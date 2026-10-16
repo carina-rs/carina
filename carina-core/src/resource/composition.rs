@@ -86,6 +86,25 @@ pub struct CompositionAttribute {
 }
 
 impl CompositionAttribute {
+    /// Whether this output contains a saved-plan secret placeholder.
+    ///
+    /// Keep the destructuring exhaustive so adding another field or value
+    /// representation requires the saved-plan placeholder inventory to make an
+    /// explicit decision about it.
+    pub fn contains_redacted_secret_placeholder(&self) -> bool {
+        let Self {
+            value,
+            declared_type: _declared_type,
+            source_argument: _source_argument,
+        } = self;
+        match value {
+            CompositionAttributeValue::Forwarded(_path) => false,
+            CompositionAttributeValue::Derived(value) => {
+                crate::value::contains_redacted_secret(value)
+            }
+        }
+    }
+
     /// Classify a `Value` into the appropriate
     /// [`CompositionAttribute`] variant.
     ///
@@ -171,6 +190,18 @@ pub struct CompositionArgument {
 }
 
 impl CompositionArgument {
+    /// Whether this argument contains a saved-plan secret placeholder.
+    ///
+    /// The exhaustive destructuring makes new fields part of the saved-plan
+    /// placeholder inventory by construction.
+    pub fn contains_redacted_secret_placeholder(&self) -> bool {
+        let Self {
+            value,
+            declared_type: _declared_type,
+        } = self;
+        crate::value::contains_redacted_secret(value)
+    }
+
     pub fn from_value(value: Value, declared_type: TypeExpr) -> Self {
         Self {
             value,

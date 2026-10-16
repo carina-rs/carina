@@ -162,10 +162,157 @@ impl ResolvedProviderConfigs {
 #[serde(transparent)]
 pub struct SavedProviderConfigs(Vec<ProviderConfig>);
 
+const PROVIDER_CONFIG_SECTIONS: [crate::value::ProviderConfigSection; 2] = [
+    crate::value::ProviderConfigSection::Attribute,
+    crate::value::ProviderConfigSection::DefaultTag,
+];
+
+fn provider_config_section(
+    config: &ProviderConfig,
+    section: crate::value::ProviderConfigSection,
+) -> &IndexMap<String, Value> {
+    match section {
+        crate::value::ProviderConfigSection::Attribute => &config.attributes,
+        crate::value::ProviderConfigSection::DefaultTag => &config.default_tags,
+    }
+}
+
+fn provider_config_section_mut(
+    config: &mut ProviderConfig,
+    section: crate::value::ProviderConfigSection,
+) -> &mut IndexMap<String, Value> {
+    match section {
+        crate::value::ProviderConfigSection::Attribute => &mut config.attributes,
+        crate::value::ProviderConfigSection::DefaultTag => &mut config.default_tags,
+    }
+}
+
+fn provider_config_secret_location(
+    config: &ProviderConfig,
+    section: crate::value::ProviderConfigSection,
+    key: &str,
+) -> String {
+    match section {
+        crate::value::ProviderConfigSection::Attribute => {
+            format!("provider {}.{key}", config.name)
+        }
+        crate::value::ProviderConfigSection::DefaultTag => {
+            format!("provider {}.default_tags.{key}", config.name)
+        }
+    }
+}
+
 impl SavedProviderConfigs {
     /// Borrow the serialized provider configuration projection.
     pub fn as_provider_configs(&self) -> &[ProviderConfig] {
         &self.0
+    }
+
+    pub fn contains_redacted_secret(&self) -> bool {
+        self.0.iter().any(|config| {
+            let ProviderConfig {
+                name: _name,
+                attributes,
+                default_tags,
+                source: _source,
+                version: _version,
+                revision: _revision,
+                unresolved_attributes,
+                binding: _binding,
+            } = config;
+            attributes
+                .values()
+                .chain(default_tags.values())
+                .chain(unresolved_attributes.values())
+                .any(crate::value::contains_redacted_secret)
+        })
+    }
+
+    /// Replace provider-configuration secrets with typed saved-plan
+    /// placeholders while preserving the historical transparent array shape.
+    pub fn redact_secrets(&self) -> Result<Self, crate::value::SerializationError> {
+        let configs = self
+            .0
+            .iter()
+            .map(|config| {
+                let mut out = config.clone();
+                for section in PROVIDER_CONFIG_SECTIONS {
+                    let values = provider_config_section(config, section)
+                        .iter()
+                        .map(|(key, value)| {
+                            let position = crate::value::SecretPosition::provider_config(
+                                &config.name,
+                                config.binding.as_deref(),
+                                section,
+                                key,
+                            );
+                            crate::value::redact_secrets_in_value(value, &position)
+                                .map(|value| (key.clone(), value))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    *provider_config_section_mut(&mut out, section) = values;
+                }
+                Ok(out)
+            })
+            .collect::<Result<Vec<_>, crate::value::SerializationError>>()?;
+        Ok(Self(configs))
+    }
+
+    /// Restore provider-configuration placeholders from freshly evaluated
+    /// provider configs and verify every plan-time hash.
+    pub fn rehydrate_secrets(
+        &self,
+        evaluated: &Self,
+    ) -> Result<Self, crate::value::SecretRehydrationSiteError> {
+        let configs = self
+            .0
+            .iter()
+            .map(|saved| {
+                let has_placeholder = saved
+                    .attributes
+                    .values()
+                    .chain(saved.default_tags.values())
+                    .any(crate::value::contains_redacted_secret);
+                if !has_placeholder {
+                    return Ok(saved.clone());
+                }
+                let candidate = evaluated
+                    .0
+                    .iter()
+                    .find(|candidate| {
+                        candidate.name == saved.name && candidate.binding == saved.binding
+                    })
+                    .ok_or_else(|| crate::value::SecretRehydrationSiteError {
+                        location: format!("provider {}", saved.name),
+                        source: crate::value::SecretRehydrationError::ShapeMismatch,
+                    })?;
+                let mut out = saved.clone();
+                for section in PROVIDER_CONFIG_SECTIONS {
+                    for (key, saved_value) in provider_config_section(saved, section) {
+                        let value = crate::value::rehydrate_secret_entry(
+                            saved_value,
+                            provider_config_section(candidate, section).get(key),
+                            || {
+                                Ok(crate::value::SecretPosition::provider_config(
+                                    &saved.name,
+                                    saved.binding.as_deref(),
+                                    section,
+                                    key,
+                                ))
+                            },
+                            provider_config_secret_location(saved, section, key),
+                            crate::value::SecretRehydrationCandidate::Evaluated,
+                        )?;
+                        if let Some(value) = value {
+                            provider_config_section_mut(&mut out, section)
+                                .insert(key.clone(), value);
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .collect::<Result<Vec<_>, crate::value::SecretRehydrationSiteError>>()?;
+        Ok(Self(configs))
     }
 }
 
@@ -180,6 +327,76 @@ impl TryFrom<SavedProviderConfigs> for ResolvedProviderConfigs {
 
     fn try_from(configs: SavedProviderConfigs) -> Result<Self, Self::Error> {
         Self::from_resolved(configs.0)
+    }
+}
+
+#[cfg(test)]
+mod saved_provider_config_secret_tests {
+    use super::*;
+
+    fn secret(value: &str) -> Value {
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String(value.into()),
+        ))))
+    }
+
+    fn provider(token: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::from([("token".to_string(), secret(token))]),
+            default_tags: IndexMap::from([("Token".to_string(), secret(token))]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: Some("secondary".to_string()),
+        }
+    }
+
+    fn placeholder_hash(value: &Value) -> &str {
+        match value {
+            Value::Deferred(DeferredValue::RedactedSecret { hash }) => hash.as_str(),
+            other => panic!("expected saved-plan secret placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_secret_positions_are_distinct_and_rehydrate() {
+        let evaluated = SavedProviderConfigs(vec![provider("SAME_SECRET")]);
+        let redacted = evaluated
+            .redact_secrets()
+            .expect("provider secrets should have stable saved-plan positions");
+        let saved = &redacted.0[0];
+
+        assert_ne!(
+            placeholder_hash(saved.attributes.get("token").expect("token")),
+            placeholder_hash(saved.default_tags.get("Token").expect("default tag")),
+            "provider attributes and default tags must use disjoint positions",
+        );
+
+        assert_eq!(
+            redacted
+                .rehydrate_secrets(&evaluated)
+                .expect("unchanged provider secrets should rehydrate"),
+            evaluated,
+        );
+    }
+
+    #[test]
+    fn provider_secret_rehydration_rejects_context_mismatch() {
+        let planned = SavedProviderConfigs(vec![provider("SAME_SECRET")]);
+        let redacted = planned.redact_secrets().expect("redact provider secret");
+        let mut mismatched = provider("SAME_SECRET");
+        mismatched.binding = Some("different-instance".to_string());
+
+        let error = redacted
+            .rehydrate_secrets(&SavedProviderConfigs(vec![mismatched]))
+            .expect_err("a placeholder must be bound to its provider instance position");
+        assert!(matches!(
+            error.source,
+            crate::value::SecretRehydrationError::HashMismatch
+                | crate::value::SecretRehydrationError::ShapeMismatch
+        ));
     }
 }
 
@@ -413,6 +630,38 @@ fn resolve_resource_refs_with_policy(
     let mut fn_ctx = super::ParseContext::new(config);
     fn_ctx.user_functions = parsed.user_functions.clone();
 
+    // Backend getters consume ordinary values directly and have no secret
+    // transport/writeback seam. Evaluate backend function calls with the same
+    // semantics as resource attributes, then reject any secret-derived result
+    // before validate/plan/apply can resolve a backend from it.
+    if let Some(backend) = &mut parsed.backend {
+        for (key, value) in &mut backend.attributes {
+            let evaluated = resolve_function_calls_only(
+                value,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            if crate::value::contains_secret(&evaluated) {
+                let span = backend.attribute_spans.get(key).copied().ok_or_else(|| {
+                    ParseError::InternalError {
+                        expected: format!("source span for backend attribute '{key}'"),
+                        context: "secret-derived backend attribute validation".to_string(),
+                    }
+                })?;
+                return Err(ParseError::SecretDerivedBackendAttribute {
+                    backend_type: backend.backend_type.clone(),
+                    attribute: key.clone(),
+                    line: span.start_line,
+                    start_column: span.start_column,
+                    end_column: span.end_column,
+                });
+            }
+            *value = evaluated;
+        }
+    }
+
     // Resolve references in each resource. Keep `IndexMap` to preserve
     // the user's source order through resolution (#2222).
     //
@@ -434,6 +683,44 @@ fn resolve_resource_refs_with_policy(
         }
 
         *resource.attributes_mut() = resolved_attrs;
+    }
+
+    // Residual `for` bodies are not part of `iter_pre_apply_resources_mut`:
+    // their iterable is still unknown, but function calls in the template
+    // can nevertheless have fully-known arguments. Evaluate those calls at
+    // the same semantic seam as ordinary resources. In particular this turns
+    // `secret(...)`, `decrypt(...)`, and expressions derived from them into
+    // `DeferredValue::Secret` before saved-plan redaction; leaving the raw
+    // call here would serialize its plaintext arguments from a deferred plan
+    // effect. Keep resource references deferred so apply-time expansion still
+    // substitutes the loop value and other runtime bindings normally.
+    for deferred in &mut parsed.deferred_for_expressions {
+        for value in deferred.template_resource.attributes.values_mut() {
+            *value = resolve_function_calls_only(
+                value,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+        }
+        for (key, value) in &mut deferred.attributes {
+            // `attributes` is the display projection of the same template.
+            // Reuse the evaluated resource value so effect serialization is
+            // consistent and side-effecting evaluators such as `decrypt()`
+            // run only once.
+            if let Some(evaluated) = deferred.template_resource.attributes.get(key) {
+                *value = evaluated.clone();
+            } else {
+                *value = resolve_function_calls_only(
+                    value,
+                    &binding_map,
+                    &fn_ctx,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                )?;
+            }
+        }
     }
 
     // Resolve top-level `let v = ...` bindings that contain
@@ -721,6 +1008,7 @@ fn collect_reference_roots(
             | ConcreteValue::CanonicalEnum(_)
             | ConcreteValue::StringList(_),
         )
+        | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => {}
     }
 }
@@ -1235,9 +1523,9 @@ pub fn resolve_provider_unresolved_attributes<E>(
 /// (the values fetched by the CLI's shared upstream-loading step).
 ///
 /// This is the strict plan/apply-time counterpart to the edit-tolerant
-/// [`resolve_provider_unresolved_attributes`] pass. It resolves only regular
-/// provider attributes. `default_tags` deliberately remain deferred because
-/// they are resolved per resource during desired normalization. The regular
+/// [`resolve_provider_unresolved_attributes`] pass. It resolves both regular
+/// provider attributes and the values inside `default_tags`; tag merging
+/// remains deferred until desired normalization. The regular
 /// `provider.attributes` map can contain refs nested inside
 /// struct literals — `assume_role = { role_arn = upstream.arn }` is the
 /// motivating case (carina#3182) — and those refs need to be substituted
@@ -1270,12 +1558,14 @@ pub fn resolve_provider_attributes_with_remote<E>(
     let mut providers = Vec::with_capacity(parsed.providers.len());
     for provider in &parsed.providers {
         let mut provider = provider.clone();
-        let mut resolved = IndexMap::new();
-        for (key, expr) in &provider.attributes {
-            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
-            resolved.insert(key.clone(), r);
+        for section in [&mut provider.attributes, &mut provider.default_tags] {
+            let mut resolved = IndexMap::new();
+            for (key, expr) in section.iter() {
+                let value = resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
+                resolved.insert(key.clone(), value);
+            }
+            *section = resolved;
         }
-        provider.attributes = resolved;
 
         providers.push(provider);
     }
@@ -1386,5 +1676,46 @@ mod seed_precedence_tests {
             }
             SeedKind::Structural => panic!("plain value let must seed as Value, not Structural"),
         }
+    }
+
+    #[test]
+    fn deferred_for_templates_receive_function_evaluation() {
+        let mut parsed = crate::parser::parse(
+            r#"
+let source = mock.compute.Instance {
+  name = "source"
+}
+
+for item in source.arn {
+  mock.test.resource {
+    name    = "child"
+    comment = secret("DEFERRED_TEMPLATE_PLAINTEXT")
+  }
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("parse deferred for fixture");
+        let template = &parsed.deferred_for_expressions[0].template_resource;
+        assert!(matches!(
+            template.attributes.get("comment"),
+            Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
+        ));
+
+        resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
+            .expect("resolve deferred template functions");
+
+        let template = &parsed.deferred_for_expressions[0].template_resource;
+        assert!(matches!(
+            template.attributes.get("comment"),
+            Some(Value::Deferred(DeferredValue::Secret(_)))
+        ));
+        assert!(matches!(
+            parsed.deferred_for_expressions[0]
+                .attributes
+                .iter()
+                .find_map(|(key, value)| (key == "comment").then_some(value)),
+            Some(Value::Deferred(DeferredValue::Secret(_)))
+        ));
     }
 }

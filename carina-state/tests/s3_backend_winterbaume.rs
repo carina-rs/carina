@@ -207,7 +207,8 @@ async fn write_then_read_state_round_trips() {
         "the round-tripped resource must keep its identifier",
     );
     assert_eq!(
-        read_res.attributes, written_res.attributes,
+        read_res.persisted_attributes(),
+        written_res.persisted_attributes(),
         "the round-tripped resource must keep its attributes map",
     );
     assert_eq!(

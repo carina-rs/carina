@@ -43,6 +43,18 @@ carina apply plan.json
 
 When applying a saved plan, Carina checks the state lineage and serial number against the current state to detect drift since the plan was created.
 
+When a saved plan contains secret placeholders, Carina also re-reads and
+evaluates the configuration from the source directory recorded in the plan.
+Each saved secret hash must match the secret at the same typed position,
+including resource attributes, provider configuration, and deferred templates.
+The provider then receives the rehydrated plaintext, while state stores the
+normal Argon2id hash. If a secret changed or can no longer be found, apply stops
+before any planned provider mutation or state write and asks you to run
+`carina plan --out` again. Saved-plan verification may perform additional
+provider reads, including reads for resources scheduled for deletion. A saved
+plan without secret placeholders does not revalidate unrelated source
+configuration.
+
 Before applying either a live configuration or a saved plan, Carina also
 checks the current project backend against `carina-backend.lock`. If the
 backend changed, apply refuses and points at

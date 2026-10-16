@@ -226,6 +226,59 @@ fn parse_account_guard_clause(msg: &str, kind: &str) -> Option<AccountGuardClaus
     })
 }
 
+/// Typed causes for saved-plan secret verification failures.
+#[derive(Debug, thiserror::Error)]
+pub enum SavedPlanSecretVerificationError {
+    #[error(
+        "Saved-plan secret verification failed at {location}: the secret changed since the plan was created; re-run `{replan}`."
+    )]
+    HashMismatch {
+        location: String,
+        replan: String,
+        #[source]
+        source: carina_core::value::SecretRehydrationSiteError,
+    },
+
+    #[error(
+        "Saved-plan secret verification failed at {location}: the configuration changed and the recorded secret position no longer exists; re-run `{replan}`."
+    )]
+    ConfigurationChanged {
+        location: String,
+        replan: String,
+        #[source]
+        source: carina_core::value::SecretRehydrationSiteError,
+    },
+
+    #[error(
+        "Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs."
+    )]
+    EvaluationUnavailable {
+        replan: String,
+        #[source]
+        source: Box<AppError>,
+    },
+
+    #[error(
+        "Saved-plan secret verification failed at {location}: the current secret could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs."
+    )]
+    SecretEvaluationUnavailable {
+        location: String,
+        replan: String,
+        #[source]
+        source: carina_core::value::SecretRehydrationSiteError,
+    },
+
+    #[error(
+        "Saved-plan secret verification failed because orphan resource {resource} no longer exists; re-run `{replan}`."
+    )]
+    OrphanVanished {
+        resource: String,
+        replan: String,
+        #[source]
+        source: carina_core::value::SecretRehydrationSiteError,
+    },
+}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -295,6 +348,10 @@ pub enum AppError {
     /// A saved plan attempted to cross the provider boundary with unresolved config.
     #[error("Invalid provider config in saved plan: {0}")]
     SavedProviderConfig(#[source] Box<carina_core::parser::ProviderConfigInvariantError>),
+
+    /// A typed saved-plan secret verification failure with actionable cause.
+    #[error(transparent)]
+    SavedPlanSecretVerification(Box<SavedPlanSecretVerificationError>),
 
     /// State-backend bootstrap preparation failed before provider dispatch.
     #[error(transparent)]

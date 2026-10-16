@@ -694,6 +694,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            attribute_spans: Default::default(),
         };
 
         let state_config = BackendConfig::from(&provider_context);

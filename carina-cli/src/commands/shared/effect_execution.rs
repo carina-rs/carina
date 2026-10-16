@@ -46,11 +46,16 @@ pub(crate) async fn execute_import_effects(
                     continue;
                 }
             };
+            let identifier_display = if carina_core::value::contains_secret(identifier) {
+                "(secret)"
+            } else {
+                identifier_str.as_str()
+            };
             println!(
                 "  {} Importing {} (id: {})...",
                 "<-".cyan(),
                 id,
-                identifier_str
+                identifier_display
             );
             let read = provider.read(id, Some(identifier_str.as_str()), ReadRequest);
             let read_result = match cleanup_wait.until_cleanup_priority(read).await {
@@ -68,7 +73,7 @@ pub(crate) async fn execute_import_effects(
                             "  {} Import failed: resource {} with id {} not found",
                             "✗".red(),
                             id,
-                            identifier_str
+                            identifier_display
                         );
                         result.failure_count += 1;
                     }

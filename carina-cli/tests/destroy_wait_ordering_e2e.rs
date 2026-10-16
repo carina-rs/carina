@@ -154,17 +154,17 @@ let lst = mock.test.resource {{
             .with_attribute("id", serde_json::json!("main-current"))
             .with_attribute("status", serde_json::json!("ACTIVE"));
         main.binding = Some("main".to_string());
-        main.deposed.push(DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: "main-old".to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([
+        main.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "main-old".to_string(),
+            None,
+            HashMap::from([
                 ("name".to_string(), serde_json::json!("main-old")),
                 ("id".to_string(), serde_json::json!("main-old")),
                 ("status".to_string(), serde_json::json!("STALE")),
             ]),
-            dependency_bindings: BTreeSet::new(),
-        });
+            BTreeSet::new(),
+        ));
         state
             .upsert_resource(main)
             .expect("test state setup must be valid");

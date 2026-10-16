@@ -6,7 +6,8 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
-use carina_core::effect::{DeletedInstanceKey, Effect, EffectGeneration};
+use carina_core::detail_rows::HistoricalDisplayAttributes;
+use carina_core::effect::{Effect, EffectGeneration};
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
@@ -17,7 +18,9 @@ use carina_core::plan::Plan;
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{
-    redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
+    redact_secrets_in_plan_with_desired_and_historical, redact_secrets_in_resource,
+    redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
+    redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
 use carina_state::{BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend};
 
@@ -33,7 +36,7 @@ use crate::wiring::{
 use carina_core::hint::ProjectCommand;
 
 /// Saved plan file for `plan --out` / `apply <plan-file>`
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanFile {
     /// Plan file format version.
     ///
@@ -150,7 +153,132 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 11;
+    pub const CURRENT_VERSION: u32 = 12;
+
+    /// Whether any typed, value-bearing plan field still contains a secret
+    /// placeholder.
+    pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
+        use carina_core::resource::{Composition, DataSource, Signature};
+
+        fn resource_contains(resource: &Resource) -> bool {
+            let Resource {
+                id: _id,
+                attributes,
+                directives: _directives,
+                prefixes: _prefixes,
+                binding: _binding,
+                dependency_bindings: _dependency_bindings,
+                module_source: _module_source,
+                quoted_string_attrs: _quoted_string_attrs,
+            } = resource;
+            attributes
+                .values()
+                .any(carina_core::value::contains_redacted_secret)
+        }
+
+        fn data_source_contains(data_source: &DataSource) -> bool {
+            let DataSource {
+                id: _id,
+                attributes,
+                directives: _directives,
+                binding: _binding,
+                dependency_bindings: _dependency_bindings,
+                module_source: _module_source,
+                quoted_string_attrs: _quoted_string_attrs,
+            } = data_source;
+            attributes
+                .values()
+                .any(carina_core::value::contains_redacted_secret)
+        }
+
+        fn composition_contains(composition: &Composition) -> bool {
+            let Composition {
+                id: _id,
+                signature,
+                binding: _binding,
+                dependency_bindings: _dependency_bindings,
+                module_name: _module_name,
+                instance: _instance,
+                provenance: _provenance,
+                quoted_string_attrs: _quoted_string_attrs,
+            } = composition;
+            let Signature {
+                arguments,
+                attributes,
+                pending_constraints: _pending_constraints,
+            } = signature;
+            arguments
+                .values()
+                .any(|argument| argument.contains_redacted_secret_placeholder())
+                || attributes
+                    .values()
+                    .any(|attribute| attribute.contains_redacted_secret_placeholder())
+        }
+
+        fn state_contains(state: &State) -> bool {
+            let State {
+                id: _id,
+                identifier: _identifier,
+                attributes,
+                exists: _exists,
+                dependency_bindings: _dependency_bindings,
+                partial_read: _partial_read,
+            } = state;
+            attributes
+                .values()
+                .any(carina_core::value::contains_redacted_secret)
+        }
+
+        fn current_state_contains(entry: &CurrentStateEntry) -> bool {
+            let CurrentStateEntry { id: _id, state } = entry;
+            state_contains(state)
+        }
+
+        let PlanFile {
+            version: _version,
+            carina_version: _carina_version,
+            timestamp: _timestamp,
+            source_path: _source_path,
+            state_lineage: _state_lineage,
+            state_serial: _state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            current_states,
+            upstream_snapshot,
+            upstream_sources: _upstream_sources,
+            wait_bindings: _wait_bindings,
+        } = self;
+
+        provider_configs.contains_redacted_secret()
+            || backend_config.as_ref().is_some_and(|backend| {
+                let BackendConfig {
+                    backend_type: _backend_type,
+                    attributes,
+                    attribute_spans: _attribute_spans,
+                } = backend;
+                attributes
+                    .values()
+                    .any(carina_core::value::contains_redacted_secret)
+            })
+            || plan.contains_redacted_secret_placeholders()
+            || sorted_resources.iter().any(resource_contains)
+            || unresolved_resources.iter().any(resource_contains)
+            || compositions.iter().any(composition_contains)
+            || data_sources.iter().any(data_source_contains)
+            || data_source_origins.iter().any(data_source_contains)
+            || current_states.iter().any(current_state_contains)
+            || upstream_snapshot.values().any(|attributes| {
+                attributes
+                    .values()
+                    .any(carina_core::value::contains_redacted_secret)
+            })
+    }
 
     pub(crate) fn validate_resource_identities(&self) -> Result<(), String> {
         fn require_identity(id: &ResourceId, location: &str) -> Result<(), String> {
@@ -300,33 +428,65 @@ impl PlanFile {
     }
 }
 
-pub(crate) fn collect_delete_attributes(
+pub(crate) fn collect_historical_display_attributes(
     plan: &Plan,
     current_states: &HashMap<ResourceId, State>,
     state_file: Option<&StateFile>,
-) -> HashMap<DeletedInstanceKey, HashMap<String, Value>> {
-    let mut delete_attributes = HashMap::new();
+) -> HistoricalDisplayAttributes {
+    let mut display = HistoricalDisplayAttributes::for_plan(plan);
+    let moved_origins: HashMap<_, _> = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Move { from, to } => Some((to.as_inner(), from.as_inner())),
+            _ => None,
+        })
+        .collect();
 
     for effect in plan.effects() {
         for key in effect.deleted_resource_attribute_keys() {
             match key.generation() {
                 carina_core::effect::EffectGeneration::Current => {
                     if let Some(state) = current_states.get(key.id()) {
-                        delete_attributes.insert(key, state.attributes.clone());
+                        let persisted_id = moved_origins.get(key.id()).copied().unwrap_or(key.id());
+                        let persisted = state_file
+                            .and_then(|file| file.find_resource_for_id(persisted_id))
+                            .map(|resource| resource.persisted_attributes());
+                        display.set_delete_from_provider_and_persisted(
+                            key,
+                            &state.attributes,
+                            persisted,
+                        );
                     }
                 }
                 carina_core::effect::EffectGeneration::Deposed(deposed_key) => {
                     if let Some(attrs) = state_file.and_then(|sf| {
                         deposed_attributes_for_display(sf, key.id(), key.identifier(), deposed_key)
                     }) {
-                        delete_attributes.insert(key, attrs);
+                        display.set_delete_from_persisted(key, &attrs);
                     }
                 }
             }
         }
+
+        // Update::from has already crossed the plan-input canonicalization
+        // boundary (including reconstruction of partial-read Unknown values).
+        // Mask that shape in place instead of replacing it with the raw
+        // refreshed state used by Delete effects.
+        if let Effect::Update { from, .. } = effect {
+            let persisted_id = moved_origins.get(&from.id).copied().unwrap_or(&from.id);
+            let persisted = state_file
+                .and_then(|file| file.find_resource_for_id(persisted_id))
+                .map(|resource| resource.persisted_attributes());
+            display.set_update_from_provider_and_persisted(
+                from.id.clone(),
+                &from.attributes,
+                persisted,
+            );
+        }
     }
 
-    delete_attributes
+    display
 }
 
 fn deposed_attributes_for_display(
@@ -334,22 +494,69 @@ fn deposed_attributes_for_display(
     id: &ResourceId,
     identifier: &str,
     key: &carina_state::DeposedKey,
-) -> Option<HashMap<String, Value>> {
-    let row = state_file.find_resource(&id.provider, &id.resource_type, id.identity_str()?)?;
+) -> Option<carina_core::provider::PersistedAttributes> {
+    let row = state_file.find_resource_for_id(id)?;
     let deposed = row.deposed.iter().find(|deposed| {
         deposed.key == *key
             && deposed.identifier == identifier
             && deposed.provider_instance == id.provider_instance
     })?;
-    Some(
-        deposed
-            .attributes
-            .iter()
-            .filter_map(|(k, v)| {
-                carina_core::value::json_to_dsl_value(v).map(|value| (k.clone(), value))
-            })
-            .collect(),
-    )
+    Some(deposed.persisted_attributes().clone())
+}
+
+#[cfg(test)]
+mod historical_display_tests {
+    use super::*;
+    use carina_core::resource::{DeferredValue, ResolvedResource};
+
+    #[test]
+    fn production_historical_display_combines_desired_and_persisted_secret_shapes() {
+        const PLAINTEXT: &str = "hunter2";
+        let id = ResourceId::with_identity("mock.test.resource", "masked-update");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String(PLAINTEXT.into())),
+            )]),
+        );
+        let to = ResolvedResource::new(
+            Resource::new("mock.test.resource", "masked-update").with_attribute(
+                "comment",
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("rotated".into()),
+                )))),
+            ),
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from.clone()),
+            to,
+            changed_attributes: vec!["comment".to_string()],
+        });
+        let current_states = HashMap::from([(id, from)]);
+
+        // Exercise the same collector and row builder used by CLI and TUI
+        // production paths. There is deliberately no persisted state shape:
+        // the desired Secret shape must still mask the provider plaintext.
+        let historical = collect_historical_display_attributes(&plan, &current_states, None);
+        let app = carina_tui::App::new(
+            &plan,
+            &carina_core::schema::SchemaRegistry::new(),
+            &historical,
+        );
+        let rendered = format!("{:?}", app.nodes[0].detail_rows);
+
+        assert!(
+            !rendered.contains(PLAINTEXT),
+            "detail rows leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("(secret)"),
+            "detail rows were not masked: {rendered}"
+        );
+    }
 }
 
 /// Serializable `(binding, target)` pair for a `wait` declaration —
@@ -378,7 +585,7 @@ pub struct UpstreamSource {
 }
 
 /// Entry for serializing current resource states
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentStateEntry {
     pub id: ResourceId,
     pub state: State,
@@ -397,13 +604,104 @@ fn build_plan_file<E>(
         parsed.data_sources.len(),
         "plan data sources must stay paired with their authored origins"
     );
+    assert_eq!(
+        ctx.unresolved_resources.len(),
+        ctx.sorted_resources.len(),
+        "plan resources must stay paired with their authored origins"
+    );
     let source_path = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string();
 
+    let desired_resources: HashMap<ResourceId, Resource> = ctx
+        .sorted_resources
+        .iter()
+        .map(|resource| (resource.id.clone(), resource.clone()))
+        .collect();
+    let provider_configs = SavedProviderConfigs::from(provider_configs).redact_secrets()?;
+    for (binding, attributes) in &ctx.upstream_snapshot {
+        for (key, value) in attributes {
+            // Export validation rejects secret-valued exports before an
+            // upstream state snapshot can be produced. Keep this guard for
+            // malformed/tampered in-memory input rather than defining a
+            // position that valid plans cannot reach.
+            carina_core::value::reject_secret_without_saved_plan_position(
+                value,
+                format!("upstream_state {binding}.{key}"),
+            )?;
+        }
+    }
+    let upstream_snapshot = ctx.upstream_snapshot.clone();
+    let persisted_resources = state_file.as_ref().map(|state_file| {
+        state_file
+            .resources()
+            .iter()
+            .map(|resource| {
+                (
+                    (
+                        resource.provider.as_str(),
+                        resource.resource_type.as_str(),
+                        resource.identity.as_str(),
+                        resource.directives.provider_instance.as_deref(),
+                    ),
+                    resource,
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    });
+    let redacted_current_states = ctx
+        .current_states
+        .iter()
+        .map(|(id, state)| {
+            let hash_context_id = ctx.moved_origins.get(id).unwrap_or(id);
+            let persisted = persisted_resources.as_ref().and_then(|resources| {
+                let identity = hash_context_id.identity_str()?;
+                resources
+                    .get(&(
+                        hash_context_id.provider.as_str(),
+                        hash_context_id.resource_type.as_str(),
+                        identity,
+                        hash_context_id.provider_instance.as_deref(),
+                    ))
+                    .copied()
+            });
+            // A moved state keeps the hash produced under its source address
+            // until execution writes the destination row. Both persisted
+            // lookup and fresh-read redaction therefore use that source
+            // address as the historical hash context.
+            let redacted = match persisted {
+                Some(persisted) => {
+                    let persisted_attributes = persisted.persisted_attributes();
+                    redact_secrets_in_state_using_persisted(
+                        state,
+                        persisted_attributes,
+                        hash_context_id,
+                    )?
+                }
+                None => state.clone(),
+            };
+            let redacted = match desired_resources.get(id) {
+                Some(desired) => {
+                    redact_secrets_in_state_using_resource(&redacted, desired, hash_context_id)?
+                }
+                None if persisted.is_some() => redacted,
+                None => redact_secrets_in_state(&redacted)?,
+            };
+            Ok((id.clone(), redacted))
+        })
+        .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
+
     Ok(PlanFile {
+        // carina#3861 / carina#2674: bumped 11→12 — secrets now use a typed
+        // placeholder bound to a stable, position-unique hash context, and
+        // saved-plan apply must re-evaluate and verify it. Resource positions
+        // stay byte-identical to state writeback; other positions use disjoint
+        // namespaces. A v11 plan represents secret hashes as ordinary strings
+        // and could send those hashes to a provider, so it must never cross
+        // this seam.
+        //
         // carina#3805: bumped 10→11 — `compositions` stores the pending module
         // constraints required by apply, and `data_source_origins` preserves
         // the authored input paired with each canonical plan-time data source
@@ -441,9 +739,13 @@ fn build_plan_file<E>(
         source_path,
         state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
         state_serial: state_file.as_ref().map(|s| s.serial),
-        provider_configs: SavedProviderConfigs::from(provider_configs),
+        provider_configs,
         backend_config,
-        plan: redact_secrets_in_plan(&ctx.plan)?,
+        plan: redact_secrets_in_plan_with_desired_and_historical(
+            &ctx.plan,
+            &desired_resources,
+            &redacted_current_states,
+        )?,
         sorted_resources: ctx
             .sorted_resources
             .iter()
@@ -452,7 +754,10 @@ fn build_plan_file<E>(
         unresolved_resources: ctx
             .unresolved_resources
             .iter()
-            .map(redact_secrets_in_resource)
+            .zip(&ctx.sorted_resources)
+            .map(|(source, evaluated)| {
+                redact_secrets_in_resource_using_evaluated(source, evaluated)
+            })
             .collect::<Result<Vec<_>, _>>()?,
         compositions: ctx
             .compositions
@@ -471,20 +776,20 @@ fn build_plan_file<E>(
             .map(|(resolved, authored)| {
                 let mut authored = authored.clone();
                 authored.id = resolved.id.clone();
-                carina_core::value::redact_secrets_in_data_source(&authored)
+                carina_core::value::redact_secrets_in_data_source_using_evaluated(
+                    &authored, resolved,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?,
         current_states: ctx
             .current_states
-            .iter()
-            .map(|(id, state)| {
-                Ok::<_, carina_core::value::SerializationError>(CurrentStateEntry {
-                    id: id.clone(),
-                    state: redact_secrets_in_state(state)?,
-                })
+            .keys()
+            .map(|id| CurrentStateEntry {
+                id: id.clone(),
+                state: redacted_current_states[id].clone(),
             })
-            .collect::<Result<Vec<_>, _>>()?,
-        upstream_snapshot: ctx.upstream_snapshot.clone(),
+            .collect(),
+        upstream_snapshot,
         upstream_sources: parsed
             .upstream_states
             .iter()
@@ -516,6 +821,7 @@ fn parser_backend_config_from_state(config: &StateBackendConfig) -> BackendConfi
     BackendConfig {
         backend_type: config.backend_type.clone(),
         attributes: config.attributes.clone(),
+        attribute_spans: HashMap::new(),
     }
 }
 
@@ -840,52 +1146,20 @@ pub async fn run_plan(
         println!();
     }
 
-    // Factory/schema wiring uses provider declaration metadata only. Provider
-    // attributes are resolved after state-based identity reconciliation below.
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let wiring = WiringContext::new(factories, &parsed.providers);
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let crate::wiring::StateBlockResolution {
-        claims: state_block_claims,
-        targets: resolved_state_block_targets,
-    } = crate::wiring::resolve_state_blocks(
-        &parsed.state_blocks,
-        &state_file,
-        &parsed.resources,
-        wiring.schemas(),
-    );
-    if let Some(sf) = state_file.as_ref() {
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut parsed.resources,
-            &mut parsed.compositions,
-            &|provider, resource_type| {
-                sf.resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|r| r.identity.to_string())
-                    .collect()
+    let PreparedPlanIdentityInputs {
+        wiring,
+        state_blocks:
+            crate::wiring::StateBlockResolution {
+                claims: state_block_claims,
+                targets: resolved_state_block_targets,
             },
-            &state_block_claims,
-        );
-    }
-    if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
-            &wiring,
-            &mut parsed.resources,
-            sf,
-            &state_block_claims,
-        )?;
-    }
-
-    // #2366: plan tolerates missing upstream state; mutating commands are strict.
-    // Resolve here, after prefix and anonymous-identity reconciliation, so a
-    // provider attribute that references a generated resource attribute sees
-    // the stable value recovered from state.
-    let provider_inputs = load_and_resolve_provider_configs(
-        &parsed,
+        provider_inputs,
+    } = prepare_plan_identity_and_provider_inputs(
+        &mut parsed,
+        &mut state_file,
         base_dir,
         provider_context,
         UpstreamMissingStatePolicy::Lenient,
-        ProviderUpstreamScope::All,
     )
     .await?;
     if !refresh {
@@ -964,9 +1238,9 @@ pub async fn run_plan(
             .as_ref()
             .is_some_and(crate::commands::iam_preflight::should_fail_strict);
 
-    // Build delete attributes map from current states for display
-    let delete_attributes =
-        collect_delete_attributes(&ctx.plan, &ctx.current_states, state_file.as_ref());
+    // Build display-safe historical attributes from current and persisted state.
+    let historical_display =
+        collect_historical_display_attributes(&ctx.plan, &ctx.current_states, state_file.as_ref());
 
     // Resolve exports against the same pre-apply binding view used for their
     // display and reject secrets that were hidden behind references during
@@ -982,6 +1256,8 @@ pub async fn run_plan(
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
         current_states: &ctx.current_states,
+        state_file: state_file.as_ref(),
+        moved_origins: &ctx.moved_origins,
         schemas: wiring.schemas(),
         wait_aliases: &export_wait_aliases,
         provider_context,
@@ -1011,7 +1287,7 @@ pub async fn run_plan(
             crate::commands::iam_preflight::emit_warnings(result);
         }
     } else if tui {
-        carina_tui::run(&ctx.plan, wiring.schemas())
+        carina_tui::run(&ctx.plan, wiring.schemas(), &historical_display)
             .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -1029,7 +1305,7 @@ pub async fn run_plan(
         print_plan(
             &ctx.plan,
             detail,
-            &delete_attributes,
+            &historical_display,
             Some(wiring.schemas()),
             &ctx.moved_origins,
             &export_changes,
@@ -1093,6 +1369,73 @@ pub async fn run_plan(
     Ok(has_changes)
 }
 
+/// The state-aware identity and provider-input preparation shared by normal
+/// planning and saved-plan secret verification. It is intentionally the only
+/// owner of this ordering: prefix recovery, state-block target resolution,
+/// module/anonymous identity reconciliation, then provider/upstream folding.
+pub(crate) struct PreparedPlanIdentityInputs {
+    pub(crate) wiring: WiringContext,
+    pub(crate) state_blocks: crate::wiring::StateBlockResolution,
+    pub(crate) provider_inputs: ResolvedProviderInputs,
+}
+
+pub(crate) async fn prepare_plan_identity_and_provider_inputs(
+    parsed: &mut carina_core::parser::InferredFile,
+    state_file: &mut Option<StateFile>,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+    upstream_policy: UpstreamMissingStatePolicy,
+) -> Result<PreparedPlanIdentityInputs, AppError> {
+    // Factory/schema wiring uses declaration metadata only. Provider values
+    // are folded after identities are reconciled against state.
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let wiring = WiringContext::new(factories, &parsed.providers);
+    reconcile_prefixed_names(&mut parsed.resources, state_file);
+    let state_blocks = crate::wiring::resolve_state_blocks(
+        &parsed.state_blocks,
+        state_file,
+        &parsed.resources,
+        wiring.schemas(),
+    );
+    if let Some(state) = state_file.as_ref() {
+        carina_core::module_resolver::reconcile_anonymous_module_instances(
+            &mut parsed.resources,
+            &mut parsed.compositions,
+            &|provider, resource_type| {
+                state
+                    .resources_by_type(provider, resource_type)
+                    .into_iter()
+                    .map(|resource| resource.identity.to_string())
+                    .collect()
+            },
+            &state_blocks.claims,
+        );
+    }
+    if let Some(state) = state_file.as_mut() {
+        reconcile_anonymous_identifiers_with_ctx(
+            &wiring,
+            &mut parsed.resources,
+            state,
+            &state_blocks.claims,
+        )?;
+    }
+
+    let provider_inputs = load_and_resolve_provider_configs(
+        parsed,
+        base_dir,
+        provider_context,
+        upstream_policy,
+        ProviderUpstreamScope::All,
+    )
+    .await?;
+
+    Ok(PreparedPlanIdentityInputs {
+        wiring,
+        state_blocks,
+        provider_inputs,
+    })
+}
+
 /// Complete input needed to check exports and resolve their display-only
 /// values against the pre-apply binding view.
 ///
@@ -1104,6 +1447,12 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
     pub compositions: &'a [carina_core::resource::Composition],
     pub data_sources: &'a [carina_core::resource::DataSource],
     pub current_states: &'a HashMap<ResourceId, State>,
+    /// Persisted secret shapes that classify provider-returned plaintext before
+    /// it enters export resolution.
+    pub state_file: Option<&'a StateFile>,
+    /// A moved resource's persisted hash shape still lives at its source
+    /// address until writeback completes.
+    pub moved_origins: &'a HashMap<ResourceId, ResourceId>,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
     pub provider_context: &'a ProviderContext,
@@ -1120,8 +1469,25 @@ pub(crate) fn check_exports_pre_apply(
     // carina#3248: build the unified pre-apply bindings view so an
     // export referencing `<module_instance>.<attr>` chains through the
     // composition to the managed sibling literal (carina#3246).
+    let mut secret_aware_states = input.current_states.clone();
+    if let Some(state_file) = input.state_file {
+        for (id, state) in &mut secret_aware_states {
+            let persisted_id = input.moved_origins.get(id).unwrap_or(id);
+            let Some(persisted) = state_file.find_resource_for_id(persisted_id) else {
+                continue;
+            };
+            let persisted_attributes = persisted.persisted_attributes();
+            for (key, value) in &mut state.attributes {
+                *value = carina_core::value::mask_plaintext_using_persisted_attribute(
+                    value,
+                    persisted_attributes,
+                    key,
+                );
+            }
+        }
+    }
     let plan_input_states = carina_core::resource::into_plan_input_map(
-        input.current_states.clone(),
+        secret_aware_states,
         input.schemas,
         input.resources,
     );
@@ -2354,9 +2720,7 @@ mod run_plan_out_tests {
         let mut state = StateFile::new();
         let mut bucket = carina_state::ResourceState::new("test.resource", "bucket", "mock")
             .with_identifier("pref-existing");
-        bucket
-            .attributes
-            .insert("name".to_string(), serde_json::json!("pref-existing"));
+        bucket.set_persisted_attribute("name".to_string(), serde_json::json!("pref-existing"));
         bucket
             .prefixes
             .insert("name".to_string(), "pref-".to_string());

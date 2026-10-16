@@ -785,6 +785,7 @@ mod tests {
         BackendConfig {
             backend_type: "s3".to_string(),
             attributes,
+            attribute_spans: HashMap::new(),
         }
     }
 
@@ -797,6 +798,7 @@ mod tests {
         BackendConfig {
             backend_type: "local".to_string(),
             attributes,
+            attribute_spans: HashMap::new(),
         }
     }
 

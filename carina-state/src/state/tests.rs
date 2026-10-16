@@ -1,6 +1,32 @@
 use super::*;
+use carina_core::value::SECRET_PREFIX;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
+
+fn persisted_attributes_from_state_json(
+    attributes: &HashMap<String, serde_json::Value>,
+) -> PersistedAttributes {
+    serde_json::from_value(
+        serde_json::to_value(attributes).expect("test state JSON is serializable"),
+    )
+    .expect("test attributes use the persisted JSON shape")
+}
+
+fn state_json_from_persisted_attributes(
+    attributes: &PersistedAttributes,
+) -> HashMap<String, serde_json::Value> {
+    serde_json::from_value(
+        serde_json::to_value(attributes).expect("persisted attributes are serializable"),
+    )
+    .expect("persisted attributes serialize as a JSON object")
+}
+
+fn persisted_json_attribute(
+    attributes: &PersistedAttributes,
+    key: &str,
+) -> Option<serde_json::Value> {
+    state_json_from_persisted_attributes(attributes).remove(key)
+}
 
 fn resolved(resource: &carina_core::resource::Resource) -> carina_core::resource::ResolvedResource {
     carina_core::resource::ResolvedResource::new(resource.clone())
@@ -82,8 +108,8 @@ fn test_state_file_upsert_resource() {
         .expect("test state setup must be valid");
     assert_eq!(state.resources.len(), 1);
     assert_eq!(
-        state.resources[0].attributes.get("region"),
-        Some(&serde_json::json!("us-west-2"))
+        persisted_json_attribute(&state.resources[0].attributes, "region"),
+        Some(serde_json::json!("us-west-2"))
     );
 }
 
@@ -97,14 +123,14 @@ fn upsert_resource_returns_error_for_duplicate_deposed_key() {
             key: duplicate_key.clone(),
             identifier: "vpc-old-a".to_string(),
             provider_instance: Some("west".to_string()),
-            attributes: HashMap::new(),
+            attributes: PersistedAttributes::default(),
             dependency_bindings: BTreeSet::new(),
         },
         DeposedInstance {
             key: duplicate_key,
             identifier: "vpc-old-b".to_string(),
             provider_instance: Some("east".to_string()),
-            attributes: HashMap::new(),
+            attributes: PersistedAttributes::default(),
             dependency_bindings: BTreeSet::new(),
         },
     ];
@@ -168,14 +194,14 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
             key: first_key.clone(),
             identifier: "vpc-old-a".to_string(),
             provider_instance: Some("west".to_string()),
-            attributes: HashMap::new(),
+            attributes: PersistedAttributes::default(),
             dependency_bindings: BTreeSet::new(),
         },
         DeposedInstance {
             key: second_key,
             identifier: "vpc-old-b".to_string(),
             provider_instance: Some("east".to_string()),
-            attributes: HashMap::new(),
+            attributes: PersistedAttributes::default(),
             dependency_bindings: BTreeSet::new(),
         },
     ];
@@ -194,7 +220,7 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
                 key: first_key,
                 identifier: "vpc-old-b".to_string(),
                 provider_instance: Some("east".to_string()),
-                attributes: HashMap::new(),
+                attributes: PersistedAttributes::default(),
                 dependency_bindings: BTreeSet::new(),
             },
         )
@@ -220,7 +246,10 @@ fn upsert_resource_preserves_existing_deposed_generations() {
         key: deposed_key.clone(),
         identifier: "vpc-older".to_string(),
         provider_instance: Some("west".to_string()),
-        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.255.0.0/16"))]),
+        attributes: persisted_attributes_from_state_json(&HashMap::from([(
+            "cidr_block".to_string(),
+            serde_json::json!("10.255.0.0/16"),
+        )])),
         dependency_bindings: BTreeSet::from(["igw".to_string()]),
     });
     state
@@ -239,8 +268,8 @@ fn upsert_resource_preserves_existing_deposed_generations() {
         .expect("resource should still exist");
     assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
     assert_eq!(
-        row.attributes.get("cidr_block"),
-        Some(&serde_json::json!("10.1.0.0/16"))
+        persisted_json_attribute(&row.attributes, "cidr_block"),
+        Some(serde_json::json!("10.1.0.0/16"))
     );
     assert_eq!(row.deposed.len(), 1);
     assert_eq!(row.deposed[0].key, deposed_key);
@@ -259,14 +288,20 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
         key: DeposedKey::new_unique(),
         identifier: "vpc-reused".to_string(),
         provider_instance: Some("west".to_string()),
-        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
+        attributes: persisted_attributes_from_state_json(&HashMap::from([(
+            "cidr_block".to_string(),
+            serde_json::json!("10.2.0.0/16"),
+        )])),
         dependency_bindings: BTreeSet::new(),
     });
     existing.deposed.push(DeposedInstance {
         key: retained_key.clone(),
         identifier: "vpc-older".to_string(),
         provider_instance: Some("west".to_string()),
-        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.255.0.0/16"))]),
+        attributes: persisted_attributes_from_state_json(&HashMap::from([(
+            "cidr_block".to_string(),
+            serde_json::json!("10.255.0.0/16"),
+        )])),
         dependency_bindings: BTreeSet::from(["igw".to_string()]),
     });
     state
@@ -301,7 +336,10 @@ fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provid
         key: retained_key.clone(),
         identifier: "vpc-reused".to_string(),
         provider_instance: Some("west".to_string()),
-        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
+        attributes: persisted_attributes_from_state_json(&HashMap::from([(
+            "cidr_block".to_string(),
+            serde_json::json!("10.2.0.0/16"),
+        )])),
         dependency_bindings: BTreeSet::new(),
     });
     state
@@ -379,7 +417,10 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
         key: DeposedKey::new_unique(),
         identifier: "vpc-old".to_string(),
         provider_instance: Some("west".to_string()),
-        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
+        attributes: persisted_attributes_from_state_json(&HashMap::from([(
+            "cidr_block".to_string(),
+            serde_json::json!("10.0.0.0/16"),
+        )])),
         dependency_bindings: BTreeSet::from(["network".to_string()]),
     });
     state
@@ -455,8 +496,8 @@ fn test_resource_state_managed_state_bucket_shape() {
     );
     assert!(resource.protected);
     assert_eq!(
-        resource.attributes.get("bucket"),
-        Some(&serde_json::json!("my-state-bucket"))
+        persisted_json_attribute(&resource.attributes, "bucket"),
+        Some(serde_json::json!("my-state-bucket"))
     );
 }
 
@@ -833,8 +874,8 @@ fn test_from_provider_state() {
 
     assert_eq!(rs.identifier, Some("my-bucket-abcd1234".to_string()));
     assert_eq!(
-        rs.attributes.get("region"),
-        Some(&serde_json::json!("ap-northeast-1"))
+        persisted_json_attribute(&rs.attributes, "region"),
+        Some(serde_json::json!("ap-northeast-1"))
     );
     assert!(rs.protected);
     assert!(rs.directives.force_delete);
@@ -928,7 +969,9 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     )
     .unwrap();
 
-    let stored_rules = row.attributes["rules"].as_array().expect("stored rules");
+    let stored_rules_json =
+        persisted_json_attribute(&row.attributes, "rules").expect("stored rules attribute");
+    let stored_rules = stored_rules_json.as_array().expect("stored rules");
     assert_eq!(stored_rules.len(), 3);
     assert_eq!(stored_rules[0]["port"], 443);
     assert_eq!(stored_rules[1]["port"], 22);
@@ -1569,6 +1612,118 @@ fn test_build_state_for_resource_existing() {
         Some(&Value::Concrete(ConcreteValue::String(
             "ap-northeast-1".into()
         )))
+    );
+}
+
+#[test]
+fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
+    use carina_core::resource::{DeferredValue, Resource, Value};
+
+    let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(
+            ResourceState::new("test.resource", "old", "mock")
+                .with_identifier("mock-id")
+                .with_attribute(
+                    "comment".to_string(),
+                    serde_json::json!(format!("{SECRET_PREFIX}{hash}")),
+                ),
+        )
+        .expect("test state setup must be valid");
+
+    let resource = Resource::with_provider("mock", "test.resource", "old", None);
+    let loaded = state.build_state_for_resource(&resource.id);
+    let saved_attrs = state.build_saved_attrs();
+
+    for loaded in [
+        loaded.attributes.get("comment"),
+        saved_attrs
+            .get(&resource.id)
+            .and_then(|attributes| attributes.get("comment")),
+    ] {
+        match loaded {
+            Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })) => {
+                assert_eq!(loaded.as_str(), hash)
+            }
+            other => panic!("persisted secret hash lost its type at the state boundary: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
+    use carina_core::resource::{DeferredValue, Value};
+
+    let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let marker = serde_json::json!(format!("{SECRET_PREFIX}{hash}"));
+    let row =
+        ResourceState::new("test.resource", "main", "mock").with_attribute("token", marker.clone());
+    let deposed = DeposedInstance {
+        key: DeposedKey::new_unique(),
+        identifier: "old-id".to_string(),
+        provider_instance: None,
+        attributes: persisted_attributes_from_state_json(&HashMap::from([(
+            "token".to_string(),
+            marker,
+        )])),
+        dependency_bindings: BTreeSet::new(),
+    };
+
+    for decoded in [
+        row.persisted_attributes().to_values(),
+        deposed.persisted_attributes().to_values(),
+    ] {
+        assert!(matches!(
+            decoded.get("token"),
+            Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
+                if loaded.as_str() == hash
+        ));
+    }
+}
+
+#[test]
+fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
+    let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let marker = serde_json::json!(format!("{SECRET_PREFIX}{hash}"));
+    let mut row = ResourceState::new("test.resource", "main", "mock")
+        .with_identifier("current-id")
+        .with_attribute("token", marker.clone());
+    row.deposed.push(DeposedInstance {
+        key: DeposedKey::new_unique(),
+        identifier: "old-id".to_string(),
+        provider_instance: None,
+        attributes: persisted_attributes_from_state_json(&HashMap::from([(
+            "token".to_string(),
+            marker,
+        )])),
+        dependency_bindings: BTreeSet::new(),
+    });
+
+    let mut state = StateFile::new();
+    state.lineage = "typed-persisted-attributes".to_string();
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+    let before = serde_json::to_vec(&state).expect("serialize initial state");
+    let reloaded =
+        StateFile::from_json_str(std::str::from_utf8(&before).expect("serialized state is UTF-8"))
+            .expect("reload serialized state");
+
+    let current: &PersistedAttributes = &reloaded.resources()[0].attributes;
+    let deposed: &PersistedAttributes = &reloaded.resources()[0].deposed[0].attributes;
+    assert!(matches!(
+        current.get("token"),
+        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+    ));
+    assert!(matches!(
+        deposed.get("token"),
+        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+    ));
+    assert_eq!(
+        serde_json::to_vec(&reloaded).expect("serialize reloaded state"),
+        before,
+        "changing the in-memory attribute type must not change state-file bytes",
     );
 }
 
@@ -2318,15 +2473,15 @@ fn test_merge_write_only_attributes() {
 
     // The write-only attribute should be persisted in state
     assert_eq!(
-        rs.attributes.get("ipv4_netmask_length"),
-        Some(&serde_json::json!(16))
+        persisted_json_attribute(&rs.attributes, "ipv4_netmask_length"),
+        Some(serde_json::json!(16))
     );
     assert_eq!(rs.write_only_attributes, vec!["ipv4_netmask_length"]);
 
     // The regular attribute should still be there
     assert_eq!(
-        rs.attributes.get("cidr_block"),
-        Some(&serde_json::json!("10.0.0.0/16"))
+        persisted_json_attribute(&rs.attributes, "cidr_block"),
+        Some(serde_json::json!("10.0.0.0/16"))
     );
 }
 
@@ -2413,8 +2568,8 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
 
     // Should keep the API-returned value, not overwrite with desired
     assert_eq!(
-        rs.attributes.get("some_attr"),
-        Some(&serde_json::json!("from-api"))
+        persisted_json_attribute(&rs.attributes, "some_attr"),
+        Some(serde_json::json!("from-api"))
     );
     // Should NOT be recorded as write-only since the API returned it
     assert!(rs.write_only_attributes.is_empty());
@@ -2436,8 +2591,8 @@ fn test_write_only_attributes_serialization() {
         vec!["ipv4_netmask_length"]
     );
     assert_eq!(
-        deserialized.attributes.get("ipv4_netmask_length"),
-        Some(&serde_json::json!(16))
+        persisted_json_attribute(&deserialized.attributes, "ipv4_netmask_length"),
+        Some(serde_json::json!(16))
     );
 }
 
@@ -2493,12 +2648,9 @@ fn test_from_provider_state_secret_stored_as_hash() {
     .unwrap();
 
     // State should store the hash, not the plain password
-    let stored = rs
-        .attributes
-        .get("master_password")
-        .unwrap()
-        .as_str()
-        .unwrap();
+    let stored_json = persisted_json_attribute(&rs.attributes, "master_password")
+        .expect("master_password should be stored");
+    let stored = stored_json.as_str().unwrap();
     assert!(
         stored.starts_with(SECRET_PREFIX),
         "Expected secret hash, got: {}",
@@ -2520,7 +2672,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}previous")),
+            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -2544,10 +2696,10 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         None,
     )
     .expect("provider state should serialize");
-    let stored = rs
-        .attributes
-        .get("password")
-        .and_then(|value| value.as_str())
+    let stored_json =
+        persisted_json_attribute(&rs.attributes, "password").expect("password should be stored");
+    let stored = stored_json
+        .as_str()
         .expect("password should remain a stored secret hash");
 
     assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
@@ -2564,10 +2716,10 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         "password".to_string(),
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     )]);
-    let existing = HashMap::from([(
+    let existing = persisted_attributes_from_state_json(&HashMap::from([(
         "password".to_string(),
-        serde_json::json!(format!("{SECRET_PREFIX}previous")),
-    )]);
+        serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+    )]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
@@ -2575,6 +2727,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
+    let stored = state_json_from_persisted_attributes(&stored);
     let password = stored
         .get("password")
         .and_then(|value| value.as_str())
@@ -2590,14 +2743,17 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let previous = serde_json::json!(format!("{SECRET_PREFIX}previous"));
+    let previous = serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32)));
     let attrs = HashMap::from([(
         "password".to_string(),
         Value::Concrete(ConcreteValue::String(
             previous.as_str().unwrap().to_string().into(),
         )),
     )]);
-    let existing = HashMap::from([("password".to_string(), previous.clone())]);
+    let existing = persisted_attributes_from_state_json(&HashMap::from([(
+        "password".to_string(),
+        previous.clone(),
+    )]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
@@ -2606,6 +2762,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
 
+    let stored = state_json_from_persisted_attributes(&stored);
     assert_eq!(stored.get("password"), Some(&previous));
 }
 
@@ -2622,7 +2779,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}previous")),
+            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -2648,8 +2805,8 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     .expect("provider state should serialize");
 
     assert_eq!(
-        rs.attributes.get("password"),
-        Some(&serde_json::json!("plain-secret"))
+        persisted_json_attribute(&rs.attributes, "password"),
+        Some(serde_json::json!("plain-secret"))
     );
 }
 
@@ -2666,7 +2823,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}previous")),
+            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -2688,8 +2845,8 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     rs.merge_write_only_attributes(&resource, &["password".to_string()]);
 
     assert_eq!(
-        rs.attributes.get("password"),
-        Some(&serde_json::json!("plain-secret"))
+        persisted_json_attribute(&rs.attributes, "password"),
+        Some(serde_json::json!("plain-secret"))
     );
     assert_eq!(rs.write_only_attributes, vec!["password"]);
 }
@@ -2703,7 +2860,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{SECRET_PREFIX}previous"),
+        "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
     });
     let mut provider_tags = IndexMap::new();
     provider_tags.insert(
@@ -2718,7 +2875,10 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(provider_tags)),
     )]);
-    let existing = HashMap::from([("tags".to_string(), previous_tags.clone())]);
+    let existing = persisted_attributes_from_state_json(&HashMap::from([(
+        "tags".to_string(),
+        previous_tags.clone(),
+    )]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
@@ -2726,7 +2886,8 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
-    let stored_tags = stored
+    let stored_json = state_json_from_persisted_attributes(&stored);
+    let stored_tags = stored_json
         .get("tags")
         .and_then(|value| value.as_object())
         .expect("tags should remain a map");
@@ -2742,7 +2903,10 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
     assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
     assert!(!secret.contains("plain-secret"));
 
-    let second_existing = HashMap::from([("tags".to_string(), stored["tags"].clone())]);
+    let second_existing = persisted_attributes_from_state_json(&HashMap::from([(
+        "tags".to_string(),
+        stored_json["tags"].clone(),
+    )]));
     let stored_again = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
         None,
@@ -2761,13 +2925,14 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{SECRET_PREFIX}previous"),
+        "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
     });
     let attrs = HashMap::from([(
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::new())),
     )]);
-    let existing = HashMap::from([("tags".to_string(), previous_tags)]);
+    let existing =
+        persisted_attributes_from_state_json(&HashMap::from([("tags".to_string(), previous_tags)]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
@@ -2775,6 +2940,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
+    let stored = state_json_from_persisted_attributes(&stored);
     let stored_tags = stored
         .get("tags")
         .and_then(|value| value.as_object())
@@ -2798,7 +2964,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
     let previous_items = serde_json::json!([
         {
             "Name": "one",
-            "Token": format!("{SECRET_PREFIX}previous"),
+            "Token": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
         },
         {
             "Name": "two",
@@ -2830,7 +2996,10 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
             Value::Concrete(ConcreteValue::Map(second_provider_item)),
         ])),
     )]);
-    let existing = HashMap::from([("items".to_string(), previous_items)]);
+    let existing = persisted_attributes_from_state_json(&HashMap::from([(
+        "items".to_string(),
+        previous_items,
+    )]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
@@ -2838,6 +3007,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
+    let stored = state_json_from_persisted_attributes(&stored);
     let stored_items = stored
         .get("items")
         .and_then(|value| value.as_str())
@@ -2908,7 +3078,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     .unwrap();
 
     // The tags map in state should have the hash for SecretTag
-    let tags_json = rs.attributes.get("tags").unwrap();
+    let tags_json = persisted_json_attribute(&rs.attributes, "tags").unwrap();
     let tags_obj = tags_json.as_object().unwrap();
 
     // Name should be plain
@@ -2986,7 +3156,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     )
     .unwrap();
 
-    let tags_json = rs.attributes.get("tags").unwrap();
+    let tags_json = persisted_json_attribute(&rs.attributes, "tags").unwrap();
     let tags_obj = tags_json.as_object().unwrap();
 
     // Provider-only keys should be preserved from the provider state
@@ -3053,7 +3223,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     )
     .unwrap();
 
-    let values_json = rs.attributes.get("values").unwrap();
+    let values_json = persisted_json_attribute(&rs.attributes, "values").unwrap();
     let values_arr = values_json.as_array().unwrap();
 
     // First item should be plain
@@ -3101,10 +3271,10 @@ fn build_remote_bindings_ignores_resource_bindings() {
             identity: ResourceIdentity::from("vpc_123"),
             provider: "awscc".to_string(),
             identifier: Some("vpc-123".to_string()),
-            attributes: HashMap::from([(
+            attributes: persisted_attributes_from_state_json(&HashMap::from([(
                 "vpc_id".to_string(),
                 serde_json::Value::String("vpc-123".to_string()),
-            )]),
+            )])),
             deposed: Vec::new(),
             protected: false,
             directives: carina_core::resource::Directives::default(),
@@ -3547,9 +3717,9 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         None,
     )
     .unwrap();
-    let stored = second_row.attributes["rules"]
-        .as_array()
-        .expect("stored reordered rules");
+    let stored_json = persisted_json_attribute(&second_row.attributes, "rules")
+        .expect("stored reordered rules attribute");
+    let stored = stored_json.as_array().expect("stored reordered rules");
     assert_eq!(stored[0]["port"], 443);
     assert_eq!(stored[1]["port"], 80);
     let ExplicitFields::Struct { children } = &second_row.explicit else {

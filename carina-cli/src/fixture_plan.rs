@@ -560,6 +560,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             compositions: &parsed.compositions,
             data_sources: &data_sources_for_plan,
             current_states: &current_states,
+            state_file: state_file.as_ref(),
+            moved_origins: &moved_origins,
             schemas: wiring.schemas(),
             wait_aliases: &export_wait_aliases,
             provider_context: &provider_context,
@@ -981,6 +983,6 @@ pub fn delete_instance_attributes_from_plan(
     plan: &Plan,
     current_states: &HashMap<ResourceId, State>,
     state_file: Option<&StateFile>,
-) -> HashMap<carina_core::effect::DeletedInstanceKey, HashMap<String, Value>> {
-    crate::commands::plan::collect_delete_attributes(plan, current_states, state_file)
+) -> carina_core::detail_rows::HistoricalDisplayAttributes {
+    crate::commands::plan::collect_historical_display_attributes(plan, current_states, state_file)
 }

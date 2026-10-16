@@ -4458,12 +4458,15 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
         .as_str()
         .expect("secret hash must serialize to a string")
         .to_string();
+    let hash = crate::value::persisted_secret_hash(&hash_str)
+        .expect("state hash must use the persisted marker format");
+    let persisted_secret: Value = serde_json::from_value(serde_json::json!({
+        "RedactedSecret": { "hash": hash }
+    }))
+    .expect("deserialize persisted secret");
 
     let mut from_attrs = HashMap::new();
-    from_attrs.insert(
-        "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str.into())),
-    );
+    from_attrs.insert("master_password".to_string(), persisted_secret);
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
     let mut plan = Plan::new();

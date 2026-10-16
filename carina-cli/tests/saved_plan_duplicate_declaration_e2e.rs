@@ -67,7 +67,7 @@ fn assert_success(label: &str, output: &Output) {
 }
 
 #[test]
-fn saved_plan_apply_rejects_module_duplicate_added_after_plan() {
+fn placeholder_free_saved_plan_ignores_module_duplicate_added_after_plan() {
     let scenario = Scenario::new();
     scenario.save_plan();
     fs::write(
@@ -77,18 +77,9 @@ fn saved_plan_apply_rejects_module_duplicate_added_after_plan() {
     .expect("write duplicate module declaration");
 
     let output = scenario.apply_plan();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !output.status.success(),
-        "saved-plan apply must reject module duplicates\nstdout:\n{}\nstderr:\n{stderr}",
-        String::from_utf8_lossy(&output.stdout),
-    );
-    assert!(
-        stderr.contains("module: duplicate module attribute 'value'")
-            && stderr.contains("duplicate.crn")
-            && stderr.contains("main.crn"),
-        "saved-plan error must retain module and sibling-file provenance: {stderr}",
+    assert_success(
+        "placeholder-free saved-plan apply after unrelated module error",
+        &output,
     );
 }
 

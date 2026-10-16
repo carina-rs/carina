@@ -1266,10 +1266,11 @@ pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
 /// `(known after upstream apply: …)` rather than being silently
 /// substituted to empty — see carina#3329.
 pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<&str, String> {
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ConcreteValue, DeferredValue, Value};
     match identifier {
         Value::Concrete(ConcreteValue::String(s)) => Ok(s.expose_plaintext()),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
+        Value::Deferred(DeferredValue::Secret(inner)) => resolve_import_identifier(inner),
         other => Err(format!(
             "import identifier did not resolve to a concrete string at apply time \
              (got {}). A referenced upstream value has not been published yet — \
@@ -1474,9 +1475,11 @@ mod tests {
 
     #[test]
     fn resolve_import_identifier_accepts_concrete_string() {
-        use crate::resource::{ConcreteValue, Value};
+        use crate::resource::{ConcreteValue, DeferredValue, Value};
         let v = Value::Concrete(ConcreteValue::String("vpc-0abc".into()));
         assert_eq!(resolve_import_identifier(&v).unwrap(), "vpc-0abc");
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(v)));
+        assert_eq!(resolve_import_identifier(&secret).unwrap(), "vpc-0abc");
     }
 
     #[test]

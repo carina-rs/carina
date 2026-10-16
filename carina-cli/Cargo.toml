@@ -47,6 +47,7 @@ tokio-util = "0.7"
 [dev-dependencies]
 async-trait = "0.1"
 carina-core = { path = "../carina-core", features = ["test-shutdown"] }
+carina-state = { path = "../carina-state", features = ["test-utils"] }
 carina-lsp = { path = "../carina-lsp" }
 insta = "1"
 tokio = { version = "1", features = ["test-util"] }

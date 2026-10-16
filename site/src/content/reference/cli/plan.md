@@ -32,6 +32,18 @@ Display the plan in an interactive TUI (terminal user interface) mode. Allows na
 
 Save the plan to a JSON file for later use with `carina apply`. The saved plan includes the effects, resource definitions, provider configurations, and state metadata for drift detection.
 
+Saved plans never contain secret plaintext. Carina stores each secret as a
+typed placeholder containing only an Argon2id hash, including secrets nested
+inside lists or maps and values derived from `decrypt()` or other expressions.
+Each hash is scoped to a stable typed position. Resource attributes use the
+same resource identity and top-level attribute context as state; provider
+configuration and deferred templates use separate position namespaces. Equal
+secrets at different positions therefore do not produce equal plan hashes. The
+placeholder is not a provider value and cannot be applied directly. Backend
+attributes cannot be secret-derived because backend implementations accept only
+ordinary configuration values; validation rejects `secret()` and `decrypt()`
+results there.
+
 ```bash
 carina plan --out plan.json
 carina apply plan.json

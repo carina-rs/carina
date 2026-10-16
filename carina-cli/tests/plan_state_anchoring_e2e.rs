@@ -34,6 +34,7 @@ fn local_backend_lock(path: &str) -> BackendLock {
     let config = carina_core::parser::BackendConfig {
         backend_type: "local".to_string(),
         attributes,
+        attribute_spans: Default::default(),
     };
     BackendLock::for_config(Some(&config)).unwrap()
 }

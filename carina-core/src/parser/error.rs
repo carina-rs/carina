@@ -16,6 +16,17 @@ pub enum ParseError {
     InvalidExpression { line: usize, message: String },
 
     #[error(
+        "Invalid expression at line {line}: backend {backend_type} attribute '{attribute}' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed"
+    )]
+    SecretDerivedBackendAttribute {
+        backend_type: String,
+        attribute: String,
+        line: usize,
+        start_column: usize,
+        end_column: usize,
+    },
+
+    #[error(
         "Invalid expression at line {line}: interpolation is not allowed in this string literal"
     )]
     InterpolationNotAllowedInLiteralString { line: usize },

@@ -1225,10 +1225,9 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         (distribution_id.clone(), distribution_state),
         (web_acl_id.clone(), web_acl_state),
     ]);
-    let saved_attrs = crate::provider::RawSavedAttrs::from_persisted(HashMap::from([(
-        distribution_id.clone(),
-        distribution_attrs,
-    )]))
+    let saved_attrs = crate::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from(
+        [(distribution_id.clone(), distribution_attrs)],
+    ))
     .lift(&SchemaRegistry::new());
     let prev_explicit = HashMap::from([(
         distribution_id,

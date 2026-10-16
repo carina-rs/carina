@@ -1772,6 +1772,7 @@ fn backend_in_module_with_arguments_errors() {
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
         attributes: HashMap::new(),
+        attribute_spans: HashMap::new(),
     });
 
     let result = validate_no_backend_in_module(&parsed);
@@ -1795,6 +1796,7 @@ fn backend_in_module_with_attributes_errors() {
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
         attributes: HashMap::new(),
+        attribute_spans: HashMap::new(),
     });
 
     let result = validate_no_backend_in_module(&parsed);
@@ -1808,6 +1810,7 @@ fn backend_without_module_markers_ok() {
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
         attributes: HashMap::new(),
+        attribute_spans: HashMap::new(),
     });
 
     let result = validate_no_backend_in_module(&parsed);
@@ -1960,6 +1963,7 @@ fn arguments_with_backend_errors() {
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
         attributes: HashMap::new(),
+        attribute_spans: HashMap::new(),
     });
 
     let result = validate_no_arguments_in_root(&parsed);

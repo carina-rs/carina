@@ -4,7 +4,8 @@ use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
-use carina_core::provider::RawSavedAttrs;
+pub use carina_core::provider::PreviousSecretHashAuthority;
+use carina_core::provider::{PersistedAttributes, RawSavedAttrs};
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
@@ -12,8 +13,8 @@ use carina_core::resource::{
 };
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{
-    SECRET_PREFIX, SecretHashContext, contains_secret, json_to_dsl_value,
-    merge_secrets_into_provider_json, value_to_json, value_to_json_with_context,
+    SecretHashContext, contains_unredacted_secret, json_to_dsl_value, persisted_secret_marker,
+    value_to_json, value_to_json_with_context,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -269,6 +270,14 @@ impl StateFile {
         })
     }
 
+    /// Find the persisted row addressed by a full resource ID, including its
+    /// provider-instance routing dimension.
+    pub fn find_resource_for_id(&self, id: &ResourceId) -> Option<&ResourceState> {
+        let identity = id.identity_str()?;
+        self.find_resource(&id.provider, &id.resource_type, identity)
+            .filter(|row| row.directives.provider_instance == id.provider_instance)
+    }
+
     /// Find all resources matching a provider and resource type
     pub fn resources_by_type(&self, provider: &str, resource_type: &str) -> Vec<&ResourceState> {
         self.resources
@@ -455,12 +464,7 @@ impl StateFile {
         let mut result = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            let attrs: HashMap<String, Value> = rs
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-                .collect();
-            result.insert(id, attrs);
+            result.insert(id, rs.persisted_attributes().clone());
         }
         RawSavedAttrs::from_persisted(result)
     }
@@ -513,12 +517,7 @@ impl StateFile {
             .identity_str()
             .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity));
         if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
-            let attrs: HashMap<String, Value> = rs
-                .unwrap()
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-                .collect();
+            let attrs = rs.unwrap().persisted_attributes().to_values();
             return State {
                 id: id.clone(),
                 identifier: Some(identifier.to_string()),
@@ -546,11 +545,7 @@ impl StateFile {
             }
             // Only include resources that actually have an identifier (i.e. exist in infra)
             if let Some(ref identifier) = rs.identifier {
-                let mut attrs: HashMap<String, Value> = rs
-                    .attributes
-                    .iter()
-                    .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-                    .collect();
+                let mut attrs = rs.persisted_attributes().to_values();
                 // Inject _binding so orphan Delete effects can have tree structure
                 if let Some(ref binding) = rs.binding {
                     attrs.insert(
@@ -1084,6 +1079,17 @@ pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<MigratedStateFile, Backen
 }
 
 /// Pre-replacement instance that still needs a successful Delete.
+///
+/// Persisted attributes cannot be read as ordinary JSON values. Callers must
+/// use [`DeposedInstance::persisted_attributes`] so secret markers retain
+/// their typed meaning.
+///
+/// ```compile_fail
+/// use carina_state::state::DeposedInstance;
+///
+/// let instance: Option<DeposedInstance> = None;
+/// let _raw = &instance.unwrap().attributes;
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeposedInstance {
     /// System-assigned unique key for this generation.
@@ -1094,12 +1100,70 @@ pub struct DeposedInstance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
     /// Last known attributes of the old instance.
-    pub attributes: HashMap<String, serde_json::Value>,
+    attributes: PersistedAttributes,
     /// Binding dependencies inherited from the old row.
     pub dependency_bindings: BTreeSet<String>,
 }
 
-/// State of a single managed resource
+impl DeposedInstance {
+    /// Construct a deposed generation from the opaque output of the state
+    /// writeback encoder.
+    pub fn from_persisted_attributes(
+        key: DeposedKey,
+        identifier: String,
+        provider_instance: Option<String>,
+        attributes: PersistedAttributes,
+        dependency_bindings: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            key,
+            identifier,
+            provider_instance,
+            attributes,
+            dependency_bindings,
+        }
+    }
+
+    /// Construct a deposed generation from raw state JSON in tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn from_persisted_json(
+        key: DeposedKey,
+        identifier: String,
+        provider_instance: Option<String>,
+        attributes: HashMap<String, serde_json::Value>,
+        dependency_bindings: BTreeSet<String>,
+    ) -> Self {
+        Self::from_persisted_attributes(
+            key,
+            identifier,
+            provider_instance,
+            serde_json::from_value(
+                serde_json::to_value(attributes).expect("test state JSON is serializable"),
+            )
+            .expect("test state attributes use the persisted JSON shape"),
+            dependency_bindings,
+        )
+    }
+
+    /// Borrow this generation's attributes through the persisted decode seam.
+    pub fn persisted_attributes(&self) -> &PersistedAttributes {
+        &self.attributes
+    }
+}
+
+/// State of a single managed resource.
+///
+/// Persisted attributes cannot be read as ordinary JSON values. Callers must
+/// use [`ResourceState::persisted_attributes`] so secret markers retain their
+/// typed meaning.
+///
+/// ```compile_fail
+/// use carina_state::state::ResourceState;
+///
+/// let state = ResourceState::new("mock.test.resource", "example", "mock");
+/// let _raw = &state.attributes;
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceState {
     /// Resource type (e.g., "s3.Bucket", "ec2.Vpc")
@@ -1113,8 +1177,8 @@ pub struct ResourceState {
     /// If None, the resource is considered not to exist
     #[serde(default)]
     pub identifier: Option<String>,
-    /// All attributes of the resource as JSON values
-    pub attributes: HashMap<String, serde_json::Value>,
+    /// Attributes in their state-file JSON representation.
+    attributes: PersistedAttributes,
     /// Old replacement generations that still need a successful Delete.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deposed: Vec<DeposedInstance>,
@@ -1167,42 +1231,96 @@ pub struct ResourceState {
     pub partial_read: Option<PartialReadMarker>,
 }
 
-/// Caller intent for treating already-persisted secret hashes as masking
-/// authority when provider reads return plaintext.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviousSecretHashAuthority<'a> {
-    None,
-    /// The prior generation is the authority for every key that already
-    /// contains a stored secret hash. Used for deposed generations and
-    /// replacement snapshots whose old instance state is no longer described
-    /// by the desired resource.
-    AllPreviouslyHashedKeys(&'a HashMap<String, serde_json::Value>),
-    /// The desired resource is authoritative for explicitly-authored keys.
-    /// Previously stored hashes only protect keys now absent from desired
-    /// state, preserving orphan recovery without blocking secret->plain
-    /// demotion.
-    OnlyKeysAbsentFromDesired(&'a HashMap<String, serde_json::Value>),
-}
-
-impl<'a> PreviousSecretHashAuthority<'a> {
-    fn protects_key(self, resource: &Resource, key: &str) -> bool {
-        match self {
-            Self::None => false,
-            Self::AllPreviouslyHashedKeys(_) => true,
-            Self::OnlyKeysAbsentFromDesired(_) => !resource.attributes.contains_key(key),
-        }
-    }
-
-    fn attributes(self) -> Option<&'a HashMap<String, serde_json::Value>> {
-        match self {
-            Self::None => None,
-            Self::AllPreviouslyHashedKeys(attributes)
-            | Self::OnlyKeysAbsentFromDesired(attributes) => Some(attributes),
-        }
-    }
-}
-
 impl ResourceState {
+    /// Borrow this row's attributes through the persisted decode seam.
+    pub fn persisted_attributes(&self) -> &PersistedAttributes {
+        &self.attributes
+    }
+
+    /// Set one raw persisted attribute in tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_persisted_attribute(&mut self, key: impl Into<String>, value: serde_json::Value) {
+        let mut encoded = serde_json::to_value(&self.attributes)
+            .expect("test persisted attributes are serializable");
+        encoded
+            .as_object_mut()
+            .expect("persisted attributes serialize as an object")
+            .insert(key.into(), value);
+        self.attributes = serde_json::from_value(encoded)
+            .expect("test state attributes use the persisted JSON shape");
+    }
+
+    /// Render the sorted attribute map for `carina state show` without
+    /// exposing the encoded values to value-layer callers.
+    pub fn format_attributes_for_state_show(&self) -> String {
+        let sorted: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_value(
+            serde_json::to_value(&self.attributes).expect("persisted attributes are serializable"),
+        )
+        .expect("persisted attributes serialize as an object");
+        serde_json::to_string_pretty(&sorted).expect("state JSON values are serializable")
+    }
+
+    /// Render one stored attribute for `carina state show`.
+    pub fn format_attribute_for_state_show(&self, key: &str, json_output: bool) -> Option<String> {
+        let attributes =
+            serde_json::to_value(&self.attributes).expect("persisted attributes are serializable");
+        attributes.as_object()?.get(key).map(|value| {
+            if json_output {
+                serde_json::to_string_pretty(value).expect("state JSON values are serializable")
+            } else {
+                match value {
+                    serde_json::Value::String(value) => value.clone(),
+                    serde_json::Value::Bool(value) => value.to_string(),
+                    serde_json::Value::Number(value) => value.to_string(),
+                    serde_json::Value::Null => "null".to_string(),
+                    other => serde_json::to_string_pretty(other)
+                        .expect("state JSON values are serializable"),
+                }
+            }
+        })
+    }
+
+    /// Render current and deposed generations for `carina state show`.
+    pub fn format_generations_for_state_show(&self) -> String {
+        fn sorted_attributes(attributes: &PersistedAttributes) -> serde_json::Value {
+            let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                serde_json::from_value(
+                    serde_json::to_value(attributes)
+                        .expect("persisted attributes are serializable"),
+                )
+                .expect("persisted attributes serialize as an object");
+            serde_json::to_value(sorted).expect("state JSON values are serializable")
+        }
+
+        let current = if self.identifier.is_none() && self.attributes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({
+                "identifier": self.identifier.as_ref(),
+                "attributes": sorted_attributes(&self.attributes),
+            })
+        };
+        let deposed: Vec<_> = self
+            .deposed
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "key": entry.key.as_str(),
+                    "identifier": entry.identifier,
+                    "marker": format!("(deposed {} {})", entry.key.as_str(), entry.identifier),
+                    "provider_instance": entry.provider_instance,
+                    "attributes": sorted_attributes(&entry.attributes),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "current": current,
+            "deposed": deposed,
+        }))
+        .expect("state JSON values are serializable")
+    }
+
     /// Create a new resource state
     pub fn new(
         resource_type: impl Into<String>,
@@ -1214,7 +1332,7 @@ impl ResourceState {
             identity: identity.into(),
             provider: provider.into(),
             identifier: None,
-            attributes: HashMap::new(),
+            attributes: PersistedAttributes::default(),
             deposed: Vec::new(),
             protected: false,
             directives: Directives::default(),
@@ -1234,19 +1352,28 @@ impl ResourceState {
         self
     }
 
-    /// Set an attribute value
+    /// Set a raw persisted attribute in tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn with_attribute(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        self.attributes.insert(key.into(), value);
+        self.set_persisted_attribute(key, value);
         self
     }
 
     /// Populate attributes from a provider-returned State
     pub fn with_attributes_from_state(mut self, state: &State) -> Self {
+        let mut attributes =
+            serde_json::to_value(&self.attributes).expect("persisted attributes are serializable");
+        let encoded = attributes
+            .as_object_mut()
+            .expect("persisted attributes serialize as an object");
         for (key, value) in &state.attributes {
             if let Ok(json_value) = value_to_json(value) {
-                self.attributes.insert(key.clone(), json_value);
+                encoded.insert(key.clone(), json_value);
             }
         }
+        self.attributes = serde_json::from_value(attributes)
+            .expect("provider state attributes use the persisted JSON shape");
         if let Some(identifier) = &state.identifier {
             self.identifier = Some(identifier.clone());
         }
@@ -1282,10 +1409,12 @@ impl ResourceState {
         bucket_name: impl Into<String>,
     ) -> Self {
         let bucket_name = bucket_name.into();
-        Self::new(resource_type, resource_identity, provider)
+        let mut state = Self::new(resource_type, resource_identity, provider)
             .with_identifier(&bucket_name)
-            .with_attribute("bucket", serde_json::json!(bucket_name))
-            .with_protected(true)
+            .with_protected(true);
+        state.attributes = serde_json::from_value(serde_json::json!({ "bucket": bucket_name }))
+            .expect("managed state bucket attributes use the persisted JSON shape");
+        state
     }
 
     /// Merge write-only attribute values from the desired resource into this state.
@@ -1299,17 +1428,24 @@ impl ResourceState {
     /// in the resource schema.
     pub fn merge_write_only_attributes(&mut self, resource: &Resource, write_only_keys: &[String]) {
         let mut merged = Vec::new();
+        let mut attributes =
+            serde_json::to_value(&self.attributes).expect("persisted attributes are serializable");
+        let encoded = attributes
+            .as_object_mut()
+            .expect("persisted attributes serialize as an object");
         for key in write_only_keys {
             // Only merge if the user specified this attribute and it's not already
             // in the provider-returned state
             if let Some(value) = resource.attributes.get(key)
-                && !self.attributes.contains_key(key)
+                && !encoded.contains_key(key)
                 && let Ok(json_value) = value_to_json(value)
             {
-                self.attributes.insert(key.clone(), json_value);
+                encoded.insert(key.clone(), json_value);
                 merged.push(key.clone());
             }
         }
+        self.attributes = serde_json::from_value(attributes)
+            .expect("write-only state attributes use the persisted JSON shape");
         merged.sort();
         self.write_only_attributes = merged;
     }
@@ -1320,33 +1456,41 @@ impl ResourceState {
         key: &str,
         value: &Value,
     ) -> Result<serde_json::Value, String> {
-        if contains_secret(value) {
-            let ctx = SecretHashContext::new(resource_display_type, identity, key);
-            value_to_json_with_context(value, Some(&ctx)).map_err(|e| e.to_string())
-        } else {
-            value_to_json(value).map_err(|e| e.to_string())
-        }
+        let ctx = SecretHashContext::new(resource_display_type, identity, key);
+        Self::provider_state_value_to_json(value, &ctx).map_err(|e| e.to_string())
     }
 
-    /// Serialize best-effort provider attributes into the state-file JSON shape.
-    ///
-    /// Secret values use the same context-aware hashing as
-    /// `from_provider_state_for_resource_and_schema`.
-    /// Attributes that cannot be represented in state, such as unresolved
-    /// `Unknown` placeholders, are skipped instead of aborting state writeback.
-    fn attributes_to_state_json_lossy(
-        resource_display_type: &str,
-        identity: &str,
-        attributes: &HashMap<String, Value>,
-    ) -> HashMap<String, serde_json::Value> {
-        attributes
-            .iter()
-            .filter_map(|(key, value)| {
-                Self::attribute_to_state_json(resource_display_type, identity, key, value)
-                    .ok()
-                    .map(|json| (key.clone(), json))
-            })
-            .collect()
+    /// Encode values returned by a provider for persisted state. Opaque hash
+    /// values may legitimately be echoed by legacy providers and must retain
+    /// their exact marker bytes; live `Secret` values are hashed with the
+    /// resource context. Desired-side JSON conversion remains strict and
+    /// rejects `RedactedSecret`.
+    fn provider_state_value_to_json(
+        value: &Value,
+        context: &SecretHashContext,
+    ) -> Result<serde_json::Value, carina_core::value::SerializationError> {
+        match value {
+            Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
+                Ok(serde_json::Value::String(persisted_secret_marker(hash)))
+            }
+            Value::Concrete(ConcreteValue::List(values)) => values
+                .iter()
+                .map(|value| Self::provider_state_value_to_json(value, context))
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_json::Value::Array),
+            Value::Concrete(ConcreteValue::Map(values)) => values
+                .iter()
+                .map(|(key, value)| {
+                    Self::provider_state_value_to_json(value, context)
+                        .map(|value| (key.clone(), value))
+                })
+                .collect::<Result<serde_json::Map<_, _>, _>>()
+                .map(serde_json::Value::Object),
+            _ if contains_unredacted_secret(value) => {
+                value_to_json_with_context(value, Some(context))
+            }
+            _ => value_to_json(value),
+        }
     }
 
     /// Serialize provider attributes with desired-resource and schema-derived
@@ -1361,119 +1505,24 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         attributes: &HashMap<String, Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> HashMap<String, serde_json::Value> {
-        let resource_display_type = resource.id.display_type();
-        let identity = resource.identity_str();
-        let serialized =
-            Self::attributes_to_state_json_lossy(&resource_display_type, identity, attributes);
-        Self::protect_state_json_for_resource_and_schema(
+    ) -> PersistedAttributes {
+        PersistedAttributes::encode_values_for_resource_and_schema(
             resource,
             schema,
-            serialized,
+            attributes,
             previous_hash_authority,
         )
     }
 
     /// Apply desired-resource and schema-derived secret protection to an
-    /// already serialized state attribute map.
-    pub fn protect_state_json_for_resource_and_schema(
+    /// opaque persisted attribute map.
+    pub fn protect_persisted_attributes_for_resource_and_schema(
         resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
-        serialized: HashMap<String, serde_json::Value>,
+        serialized: PersistedAttributes,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> HashMap<String, serde_json::Value> {
-        let mut serialized = serialized;
-        let resource_display_type = resource.id.display_type();
-        let identity = resource.identity_str();
-        let mut protected_secret_keys = std::collections::HashSet::new();
-
-        for (key, desired_value) in &resource.attributes {
-            if !contains_secret(desired_value) {
-                continue;
-            }
-
-            let ctx = SecretHashContext::new(&resource_display_type, identity, key);
-            let masked = if let Some(provider_json) = serialized.get(key).cloned() {
-                merge_secrets_into_provider_json(desired_value, &provider_json, Some(&ctx))
-            } else {
-                value_to_json_with_context(desired_value, Some(&ctx))
-            };
-
-            if let Ok(masked) = masked {
-                serialized.insert(key.clone(), masked);
-                protected_secret_keys.insert(key.clone());
-            } else {
-                serialized.remove(key);
-            }
-        }
-
-        Self::protect_previously_hashed_secrets(
-            &resource_display_type,
-            identity,
-            resource,
-            previous_hash_authority,
-            &mut serialized,
-            &mut protected_secret_keys,
-        );
-
-        if let Some(schema) = schema {
-            for (key, attr) in &schema.attributes {
-                if attr.write_only && !protected_secret_keys.contains(key) {
-                    serialized.remove(key);
-                }
-            }
-        }
-
-        serialized
-    }
-
-    fn protect_previously_hashed_secrets(
-        resource_display_type: &str,
-        identity: &str,
-        resource: &Resource,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
-        serialized: &mut HashMap<String, serde_json::Value>,
-        protected_secret_keys: &mut std::collections::HashSet<String>,
-    ) {
-        let Some(existing_attributes) = previous_hash_authority.attributes() else {
-            return;
-        };
-
-        for (key, previous_value) in existing_attributes {
-            if protected_secret_keys.contains(key)
-                || !previous_hash_authority.protects_key(resource, key)
-            {
-                continue;
-            }
-            let secret_shape = secret_hash_shape(previous_value);
-            if secret_shape == SecretHashShape::None {
-                continue;
-            }
-
-            let ctx = SecretHashContext::new(resource_display_type, identity, key);
-            let masked = match (secret_shape, serialized.get(key)) {
-                (SecretHashShape::TopLevel, Some(provider_json))
-                    if secret_hash_shape(provider_json) == SecretHashShape::TopLevel =>
-                {
-                    provider_json.clone()
-                }
-                (SecretHashShape::TopLevel, Some(provider_json)) => {
-                    hash_provider_json_as_secret(provider_json, &ctx)
-                        .unwrap_or_else(|_| previous_value.clone())
-                }
-                (SecretHashShape::TopLevel, None) => previous_value.clone(),
-                (SecretHashShape::Nested, provider_json) => {
-                    merge_previous_secret_hashes_into_provider_json(
-                        previous_value,
-                        provider_json,
-                        &ctx,
-                    )
-                }
-                (SecretHashShape::None, _) => unreachable!("None shape is filtered above"),
-            };
-            serialized.insert(key.clone(), masked);
-            protected_secret_keys.insert(key.clone());
-        }
+    ) -> PersistedAttributes {
+        serialized.protect_for_resource_and_schema(resource, schema, previous_hash_authority)
     }
 
     /// Build a `ResourceState` from a desired resource, provider-returned
@@ -1503,56 +1552,26 @@ impl ResourceState {
         rs.partial_read = state.partial_read.clone();
         let resource_display_type = resource.id.display_type();
         let identity = resource.identity_str();
+        let mut serialized = serde_json::Map::new();
         for (k, v) in &state.attributes {
-            rs.attributes.insert(
+            serialized.insert(
                 k.clone(),
                 Self::attribute_to_state_json(&resource_display_type, identity, k, v)?,
             );
         }
-        // For secret attributes, override the provider-returned plain value
-        // with the Argon2id hash. The provider returns the actual value (since
-        // secrets are unwrapped before sending), but state should only store
-        // the hash to avoid persisting sensitive data.
-        // For nested secrets (inside Maps/Lists), merge the hashed values into
-        // the provider-returned structure to preserve extra keys from the provider.
-        let mut protected_secret_keys = std::collections::HashSet::new();
-        for (k, v) in &resource.attributes {
-            if contains_secret(v) {
-                let ctx = SecretHashContext::new(&resource_display_type, identity, k);
-                if let Some(provider_json) = rs.attributes.get(k).cloned() {
-                    rs.attributes.insert(
-                        k.clone(),
-                        merge_secrets_into_provider_json(v, &provider_json, Some(&ctx))
-                            .map_err(|e| e.to_string())?,
-                    );
-                } else {
-                    rs.attributes.insert(
-                        k.clone(),
-                        Self::attribute_to_state_json(&resource_display_type, identity, k, v)?,
-                    );
-                }
-                protected_secret_keys.insert(k.clone());
-            }
-        }
+        let previous_hash_authority = existing
+            .map(ResourceState::persisted_attributes)
+            .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
+            .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(existing) = existing {
-            Self::protect_previously_hashed_secrets(
-                &resource_display_type,
-                identity,
-                resource,
-                PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(&existing.attributes),
-                &mut rs.attributes,
-                &mut protected_secret_keys,
-            );
             rs.protected = existing.protected;
             rs.name_overrides = existing.name_overrides.clone();
         }
-        if let Some(schema) = schema {
-            for (key, attr) in &schema.attributes {
-                if attr.write_only && !protected_secret_keys.contains(key) {
-                    rs.attributes.remove(key);
-                }
-            }
-        }
+        rs.attributes =
+            serde_json::from_value::<PersistedAttributes>(serde_json::Value::Object(serialized))
+                .expect("provider state produces persisted attribute JSON")
+                .try_protect_for_resource_and_schema(resource, schema, previous_hash_authority)
+                .map_err(|error| error.to_string())?;
         rs.directives = resource.directives.clone();
         if rs.directives.provider_instance.is_none() {
             rs.directives.provider_instance = resource.id.provider_instance.clone();
@@ -1650,144 +1669,6 @@ impl ResourceState {
         }
         Ok(rs)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecretHashShape {
-    None,
-    TopLevel,
-    Nested,
-}
-
-fn secret_hash_shape(value: &serde_json::Value) -> SecretHashShape {
-    match value {
-        serde_json::Value::String(stored) if stored.starts_with(SECRET_PREFIX) => {
-            SecretHashShape::TopLevel
-        }
-        serde_json::Value::Array(items) if items.iter().any(contains_secret_hash_json) => {
-            SecretHashShape::Nested
-        }
-        serde_json::Value::Object(map) if map.values().any(contains_secret_hash_json) => {
-            SecretHashShape::Nested
-        }
-        _ => SecretHashShape::None,
-    }
-}
-
-fn contains_secret_hash_json(value: &serde_json::Value) -> bool {
-    secret_hash_shape(value) != SecretHashShape::None
-}
-
-fn merge_previous_secret_hashes_into_provider_json(
-    previous_value: &serde_json::Value,
-    provider_value: Option<&serde_json::Value>,
-    context: &SecretHashContext,
-) -> serde_json::Value {
-    match previous_value {
-        serde_json::Value::String(stored) if stored.starts_with(SECRET_PREFIX) => {
-            let Some(provider_value) = provider_value else {
-                return previous_value.clone();
-            };
-            if secret_hash_shape(provider_value) == SecretHashShape::TopLevel {
-                return provider_value.clone();
-            }
-            hash_provider_json_as_secret(provider_value, context)
-                .unwrap_or_else(|_| previous_value.clone())
-        }
-        serde_json::Value::Object(previous_object) => {
-            let Some(serde_json::Value::Object(provider_object)) = provider_value else {
-                return previous_value.clone();
-            };
-            let mut merged = provider_object.clone();
-            for (key, previous_child) in previous_object {
-                if contains_secret_hash_json(previous_child) {
-                    let provider_child = provider_object.get(key);
-                    merged.insert(
-                        key.clone(),
-                        merge_previous_secret_hashes_into_provider_json(
-                            previous_child,
-                            provider_child,
-                            context,
-                        ),
-                    );
-                }
-            }
-            serde_json::Value::Object(merged)
-        }
-        serde_json::Value::Array(previous_items) => {
-            let Some(serde_json::Value::Array(provider_items)) = provider_value else {
-                return previous_value.clone();
-            };
-            if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
-                return provider_value
-                    .and_then(|provider| hash_provider_json_as_secret(provider, context).ok())
-                    .unwrap_or_else(|| previous_value.clone());
-            }
-            let mut merged = provider_items.clone();
-            for (index, previous_child) in previous_items.iter().enumerate() {
-                if contains_secret_hash_json(previous_child) {
-                    let merged_child = merge_previous_secret_hashes_into_provider_json(
-                        previous_child,
-                        provider_items.get(index),
-                        context,
-                    );
-                    merged[index] = merged_child;
-                }
-            }
-            serde_json::Value::Array(merged)
-        }
-        _ => provider_value
-            .cloned()
-            .unwrap_or_else(|| previous_value.clone()),
-    }
-}
-
-fn previous_secret_hash_array_alignment_is_trusted(
-    previous_items: &[serde_json::Value],
-    provider_items: &[serde_json::Value],
-) -> bool {
-    if previous_items.len() != provider_items.len() {
-        return false;
-    }
-
-    previous_items
-        .iter()
-        .zip(provider_items)
-        .filter(|(previous, _)| contains_secret_hash_json(previous))
-        .all(|(previous, provider)| hash_bearing_item_alignment_is_trusted(previous, provider))
-}
-
-fn hash_bearing_item_alignment_is_trusted(
-    previous: &serde_json::Value,
-    provider: &serde_json::Value,
-) -> bool {
-    let (serde_json::Value::Object(previous_object), serde_json::Value::Object(provider_object)) =
-        (previous, provider)
-    else {
-        return false;
-    };
-
-    let anchors: Vec<_> = previous_object
-        .iter()
-        .filter(|(_, value)| !contains_secret_hash_json(value))
-        .collect();
-    if anchors.is_empty() {
-        return false;
-    }
-
-    anchors
-        .into_iter()
-        .all(|(key, previous_value)| provider_object.get(key) == Some(previous_value))
-}
-
-fn hash_provider_json_as_secret(
-    provider_json: &serde_json::Value,
-    context: &SecretHashContext,
-) -> Result<serde_json::Value, String> {
-    let provider_value = json_to_dsl_value(provider_json)
-        .ok_or_else(|| "cannot hash null provider secret".to_string())?;
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(provider_value)));
-    value_to_json_with_context(&secret_value, Some(context)).map_err(|err| err.to_string())
 }
 
 /// Returns true if the `ExplicitFields` is the default (`Leaf`) — used

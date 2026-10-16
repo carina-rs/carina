@@ -8,13 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
-use carina_core::effect::{DeletedInstanceKey, Effect};
+use carina_core::effect::Effect;
 use carina_core::module_resolver::{
     ModuleConstraintCall, ModuleConstraintDiagnostic, ModuleConstraintKind,
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::resource::{
-    DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State, Value,
+    DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State,
 };
 use carina_core::schema::SchemaRegistry;
 
@@ -67,8 +67,8 @@ fn build_plan_and_states_from_fixture(
 fn delete_attributes_for_plan(
     plan: &Plan,
     current_states: &HashMap<ResourceId, State>,
-) -> HashMap<DeletedInstanceKey, HashMap<String, Value>> {
-    crate::commands::plan::collect_delete_attributes(plan, current_states, None)
+) -> carina_core::detail_rows::HistoricalDisplayAttributes {
+    crate::commands::plan::collect_historical_display_attributes(plan, current_states, None)
 }
 
 /// Plan-display gate for `directives.depends_on` (#2823). The bucket

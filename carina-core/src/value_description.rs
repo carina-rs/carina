@@ -4,7 +4,6 @@ use std::fmt;
 
 use crate::parser::display_string_literal;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::value::SECRET_PREFIX;
 
 /// Value-derived description used in type-mismatch diagnostics.
 ///
@@ -20,11 +19,6 @@ impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
     pub fn of(value: &Value) -> Self {
         Self(match value {
-            Value::Concrete(ConcreteValue::String(value))
-                if value.expose_plaintext().starts_with(SECRET_PREFIX) =>
-            {
-                "secret".to_string()
-            }
             Value::Concrete(ConcreteValue::String(value)) => value
                 .diagnostic_literal()
                 .map(|value| format!("string {}", display_string_literal(value)))
@@ -46,7 +40,9 @@ impl ValueDescription {
             Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation".to_string(),
             Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call".to_string(),
-            Value::Deferred(DeferredValue::Secret(_)) => "secret".to_string(),
+            Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
+                "secret".to_string()
+            }
             Value::Deferred(DeferredValue::Unknown(_)) => "unknown".to_string(),
         })
     }
@@ -73,10 +69,11 @@ mod tests {
     }
 
     #[test]
-    fn hashed_secret_string_is_masked() {
-        let value = Value::Concrete(ConcreteValue::String(
-            format!("{}deadbeef", crate::value::SECRET_PREFIX).into(),
-        ));
+    fn typed_persisted_secret_is_masked() {
+        let value: Value = serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": "deadbeef".repeat(8) }
+        }))
+        .expect("deserialize persisted secret");
 
         assert_eq!(ValueDescription::of(&value).to_string(), "secret");
     }

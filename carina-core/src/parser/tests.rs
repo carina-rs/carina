@@ -1273,6 +1273,32 @@ fn parse_backend_block() {
 }
 
 #[test]
+fn secret_derived_backend_attribute_error_carries_the_attribute_span() {
+    let input = "backend local {\n    path = secret(\"carina.state.json\")\n}";
+    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+
+    let error = resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
+        .expect_err("secret-derived backend attributes must be rejected");
+
+    match error {
+        ParseError::SecretDerivedBackendAttribute {
+            backend_type,
+            attribute,
+            line,
+            start_column,
+            end_column,
+        } => {
+            assert_eq!(backend_type, "local");
+            assert_eq!(attribute, "path");
+            assert_eq!(line, 2);
+            assert_eq!(start_column, 5);
+            assert_eq!(end_column, 9);
+        }
+        other => panic!("unexpected backend validation error: {other:?}"),
+    }
+}
+
+#[test]
 fn parse_backend_block_with_resources() {
     let input = r#"
         backend s3 {

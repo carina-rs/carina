@@ -16,7 +16,7 @@ fn create(resource: Resource) -> Effect {
 #[test]
 fn app_from_empty_plan() {
     let plan = Plan::new();
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes.len(), 0);
     assert_eq!(app.selected, 0);
 }
@@ -39,7 +39,7 @@ fn app_from_plan_with_effects() {
         blocked_by_updates: HashSet::new(),
     });
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes.len(), 2);
     assert_eq!(app.nodes[0].symbol, "+");
     assert_eq!(app.nodes[0].kind, EffectKind::Create);
@@ -62,7 +62,7 @@ fn remove_effect_uses_non_failure_symbol_and_kind() {
         )),
     });
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes.len(), 1);
     assert_ne!(
         app.nodes[0].symbol, "x",
@@ -105,7 +105,7 @@ fn deferred_create_uses_create_symbol_and_kind() {
         template: Box::new(deferred),
     });
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes.len(), 1);
     assert_eq!(app.nodes[0].symbol, "+");
     assert_eq!(app.nodes[0].kind, EffectKind::Create);
@@ -120,7 +120,7 @@ fn navigation() {
     plan.add(create(Resource::new("s3.Bucket", "b")));
     plan.add(create(Resource::new("s3.Bucket", "c")));
 
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.selected, 0);
 
     app.move_down();
@@ -164,7 +164,7 @@ fn update_effect_has_detail_rows() {
         changed_attributes: vec!["versioning".to_string()],
     });
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes[0].kind, EffectKind::Update);
     // Should have a Changed detail row for versioning
     assert!(
@@ -188,7 +188,7 @@ fn internal_attributes_filtered() {
             .with_module_source(carina_core::resource::ModuleSource::module("web", "web")),
     ));
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     // Only "name" should appear (not _binding or _module)
     let attr_rows: Vec<_> = app.nodes[0]
         .detail_rows
@@ -240,7 +240,7 @@ fn tree_structure_with_dependencies() {
             ),
     ));
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
 
     // VPC should be root (depth 0) with subnet as child
     assert_eq!(app.nodes[0].depth, 0);
@@ -263,7 +263,7 @@ fn selected_node_returns_correct_node() {
         ),
     ));
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     let node = app.selected_node().unwrap();
     assert_eq!(node.kind, EffectKind::Create);
     // Detail rows should contain the name attribute
@@ -274,7 +274,7 @@ fn selected_node_returns_correct_node() {
 fn toggle_focus_switches_panels() {
     let mut plan = Plan::new();
     plan.add(create(Resource::new("s3.Bucket", "a")));
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     assert_eq!(app.focused_panel, FocusedPanel::Tree);
     app.toggle_focus();
@@ -287,7 +287,7 @@ fn toggle_focus_switches_panels() {
 fn detail_scroll_up_down() {
     let mut plan = Plan::new();
     plan.add(create(Resource::new("s3.Bucket", "a")));
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     assert_eq!(app.detail_scroll, 0);
     app.detail_scroll_down();
@@ -308,7 +308,7 @@ fn detail_scroll_resets_on_navigation() {
     let mut plan = Plan::new();
     plan.add(create(Resource::new("s3.Bucket", "a")));
     plan.add(create(Resource::new("s3.Bucket", "b")));
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     app.detail_scroll = 5;
     app.move_down();
@@ -329,7 +329,7 @@ fn tree_scroll_cursor_moves_within_visible_area_before_scrolling() {
             carina_core::resource::ResourceIdentity::try_from(format!("bucket-{i}")).unwrap(),
         )));
     }
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     // Simulate a visible area of 5 items
     app.tree_area_height = 5;
 
@@ -385,7 +385,7 @@ fn tree_scroll_zero_height_does_not_scroll_on_move_down() {
     let mut plan = Plan::new();
     plan.add(create(Resource::new("s3.Bucket", "a")));
     plan.add(create(Resource::new("s3.Bucket", "b")));
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.tree_area_height, 0);
 
     app.move_down();
@@ -421,7 +421,7 @@ fn make_tree_plan() -> Plan {
 #[test]
 fn filter_mode_hides_non_matching_nodes() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     // Before search, all 3 nodes visible
     assert_eq!(app.visible_count(), 3);
@@ -442,7 +442,7 @@ fn filter_mode_hides_non_matching_nodes() {
 #[test]
 fn filter_mode_ancestor_shown_dimmed() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     app.search_query = "subnet".to_string();
     app.update_search_matches();
@@ -466,7 +466,7 @@ fn filter_mode_ancestor_shown_dimmed() {
 #[test]
 fn filter_mode_clear_query_restores_all() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     app.search_query = "subnet".to_string();
     app.update_search_matches();
@@ -481,7 +481,7 @@ fn filter_mode_clear_query_restores_all() {
 #[test]
 fn filter_mode_no_matches_shows_all() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     app.search_query = "zzz_nonexistent".to_string();
     app.update_search_matches();
@@ -493,7 +493,7 @@ fn filter_mode_no_matches_shows_all() {
 #[test]
 fn filter_mode_search_matches_are_non_ancestor_indices() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
 
     app.search_query = "subnet".to_string();
     app.update_search_matches();
@@ -509,7 +509,7 @@ fn filter_mode_search_matches_are_non_ancestor_indices() {
 #[test]
 fn tab_complete_basic() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
     app.search_query = "sub".to_string();
 
@@ -523,7 +523,7 @@ fn tab_complete_basic() {
 #[test]
 fn tab_complete_cycles_candidates() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
     app.search_query = "ec2".to_string();
 
@@ -544,7 +544,7 @@ fn tab_complete_cycles_candidates() {
 #[test]
 fn tab_complete_no_match() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
     app.search_query = "zzz".to_string();
 
@@ -557,7 +557,7 @@ fn tab_complete_no_match() {
 #[test]
 fn tab_complete_empty_query() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
     app.search_query = String::new();
 
@@ -570,7 +570,7 @@ fn tab_complete_empty_query() {
 #[test]
 fn tab_complete_case_insensitive() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
     app.search_query = "SUB".to_string();
 
@@ -584,7 +584,7 @@ fn tab_complete_case_insensitive() {
 #[test]
 fn tab_complete_matches_middle_of_word() {
     let plan = make_tree_plan();
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
     app.search_query = "net".to_string();
 
@@ -605,7 +605,7 @@ fn tab_complete_with_provider_prefix() {
     plan.add(create(
         Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None).with_binding("subnet"),
     ));
-    let mut app = App::new(&plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
     app.search_query = "ec".to_string();
 
@@ -683,7 +683,7 @@ fn create_effect_attributes_resolve_enum_values() {
             ),
     ));
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     let node = &app.nodes[0];
 
     // Enum value should be resolved in detail rows
@@ -735,7 +735,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
         changed_attributes: vec!["versioning".to_string()],
     });
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     // Move should be suppressed; only the Update node should remain
     assert_eq!(app.nodes.len(), 1);
     assert_eq!(app.nodes[0].kind, EffectKind::Update);
@@ -755,7 +755,7 @@ fn pure_move_not_suppressed() {
         )),
     });
 
-    let app = App::new(&plan, &SchemaRegistry::new());
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
     // Pure move (no Update/Replace for same target) should be kept
     assert_eq!(app.nodes.len(), 1);
     assert_eq!(app.nodes[0].symbol, "->");

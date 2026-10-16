@@ -13,7 +13,8 @@ use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    self as provider_mod, Provider, ProviderError, ProviderNormalizer, RawSavedAttrs,
+    self as provider_mod, PersistedAttributes, Provider, ProviderError, ProviderNormalizer,
+    RawSavedAttrs,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId,
@@ -22,7 +23,7 @@ use carina_core::resource::{
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
-use carina_core::value::{format_value, json_to_dsl_value};
+use carina_core::value::format_value;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LockInfo,
     ResourceState, StateBackend, StateFile, StateUrl, create_backend, create_remote_backend,
@@ -178,8 +179,8 @@ fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<Completio
     if let Some((before_dot, _)) = current.rsplit_once('.')
         && let Some((rs, _)) = resolve_resource_address(state, before_dot)
     {
-        return rs
-            .attributes
+        let persisted = rs.persisted_attributes();
+        return persisted
             .keys()
             .filter(|key| {
                 let full = format!("{}.{}", before_dot, key);
@@ -647,10 +648,7 @@ fn format_resource_value(
     match attribute {
         Some(attr) => format_resource_attribute_value(rs, attr, json_output),
         None if !rs.deposed.is_empty() => format_resource_full_value_with_deposed(rs),
-        None => {
-            let sorted: std::collections::BTreeMap<_, _> = rs.attributes.iter().collect();
-            Ok(serde_json::to_string_pretty(&sorted).unwrap())
-        }
+        None => Ok(rs.format_attributes_for_state_show()),
     }
 }
 
@@ -659,24 +657,14 @@ fn format_resource_attribute_value(
     attr: &str,
     json_output: bool,
 ) -> Result<String, AppError> {
-    let Some(value) = rs.attributes.get(attr) else {
+    let Some(value) = rs.format_attribute_for_state_show(attr, json_output) else {
         return missing_attribute_error(rs, attr);
     };
-    if json_output {
-        Ok(serde_json::to_string_pretty(value).unwrap())
-    } else {
-        Ok(format_raw_value(value))
-    }
+    Ok(value)
 }
 
 fn format_resource_full_value_with_deposed(rs: &ResourceState) -> Result<String, AppError> {
-    let current = current_full_value(rs);
-    let deposed: Vec<serde_json::Value> = rs.deposed.iter().map(deposed_full_value).collect();
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "current": current,
-        "deposed": deposed,
-    }))
-    .unwrap())
+    Ok(rs.format_generations_for_state_show())
 }
 
 fn missing_attribute_error<T>(rs: &ResourceState, attr: &str) -> Result<T, AppError> {
@@ -685,32 +673,6 @@ fn missing_attribute_error<T>(rs: &ResourceState, attr: &str) -> Result<T, AppEr
         "Attribute '{}' not found on resource '{}'.",
         attr, display_name
     )))
-}
-
-fn sorted_attributes_value(attributes: &HashMap<String, serde_json::Value>) -> serde_json::Value {
-    let sorted: std::collections::BTreeMap<_, _> = attributes.iter().collect();
-    serde_json::to_value(sorted).unwrap()
-}
-
-fn current_full_value(rs: &ResourceState) -> serde_json::Value {
-    if rs.identifier.is_none() && rs.attributes.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::json!({
-            "identifier": rs.identifier.as_ref(),
-            "attributes": sorted_attributes_value(&rs.attributes),
-        })
-    }
-}
-
-fn deposed_full_value(entry: &DeposedInstance) -> serde_json::Value {
-    serde_json::json!({
-        "key": entry.key.as_str(),
-        "identifier": entry.identifier,
-        "marker": deposed_state_marker(&entry.key, &entry.identifier),
-        "provider_instance": entry.provider_instance,
-        "attributes": sorted_attributes_value(&entry.attributes),
-    })
 }
 
 /// Run state lookup command
@@ -748,11 +710,9 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
         resource.binding = rs.binding.clone();
         resource.dependency_bindings = rs.dependency_bindings.clone();
 
-        // Convert JSON attributes to DSL values
-        for (key, json_val) in &rs.attributes {
-            if let Some(dsl_val) = json_to_dsl_value(json_val) {
-                resource.set_attr(key.clone(), dsl_val);
-            }
+        // Convert persisted JSON attributes through the state-only decoder.
+        for (key, value) in rs.persisted_attributes().to_values() {
+            resource.set_attr(key, value);
         }
 
         plan.add(Effect::Read {
@@ -777,13 +737,17 @@ fn format_state_show(state: &StateFile) -> String {
             rs.provider, rs.resource_type, display_name
         ));
 
-        format_attributes_for_show(&mut output, &rs.attributes, "  ");
+        format_attributes_for_show(&mut output, rs.persisted_attributes().to_values(), "  ");
         for deposed in &rs.deposed {
             output.push_str(&format!(
                 "  {}\n",
                 deposed_state_marker(&deposed.key, &deposed.identifier)
             ));
-            format_attributes_for_show(&mut output, &deposed.attributes, "    ");
+            format_attributes_for_show(
+                &mut output,
+                deposed.persisted_attributes().to_values(),
+                "    ",
+            );
         }
     }
     output
@@ -791,16 +755,14 @@ fn format_state_show(state: &StateFile) -> String {
 
 fn format_attributes_for_show(
     output: &mut String,
-    attributes: &HashMap<String, serde_json::Value>,
+    attributes: HashMap<String, Value>,
     indent: &str,
 ) {
     let mut keys: Vec<&String> = attributes.keys().collect();
     keys.sort();
     for key in keys {
         let value = &attributes[key];
-        if let Some(dsl_val) = json_to_dsl_value(value) {
-            output.push_str(&format!("{}{} = {}\n", indent, key, format_value(&dsl_val)));
-        }
+        output.push_str(&format!("{}{} = {}\n", indent, key, format_value(value)));
     }
 }
 
@@ -828,8 +790,14 @@ async fn run_state_show(
 
     if tui {
         let plan = build_plan_from_state(&state);
-        carina_tui::run(&plan, &carina_core::schema::SchemaRegistry::new())
-            .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        let historical_display =
+            carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+        carina_tui::run(
+            &plan,
+            &carina_core::schema::SchemaRegistry::new(),
+            &historical_display,
+        )
+        .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
         let output = format_state_show(&state);
         print!("{}", output);
@@ -1681,7 +1649,7 @@ struct DeposedRefreshTarget {
     key: DeposedKey,
     identifier: String,
     provider_instance: Option<String>,
-    attributes: HashMap<String, serde_json::Value>,
+    attributes: PersistedAttributes,
     dependency_bindings: BTreeSet<String>,
 }
 
@@ -1810,13 +1778,13 @@ where
         }
         summary.updated_generations += 1;
 
-        let updated = DeposedInstance {
-            key: target.key.clone(),
-            identifier: target.identifier.clone(),
-            provider_instance: target.provider_instance.clone(),
+        let updated = DeposedInstance::from_persisted_attributes(
+            target.key.clone(),
+            target.identifier.clone(),
+            target.provider_instance.clone(),
             attributes,
-            dependency_bindings: target.dependency_bindings.clone(),
-        };
+            target.dependency_bindings.clone(),
+        );
         state.upsert_deposed_generation(
             &target.row_provider,
             &target.row_resource_type,
@@ -1859,7 +1827,7 @@ fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<Depos
                     key: deposed.key.clone(),
                     identifier: deposed.identifier.clone(),
                     provider_instance: deposed.provider_instance.clone(),
-                    attributes: deposed.attributes.clone(),
+                    attributes: deposed.persisted_attributes().clone(),
                     dependency_bindings: deposed.dependency_bindings.clone(),
                 }
             })
@@ -1881,10 +1849,8 @@ fn desired_resource_for_deposed<'a>(
 
 fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> ResolvedResource {
     let mut resource = ResolvedResource::from_id(target.id.clone());
-    for (key, value) in &target.attributes {
-        if let Some(dsl_value) = json_to_dsl_value(value) {
-            resource.set_attr(key.clone(), dsl_value);
-        }
+    for (key, value) in target.attributes.to_values() {
+        resource.set_attr(key, value);
     }
     resource
 }
@@ -1914,12 +1880,10 @@ where
 }
 
 fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
-    let attrs = target
-        .attributes
-        .iter()
-        .filter_map(|(key, value)| json_to_dsl_value(value).map(|dsl| (key.clone(), dsl)))
-        .collect();
-    RawSavedAttrs::from_persisted(HashMap::from([(target.id.as_inner().clone(), attrs)]))
+    RawSavedAttrs::from_persisted(HashMap::from([(
+        target.id.as_inner().clone(),
+        target.attributes.clone(),
+    )]))
 }
 
 /// Compare old state with fresh provider state for a single resource,
@@ -1989,19 +1953,10 @@ fn diff_display_update_resource(
     };
 
     // Build old attributes as DSL values for comparison
-    let old_attrs: HashMap<String, Value> = existing_rs
-        .attributes
-        .iter()
-        .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-        .collect();
+    let old_attrs = existing_rs.persisted_attributes().to_values();
     let refreshed_attrs: HashMap<String, Value> = refreshed_resource_state
         .as_ref()
-        .map(|rs| {
-            rs.attributes
-                .iter()
-                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-                .collect()
-        })
+        .map(|rs| rs.persisted_attributes().to_values())
         .unwrap_or_default();
 
     let mut has_changes = false;
@@ -2866,17 +2821,21 @@ mod tests {
         provider_instance: Option<&str>,
         attributes: HashMap<String, serde_json::Value>,
     ) -> DeposedInstance {
-        DeposedInstance {
+        DeposedInstance::from_persisted_json(
             key,
-            identifier: identifier.to_string(),
-            provider_instance: provider_instance.map(str::to_string),
+            identifier.to_string(),
+            provider_instance.map(str::to_string),
             attributes,
-            dependency_bindings: BTreeSet::new(),
-        }
+            BTreeSet::new(),
+        )
     }
 
     fn string_value(raw: &str) -> Value {
         Value::Concrete(ConcreteValue::String(raw.to_string().into()))
+    }
+
+    fn encoded_persisted_attributes(attributes: &PersistedAttributes) -> serde_json::Value {
+        serde_json::to_value(attributes).expect("persisted attributes should serialize")
     }
 
     #[tokio::test]
@@ -2895,9 +2854,7 @@ mod tests {
         let mut managed =
             ResourceState::new("test.resource", "managed", "mock").with_identifier("mock-id");
         managed.binding = Some("managed".to_string());
-        managed
-            .attributes
-            .insert("name".to_string(), serde_json::json!("managed"));
+        managed.set_persisted_attribute("name".to_string(), serde_json::json!("managed"));
         initial_state
             .upsert_resource(managed)
             .expect("test state setup must be valid");
@@ -3701,18 +3658,21 @@ mod tests {
 
         let row = state.find_resource("awscc", "ec2.Vpc", "main").unwrap();
         assert_eq!(row.identifier.as_deref(), Some("vpc-current"));
-        assert_eq!(row.attributes.get("vpc_id"), Some(&json!("vpc-current")));
+        assert_eq!(
+            row.persisted_attributes().get("vpc_id"),
+            carina_core::value::json_to_dsl_value(&json!("vpc-current"))
+        );
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].key, alive_key);
         assert_eq!(row.deposed[0].identifier, "vpc-alive");
         assert_eq!(row.deposed[0].provider_instance.as_deref(), Some("west"));
         assert_eq!(
-            row.deposed[0].attributes.get("vpc_id"),
-            Some(&json!("vpc-alive"))
+            row.deposed[0].persisted_attributes().get("vpc_id"),
+            carina_core::value::json_to_dsl_value(&json!("vpc-alive"))
         );
         assert_eq!(
-            row.deposed[0].attributes.get("cidr_block"),
-            Some(&json!("10.0.1.0/16"))
+            row.deposed[0].persisted_attributes().get("cidr_block"),
+            carina_core::value::json_to_dsl_value(&json!("10.0.1.0/16"))
         );
         assert_eq!(
             summary,
@@ -3809,11 +3769,14 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = state
+        let persisted = state
             .find_resource("awscc", "db.Instance", "main")
             .unwrap()
             .deposed[0]
-            .attributes
+            .persisted_attributes()
+            .clone();
+        let encoded = encoded_persisted_attributes(&persisted);
+        let stored = encoded
             .get("password")
             .and_then(|value| value.as_str())
             .expect("password should be stored as a string hash");
@@ -3866,12 +3829,15 @@ mod tests {
         .await
         .unwrap();
 
-        let attributes = &state
+        let attributes = state
             .find_resource("awscc", "db.Instance", "main")
             .unwrap()
             .deposed[0]
-            .attributes;
-        assert_eq!(attributes.get("endpoint"), Some(&json!("db.example")));
+            .persisted_attributes();
+        assert_eq!(
+            attributes.get("endpoint"),
+            carina_core::value::json_to_dsl_value(&json!("db.example"))
+        );
         assert!(
             !attributes.contains_key("password"),
             "schema write_only provider plaintext must not be persisted"
@@ -3888,7 +3854,7 @@ mod tests {
             None,
             HashMap::from([(
                 "password".to_string(),
-                json!(format!("{SECRET_PREFIX}previous")),
+                json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
             )]),
         ));
         state
@@ -3916,11 +3882,13 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = state
+        let persisted = state
             .find_resource("awscc", "db.Instance", "main")
             .unwrap()
             .deposed[0]
-            .attributes
+            .persisted_attributes();
+        let encoded = encoded_persisted_attributes(persisted);
+        let stored = encoded
             .get("password")
             .and_then(|value| value.as_str())
             .expect("password should remain a stored secret hash");
@@ -3942,7 +3910,7 @@ mod tests {
         let mut state = StateFile::new();
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{SECRET_PREFIX}previous"),
+            "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
         });
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -3982,14 +3950,13 @@ mod tests {
         .await
         .unwrap();
 
-        let stored_tags = state
+        let persisted = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .unwrap()
             .deposed[0]
-            .attributes
-            .get("tags")
-            .cloned()
-            .expect("tags should be stored");
+            .persisted_attributes();
+        let encoded = encoded_persisted_attributes(persisted);
+        let stored_tags = encoded.get("tags").expect("tags should be stored");
         assert_eq!(stored_tags["Name"], json!("new-name"));
         let secret = stored_tags["SecretTag"]
             .as_str()
@@ -4006,13 +3973,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let stored_again = state
+        let persisted_again = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .unwrap()
             .deposed[0]
-            .attributes
+            .persisted_attributes();
+        let encoded_again = encoded_persisted_attributes(persisted_again);
+        let stored_again = encoded_again
             .get("tags")
-            .cloned()
             .expect("tags should still be stored");
         assert_eq!(stored_again, stored_tags);
     }
@@ -4025,7 +3993,10 @@ mod tests {
             .upsert_resource(
                 ResourceState::new("db.Instance", "main", "awscc")
                     .with_identifier("db-current")
-                    .with_attribute("password", json!(format!("{SECRET_PREFIX}previous"))),
+                    .with_attribute(
+                        "password",
+                        json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+                    ),
             )
             .expect("test state setup must be valid");
         let fresh = State::existing(
@@ -4046,10 +4017,12 @@ mod tests {
         )
         .unwrap();
 
-        let stored = state
+        let persisted = state
             .find_resource("awscc", "db.Instance", "main")
             .unwrap()
-            .attributes
+            .persisted_attributes();
+        let encoded = encoded_persisted_attributes(persisted);
+        let stored = encoded
             .get("password")
             .and_then(|value| value.as_str())
             .expect("password should remain a stored secret hash");
@@ -4064,7 +4037,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{SECRET_PREFIX}previous"),
+            "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
         });
         let mut state = StateFile::new();
         state
@@ -4098,13 +4071,12 @@ mod tests {
         )
         .unwrap();
 
-        let stored_tags = state
+        let persisted = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .unwrap()
-            .attributes
-            .get("tags")
-            .cloned()
-            .expect("tags should be stored");
+            .persisted_attributes();
+        let encoded = encoded_persisted_attributes(persisted);
+        let stored_tags = encoded.get("tags").expect("tags should be stored");
         assert_eq!(stored_tags["Name"], json!("new-name"));
         let secret = stored_tags["SecretTag"]
             .as_str()
@@ -4125,12 +4097,13 @@ mod tests {
         )
         .unwrap();
 
-        let stored_again = state
+        let persisted_again = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .unwrap()
-            .attributes
+            .persisted_attributes();
+        let encoded_again = encoded_persisted_attributes(persisted_again);
+        let stored_again = encoded_again
             .get("tags")
-            .cloned()
             .expect("tags should still be stored");
         assert_eq!(stored_again, stored_tags);
         assert_eq!(counts.updated, 1);
@@ -4173,7 +4146,7 @@ mod tests {
 
         let row = state.find_resource("awscc", "db.Instance", "main").unwrap();
         assert!(
-            !row.attributes.contains_key("password"),
+            !row.persisted_attributes().contains_key("password"),
             "write-only plaintext must not be persisted by refresh"
         );
         assert_eq!(counts.updated, 0);
@@ -4220,13 +4193,19 @@ mod tests {
         .await
         .unwrap();
 
-        let attrs = &state
+        let attrs = state
             .find_resource("awscc", "db.Instance", "main")
             .unwrap()
             .deposed[0]
-            .attributes;
-        assert_eq!(attrs.get("endpoint"), Some(&json!("new.example")));
-        assert_eq!(attrs.get("description"), Some(&json!("kept from state")));
+            .persisted_attributes();
+        assert_eq!(
+            attrs.get("endpoint"),
+            carina_core::value::json_to_dsl_value(&json!("new.example"))
+        );
+        assert_eq!(
+            attrs.get("description"),
+            carina_core::value::json_to_dsl_value(&json!("kept from state"))
+        );
         assert_eq!(
             summary,
             DeposedRefreshSummary {
@@ -4301,10 +4280,11 @@ mod tests {
             .find_resource("awscc", "service.Widget", "main")
             .unwrap()
             .deposed[0]
-            .attributes
+            .persisted_attributes()
             .clone();
+        let after_first_json = encoded_persisted_attributes(&after_first);
         assert!(
-            after_first["status"].get("Enum").is_some(),
+            after_first_json["status"].get("Enum").is_some(),
             "enum state should be stored in canonical enum shape"
         );
 
@@ -4321,7 +4301,7 @@ mod tests {
             .find_resource("awscc", "service.Widget", "main")
             .unwrap()
             .deposed[0]
-            .attributes
+            .persisted_attributes()
             .clone();
 
         assert_eq!(
@@ -4386,11 +4366,13 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = state
+        let persisted = state
             .find_resource("awscc", "db.Instance", "main")
             .unwrap()
             .deposed[0]
-            .attributes
+            .persisted_attributes();
+        let encoded = encoded_persisted_attributes(persisted);
+        let stored = encoded
             .get("password")
             .and_then(|value| value.as_str())
             .expect("password should remain plaintext because west desired is not secret");
@@ -4430,8 +4412,8 @@ mod tests {
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].key, key);
         assert_eq!(
-            row.deposed[0].attributes.get("vpc_id"),
-            Some(&json!("vpc-old"))
+            row.deposed[0].persisted_attributes().get("vpc_id"),
+            carina_core::value::json_to_dsl_value(&json!("vpc-old"))
         );
         assert_eq!(
             summary,
@@ -4748,8 +4730,7 @@ mod tests {
         let mut state = StateFile::new();
         let mut rs = ResourceState::new("ec2.Vpc", "exports-vpc", "awscc");
         rs.binding = Some("exports".to_string());
-        rs.attributes
-            .insert("vpc_id".to_string(), serde_json::json!("vpc-from-resource"));
+        rs.set_persisted_attribute("vpc_id".to_string(), serde_json::json!("vpc-from-resource"));
         state
             .upsert_resource(rs)
             .expect("test state setup must be valid");

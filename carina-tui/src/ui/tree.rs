@@ -167,7 +167,7 @@ mod tests {
     fn tree_connector_root_has_no_prefix() {
         let mut plan = Plan::new();
         plan.add(create(Resource::new("s3.Bucket", "my-bucket")));
-        let app = App::new(&plan, &SchemaRegistry::new());
+        let app = App::for_plan(&plan, &SchemaRegistry::new());
         assert_eq!(build_tree_connector(0, &app), "");
     }
 
@@ -190,7 +190,7 @@ mod tests {
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
-        let app = App::new(&plan, &SchemaRegistry::new());
+        let app = App::for_plan(&plan, &SchemaRegistry::new());
 
         // Subnet is the only (last) child of VPC
         let connector = build_tree_connector(1, &app);
@@ -219,7 +219,7 @@ mod tests {
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
-        let app = App::new(&plan, &SchemaRegistry::new());
+        let app = App::for_plan(&plan, &SchemaRegistry::new());
 
         // First child gets ├─, last child gets └─
         let children = &app.nodes[0].children;

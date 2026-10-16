@@ -33,7 +33,7 @@ use carina_core::parser::ProviderContext;
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
-use crate::commands::plan::collect_delete_attributes;
+use crate::commands::plan::collect_historical_display_attributes;
 use crate::commands::plan::{
     ProviderUpstreamScope, UpstreamMissingStatePolicy, load_and_resolve_provider_configs,
 };
@@ -593,8 +593,8 @@ async fn run_destroy_locked_with_ctx(
         destroy_plan.add(delete_effects[*idx].clone());
     }
 
-    let delete_attributes =
-        collect_delete_attributes(&destroy_plan, &current_states, state_file.as_ref());
+    let historical_display =
+        collect_historical_display_attributes(&destroy_plan, &current_states, state_file.as_ref());
 
     // Display destroy plan as a dependency tree
     print!(
@@ -602,7 +602,7 @@ async fn run_destroy_locked_with_ctx(
         format_destroy_plan_with_delete_instances(
             &destroy_plan,
             DetailLevel::Full,
-            &delete_attributes
+            &historical_display
         )
     );
 
@@ -2434,13 +2434,13 @@ mod tests {
         let deposed_key = DeposedKey::new_unique();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.binding = Some("main".to_string());
-        row.deposed.push(DeposedInstance {
-            key: deposed_key.clone(),
-            identifier: "vpc-old".to_string(),
-            provider_instance: Some("deposed".to_string()),
-            attributes: HashMap::new(),
-            dependency_bindings: BTreeSet::from(["subnet".to_string()]),
-        });
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            deposed_key.clone(),
+            "vpc-old".to_string(),
+            Some("deposed".to_string()),
+            HashMap::new(),
+            BTreeSet::from(["subnet".to_string()]),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row)
@@ -2486,13 +2486,13 @@ mod tests {
             Resource::with_provider("awscc", "s3.Bucket", "state", None).with_binding("state");
         let mut row = ResourceState::new("s3.Bucket", "state", "awscc");
         row.binding = Some("state".to_string());
-        row.deposed.push(DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: "old-state-bucket".to_string(),
-            provider_instance: None,
-            attributes: HashMap::new(),
-            dependency_bindings: BTreeSet::new(),
-        });
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "old-state-bucket".to_string(),
+            None,
+            HashMap::new(),
+            BTreeSet::new(),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row)
@@ -2519,13 +2519,13 @@ mod tests {
         row.binding = Some("main".to_string());
         row.directives.prevent_destroy = true;
         let deposed_key = DeposedKey::new_unique();
-        row.deposed.push(DeposedInstance {
-            key: deposed_key.clone(),
-            identifier: "vpc-old".to_string(),
-            provider_instance: None,
-            attributes: HashMap::new(),
-            dependency_bindings: BTreeSet::new(),
-        });
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            deposed_key.clone(),
+            "vpc-old".to_string(),
+            None,
+            HashMap::new(),
+            BTreeSet::new(),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row)
@@ -2551,13 +2551,13 @@ mod tests {
         use std::collections::{BTreeSet, HashMap};
 
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
-        row.deposed.push(DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: "vpc-old".to_string(),
-            provider_instance: None,
-            attributes: HashMap::new(),
-            dependency_bindings: BTreeSet::new(),
-        });
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "vpc-old".to_string(),
+            None,
+            HashMap::new(),
+            BTreeSet::new(),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row)
@@ -2619,16 +2619,13 @@ mod tests {
         let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
             .with_identifier("vpc-new")
             .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
-        resource.deposed.push(DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: "vpc-old".to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([(
-                "cidr_block".to_string(),
-                serde_json::json!("10.0.0.0/16"),
-            )]),
-            dependency_bindings: BTreeSet::from(["network".to_string()]),
-        });
+        resource.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "vpc-old".to_string(),
+            None,
+            HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
+            BTreeSet::from(["network".to_string()]),
+        ));
         state
             .upsert_resource(resource)
             .expect("test state setup must be valid");
@@ -2646,7 +2643,7 @@ mod tests {
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("row with deposed generations should be retained");
         assert_eq!(retained.identifier, None);
-        assert!(retained.attributes.is_empty());
+        assert!(retained.persisted_attributes().is_empty());
         assert_eq!(retained.deposed.len(), 1);
         assert_eq!(retained.deposed[0].identifier, "vpc-old");
         assert!(state.exports.is_empty(), "exports should be cleared");
@@ -2663,26 +2660,20 @@ mod tests {
         let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
             .with_identifier("vpc-new")
             .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
-        resource.deposed.push(DeposedInstance {
-            key: removed_key.clone(),
-            identifier: "vpc-old".to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([(
-                "cidr_block".to_string(),
-                serde_json::json!("10.0.0.0/16"),
-            )]),
-            dependency_bindings: BTreeSet::from(["network".to_string()]),
-        });
-        resource.deposed.push(DeposedInstance {
-            key: retained_key.clone(),
-            identifier: "vpc-older".to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([(
-                "cidr_block".to_string(),
-                serde_json::json!("10.2.0.0/16"),
-            )]),
-            dependency_bindings: BTreeSet::from(["network".to_string()]),
-        });
+        resource.deposed.push(DeposedInstance::from_persisted_json(
+            removed_key.clone(),
+            "vpc-old".to_string(),
+            None,
+            HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
+            BTreeSet::from(["network".to_string()]),
+        ));
+        resource.deposed.push(DeposedInstance::from_persisted_json(
+            retained_key.clone(),
+            "vpc-older".to_string(),
+            None,
+            HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
+            BTreeSet::from(["network".to_string()]),
+        ));
         state
             .upsert_resource(resource)
             .expect("test state setup must be valid");
@@ -2712,16 +2703,13 @@ mod tests {
         let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
             .with_identifier("vpc-new")
             .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
-        resource.deposed.push(DeposedInstance {
-            key: deposed_key.clone(),
-            identifier: "vpc-old".to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([(
-                "cidr_block".to_string(),
-                serde_json::json!("10.0.0.0/16"),
-            )]),
-            dependency_bindings: BTreeSet::from(["network".to_string()]),
-        });
+        resource.deposed.push(DeposedInstance::from_persisted_json(
+            deposed_key.clone(),
+            "vpc-old".to_string(),
+            None,
+            HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
+            BTreeSet::from(["network".to_string()]),
+        ));
         state
             .upsert_resource(resource)
             .expect("test state setup must be valid");

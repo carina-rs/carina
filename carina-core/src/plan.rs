@@ -256,7 +256,30 @@ pub struct ReplaceDisplayInfo<'a> {
     /// Temporary name when CBD used a name swap. `None` for DBC.
     pub temporary_name: Option<&'a TemporaryName>,
     /// Pre-replace state values used as the "from" side of display diffs.
-    pub previous_attributes: &'a HashMap<String, Value>,
+    pub(crate) previous_attributes: &'a HashMap<String, Value>,
+}
+
+/// Opaque historical replacement values that may only be converted through
+/// the persisted-state writeback encoder.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplacementPreviousAttributesForStateWriteback<'a> {
+    attributes: &'a HashMap<String, Value>,
+}
+
+impl ReplacementPreviousAttributesForStateWriteback<'_> {
+    pub fn encode(
+        self,
+        resource: &ResolvedResource,
+        schema: Option<&crate::schema::ResourceSchema>,
+        previous_hash_authority: crate::provider::PreviousSecretHashAuthority<'_>,
+    ) -> crate::provider::PersistedAttributes {
+        crate::provider::PersistedAttributes::encode_values_for_resource_and_schema(
+            resource,
+            schema,
+            self.attributes,
+            previous_hash_authority,
+        )
+    }
 }
 
 impl<'a> ReplaceDisplayInfo<'a> {
@@ -375,11 +398,58 @@ impl Plan {
         &self.effects
     }
 
+    /// Whether any typed value-bearing field contains a saved-plan secret
+    /// placeholder.
+    ///
+    /// The owned plan and its replacement metadata are destructured
+    /// exhaustively so a newly added field cannot silently escape the saved
+    /// plan's verification gate.
+    pub fn contains_redacted_secret_placeholders(&self) -> bool {
+        let Plan {
+            effects,
+            replace_display,
+            permanent_name_overrides: _permanent_name_overrides,
+            errors: _errors,
+        } = self;
+
+        effects
+            .iter()
+            .any(crate::value::effect_contains_redacted_secret)
+            || replace_display.iter().any(|metadata| {
+                let ReplaceDisplayMetadata {
+                    create_idx: _create_idx,
+                    delete_idx: _delete_idx,
+                    create_before_destroy: _create_before_destroy,
+                    changed_create_only: _changed_create_only,
+                    cascade_ref_hints: _cascade_ref_hints,
+                    temporary_name: _temporary_name,
+                    previous_attributes,
+                } = metadata;
+                previous_attributes
+                    .values()
+                    .any(crate::value::contains_redacted_secret)
+            })
+    }
+
     /// Replacement display metadata for decomposed Create/Delete replacement pairs.
     pub fn replace_display_info(&self) -> impl Iterator<Item = ReplaceDisplayInfo<'_>> {
         self.replace_display
             .iter()
             .map(ReplaceDisplayInfo::from_metadata)
+    }
+
+    /// Historical replacement values used when state writeback must preserve
+    /// an old generation after the provider result no longer carries it.
+    pub fn replacement_previous_attributes_for_state_writeback(
+        &self,
+        delete_idx: usize,
+    ) -> Option<ReplacementPreviousAttributesForStateWriteback<'_>> {
+        self.replace_display
+            .iter()
+            .find(|metadata| metadata.delete_idx == delete_idx)
+            .map(|metadata| ReplacementPreviousAttributesForStateWriteback {
+                attributes: &metadata.previous_attributes,
+            })
     }
 
     pub(crate) fn replace_display_mut(&mut self) -> &mut Vec<ReplaceDisplayMetadata> {

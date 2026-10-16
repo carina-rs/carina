@@ -25,6 +25,49 @@ use cancellation_fixture::ApplyCancellationFixture;
 
 use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 
+#[test]
+fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
+    use std::error::Error as _;
+
+    let target = ApplyTarget::SavedPlan {
+        plan_file: Path::new("reviewed-plan.json"),
+        source_dir: Path::new("infra"),
+    };
+    let hash = saved_plan_secret_rehydration_error(
+        carina_core::value::SecretRehydrationSiteError::new(
+            "mock.test.resource.example.token",
+            carina_core::value::SecretRehydrationError::HashMismatch,
+        ),
+        target,
+    );
+    assert!(matches!(hash, AppError::SavedPlanSecretVerification(_)));
+    assert!(hash.to_string().contains("secret changed"));
+    assert!(hash.source().is_some(), "typed source chain must survive");
+
+    let shape = saved_plan_secret_rehydration_error(
+        carina_core::value::SecretRehydrationSiteError::new(
+            "mock.test.resource.example.token",
+            carina_core::value::SecretRehydrationError::ShapeMismatch,
+        ),
+        target,
+    );
+    assert!(shape.to_string().contains("configuration changed"));
+    assert!(shape.to_string().contains("no longer exists"));
+    assert!(!shape.to_string().contains("secret changed"));
+
+    let unavailable = saved_plan_secret_evaluation_error(
+        AppError::Config("environment variable TOKEN is not set".to_string()),
+        target,
+    );
+    assert!(unavailable.to_string().contains("could not be evaluated"));
+    assert!(unavailable.source().is_some());
+
+    let orphan = saved_plan_secret_orphan_vanished_error("mock.test.resource.orphan", target);
+    assert!(orphan.to_string().contains("orphan"));
+    assert!(orphan.to_string().contains("no longer exists"));
+    assert!(orphan.source().is_some(), "orphan cause chain must survive");
+}
+
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
@@ -42,6 +85,10 @@ fn resolved_provider_configs<E>(
 
 fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderConfigs {
     resolved_provider_configs(&carina_core::parser::InferredFile::default())
+}
+
+fn inspected_saved_plan(plan_file: PlanFile) -> InspectedPlanFile {
+    InspectedPlanFile::inspect(plan_file)
 }
 
 fn checked_exports(
@@ -112,6 +159,223 @@ fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
         provenance: Default::default(),
         quoted_string_attrs: HashSet::new(),
     }
+}
+
+#[test]
+fn saved_plan_import_rehydration_respects_current_provider_instance() {
+    let planned_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "example",
+        Some("planned".to_string()),
+    );
+    let mut plan = Plan::new();
+    plan.add(carina_core::effect::Effect::Import {
+        id: carina_core::resource::ResolvedResourceId::new(planned_id.clone()),
+        identifier: string_value("provider-id"),
+    });
+
+    let parsed = carina_core::parser::InferredFile {
+        resources: vec![Resource::with_provider(
+            "mock",
+            "test.resource",
+            "example",
+            Some("current".to_string()),
+        )],
+        state_blocks: vec![carina_core::parser::StateBlock::Import {
+            to: carina_core::parser::StateBlockAddress::new("mock", "test.resource", "example"),
+            id: string_value("provider-id"),
+        }],
+        ..Default::default()
+    };
+
+    let identifiers = import_identifiers_from_current_config(&plan, &parsed);
+
+    assert!(
+        !identifiers.contains_key(&planned_id),
+        "a current import routed to a different provider instance must not rehydrate the saved effect"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
+    let secret = || {
+        Value::Deferred(DeferredValue::Secret(Box::new(string_value(
+            "composition-secret",
+        ))))
+    };
+    let mut saved = saved_module_composition(secret(), "rejected");
+    saved.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+        "_virtual",
+        "saved.anonymous",
+    ));
+    saved.binding = None;
+    let saved =
+        carina_core::value::redact_secrets_in_virtual(&saved).expect("redact saved composition");
+
+    let mut current = saved_module_composition(secret(), "rejected");
+    current.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+        "_virtual",
+        "current.anonymous",
+    ));
+    current.binding = None;
+    let parsed = carina_core::parser::InferredFile {
+        compositions: vec![current],
+        ..Default::default()
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let provider_inputs = load_and_resolve_provider_configs(
+        &parsed,
+        tmp.path(),
+        &ProviderContext::default(),
+        UpstreamMissingStatePolicy::Strict,
+        ProviderUpstreamScope::All,
+    )
+    .await
+    .expect("resolve empty provider config");
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-16T00:00:00Z".to_string(),
+        source_path: tmp.path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(Vec::new()),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: vec![saved],
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+
+    let result = rehydrate_desired_plan_file(
+        plan_file,
+        &parsed,
+        &provider_inputs,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "two anonymous compositions must not match merely because both bindings are None"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_persists_pending_state_migration_before_drift_return() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp.path().join("carina.state.json");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    let lineage = "11111111-1111-1111-1111-111111111111";
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 6,
+            "serial": 7,
+            "lineage": lineage,
+            "carina_version": "0.0.0-test",
+            "resources": []
+        }))
+        .expect("serialize v6 state"),
+    )
+    .expect("write v6 state");
+    std::fs::write(
+        &mock_state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "test.resource.example": { "name": "drifted" }
+        }))
+        .expect("serialize provider state"),
+    )
+    .expect("write provider state");
+
+    let mut resource = Resource::with_provider("mock", "test.resource", "example", None);
+    resource.set_attr("name", string_value("planned"));
+    let id = resource.id.clone();
+    let planned_state = State::existing(
+        id.clone(),
+        HashMap::from([("name".to_string(), string_value("planned"))]),
+    )
+    .with_identifier("mock-id");
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-16T00:00:00Z".to_string(),
+        source_path: tmp.path().display().to_string(),
+        state_lineage: Some(lineage.to_string()),
+        state_serial: Some(7),
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: vec![resource.clone()],
+        unresolved_resources: vec![resource],
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: vec![crate::commands::plan::CurrentStateEntry {
+            id,
+            state: planned_state,
+        }],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let backend = carina_state::LocalBackend::with_path(state_path.clone());
+    unsafe {
+        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
+    }
+
+    let observer_factory = fixture.observer_factory();
+    let result = run_apply_from_plan_locked(
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
+        true,
+        &backend,
+        None,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).expect("non-zero parallelism"),
+        false,
+    )
+    .await;
+
+    unsafe {
+        std::env::remove_var("CARINA_MOCK_STATE_FILE");
+    }
+    let error = result.expect_err("drift must still abort the saved-plan apply");
+    assert!(error.to_string().contains("drift"), "error: {error}");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read state after drift return"))
+            .expect("parse persisted state");
+    assert_eq!(
+        persisted["version"],
+        serde_json::json!(StateFile::CURRENT_VERSION),
+        "the pending schema migration must be saved before drift can return early"
+    );
 }
 
 fn state_file_from_json(json: serde_json::Value) -> StateFile {
@@ -949,16 +1213,16 @@ fn seed_apply_cascade_state_with_deposed(
         .with_attribute("vpc_id", serde_json::json!("vpc-new"));
     vpc_state.binding = Some("vpc".to_string());
     for identifier in deposed_identifiers {
-        vpc_state.deposed.push(DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: (*identifier).to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([
+        vpc_state.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            (*identifier).to_string(),
+            None,
+            HashMap::from([
                 ("cidr_block".to_string(), serde_json::json!("10.220.0.0/16")),
                 ("vpc_id".to_string(), serde_json::json!(identifier)),
             ]),
-            dependency_bindings: BTreeSet::new(),
-        });
+            BTreeSet::new(),
+        ));
     }
 
     let mut state_file = carina_state::StateFile::new();
@@ -1658,7 +1922,9 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        plan_file,
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
         true,
         fixture.backend(),
         None,
@@ -1683,8 +1949,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         .find_resource("mock", "test.resource", "consumer")
         .expect("consumer should be persisted");
     assert_eq!(
-        consumer.attributes.get("comment"),
-        Some(&serde_json::json!("target")),
+        consumer.persisted_attributes().get("comment"),
+        carina_core::value::json_to_dsl_value(&serde_json::json!("target")),
         "consumer must receive the value published by the apply-time read"
     );
 }
@@ -1771,7 +2037,9 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        plan_file,
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
         true,
         fixture.backend(),
         None,
@@ -1827,7 +2095,9 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
-        plan_file,
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
         true,
         fixture.backend(),
         None,
@@ -1908,7 +2178,9 @@ async fn saved_plan_provider_validation_preserves_typed_error_source() {
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_from_plan_locked(
-        plan_file,
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
         true,
         fixture.backend(),
         None,
@@ -2005,7 +2277,9 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_from_plan_locked(
-        plan_file,
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
         true,
         fixture.backend(),
         None,
@@ -3002,13 +3276,15 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         .and_then(|state| state.find_resource("mock", "iam.Role", "target_role"))
         .expect("target role must be persisted before post-apply plan");
     assert_eq!(
-        target_state.attributes.get("path"),
-        Some(&serde_json::json!("/")),
+        target_state.persisted_attributes().get("path"),
+        carina_core::value::json_to_dsl_value(&serde_json::json!("/")),
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
     assert_eq!(
-        target_state.attributes.get("max_session_duration"),
-        Some(&serde_json::json!(3600)),
+        target_state
+            .persisted_attributes()
+            .get("max_session_duration"),
+        carina_core::value::json_to_dsl_value(&serde_json::json!(3600)),
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
 
@@ -3162,6 +3438,7 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Backend
     carina_core::parser::BackendConfig {
         backend_type: "s3".to_string(),
         attributes,
+        attribute_spans: HashMap::new(),
     }
 }
 
@@ -3468,8 +3745,8 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
         .find_resource("awscc", "ec2.Vpc", "my-vpc")
         .expect("resource should exist in state");
     assert_eq!(
-        saved.attributes.get("ipv4_netmask_length"),
-        Some(&serde_json::Value::String("16".to_string())),
+        saved.persisted_attributes().get("ipv4_netmask_length"),
+        carina_core::value::json_to_dsl_value(&serde_json::Value::String("16".to_string())),
         "write-only attribute should be persisted in state"
     );
 }
@@ -3582,7 +3859,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
         .find_resource("awscc", "iam.role", "test-role")
         .expect("resource should exist in state");
     assert!(
-        saved.attributes.contains_key("policies"),
+        saved.persisted_attributes().contains_key("policies"),
         "state should contain 'policies' attribute (carried over from desired)"
     );
 
@@ -3816,7 +4093,9 @@ fn block_unique_name_attribute_state_roundtrip() {
         .find_resource("awscc", "ec2.ipam", "test-ipam")
         .expect("resource should exist");
     assert!(
-        saved_rs.attributes.contains_key("operating_regions"),
+        saved_rs
+            .persisted_attributes()
+            .contains_key("operating_regions"),
         "state should contain 'operating_regions'"
     );
     let carina_core::explicit::ExplicitFields::Struct {
@@ -3946,8 +4225,8 @@ fn move_plus_update_keeps_post_update_attributes() {
         .find_resource("awscc", "ec2.Tag", "tag_new")
         .expect("new row must exist");
     assert_eq!(
-        new_row.attributes.get("value"),
-        Some(&serde_json::Value::String("prod".to_string())),
+        new_row.persisted_attributes().get("value"),
+        carina_core::value::json_to_dsl_value(&serde_json::Value::String("prod".to_string())),
         "Move must not overwrite Update's post-apply value",
     );
 }
@@ -4032,8 +4311,8 @@ fn move_alone_carries_attributes_via_current_states() {
         "identifier carried over via current_states",
     );
     assert_eq!(
-        new_row.attributes.get("bucket_name"),
-        Some(&serde_json::Value::String("my-bucket".to_string())),
+        new_row.persisted_attributes().get("bucket_name"),
+        carina_core::value::json_to_dsl_value(&serde_json::Value::String("my-bucket".to_string(),)),
     );
 }
 
@@ -5494,7 +5773,7 @@ mod saved_plan_version_tests {
         )
         .await;
 
-        let err = result.expect_err("v10 saved plan must be rejected after v11 bump");
+        let err = result.expect_err("v10 saved plan must be rejected after format bumps");
         let crate::error::AppError::UnsupportedPlanVersion {
             path: error_path,
             found,
@@ -5516,8 +5795,8 @@ mod saved_plan_version_tests {
             "error must name the rejected v10 version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 11"),
-            "error must name the v11 expected version, got: {msg}",
+            msg.contains("expected 12"),
+            "error must name the v12 expected version, got: {msg}",
         );
         assert!(
             msg.contains(&format!("Re-run `{expected_replan}`")),

@@ -357,6 +357,9 @@ fn infer_type_from_value_with_visiting(
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
         Value::Deferred(DeferredValue::Secret(_)) => Ok(TypeExpr::String),
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(InferenceError::UnknownType {
+            reason: "saved-plan secret has not been rehydrated".to_string(),
+        }),
         Value::Concrete(ConcreteValue::List(items)) => {
             infer_collection(items, bindings, schemas, visiting, TypeExpr::List)
         }

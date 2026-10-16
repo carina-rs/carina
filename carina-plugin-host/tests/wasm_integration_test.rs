@@ -5,13 +5,20 @@ use std::path::PathBuf;
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    CreateRequest, DeleteRequest, Provider, ProviderFactory, ProviderReadyConfig, ReadRequest,
-    SavedAttrs, UpdateRequest,
+    CreateRequest, DeleteRequest, Provider, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
+    ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
 use carina_plugin_host::WasmProviderFactory;
+
+fn lifted_saved_attrs(
+    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, Value>)>,
+) -> carina_core::provider::LiftedSavedAttrs {
+    RawSavedAttrs::from_decoded_values_for_test(entries.into_iter().collect())
+        .lift(&carina_core::schema::SchemaRegistry::new())
+}
 
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
@@ -514,7 +521,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
             )]),
         ),
     )]);
-    let saved_attrs = SavedAttrs::from([(
+    let saved_attrs = lifted_saved_attrs([(
         hydrate_id.clone(),
         HashMap::from([(
             "__mock_hydrate_read_state__".to_string(),
@@ -522,7 +529,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
         )]),
     )]);
     normalizer
-        .hydrate_read_state(&mut hydrate_states, &saved_attrs)
+        .hydrate_read_state(&mut hydrate_states, saved_attrs.as_provider_saved_attrs())
         .await
         .expect("a single pending hydrate result is correlated by position, not guest key");
     assert_eq!(
@@ -618,7 +625,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
             State::existing(second_id.clone(), HashMap::new()),
         ),
     ]);
-    let saved_attrs = SavedAttrs::from([
+    let saved_attrs = lifted_saved_attrs([
         (
             first_id.clone(),
             HashMap::from([(
@@ -636,7 +643,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
     ]);
 
     normalizer
-        .hydrate_read_state(&mut hydrate_states, &saved_attrs)
+        .hydrate_read_state(&mut hydrate_states, saved_attrs.as_provider_saved_attrs())
         .await
         .unwrap();
 
@@ -769,7 +776,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
             ),
         ]);
         let before = states.clone();
-        let saved_attrs = SavedAttrs::from([(
+        let saved_attrs = lifted_saved_attrs([(
             update_id,
             HashMap::from([(
                 "__mock_hydrate_read_state__".to_string(),
@@ -778,12 +785,44 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
         )]);
 
         let result = normalizer
-            .hydrate_read_state(&mut states, &saved_attrs)
+            .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
             .await;
 
         assert!(result.is_err(), "{identity} must be rejected");
         assert_eq!(states, before, "key mismatches must be atomic");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_hydrate_read_state_receives_persisted_secret_as_legacy_marker_string() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let persisted_secret: Value = serde_json::from_value(serde_json::json!({
+        "RedactedSecret": { "hash": hash }
+    }))
+    .expect("deserialize persisted secret");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-state", None);
+    let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+    let saved_attrs = lifted_saved_attrs([(
+        id.clone(),
+        HashMap::from([("__mock_hydrate_read_state__".to_string(), persisted_secret)]),
+    )]);
+
+    normalizer
+        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
+        .await
+        .expect("persisted secret must cross the legacy guest wire");
+
+    assert!(matches!(
+        states[&id].attributes.get("__mock_hydrated_read_state__"),
+        Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
+            if loaded.as_str() == hash
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1233,7 +1272,7 @@ async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation()
     let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-saved", None);
     let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
     let before = states.clone();
-    let saved_attrs = SavedAttrs::from([(
+    let saved_attrs = lifted_saved_attrs([(
         id,
         HashMap::from([(
             "values".to_string(),
@@ -1244,7 +1283,7 @@ async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation()
     )]);
 
     let error = normalizer
-        .hydrate_read_state(&mut states, &saved_attrs)
+        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
         .await
         .expect_err("non-finite saved attributes must fail boundary encoding");
 
@@ -1356,22 +1395,18 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
             (id, state)
         })
         .collect::<HashMap<_, _>>();
-    let saved_attrs: SavedAttrs = ids
-        .iter()
-        .enumerate()
-        .map(|(index, id)| {
-            (
-                id.clone(),
-                HashMap::from([(
-                    "__mock_hydrate_read_state__".to_string(),
-                    Value::Concrete(ConcreteValue::String(format!("marker-{index}").into())),
-                )]),
-            )
-        })
-        .collect();
+    let saved_attrs = lifted_saved_attrs(ids.iter().enumerate().map(|(index, id)| {
+        (
+            id.clone(),
+            HashMap::from([(
+                "__mock_hydrate_read_state__".to_string(),
+                Value::Concrete(ConcreteValue::String(format!("marker-{index}").into())),
+            )]),
+        )
+    }));
 
     normalizer
-        .hydrate_read_state(&mut states, &saved_attrs)
+        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
         .await
         .unwrap();
 
