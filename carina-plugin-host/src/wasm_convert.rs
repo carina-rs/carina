@@ -2855,12 +2855,6 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v3_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 3);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 3);
-    }
-
-    #[test]
     fn test_check_protocol_version_rejects_lower_version() {
         let err = check_protocol_version(
             r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":2}"#,

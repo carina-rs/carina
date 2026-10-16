@@ -385,10 +385,10 @@ macro_rules! export_provider {
                     wit_types::Value::StringListVal(json) => helpers::decode_string_list_val(json),
                     wit_types::Value::ListVal(json) => helpers::decode_list_val(json),
                     wit_types::Value::MapVal(json) => helpers::decode_map_val(json),
-                    // Desired-state round trips (`normalize_desired` and
-                    // `merge_default_tags`) are host-sealed and never carry
-                    // `SecretVal` (carina#3800). CRUD inputs decode the inner
-                    // JSON into an ordinary provider value because
+                    // Desired-state `normalize_desired` round trips are
+                    // host-sealed and never carry `SecretVal` (carina#3800).
+                    // CRUD inputs decode the inner JSON into an ordinary
+                    // provider value because
                     // `proto::Value` has no `Secret` arm. Malformed or null
                     // payloads remain boundary errors. Providers MUST NOT log
                     // or persist the plaintext.
@@ -1042,47 +1042,6 @@ macro_rules! export_provider {
                         })
                 }
 
-                fn merge_default_tags(
-                    resources: Vec<wit_types::ResourceDef>,
-                    default_tags: Vec<(String, wit_types::Value)>,
-                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
-                    let mut proto_resources = resources
-                        .iter()
-                        .map(wit_to_proto_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error(
-                                "merge_default_tags",
-                                Some("resources"),
-                                error,
-                            )
-                        })?;
-                    let proto_tags = wit_to_proto_value_map(&default_tags).map_err(|error| {
-                        boundary_decode_to_provider_error(
-                            "merge_default_tags",
-                            Some("default tags"),
-                            error,
-                        )
-                    })?;
-                    let result = {
-                        let provider = get_provider().lock().unwrap();
-                        let schemas = $crate::CarinaProvider::schemas(&*provider);
-                        $crate::CarinaProvider::merge_default_tags(
-                            &*provider,
-                            &mut proto_resources,
-                            &proto_tags,
-                            &schemas,
-                        )
-                    }
-                    .map_err(proto_to_wit_provider_error)?;
-                    proto_resources
-                        .iter()
-                        .map(proto_to_wit_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error("merge_default_tags", None, error)
-                        })
-                }
             }
 
             export!(WasmGuest);
@@ -1150,10 +1109,10 @@ macro_rules! export_provider {
                     wit_types::Value::StringListVal(json) => helpers::decode_string_list_val(json),
                     wit_types::Value::ListVal(json) => helpers::decode_list_val(json),
                     wit_types::Value::MapVal(json) => helpers::decode_map_val(json),
-                    // Desired-state round trips (`normalize_desired` and
-                    // `merge_default_tags`) are host-sealed and never carry
-                    // `SecretVal` (carina#3800). CRUD inputs decode the inner
-                    // JSON into an ordinary provider value because
+                    // Desired-state `normalize_desired` round trips are
+                    // host-sealed and never carry `SecretVal` (carina#3800).
+                    // CRUD inputs decode the inner JSON into an ordinary
+                    // provider value because
                     // `proto::Value` has no `Secret` arm. Malformed or null
                     // payloads remain boundary errors. Providers MUST NOT log
                     // or persist the plaintext.
@@ -1807,47 +1766,6 @@ macro_rules! export_provider {
                         })
                 }
 
-                fn merge_default_tags(
-                    resources: Vec<wit_types::ResourceDef>,
-                    default_tags: Vec<(String, wit_types::Value)>,
-                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
-                    let mut proto_resources = resources
-                        .iter()
-                        .map(wit_to_proto_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error(
-                                "merge_default_tags",
-                                Some("resources"),
-                                error,
-                            )
-                        })?;
-                    let proto_tags = wit_to_proto_value_map(&default_tags).map_err(|error| {
-                        boundary_decode_to_provider_error(
-                            "merge_default_tags",
-                            Some("default tags"),
-                            error,
-                        )
-                    })?;
-                    let result = {
-                        let provider = get_provider().lock().unwrap();
-                        let schemas = $crate::CarinaProvider::schemas(&*provider);
-                        $crate::CarinaProvider::merge_default_tags(
-                            &*provider,
-                            &mut proto_resources,
-                            &proto_tags,
-                            &schemas,
-                        )
-                    }
-                    .map_err(proto_to_wit_provider_error)?;
-                    proto_resources
-                        .iter()
-                        .map(proto_to_wit_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error("merge_default_tags", None, error)
-                        })
-                }
             }
 
             export!(WasmGuest);

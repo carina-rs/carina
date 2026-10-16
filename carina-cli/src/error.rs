@@ -328,6 +328,17 @@ pub enum AppError {
     #[error(transparent)]
     ProviderConfigPreparation(#[from] carina_core::executor::ProviderConfigPreparationError),
 
+    /// A source-loaded provider reported a kind other than the block that
+    /// selected its artifact.
+    #[error(
+        "Provider block kind '{configured}' does not match loaded provider name '{loaded}' from source '{provider_source}'."
+    )]
+    SourceProviderKindMismatch {
+        configured: String,
+        loaded: String,
+        provider_source: String,
+    },
+
     /// A parsed provider expression could not be evaluated.
     #[error("Provider attribute resolution error: {0}")]
     ProviderAttributeResolution(#[source] Box<carina_core::parser::ParseError>),

@@ -9,7 +9,7 @@ use carina_core::executor::{
 };
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
-    SavedAttrs, UpdateOutcome, UpdateRequest, ready_noop,
+    UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
     Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
@@ -32,51 +32,8 @@ fn resolved_provider_configs<E>(
     resolved_provider_configs_with_remote(parsed, &HashMap::new())
 }
 
-struct TestDefaultTagNormalizer;
-
-impl ProviderNormalizer for TestDefaultTagNormalizer {
-    fn normalize_desired<'a>(
-        &'a self,
-        _resources: &'a mut [Resource],
-    ) -> BoxFuture<'a, ProviderResult<()>> {
-        ready_noop()
-    }
-
-    fn normalize_state<'a>(
-        &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
-        ready_noop()
-    }
-
-    fn hydrate_read_state<'a>(
-        &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
-        _saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
-        ready_noop()
-    }
-
-    fn merge_default_tags<'a>(
-        &'a self,
-        resources: &'a mut [Resource],
-        default_tags: &'a IndexMap<String, Value>,
-        registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            carina_core::provider::merge_default_tags_for_provider(
-                BUILTIN_PROVIDER_NAME,
-                resources,
-                default_tags,
-                registry,
-            );
-            Ok(())
-        })
-    }
-}
-
 #[tokio::test]
-async fn shared_desired_pipeline_supports_test_injected_default_tag_normalization() {
+async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("test-only-default-tag-secret".into()),
     ))));
@@ -103,7 +60,7 @@ async fn shared_desired_pipeline_supports_test_injected_default_tag_normalizatio
         &mut resources,
         &mut [],
         &provider_configs,
-        &TestDefaultTagNormalizer,
+        &carina_core::provider::NoopNormalizer,
         &ctx,
     )
     .await
@@ -113,11 +70,23 @@ async fn shared_desired_pipeline_supports_test_injected_default_tag_normalizatio
     let Value::Concrete(ConcreteValue::Map(tags)) = resources[0]
         .attributes
         .get("tags")
-        .expect("test normalizer should merge default tags")
+        .expect("host default-tag normalization should merge default tags")
     else {
         panic!("merged tags must be a map")
     };
     assert_eq!(tags.get("SecretTag"), Some(&secret));
+}
+
+#[test]
+fn source_provider_kind_mismatch_is_rejected() {
+    let source = "file:///tmp/provider.wasm";
+    let error = ensure_source_provider_kind_matches("configured", "reported", source)
+        .expect_err("a source provider must report the configured block kind");
+
+    assert_eq!(
+        error.to_string(),
+        "Provider block kind 'configured' does not match loaded provider name 'reported' from source 'file:///tmp/provider.wasm'."
+    );
 }
 
 fn resolved_provider_configs_with_remote<E>(
@@ -248,15 +217,6 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
         ) -> BoxFuture<'a, ProviderResult<()>> {
             carina_core::provider::ready_noop()
         }
-
-        fn merge_default_tags<'a>(
-            &'a self,
-            _resources: &'a mut [Resource],
-            _default_tags: &'a IndexMap<String, Value>,
-            _registry: &'a SchemaRegistry,
-        ) -> BoxFuture<'a, ProviderResult<()>> {
-            carina_core::provider::ready_noop()
-        }
     }
 
     let state_called = Arc::new(AtomicBool::new(false));
@@ -365,10 +325,9 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     let configs = validated_provider_configs(vec![config]);
     let config = configs.iter().next().unwrap();
     let mut router = ProviderRouter::new();
-    let error =
-        instantiate_provider_into_router(&ctx, &mut router, config, Path::new("."), None, None)
-            .await
-            .expect_err("normalizer creation failure must abort provider router setup");
+    let error = instantiate_provider_into_router(&ctx, &mut router, config, Path::new("."), None)
+        .await
+        .expect_err("normalizer creation failure must abort provider router setup");
 
     let AppError::Provider(error) = error else {
         panic!("expected provider error, got {error}");
@@ -1224,24 +1183,23 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
     assert!(ready.attributes().is_empty());
 }
 
-/// Verify that merge_default_tags prevents false diffs when default_tags are
+/// Verify that host default-tag merging prevents false diffs when default_tags are
 /// configured in the provider block.
 ///
 /// When default_tags are set and state already contains those tags (from a
 /// previous apply), the differ must not report a diff for the tags. This
-/// requires merge_default_tags to be called so the desired resources include
-/// the default tags before diffing.
+/// requires the desired normalization pipeline to add the default tags before
+/// diffing.
 ///
-/// Both the plan path (wiring.rs) and the apply path (apply.rs) must call
-/// merge_default_tags to maintain parity.
+/// Both the plan path and the apply path use the shared desired normalization
+/// pipeline to maintain parity.
 #[test]
-#[ignore = "requires provider binary for default tags merging"]
 fn test_merge_default_tags_prevents_false_diff() {
     use carina_core::resource::Directives;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    // Build a minimal schema that has a "tags" attribute.
-    // merge_default_tags checks for the presence of "tags" in the schema.
+    // Build a minimal schema with the map(string) `tags` attribute required by
+    // host default-tag merging.
     let schema = ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
         "tags",
         AttributeType::map(AttributeType::string()),
@@ -1278,7 +1236,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     };
 
     // Simulate prev_explicit from a previous apply that included "tags"
-    // (because merge_default_tags was called correctly in the plan path).
+    // (because default tags were merged correctly in the plan path).
     let mut prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields> =
         HashMap::new();
     prev_explicit.insert(
@@ -1291,7 +1249,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         },
     );
 
-    // Without merge_default_tags, the desired resource has no tags,
+    // Without host merging, the desired resource has no tags,
     // but state has tags and prev_explicit says "tags" was previously desired.
     // The differ sees this as attribute removal → false Update diff.
     let resources_without = vec![resource.clone()];
@@ -1316,32 +1274,22 @@ fn test_merge_default_tags_prevents_false_diff() {
     );
     assert!(
         !plan_without.effects().is_empty(),
-        "Without merge_default_tags, differ should see a false diff"
+        "without host default-tag merging, differ should see a false diff"
     );
 
-    // After merge_default_tags, desired resource gains the default tags → no diff
-    let ctx = WiringContext::new(vec![], &[]);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("failed to build tokio runtime");
-    let mut router = ProviderRouter::new();
-    for factory in ctx.factories() {
-        let resolved_configs = validated_provider_configs(Vec::new());
-        let resolved_config = resolved_configs.provider_or_implicit(factory.name());
-        let config = carina_core::executor::prepare_provider_ready_config(
-            factory.as_ref(),
-            resolved_config.as_ref(),
-        )
-        .expect("test provider config should pass preparation");
-        router.add_normalizer(
-            factory.name(),
-            rt.block_on(factory.create_normalizer(None, &config))
-                .expect("test normalizer should be created"),
-        );
-    }
+    // After host merging, desired resource gains the default tags → no diff.
+    let config = ProviderConfig {
+        name: "awscc".to_string(),
+        attributes: IndexMap::new(),
+        default_tags,
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    };
     let mut resources_with = vec![resource];
-    rt.block_on(router.merge_default_tags(&mut resources_with, &default_tags, &schemas))
-        .unwrap();
+    carina_core::provider::merge_default_tags(&config, &mut resources_with, &schemas).unwrap();
 
     // After merging, desired now has tags matching state → no diff
     let plan_with = create_plan(
@@ -1362,7 +1310,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     );
     assert!(
         plan_with.effects().is_empty(),
-        "After merge_default_tags, no false diff should occur"
+        "after host default-tag merging, no false diff should occur"
     );
 }
 
@@ -6451,15 +6399,6 @@ mod resolved_value_constraint_gate {
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a carina_core::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ProviderResult<()>> {
-            ready_noop()
-        }
-
-        fn merge_default_tags<'a>(
-            &'a self,
-            _resources: &'a mut [Resource],
-            _default_tags: &'a IndexMap<String, Value>,
-            _registry: &'a SchemaRegistry,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }

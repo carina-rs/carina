@@ -106,13 +106,13 @@ fn build_protocol_v2_component() -> Vec<u8> {
     let state_result = ") -> result<list<tuple<string, state>>, provider-error>;";
     assert_eq!(
         provider_wit.matches(resource_result).count(),
-        2,
-        "v3 WIT must have result channels for both resource normalizers"
+        1,
+        "v4 WIT must have a result channel for desired-resource normalization"
     );
     assert_eq!(
         provider_wit.matches(state_result).count(),
         2,
-        "v3 WIT must have result channels for both state normalizers"
+        "v4 WIT must have result channels for both state normalizers"
     );
     provider_wit = provider_wit
         .replace(resource_result, ") -> list<resource-def>;")
@@ -385,7 +385,7 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn protocol_v2_is_rejected_before_v3_export_signature_binding() {
+async fn protocol_v2_is_rejected_before_v4_world_binding() {
     let source_dir = tempfile::tempdir().expect("create source temp dir");
     let wasm_path = source_dir.path().join("protocol-v2.wasm");
     std::fs::write(&wasm_path, build_protocol_v2_component()).expect("write protocol-v2 component");
@@ -403,14 +403,14 @@ async fn protocol_v2_is_rejected_before_v3_export_signature_binding() {
     );
     assert!(
         rendered.contains(
-            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 3"
+            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 4"
         ),
         "the stable info preflight must report the protocol mismatch: {rendered}"
     );
     assert!(
         !rendered.contains("failed to convert function to given type")
             && !rendered.contains("normalize-desired"),
-        "v3 signature binding must not run before the version check: {rendered}"
+        "v4 world binding must not run before the version check: {rendered}"
     );
 }
 

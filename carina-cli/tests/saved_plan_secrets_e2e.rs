@@ -909,7 +909,7 @@ mock.test.resource {
 }
 
 #[test]
-fn saved_plan_verifies_mock_default_tag_secret_without_production_merge() {
+fn saved_plan_rehydrates_host_merged_default_tag_secret() {
     const ENV_NAME: &str = "SAVED_PLAN_DEFAULT_TAG_SECRET_3861";
     const PLAINTEXT: &str = "DEFAULT_TAG_PLAINTEXT_3861";
     let scenario = Scenario::new_with_env(
@@ -939,9 +939,10 @@ mock.test.resource { name = "default-tag-secret" }
     );
     assert!(
         plan_resource_by_name(&saved_plan, "default-tag-secret")
-            .pointer("/attributes/tags")
-            .is_none(),
-        "the built-in mock must not gain production default-tag normalization",
+            .pointer("/attributes/tags/Map/SecretTag/RedactedSecret/hash")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the host-merged default tag must be redacted on the saved resource: {saved_plan:#}",
     );
 
     let apply = scenario.apply_plan_with_env(&[(ENV_NAME, PLAINTEXT)]);
@@ -949,11 +950,14 @@ mock.test.resource { name = "default-tag-secret" }
     assert_output_has_no_plaintext("carina apply saved plan", &apply, &[PLAINTEXT]);
 
     let provider = scenario.provider_json();
-    assert!(
-        provider_resource_by_name(&provider, "default-tag-secret")
-            .get("tags")
-            .is_none(),
-        "the built-in mock must retain main's no-default-tag behavior",
+    assert_eq!(
+        provider_resource_by_name(&provider, "default-tag-secret")["tags"]["SecretTag"],
+        PLAINTEXT,
+        "saved-plan apply must rehydrate the host-merged default tag",
+    );
+    assert_secret_hash(
+        &state_resource_by_name(&scenario.state_json(), "default-tag-secret")["attributes"]["tags"]
+            ["SecretTag"],
     );
 }
 
