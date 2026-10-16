@@ -56,7 +56,7 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
         None,
     )];
 
-    let stripped = prepare_desired_side_for_plan(
+    prepare_desired_side_for_plan(
         &mut resources,
         &mut [],
         &provider_configs,
@@ -65,7 +65,6 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
     )
     .await
     .expect("test normalizer should traverse the shared desired pipeline");
-    restore_stripped_attributes(&mut resources, stripped);
 
     let Value::Concrete(ConcreteValue::Map(tags)) = resources[0]
         .attributes

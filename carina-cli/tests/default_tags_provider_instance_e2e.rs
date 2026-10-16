@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use carina_cli::commands::plan::PlanFile;
@@ -12,6 +13,56 @@ fn tags(resource: &Resource) -> &IndexMap<String, Value> {
             resource.id
         ),
     }
+}
+
+struct PlanJsonOutput {
+    plan: PlanFile,
+    stderr: String,
+}
+
+fn plan_json(dir: &Path) -> PlanJsonOutput {
+    let init = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "warn")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["init", "."])
+        .output()
+        .expect("run carina init");
+    assert!(
+        init.status.success(),
+        "carina init failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "warn")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["plan", "--json", "."])
+        .output()
+        .expect("run carina plan");
+    assert!(
+        output.status.success(),
+        "carina plan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let json_start = stdout
+        .find('{')
+        .expect("JSON plan must follow provider and refresh status lines");
+    let plan = serde_json::from_str(&stdout[json_start..]).unwrap_or_else(|error| {
+        panic!(
+            "plan output was not a saved-plan JSON document: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+    });
+
+    PlanJsonOutput { plan, stderr }
 }
 
 #[test]
@@ -51,45 +102,7 @@ let second_resource = mock.test.resource {
     )
     .expect("write routed resources");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(project.path())
-        .env("NO_COLOR", "1")
-        .env_remove("CLICOLOR_FORCE")
-        .args(["init", "."])
-        .output()
-        .expect("run carina init");
-    assert!(
-        init.status.success(),
-        "carina init failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&init.stdout),
-        String::from_utf8_lossy(&init.stderr),
-    );
-
-    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(project.path())
-        .env("NO_COLOR", "1")
-        .env_remove("CLICOLOR_FORCE")
-        .args(["plan", "--json", "."])
-        .output()
-        .expect("run carina plan");
-    assert!(
-        output.status.success(),
-        "carina plan failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json_start = stdout
-        .find('{')
-        .expect("JSON plan must follow provider and refresh status lines");
-    let plan: PlanFile = serde_json::from_str(&stdout[json_start..]).unwrap_or_else(|error| {
-        panic!(
-            "plan output was not a saved-plan JSON document: {error}\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            String::from_utf8_lossy(&output.stderr),
-        )
-    });
+    let PlanJsonOutput { plan, .. } = plan_json(project.path());
     let default_resource = plan
         .sorted_resources
         .iter()
@@ -126,6 +139,58 @@ let second_resource = mock.test.resource {
 }
 
 #[test]
+fn plan_merges_default_tags_into_a_ref_bearing_tags_map() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(
+        project.path().join("providers.crn"),
+        r#"provider mock {
+  default_tags = {
+    ManagedBy = "carina"
+  }
+}
+"#,
+    )
+    .expect("write provider configuration");
+    std::fs::write(
+        project.path().join("main.crn"),
+        r#"let a = mock.test.resource {
+  name = "a"
+}
+
+let b = mock.test.resource {
+  name = "b"
+  tags = {
+    Name = "b"
+    Peer = a.identifier
+  }
+}
+"#,
+    )
+    .expect("write ref-bearing resources");
+
+    let PlanJsonOutput { plan, .. } = plan_json(project.path());
+    let resource = plan
+        .sorted_resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("b"))
+        .expect("resource b must be present");
+
+    assert_eq!(
+        tags(resource).get("ManagedBy"),
+        Some(&Value::Concrete(ConcreteValue::String("carina".into()))),
+        "the plan must include provider defaults in a ref-bearing tags map"
+    );
+    assert!(tags(resource).contains_key("Peer"));
+    assert_eq!(
+        resource.get_attr("_default_tag_keys"),
+        Some(&Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("ManagedBy".into())),
+        ]))),
+        "the plan must record exactly which tag was supplied by provider defaults"
+    );
+}
+
+#[test]
 fn plan_logs_when_an_unresolved_default_tag_is_skipped() {
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");
@@ -156,37 +221,7 @@ mock.test.resource {
     )
     .expect("write project configuration");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(&project)
-        .env("NO_COLOR", "1")
-        .env("RUST_LOG", "warn")
-        .env_remove("CLICOLOR_FORCE")
-        .args(["init", "."])
-        .output()
-        .expect("run carina init");
-    assert!(
-        init.status.success(),
-        "carina init failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&init.stdout),
-        String::from_utf8_lossy(&init.stderr),
-    );
-
-    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(&project)
-        .env("NO_COLOR", "1")
-        .env("RUST_LOG", "warn")
-        .env_remove("CLICOLOR_FORCE")
-        .args(["plan", "--json", "."])
-        .output()
-        .expect("run carina plan");
-    assert!(
-        output.status.success(),
-        "carina plan failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let PlanJsonOutput { stderr, .. } = plan_json(&project);
     assert!(
         stderr.contains("Skipping default_tag 'Owner'"),
         "missing skipped-default-tag log message; stderr:\n{stderr}"

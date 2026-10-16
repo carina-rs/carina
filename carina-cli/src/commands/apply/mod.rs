@@ -2413,7 +2413,7 @@ async fn prepare_saved_plan_secret_candidates(
     .await?;
     let normalizers =
         create_normalizers_from_configs_with_ctx(&wiring, provider_inputs.configs()).await?;
-    let stripped = prepare_desired_side_for_plan(
+    prepare_desired_side_for_plan(
         &mut parsed.resources,
         &mut parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
@@ -2422,7 +2422,6 @@ async fn prepare_saved_plan_secret_candidates(
     )
     .await
     .map_err(AppError::Provider)?;
-    carina_core::executor::normalized::restore_stripped_attributes(&mut parsed.resources, stripped);
 
     Ok((provider_inputs, wiring))
 }

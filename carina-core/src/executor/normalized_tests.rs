@@ -3,19 +3,15 @@ use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
 
-use crate::executor::normalized::{
-    apply_desired_normalization, apply_desired_normalization_slice, restore_stripped_attributes,
-    run_desired_normalization_stages, strip_attributes_matching,
-    strip_provider_boundary_attributes,
-};
+use crate::executor::normalized::{apply_desired_normalization, apply_desired_normalization_slice};
 use crate::parser::ProviderConfig;
 use crate::provider::{
     BoxFuture, NoopNormalizer, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
     ready_noop,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State,
-    UnknownReason, Value, contains_resource_ref,
+    ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, UnknownReason,
+    Value,
 };
 use crate::schema::SchemaRegistry;
 use crate::value::SerializationError;
@@ -44,9 +40,15 @@ async fn normalization_error_stops_later_stages() {
     impl ProviderNormalizer for FailingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            _resources: &'a mut [Resource],
+            resources: &'a mut [Resource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
-            Box::pin(async { Err(ProviderError::internal("normalization failed")) })
+            Box::pin(async move {
+                assert!(
+                    resources[0].get_attr("peer").is_some(),
+                    "in-process normalizers must receive ref-bearing attributes"
+                );
+                Err(ProviderError::internal("normalization failed"))
+            })
         }
 
         fn normalize_state<'a>(
@@ -68,6 +70,8 @@ async fn normalization_error_stops_later_stages() {
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
     let mut resources = vec![Resource::with_provider("test", "thing", "example", None)];
+    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
+    resources[0].set_attr("peer", peer_ref.clone());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -77,7 +81,7 @@ async fn normalization_error_stops_later_stages() {
         )),
     );
 
-    let error = run_desired_normalization_stages(
+    let error = apply_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
         &FailingNormalizer,
@@ -91,6 +95,11 @@ async fn normalization_error_stops_later_stages() {
     assert!(
         resources[0].get_attr("tags").is_none(),
         "host default-tag merging must not run after a normalizer error"
+    );
+    assert_eq!(
+        resources[0].get_attr("peer"),
+        Some(&peer_ref),
+        "an in-process normalizer error must leave untouched attributes intact"
     );
 }
 
@@ -109,7 +118,7 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
     let original = resources.clone();
     let schemas = order_schema();
 
-    let error = run_desired_normalization_stages(
+    let error = apply_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
         &NoopNormalizer,
@@ -344,6 +353,75 @@ async fn desired_normalization_merges_non_empty_provider_default_tags() {
 }
 
 #[tokio::test]
+async fn desired_normalization_merges_default_tags_into_ref_bearing_tags() {
+    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
+    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    resource.set_attr(
+        "tags",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("Name".to_string(), string_value("example")),
+            ("Peer".to_string(), peer_ref.clone()),
+        ]))),
+    );
+    let default_tags = IndexMap::from([("ManagedBy".to_string(), string_value("carina"))]);
+
+    let normalized = apply_desired_normalization(
+        resource,
+        &[provider_config(default_tags)],
+        &NoopNormalizer,
+        &[],
+        &order_schema(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        normalized.as_resource().get_attr("tags"),
+        Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("Name".to_string(), string_value("example")),
+            ("Peer".to_string(), peer_ref),
+            ("ManagedBy".to_string(), string_value("carina")),
+        ])))),
+        "host default-tag merging must see the full ref-bearing tags map"
+    );
+    assert_eq!(
+        normalized.as_resource().get_attr("_default_tag_keys"),
+        Some(&Value::Concrete(ConcreteValue::List(vec![string_value(
+            "ManagedBy"
+        )]))),
+        "default-tag metadata must match the keys actually merged into tags"
+    );
+}
+
+#[tokio::test]
+async fn desired_normalization_resolves_enum_alias_nested_with_resource_ref() {
+    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
+    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    resource.set_attr(
+        "settings",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("mode".to_string(), string_value("Mode.friendly")),
+            ("peer".to_string(), peer_ref.clone()),
+        ]))),
+    );
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
+
+    let normalized =
+        apply_desired_normalization(resource, &[], &NoopNormalizer, &factories, &order_schema())
+            .await
+            .unwrap();
+
+    assert_eq!(
+        normalized.as_resource().get_attr("settings"),
+        Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("mode".to_string(), string_value("canonical")),
+            ("peer".to_string(), peer_ref),
+        ])))),
+        "host enum-alias resolution must see full ref-bearing attributes"
+    );
+}
+
+#[tokio::test]
 async fn desired_normalization_scopes_default_tags_to_provider_instance() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -370,7 +448,7 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
         )),
     );
 
-    run_desired_normalization_stages(
+    apply_desired_normalization_slice(
         &mut resources,
         &[default_config, second_config],
         &NoopNormalizer,
@@ -436,7 +514,7 @@ async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
         )),
     );
 
-    run_desired_normalization_stages(
+    apply_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
         &NoopNormalizer,
@@ -456,36 +534,26 @@ async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
 }
 
 #[tokio::test]
-async fn in_place_desired_normalization_does_not_canonicalize_resources() {
-    let mut resource = Resource::with_provider("test", "thing", "example", None);
-    resource.set_attr("subjects", string_value("one"));
-    let mut resources = vec![resource];
-    let schemas = order_schema();
+async fn apply_desired_normalization_passes_deferred_values_to_in_process_normalizers() {
+    struct InspectingNormalizer;
 
-    run_desired_normalization_stages(&mut resources, &[], &NoopNormalizer, &[], &schemas)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        resources[0].get_attr("subjects"),
-        Some(&string_value("one")),
-        "in-place desired normalization must leave canonicalize to the caller so plan code can run it before strip/restore"
-    );
-}
-
-#[tokio::test]
-async fn apply_desired_normalization_strips_and_restores_deferred_resource_refs() {
-    struct RefRejectingNormalizer;
-
-    impl ProviderNormalizer for RefRejectingNormalizer {
+    impl ProviderNormalizer for InspectingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
             resources: &'a mut [Resource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
-                assert!(
-                    resources[0].get_attr("role_arn").is_none(),
-                    "deferred resource refs must be stripped before provider normalization"
+                assert!(matches!(
+                    resources[0].get_attr("role_arn"),
+                    Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+                ));
+                assert!(matches!(
+                    resources[0].get_attr("pending"),
+                    Some(Value::Deferred(DeferredValue::Unknown(_)))
+                ));
+                resources[0].set_attr(
+                    "observed_full_resource",
+                    Value::Concrete(ConcreteValue::Bool(true)),
                 );
                 Ok(())
             })
@@ -510,11 +578,15 @@ async fn apply_desired_normalization_strips_and_restores_deferred_resource_refs(
     let deferred = Value::resource_ref("role", "arn", vec![]);
     let mut resource = Resource::new("test", "thing");
     resource.set_attr("role_arn", deferred.clone());
+    resource.set_attr(
+        "pending",
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+    );
 
     let normalized = apply_desired_normalization(
         resource,
         &[],
-        &RefRejectingNormalizer,
+        &InspectingNormalizer,
         &[],
         &SchemaRegistry::new(),
     )
@@ -524,25 +596,38 @@ async fn apply_desired_normalization_strips_and_restores_deferred_resource_refs(
     assert_eq!(
         normalized.as_resource().get_attr("role_arn"),
         Some(&deferred),
-        "the stripped deferred resource ref must be restored after normalization"
+        "in-process normalization must preserve deferred resource refs"
+    );
+    assert!(matches!(
+        normalized.as_resource().get_attr("pending"),
+        Some(Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::ForValue
+        )))
+    ));
+    assert_eq!(
+        normalized.as_resource().get_attr("observed_full_resource"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
     );
 }
 
 #[tokio::test]
-async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_refs() {
-    struct RefRejectingNormalizer {
+async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resources() {
+    struct FullResourceNormalizer {
         calls: Arc<Mutex<Vec<String>>>,
     }
 
-    impl ProviderNormalizer for RefRejectingNormalizer {
+    impl ProviderNormalizer for FullResourceNormalizer {
         fn normalize_desired<'a>(
             &'a self,
             resources: &'a mut [Resource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 assert!(
-                    resources[0].get_attr("ref_subjects").is_none(),
-                    "ref-bearing attributes must be stripped before normalize_desired"
+                    matches!(
+                        resources[0].get_attr("ref_subjects"),
+                        Some(Value::Deferred(DeferredValue::Interpolation(_)))
+                    ),
+                    "in-process normalize_desired must receive ref-bearing attributes"
                 );
                 self.calls
                     .lock()
@@ -578,7 +663,7 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
     resource.set_attr("ref_subjects", ref_interpolation.clone());
 
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let normalizer = RefRejectingNormalizer {
+    let normalizer = FullResourceNormalizer {
         calls: Arc::clone(&calls),
     };
     let mut default_tags = IndexMap::new();
@@ -611,7 +696,7 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
     assert_eq!(
         resources[0].get_attr("ref_subjects"),
         Some(&ref_interpolation),
-        "ref-bearing interpolation must round-trip unchanged"
+        "the in-process normalizer must retain the ref-bearing interpolation"
     );
     assert_eq!(
         resources[0].get_attr("tags"),
@@ -619,380 +704,13 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
             "ManagedBy".to_string(),
             string_value("carina"),
         )])))),
-        "slice wrapper must run host default-tag merging while refs are stripped"
+        "slice wrapper must run host default-tag merging on the full resource"
     );
     assert_eq!(
         resources[0].get_attr("mode"),
         Some(&string_value("canonical")),
         "slice wrapper must run enum alias resolution after provider stages"
     );
-}
-
-// ----- RFC #2371 stage 2 (#2377): strip-and-restore round trip -----
-
-#[test]
-fn strip_and_restore_unknown_attributes_round_trip() {
-    let mut r = Resource::new("test.t", "n");
-    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    r.attributes.insert(
-        "group_description".into(),
-        Value::Concrete(ConcreteValue::String("web".into())),
-    );
-    r.attributes.insert(
-        "vpc_id".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
-            path: path.clone(),
-        })),
-    );
-    let mut tags: IndexMap<String, Value> = IndexMap::new();
-    tags.insert(
-        "Name".into(),
-        Value::Concrete(ConcreteValue::String("web-sg".into())),
-    );
-    r.attributes
-        .insert("tags".into(), Value::Concrete(ConcreteValue::Map(tags)));
-    r.attributes.insert(
-        "nested_unknown".into(),
-        Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-            DeferredValue::Unknown(UnknownReason::UpstreamRef { path }),
-        )])),
-    );
-    let mut resources = vec![r];
-    let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
-
-    let stripped = strip_provider_boundary_attributes(&mut resources);
-    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(
-        after_strip,
-        vec!["group_description".to_string(), "tags".to_string()]
-    );
-    assert_eq!(stripped.len(), 1);
-    let entries = stripped.values().next().unwrap();
-    assert_eq!(entries.len(), 2);
-
-    restore_stripped_attributes(&mut resources, stripped);
-    let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(
-        order_after, order_before,
-        "restore must put attributes back at their original index"
-    );
-    assert!(matches!(
-        resources[0].get_attr("vpc_id"),
-        Some(Value::Deferred(DeferredValue::Unknown(_)))
-    ));
-    match resources[0].get_attr("nested_unknown") {
-        Some(Value::Concrete(ConcreteValue::List(items))) => {
-            assert!(matches!(
-                items[0],
-                Value::Deferred(DeferredValue::Unknown(_))
-            ));
-        }
-        other => panic!(
-            "nested_unknown should still be Value::Concrete(ConcreteValue::List), got {:?}",
-            other
-        ),
-    }
-}
-
-#[test]
-fn strip_provider_boundary_attributes_recurses_into_unknown_wrappers() {
-    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let unknown = || {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
-            path: path.clone(),
-        }))
-    };
-
-    let mut resource = Resource::new("test.t", "n");
-    resource.attributes.insert("direct".into(), unknown());
-    resource.attributes.insert(
-        "list".into(),
-        Value::Concrete(ConcreteValue::List(vec![unknown()])),
-    );
-    resource.attributes.insert(
-        "map".into(),
-        Value::Concrete(ConcreteValue::Map({
-            let mut m = IndexMap::new();
-            m.insert("k".into(), unknown());
-            m
-        })),
-    );
-    resource.attributes.insert(
-        "interpolation".into(),
-        Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-            unknown(),
-        )])),
-    );
-    resource.attributes.insert(
-        "function".into(),
-        Value::Deferred(DeferredValue::FunctionCall {
-            name: "f".into(),
-            args: vec![unknown()],
-        }),
-    );
-    resource.attributes.insert(
-        "secret".into(),
-        Value::Deferred(DeferredValue::Secret(Box::new(unknown()))),
-    );
-    resource.attributes.insert(
-        "plain_string".into(),
-        Value::Concrete(ConcreteValue::String("x".into())),
-    );
-    resource
-        .attributes
-        .insert("plain_int".into(), Value::Concrete(ConcreteValue::Int(1)));
-    let mut resources = vec![resource];
-
-    let stripped = strip_provider_boundary_attributes(&mut resources);
-
-    assert_eq!(stripped.values().next().unwrap().len(), 6);
-    assert_eq!(
-        resources[0].attributes.keys().cloned().collect::<Vec<_>>(),
-        vec!["plain_string".to_string(), "plain_int".to_string()]
-    );
-}
-
-#[test]
-fn restore_unknown_attributes_after_normalize_injection() {
-    let mut r = Resource::new("test.t", "n");
-    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    r.attributes.insert(
-        "a".into(),
-        Value::Concrete(ConcreteValue::String("a-val".into())),
-    );
-    r.attributes.insert(
-        "b".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
-            path: path.clone(),
-        })),
-    );
-    r.attributes.insert(
-        "c".into(),
-        Value::Concrete(ConcreteValue::String("c-val".into())),
-    );
-    let mut resources = vec![r];
-
-    let stripped = strip_provider_boundary_attributes(&mut resources);
-    resources[0].attributes.insert(
-        "z".into(),
-        Value::Concrete(ConcreteValue::String("z-val".into())),
-    );
-    restore_stripped_attributes(&mut resources, stripped);
-
-    let order: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(
-        order,
-        vec![
-            "a".to_string(),
-            "b".to_string(),
-            "c".to_string(),
-            "z".to_string()
-        ],
-        "originals must keep their indices; injected attrs trail them"
-    );
-}
-
-#[test]
-fn strip_and_restore_for_expression_unknowns_round_trip() {
-    let mut r = Resource::new("test.t", "n");
-    r.attributes.insert(
-        "name".into(),
-        Value::Concrete(ConcreteValue::String("static".into())),
-    );
-    r.attributes.insert(
-        "target_id".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
-    );
-    r.attributes.insert(
-        "items".into(),
-        Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-            DeferredValue::Unknown(UnknownReason::ForKey),
-        )])),
-    );
-    r.attributes.insert(
-        "index".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
-    );
-    let mut resources = vec![r];
-    let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
-
-    let stripped = strip_provider_boundary_attributes(&mut resources);
-    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(
-        after_strip,
-        vec!["name".to_string()],
-        "all three for-expression Unknown attributes must be stripped"
-    );
-    assert_eq!(stripped.values().next().unwrap().len(), 3);
-
-    restore_stripped_attributes(&mut resources, stripped);
-    let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(
-        order_after, order_before,
-        "for-expression Unknowns must be restored at their original indices"
-    );
-    assert!(matches!(
-        resources[0].get_attr("target_id"),
-        Some(Value::Deferred(DeferredValue::Unknown(
-            UnknownReason::ForValue
-        )))
-    ));
-    assert!(matches!(
-        resources[0].get_attr("index"),
-        Some(Value::Deferred(DeferredValue::Unknown(
-            UnknownReason::ForIndex
-        )))
-    ));
-}
-
-#[test]
-fn strip_provider_boundary_attributes_covers_unknown_for_variants() {
-    let mut resource = Resource::new("test.t", "n");
-    resource.attributes.insert(
-        "for_value".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
-    );
-    resource.attributes.insert(
-        "for_key".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
-    );
-    resource.attributes.insert(
-        "for_index".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
-    );
-    resource.attributes.insert(
-        "nested_for_value".into(),
-        Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-            DeferredValue::Unknown(UnknownReason::ForValue),
-        )])),
-    );
-    let mut resources = vec![resource];
-
-    let stripped = strip_provider_boundary_attributes(&mut resources);
-
-    assert_eq!(stripped.values().next().unwrap().len(), 4);
-    assert!(resources[0].attributes.is_empty());
-}
-
-// ----- #2387: strip-and-restore round trip for ResourceRef -----
-
-#[test]
-fn strip_and_restore_resource_ref_round_trip() {
-    let mut r = Resource::new("test.t", "n");
-    let path = AccessPath::with_fields("admins", "group_id", vec![]);
-    r.attributes.insert(
-        "name".into(),
-        Value::Concrete(ConcreteValue::String("static".into())),
-    );
-    r.attributes.insert(
-        "group_id".into(),
-        Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
-    );
-    let mut nested_map: IndexMap<String, Value> = IndexMap::new();
-    nested_map.insert(
-        "ref".into(),
-        Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
-    );
-    r.attributes.insert(
-        "policy".into(),
-        Value::Concrete(ConcreteValue::Map(nested_map)),
-    );
-    r.attributes.insert(
-        "label".into(),
-        Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("prefix-".into()),
-            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                path: path.clone(),
-            })),
-        ])),
-    );
-    r.attributes.insert(
-        "joined".into(),
-        Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".into(),
-            args: vec![
-                Value::Concrete(ConcreteValue::String(",".into())),
-                Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
-            ],
-        }),
-    );
-    r.attributes.insert(
-        "secret_ref".into(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::ResourceRef { path: path.clone() },
-        )))),
-    );
-    let mut resources = vec![r];
-    let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
-
-    let stripped = strip_attributes_matching(&mut resources, &contains_resource_ref);
-    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(
-        after_strip,
-        vec!["name".to_string()],
-        "every attribute that recursively contains a ResourceRef must be stripped"
-    );
-    let entries = stripped.values().next().expect("one resource stripped");
-    assert_eq!(entries.len(), 5);
-
-    restore_stripped_attributes(&mut resources, stripped);
-    let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(
-        order_after, order_before,
-        "ResourceRef-bearing attributes must be restored at their original indices"
-    );
-    assert!(matches!(
-        resources[0].get_attr("group_id"),
-        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-    ));
-    assert!(matches!(
-        resources[0].get_attr("label"),
-        Some(Value::Deferred(DeferredValue::Interpolation(_)))
-    ));
-    assert!(matches!(
-        resources[0].get_attr("joined"),
-        Some(Value::Deferred(DeferredValue::FunctionCall { .. }))
-    ));
-    assert!(matches!(
-        resources[0].get_attr("secret_ref"),
-        Some(Value::Deferred(DeferredValue::Secret(_)))
-    ));
-}
-
-#[test]
-fn strip_unified_predicate_covers_unknown_and_ref() {
-    let mut r = Resource::new("test.t", "n");
-    let path = AccessPath::with_fields("admins", "group_id", vec![]);
-    r.attributes.insert(
-        "name".into(),
-        Value::Concrete(ConcreteValue::String("static".into())),
-    );
-    r.attributes.insert(
-        "vpc_id".into(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
-            path: AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]),
-        })),
-    );
-    r.attributes.insert(
-        "group_id".into(),
-        Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
-    );
-    let mut resources = vec![r];
-
-    let stripped = strip_provider_boundary_attributes(&mut resources);
-    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
-    assert_eq!(after_strip, vec!["name".to_string()]);
-    assert_eq!(stripped.values().next().unwrap().len(), 2);
-
-    restore_stripped_attributes(&mut resources, stripped);
-    assert!(matches!(
-        resources[0].get_attr("vpc_id"),
-        Some(Value::Deferred(DeferredValue::Unknown(_)))
-    ));
-    assert!(matches!(
-        resources[0].get_attr("group_id"),
-        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-    ));
 }
 
 #[tokio::test]

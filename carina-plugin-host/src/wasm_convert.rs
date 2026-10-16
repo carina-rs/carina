@@ -236,12 +236,12 @@ impl std::error::Error for WasmValueDecodeError {
 ///
 /// Returns `Err(SerializationError)` for `Value::Deferred(DeferredValue::Unknown)`,
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
-/// `Value::Deferred(DeferredValue::FunctionCall)`. The plan-time pipeline strips every attribute
-/// that recursively contains one of these via
-/// `PlanPreprocessor::prepare`'s strip-and-restore pass, so reaching
-/// any of these arms is a producer-side bug — the diagnostic identifies
-/// which variant leaked. See RFC #2371 stage 2 (#2378) for `Unknown`
-/// and #2387 for `ResourceRef` / `Interpolation` / `FunctionCall`.
+/// `Value::Deferred(DeferredValue::FunctionCall)`. The scoped transport wrapper in
+/// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
+/// attributes before conversion and restores them after the guest call, so
+/// reaching any of these arms is a producer-side bug — the diagnostic
+/// identifies which variant leaked. See RFC #2371 stage 2 (#2378) for
+/// `Unknown` and #2387 for `ResourceRef` / `Interpolation` / `FunctionCall`.
 ///
 /// `Value::Deferred(DeferredValue::Secret(inner))` is encoded as the `secret-val` WIT variant
 /// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
@@ -517,8 +517,9 @@ pub(crate) fn wit_to_core_binding_pattern(
 /// Helper: convert a core Value to a serde_json::Value for JSON
 /// encoding inside the WIT-string fallback for List/Map. Returns
 /// `Err` for the same set of variants as `core_to_wit_value` — see
-/// that function's doc for the rationale and the strip-and-restore
-/// pass that keeps these arms unreachable in legitimate flows.
+/// that function's doc for the rationale and the scoped strip-and-restore
+/// wrapper in `WasmProviderNormalizer::normalize_desired` that keeps these
+/// arms unreachable in legitimate desired-normalization flows.
 #[cfg(test)]
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     core_value_to_json_from(v, ValueWireSource::Desired)
@@ -2016,9 +2017,9 @@ mod tests {
     }
 
     /// RFC #2371 stage 4 contract pin: `Value::Deferred(DeferredValue::Unknown)` reaching either
-    /// WASM-boundary converter is a stage-2 invariant violation
-    /// (`PlanPreprocessor::strip_unknown_attributes` must remove it
-    /// first). The converters now return `Err(SerializationError::
+    /// WASM-boundary converter during desired normalization is a stage-2
+    /// invariant violation (`WasmProviderNormalizer::normalize_desired` must
+    /// hide its containing attribute first). The converters now return `Err(SerializationError::
     /// UnknownNotAllowed)` so a silent `format!("{v:?}")` fallback
     /// would re-introduce the v1 corruption bug (#2375); these tests
     /// pin the contract by asserting the variant + context survives.
@@ -2315,9 +2316,9 @@ mod tests {
     }
 
     /// #2387: `Value::Deferred(DeferredValue::ResourceRef)` reaching `core_to_wit_value` is a
-    /// stage-2 invariant violation now — the strip-and-restore pass in
-    /// `PlanPreprocessor::prepare` removes any attribute that
-    /// recursively contains a `ResourceRef` before this boundary. The
+    /// stage-2 invariant violation now — the scoped strip-and-restore wrapper
+    /// in `WasmProviderNormalizer::normalize_desired` removes any attribute
+    /// that recursively contains a `ResourceRef` before this boundary. The
     /// converter returns `Err(UnresolvedResourceRef)` so a regression
     /// surfaces as a typed error at the call site instead of a
     /// debug-format string silently flowing into the provider.

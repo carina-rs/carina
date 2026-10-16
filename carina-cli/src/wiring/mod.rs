@@ -19,8 +19,8 @@ use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
 };
 use carina_core::executor::normalized::{
-    StrippedAttributes, is_value_fully_concrete_for_expansion, restore_stripped_attributes,
-    run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
+    apply_desired_normalization_slice, is_value_fully_concrete_for_expansion,
+    states_contain_unknown,
 };
 use carina_core::executor::{
     ProviderReadyConfig, UnresolvedDataSourceInput, prepare_provider_ready_config,
@@ -1163,7 +1163,7 @@ impl<'a> PlanPreprocessor<'a> {
         }
 
         let resources = resources.resources_mut();
-        let stripped = prepare_desired_side_for_plan(
+        prepare_desired_side_for_plan(
             resources,
             data_sources,
             provider_configs,
@@ -1172,48 +1172,41 @@ impl<'a> PlanPreprocessor<'a> {
         )
         .await?;
         // Hard assert (not debug_assert): RFC #2371 constraint b says
-        // state files never carry `Value::Deferred(DeferredValue::Unknown)`, and the
-        // strip-and-restore design depends on it. A release-mode
-        // violation would degrade silently into a WASM-boundary panic
-        // far from the source — fail fast here instead.
+        // state files never carry `Value::Deferred(DeferredValue::Unknown)`.
+        // Unlike desired resources, states have no legitimate deferred values
+        // to hide before `normalize_state` crosses the provider boundary. A
+        // release-mode violation would otherwise degrade into a distant WASM
+        // serialization failure, so fail fast here instead.
         assert!(
             !states_contain_unknown(current_states),
             "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
-        if let Err(error) = self.normalizer.normalize_state(current_states).await {
-            restore_stripped_attributes(resources, stripped);
-            return Err(PlanPreparationError::Provider(error));
-        }
+        self.normalizer.normalize_state(current_states).await?;
         resolve_enum_aliases_in_states(self.ctx, current_states);
         // carina#3358: the `until` predicate RHS is the third enum-alias
         // axis. Resolve it here, beside the resource/state passes, so the
-        // shared seam keeps all three in lockstep. `resources` carry
-        // their real `id`/`binding` (stripping only touched attributes),
-        // so target lookup is valid at this point.
+        // shared seam keeps all three in lockstep. Desired resources retain
+        // every attribute throughout the core/CLI pipeline; any transport-level
+        // hiding is internal to the WASM provider boundary. Target lookup uses
+        // each resource's stable `id`/`binding`.
         resolve_enum_aliases_in_wait_bindings(self.ctx, wait_bindings, resources, data_sources);
-        restore_stripped_attributes(resources, stripped);
         Ok(())
     }
 }
 
-/// The complete desired-side portion of plan preprocessing. Saved-plan
-/// verification calls this same function, then restores the stripped values
-/// immediately because it has no state-side normalization work to perform.
+/// The complete desired-side portion of plan preprocessing. Resources retain
+/// every desired attribute throughout this host-owned pipeline; any
+/// transport-level hiding is internal to the WASM provider boundary.
 pub(crate) async fn prepare_desired_side_for_plan(
     resources: &mut [Resource],
     data_sources: &mut [DataSource],
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
     ctx: &WiringContext,
-) -> Result<StrippedAttributes, ProviderError> {
-    carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas());
+) -> Result<(), ProviderError> {
     carina_core::value::canonicalize_data_sources_with_schemas(data_sources, ctx.schemas());
 
-    // Deferred values cannot cross a provider boundary. Retain them while the
-    // provider normalizes only the concrete desired attributes, then let the
-    // caller restore them at the point appropriate to its larger pipeline.
-    let stripped = strip_provider_boundary_attributes(resources);
-    if let Err(error) = run_desired_normalization_stages(
+    apply_desired_normalization_slice(
         resources,
         provider_configs,
         normalizer,
@@ -1221,11 +1214,6 @@ pub(crate) async fn prepare_desired_side_for_plan(
         ctx.schemas(),
     )
     .await
-    {
-        restore_stripped_attributes(resources, stripped);
-        return Err(error);
-    }
-    Ok(stripped)
 }
 
 /// Normalize enum values in current states to match DSL format.
