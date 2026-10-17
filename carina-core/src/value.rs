@@ -7022,6 +7022,7 @@ mod tests {
             binding: Some("p1".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }

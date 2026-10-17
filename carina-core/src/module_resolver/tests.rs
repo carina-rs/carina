@@ -39,7 +39,7 @@ fn create_test_module() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::with_identity("security_group", "sg"),
+            id: ResourceId::with_provider_identity("aws", "security_group", "sg", None),
             attributes: {
                 let mut attrs = HashMap::new();
                 attrs.insert(
@@ -52,10 +52,6 @@ fn create_test_module() -> ParsedFile {
                         binding: "vpc_id".to_string(),
                     }),
                 );
-                attrs.insert(
-                    "_type".to_string(),
-                    Value::Concrete(ConcreteValue::String("aws.security_group".into())),
-                );
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
@@ -63,6 +59,7 @@ fn create_test_module() -> ParsedFile {
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -171,6 +168,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -371,6 +369,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             binding: Some("cert".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -474,6 +473,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             instance: current_prefix.clone(),
             scope: None,
         }),
+        default_tag_keys: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),
     }];
 
@@ -518,6 +518,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 binding: Some("vpc".to_string()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                default_tag_keys: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
             Resource {
@@ -535,6 +536,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 binding: Some("subnet".to_string()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                default_tag_keys: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         ],
@@ -670,16 +672,12 @@ fn create_module_with_attributes() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::with_identity("security_group", "sg"),
+            id: ResourceId::with_provider_identity("aws", "security_group", "sg", None),
             attributes: {
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     "name".to_string(),
                     Value::Concrete(ConcreteValue::String("sg".into())),
-                );
-                attrs.insert(
-                    "_type".to_string(),
-                    Value::Concrete(ConcreteValue::String("aws.security_group".into())),
                 );
                 attrs.into_iter().collect()
             },
@@ -688,6 +686,7 @@ fn create_module_with_attributes() -> ParsedFile {
             binding: Some("sg".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -1945,6 +1944,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             binding: Some("distribution".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.wait_bindings.push(WaitBinding {
@@ -2201,6 +2201,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             binding: Some("vpc".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -2310,12 +2311,7 @@ fn test_nested_module_two_level() {
     let resource_types: Vec<&str> = parsed
         .resources
         .iter()
-        .filter_map(|r| {
-            r.get_attr("_type").and_then(|v| match v {
-                Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext()),
-                _ => None,
-            })
-        })
+        .map(|resource| resource.id.resource_type.as_str())
         .collect();
 
     assert!(
@@ -2327,6 +2323,13 @@ fn test_nested_module_two_level() {
         resource_types.iter().any(|t| t.ends_with(".SecurityGroup")),
         "Should contain security group from outer module, got: {:?}",
         resource_types
+    );
+    assert!(
+        parsed
+            .resources
+            .iter()
+            .all(|resource| resource.attributes.keys().all(|key| !key.starts_with('_'))),
+        "module expansion must not introduce host metadata into resource attributes"
     );
 }
 
@@ -2407,12 +2410,7 @@ fn test_nested_module_three_level() {
     let resource_types: Vec<&str> = parsed
         .resources
         .iter()
-        .filter_map(|r| {
-            r.get_attr("_type").and_then(|v| match v {
-                Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext()),
-                _ => None,
-            })
-        })
+        .map(|resource| resource.id.resource_type.as_str())
         .collect();
 
     assert!(
@@ -5229,6 +5227,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             binding: Some("cert".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.deferred_for_expressions.push(DeferredForExpression {
@@ -5264,6 +5263,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                default_tag_keys: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         });
@@ -5445,6 +5445,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                default_tag_keys: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         });

@@ -64,8 +64,7 @@ pub enum ExplicitFields {
 }
 
 /// Build an `ExplicitFields::Struct` rooted at a resource's top-level
-/// attributes. Underscore-prefixed keys (internal attributes) are
-/// excluded. Lists are recorded in the resource value's order; state
+/// attributes. Lists are recorded in the resource value's order; state
 /// writeback must use [`build_from_resource_for_stored_values`] instead.
 #[cfg(test)]
 pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
@@ -73,7 +72,6 @@ pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
         children: resource
             .attributes
             .iter()
-            .filter(|(k, _)| !k.starts_with('_'))
             .map(|(k, v)| (k.clone(), build_from_value(v)))
             .collect(),
     }
@@ -102,7 +100,6 @@ pub fn build_from_resource_for_stored_values(
         children: resource
             .attributes
             .iter()
-            .filter(|(key, _)| !key.starts_with('_'))
             .map(|(key, desired)| {
                 (
                     key.clone(),
@@ -593,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn build_from_resource_skips_underscore_attrs() {
+    fn build_from_resource_records_all_resource_attributes() {
         let mut r = Resource::with_provider("aws", "s3.Bucket", "x", None);
         r.set_attr(
             "name".to_string(),
@@ -607,7 +604,7 @@ mod tests {
             panic!("expected Struct at root");
         };
         assert!(children.contains_key("name"));
-        assert!(!children.contains_key("_internal"));
+        assert!(children.contains_key("_internal"));
     }
 
     #[test]

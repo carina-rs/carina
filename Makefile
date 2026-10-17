@@ -70,6 +70,8 @@ plan-explicit:
 	$(PLAN_FIXTURE) explicit --detail explicit
 plan-default-tags:
 	$(PLAN_FIXTURE) default_tags
+plan-default-tags-update-replace:
+	$(PLAN_FIXTURE) default_tags_update_replace
 plan-depends-on:
 	$(PLAN_FIXTURE) depends_on
 plan-resolved-value-constraint-multifile:
@@ -179,6 +181,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== default_tags ==="
 	@$(MAKE) plan-default-tags
+	@echo ""
+	@echo "=== default_tags_update_replace ==="
+	@$(MAKE) plan-default-tags-update-replace
 	@echo ""
 	@echo "=== state_blocks ==="
 	@$(MAKE) plan-state-blocks
@@ -322,7 +327,7 @@ plan-multi-instance-module:
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \
         plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
-        plan-default-values plan-explicit plan-default-tags \
+        plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \

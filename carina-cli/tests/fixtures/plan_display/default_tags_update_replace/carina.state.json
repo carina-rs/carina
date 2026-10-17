@@ -1,0 +1,66 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-default-tags-update-replace",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "updated",
+      "provider": "awscc",
+      "identifier": "vpc-updated",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "tags": {
+          "ManagedBy": "carina"
+        }
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "updated",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
+    },
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "replaced",
+      "provider": "awscc",
+      "identifier": "vpc-replaced",
+      "attributes": {
+        "cidr_block": "10.1.0.0/16",
+        "tags": {
+          "ManagedBy": "legacy"
+        }
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "replaced",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1703,11 +1703,8 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 Effect::Delete { .. } => value.red().strikethrough().to_string(),
                 _ => colored_value(value, ref_binding.is_some()),
             };
-            if let Some(ann) = annotation {
-                writeln!(out, "{}{}: {}  {}", attr_prefix, key, cv, ann.dimmed()).unwrap();
-            } else {
-                writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
-            }
+            let annotation_suffix = annotation_suffix(annotation.as_deref());
+            writeln!(out, "{}{}: {}{}", attr_prefix, key, cv, annotation_suffix).unwrap();
         }
         DetailRow::PrettyAttribute { key, value } => {
             // attr_prefix may contain the tree glyph `│` (U+2502, 1 column
@@ -1750,19 +1747,13 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                     _ => colored_value(&pretty, false),
                 };
                 let cv = reindent_with_gutter(&cv, attr_prefix);
-                if let Some(ann) = &entry.annotation {
-                    writeln!(
-                        out,
-                        "{}  {}: {}  {}",
-                        attr_prefix,
-                        entry.key,
-                        cv,
-                        ann.dimmed()
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(out, "{}  {}: {}", attr_prefix, entry.key, cv).unwrap();
-                }
+                let annotation_suffix = annotation_suffix(entry.annotation.as_deref());
+                writeln!(
+                    out,
+                    "{}  {}: {}{}",
+                    attr_prefix, entry.key, cv, annotation_suffix
+                )
+                .unwrap();
             }
         }
         DetailRow::Changed { key, old, new } => {
@@ -1968,26 +1959,39 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
 fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_prefix: &str) {
     for entry in entries {
         match entry {
-            MapDiffEntryIR::Changed { key, old, new } => {
+            MapDiffEntryIR::Changed {
+                key,
+                old,
+                new,
+                annotation,
+            } => {
+                let annotation_suffix = annotation_suffix(annotation.as_deref());
                 writeln!(
                     out,
-                    "{}  {} {}: {} → {}",
+                    "{}  {} {}: {} → {}{}",
                     attr_prefix,
                     "~".yellow(),
                     key,
                     old.red().strikethrough(),
-                    colored_value(new, false)
+                    colored_value(new, false),
+                    annotation_suffix
                 )
                 .unwrap();
             }
-            MapDiffEntryIR::Added { key, value } => {
+            MapDiffEntryIR::Added {
+                key,
+                value,
+                annotation,
+            } => {
+                let annotation_suffix = annotation_suffix(annotation.as_deref());
                 writeln!(
                     out,
-                    "{}  {} {}: {}",
+                    "{}  {} {}: {}{}",
                     attr_prefix,
                     "+".green(),
                     key,
-                    colored_value(value, false)
+                    colored_value(value, false),
+                    annotation_suffix
                 )
                 .unwrap();
             }
@@ -2032,6 +2036,12 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
             }
         }
     }
+}
+
+fn annotation_suffix(annotation: Option<&str>) -> String {
+    annotation.map_or_else(String::new, |annotation| {
+        format!("  {}", annotation.dimmed())
+    })
 }
 
 /// Render a string-list diff (#2943) with ANSI colors. The

@@ -1,5 +1,6 @@
+use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
 use carina_core::resource::{ConcreteValue, Resource, Value};
@@ -17,52 +18,51 @@ fn tags(resource: &Resource) -> &IndexMap<String, Value> {
 
 struct PlanJsonOutput {
     plan: PlanFile,
+    json: serde_json::Value,
     stderr: String,
 }
 
-fn plan_json(dir: &Path) -> PlanJsonOutput {
-    let init = Command::new(env!("CARGO_BIN_EXE_carina"))
+fn run_cli(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_carina"))
         .current_dir(dir)
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "warn")
         .env_remove("CLICOLOR_FORCE")
-        .args(["init", "."])
+        .args(args)
         .output()
-        .expect("run carina init");
-    assert!(
-        init.status.success(),
-        "carina init failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&init.stdout),
-        String::from_utf8_lossy(&init.stderr),
-    );
+        .expect("run carina")
+}
 
-    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(dir)
-        .env("NO_COLOR", "1")
-        .env("RUST_LOG", "warn")
-        .env_remove("CLICOLOR_FORCE")
-        .args(["plan", "--json", "."])
-        .output()
-        .expect("run carina plan");
+fn assert_success(output: &Output, operation: &str) {
     assert!(
         output.status.success(),
-        "carina plan failed\nstdout:\n{}\nstderr:\n{}",
+        "carina {operation} failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+fn plan_json(dir: &Path) -> PlanJsonOutput {
+    let init = run_cli(dir, &["init", "."]);
+    assert_success(&init, "init");
+
+    let output = run_cli(dir, &["plan", "--json", "."]);
+    assert_success(&output, "plan --json");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let json_start = stdout
         .find('{')
         .expect("JSON plan must follow provider and refresh status lines");
-    let plan = serde_json::from_str(&stdout[json_start..]).unwrap_or_else(|error| {
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout[json_start..]).unwrap_or_else(|error| {
         panic!(
             "plan output was not a saved-plan JSON document: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )
     });
+    let plan = serde_json::from_value(json.clone()).expect("decode saved-plan JSON");
 
-    PlanJsonOutput { plan, stderr }
+    PlanJsonOutput { plan, json, stderr }
 }
 
 #[test]
@@ -168,12 +168,13 @@ let b = mock.test.resource {
     )
     .expect("write ref-bearing resources");
 
-    let PlanJsonOutput { plan, .. } = plan_json(project.path());
-    let resource = plan
+    let PlanJsonOutput { plan, json, .. } = plan_json(project.path());
+    let resource_index = plan
         .sorted_resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("b"))
+        .position(|resource| resource.binding.as_deref() == Some("b"))
         .expect("resource b must be present");
+    let resource = &plan.sorted_resources[resource_index];
 
     assert_eq!(
         tags(resource).get("ManagedBy"),
@@ -181,13 +182,183 @@ let b = mock.test.resource {
         "the plan must include provider defaults in a ref-bearing tags map"
     );
     assert!(tags(resource).contains_key("Peer"));
-    assert_eq!(
-        resource.get_attr("_default_tag_keys"),
-        Some(&Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("ManagedBy".into())),
-        ]))),
-        "the plan must record exactly which tag was supplied by provider defaults"
+    assert!(
+        resource.default_tag_keys.contains("ManagedBy"),
+        "the plan must record the tag supplied by provider defaults"
     );
+    let json_resource = &json["sorted_resources"][resource_index];
+    assert_eq!(
+        json_resource.get("default_tag_keys"),
+        Some(&serde_json::json!(["ManagedBy"])),
+        "plan JSON must serialize typed default-tag provenance"
+    );
+    assert!(
+        json_resource["attributes"]
+            .as_object()
+            .expect("resource attributes must be an object")
+            .keys()
+            .all(|key| !key.starts_with('_')),
+        "plan JSON attributes must contain no host metadata"
+    );
+}
+
+#[test]
+fn saved_plan_apply_preserves_default_tag_annotation_without_persisting_provenance() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    fs::write(
+        project.path().join("backend.crn"),
+        r#"backend local { path = "carina.state.json" }
+"#,
+    )
+    .expect("write backend configuration");
+    fs::write(
+        project.path().join("providers.crn"),
+        r#"provider mock {
+  default_tags = {
+    ManagedBy = "carina"
+  }
+}
+"#,
+    )
+    .expect("write provider configuration");
+    fs::write(
+        project.path().join("main.crn"),
+        r#"let a = mock.test.resource {
+  name = "a"
+}
+"#,
+    )
+    .expect("write resource configuration");
+
+    assert_success(&run_cli(project.path(), &["init", "."]), "init");
+    assert_success(
+        &run_cli(project.path(), &["plan", "--out", "plan.json", "."]),
+        "plan --out",
+    );
+
+    let saved_plan: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(project.path().join("plan.json")).expect("read saved plan"),
+    )
+    .expect("parse saved plan");
+    let saved_resource = saved_plan["sorted_resources"]
+        .as_array()
+        .expect("saved plan resources must be an array")
+        .iter()
+        .find(|resource| resource["binding"] == "a")
+        .expect("saved plan must contain resource a");
+    assert_eq!(
+        saved_resource.get("default_tag_keys"),
+        Some(&serde_json::json!(["ManagedBy"])),
+        "saved plan must preserve default-tag provenance"
+    );
+
+    let apply = run_cli(project.path(), &["apply", "--auto-approve", "plan.json"]);
+    assert_success(&apply, "apply saved plan");
+    let stdout = String::from_utf8_lossy(&apply.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains(r#"ManagedBy: "carina"  # default_tags"#)),
+        "saved-plan apply must annotate the default tag; stdout:\n{stdout}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(project.path().join("carina.state.json"))
+            .expect("read persisted state"),
+    )
+    .expect("parse persisted state");
+    let attributes = state["resources"][0]["attributes"]
+        .as_object()
+        .expect("persisted resource attributes must be an object");
+    assert!(
+        attributes.keys().all(|key| !key.starts_with('_')),
+        "persisted provider state must contain no host metadata: {attributes:#?}"
+    );
+}
+
+#[test]
+fn apply_updates_default_tags_without_persisting_host_metadata() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    fs::write(
+        project.path().join("backend.crn"),
+        r#"backend local { path = "carina.state.json" }
+"#,
+    )
+    .expect("write backend configuration");
+    let provider_path = project.path().join("providers.crn");
+    fs::write(
+        &provider_path,
+        r#"provider mock {
+  default_tags = {
+    ManagedBy = "carina"
+  }
+}
+"#,
+    )
+    .expect("write provider configuration");
+    fs::write(
+        project.path().join("main.crn"),
+        r#"mock.test.resource {
+  name = "tagged"
+}
+"#,
+    )
+    .expect("write resource configuration");
+
+    assert_success(&run_cli(project.path(), &["init", "."]), "init");
+
+    let assert_state = |expected_tags: serde_json::Value| {
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(project.path().join("carina.state.json"))
+                .expect("read persisted state"),
+        )
+        .expect("parse persisted state");
+        let attributes = state["resources"][0]["attributes"]
+            .as_object()
+            .expect("persisted resource attributes must be an object");
+        assert!(
+            attributes.keys().all(|key| !key.starts_with('_')),
+            "persisted provider state must contain no host metadata: {attributes:#?}"
+        );
+        assert_eq!(attributes.get("tags"), Some(&expected_tags));
+    };
+
+    assert_success(
+        &run_cli(project.path(), &["apply", ".", "--auto-approve"]),
+        "apply",
+    );
+    assert_state(serde_json::json!({ "ManagedBy": "carina" }));
+
+    fs::write(
+        provider_path,
+        r#"provider mock {
+  default_tags = {
+    ManagedBy = "carina"
+    Team = "x"
+  }
+}
+"#,
+    )
+    .expect("update provider configuration");
+
+    let plan = run_cli(project.path(), &["plan", "."]);
+    assert_success(&plan, "plan");
+    let stdout = String::from_utf8_lossy(&plan.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim() == r#"+ Team: "x"  # default_tags"#),
+        "update plan must annotate the newly injected default tag; stdout:\n{stdout}"
+    );
+
+    assert_success(
+        &run_cli(project.path(), &["apply", ".", "--auto-approve"]),
+        "apply",
+    );
+    assert_state(serde_json::json!({
+        "ManagedBy": "carina",
+        "Team": "x"
+    }));
 }
 
 #[test]

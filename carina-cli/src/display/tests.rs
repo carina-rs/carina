@@ -733,9 +733,10 @@ fn test_extract_compact_hint_resolves_dsl_enum() {
     );
 }
 
-/// Test that extract_compact_hint skips _-prefixed attributes.
+/// Desired-resource consumers trust the parser boundary and inspect every
+/// attribute rather than carrying another internal-key filter.
 #[test]
-fn test_extract_compact_hint_skips_internal_attributes() {
+fn test_extract_compact_hint_considers_all_resource_attributes() {
     let mut r = Resource::new("ec2.Vpc", "hash_internal");
     r.binding = Some("vpc".to_string());
     r.set_attr(
@@ -744,7 +745,7 @@ fn test_extract_compact_hint_skips_internal_attributes() {
     );
 
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
-    assert_eq!(hint, None, "Internal attributes should be skipped");
+    assert_eq!(hint, Some("_hash: abc123".to_string()));
 }
 
 #[test]

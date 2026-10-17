@@ -7,6 +7,8 @@ use carina_core::detail_rows::{
 use carina_core::value::{PrettyLayout, format_value_pretty, needs_trailing_separator};
 use ratatui::prelude::*;
 
+use super::push_annotation_span;
+
 /// Render string-list diff entries (#2943) into TUI lines. Mirrors
 /// `carina-cli::display::render_string_list_diff_entries` — including
 /// the trailing-summary placement.
@@ -55,8 +57,13 @@ pub(super) fn render_string_list_diff_entries(
 pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffEntryIR]) {
     for entry in entries {
         match entry {
-            MapDiffEntryIR::Changed { key, old, new } => {
-                lines.push(Line::from(vec![
+            MapDiffEntryIR::Changed {
+                key,
+                old,
+                new,
+                annotation,
+            } => {
+                let mut spans = vec![
                     Span::raw("    "),
                     Span::styled("~ ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!("{}: ", key)),
@@ -68,15 +75,23 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                     ),
                     Span::raw(" -> "),
                     Span::styled(new.clone(), Style::default().fg(Color::Green)),
-                ]));
+                ];
+                push_annotation_span(&mut spans, annotation.as_deref());
+                lines.push(Line::from(spans));
             }
-            MapDiffEntryIR::Added { key, value } => {
-                lines.push(Line::from(vec![
+            MapDiffEntryIR::Added {
+                key,
+                value,
+                annotation,
+            } => {
+                let mut spans = vec![
                     Span::raw("    "),
                     Span::styled("+ ", Style::default().fg(Color::Green)),
                     Span::raw(format!("{}: ", key)),
                     Span::styled(value.clone(), Style::default().fg(Color::Green)),
-                ]));
+                ];
+                push_annotation_span(&mut spans, annotation.as_deref());
+                lines.push(Line::from(spans));
             }
             MapDiffEntryIR::Removed { key, value } => {
                 lines.push(Line::from(vec![
@@ -321,4 +336,49 @@ fn push_added_removed_block(
         Span::raw("    "),
         Span::styled("}".to_string(), style),
     ]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn map_diff_renders_annotations_on_added_and_changed_entries() {
+        let entries = vec![
+            MapDiffEntryIR::Added {
+                key: "Team".to_string(),
+                value: "\"x\"".to_string(),
+                annotation: Some("# default_tags".to_string()),
+            },
+            MapDiffEntryIR::Changed {
+                key: "ManagedBy".to_string(),
+                old: "\"old\"".to_string(),
+                new: "\"carina\"".to_string(),
+                annotation: Some("# default_tags".to_string()),
+            },
+            MapDiffEntryIR::Removed {
+                key: "Legacy".to_string(),
+                value: "\"gone\"".to_string(),
+            },
+        ];
+        let mut lines = Vec::new();
+
+        render_map_diff_entries(&mut lines, &entries);
+
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            vec![
+                "    + Team: \"x\"  # default_tags",
+                "    ~ ManagedBy: \"old\" -> \"carina\"  # default_tags",
+                "    - Legacy: \"gone\"",
+            ]
+        );
+    }
 }

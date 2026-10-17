@@ -511,7 +511,7 @@ pub fn extract_compact_hint(
     parent_binding: Option<&str>,
 ) -> Option<String> {
     let attrs = resource.attributes();
-    let mut keys: Vec<&String> = attrs.keys().filter(|k| !k.starts_with('_')).collect();
+    let mut keys: Vec<&String> = attrs.keys().collect();
     keys.sort();
 
     // Priority 1: First distinguishing string attribute (most identifying)

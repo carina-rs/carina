@@ -11,7 +11,8 @@ use carina_core::executor::ExecutionResult;
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
 use carina_core::provider::PersistedAttributes;
 use carina_core::resource::{
-    ConcreteValue, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+    ConcreteValue, DefaultTagKeys, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+    State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{
@@ -1356,7 +1357,8 @@ pub(crate) fn build_orphan_resource(
         binding: rs.binding.clone(),
         dependency_bindings: rs.dependency_bindings.clone(),
         module_source: None,
-        quoted_string_attrs: std::collections::HashSet::new(),
+        default_tag_keys: DefaultTagKeys::default(),
+        quoted_string_attrs: HashSet::new(),
     }
 }
 

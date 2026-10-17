@@ -332,18 +332,14 @@ fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
 
 /// Walk every resource attribute in the project (managed, composition, data
 /// source, and deferred-for templates), yielding
-/// `(ResourceRef, attr_name, &Value)` for each non-internal attribute
-/// (skips `_*` keys). Used by all upstream-ref checks; centralized so the
-/// `iter_all_resources` walk and the `_*` skip are written once.
+/// `(ResourceRef, attr_name, &Value)` for each attribute. Used by all
+/// upstream-ref checks so the `iter_all_resources` walk is written once.
 fn for_each_resource_attr<E, F>(parsed: &crate::parser::File<E>, mut f: F)
 where
     F: FnMut(ResourceRef<'_>, &str, &Value),
 {
     for rref in parsed.iter_all_resources() {
         for (attr_name, value) in rref.attributes().iter() {
-            if attr_name.starts_with('_') {
-                continue;
-            }
             f(rref, attr_name, value);
         }
     }

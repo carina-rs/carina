@@ -153,7 +153,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 12;
+    pub const CURRENT_VERSION: u32 = 13;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -169,6 +169,7 @@ impl PlanFile {
                 binding: _binding,
                 dependency_bindings: _dependency_bindings,
                 module_source: _module_source,
+                default_tag_keys: _default_tag_keys,
                 quoted_string_attrs: _quoted_string_attrs,
             } = resource;
             attributes
@@ -694,6 +695,12 @@ fn build_plan_file<E>(
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
 
     Ok(PlanFile {
+        // carina#3869: bumped 12→13 — host metadata no longer lives in
+        // provider-facing resource attributes. Default-tag provenance moved
+        // to `Resource::default_tag_keys`, and resource type comes solely
+        // from `Resource::id`. A v12 plan must be regenerated rather than
+        // mixing its synthetic-attribute representation with v13 apply.
+        //
         // carina#3861 / carina#2674: bumped 11→12 — secrets now use a typed
         // placeholder bound to a stable, position-unique hash context, and
         // saved-plan apply must re-evaluate and verify it. Resource positions

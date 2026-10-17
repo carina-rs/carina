@@ -190,6 +190,115 @@ fn parse_resource_with_namespaced_type() {
 }
 
 #[test]
+fn parse_resource_attributes_contain_no_host_metadata() {
+    let input = r#"
+        let named = aws.s3_bucket {
+            name = "named"
+        }
+
+        aws.s3_bucket {
+            name = "anonymous"
+        }
+
+        let existing = read aws.s3_bucket {
+            name = "existing"
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    for resource in &result.resources {
+        assert!(
+            resource.attributes.keys().all(|key| !key.starts_with('_')),
+            "managed resource attributes must be purely user-authored: {:?}",
+            resource.attributes
+        );
+    }
+    for data_source in &result.data_sources {
+        assert!(
+            data_source
+                .attributes
+                .keys()
+                .all(|key| !key.starts_with('_')),
+            "data-source attributes must be purely user-authored: {:?}",
+            data_source.attributes
+        );
+    }
+}
+
+#[test]
+fn parse_rejects_reserved_top_level_resource_attribute_names() {
+    let inputs = [
+        r#"let named = aws.s3_bucket { "_x" = 1 }"#,
+        r#"aws.s3_bucket { "_x" = 1 }"#,
+        r#"let existing = read aws.s3_bucket { "_x" = 1 }"#,
+    ];
+
+    for input in inputs {
+        let error = parse(input, &ProviderContext::default())
+            .expect_err("reserved top-level resource attribute must be rejected");
+        let expected_start_column = input.find("\"_x\"").unwrap() + 1;
+        match &error {
+            ParseError::ReservedResourceAttribute {
+                attribute,
+                line,
+                column,
+                end_line,
+                end_column,
+            } => {
+                assert_eq!(attribute, "_x");
+                assert_eq!(*line, 1);
+                assert_eq!(*column, expected_start_column);
+                assert_eq!(*end_line, 1);
+                assert_eq!(*end_column, expected_start_column + "\"_x\"".len());
+            }
+            other => panic!("unexpected parser error: {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Reserved attribute name '_x' at line 1, column {expected_start_column}: names starting with '_' are reserved for Carina"
+            )
+        );
+    }
+}
+
+#[test]
+fn parse_allows_underscore_prefixed_map_entries_inside_resource_attributes() {
+    let input = r#"
+        let bucket = aws.s3_bucket {
+            tags = {
+                "_x" = "y"
+            }
+            settings {
+                "_nested" = "z"
+            }
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let Some(Value::Concrete(ConcreteValue::Map(tags))) = result.resources[0].get_attr("tags")
+    else {
+        panic!("tags must parse as a concrete map");
+    };
+    assert_eq!(
+        tags.get("_x"),
+        Some(&Value::Concrete(ConcreteValue::String("y".into())))
+    );
+    let Some(Value::Concrete(ConcreteValue::List(settings))) =
+        result.resources[0].get_attr("settings")
+    else {
+        panic!("settings must parse as a nested block list");
+    };
+    let Value::Concrete(ConcreteValue::Map(settings)) = &settings[0] else {
+        panic!("settings block must contain a concrete map");
+    };
+    assert_eq!(
+        settings.get("_nested"),
+        Some(&Value::Concrete(ConcreteValue::String("z".into())))
+    );
+}
+
+#[test]
 fn parse_multiple_resources() {
     let input = r#"
         let logs = aws.s3_bucket {

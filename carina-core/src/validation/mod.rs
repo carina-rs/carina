@@ -1385,10 +1385,6 @@ fn validate_resource_ref_types_inner<E>(
 
         let attrs = rref.attributes();
         for (attr_name, attr_value) in attrs.iter() {
-            if attr_name.starts_with('_') {
-                continue;
-            }
-
             let sink = schema
                 .attributes
                 .get(attr_name)
@@ -2390,10 +2386,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     let mut referenced: HashSet<String> = HashSet::new();
     for rref in parsed.iter_all_resources() {
         let attrs = rref.attributes();
-        for (attr_name, value) in attrs.iter() {
-            if attr_name.starts_with('_') {
-                continue;
-            }
+        for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
         }
         // `Composition` has no directives — `directives()` is `None`

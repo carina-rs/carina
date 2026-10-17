@@ -811,6 +811,7 @@ fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashS
         binding: None,
         dependency_bindings: state.dependency_bindings.clone(),
         module_source: None,
+        default_tag_keys: Default::default(),
         quoted_string_attrs: HashSet::new(),
     };
     get_resource_dependencies(&prior_resource)

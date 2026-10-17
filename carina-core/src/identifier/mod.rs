@@ -810,7 +810,7 @@ pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<Anonymous
 }
 
 /// Build a SimHash over the combined set of provider identity values plus
-/// a resource's user-specified attributes (non-`_`-prefixed, flattened).
+/// a resource's user-specified attributes (flattened).
 ///
 /// This is the shared feature set used by both anonymous identifier computation
 /// (when the schema has no create-only attributes) and `compute_resource_simhash`
@@ -821,9 +821,6 @@ fn simhash_from_identity_and_resource(
 ) -> SimHash {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
-        if key.starts_with('_') {
-            continue;
-        }
         flatten_value_for_simhash(key, value, &mut simhash_values);
     }
     compute_simhash(&simhash_values)

@@ -4001,7 +4001,7 @@ fn validate_accepts_block_name_alias() {
 }
 
 #[test]
-fn validate_skips_internal_attributes() {
+fn validate_does_not_exempt_underscore_prefixed_attributes() {
     let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
 
@@ -4015,7 +4015,12 @@ fn validate_skips_internal_attributes() {
         Value::Concrete(ConcreteValue::String("b".into())),
     );
 
-    assert!(schema.validate(&attrs).is_ok());
+    let errors = schema
+        .validate(&attrs)
+        .expect_err("underscore-prefixed attributes must not bypass schema validation");
+    assert!(
+        matches!(&errors[..], [TypeError::UnknownAttribute { name, .. }] if name == "_binding")
+    );
 }
 
 fn make_custom(name: &str, base: AttributeType) -> AttributeType {
