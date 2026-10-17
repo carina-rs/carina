@@ -457,14 +457,12 @@ pub fn diff(
         return Diff::Create(desired.as_resource().clone());
     }
 
-    let desired_id = desired.resolved_id();
     let changed = comparison::find_changed_attributes(
         &desired.resolved_attributes(),
         &current.attributes,
         saved,
         prev_explicit,
         schema,
-        Some(&desired_id),
     );
 
     if changed.is_empty() {

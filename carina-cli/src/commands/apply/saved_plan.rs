@@ -2,45 +2,37 @@ use std::collections::HashMap;
 
 use carina_core::parser::{BackendConfig, SavedProviderConfigs};
 use carina_core::plan::Plan;
-use carina_core::provider::{Provider, ReadRequest};
+use carina_core::provider::{PersistedAttributes, Provider, ReadRequest};
 use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State, Value};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    CurrentStateEntry, PlanFile, PlanWaitBinding, ResolvedProviderInputs, UpstreamSource,
+    CurrentStateEntry, MovedOrigins, PlanFile, PlanWaitBinding, ResolvedProviderInputs,
+    UpstreamSource,
 };
 use crate::error::AppError;
 
-/// Historical provider/hash address for each saved-plan resource address.
-///
-/// A `moved` block rewrites the runtime state key to its destination, while
-/// the persisted secret hash and remote object still belong to the source
-/// address until execution completes. This typed map keeps both drift reads
-/// and hash verification on that source address.
-#[derive(Default)]
-pub(crate) struct HistoricalResourceAddresses {
-    moved_origins: HashMap<ResourceId, ResourceId>,
+pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
+
+fn planned_secret_hashes(resources: &[Resource]) -> PlannedSecretHashes {
+    resources
+        .iter()
+        .filter(|resource| {
+            resource
+                .attributes
+                .values()
+                .any(carina_core::value::contains_redacted_secret)
+        })
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                PersistedAttributes::from_saved_plan_attributes(&resource.attributes),
+            )
+        })
+        .collect()
 }
 
-impl HistoricalResourceAddresses {
-    fn from_plan(plan: &Plan) -> Self {
-        let moved_origins = plan
-            .effects()
-            .iter()
-            .filter_map(|effect| match effect {
-                carina_core::effect::Effect::Move { from, to } => {
-                    Some((to.as_inner().clone(), from.as_inner().clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        Self { moved_origins }
-    }
-
-    pub(super) fn origin_for(&self, id: &ResourceId) -> Option<&ResourceId> {
-        self.moved_origins.get(id)
-    }
-}
+pub(crate) type HistoricalResourceAddresses = MovedOrigins;
 
 /// Result of the one typed placeholder inventory performed after decoding.
 ///
@@ -57,7 +49,10 @@ impl InspectedPlanFile {
         if plan_file.contains_redacted_secret_placeholders() {
             Self::NeedsSecretVerification(PendingPlanFile { plan_file })
         } else {
-            Self::Verified(RehydratedPlanFile { plan_file })
+            Self::Verified(RehydratedPlanFile {
+                plan_file,
+                planned_secret_hashes: HashMap::new(),
+            })
         }
     }
 
@@ -100,6 +95,7 @@ impl PendingPlanFile {
         provider_inputs: &ResolvedProviderInputs,
         apply_target: ApplyTarget<'_>,
     ) -> Result<DesiredPlanFile, AppError> {
+        let planned_secret_hashes = planned_secret_hashes(&self.plan_file.sorted_resources);
         let plan_file = super::rehydrate_desired_plan_file(
             self.plan_file,
             parsed,
@@ -107,7 +103,10 @@ impl PendingPlanFile {
             apply_target,
         )?;
         Ok(DesiredPlanFile::NeedsHistoricalVerification(
-            DesiredVerifiedPlanFile { plan_file },
+            DesiredVerifiedPlanFile {
+                plan_file,
+                planned_secret_hashes,
+            },
         ))
     }
 }
@@ -146,7 +145,7 @@ impl DesiredPlanFile {
             Self::Verified(plan) => plan.plan(),
             Self::NeedsHistoricalVerification(plan) => &plan.plan_file.plan,
         };
-        HistoricalResourceAddresses::from_plan(plan)
+        MovedOrigins::from_plan(plan)
     }
 
     pub(super) async fn verify_historical(
@@ -178,6 +177,7 @@ impl DesiredPlanFile {
 /// fresh provider reads, so this type deliberately cannot reach the executor.
 pub(super) struct DesiredVerifiedPlanFile {
     plan_file: PlanFile,
+    planned_secret_hashes: PlannedSecretHashes,
 }
 
 impl DesiredVerifiedPlanFile {
@@ -227,8 +227,13 @@ impl DesiredVerifiedPlanFile {
             // Orphans do not participate in ordinary drift reads. Read them
             // here because their historical secret still needs verification.
             if !actual_states.contains_key(&entry.id) {
-                let actual = provider
-                    .read(&entry.id, entry.state.identifier.as_deref(), ReadRequest)
+                let historical_id = historical_addresses.origin_for(&entry.id);
+                let mut actual = provider
+                    .read(
+                        historical_id,
+                        entry.state.identifier.as_deref(),
+                        ReadRequest,
+                    )
                     .await
                     .map_err(AppError::Provider)?;
                 if !actual.exists {
@@ -237,20 +242,15 @@ impl DesiredVerifiedPlanFile {
                         apply_target,
                     ));
                 }
+                actual.id = entry.id.clone();
                 actual_states.insert(entry.id.clone(), actual);
             }
             let actual = actual_states.get(&entry.id).ok_or_else(|| {
                 super::saved_plan_secret_shape_error(entry.id.to_string(), apply_target)
             })?;
-            let hash_context_id = historical_addresses
-                .origin_for(&entry.id)
-                .unwrap_or(&entry.id);
-            entry.state = carina_core::value::rehydrate_state_secrets_from_plaintext(
-                &entry.state,
-                actual,
-                hash_context_id,
-            )
-            .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+            entry.state =
+                carina_core::value::rehydrate_state_secrets_from_plaintext(&entry.state, actual)
+                    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
             verified_planned_states.insert(entry.id.clone(), entry.state.clone());
         }
         self.plan_file.plan =
@@ -263,6 +263,7 @@ impl DesiredVerifiedPlanFile {
 
         Ok(RehydratedPlanFile {
             plan_file: self.plan_file,
+            planned_secret_hashes: self.planned_secret_hashes,
         })
     }
 }
@@ -273,6 +274,7 @@ impl DesiredVerifiedPlanFile {
 /// type accepted by the saved-plan executor gateway.
 pub(super) struct RehydratedPlanFile {
     plan_file: PlanFile,
+    planned_secret_hashes: PlannedSecretHashes,
 }
 
 impl RehydratedPlanFile {
@@ -298,6 +300,10 @@ impl RehydratedPlanFile {
 
     pub(super) fn sorted_resources(&self) -> &[Resource] {
         &self.plan_file.sorted_resources
+    }
+
+    pub(super) fn planned_secret_hashes(&self) -> &PlannedSecretHashes {
+        &self.planned_secret_hashes
     }
 
     pub(super) fn unresolved_resources(&self) -> &[Resource] {

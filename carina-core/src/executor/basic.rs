@@ -22,7 +22,7 @@ use crate::resolver::resolve_ref_value;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
-use crate::value::{SecretHashContext, SerializationContext, SerializationError};
+use crate::value::{SerializationContext, SerializationError};
 
 use super::wait::AppliedStates;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
@@ -691,11 +691,6 @@ pub(super) async fn execute_basic_effect<'a>(
                         defs: &s.defs,
                     })
                 });
-                let secret_ctx = Some(SecretHashContext::new(
-                    id.display_type(),
-                    to.identity_str(),
-                    key,
-                ));
                 let Some(comparison_value) =
                     secret_grafted_comparison_view(new_value, resolve_source.attributes.get(key))
                 else {
@@ -709,7 +704,6 @@ pub(super) async fn execute_basic_effect<'a>(
                         to: comparison_value.as_ref(),
                         saved: None,
                         type_info,
-                        secret_ctx: secret_ctx.as_ref(),
                     },
                 ) {
                     effective_changed.push(key.clone());
@@ -953,7 +947,7 @@ mod assert_fully_resolved_tests {
     #[test]
     fn saved_plan_secret_placeholder_is_rejected_at_apply_seam() {
         let v = Value::Deferred(DeferredValue::RedactedSecret {
-            hash: crate::resource::RedactedSecretHash::new("00".repeat(32)),
+            hash: crate::resource::RedactedSecretHash::generate(b"placeholder"),
         });
         let err = assert_fully_resolved(&v, "password", &empty_bindings())
             .expect_err("saved-plan placeholder must be rejected before provider dispatch");

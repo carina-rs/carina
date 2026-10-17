@@ -869,10 +869,9 @@ mod tests {
     use super::*;
 
     fn redacted_secret() -> Value {
-        serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": "deadbeef".repeat(8) }
-        }))
-        .expect("deserialize persisted secret")
+        Value::Deferred(DeferredValue::RedactedSecret {
+            hash: crate::resource::RedactedSecretHash::generate(b"validation-test"),
+        })
     }
 
     fn length_at_least(variable: &str, minimum: i64) -> ValidateExpr {

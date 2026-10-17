@@ -19,6 +19,7 @@ use carina_core::resource::DeferredValue;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{
     redact_secrets_in_plan_with_desired_and_historical, redact_secrets_in_resource,
+    redact_secrets_in_resource_reusing_persisted_hashes,
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
@@ -153,7 +154,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 14;
+    pub const CURRENT_VERSION: u32 = 15;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -435,21 +436,14 @@ pub(crate) fn collect_historical_display_attributes(
     state_file: Option<&StateFile>,
 ) -> HistoricalDisplayAttributes {
     let mut display = HistoricalDisplayAttributes::for_plan(plan);
-    let moved_origins: HashMap<_, _> = plan
-        .effects()
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Move { from, to } => Some((to.as_inner(), from.as_inner())),
-            _ => None,
-        })
-        .collect();
+    let moved_origins = MovedOrigins::from_plan(plan);
 
     for effect in plan.effects() {
         for key in effect.deleted_resource_attribute_keys() {
             match key.generation() {
                 carina_core::effect::EffectGeneration::Current => {
                     if let Some(state) = current_states.get(key.id()) {
-                        let persisted_id = moved_origins.get(key.id()).copied().unwrap_or(key.id());
+                        let persisted_id = moved_origins.origin_for(key.id());
                         let persisted = state_file
                             .and_then(|file| file.find_resource_for_id(persisted_id))
                             .map(|resource| resource.persisted_attributes());
@@ -475,7 +469,7 @@ pub(crate) fn collect_historical_display_attributes(
         // Mask that shape in place instead of replacing it with the raw
         // refreshed state used by Delete effects.
         if let Effect::Update { from, .. } = effect {
-            let persisted_id = moved_origins.get(&from.id).copied().unwrap_or(&from.id);
+            let persisted_id = moved_origins.origin_for(&from.id);
             let persisted = state_file
                 .and_then(|file| file.find_resource_for_id(persisted_id))
                 .map(|resource| resource.persisted_attributes());
@@ -488,6 +482,78 @@ pub(crate) fn collect_historical_display_attributes(
     }
 
     display
+}
+
+/// Resolves a plan address to the state row that owns its persisted history.
+///
+/// The mapping cannot be supplied independently of a plan: move effects are
+/// the sole authority for historical state-row ownership during planning,
+/// saved-plan verification, and writeback.
+pub(crate) struct MovedOrigins {
+    by_destination: HashMap<ResourceId, ResourceId>,
+}
+
+impl MovedOrigins {
+    pub(crate) fn from_plan(plan: &Plan) -> Self {
+        let by_destination = plan
+            .effects()
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Move { from, to } => Some((to.as_inner().clone(), from.as_inner().clone())),
+                _ => None,
+            })
+            .collect();
+        Self { by_destination }
+    }
+
+    pub(crate) fn origin_for<'a>(&'a self, id: &'a ResourceId) -> &'a ResourceId {
+        self.by_destination.get(id).unwrap_or(id)
+    }
+
+    pub(crate) fn find_persisted_row<'a>(
+        &self,
+        state_file: &'a StateFile,
+        id: &ResourceId,
+    ) -> Option<&'a carina_state::ResourceState> {
+        state_file.find_resource_for_id(self.origin_for(id))
+    }
+
+    /// Resolve the row by state address while deliberately retaining its
+    /// stored provider-instance routing. Replacement writeback uses this when
+    /// a create changes provider instances and the old instance must be
+    /// deposed through its original route.
+    pub(crate) fn find_persisted_row_at_address<'a>(
+        &self,
+        state_file: &'a StateFile,
+        id: &ResourceId,
+    ) -> Option<&'a carina_state::ResourceState> {
+        let origin = self.origin_for(id);
+        state_file.find_resource(
+            &origin.provider,
+            &origin.resource_type,
+            origin.identity_str()?,
+        )
+    }
+}
+
+type PersistedResourceLookup<'a> =
+    HashMap<(&'a str, &'a str, &'a str, Option<&'a str>), &'a carina_state::ResourceState>;
+
+fn persisted_resource_for_plan_address<'a>(
+    persisted_resources: Option<&PersistedResourceLookup<'a>>,
+    moved_origins: &MovedOrigins,
+    id: &ResourceId,
+) -> Option<&'a carina_state::ResourceState> {
+    let persisted_id = moved_origins.origin_for(id);
+    let identity = persisted_id.identity_str()?;
+    persisted_resources?
+        .get(&(
+            persisted_id.provider.as_str(),
+            persisted_id.resource_type.as_str(),
+            identity,
+            persisted_id.provider_instance.as_deref(),
+        ))
+        .copied()
 }
 
 fn deposed_attributes_for_display(
@@ -626,9 +692,8 @@ fn build_plan_file<E>(
         for (key, value) in attributes {
             // Export validation rejects secret-valued exports before an
             // upstream state snapshot can be produced. Keep this guard for
-            // malformed/tampered in-memory input rather than defining a
-            // position that valid plans cannot reach.
-            carina_core::value::reject_secret_without_saved_plan_position(
+            // malformed/tampered in-memory input.
+            carina_core::value::reject_secret_in_saved_plan_field(
                 value,
                 format!("upstream_state {binding}.{key}"),
             )?;
@@ -650,51 +715,65 @@ fn build_plan_file<E>(
                     resource,
                 )
             })
-            .collect::<HashMap<_, _>>()
+            .collect::<PersistedResourceLookup<'_>>()
     });
+    let moved_origins = MovedOrigins::from_plan(&ctx.plan);
     let redacted_current_states = ctx
         .current_states
         .iter()
         .map(|(id, state)| {
-            let hash_context_id = ctx.moved_origins.get(id).unwrap_or(id);
-            let persisted = persisted_resources.as_ref().and_then(|resources| {
-                let identity = hash_context_id.identity_str()?;
-                resources
-                    .get(&(
-                        hash_context_id.provider.as_str(),
-                        hash_context_id.resource_type.as_str(),
-                        identity,
-                        hash_context_id.provider_instance.as_deref(),
-                    ))
-                    .copied()
-            });
-            // A moved state keeps the hash produced under its source address
-            // until execution writes the destination row. Both persisted
-            // lookup and fresh-read redaction therefore use that source
-            // address as the historical hash context.
+            let persisted = persisted_resource_for_plan_address(
+                persisted_resources.as_ref(),
+                &moved_origins,
+                id,
+            );
+            // A moved resource's previous state row still lives at its source
+            // address until execution writes the destination row.
             let redacted = match persisted {
                 Some(persisted) => {
                     let persisted_attributes = persisted.persisted_attributes();
-                    redact_secrets_in_state_using_persisted(
-                        state,
-                        persisted_attributes,
-                        hash_context_id,
-                    )?
+                    redact_secrets_in_state_using_persisted(state, persisted_attributes)?
                 }
                 None => state.clone(),
             };
             let redacted = match desired_resources.get(id) {
-                Some(desired) => {
-                    redact_secrets_in_state_using_resource(&redacted, desired, hash_context_id)?
-                }
+                Some(desired) => redact_secrets_in_state_using_resource(&redacted, desired)?,
                 None if persisted.is_some() => redacted,
                 None => redact_secrets_in_state(&redacted)?,
             };
             Ok((id.clone(), redacted))
         })
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
+    let redacted_sorted_resources = ctx
+        .sorted_resources
+        .iter()
+        .map(|resource| {
+            let persisted = persisted_resource_for_plan_address(
+                persisted_resources.as_ref(),
+                &moved_origins,
+                &resource.id,
+            );
+            match persisted {
+                Some(persisted) => redact_secrets_in_resource_reusing_persisted_hashes(
+                    resource,
+                    persisted.persisted_attributes(),
+                ),
+                None => redact_secrets_in_resource(resource),
+            }
+        })
+        .collect::<Result<Vec<_>, carina_core::value::SerializationError>>()?;
+    let redacted_desired_resources: HashMap<ResourceId, Resource> = redacted_sorted_resources
+        .iter()
+        .map(|resource| (resource.id.clone(), resource.clone()))
+        .collect();
 
     Ok(PlanFile {
+        // carina#3863 / carina#3865: bumped 14→15 — secret digests now
+        // carry their salt, including upgraded legacy placeholders in embedded
+        // current states. Saved-plan resource placeholders carry the exact
+        // digest that state writeback must reuse. A v14 plan contains
+        // context-derived digests and cannot satisfy those contracts.
+        //
         // carina#3871: bumped 13→14 — orphan state and host metadata now
         // travel as one typed value until planning finishes. V13
         // `CurrentStateEntry` values may also contain legacy `_`-prefixed
@@ -707,13 +786,10 @@ fn build_plan_file<E>(
         // from `Resource::id`. A v12 plan must be regenerated rather than
         // mixing its synthetic-attribute representation with v13 apply.
         //
-        // carina#3861 / carina#2674: bumped 11→12 — secrets now use a typed
-        // placeholder bound to a stable, position-unique hash context, and
-        // saved-plan apply must re-evaluate and verify it. Resource positions
-        // stay byte-identical to state writeback; other positions use disjoint
-        // namespaces. A v11 plan represents secret hashes as ordinary strings
-        // and could send those hashes to a provider, so it must never cross
-        // this seam.
+        // carina#3861 / carina#2674: bumped 11→12 — secrets now use typed
+        // placeholders, and saved-plan apply must re-evaluate and verify them.
+        // A v11 plan represents secret hashes as ordinary strings and could
+        // send those hashes to a provider, so it must never cross this seam.
         //
         // carina#3805: bumped 10→11 — `compositions` stores the pending module
         // constraints required by apply, and `data_source_origins` preserves
@@ -756,14 +832,10 @@ fn build_plan_file<E>(
         backend_config,
         plan: redact_secrets_in_plan_with_desired_and_historical(
             &ctx.plan,
-            &desired_resources,
+            &redacted_desired_resources,
             &redacted_current_states,
         )?,
-        sorted_resources: ctx
-            .sorted_resources
-            .iter()
-            .map(redact_secrets_in_resource)
-            .collect::<Result<Vec<_>, _>>()?,
+        sorted_resources: redacted_sorted_resources,
         unresolved_resources: ctx
             .unresolved_resources
             .iter()
@@ -1270,7 +1342,7 @@ pub async fn run_plan(
         data_sources: &parsed.data_sources,
         current_states: &ctx.current_states,
         state_file: state_file.as_ref(),
-        moved_origins: &ctx.moved_origins,
+        plan: &ctx.plan,
         schemas: wiring.schemas(),
         wait_aliases: &export_wait_aliases,
         provider_context,
@@ -1463,9 +1535,9 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
     /// Persisted secret shapes that classify provider-returned plaintext before
     /// it enters export resolution.
     pub state_file: Option<&'a StateFile>,
-    /// A moved resource's persisted hash shape still lives at its source
-    /// address until writeback completes.
-    pub moved_origins: &'a HashMap<ResourceId, ResourceId>,
+    /// The plan is the only authority for resolving destination addresses back
+    /// to the persisted rows that own their historical secret shapes.
+    pub plan: &'a Plan,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
     pub provider_context: &'a ProviderContext,
@@ -1484,9 +1556,9 @@ pub(crate) fn check_exports_pre_apply(
     // composition to the managed sibling literal (carina#3246).
     let mut secret_aware_states = input.current_states.clone();
     if let Some(state_file) = input.state_file {
+        let moved_origins = MovedOrigins::from_plan(input.plan);
         for (id, state) in &mut secret_aware_states {
-            let persisted_id = input.moved_origins.get(id).unwrap_or(id);
-            let Some(persisted) = state_file.find_resource_for_id(persisted_id) else {
+            let Some(persisted) = moved_origins.find_persisted_row(state_file, id) else {
                 continue;
             };
             let persisted_attributes = persisted.persisted_attributes();
@@ -2717,6 +2789,136 @@ mod run_plan_out_tests {
     };
     use std::fs;
 
+    fn resource_with_secret(identity: &str, plaintext: &str) -> Resource {
+        Resource::with_provider(
+            "mock",
+            "test.resource",
+            carina_core::resource::ResourceIdentity::try_from(identity.to_string()).unwrap(),
+            None,
+        )
+        .with_attribute(
+            "comment",
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(plaintext.to_string().into()),
+            )))),
+        )
+    }
+
+    #[test]
+    fn saved_plan_effects_share_sorted_resource_secret_placeholders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+
+        let created = resource_with_secret("created", "CREATE_SECRET").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("created".into())),
+        );
+        let created_effect = resource_with_secret("created", "CREATE_SECRET").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("created-temporary".into())),
+        );
+        let updated = resource_with_secret("updated", "UPDATE_SECRET").with_attribute(
+            "web_acl_arn",
+            Value::Concrete(ConcreteValue::String("resolved-at-plan-time".into())),
+        );
+        let updated_effect = resource_with_secret("updated", "UPDATE_SECRET").with_attribute(
+            "web_acl_arn",
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("producer", "identifier"),
+            }),
+        );
+        let persisted_update_marker = carina_core::value::value_to_json(
+            updated.attributes.get("comment").expect("updated secret"),
+        )
+        .expect("persisted update marker");
+        let mut state_file = StateFile::new();
+        state_file
+            .upsert_resource(
+                carina_state::ResourceState::new("test.resource", "updated", "mock")
+                    .with_identifier("updated-id")
+                    .with_attribute("comment", persisted_update_marker.clone()),
+            )
+            .expect("persisted update row");
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(created_effect),
+        ));
+        plan.add(Effect::Update {
+            from: Box::new(
+                State::existing(updated.id.clone(), HashMap::new()).with_identifier("updated-id"),
+            ),
+            to: carina_core::resource::ResolvedResource::new(updated_effect),
+            changed_attributes: vec!["comment".to_string(), "web_acl_arn".to_string()],
+        });
+        let parsed = carina_core::parser::ParsedFile::default();
+        let ctx = crate::wiring::PlanContext {
+            plan,
+            provider: ProviderRouter::new(),
+            sorted_resources: vec![created.clone(), updated.clone()],
+            unresolved_resources: vec![created, updated],
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            current_states: HashMap::new(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: Vec::new(),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .unwrap();
+
+        let saved = build_plan_file(
+            &path,
+            &parsed,
+            &provider_configs,
+            None,
+            &Some(state_file),
+            &ctx,
+        )
+        .expect("saved plan should serialize");
+        let Effect::Create(created_effect) = &saved.plan.effects()[0] else {
+            panic!("expected create effect")
+        };
+        let Effect::Update {
+            to: updated_effect, ..
+        } = &saved.plan.effects()[1]
+        else {
+            panic!("expected update effect")
+        };
+        assert_eq!(
+            created_effect.attributes["comment"], saved.sorted_resources[0].attributes["comment"],
+            "create effect and sorted resource must share one digest",
+        );
+        assert_eq!(
+            created_effect.attributes["name"],
+            Value::Concrete(ConcreteValue::String("created-temporary".into())),
+            "saved-plan redaction must retain a create-before-destroy temporary name",
+        );
+        assert_eq!(
+            updated_effect.attributes["comment"], saved.sorted_resources[1].attributes["comment"],
+            "update effect and sorted resource must share one digest",
+        );
+        assert!(
+            matches!(
+                updated_effect.attributes.get("web_acl_arn"),
+                Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+            ),
+            "saved-plan redaction must retain unresolved cascade-consumer references",
+        );
+        assert_eq!(
+            saved.sorted_resources[1].attributes["comment"],
+            carina_core::value::persisted_json_to_dsl_value(&persisted_update_marker)
+                .expect("lift persisted update marker"),
+            "both saved-plan copies must use the matching persisted digest",
+        );
+    }
+
     #[tokio::test]
     async fn provider_attributes_observe_reconciled_prefixed_resource_names() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2950,6 +3152,48 @@ mod run_plan_out_tests {
                 .len(),
             1,
             "the prepared pending constraint must survive into the plan file"
+        );
+    }
+
+    #[test]
+    fn saved_plan_upstream_secret_error_names_binding_and_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+        let parsed = carina_core::parser::ParsedFile::default();
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            carina_core::resource::ConcreteValue::String("upstream-secret".into()),
+        ))));
+        let ctx = crate::wiring::PlanContext {
+            plan: Plan::new(),
+            provider: ProviderRouter::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            current_states: HashMap::new(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::from([(
+                "network".to_string(),
+                HashMap::from([("password".to_string(), secret)]),
+            )]),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: Vec::new(),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .unwrap();
+
+        let error = build_plan_file(&path, &parsed, &provider_configs, None, &None, &ctx)
+            .expect_err("a secret-bearing upstream snapshot must be rejected")
+            .to_string();
+        assert!(
+            error.contains("upstream_state network.password"),
+            "saved-plan error lost the upstream field location: {error}",
         );
     }
 }

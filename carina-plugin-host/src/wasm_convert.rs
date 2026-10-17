@@ -13,7 +13,7 @@ use carina_core::provider::{
     UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
+    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives, RedactedSecretHash,
     Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentity,
     ResourceIdentityError, ResourceIdentityState, State as CoreState, Value as CoreValue,
 };
@@ -147,6 +147,7 @@ pub struct WasmValueDecodeError {
 
 #[derive(Debug, Clone, Copy)]
 enum WitValueVariant {
+    StrVal,
     StringListVal,
     ListVal,
     MapVal,
@@ -157,6 +158,7 @@ enum WitValueVariant {
 impl fmt::Display for WitValueVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::StrVal => "str-val",
             Self::StringListVal => "string-list-val",
             Self::ListVal => "list-val",
             Self::MapVal => "map-val",
@@ -174,6 +176,7 @@ enum WasmValueDecodeErrorKind {
     ExpectedString { index: usize },
     Null,
     UnsupportedNumber,
+    RawLegacySecretMarker,
 }
 
 impl WasmValueDecodeError {
@@ -210,6 +213,9 @@ impl fmt::Display for WasmValueDecodeError {
             WasmValueDecodeErrorKind::UnsupportedNumber => {
                 f.write_str(": JSON number cannot be represented by the value protocol")
             }
+            WasmValueDecodeErrorKind::RawLegacySecretMarker => {
+                f.write_str(": raw legacy secret marker is valid only in a state file")
+            }
         }
     }
 }
@@ -222,7 +228,8 @@ impl std::error::Error for WasmValueDecodeError {
             | WasmValueDecodeErrorKind::ExpectedObject
             | WasmValueDecodeErrorKind::ExpectedString { .. }
             | WasmValueDecodeErrorKind::Null
-            | WasmValueDecodeErrorKind::UnsupportedNumber => None,
+            | WasmValueDecodeErrorKind::UnsupportedNumber
+            | WasmValueDecodeErrorKind::RawLegacySecretMarker => None,
         }
     }
 }
@@ -386,10 +393,7 @@ fn wit_to_core_value_from(
             ValueDecodeSource::Provider => {
                 Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
             }
-            ValueDecodeSource::PersistedState => Ok(persisted_json_to_dsl_value(
-                &serde_json::Value::String(s.clone()),
-            )
-            .expect("a JSON string always converts to a DSL value")),
+            ValueDecodeSource::PersistedState => decode_persisted_json_string(s),
         },
         wit::Value::IntVal(i) => Ok(CoreValue::Concrete(ConcreteValue::Int(*i))),
         wit::Value::FloatVal(f) => Ok(CoreValue::Concrete(ConcreteValue::Float(*f))),
@@ -630,8 +634,7 @@ fn json_to_core_value(
             ValueDecodeSource::Provider => {
                 Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
             }
-            ValueDecodeSource::PersistedState => Ok(persisted_json_to_dsl_value(v)
-                .expect("a JSON string always converts to a DSL value")),
+            ValueDecodeSource::PersistedState => decode_persisted_json_string(s),
         },
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -742,6 +745,17 @@ pub(crate) fn wit_to_core_persisted_value_map(
                 .map_err(|error| error.prepend_attribute(key))
         })
         .collect()
+}
+
+fn decode_persisted_json_string(value: &str) -> Result<CoreValue, WasmValueDecodeError> {
+    if RedactedSecretHash::is_raw_legacy_marker(value) {
+        return Err(WasmValueDecodeError::new(
+            WitValueVariant::StrVal,
+            WasmValueDecodeErrorKind::RawLegacySecretMarker,
+        ));
+    }
+    let json = serde_json::Value::String(value.to_string());
+    Ok(persisted_json_to_dsl_value(&json).expect("a JSON string always converts to a DSL value"))
 }
 
 // -- ResourceId --
@@ -1579,6 +1593,23 @@ fn proto_input_mode_to_core(
 mod tests {
     use super::*;
 
+    fn v2_redacted_secret(plaintext: &str) -> (CoreValue, String) {
+        let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::String(plaintext.into()),
+        ))));
+        let marker = carina_core::value::value_to_json(&secret)
+            .expect("serialize test secret")
+            .as_str()
+            .expect("secret marker string")
+            .to_string();
+        let hash =
+            carina_core::value::persisted_secret_hash(&marker).expect("parse generated v2 marker");
+        (
+            CoreValue::Deferred(DeferredValue::RedactedSecret { hash }),
+            marker,
+        )
+    }
+
     fn proto_string() -> proto::AttributeType {
         proto::AttributeType::String {
             pattern: None,
@@ -2042,10 +2073,7 @@ mod tests {
 
     #[test]
     fn redacted_saved_plan_secret_is_rejected_at_wasm_boundary() {
-        let value: CoreValue = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": "00".repeat(32) }
-        }))
-        .expect("deserialize saved-plan placeholder");
+        let (value, _) = v2_redacted_secret("saved-plan-secret");
         assert!(matches!(
             core_to_wit_value(&value),
             Err(SerializationError::RedactedSecretNotAllowed {
@@ -2558,13 +2586,8 @@ mod tests {
     }
 
     #[test]
-    fn persisted_state_and_saved_attrs_encode_redacted_secrets_as_legacy_marker_strings() {
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
-        let redacted: CoreValue = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": hash }
-        }))
-        .expect("deserialize persisted secret marker");
+    fn persisted_state_and_saved_attrs_round_trip_v2_marker_strings() {
+        let (redacted, marker) = v2_redacted_secret("wire-secret");
         let id = CoreResourceId::with_provider_identity("aws", "test.Resource", "example", None);
         let state = CoreState::existing(
             id.clone(),
@@ -2572,7 +2595,7 @@ mod tests {
         );
 
         let wit_state = core_to_wit_state(&state)
-            .expect("persisted state must retain the provider's legacy string wire shape");
+            .expect("persisted state must retain the provider's marker string wire shape");
         assert!(matches!(
             wit_state.attributes.as_slice(),
             [(key, wit::Value::StrVal(value))] if key == "token" && value == &marker
@@ -2583,7 +2606,7 @@ mod tests {
         )
         .lift(&carina_core::schema::SchemaRegistry::new());
         let wit_saved = core_saved_attrs_to_wit(saved.as_provider_saved_attrs(), &id)
-            .expect("saved attributes must retain the provider's legacy string wire shape");
+            .expect("saved attributes must retain the provider's marker string wire shape");
         assert!(matches!(
             wit_saved.as_deref(),
             Some([(key, wit::Value::StrVal(value))]) if key == "token" && value == &marker
@@ -2592,10 +2615,7 @@ mod tests {
 
     #[test]
     fn desired_resource_rejects_redacted_secret_placeholder() {
-        let redacted: CoreValue = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": "00".repeat(32) }
-        }))
-        .expect("deserialize saved-plan placeholder");
+        let (redacted, _) = v2_redacted_secret("desired-secret");
         let resource = CoreResource::with_provider("aws", "test.Resource", "example", None)
             .with_attribute("token", redacted);
 
@@ -2608,9 +2628,8 @@ mod tests {
     }
 
     #[test]
-    fn only_state_decode_assigns_secret_marker_semantics() {
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
+    fn only_state_decode_assigns_v2_secret_marker_semantics() {
+        let (expected, marker) = v2_redacted_secret("wire-secret");
         let wire = wit::Value::StrVal(marker.clone());
 
         assert_eq!(
@@ -2622,8 +2641,43 @@ mod tests {
         assert!(matches!(
             state.get("token"),
             Some(CoreValue::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if loaded.as_str() == hash
+                if CoreValue::Deferred(DeferredValue::RedactedSecret {
+                    hash: loaded.clone()
+                }) == expected
         ));
+    }
+
+    #[test]
+    fn persisted_wasm_decode_rejects_raw_legacy_marker() {
+        let marker = format!(
+            "{}{}",
+            RedactedSecretHash::LEGACY_MARKER_PREFIX,
+            "ab".repeat(32)
+        );
+        let error =
+            wit_to_core_persisted_value_map(&[("token".to_string(), wit::Value::StrVal(marker))])
+                .expect_err("raw legacy state markers must fail closed outside state-file load");
+
+        assert!(matches!(
+            error.kind,
+            WasmValueDecodeErrorKind::RawLegacySecretMarker
+        ));
+        assert_eq!(error.attribute_path, ["token"]);
+    }
+
+    #[test]
+    fn persisted_wasm_decode_keeps_malformed_legacy_looking_text_plain() {
+        let marker = "_secret:argon2:xyz";
+        let state = wit_to_core_persisted_value_map(&[(
+            "token".to_string(),
+            wit::Value::StrVal(marker.to_string()),
+        )])
+        .expect("an invalid raw legacy marker is ordinary persisted text");
+
+        assert_eq!(
+            state.get("token"),
+            Some(&CoreValue::Concrete(ConcreteValue::String(marker.into())))
+        );
     }
 
     // -- Value map helpers --
@@ -2764,12 +2818,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
         use carina_core::resource::Value as CV;
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
-        let persisted_secret: CV = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": hash }
-        }))
-        .expect("deserialize persisted secret");
+        let (persisted_secret, marker) = v2_redacted_secret("patch-secret");
         let resource = CoreResource::new("test", "patch-round-trip")
             .with_attribute("a", CV::Concrete(ConcreteValue::String("alpha".into())))
             .with_attribute("b", CV::Concrete(ConcreteValue::Int(42)));
@@ -2856,14 +2905,20 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_version_range_is_v5_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 5);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
     fn test_check_protocol_version_rejects_lower_version() {
         let err = check_protocol_version(
-            r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":2}"#,
+            r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":4}"#,
         )
         .unwrap_err();
 
         assert!(err.contains("provider 'aws'"));
-        assert!(err.contains("protocol version 2"));
+        assert!(err.contains("protocol version 4"));
         assert!(err.contains(&format!(
             "requires at least version {}",
             carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION

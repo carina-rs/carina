@@ -8,9 +8,10 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use carina_core::resource::{ConcreteValue, DeferredValue, Value as CoreValue};
-use carina_core::value::{SecretHashContext, value_to_json_with_context};
+use carina_core::value::value_to_json;
 
-const SECRET_PREFIX: &str = "_secret:argon2:";
+const STATE_SECRET_PREFIX: &str = "_secret:";
+const V2_SECRET_PREFIX: &str = "_secret:$argon2id$";
 
 struct Scenario {
     _temp: TempDir,
@@ -184,7 +185,7 @@ fn assert_plan_is_redacted(scenario: &Scenario, plaintexts: &[&str]) {
         );
     }
     assert!(
-        !text.contains(SECRET_PREFIX),
+        !text.contains(STATE_SECRET_PREFIX),
         "saved plan must not encode a secret hash as an ordinary string:\n{text}",
     );
     let json: Value = serde_json::from_str(&text).expect("valid saved-plan JSON");
@@ -272,7 +273,7 @@ fn state_comment_hash<'a>(state: &'a Value, name: &str) -> &'a str {
     state_resource_by_name(state, name)["attributes"]["comment"]
         .as_str()
         .expect("state secret hash")
-        .strip_prefix(SECRET_PREFIX)
+        .strip_prefix(STATE_SECRET_PREFIX)
         .expect("state secret prefix")
 }
 
@@ -295,10 +296,13 @@ fn current_state_comment_placeholder_hash<'a>(plan: &'a Value, identity: &str) -
 fn assert_secret_hash(value: &Value) {
     let hash = value.as_str().expect("secret state value is a string");
     assert!(
-        hash.starts_with(SECRET_PREFIX),
+        hash.starts_with(V2_SECRET_PREFIX),
         "state must contain a secret hash, got {hash:?}",
     );
-    assert_eq!(hash.len(), SECRET_PREFIX.len() + 64);
+    assert!(
+        carina_core::value::persisted_secret_hash(hash).is_some(),
+        "state secret hash must be a validated persisted digest",
+    );
 }
 
 #[test]
@@ -342,7 +346,7 @@ mock.test.resource {
 }
 
 #[test]
-fn saved_plan_secret_hashes_use_resource_state_context() {
+fn saved_plan_secret_digests_are_distinct_and_match_state_writeback() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -378,17 +382,17 @@ mock.test.resource {
         let state_hash = state_resource_by_name(&state, name)["attributes"]["comment"]
             .as_str()
             .expect("state secret hash")
-            .strip_prefix(SECRET_PREFIX)
+            .strip_prefix(STATE_SECRET_PREFIX)
             .expect("state secret prefix");
         assert_eq!(
             plan_hash, state_hash,
-            "saved-plan and state hashes must use the same resource context for {name}",
+            "state writeback must reuse the exact saved-plan digest for {name}",
         );
     }
 }
 
 #[test]
-fn saved_plan_rehydrates_provider_config_secret_with_position_scoped_hash() {
+fn saved_plan_rehydrates_provider_config_secret_with_independent_digest() {
     const ENV: &[(&str, &str)] = &[(
         "SAVED_PLAN_PROVIDER_TOKEN_3861",
         "SHARED_POSITION_SECRET_3861",
@@ -414,7 +418,7 @@ mock.test.resource {
     let resource_hash = plan_comment_placeholder_hash(&plan, "provider-secret");
     assert_ne!(
         provider_hash, resource_hash,
-        "provider and resource positions must use collision-separated salts",
+        "independent placeholders must use independent random salts",
     );
 
     assert_success(
@@ -510,6 +514,47 @@ let interpolated = mock.test.resource {
     let state = scenario.state_json();
     assert_secret_hash(&state_resource_by_name(&state, "nested")["attributes"]["tags"]["password"]);
     assert_secret_hash(&state_resource_by_name(&state, "interpolated")["attributes"]["comment"]);
+}
+
+#[test]
+fn saved_plan_hash_inventory_ignores_runtime_reference_siblings() {
+    const PLAINTEXT: &str = "SPARSE_PLACEHOLDER_PLAIN_3863";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let vpc = mock.test.resource {
+  name = "runtime-vpc"
+}
+
+let consumer = mock.test.resource {
+  name = "runtime-consumer"
+  tags = {
+    S   = secret("SPARSE_PLACEHOLDER_PLAIN_3863")
+    Vpc = vpc.identifier
+  }
+}
+"#,
+    );
+
+    let plan = scenario.plan();
+    assert_success("saved plan with mixed placeholder/ref map", &plan);
+    assert_output_has_no_plaintext("mixed placeholder/ref plan", &plan, &[PLAINTEXT]);
+    let apply = scenario.apply_plan();
+    assert_success("apply mixed placeholder/ref saved plan", &apply);
+    assert_output_has_no_plaintext(
+        "apply mixed placeholder/ref saved plan",
+        &apply,
+        &[PLAINTEXT],
+    );
+
+    let provider = scenario.provider_json();
+    let tags = &provider_resource_by_name(&provider, "runtime-consumer")["tags"];
+    assert_eq!(tags["S"], PLAINTEXT);
+    assert!(tags["Vpc"].as_str().is_some_and(|value| !value.is_empty()));
+    assert_secret_hash(
+        &state_resource_by_name(&scenario.state_json(), "runtime-consumer")["attributes"]["tags"]["S"],
+    );
 }
 
 #[test]
@@ -718,7 +763,7 @@ let item = mock.test.resource {{
     let plan = read_json(&scenario.project.join("plan.json"));
     assert!(
         contains_redacted_secret_hash(&plan, &old_state_hash),
-        "the historical side of an update must retain the state-context hash",
+        "the historical side of an update must retain the persisted digest",
     );
     let desired_plan_hash = plan_comment_placeholder_hash(&plan, "updated").to_string();
     assert_success("carina apply saved plan", &scenario.apply_plan());
@@ -735,7 +780,7 @@ let item = mock.test.resource {{
     assert_eq!(
         desired_plan_hash,
         state_comment_hash(&state, "updated"),
-        "the desired update placeholder must match the state-context hash",
+        "the desired update placeholder must match the state digest",
     );
 }
 
@@ -776,7 +821,7 @@ let item = mock.test.resource {
     let plan = read_json(&scenario.project.join("plan.json"));
     assert!(
         contains_redacted_secret_hash(&plan, &old_state_hash),
-        "the historical side of a replacement must retain the state-context hash",
+        "the historical side of a replacement must retain the persisted digest",
     );
     let desired_plan_hash = plan_comment_placeholder_hash(&plan, "replace-new").to_string();
     assert_success("carina apply saved plan", &scenario.apply_plan());
@@ -791,7 +836,149 @@ let item = mock.test.resource {
     assert_eq!(
         desired_plan_hash,
         state_comment_hash(&state, "replace-new"),
-        "the desired replacement placeholder must match the state-context hash",
+        "the desired replacement placeholder must match the state digest",
+    );
+}
+
+#[test]
+fn saved_plan_cbd_secret_replacement_keeps_temporary_name_and_applies() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name            = "cbd-secret"
+  replacement_key = "before"
+  comment         = secret("CBD_SECRET_PLAIN_3863")
+  directives {
+    create_before_destroy = true
+  }
+}
+"#,
+    );
+    assert_success(
+        "initial CBD fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name            = "cbd-secret"
+  replacement_key = "after"
+  comment         = secret("CBD_SECRET_PLAIN_3863")
+  directives {
+    create_before_destroy = true
+  }
+}
+"#,
+    );
+
+    assert_success("CBD saved plan", &scenario.plan());
+    let plan = read_json(&scenario.project.join("plan.json"));
+    let create = plan["plan"]["effects"]
+        .as_array()
+        .expect("saved plan effects")
+        .iter()
+        .find_map(|effect| effect.get("Create"))
+        .expect("CBD replacement create effect");
+    let create_name = create
+        .pointer("/attributes/name/String")
+        .and_then(Value::as_str)
+        .expect("CBD create name");
+    assert!(
+        create_name.starts_with("cbd-secret-") && create_name != "cbd-secret",
+        "saved Create effect lost its temporary name: {create_name}"
+    );
+    assert_eq!(
+        plan_resource_by_name(&plan, "cbd-secret")
+            .pointer("/attributes/name/String")
+            .and_then(Value::as_str),
+        Some("cbd-secret"),
+        "the planned resource remains the permanent desired value",
+    );
+
+    let apply = scenario.apply_plan();
+    assert_success("CBD saved-plan apply", &apply);
+    assert_output_has_no_plaintext("CBD saved-plan apply", &apply, &["CBD_SECRET_PLAIN_3863"]);
+    let state = scenario.state_json();
+    let row = state["resources"]
+        .as_array()
+        .and_then(|resources| resources.first())
+        .expect("CBD state row");
+    assert_eq!(row["identity"], "item");
+    assert_secret_hash(&row["attributes"]["comment"]);
+}
+
+#[test]
+fn saved_plan_cascade_keeps_secret_resource_ref_and_applies() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let producer = mock.test.resource {
+  name            = "cascade-producer"
+  replacement_key = "before"
+  comment         = secret("CASCADE_SECRET_PLAIN_3863")
+}
+
+let consumer = mock.test.resource {
+  name    = "cascade-consumer"
+  comment = producer.comment
+}
+"#,
+    );
+    assert_success(
+        "initial cascade fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let producer = mock.test.resource {
+  name            = "cascade-producer"
+  replacement_key = "after"
+  comment         = secret("CASCADE_SECRET_PLAIN_3863")
+}
+
+let consumer = mock.test.resource {
+  name    = "cascade-consumer"
+  comment = producer.comment
+}
+"#,
+    );
+
+    assert_success("cascade saved plan", &scenario.plan());
+    let plan = read_json(&scenario.project.join("plan.json"));
+    let consumer_update = plan["plan"]["effects"]
+        .as_array()
+        .expect("saved plan effects")
+        .iter()
+        .filter_map(|effect| effect.get("Update"))
+        .find(|update| {
+            update.pointer("/to/attributes/name/String")
+                == Some(&Value::String("cascade-consumer".to_string()))
+        })
+        .unwrap_or_else(|| panic!("saved plan has no cascade consumer update: {plan:#}"));
+    assert!(
+        consumer_update
+            .pointer("/to/attributes/comment/ResourceRef")
+            .is_some(),
+        "cascade consumer effect lost its ResourceRef: {consumer_update:#}",
+    );
+
+    let apply = scenario.apply_plan();
+    assert_success("cascade saved-plan apply", &apply);
+    assert_output_has_no_plaintext(
+        "cascade saved-plan apply",
+        &apply,
+        &["CASCADE_SECRET_PLAIN_3863"],
+    );
+    let state = scenario.state_json();
+    assert_secret_hash(
+        &state_resource_by_name(&state, "cascade-consumer")["attributes"]["comment"],
     );
 }
 
@@ -935,7 +1122,7 @@ mock.test.resource { name = "default-tag-secret" }
             .pointer("/provider_configs/0/default_tags/SecretTag/RedactedSecret/hash")
             .and_then(Value::as_str)
             .is_some(),
-        "the provider default-tag secret must retain its own saved-plan position: {saved_plan:#}",
+        "the provider default-tag secret must retain its saved-plan placeholder: {saved_plan:#}",
     );
     assert!(
         plan_resource_by_name(&saved_plan, "default-tag-secret")
@@ -988,17 +1175,11 @@ mock.test.resource {{
         .to_string();
     let reconciled_identity = "state_preserved_anonymous_identity_3861";
     state["resources"][0]["identity"] = Value::String(reconciled_identity.to_string());
-    state["resources"][0]["attributes"]["comment"] = value_to_json_with_context(
-        &CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into()),
-        )))),
-        Some(&SecretHashContext::new(
-            "mock.test.resource",
-            reconciled_identity,
-            "comment",
-        )),
-    )
-    .expect("rehash state secret for the reconciled identity");
+    state["resources"][0]["attributes"]["comment"] =
+        value_to_json(&CoreValue::Deferred(DeferredValue::Secret(Box::new(
+            CoreValue::Concrete(ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into())),
+        ))))
+        .expect("rehash state secret for the reconciled identity");
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&state).expect("serialize reconciled state"),
@@ -1664,14 +1845,14 @@ provider mock {}
 }
 
 #[test]
-fn refresh_false_saved_plan_preserves_moved_state_secret_hash_context() {
+fn refresh_false_saved_plan_reuses_moved_state_secret_digest() {
     const PLAINTEXT: &str = "MOVE_PLAIN_3861";
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
 
 let old = mock.test.resource {
-  name    = "moved-hash-context"
+  name    = "moved-secret-digest"
   comment = secret("MOVE_PLAIN_3861")
 }
 "#,
@@ -1679,7 +1860,7 @@ let old = mock.test.resource {
     let initial_apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]);
     assert_success("initial moved-secret apply", &initial_apply);
     assert_output_has_no_plaintext("initial moved-secret apply", &initial_apply, &[PLAINTEXT]);
-    let old_hash = state_comment_hash(&scenario.state_json(), "moved-hash-context").to_string();
+    let old_hash = state_comment_hash(&scenario.state_json(), "moved-secret-digest").to_string();
 
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
@@ -1691,13 +1872,18 @@ moved {
 }
 
 let renamed = mock.test.resource {
-  name    = "moved-hash-context"
+  name    = "moved-secret-digest"
   comment = secret("MOVE_PLAIN_3861")
 }
 "#,
     );
     let plan = scenario.carina(&["plan", "--refresh=false", "--out", "plan.json", "."]);
     assert_success("refresh=false moved-secret plan", &plan);
+    assert!(
+        output_text(&plan).contains("Plan: 0 to add, 0 to change, 0 to destroy"),
+        "an unchanged moved secret must remain a pure move:\n{}",
+        output_text(&plan),
+    );
     assert_output_has_no_plaintext("refresh=false moved-secret plan", &plan, &[PLAINTEXT]);
     assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
     let saved_plan = read_json(&scenario.project.join("plan.json"));
@@ -1715,11 +1901,17 @@ let renamed = mock.test.resource {
         &[PLAINTEXT],
     );
     assert_eq!(
-        provider_resource_by_name(&scenario.provider_json(), "moved-hash-context")["comment"],
+        provider_resource_by_name(&scenario.provider_json(), "moved-secret-digest")["comment"],
         PLAINTEXT,
     );
+    let state = scenario.state_json();
     assert_secret_hash(
-        &state_resource_by_name(&scenario.state_json(), "moved-hash-context")["attributes"]["comment"],
+        &state_resource_by_name(&state, "moved-secret-digest")["attributes"]["comment"],
+    );
+    assert_eq!(
+        state_comment_hash(&state, "moved-secret-digest"),
+        old_hash,
+        "saved-plan apply must write the exact digest selected from the pre-move state",
     );
 }
 

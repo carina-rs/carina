@@ -578,7 +578,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             data_sources: &data_sources_for_plan,
             current_states: &current_states,
             state_file: state_file.as_ref(),
-            moved_origins: &moved_origins,
+            plan: &plan,
             schemas: wiring.schemas(),
             wait_aliases: &export_wait_aliases,
             provider_context: &provider_context,

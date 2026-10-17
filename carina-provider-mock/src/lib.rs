@@ -65,6 +65,9 @@ pub fn builtin_schemas() -> Vec<ResourceSchema> {
             )
             .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only())
             .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(
+                AttributeSchema::new("replacement_key", AttributeType::string()).create_only(),
+            )
             .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
             .attribute(AttributeSchema::new("parent", AttributeType::string()))
             .attribute(AttributeSchema::new("parent_name", AttributeType::string()))

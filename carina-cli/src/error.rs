@@ -7,6 +7,27 @@ use carina_core::provider::ProviderError;
 use carina_core::resource::ResourceId;
 use carina_state::BackendError;
 
+/// State encoding failure annotated with the resource row being written.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to encode state for resource {resource}: {source}")]
+pub struct LocatedResourceStateEncodingError {
+    resource: ResourceId,
+    #[source]
+    source: carina_state::ResourceStateEncodingError,
+}
+
+impl LocatedResourceStateEncodingError {
+    #[cfg(test)]
+    pub(crate) fn resource(&self) -> &ResourceId {
+        &self.resource
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encoding_error(&self) -> &carina_state::ResourceStateEncodingError {
+        &self.source
+    }
+}
+
 /// A backend error rendered with the concrete project directory available at
 /// the CLI boundary.
 #[derive(Debug)]
@@ -302,6 +323,10 @@ pub enum AppError {
     #[error(transparent)]
     Backend(#[from] BackendError),
 
+    /// A provider or desired value could not be encoded into one resource row.
+    #[error(transparent)]
+    ResourceStateEncoding(Box<LocatedResourceStateEncodingError>),
+
     /// A state backend error with a project-scoped recovery command.
     #[error(transparent)]
     ProjectBackend(Box<ProjectBackendError>),
@@ -489,6 +514,16 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn from_resource_state_encoding(
+        resource: ResourceId,
+        source: carina_state::ResourceStateEncodingError,
+    ) -> Self {
+        Self::ResourceStateEncoding(Box::new(LocatedResourceStateEncodingError {
+            resource,
+            source,
+        }))
+    }
+
     /// Enrich legacy-state recovery guidance with the command's project path.
     pub fn with_project_dir(self, project_dir: &Path) -> Self {
         match self {

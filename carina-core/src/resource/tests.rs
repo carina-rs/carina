@@ -2,6 +2,55 @@ use super::*;
 use crate::explicit::ExplicitFields;
 
 #[test]
+fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_hashes() {
+    let plaintext = br#""legacy-constant-time""#;
+    let salt = b"carina:mock.test.resource:legacy:comment";
+    let mut output = [0_u8; RedactedSecretHash::HASH_LEN];
+    legacy_argon2()
+        .hash_password_into(plaintext, salt, &mut output)
+        .expect("hash legacy fixture");
+    let marker = format!(
+        "{}{}",
+        RedactedSecretHash::LEGACY_MARKER_PREFIX,
+        hex::encode(output)
+    );
+    let matching = RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
+        &marker,
+        "mock.test.resource",
+        "legacy",
+        "comment",
+    )
+    .expect("legacy salt is representable")
+    .expect("upgrade legacy fixture");
+    assert!(matching.verify(plaintext));
+    assert_eq!(
+        matching.encoded_digest(),
+        format!(
+            "argon2-legacy:{}:{}",
+            hex::encode(salt),
+            hex::encode(output),
+        ),
+        "the self-contained marker stores only the row salt and digest",
+    );
+
+    output[0] ^= 1;
+    let mismatched_marker = format!(
+        "{}{}",
+        RedactedSecretHash::LEGACY_MARKER_PREFIX,
+        hex::encode(output)
+    );
+    let mismatched = RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
+        &mismatched_marker,
+        "mock.test.resource",
+        "legacy",
+        "comment",
+    )
+    .expect("legacy salt is representable")
+    .expect("upgrade mismatched legacy fixture");
+    assert!(!mismatched.verify(plaintext));
+}
+
+#[test]
 fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -1449,7 +1498,7 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
-    let state_hash = crate::value::argon2id_hash(serialized.as_bytes(), None);
+    let state_hash = RedactedSecretHash::generate(serialized.as_bytes());
     let persisted_secret = || {
         serde_json::from_value::<Value>(serde_json::json!({
             "RedactedSecret": { "hash": state_hash }

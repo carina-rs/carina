@@ -4357,6 +4357,60 @@ mod tests {
     }
 
     #[test]
+    fn normalized_state_roundtrip_preserves_self_contained_legacy_secret() {
+        use argon2::Argon2;
+        use carina_core::provider::EncodedStateRowAttributes;
+        use wit_types::Value as WitValue;
+
+        let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
+        let material = b"\"wire-legacy\"";
+        let salt = b"carina:mock.test.resource:legacy:comment";
+        let mut output = [0_u8; 32];
+        Argon2::default()
+            .hash_password_into(material, salt, &mut output)
+            .expect("hash legacy state fixture");
+        let marker = format!("_secret:argon2:{}", hex::encode(output));
+        let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "legacy",
+            "attributes": { "comment": marker },
+        }))
+        .expect("decode test state row");
+        let (_, _, _, persisted) = encoded
+            .decode()
+            .expect("upgrade test state row")
+            .into_parts();
+        let upgraded_marker = persisted
+            .encoded_value("comment")
+            .and_then(serde_json::Value::as_str)
+            .expect("state load upgrades the raw legacy marker")
+            .to_string();
+        let attributes = persisted.to_values();
+        let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
+
+        apply_wit_state_attribute_updates(
+            "normalize_state",
+            &mut states,
+            vec![(
+                id.clone(),
+                vec![("comment".to_string(), WitValue::StrVal(upgraded_marker))],
+            )],
+        )
+        .expect("apply normalized state");
+
+        let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
+            states[&id].attributes.get("comment")
+        else {
+            panic!("normalized legacy marker must remain a typed secret hash")
+        };
+        assert!(
+            hash.verify(material),
+            "the normalizer roundtrip must retain the marker's explicit salt"
+        );
+    }
+
+    #[test]
     fn invalid_state_key_error_names_the_operation_once() {
         let id = Resource::with_provider("mock", "test.resource", "only", None).id;
         let expected = HashMap::from([("expected".to_string(), id)]);

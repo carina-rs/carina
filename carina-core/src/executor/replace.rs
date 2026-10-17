@@ -7,9 +7,8 @@ use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
 use crate::provider::{ProviderReadyResource, UpdatePatch, build_update_patch};
-use crate::resource::{DataSource, ResolvedResourceId, Resource, State, Value};
+use crate::resource::{DataSource, Resource, State, Value};
 use crate::schema::SchemaRegistry;
-use crate::value::SecretHashContext;
 
 use super::ProgressInfo;
 use super::basic::BasicEffectResult;
@@ -23,7 +22,6 @@ pub fn compute_full_diff_patch(
     to: &ProviderReadyResource,
     to_source: &Resource,
     schemas: &SchemaRegistry,
-    resource_id: &ResolvedResourceId,
 ) -> UpdatePatch {
     use std::collections::HashSet;
 
@@ -45,11 +43,6 @@ pub fn compute_full_diff_patch(
                         defs: &s.defs,
                     })
                 });
-                let secret_ctx = Some(SecretHashContext::new(
-                    resource_id.display_type(),
-                    resource_id.identity_str(),
-                    key,
-                ));
                 let comparison_value =
                     secret_grafted_comparison_view(new_value, to_source.attributes.get(key))?;
                 key_should_enter_patch(
@@ -60,7 +53,6 @@ pub fn compute_full_diff_patch(
                         to: comparison_value.as_ref(),
                         saved: None,
                         type_info,
-                        secret_ctx: secret_ctx.as_ref(),
                     },
                 )
                 .then(|| key.to_string())

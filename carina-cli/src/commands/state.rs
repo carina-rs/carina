@@ -1946,7 +1946,11 @@ fn diff_display_update_resource(
                         fresh_state,
                         Some(existing_rs),
                         schema,
-                    )?;
+                        None,
+                    )
+                    .map_err(|source| {
+                        AppError::from_resource_state_encoding(resource.id.clone(), source)
+                    })?;
                 let write_only_keys: Vec<String> = schema
                     .map(|schema| {
                         schema
@@ -1958,7 +1962,11 @@ fn diff_display_update_resource(
                     })
                     .unwrap_or_default();
                 if !write_only_keys.is_empty() {
-                    resource_state.merge_write_only_attributes(resource, &write_only_keys);
+                    resource_state
+                        .merge_write_only_attributes(resource, &write_only_keys)
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(resource.id.clone(), source)
+                        })?;
                 }
                 Some(resource_state)
             }
@@ -1968,7 +1976,13 @@ fn diff_display_update_resource(
                     &id.resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 );
-                Some(existing_rs.refreshed_from_provider_state(fresh_state, schema)?)
+                Some(
+                    existing_rs
+                        .refreshed_from_provider_state(fresh_state, schema)
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.as_inner().clone(), source)
+                        })?,
+                )
             }
         }
     } else {
@@ -2083,7 +2097,7 @@ mod tests {
         PendingModuleConstraint, Resource, Signature,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    use carina_core::value::SECRET_PREFIX;
+    use carina_core::value::{LEGACY_SECRET_PREFIX, SECRET_PREFIX};
     use carina_state::{DeposedInstance, DeposedKey};
     use indexmap::IndexMap;
     use serde_json::json;
@@ -3875,21 +3889,24 @@ mod tests {
     #[tokio::test]
     async fn refresh_deposed_generation_rehashes_existing_hash_without_desired_secret() {
         let mut state = StateFile::new();
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
-        row.deposed.push(deposed_instance(
-            deposed_key("secret-key"),
-            "db-old",
-            None,
-            HashMap::from([(
-                "password".to_string(),
-                json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
-            )]),
-        ));
+        row.deposed
+            .push(DeposedInstance::from_persisted_json_for_resource(
+                &id,
+                deposed_key("secret-key"),
+                "db-old".to_string(),
+                None,
+                HashMap::from([(
+                    "password".to_string(),
+                    json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
+                )]),
+                BTreeSet::new(),
+            ));
         state
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &ResolvedResourceId::new(id.clone()),
             "db-old",
@@ -3936,22 +3953,25 @@ mod tests {
     #[tokio::test]
     async fn refresh_deposed_generation_merges_nested_secret_hash_per_leaf_and_converges() {
         let mut state = StateFile::new();
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+            "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
         });
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
-        row.deposed.push(deposed_instance(
-            deposed_key("nested-secret-key"),
-            "vpc-old",
-            None,
-            HashMap::from([("tags".to_string(), previous_tags.clone())]),
-        ));
+        row.deposed
+            .push(DeposedInstance::from_persisted_json_for_resource(
+                &id,
+                deposed_key("nested-secret-key"),
+                "vpc-old".to_string(),
+                None,
+                HashMap::from([("tags".to_string(), previous_tags.clone())]),
+                BTreeSet::new(),
+            ));
         state
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let mut provider_tags = indexmap::IndexMap::new();
         provider_tags.insert("Name".to_string(), string_value("new-name"));
         provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));
@@ -4151,7 +4171,7 @@ mod tests {
                     .with_identifier("db-current")
                     .with_attribute(
                         "password",
-                        json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+                        json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
                     ),
             )
             .expect("test state setup must be valid");
@@ -4193,7 +4213,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+            "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
         });
         let mut state = StateFile::new();
         state
@@ -4307,6 +4327,52 @@ mod tests {
         );
         assert_eq!(counts.updated, 0);
         assert_eq!(counts.unchanged, 1);
+    }
+
+    #[test]
+    fn current_refresh_locates_plain_raw_legacy_marker_in_write_only_attribute() {
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
+        let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+        let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
+            .with_attribute("password", string_value(&marker));
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::new("db.Instance", "main", "awscc").with_identifier("db-current"),
+            )
+            .expect("test state setup must be valid");
+        let fresh = State::existing(id.clone(), HashMap::new()).with_identifier("db-current");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "awscc",
+            ResourceSchema::new("db.Instance")
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+
+        let error = diff_display_update_resource(
+            &ResolvedResourceId::new(id.clone()),
+            &fresh,
+            &mut state,
+            Some(&resolved(desired)),
+            &schemas,
+            "",
+            &mut StateRefreshCounts::default(),
+        )
+        .expect_err("marker-shaped write-only plaintext must fail closed without panicking");
+
+        let AppError::ResourceStateEncoding(located) = &error else {
+            panic!("expected typed resource-state encoding error, got {error:?}")
+        };
+        assert_eq!(located.resource(), &id);
+        let carina_state::ResourceStateEncodingError::PersistedAttributes(attribute_error) =
+            located.encoding_error()
+        else {
+            panic!("expected persisted-attribute validation error")
+        };
+        assert_eq!(attribute_error.attribute_key(), "password");
+        let rendered = error.to_string();
+        assert!(rendered.contains(&id.to_string()), "{rendered}");
+        assert!(rendered.contains("password"), "{rendered}");
     }
 
     #[tokio::test]

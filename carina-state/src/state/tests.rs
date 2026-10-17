@@ -1,15 +1,15 @@
 use super::*;
-use carina_core::value::SECRET_PREFIX;
+use carina_core::value::{EXPLICIT_LEGACY_SECRET_PREFIX, LEGACY_SECRET_PREFIX};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
 
 fn persisted_attributes_from_state_json(
     attributes: &HashMap<String, serde_json::Value>,
 ) -> PersistedAttributes {
-    serde_json::from_value(
-        serde_json::to_value(attributes).expect("test state JSON is serializable"),
+    persisted_attributes_for_test_state_row(
+        &ResourceId::with_provider_identity("test", "test.resource", "fixture-row", None),
+        attributes.clone(),
     )
-    .expect("test attributes use the persisted JSON shape")
 }
 
 fn state_json_from_persisted_attributes(
@@ -869,6 +869,7 @@ fn test_from_provider_state() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .unwrap();
 
@@ -905,6 +906,7 @@ fn test_from_provider_state_without_existing() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -964,6 +966,7 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     let row = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -1049,6 +1052,7 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .unwrap();
 
@@ -1096,6 +1100,7 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -1149,6 +1154,7 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .unwrap();
 
@@ -1183,6 +1189,7 @@ fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_
         &resolved(&resource),
         &provider_state,
         Some(&existing),
+        None,
         None,
     )
     .unwrap();
@@ -1237,6 +1244,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
         &resolved(&resource),
         &reordered_provider,
         Some(&existing),
+        None,
         None,
     )
     .unwrap();
@@ -1298,6 +1306,7 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
         &resolved(&resource),
         &provider_state,
         Some(&existing),
+        None,
         None,
     )
     .unwrap();
@@ -1627,7 +1636,7 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
                 .with_identifier("mock-id")
                 .with_attribute(
                     "comment".to_string(),
-                    serde_json::json!(format!("{SECRET_PREFIX}{hash}")),
+                    serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}")),
                 ),
         )
         .expect("test state setup must be valid");
@@ -1644,7 +1653,12 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
     ] {
         match loaded {
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })) => {
-                assert_eq!(loaded.as_str(), hash)
+                assert!(
+                    loaded
+                        .persisted_marker()
+                        .starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
+                    "state load must make the legacy salt self-contained",
+                );
             }
             other => panic!("persisted secret hash lost its type at the state boundary: {other:?}"),
         }
@@ -1656,7 +1670,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
     use carina_core::resource::{DeferredValue, Value};
 
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let marker = serde_json::json!(format!("{SECRET_PREFIX}{hash}"));
+    let marker = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}"));
     let row =
         ResourceState::new("test.resource", "main", "mock").with_attribute("token", marker.clone());
     let deposed = DeposedInstance {
@@ -1677,7 +1691,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
         assert!(matches!(
             decoded.get("token"),
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if loaded.as_str() == hash
+                if loaded.persisted_marker().starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
         ));
     }
 }
@@ -1685,7 +1699,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
 #[test]
 fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let marker = serde_json::json!(format!("{SECRET_PREFIX}{hash}"));
+    let marker = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}"));
     let mut row = ResourceState::new("test.resource", "main", "mock")
         .with_identifier("current-id")
         .with_attribute("token", marker.clone());
@@ -1787,6 +1801,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -2071,6 +2086,79 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
         row_json.get("deposed").is_none(),
         "empty deposed vec should use serde default and skip serialization"
     );
+}
+
+#[test]
+fn v11_state_migrates_to_v12_and_upgrades_raw_legacy_secrets_at_row_load() {
+    use super::check_and_migrate;
+
+    assert_eq!(StateFile::CURRENT_VERSION, 12);
+    let json = format!(
+        r#"{{
+        "version": 11,
+        "serial": 5,
+        "lineage": "v11-secret-lineage",
+        "carina_version": "0.4.0",
+        "resources": [
+            {{
+                "resource_type": "test.resource",
+                "identity": "legacy",
+                "provider": "mock",
+                "identifier": "legacy-id",
+                "attributes": {{
+                    "comment": "{LEGACY_SECRET_PREFIX}{}"
+                }}
+            }}
+        ]
+    }}"#,
+        "ab".repeat(32),
+    );
+
+    let outcome = check_and_migrate(&json).expect("v11 state should migrate to v12");
+    assert_eq!(
+        outcome.migration(),
+        Some(MigrationInfo { from: 11, to: 12 })
+    );
+    assert_eq!(outcome.state().version, 12);
+    let row = outcome
+        .state()
+        .find_resource("mock", "test.resource", "legacy")
+        .expect("legacy row should survive migration");
+    let marker = row
+        .persisted_attributes()
+        .encoded_value("comment")
+        .and_then(serde_json::Value::as_str)
+        .expect("legacy marker should remain persisted");
+    assert!(
+        marker.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
+        "row load must make the legacy marker self-contained: {marker}",
+    );
+}
+
+#[test]
+fn state_row_load_rejects_raw_legacy_salt_that_cannot_round_trip() {
+    let json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "oversized-legacy-salt",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.resource",
+            "identity": "x".repeat(5000),
+            "provider": "mock",
+            "identifier": "legacy-id",
+            "attributes": {
+                "comment": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
+            },
+        }],
+    })
+    .to_string();
+
+    let error = check_and_migrate(&json)
+        .expect_err("state load must reject a legacy salt that its marker parser cannot reload");
+    let message = error.to_string();
+    assert!(message.contains("comment"), "{message}");
+    assert!(message.contains("maximum is 4096 bytes"), "{message}");
 }
 
 #[test]
@@ -2648,12 +2736,14 @@ fn test_merge_write_only_attributes() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
     // Merge write-only attributes
     let write_only_keys = vec!["ipv4_netmask_length".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys);
+    rs.merge_write_only_attributes(&resource, &write_only_keys)
+        .unwrap();
 
     // The write-only attribute should be persisted in state
     assert_eq!(
@@ -2700,12 +2790,14 @@ fn test_merge_write_only_attributes_not_in_desired() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
     // Try to merge a write-only attribute that the user didn't specify
     let write_only_keys = vec!["ipv4_netmask_length".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys);
+    rs.merge_write_only_attributes(&resource, &write_only_keys)
+        .unwrap();
 
     // Should NOT be in state since user didn't specify it
     assert!(!rs.attributes.contains_key("ipv4_netmask_length"));
@@ -2744,11 +2836,13 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
     let write_only_keys = vec!["some_attr".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys);
+    rs.merge_write_only_attributes(&resource, &write_only_keys)
+        .unwrap();
 
     // Should keep the API-returned value, not overwrite with desired
     assert_eq!(
@@ -2828,6 +2922,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -2856,7 +2951,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -2877,6 +2972,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         &resolved(&resource),
         &provider_state,
         Some(&existing),
+        None,
         None,
     )
     .expect("provider state should serialize");
@@ -2902,7 +2998,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     )]);
     let existing = persisted_attributes_from_state_json(&HashMap::from([(
         "password".to_string(),
-        serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+        serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
     )]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
@@ -2922,22 +3018,93 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
 }
 
 #[test]
+fn with_attributes_from_state_reuses_matching_secret_digest() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, State, Value};
+
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "stable", None);
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("stable-secret".into()),
+    ))));
+    let provider_state = State::existing(id, HashMap::from([("comment".to_string(), secret)]));
+    let first = ResourceState::new("test.resource", "stable", "mock")
+        .with_attributes_from_state(&provider_state)
+        .unwrap();
+    let first_marker =
+        persisted_json_attribute(&first.attributes, "comment").expect("first secret marker");
+
+    let second = first.with_attributes_from_state(&provider_state).unwrap();
+    let second_marker =
+        persisted_json_attribute(&second.attributes, "comment").expect("second secret marker");
+
+    assert_eq!(
+        first_marker, second_marker,
+        "unchanged secret marker churned"
+    );
+}
+
+#[test]
+fn with_attributes_from_state_reports_raw_legacy_attribute_key() {
+    use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "plain", None);
+    let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+    let provider_state = State::existing(
+        id,
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String(marker.into())),
+        )]),
+    );
+
+    let error = ResourceState::new("test.resource", "plain", "mock")
+        .with_attributes_from_state(&provider_state)
+        .expect_err("marker-shaped provider plaintext must fail closed");
+    let ResourceStateEncodingError::PersistedAttributes(source) = error else {
+        panic!("expected persisted-attribute validation error")
+    };
+    assert_eq!(source.attribute_key(), "comment");
+}
+
+#[test]
+fn merge_write_only_attributes_reports_raw_legacy_attribute_key() {
+    use carina_core::resource::{ConcreteValue, Resource, Value};
+
+    let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+    let resource = Resource::with_provider("mock", "test.resource", "plain", None).with_attribute(
+        "password",
+        Value::Concrete(ConcreteValue::String(marker.into())),
+    );
+    let mut row = ResourceState::new("test.resource", "plain", "mock");
+
+    let error = row
+        .merge_write_only_attributes(&resource, &["password".to_string()])
+        .expect_err("marker-shaped desired plaintext must fail closed");
+    let ResourceStateEncodingError::PersistedAttributes(source) = error else {
+        panic!("expected persisted-attribute validation error")
+    };
+    assert_eq!(source.attribute_key(), "password");
+}
+
+#[test]
 fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let previous = serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32)));
-    let attrs = HashMap::from([(
-        "password".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            previous.as_str().unwrap().to_string().into(),
-        )),
-    )]);
+    let previous = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)));
     let existing = persisted_attributes_from_state_json(&HashMap::from([(
         "password".to_string(),
         previous.clone(),
     )]));
+    let upgraded = existing
+        .encoded_value("password")
+        .expect("legacy state marker is upgraded")
+        .clone();
+    let attrs = HashMap::from([(
+        "password".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            upgraded.as_str().unwrap().to_string().into(),
+        )),
+    )]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
@@ -2947,13 +3114,12 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     );
 
     let stored = state_json_from_persisted_attributes(&stored);
-    assert_eq!(stored.get("password"), Some(&previous));
+    assert_eq!(stored.get("password"), Some(&upgraded));
 }
 
 #[test]
 fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
@@ -2963,7 +3129,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -2985,6 +3151,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .expect("provider state should serialize");
 
@@ -2997,7 +3164,6 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
 #[test]
 fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
@@ -3007,7 +3173,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -3024,9 +3190,11 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .expect("provider state should serialize");
-    rs.merge_write_only_attributes(&resource, &["password".to_string()]);
+    rs.merge_write_only_attributes(&resource, &["password".to_string()])
+        .unwrap();
 
     assert_eq!(
         persisted_json_attribute(&rs.attributes, "password"),
@@ -3044,7 +3212,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+        "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
     });
     let mut provider_tags = IndexMap::new();
     provider_tags.insert(
@@ -3103,13 +3271,12 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
 #[test]
 fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::value::SECRET_PREFIX;
     use indexmap::IndexMap;
 
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+        "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
     });
     let attrs = HashMap::from([(
         "tags".to_string(),
@@ -3135,7 +3302,10 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         .expect("missing secret tag should keep the previous hash");
 
     assert!(!stored_tags.contains_key("Name"));
-    assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+    assert!(
+        secret.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
+        "got {secret}"
+    );
 }
 
 #[test]
@@ -3148,7 +3318,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
     let previous_items = serde_json::json!([
         {
             "Name": "one",
-            "Token": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+            "Token": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
         },
         {
             "Name": "two",
@@ -3258,6 +3428,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -3337,6 +3508,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -3402,6 +3574,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -3549,10 +3722,12 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap_err();
+    let rendered = err.to_string();
     assert!(
-        err.contains("unresolved reference") && err.contains("net.vpc.vpc_id"),
+        rendered.contains("unresolved reference") && rendered.contains("net.vpc.vpc_id"),
         "expected UnresolvedResourceRef diagnostic in error, got: {err}"
     );
 }
@@ -3756,6 +3931,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
         &current,
         Some(row),
         None,
+        None,
     )
     .unwrap();
     let ExplicitFields::Struct { children } = rewritten.explicit else {
@@ -3795,6 +3971,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
     let first_row = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&authored),
         &first_provider,
+        None,
         None,
         None,
     )
@@ -3898,6 +4075,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         &resolved(&authored),
         &reordered_provider,
         Some(&first_row),
+        None,
         None,
     )
     .unwrap();
