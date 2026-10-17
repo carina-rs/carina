@@ -65,7 +65,7 @@ pub fn compute_full_diff_patch(
                 )
                 .then(|| key.to_string())
             }
-            None => (!key.starts_with('_')).then(|| key.to_string()),
+            None => Some(key.to_string()),
         })
         .collect();
     build_update_patch(&changed, to, from)

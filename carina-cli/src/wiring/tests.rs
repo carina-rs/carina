@@ -150,7 +150,7 @@ fn create_plan(
     registry: &SchemaRegistry,
     saved_attrs: &carina_core::provider::LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
+    orphans: &Orphans,
     wait_bindings: &[carina_core::parser::WaitBinding],
 ) -> Plan {
     let managed = ResolvedResource::collect_resolved(managed.iter().cloned()).unwrap();
@@ -158,12 +158,11 @@ fn create_plan(
         &managed,
         data_sources,
         provider,
-        current_states,
+        carina_core::differ::PlanPriorStates::new(current_states, orphans),
         directives_map,
         registry,
         saved_attrs,
         prev_explicit,
-        orphan_dependencies,
         wait_bindings,
     )
     .expect("test provider hints should succeed")
@@ -237,13 +236,16 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     )
     .unwrap();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let mut current_states = HashMap::new();
+    let mut orphans = Orphans::new();
 
     let error = PlanPreprocessor::new(&normalizer, &ctx)
         .prepare(
             &mut resources,
             &[],
             &module_gate,
-            &mut HashMap::new(),
+            &mut current_states,
+            &mut orphans,
             &[],
             &mut [],
             &[],
@@ -262,6 +264,214 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
         !state_called.load(Ordering::SeqCst),
         "state normalization must not run after desired normalization fails"
     );
+}
+
+#[tokio::test]
+async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and_diff() {
+    struct TransformingNormalizer;
+
+    impl ProviderNormalizer for TransformingNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            carina_core::provider::ready_noop()
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            for state in states.values_mut().filter(|state| state.exists) {
+                if state.attributes.get("status")
+                    == Some(&Value::Concrete(ConcreteValue::String(
+                        "provider-alias".into(),
+                    )))
+                {
+                    state.attributes.insert(
+                        "status".to_string(),
+                        Value::Concrete(ConcreteValue::String("canonical".into())),
+                    );
+                }
+            }
+            carina_core::provider::ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            for state in states.values_mut().filter(|state| state.exists) {
+                state.attributes.insert(
+                    "restored".to_string(),
+                    Value::Concrete(ConcreteValue::String("saved".into())),
+                );
+            }
+            carina_core::provider::ready_noop()
+        }
+    }
+
+    let old_id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+    let target_id = ResourceId::with_provider_identity("mock", "test.resource", "target", None);
+    let mut desired = Resource::with_provider("mock", "test.resource", "target", None)
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("canonical".into())),
+        )
+        .with_attribute(
+            "restored",
+            Value::Concrete(ConcreteValue::String("saved".into())),
+        );
+    desired.binding = Some("resource".to_string());
+    let mut resources = OverrideAwareResources::build(
+        vec![desired],
+        None::<&StateFile>,
+        PreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .unwrap();
+    let resource_origins = resources.paired_unresolved_resources();
+    let mut current_states = HashMap::new();
+    let mut orphans = Orphans::from([carina_core::differ::Orphan::new(
+        State::existing(
+            old_id.clone(),
+            HashMap::from([
+                (
+                    "status".to_string(),
+                    Value::Concrete(ConcreteValue::String("provider-alias".into())),
+                ),
+                (
+                    "observed".to_string(),
+                    Value::Concrete(ConcreteValue::String("from-provider".into())),
+                ),
+            ]),
+        ),
+        Some("resource".to_string()),
+        Directives::default(),
+    )]);
+    let normalizer = TransformingNormalizer;
+    let saved_attrs = crate::empty_lifted_saved_attrs();
+
+    hydrate_prior_states(
+        &mut current_states,
+        &mut orphans,
+        &normalizer,
+        &saved_attrs,
+        None,
+    )
+    .await
+    .unwrap();
+    PlanPreprocessor::new(&normalizer, &WiringContext::new(Vec::new(), &[]))
+        .prepare(
+            &mut resources,
+            &resource_origins,
+            &carina_core::executor::ModuleConstraintGate::new(&[]),
+            &mut current_states,
+            &mut orphans,
+            &[],
+            &mut [],
+            &[],
+            &mut [],
+        )
+        .await
+        .unwrap();
+
+    assert!(orphans.rekey(&old_id, target_id.clone()));
+
+    let provider_states =
+        carina_core::differ::provider_states_for(&current_states, &orphans, resources.resources());
+    let input_states = carina_core::resource::into_plan_input_map(
+        provider_states,
+        &SchemaRegistry::new(),
+        resources.resources(),
+    );
+    resources.rebuild_bindings_after_identity_reconciliation(RebuildBindingsInputs {
+        compositions: &[],
+        data_sources: &[],
+        current_states: &input_states,
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    assert_eq!(
+        resources
+            .bindings()
+            .get("resource")
+            .and_then(|attrs| attrs.get("observed")),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "from-provider".into()
+        ))),
+        "post-reconcile bindings must derive from the same managed set as the differ",
+    );
+    let plan = create_plan(
+        resources.resources(),
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        &carina_core::resource::into_plan_input_map(
+            current_states,
+            &SchemaRegistry::new(),
+            resources.resources(),
+        ),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &saved_attrs,
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "a promoted orphan transformed by every prior-state stage must be a no-op, got {:?}",
+        plan.effects()
+    );
+}
+
+#[tokio::test]
+async fn combined_hydration_restores_partial_read_marker_on_refreshed_orphan() {
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "orphan", None);
+    let marker = carina_core::resource::PartialReadMarker {
+        detail: "provider read omitted token".to_string(),
+        missing_attributes: BTreeSet::from(["token".to_string()]),
+    };
+    let mut row = carina_state::ResourceState::new(
+        &id.resource_type,
+        id.identity().expect("resolved test id").clone(),
+        &id.provider,
+    )
+    .with_identifier("resource-123");
+    row.binding = Some("orphan".to_string());
+    row.partial_read = Some(marker.clone());
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+
+    let mut orphans = state_file.build_orphans(&HashSet::new());
+    let orphan = orphans.remove(&id).expect("orphan row");
+    let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("resource-123");
+    orphans.insert(orphan.with_refreshed_state(refreshed));
+    assert_eq!(orphans[&id].state().partial_read, None);
+
+    let mut current_states = HashMap::new();
+    hydrate_prior_states(
+        &mut current_states,
+        &mut orphans,
+        &carina_core::provider::NoopNormalizer,
+        &crate::empty_lifted_saved_attrs(),
+        Some(&state_file),
+    )
+    .await
+    .expect("combined state hydration");
+
+    assert_eq!(orphans[&id].state().partial_read, Some(marker));
+    assert!(current_states.is_empty());
 }
 
 #[tokio::test]
@@ -968,7 +1178,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let schemas = SchemaRegistry::new();
     let saved_attrs = crate::empty_lifted_saved_attrs();
     let prev_explicit = HashMap::new();
-    let orphan_deps = HashMap::new();
+    let orphan_deps = Orphans::new();
     let plan_without = create_plan(
         &resources_without,
         &[],
@@ -1254,7 +1464,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     let resources_without = vec![resource.clone()];
     let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
     let saved_attrs = crate::empty_lifted_saved_attrs();
-    let orphan_deps = HashMap::new();
+    let orphan_deps = Orphans::new();
     let plan_without = create_plan(
         &resources_without,
         &[],
@@ -1390,6 +1600,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
 
     let moved_pairs = materialize_moved_states(
         &mut current_states,
+        &mut Orphans::new(),
         &mut prev_explicit,
         &mut saved_attrs,
         &state_blocks,
@@ -1434,17 +1645,18 @@ fn same_type_moved_block_parses_and_materializes_state() {
 
     let from = ResourceId::with_provider_identity("awscc", "s3.Bucket", "old_bucket", None);
     let to = ResourceId::with_provider_identity("awscc", "s3.Bucket", "new_bucket", None);
-    let mut current_states = HashMap::from([(
-        from.clone(),
-        State::existing(from.clone(), HashMap::new()).with_identifier("bucket-123"),
-    )]);
+    let mut current_states = HashMap::from([(to.clone(), State::not_found(to.clone()))]);
     let mut state_file = StateFile::new();
     state_file
-        .upsert_resource(ResourceState::new("s3.Bucket", "old_bucket", "awscc"))
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "old_bucket", "awscc").with_identifier("bucket-123"),
+        )
         .expect("test state setup must be valid");
+    let mut orphans = state_file.build_orphans(&HashSet::from([to.clone()]));
 
     let moved_pairs = materialize_moved_states(
         &mut current_states,
+        &mut orphans,
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &parsed.state_blocks,
@@ -1464,6 +1676,78 @@ fn same_type_moved_block_parses_and_materializes_state() {
         .expect("source state must be transferred to the destination address");
     assert_eq!(moved.id, to);
     assert_eq!(moved.identifier.as_deref(), Some("bucket-123"));
+    assert!(orphans.is_empty());
+}
+
+#[test]
+fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
+    use carina_core::effect::Effect;
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_state::state::{ResourceState, StateFile};
+
+    let parsed = parse(
+        r#"
+            moved {
+                from = mock.test.resource 'old_name'
+                to   = mock.test.resource 'new_name'
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("same-type moved block must parse");
+
+    let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
+    let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
+    let mut row =
+        ResourceState::new("test.resource", "old_name", "mock").with_identifier("object-123");
+    row.binding = Some("retired".to_string());
+    let mut state_file = StateFile::new();
+    state_file.upsert_resource(row).unwrap();
+
+    let mut orphans = state_file.build_orphans(&HashSet::new());
+    let mut current_states = HashMap::new();
+    let moved_pairs = materialize_moved_states(
+        &mut current_states,
+        &mut orphans,
+        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
+        &parsed.state_blocks,
+        &Some(state_file.clone()),
+    );
+    assert_eq!(
+        moved_pairs,
+        vec![(
+            ResolvedResourceId::new(from),
+            ResolvedResourceId::new(to.clone())
+        )]
+    );
+    assert!(
+        current_states.is_empty(),
+        "an undeclared move target must remain solely in the orphan collection"
+    );
+    assert_eq!(
+        orphans.get(&to).and_then(|orphan| orphan.binding()),
+        Some("retired")
+    );
+
+    let plan = create_plan(
+        &[],
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        &carina_core::resource::into_plan_input_map(current_states, &SchemaRegistry::new(), &[]),
+        &state_file.build_directives(),
+        &SchemaRegistry::new(),
+        &crate::empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+
+    assert!(matches!(
+        plan.effects(),
+        [Effect::Delete { id, binding, .. }]
+            if id.as_inner() == &to && binding.as_deref() == Some("retired")
+    ));
 }
 
 /// Sibling of `import_suppresses_create_when_target_resource_is_routed_to_named_instance`:
@@ -1794,6 +2078,7 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     let mut warnings = Vec::new();
     let moved_pairs = materialize_moved_states_with_warning_sink(
         &mut HashMap::new(),
+        &mut Orphans::new(),
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
@@ -1816,6 +2101,7 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     let mut warnings = Vec::new();
     let moved_pairs = materialize_moved_states_with_warning_sink(
         &mut HashMap::new(),
+        &mut Orphans::new(),
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
@@ -2139,6 +2425,7 @@ fn test_plan_allows_from_absent_to_present_idempotent_noop() {
 
     let moved_pairs = materialize_moved_states_with_warning_sink(
         &mut HashMap::new(),
+        &mut Orphans::new(),
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
@@ -2605,6 +2892,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
 
     let moved_pairs = materialize_moved_states(
         &mut current_states,
+        &mut Orphans::new(),
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
@@ -3793,13 +4081,14 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 
     let mut state_file = StateFile::new();
     state_file
-        .upsert_resource(ResourceState::new(
-            "ec2.Route",
-            test_identity(&old_name),
-            "awscc",
-        ))
+        .upsert_resource(
+            ResourceState::new("ec2.Route", test_identity(&old_name), "awscc")
+                .with_identifier("route-123"),
+        )
         .expect("test state setup must be valid");
     let mut current_states = HashMap::new();
+    let desired_ids = HashSet::from([named.id.clone()]);
+    let mut orphans = state_file.build_orphans(&desired_ids);
     let mut prev_explicit = HashMap::new();
     let mut saved_attrs = crate::empty_lifted_saved_attrs();
 
@@ -3808,6 +4097,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         &resources,
         &providers_aws,
         &mut current_states,
+        &mut orphans,
         &mut prev_explicit,
         &mut saved_attrs,
         &Some(state_file),
@@ -3823,9 +4113,16 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
                 test_identity(&old_name),
                 None,
             ),
-            ResolvedResourceId::new(named.id)
+            ResolvedResourceId::new(named.id.clone())
         )],
         "provider config region spelling must canonicalize before rename simhash"
+    );
+    assert!(orphans.is_empty());
+    assert_eq!(
+        current_states
+            .get(&named.id)
+            .and_then(|state| state.identifier.as_deref()),
+        Some("route-123")
     );
 }
 
@@ -4566,7 +4863,11 @@ mod expand_same_config_deferred_for_tests {
         assert!(refreshable.contains(&r_a.id));
         assert!(!refreshable.contains(&r_b.id));
 
-        let selected: Vec<&ResourceId> = refreshable.select(&resources).map(|r| &r.id).collect();
+        let no_orphans = Orphans::new();
+        let selected: Vec<&ResourceId> = refreshable
+            .select(&resources, &no_orphans)
+            .map(|r| &r.id)
+            .collect();
         assert_eq!(
             selected,
             vec![&r_a.id, &r_c.id],
@@ -4578,7 +4879,22 @@ mod expand_same_config_deferred_for_tests {
         // moved targets" case from the plan/apply guard.
         let empty = RefreshableChildIds::default();
         assert!(empty.is_empty());
-        assert_eq!(empty.select(&resources).count(), 0);
+        assert_eq!(empty.select(&resources, &no_orphans).count(), 0);
+
+        let orphan_owned = Orphans::from([carina_core::differ::Orphan::new(
+            State::existing(r_a.id.clone(), HashMap::new()),
+            Some("a".to_string()),
+            Directives::default(),
+        )]);
+        let selected: Vec<&ResourceId> = refreshable
+            .select(&resources, &orphan_owned)
+            .map(|r| &r.id)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![&r_c.id],
+            "an orphan-owned child must not be duplicated into current states by refresh"
+        );
     }
 
     #[test]
@@ -5767,15 +6083,17 @@ mod wait_until_enum_alias {
             &resolved_resources,
             &[],
             &StubProvider,
-            &carina_core::resource::into_plan_input_map(
-                states.clone(),
-                &carina_core::schema::SchemaRegistry::new(),
-                &[],
+            carina_core::differ::PlanPriorStates::new(
+                &carina_core::resource::into_plan_input_map(
+                    states.clone(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                    &[],
+                ),
+                &Orphans::new(),
             ),
             &HashMap::new(),
             ctx.schemas(),
             &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
             &HashMap::new(),
             &raw_waits,
         )
@@ -5794,15 +6112,17 @@ mod wait_until_enum_alias {
             &resolved_resources,
             &[],
             &StubProvider,
-            &carina_core::resource::into_plan_input_map(
-                states.clone(),
-                &carina_core::schema::SchemaRegistry::new(),
-                &[],
+            carina_core::differ::PlanPriorStates::new(
+                &carina_core::resource::into_plan_input_map(
+                    states.clone(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                    &[],
+                ),
+                &Orphans::new(),
             ),
             &HashMap::new(),
             ctx.schemas(),
             &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
             &HashMap::new(),
             &waits,
         )
@@ -6461,6 +6781,7 @@ mod resolved_value_constraint_gate {
         let compositions = Vec::new();
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
         let mut current_states = HashMap::new();
+        let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
         let mut wait_bindings = Vec::new();
@@ -6471,6 +6792,7 @@ mod resolved_value_constraint_gate {
                 &origins,
                 &module_gate,
                 &mut current_states,
+                &mut orphans,
                 &[],
                 &mut data_sources,
                 &data_source_origins,
@@ -6548,6 +6870,7 @@ mod resolved_value_constraint_gate {
         .unwrap();
         let origins = resources.paired_unresolved_resources();
         let mut states = HashMap::new();
+        let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let mut waits = Vec::new();
         let module_gate =
@@ -6559,6 +6882,7 @@ mod resolved_value_constraint_gate {
                 &origins,
                 &module_gate,
                 &mut states,
+                &mut orphans,
                 &[],
                 &mut data_sources,
                 &[],
@@ -6688,13 +7012,16 @@ mod resolved_value_constraint_gate {
                 .with_attribute("target", ref_value()),
         ];
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let mut states = HashMap::new();
+        let mut orphans = Orphans::new();
 
         let errors = PlanPreprocessor::new(&normalizer, &ctx)
             .prepare(
                 &mut resources,
                 &[],
                 &module_gate,
-                &mut HashMap::new(),
+                &mut states,
+                &mut orphans,
                 &[],
                 &mut data_sources,
                 &data_source_origins,

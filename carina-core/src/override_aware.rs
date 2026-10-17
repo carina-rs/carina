@@ -43,6 +43,17 @@ pub struct OverrideAwareResources {
     skipped_overrides: Vec<ResourceId>,
 }
 
+/// Binding sources that remain external to [`OverrideAwareResources`] after
+/// late identity reconciliation. The managed set is deliberately absent: the
+/// rebuilt view always uses the resource set owned by the receiver.
+pub struct RebuildBindingsInputs<'a> {
+    pub compositions: &'a [crate::resource::Composition],
+    pub data_sources: &'a [crate::resource::DataSource],
+    pub current_states: &'a HashMap<ResourceId, crate::resource::PlanInputState>,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub wait_aliases: &'a [crate::binding_index::WaitAliasSpec],
+}
+
 enum ResolutionMode<'a> {
     Strict,
     Plan {
@@ -261,6 +272,29 @@ impl OverrideAwareResources {
 
     pub fn bindings(&self) -> &ResolvedBindings {
         &self.bindings
+    }
+
+    /// Rebuild the binding view after late identity reconciliation changes
+    /// which provider states belong to the managed resource set.
+    pub fn rebuild_bindings_after_identity_reconciliation(
+        &mut self,
+        inputs: RebuildBindingsInputs<'_>,
+    ) {
+        let RebuildBindingsInputs {
+            compositions,
+            data_sources,
+            current_states,
+            remote_bindings,
+            wait_aliases,
+        } = inputs;
+        self.bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &self.resources,
+            compositions,
+            data_sources,
+            current_states,
+            remote_bindings,
+            wait_aliases,
+        });
     }
 
     pub fn legacy_overrides_applied(&self) -> &[ResourceId] {

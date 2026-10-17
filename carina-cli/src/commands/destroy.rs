@@ -378,10 +378,9 @@ async fn run_destroy_locked_with_ctx(
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
                 all_resources.iter().map(|r| r.id.clone()).collect();
-            let orphan_states: Vec<(ResourceId, State)> =
-                sf.build_orphan_states(&desired_ids).into_iter().collect();
+            let orphan_entries: Vec<_> = sf.build_orphans(&desired_ids).into_iter().collect();
             let mut refresh_cancelled = false;
-            let mut orphan_iter = orphan_states.into_iter();
+            let mut orphan_iter = orphan_entries.into_iter();
             let mut orphan_in_flight = FuturesUnordered::new();
             let cleanup_loop = cancel.cleanup_aware_loop();
             loop {
@@ -398,17 +397,20 @@ async fn run_destroy_locked_with_ctx(
                 }
 
                 while !refresh_cancelled && orphan_in_flight.len() < 5 {
-                    let Some((id, state)) = orphan_iter.next() else {
+                    let Some((id, orphan)) = orphan_iter.next() else {
                         break;
                     };
                     let progress = RefreshProgress::begin_multi(&multi, &id);
                     orphan_in_flight.push(async move {
-                        let refreshed =
-                            read_with_retry(provider_ref, &id, state.identifier.as_deref())
-                                .await
-                                .map_err(AppError::Provider)?;
+                        let refreshed = read_with_retry(
+                            provider_ref,
+                            &id,
+                            orphan.state().identifier.as_deref(),
+                        )
+                        .await
+                        .map_err(AppError::Provider)?;
                         progress.finish();
-                        Ok((id, refreshed))
+                        Ok((id, orphan.with_refreshed_state(refreshed)))
                     });
                 }
 
@@ -445,7 +447,8 @@ async fn run_destroy_locked_with_ctx(
                         }
                     }
                 };
-                let result: Result<(ResourceId, State), AppError> = match next {
+                let result: Result<(ResourceId, carina_core::differ::Orphan), AppError> = match next
+                {
                     CleanupInterrupted::Completed(Some(result)) => result,
                     CleanupInterrupted::Completed(None) => break,
                     CleanupInterrupted::Abandoned => {
@@ -457,14 +460,14 @@ async fn run_destroy_locked_with_ctx(
                 if refresh_cancelled {
                     continue;
                 }
-                let (id, refreshed) = result?;
-                if refreshed.exists {
-                    current_states.insert(id.clone(), refreshed);
-                    if let Some(resolved_id) = ResolvedResourceId::try_new(id) {
-                        let orphan_resource = build_orphan_resource(sf, &resolved_id);
-                        all_resources.push(orphan_resource);
-                    }
+                let (id, orphan) = result?;
+                if orphan.state().exists
+                    && let Some(resolved_id) = ResolvedResourceId::try_new(id.clone())
+                {
+                    let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                    all_resources.push(orphan_resource);
                 }
+                current_states.insert(id, orphan.into_state());
             }
             if refresh_cancelled {
                 return Err(AppError::Interrupted);
@@ -480,12 +483,12 @@ async fn run_destroy_locked_with_ctx(
 
         // Include orphaned resources (in state but not in .crn)
         let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
-        for (id, state) in sf.build_orphan_states(&desired_ids) {
-            current_states.insert(id.clone(), state);
-            if let Some(resolved_id) = ResolvedResourceId::try_new(id) {
+        for (id, orphan) in sf.build_orphans(&desired_ids) {
+            if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
                 let orphan_resource = build_orphan_resource(sf, &resolved_id);
                 all_resources.push(orphan_resource);
             }
+            current_states.insert(id, orphan.into_state());
         }
     }
 
@@ -2475,6 +2478,84 @@ mod tests {
                 && key == &deposed_key
                 && dependencies == &HashSet::from(["subnet".to_string()])
         ));
+    }
+
+    #[test]
+    fn orphan_destroy_uses_row_binding_and_depends_on_for_delete_ordering() {
+        use carina_state::ResourceState;
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut parent =
+            ResourceState::new("test.Parent", "parent", "mock").with_identifier("parent-123");
+        parent.binding = Some("parent".to_string());
+        let mut child =
+            ResourceState::new("test.Child", "child", "mock").with_identifier("child-123");
+        child.binding = Some("child".to_string());
+        child.directives.depends_on = vec!["parent".to_string()];
+        child.dependency_bindings = BTreeSet::from(["network".to_string()]);
+
+        let mut state_file = StateFile::new();
+        state_file.upsert_resource(parent).unwrap();
+        state_file.upsert_resource(child).unwrap();
+        let orphan_entries = state_file.build_orphans(&HashSet::new());
+        let mut resources = orphan_entries
+            .keys()
+            .cloned()
+            .map(|id| {
+                build_orphan_resource(
+                    &state_file,
+                    &ResolvedResourceId::try_new(id).expect("test orphan id must be resolved"),
+                )
+            })
+            .collect::<Vec<_>>();
+        resources.sort_by_key(|resource| resource.binding.clone());
+        let current_states = orphan_entries
+            .into_iter()
+            .map(|(id, orphan)| (id, orphan.into_state()))
+            .collect();
+        let resource_refs = resources.iter().collect::<Vec<_>>();
+
+        let effects = build_destroy_delete_effects(
+            &resource_refs,
+            &current_states,
+            Some(&state_file),
+            &HashSet::new(),
+        );
+        let child_delete = effects
+            .iter()
+            .find(|effect| effect.binding_name().as_deref() == Some("child"))
+            .expect("child orphan must produce a Delete");
+        assert!(matches!(
+            child_delete,
+            Effect::Delete {
+                dependencies,
+                explicit_dependencies,
+                ..
+            } if dependencies == &HashSet::from(["network".to_string(), "parent".to_string()])
+                && explicit_dependencies == &HashSet::from(["parent".to_string()])
+        ));
+
+        let analysis = build_effect_dependency_analysis(
+            &effects,
+            &HashMap::<ResourceId, UnresolvedResource>::new(),
+            &[],
+            ScheduleInputs::Destroy { aliases: &[] },
+        );
+        let deletion_deps = transitive_delete_deps(&analysis, effects.len());
+        let depths = compute_delete_depths(effects.len(), &deletion_deps);
+        let names = effects
+            .iter()
+            .map(|effect| effect.binding_name().unwrap())
+            .collect::<Vec<_>>();
+        let order = topological_delete_order(effects.len(), &deletion_deps, &depths, &names)
+            .expect("orphan dependency graph must be acyclic");
+        assert_eq!(
+            order
+                .into_iter()
+                .map(|index| names[index].as_str())
+                .collect::<Vec<_>>(),
+            vec!["child", "parent"]
+        );
     }
 
     #[test]

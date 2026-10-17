@@ -180,7 +180,7 @@ fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -272,7 +272,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -346,7 +346,7 @@ fn no_temporary_name_without_create_before_destroy() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -419,7 +419,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -477,7 +477,7 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -544,7 +544,7 @@ fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -653,7 +653,7 @@ fn no_temporary_name_when_unique_name_attribute_changes() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -1213,18 +1213,9 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     let distribution_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
     let distribution_state = State::existing(distribution_id.clone(), distribution_attrs.clone())
         .with_dependency_bindings(BTreeSet::from(["web_acl".to_string()]));
-    let web_acl_state = State::existing(
-        web_acl_id.clone(),
-        HashMap::from([(
-            "_binding".to_string(),
-            Value::Concrete(ConcreteValue::String("web_acl".into())),
-        )]),
-    )
-    .with_identifier("arn:aws:wafv2:acl/test");
-    let current_states = HashMap::from([
-        (distribution_id.clone(), distribution_state),
-        (web_acl_id.clone(), web_acl_state),
-    ]);
+    let web_acl_state = State::existing(web_acl_id.clone(), HashMap::new())
+        .with_identifier("arn:aws:wafv2:acl/test");
+    let current_states = HashMap::from([(distribution_id.clone(), distribution_state)]);
     let saved_attrs = crate::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from(
         [(distribution_id.clone(), distribution_attrs)],
     ))
@@ -1243,6 +1234,11 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
             )]),
         },
     )]);
+    let orphans = Orphans::from([Orphan::new(
+        web_acl_state,
+        Some("web_acl".to_string()),
+        Directives::default(),
+    )]);
 
     let plan = create_plan(
         &[desired],
@@ -1257,7 +1253,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_explicit,
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -1297,6 +1293,199 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         blocked_by_updates,
         &HashSet::from([ResourceIdentity::new("distribution")])
     );
+}
+
+#[test]
+fn orphan_delete_uses_typed_binding_without_state_attribute() {
+    let orphan_id = ResourceId::with_identity("example.Service", "removed-service");
+    let orphan_state = State::existing(
+        orphan_id.clone(),
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("removed-service".into())),
+        )]),
+    )
+    .with_identifier("service-123")
+    .with_dependency_bindings(BTreeSet::from(["network".to_string()]));
+    assert!(
+        orphan_state
+            .attributes
+            .keys()
+            .all(|key| !key.starts_with('_')),
+        "provider-facing state must not carry orphan metadata"
+    );
+
+    let orphans = Orphans::from([Orphan::new(
+        orphan_state,
+        Some("service".to_string()),
+        Directives::default(),
+    )]);
+
+    let plan = create_plan(
+        &[],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(
+            HashMap::new(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+
+    let delete = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.resource_id() == &orphan_id)
+        .expect("orphan must produce a Delete effect");
+    let Effect::Delete {
+        binding,
+        dependencies,
+        ..
+    } = delete
+    else {
+        panic!("expected orphan Delete, got {delete:?}");
+    };
+    assert_eq!(binding.as_deref(), Some("service"));
+    assert_eq!(dependencies, &HashSet::from(["network".to_string()]));
+}
+
+#[test]
+fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_promotion() {
+    let id = ResourceId::with_identity("example.Service", "service");
+    let desired = Resource::new("example.Service", "service")
+        .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into())));
+    let orphan = Orphan::new(
+        State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("old".into())),
+            )]),
+        )
+        .with_identifier("service-123"),
+        Some("service".to_string()),
+        Directives::default(),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(HashMap::new(), &SchemaRegistry::new(), &[]),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::from([orphan]),
+        &[],
+    );
+
+    assert_eq!(plan.effects().len(), 1, "plan was {plan:#?}");
+    let Effect::Update {
+        from,
+        changed_attributes,
+        ..
+    } = &plan.effects()[0]
+    else {
+        panic!("expected an Update against the orphan state, got {plan:#?}");
+    };
+    assert_eq!(from.identifier.as_deref(), Some("service-123"));
+    assert_eq!(changed_attributes, &["name".to_string()]);
+}
+
+#[test]
+fn orphan_collection_rekeys_index_and_provider_state_together() {
+    let old_id = ResourceId::with_identity("example.Service", "old");
+    let new_id = ResourceId::with_identity("example.Service", "new");
+    let orphan = Orphan::new(
+        State::existing(old_id.clone(), HashMap::new()),
+        Some("service".to_string()),
+        Directives::default(),
+    );
+    let mut orphans: Orphans = [orphan].into_iter().collect();
+
+    assert!(orphans.rekey(&old_id, new_id.clone()));
+    assert!(!orphans.contains_key(&old_id));
+    assert_eq!(orphans.get(&new_id).unwrap().state().id, new_id);
+}
+
+#[tokio::test]
+#[should_panic(expected = "provider transform must preserve the complete prior-state key set")]
+async fn prior_state_transform_rejects_current_state_key_changes() {
+    let current_id = ResourceId::with_identity("example.Service", "current");
+    let orphan_id = ResourceId::with_identity("example.Service", "orphan");
+    let inserted_id = ResourceId::with_identity("example.Service", "inserted");
+    let mut current_states = HashMap::from([(
+        current_id.clone(),
+        State::existing(current_id.clone(), HashMap::new()),
+    )]);
+    let mut orphans = Orphans::from([Orphan::new(
+        State::existing(orphan_id, HashMap::new()),
+        Some("orphan".to_string()),
+        Directives::default(),
+    )]);
+
+    transform_prior_provider_states(&mut current_states, &mut orphans, async |states| {
+        states.remove(&current_id);
+        states.insert(
+            inserted_id.clone(),
+            State::existing(inserted_id, HashMap::new()),
+        );
+        Ok::<(), ()>(())
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependencies() {
+    let orphan_id = ResourceId::with_identity("example.Service", "removed-service");
+    let orphan_state =
+        State::existing(orphan_id.clone(), HashMap::new()).with_identifier("service-123");
+    let directives = Directives {
+        depends_on: vec!["x".to_string()],
+        ..Directives::default()
+    };
+    let orphans = Orphans::from([Orphan::new(
+        orphan_state,
+        Some("service".to_string()),
+        directives,
+    )]);
+
+    let plan = create_plan(
+        &[],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(HashMap::new(), &SchemaRegistry::new(), &[]),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+
+    let delete = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.resource_id() == &orphan_id)
+        .expect("orphan must produce a Delete effect");
+    let Effect::Delete {
+        dependencies,
+        explicit_dependencies,
+        ..
+    } = delete
+    else {
+        panic!("expected orphan Delete, got {delete:?}");
+    };
+    assert_eq!(dependencies, &HashSet::from(["x".to_string()]));
+    assert_eq!(explicit_dependencies, &HashSet::from(["x".to_string()]));
 }
 
 #[test]
@@ -1353,7 +1542,7 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &prev_explicit,
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -1390,18 +1579,14 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
         )]),
     )
     .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]));
-    let dependency_state = State::existing(
-        dependency_id.clone(),
-        HashMap::from([(
-            "_binding".to_string(),
-            Value::Concrete(ConcreteValue::String("dependency".into())),
-        )]),
-    )
-    .with_identifier("dependency-old");
-    let current_states = HashMap::from([
-        (consumer_id, consumer_state),
-        (dependency_id.clone(), dependency_state),
-    ]);
+    let dependency_state =
+        State::existing(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
+    let current_states = HashMap::from([(consumer_id, consumer_state)]);
+    let orphans = Orphans::from([Orphan::new(
+        dependency_state,
+        Some("dependency".to_string()),
+        Directives::default(),
+    )]);
 
     let plan = create_plan(
         &[consumer],
@@ -1416,7 +1601,7 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -1451,24 +1636,20 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
             Value::Concrete(ConcreteValue::Int(1)),
         )]),
     );
-    let dependency_state = State::existing(
-        dependency_id.clone(),
-        HashMap::from([(
-            "_binding".to_string(),
-            Value::Concrete(ConcreteValue::String("dependency".into())),
-        )]),
-    )
-    .with_identifier("dependency-old");
-    let current_states = HashMap::from([
-        (consumer_id.clone(), consumer_state),
-        (dependency_id.clone(), dependency_state),
-    ]);
+    let dependency_state =
+        State::existing(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
+    let current_states = HashMap::from([(consumer_id.clone(), consumer_state)]);
     let directives_map = HashMap::from([(
         consumer_id,
         Directives {
             depends_on: vec!["dependency".to_string()],
             ..Default::default()
         },
+    )]);
+    let orphans = Orphans::from([Orphan::new(
+        dependency_state,
+        Some("dependency".to_string()),
+        Directives::default(),
     )]);
 
     let plan = create_plan(
@@ -1484,7 +1665,7 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -1622,7 +1803,7 @@ fn create_plan_detects_attribute_removal() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &prev_explicit,
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -1694,7 +1875,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &prev_explicit,
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -1769,7 +1950,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &prev_explicit,
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -1781,8 +1962,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
 }
 
 #[test]
-fn diff_skips_internal_attributes_in_removal_detection() {
-    // prev_desired_keys includes "_internal" but it should be skipped
+fn diff_includes_underscore_prefixed_attributes_in_removal_detection() {
     let desired = Resource::new("s3.Bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
@@ -1805,11 +1985,13 @@ fn diff_skips_internal_attributes_in_removal_detection() {
     let prev_explicit = explicit_top_level(&["region", "_internal"]);
 
     let result = diff_test(&desired, &current, None, Some(&prev_explicit), None);
-    assert!(
-        matches!(result, Diff::NoChange(_)),
-        "Should skip internal attributes starting with '_', got {:?}",
-        result
-    );
+    let Diff::Update {
+        changed_attributes, ..
+    } = result
+    else {
+        panic!("underscore-prefixed provider attribute removal must produce Update");
+    };
+    assert_eq!(changed_attributes, vec!["_internal".to_string()]);
 }
 
 #[test]
@@ -1817,42 +1999,35 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     // Orphaned resource (in state but removed from .crn) with prevent_destroy
     // should produce a PlanError instead of a Delete effect.
 
-    // Orphaned resource: exists in current_states but NOT in desired
-    let mut current_states = HashMap::new();
+    let orphan_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
     let mut attrs = HashMap::new();
     attrs.insert(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    current_states.insert(
-        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
-    );
-
-    // Directives from state say prevent_destroy
-    let mut directives_map = HashMap::new();
-    directives_map.insert(
-        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+    let orphans = Orphans::from([Orphan::new(
+        State::existing(orphan_id.clone(), attrs),
+        None,
         Directives {
             prevent_destroy: true,
             ..Default::default()
         },
-    );
+    )]);
 
     let plan = create_plan(
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(
-            current_states.clone(),
+            HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
-        &directives_map,
+        &HashMap::new(),
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -1915,7 +2090,7 @@ fn prevent_destroy_blocks_replace() {
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(
-            current_states.clone(),
+            current_states,
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
@@ -1923,7 +2098,7 @@ fn prevent_destroy_blocks_replace() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -1984,7 +2159,7 @@ fn prevent_destroy_does_not_block_update() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -2024,7 +2199,7 @@ fn prevent_destroy_does_not_block_create() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -2046,23 +2221,24 @@ fn prevent_destroy_does_not_block_create() {
 #[test]
 fn without_prevent_destroy_delete_works_normally() {
     // Orphaned resource without prevent_destroy should still be deleted normally
-    let mut current_states = HashMap::new();
+    let orphan_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
     let mut attrs = HashMap::new();
     attrs.insert(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    current_states.insert(
-        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
-    );
+    let orphans = Orphans::from([Orphan::new(
+        State::existing(orphan_id, attrs),
+        None,
+        Directives::default(),
+    )]);
 
     let plan = create_plan(
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(
-            current_states.clone(),
+            HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
@@ -2070,7 +2246,7 @@ fn without_prevent_destroy_delete_works_normally() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -2089,56 +2265,45 @@ fn without_prevent_destroy_delete_works_normally() {
 #[test]
 fn prevent_destroy_collects_multiple_errors() {
     // Two orphaned resources with prevent_destroy - both should generate errors
-    let mut current_states = HashMap::new();
+    let first_id = ResourceId::with_identity("ec2.Vpc", "vpc-1");
+    let second_id = ResourceId::with_identity("ec2.Vpc", "vpc-2");
     let mut attrs1 = HashMap::new();
     attrs1.insert(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-    );
-    current_states.insert(
-        ResourceId::with_identity("ec2.Vpc", "vpc-1"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "vpc-1"), attrs1),
     );
     let mut attrs2 = HashMap::new();
     attrs2.insert(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
     );
-    current_states.insert(
-        ResourceId::with_identity("ec2.Vpc", "vpc-2"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "vpc-2"), attrs2),
-    );
-
-    let mut directives_map = HashMap::new();
-    directives_map.insert(
-        ResourceId::with_identity("ec2.Vpc", "vpc-1"),
-        Directives {
-            prevent_destroy: true,
-            ..Default::default()
-        },
-    );
-    directives_map.insert(
-        ResourceId::with_identity("ec2.Vpc", "vpc-2"),
-        Directives {
-            prevent_destroy: true,
-            ..Default::default()
-        },
-    );
+    let prevent_destroy = Directives {
+        prevent_destroy: true,
+        ..Default::default()
+    };
+    let orphans = Orphans::from([
+        Orphan::new(
+            State::existing(first_id, attrs1),
+            None,
+            prevent_destroy.clone(),
+        ),
+        Orphan::new(State::existing(second_id, attrs2), None, prevent_destroy),
+    ]);
 
     let plan = create_plan(
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(
-            current_states.clone(),
+            HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
-        &directives_map,
+        &HashMap::new(),
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -2196,7 +2361,7 @@ fn wait_binding_lowers_to_wait_effect() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 
@@ -2270,7 +2435,7 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 
@@ -2332,7 +2497,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &parsed.wait_bindings,
     );
 
@@ -2391,7 +2556,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 
@@ -2456,7 +2621,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
     let Effect::Wait {
@@ -2501,7 +2666,7 @@ fn wait_with_unknown_target_emits_plan_error() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
     assert!(
@@ -2576,7 +2741,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 
@@ -2625,7 +2790,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 
@@ -2706,7 +2871,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 
@@ -2758,7 +2923,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 
@@ -2842,7 +3007,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[wait],
     );
 

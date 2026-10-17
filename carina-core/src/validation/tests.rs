@@ -423,7 +423,7 @@ fn dotted_string_literal_does_not_count_as_binding_use() {
 fn anonymous_resource_no_warning() {
     let mut parsed = empty_parsed();
 
-    // Anonymous resource (no _binding attribute)
+    // Anonymous resource (no typed binding)
     let bucket = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_attribute(
         "bucket_name",
         Value::Concrete(ConcreteValue::String("my-bucket".into())),

@@ -1,6 +1,6 @@
 //! Plan generation from diffs and cascading update logic.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
 
@@ -24,7 +24,7 @@ use crate::schema::{
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-use super::{Diff, diff};
+use super::{Diff, PlanPriorStates, diff};
 
 pub(crate) struct PendingReplace {
     pub create: ResolvedResource,
@@ -198,10 +198,10 @@ pub fn generate_temporary_name(
 
 /// Compute Diff for multiple resources and generate a Plan
 ///
-/// The `directives_map` provides Carina-side directives for orphaned
-/// resources (resources in state but not in desired). For desired
-/// resources, the directives are read directly from the `Resource`
-/// struct.
+/// The `directives_map` provides prior directives for desired resources so
+/// update-before-delete ordering can recover removed `depends_on` edges.
+/// Orphans carry their own directives alongside their provider state in the
+/// typed `orphans` input.
 ///
 /// The `saved_attrs` map provides the last-known attribute values from the state file.
 /// This is used to merge unmanaged nested fields into desired values before comparison,
@@ -222,41 +222,42 @@ pub fn generate_temporary_name(
 /// (carina#3169) cannot accidentally reach pre-apply differ logic.
 ///
 /// ```compile_fail
-/// use std::collections::{BTreeSet, HashMap};
-/// use carina_core::differ::create_plan;
+/// use std::collections::HashMap;
+/// use carina_core::differ::{Orphans, PlanPriorStates, create_plan};
 /// use carina_core::provider::RawSavedAttrs;
-/// use carina_core::resource::Composition;
+/// use carina_core::resource::{Composition, ResourceId, State, into_plan_input_map};
 /// use carina_core::schema::SchemaRegistry;
 /// let compositions: Vec<Composition> = vec![];
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
+/// let states = HashMap::<ResourceId, State>::new();
+/// let plan_states = into_plan_input_map(states, &registry, &[]);
+/// let orphans = Orphans::new();
 /// let _ = create_plan(
 ///     &compositions,
 ///     &[],
 ///     &carina_core::provider::ProviderRouter::new(),
-///     &HashMap::new(),
+///     PlanPriorStates::new(&plan_states, &orphans),
 ///     &HashMap::new(),
 ///     &registry,
 ///     &saved_attrs,
-///     &HashMap::new(),
 ///     &HashMap::new(),
 ///     &[],
 /// );
 /// ```
 ///
-/// Raw [`State`] maps cannot be passed to planning. Callers must convert
-/// through [`into_plan_input_map`](crate::resource::into_plan_input_map),
-/// which canonicalizes state values and materializes partial-create
-/// unknowns before diffing.
+/// Raw [`State`] maps cannot be passed directly to planning. Callers must pair
+/// planning-ready current states and typed orphans in [`PlanPriorStates`],
+/// which lets the differ own same-id orphan promotion.
 ///
 /// ```compile_fail
 /// use std::collections::HashMap;
 /// use carina_core::differ::create_plan;
 /// use carina_core::provider::{ProviderRouter, RawSavedAttrs};
-/// use carina_core::resource::{Resource, ResourceId, State};
+/// use carina_core::resource::{ResolvedResource, ResourceId, State, into_plan_input_map};
 /// use carina_core::schema::SchemaRegistry;
 ///
-/// let resources: Vec<Resource> = vec![];
+/// let resources: Vec<ResolvedResource> = vec![];
 /// let states: HashMap<ResourceId, State> = HashMap::new();
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
@@ -269,7 +270,6 @@ pub fn generate_temporary_name(
 ///     &registry,
 ///     &saved_attrs,
 ///     &HashMap::new(),
-///     &HashMap::new(),
 ///     &[],
 /// );
 /// ```
@@ -279,23 +279,25 @@ pub fn generate_temporary_name(
 ///
 /// ```compile_fail
 /// use std::collections::HashMap;
-/// use carina_core::differ::create_plan;
+/// use carina_core::differ::{Orphans, PlanPriorStates, create_plan};
 /// use carina_core::provider::{ProviderRouter, RawSavedAttrs};
-/// use carina_core::resource::Resource;
+/// use carina_core::resource::{ResolvedResource, ResourceId, State, into_plan_input_map};
 /// use carina_core::schema::SchemaRegistry;
 ///
-/// let resources: Vec<Resource> = vec![];
+/// let resources: Vec<ResolvedResource> = vec![];
+/// let states = HashMap::<ResourceId, State>::new();
+/// let orphans = Orphans::new();
 /// let registry = SchemaRegistry::default();
+/// let plan_states = into_plan_input_map(states, &registry, &[]);
 /// let raw_saved_attrs = RawSavedAttrs::default();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
 ///     &ProviderRouter::new(),
-///     &HashMap::new(),
+///     PlanPriorStates::new(&plan_states, &orphans),
 ///     &HashMap::new(),
 ///     &registry,
 ///     &raw_saved_attrs,
-///     &HashMap::new(),
 ///     &HashMap::new(),
 ///     &[],
 /// );
@@ -305,24 +307,23 @@ pub fn create_plan(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<Plan> {
+    let current_states = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
         managed,
         data_sources,
         provider,
-        current_states,
-        directives_map,
+        &current_states,
         registry,
         saved_attrs,
         prev_explicit,
-        orphan_dependencies,
+        prior_states.orphans(),
         wait_bindings,
     )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
@@ -336,31 +337,30 @@ pub fn create_plan_with_cascades(
     unresolved_managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<Plan> {
+    let current_states = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
         managed,
         data_sources,
         provider,
-        current_states,
-        directives_map,
+        &current_states,
         registry,
         saved_attrs,
         prev_explicit,
-        orphan_dependencies,
+        prior_states.orphans(),
         wait_bindings,
     )?;
     cascade_dependent_updates(
         &mut build.plan,
         &mut build.pending_replaces,
         unresolved_managed,
-        current_states,
+        &current_states,
         registry,
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
@@ -379,22 +379,15 @@ fn create_plan_parts(
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
-    directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
+    orphans: &super::Orphans,
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let known_bindings = known_binding_names(managed, data_sources);
-
-    let desired_ids: std::collections::HashSet<&ResourceId> = managed
-        .iter()
-        .map(|r| &r.id)
-        .chain(data_sources.iter().map(|r| &r.id))
-        .collect();
 
     // Data sources only generate Read effects; the typestate split
     // routes them through their own slice so the legacy
@@ -521,44 +514,40 @@ fn create_plan_parts(
         }
     }
 
-    // Detect orphaned resources: exist in current_states but not in desired
-    for (id, plan_state) in current_states {
-        let state = plan_state.as_state();
-        if state.exists && !desired_ids.contains(id) {
-            let directives = directives_map.get(id).cloned().unwrap_or_default();
-            if directives.prevent_destroy {
-                plan.add_error(PlanError::prevent_destroy(
-                    id.clone(),
-                    PreventDestroyAction::DeleteRemovedFromConfiguration,
-                ));
-                continue;
-            }
-            let identifier = state.identifier.clone().unwrap_or_default();
-            let binding = state.attributes.get("_binding").and_then(|v| match v {
-                Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
-                _ => None,
-            });
-            // Use stored dependency bindings from state file if available,
-            // otherwise fall back to extracting from state attributes
-            let dependencies = orphan_dependencies
-                .get(id)
-                .map(|dep_bindings| dep_bindings.iter().cloned().collect())
-                .unwrap_or_else(|| dependencies_from_prior_state(state, directives.clone()));
-            plan.add(Effect::Delete {
-                id: ResolvedResourceId::new(id.clone()),
-                identifier,
-                generation: crate::effect::EffectGeneration::Current,
-                directives,
-                binding,
-                dependencies,
-                // Orphan deletes have no source `directives.depends_on`;
-                // the resource is gone from desired state. Carrying an
-                // empty set here is correct and serde-stable for
-                // pre-#2871 state files.
-                explicit_dependencies: std::collections::HashSet::new(),
-                blocked_by_updates: HashSet::new(),
-            });
+    // Same-id managed orphans were materialized into `current_states` by
+    // `PlanPriorStates`; skip them here so only still-unmanaged orphans emit
+    // Deletes. Binding, directives, and provider state remain paired.
+    let managed_ids: HashSet<&ResourceId> = managed.iter().map(|resource| &resource.id).collect();
+    for (id, orphan) in orphans {
+        if managed_ids.contains(id) {
+            continue;
         }
+        let state = orphan.state();
+        if !state.exists {
+            continue;
+        }
+        let directives = orphan.directives().clone();
+        if directives.prevent_destroy {
+            plan.add_error(PlanError::prevent_destroy(
+                id.clone(),
+                PreventDestroyAction::DeleteRemovedFromConfiguration,
+            ));
+            continue;
+        }
+        let identifier = state.identifier.clone().unwrap_or_default();
+        let binding = orphan.binding().map(str::to_owned);
+        let dependencies = dependencies_from_prior_state(state, directives.clone());
+        let explicit_dependencies = directives.depends_on.iter().cloned().collect();
+        plan.add(Effect::Delete {
+            id: ResolvedResourceId::new(id.clone()),
+            identifier,
+            generation: crate::effect::EffectGeneration::Current,
+            directives,
+            binding,
+            dependencies,
+            explicit_dependencies,
+            blocked_by_updates: HashSet::new(),
+        });
     }
 
     // Lower each `wait` declaration into an `Effect::Wait`.
@@ -802,19 +791,12 @@ pub fn block_deletes_on_prior_consumer_updates(
 }
 
 fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashSet<String> {
-    let prior_resource = Resource {
-        id: state.id.clone(),
-        // State attributes are a `HashMap`; source order is irrelevant to dependency walking.
-        attributes: state.attributes.clone().into_iter().collect(),
-        directives,
-        prefixes: HashMap::new(),
-        binding: None,
-        dependency_bindings: state.dependency_bindings.clone(),
-        module_source: None,
-        default_tag_keys: Default::default(),
-        quoted_string_attrs: HashSet::new(),
-    };
-    get_resource_dependencies(&prior_resource)
+    state
+        .dependency_bindings
+        .iter()
+        .chain(&directives.depends_on)
+        .cloned()
+        .collect()
 }
 
 fn resource_identity(resource: &ResolvedResource) -> ResourceIdentity {

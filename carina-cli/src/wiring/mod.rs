@@ -13,7 +13,10 @@ use futures::stream::{self, StreamExt};
 
 use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::binding_matches_deferred_template;
+use carina_core::differ::{
+    Orphans, PlanPriorStates, binding_matches_deferred_template, into_all_prior_states,
+    lift_prior_state_enum_leaves, provider_states_for, transform_prior_provider_states,
+};
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
@@ -30,7 +33,7 @@ use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
 use carina_core::module_resolver;
-use carina_core::override_aware::OverrideAwareResources;
+use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 #[cfg(test)]
 use carina_core::parser::MovedAddresses;
 use carina_core::parser::{
@@ -688,6 +691,7 @@ pub fn apply_anonymous_to_named_renames(
     resources: &[Resource],
     providers: &[ProviderConfig],
     current_states: &mut HashMap<ResourceId, State>,
+    orphans: &mut Orphans,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     saved_attrs: &mut LiftedSavedAttrs,
     state_file: &Option<StateFile>,
@@ -747,10 +751,12 @@ pub fn apply_anonymous_to_named_renames(
     );
 
     for (from, to) in &renames {
-        if let Some(mut state) = current_states.remove(from.as_inner()) {
-            state.id = to.as_inner().clone();
-            current_states.insert(to.as_inner().clone(), state);
-        }
+        promote_orphan_or_move_current_state(
+            current_states,
+            orphans,
+            from.as_inner(),
+            to.as_inner(),
+        );
         if let Some(keys) = prev_explicit.remove(from.as_inner()) {
             prev_explicit.insert(to.as_inner().clone(), keys);
         }
@@ -935,13 +941,53 @@ pub fn compute_anonymous_identifiers_with_ctx(
 /// between reference resolution and plan creation:
 ///
 /// 1. `normalize_desired` — resolve DSL enum identifiers
-/// 2. `normalize_state` — convert raw API values to match DSL format
+/// 2. `normalize_state` — convert raw API values for all prior states
+///    (current desired-resource states and typed orphans) to match DSL format
 /// 3. Host default-tag merge — add tags from each routed provider instance
 ///    (must run after `normalize_desired`)
 /// 4. `resolve_enum_aliases` — convert to canonical AWS values in both resources and states
 pub struct PlanPreprocessor<'a> {
     normalizer: &'a dyn ProviderNormalizer,
     ctx: &'a WiringContext,
+}
+
+pub(crate) async fn hydrate_prior_states(
+    current_states: &mut HashMap<ResourceId, State>,
+    orphans: &mut Orphans,
+    normalizer: &dyn ProviderNormalizer,
+    saved_attrs: &LiftedSavedAttrs,
+    state_file: Option<&StateFile>,
+) -> Result<(), ProviderError> {
+    transform_prior_provider_states(current_states, orphans, async |states| {
+        normalizer
+            .hydrate_read_state(states, saved_attrs.as_provider_saved_attrs())
+            .await?;
+        if let Some(state_file) = state_file {
+            state_file.restore_partial_read_markers(states);
+        }
+        Ok(())
+    })
+    .await
+}
+
+async fn normalize_prior_states(
+    current_states: &mut HashMap<ResourceId, State>,
+    orphans: &mut Orphans,
+    normalizer: &dyn ProviderNormalizer,
+    ctx: &WiringContext,
+) -> Result<(), ProviderError> {
+    transform_prior_provider_states(current_states, orphans, async |states| {
+        // Hard assert (not debug_assert): RFC #2371 constraint b says state
+        // files never carry `Value::Deferred(DeferredValue::Unknown)`.
+        assert!(
+            !states_contain_unknown(states),
+            "Value::Deferred(DeferredValue::Unknown) found in prior states — RFC #2371 constraint b violated"
+        );
+        normalizer.normalize_state(states).await?;
+        resolve_enum_aliases_in_states(ctx, states);
+        Ok(())
+    })
+    .await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1125,7 +1171,7 @@ impl<'a> PlanPreprocessor<'a> {
         Self { normalizer, ctx }
     }
 
-    /// Run the full normalization pipeline on desired resources, current
+    /// Run the full normalization pipeline on desired resources, all prior
     /// states, and `wait` predicates.
     ///
     /// Call after `resolve_refs_with_state_and_remote()` and before
@@ -1133,7 +1179,7 @@ impl<'a> PlanPreprocessor<'a> {
     /// pipelines traverse, so the three enum-alias passes
     /// (resources, states, and — carina#3358 — wait `until` predicates)
     /// live here together: a `create_plan` caller that runs `prepare`
-    /// cannot canonicalize resources/states while silently skipping
+    /// cannot canonicalize resources/prior states while silently skipping
     /// waits. `wait_bindings` is mutated in place; pass the same slice
     /// on to `create_plan`.
     #[allow(clippy::too_many_arguments)]
@@ -1143,6 +1189,7 @@ impl<'a> PlanPreprocessor<'a> {
         resource_origins: &[Resource],
         module_gate: &carina_core::executor::ModuleConstraintGate,
         current_states: &mut HashMap<ResourceId, State>,
+        orphans: &mut Orphans,
         provider_configs: &[ProviderConfig],
         data_sources: &mut [DataSource],
         data_source_origins: &[DataSource],
@@ -1171,18 +1218,7 @@ impl<'a> PlanPreprocessor<'a> {
             self.ctx,
         )
         .await?;
-        // Hard assert (not debug_assert): RFC #2371 constraint b says
-        // state files never carry `Value::Deferred(DeferredValue::Unknown)`.
-        // Unlike desired resources, states have no legitimate deferred values
-        // to hide before `normalize_state` crosses the provider boundary. A
-        // release-mode violation would otherwise degrade into a distant WASM
-        // serialization failure, so fail fast here instead.
-        assert!(
-            !states_contain_unknown(current_states),
-            "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
-        );
-        self.normalizer.normalize_state(current_states).await?;
-        resolve_enum_aliases_in_states(self.ctx, current_states);
+        normalize_prior_states(current_states, orphans, self.normalizer, self.ctx).await?;
         // carina#3358: the `until` predicate RHS is the third enum-alias
         // axis. Resolve it here, beside the resource/state passes, so the
         // shared seam keeps all three in lockstep. Desired resources retain
@@ -1955,7 +1991,8 @@ pub(crate) async fn create_normalizers_from_configs_with_ctx(
 
 /// The expanded children that are safe to re-read from the provider —
 /// `new_child_ids` minus any child that is a `moved` block `to` target
-/// (carina#3141).
+/// (carina#3141). [`RefreshableChildIds::select`] also excludes children
+/// already owned by the typed orphan collection.
 ///
 /// This is a newtype, not a bare `HashSet<ResourceId>`, on purpose. The
 /// plan path and the apply path must refresh *exactly this set* and not
@@ -1974,13 +2011,20 @@ pub struct RefreshableChildIds(HashSet<ResourceId>);
 impl RefreshableChildIds {
     /// From a resource slice, yield exactly the resources that should be
     /// re-read from the provider after a deferred-for expansion: the
-    /// expanded children that are not `moved` targets. Both the plan and
-    /// apply child-refresh sites must build their refresh iterator
-    /// through this method — there is no other constructor for the
-    /// refresh set, which is what makes the plan/apply parity a
-    /// type-level invariant rather than a reviewer's responsibility.
-    pub fn select<'a>(&'a self, resources: &'a [Resource]) -> impl Iterator<Item = &'a Resource> {
-        resources.iter().filter(move |r| self.0.contains(&r.id))
+    /// expanded children that are not `moved` targets and are not already
+    /// owned as typed orphans. Both the plan and apply child-refresh sites
+    /// must build their refresh iterator through this method — there is no
+    /// other constructor for the refresh set, which is what makes the
+    /// plan/apply parity a type-level invariant rather than a reviewer's
+    /// responsibility.
+    pub fn select<'a>(
+        &'a self,
+        resources: &'a [Resource],
+        orphans: &'a Orphans,
+    ) -> impl Iterator<Item = &'a Resource> {
+        resources
+            .iter()
+            .filter(move |r| self.0.contains(&r.id) && !orphans.contains_key(&r.id))
     }
 
     /// Test/inspection accessor: is this id in the refreshable set?
@@ -2249,9 +2293,8 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     })
 }
 
-/// Result of the deferred-for-expansion + materialised-child-read +
-/// Enum-lift trio that every refresh path runs on its
-/// `current_states`.
+/// Result of the deferred-for expansion, materialised-child read,
+/// prior-state hydration, and enum-lift stages shared by every refresh path.
 ///
 /// Closes the bug class behind carina#3266 / #3271 / #3272 at the type
 /// level — same closure pattern as
@@ -2259,24 +2302,22 @@ pub fn expand_same_config_deferred_for<E: Clone>(
 /// Every call site that needs a post-expansion view of `sorted_resources`
 /// (apply `run_apply_locked`, refresh `run_state_refresh_locked`) MUST
 /// obtain it via [`expand_refresh_and_lift_states`], and the constructor
-/// performs all three phases or none:
+/// performs the complete post-expansion sequence:
 ///
 /// 1. `expand_same_config_deferred_for` — synthesise for-loop children
 ///    and re-sort the augmented set.
 /// 2. `refresh_resource_set` — read each materialised child through
 ///    the provider (filtered through `refreshable_child_ids` so a
 ///    `moved`-target or orphan-pre-read child is not re-read).
-/// 3. `lift_current_state_enum_leaves` on the **post-expansion**
-///    `sorted_resources`, so enum-typed attrs on the new children are
-///    not surfaced as phantom case diffs (carina#3272).
+/// 3. `hydrate_prior_states` over both `current_states` and `orphans`, so
+///    saved attributes and partial-read markers are restored consistently.
+/// 4. `lift_prior_state_enum_leaves` on both prior-state owners using the
+///    **post-expansion** `sorted_resources`, so enum-typed attrs on new
+///    children are not surfaced as phantom case diffs (carina#3272).
 ///
-/// The constructor mutates `current_states` in place (read results are
-/// inserted, then lifted). Caller-side `provider.hydrate_read_state`
-/// stays at the call site — the apply path needs a second hydrate
-/// after this trio (saved_attrs for the new children), the refresh
-/// path runs hydrate once after the trio; encoding that difference
-/// in the constructor would re-introduce the divergence this newtype
-/// is meant to close.
+/// The constructor mutates both `current_states` and `orphans` in place.
+/// Keeping both owners inside this operation prevents a refresh path from
+/// transforming only the currently managed half of prior state.
 #[non_exhaustive]
 pub struct ExpandedRefreshState {
     pub sorted_resources: Vec<Resource>,
@@ -2297,6 +2338,11 @@ pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormal
     pub provider: &'a P,
     pub sorted_resources: &'a [Resource],
     pub current_states: &'a mut HashMap<ResourceId, State>,
+    /// Orphans refreshed before deferred `for` expansion. Persisted loop
+    /// children can remain here after materialisation: the differ owns the
+    /// late same-id promotion rule, while every provider transform operates
+    /// on the joined prior-state view.
+    pub orphans: &'a mut Orphans,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [WaitAliasSpec],
     pub moved_targets: &'a HashSet<ResourceId>,
@@ -2339,9 +2385,9 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
         inputs.already_refreshed,
     )?;
 
-    // Phase 2: read materialised children that weren't already
-    // refreshed (moved-target / orphan-pre-read are excluded by
-    // `refreshable_child_ids`).
+    // Phase 2: read materialised children that weren't already refreshed.
+    // Moved targets are excluded by `refreshable_child_ids`; orphan-owned
+    // children are excluded structurally by `select`.
     //
     // Phase 2.5: carry forward saved_attrs to the newly-read children
     // so create-only / API-unreturned fields survive. Mirrors the
@@ -2349,7 +2395,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
     // (apply/mod.rs ~1098); collapsing it into this constructor stops
     // the next caller from forgetting it.
     if !new_child_ids.is_empty() {
-        let children = refreshable_child_ids.select(&sorted_resources);
+        let children = refreshable_child_ids.select(&sorted_resources, inputs.orphans);
         refresh_resource_set(
             inputs.provider,
             inputs.multi,
@@ -2359,21 +2405,23 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
             inputs.current_states,
         )
         .await?;
-        inputs
-            .provider
-            .hydrate_read_state(
-                inputs.current_states,
-                inputs.saved_attrs.as_provider_saved_attrs(),
-            )
-            .await?;
+        hydrate_prior_states(
+            inputs.current_states,
+            inputs.orphans,
+            inputs.provider,
+            inputs.saved_attrs,
+            inputs.state_file.as_ref(),
+        )
+        .await?;
     }
 
     // Phase 3: lift Enums on the post-expansion slice. Both
     // pre-existing managed resources and the new for-loop children
     // need this so enum-typed attrs aren't surfaced as phantom case
     // diffs (carina#3272).
-    carina_core::utils::lift_current_state_enum_leaves(
+    lift_prior_state_enum_leaves(
         inputs.current_states,
+        inputs.orphans,
         &sorted_resources,
         inputs.schemas,
     );
@@ -2458,6 +2506,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // address is not read twice (carina#3145). Mirrored by the apply path
     // in `commands/apply/mod.rs`.
     let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
+    let mut orphans = Orphans::new();
 
     // Running state: is indicatif's spinner bar region currently *open*
     // (cursor parked on an unterminated `✓` line)? Set true by any refresh
@@ -2523,53 +2572,47 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
-            let orphan_states: Vec<(ResourceId, State)> =
-                sf.build_orphan_states(&desired_ids).into_iter().collect();
-            refresh_printed_bars |= !orphan_states.is_empty();
-            let orphan_results: Vec<Result<(ResourceId, State), AppError>> =
-                stream::iter(orphan_states)
-                    .map(|(id, state)| {
+            orphans = sf.build_orphans(&desired_ids);
+            refresh_printed_bars |= !orphans.is_empty();
+            let orphan_results: Vec<Result<(ResourceId, carina_core::differ::Orphan), AppError>> =
+                stream::iter(std::mem::take(&mut orphans))
+                    .map(|(id, orphan)| {
                         let progress = RefreshProgress::begin_multi(&multi, &id);
-                        // Preserve _binding and dependency_bindings from state file
-                        // so orphan Delete effects retain metadata after refresh (#1548, #1565).
-                        let binding = state.attributes.get("_binding").cloned();
-                        let dep_bindings = state.dependency_bindings.clone();
                         async move {
-                            let mut refreshed =
-                                read_with_retry(provider_ref, &id, state.identifier.as_deref())
-                                    .await
-                                    .map_err(AppError::Provider)?;
-                            if let Some(b) = binding {
-                                refreshed.attributes.insert("_binding".to_string(), b);
-                            }
-                            if !dep_bindings.is_empty() {
-                                refreshed.dependency_bindings = dep_bindings;
-                            }
+                            let refreshed = read_with_retry(
+                                provider_ref,
+                                &id,
+                                orphan.state().identifier.as_deref(),
+                            )
+                            .await
+                            .map_err(AppError::Provider)?;
                             progress.finish();
-                            Ok((id, refreshed))
+                            Ok((id, orphan.with_refreshed_state(refreshed)))
                         }
                     })
                     .buffer_unordered(5)
                     .collect()
                     .await;
             for result in orphan_results {
-                let (id, refreshed) = result?;
-                if refreshed.exists {
+                let (id, orphan) = result?;
+                if orphan.state().exists {
                     orphan_refreshed_ids.insert(id.clone());
-                    current_states.entry(id).or_insert(refreshed);
                 }
+                orphans.insert(orphan);
             }
         }
 
         // Hydrate now — before phase 2 resolves data source refs — so
         // any attributes the provider's read() didn't return are
         // available when building the binding map (#1685).
-        provider
-            .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-            .await?;
-        if let Some(sf) = state_file.as_ref() {
-            sf.restore_partial_read_markers(&mut current_states);
-        }
+        hydrate_prior_states(
+            &mut current_states,
+            &mut orphans,
+            &provider,
+            &saved_attrs,
+            state_file.as_ref(),
+        )
+        .await?;
 
         // Transfer state for explicit `moved` blocks and anonymous →
         // let-bound renames (#1685). Must run before phase 2 so the ref
@@ -2580,6 +2623,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // an orthogonal edge case that pre-dates this fix.
         moved_pairs.extend(materialize_moved_states(
             &mut current_states,
+            &mut orphans,
             &mut prev_explicit,
             &mut saved_attrs,
             &parsed.state_blocks,
@@ -2590,6 +2634,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             &sorted_resources,
             raw_provider_configs,
             &mut current_states,
+            &mut orphans,
             &mut prev_explicit,
             &mut saved_attrs,
             state_file,
@@ -2682,22 +2727,23 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             // Also include orphaned resources from state file
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
-            for (id, state) in sf.build_orphan_states(&desired_ids) {
-                current_states.entry(id).or_insert(state);
-            }
+            orphans = sf.build_orphans(&desired_ids);
 
             // Transfer state for moved blocks and anonymous → let-bound
             // renames so the later `resolve_refs_with_state_and_remote`
             // call (and data-source-input resolution) sees entries
             // under their current binding names (#1685).
-            provider
-                .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-                .await?;
-            if let Some(sf) = state_file.as_ref() {
-                sf.restore_partial_read_markers(&mut current_states);
-            }
+            hydrate_prior_states(
+                &mut current_states,
+                &mut orphans,
+                &provider,
+                &saved_attrs,
+                state_file.as_ref(),
+            )
+            .await?;
             moved_pairs.extend(materialize_moved_states(
                 &mut current_states,
+                &mut orphans,
                 &mut prev_explicit,
                 &mut saved_attrs,
                 &parsed.state_blocks,
@@ -2708,6 +2754,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &sorted_resources,
                 raw_provider_configs,
                 &mut current_states,
+                &mut orphans,
                 &mut prev_explicit,
                 &mut saved_attrs,
                 state_file,
@@ -2776,7 +2823,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // `not_found`. `select` is the only constructor for the refresh
         // set — the apply path uses the same one, so the moved-exclusion
         // cannot diverge between the two paths (compile-time parity).
-        let children = || refreshable_child_ids.select(&sorted_resources);
+        let children = || refreshable_child_ids.select(&sorted_resources, &orphans);
         if refresh {
             refresh_printed_bars |= refresh_resource_set(
                 &provider,
@@ -2787,12 +2834,14 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &mut current_states,
             )
             .await?;
-            provider
-                .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-                .await?;
-            if let Some(sf) = state_file.as_ref() {
-                sf.restore_partial_read_markers(&mut current_states);
-            }
+            hydrate_prior_states(
+                &mut current_states,
+                &mut orphans,
+                &provider,
+                &saved_attrs,
+                state_file.as_ref(),
+            )
+            .await?;
         } else if let Some(sf) = state_file.as_ref() {
             // --refresh=false: restore children's state from the cached
             // state file, same as the original resources. A child not in
@@ -2802,9 +2851,14 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 let state = sf.build_state_for_resource(&resource.id);
                 current_states.insert(resource.id.clone(), state);
             }
-            provider
-                .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-                .await?;
+            hydrate_prior_states(
+                &mut current_states,
+                &mut orphans,
+                &provider,
+                &saved_attrs,
+                state_file.as_ref(),
+            )
+            .await?;
         } else {
             for resource in children() {
                 current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
@@ -2891,6 +2945,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &constraint_origin_resources,
                 &module_gate,
                 &mut current_states,
+                &mut orphans,
                 raw_provider_configs,
                 &mut data_sources_for_plan,
                 &data_sources,
@@ -2913,6 +2968,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             .iter()
             .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
             .collect();
+        let current_states = into_all_prior_states(orphans, current_states);
         return Ok(PlanContext {
             plan,
             provider,
@@ -2950,27 +3006,28 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         state_file,
     )?;
 
-    // Build orphan dependency bindings from state file for tree structure
-    // after late anonymous reconciliation, so an anonymous desired resource
-    // matched from state is not also treated as an orphan.
-    let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> = override_aware_resources
-            .resources()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        sf.build_orphan_dependencies(&desired_ids)
-    } else {
-        HashMap::new()
-    };
-
-    let plan_input_states = carina_core::resource::into_plan_input_map(
-        current_states.clone(),
+    let reconciled_provider_states = provider_states_for(
+        &current_states,
+        &orphans,
+        override_aware_resources.resources(),
+    );
+    let reconciled_input_states = carina_core::resource::into_plan_input_map(
+        reconciled_provider_states,
         ctx.schemas(),
         override_aware_resources.resources(),
     );
+    override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+        RebuildBindingsInputs {
+            compositions: &parsed.compositions,
+            data_sources: &data_sources,
+            current_states: &reconciled_input_states,
+            remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    );
 
-    // Build directives map from state file for orphaned resource deletion
+    // Update ordering looks directives up only for Update effects. Orphan
+    // directives stay paired with their typed orphan state for Delete effects.
     let directives_map = state_file
         .as_ref()
         .map(|sf| sf.build_directives())
@@ -2981,17 +3038,21 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
     let resolved_unresolved_resources =
         ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        ctx.schemas(),
+        override_aware_resources.resources(),
+    );
     let mut plan = create_plan_with_cascades(
         &resolved_resources,
         &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider,
-        &plan_input_states,
+        PlanPriorStates::new(&plan_input_states, &orphans),
         &directives_map,
         ctx.schemas(),
         &saved_attrs,
         &prev_explicit,
-        &orphan_dependencies,
         &wait_bindings,
     )?;
     add_deposed_delete_effects(&mut plan, state_file);
@@ -3014,6 +3075,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &upstream_binding_names,
     );
     add_deferred_create_effects(&mut plan, &deferred_create_targets);
+
+    let current_states = into_all_prior_states(orphans, current_states);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -3054,12 +3117,15 @@ fn resolved_state_row_id(
     )
 }
 
-/// Pre-process moved blocks by transferring state, `prev_explicit`, and
-/// `saved_attrs` from the old resource name to the new name.
+/// Pre-process moved blocks by transferring the typed orphan/current state,
+/// `prev_explicit`, and `saved_attrs` from the old resource name to the new
+/// name.
 ///
 /// This must be called BEFORE `create_plan()` so the differ sees the moved
 /// resource's state under its new name and can produce Update/Replace effects
-/// if attributes differ between state and desired. Transferring
+/// if attributes differ between state and desired. An undeclared destination
+/// remains an orphan and is re-keyed as one value so its binding/directives
+/// travel with its provider state. Transferring
 /// `prev_explicit` ensures attribute removals are detected; transferring
 /// `saved_attrs` ensures hydrated attributes are found under the new name.
 ///
@@ -3067,6 +3133,7 @@ fn resolved_state_row_id(
 /// existed in state. Callers use this to add Move effects to the plan.
 pub fn materialize_moved_states(
     current_states: &mut HashMap<ResourceId, State>,
+    orphans: &mut Orphans,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     saved_attrs: &mut LiftedSavedAttrs,
     state_blocks: &[StateBlock],
@@ -3074,6 +3141,7 @@ pub fn materialize_moved_states(
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     materialize_moved_states_with_warning_sink(
         current_states,
+        orphans,
         prev_explicit,
         saved_attrs,
         state_blocks,
@@ -3084,6 +3152,7 @@ pub fn materialize_moved_states(
 
 fn materialize_moved_states_with_warning_sink(
     current_states: &mut HashMap<ResourceId, State>,
+    orphans: &mut Orphans,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     saved_attrs: &mut LiftedSavedAttrs,
     state_blocks: &[StateBlock],
@@ -3129,25 +3198,26 @@ fn materialize_moved_states_with_warning_sink(
                 continue;
             };
             // For `to`, look up the destination key by
-            // `(provider, resource_type, name)` across the desired
-            // state maps. `current_states` / `prev_explicit` /
-            // `saved_attrs` may already have an entry under the
-            // routed id; without resolving, `insert(to.clone(), ...)`
-            // would create a second entry under the None-routing id
-            // and the routed id would be left as an orphan.
-            //
-            // Consult all three maps (not just `current_states`) so
-            // the resolution is independent of map-population
-            // ordering — a routed entry in any of the three is the
-            // right routing for the destination.
-            let resolved_to = find_desired_id(&to, current_states.keys())
-                .or_else(|| find_desired_id(&to, prev_explicit.keys()))
-                .or_else(|| find_desired_id(&to, saved_attrs.resource_ids()))
-                .unwrap_or_else(|| to.to_unrouted_resource_id());
+            // `(provider, resource_type, name)` in the desired-state map.
+            // Phase 1 inserts an entry (including `not_found`) for every
+            // desired resource, so this both resolves provider routing and
+            // tells us whether to promote an orphan into desired state or
+            // re-key the complete orphan value for a still-undeclared target.
+            let desired_to = find_desired_id(&to, current_states.keys());
+            let target_is_desired = desired_to.is_some();
+            let resolved_to = desired_to.unwrap_or_else(|| to.to_unrouted_resource_id());
 
             // Transfer state from the old name to the new name so the
             // differ compares desired(to) against actual(from).
-            if let Some(mut state) = current_states.remove(resolved_from.as_inner()) {
+            if target_is_desired {
+                promote_orphan_or_move_current_state(
+                    current_states,
+                    orphans,
+                    resolved_from.as_inner(),
+                    resolved_to.as_inner(),
+                );
+            } else if orphans.rekey(resolved_from.as_inner(), resolved_to.as_inner().clone()) {
+            } else if let Some(mut state) = current_states.remove(resolved_from.as_inner()) {
                 state.id = resolved_to.as_inner().clone();
                 current_states.insert(resolved_to.as_inner().clone(), state);
             }
@@ -3167,6 +3237,20 @@ fn materialize_moved_states_with_warning_sink(
     }
 
     moved_pairs
+}
+
+fn promote_orphan_or_move_current_state(
+    current_states: &mut HashMap<ResourceId, State>,
+    orphans: &mut Orphans,
+    from: &ResourceId,
+    to: &ResourceId,
+) {
+    if let Some(orphan) = orphans.remove(from) {
+        current_states.insert(to.clone(), orphan.into_state_with_id(to.clone()));
+    } else if let Some(mut state) = current_states.remove(from) {
+        state.id = to.clone();
+        current_states.insert(to.clone(), state);
+    }
 }
 
 pub fn resolve_state_block_claims(

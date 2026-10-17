@@ -1443,7 +1443,7 @@ fn into_plan_input_map_canonicalizes_string_or_list_state() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -1504,7 +1504,7 @@ fn into_plan_input_map_canonicalizes_separator_folded_enum_state_before_diffing(
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 

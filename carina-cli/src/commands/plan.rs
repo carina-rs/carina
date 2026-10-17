@@ -153,7 +153,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 13;
+    pub const CURRENT_VERSION: u32 = 14;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -695,6 +695,12 @@ fn build_plan_file<E>(
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
 
     Ok(PlanFile {
+        // carina#3871: bumped 13→14 — orphan state and host metadata now
+        // travel as one typed value until planning finishes. V13
+        // `CurrentStateEntry` values may also contain legacy `_`-prefixed
+        // host attributes, so they must be regenerated at the state migration
+        // boundary instead of entering drift detection.
+        //
         // carina#3869: bumped 12→13 — host metadata no longer lives in
         // provider-facing resource attributes. Default-tag provenance moved
         // to `Resource::default_tag_keys`, and resource type comes solely

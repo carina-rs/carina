@@ -13,12 +13,15 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
+use carina_core::differ::{
+    Orphans, PlanPriorStates, block_deletes_on_prior_consumer_updates, create_plan_with_cascades,
+    into_all_prior_states, provider_states_for,
+};
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     ProviderCheckInputs, UnresolvedResource,
 };
-use carina_core::override_aware::OverrideAwareResources;
+use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
@@ -1036,9 +1039,6 @@ pub(crate) async fn detect_drift(
                 // Compare attributes for existing resources
                 let mut attr_diffs: Vec<String> = Vec::new();
                 for (key, planned_val) in &planned.attributes {
-                    if key.starts_with('_') {
-                        continue;
-                    }
                     let historical_shape = planned_state
                         .and_then(|state| state.attributes.get(key))
                         .unwrap_or(planned_val);
@@ -1082,9 +1082,6 @@ pub(crate) async fn detect_drift(
                     }
                 }
                 for (key, actual_val) in &actual_state.attributes {
-                    if key.starts_with('_') {
-                        continue;
-                    }
                     if !planned.attributes.contains_key(key) {
                         attr_diffs.push(format!(
                             "      {}: (none) → {}",
@@ -1653,7 +1650,7 @@ async fn run_apply_locked(
     // Refresh orphaned resources (#844, #1685). Must run before the
     // rename transfer below so old-name entries are present for
     // `apply_anonymous_to_named_renames` to transfer.
-    let mut orphan_dependencies: HashMap<ResourceId, BTreeSet<String>> = HashMap::new();
+    let mut orphans = Orphans::new();
     // Ids the orphan pass already live-read this run. A for-loop child
     // applied previously is in state but not yet a desired resource at
     // orphan time (expansion is post-refresh); the orphan pass live-reads
@@ -1665,51 +1662,42 @@ async fn run_apply_locked(
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();
-        let orphan_states: Vec<(ResourceId, State)> =
-            sf.build_orphan_states(&desired_ids).into_iter().collect();
-        let orphan_results: Vec<Result<(ResourceId, State), AppError>> =
-            stream::iter(orphan_states)
-                .map(|(id, state)| {
-                    let binding = state.attributes.get("_binding").cloned();
-                    let dep_bindings = state.dependency_bindings.clone();
-                    async move {
-                        let mut refreshed =
-                            read_with_retry(provider_ref, &id, state.identifier.as_deref())
-                                .await
-                                .map_err(AppError::Provider)?;
-                        if let Some(b) = binding {
-                            refreshed.attributes.insert("_binding".to_string(), b);
-                        }
-                        if !dep_bindings.is_empty() {
-                            refreshed.dependency_bindings = dep_bindings;
-                        }
-                        Ok((id, refreshed))
-                    }
+        orphans = sf.build_orphans(&desired_ids);
+        let orphan_results: Vec<Result<(ResourceId, carina_core::differ::Orphan), AppError>> =
+            stream::iter(std::mem::take(&mut orphans))
+                .map(|(id, orphan)| async move {
+                    let refreshed =
+                        read_with_retry(provider_ref, &id, orphan.state().identifier.as_deref())
+                            .await
+                            .map_err(AppError::Provider)?;
+                    Ok((id, orphan.with_refreshed_state(refreshed)))
                 })
                 .buffer_unordered(5)
                 .collect()
                 .await;
         for result in orphan_results {
-            let (id, refreshed) = result?;
-            if refreshed.exists {
+            let (id, orphan) = result?;
+            if orphan.state().exists {
                 orphan_refreshed_ids.insert(id.clone());
-                current_states.entry(id).or_insert(refreshed);
             }
+            orphans.insert(orphan);
         }
-        orphan_dependencies = sf.build_orphan_dependencies(&desired_ids);
     }
 
     // Hydrate, transfer state for moved blocks and anonymous → let-bound
     // renames (#1685), then run phase 2 against the consolidated state.
-    provider
-        .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-        .await?;
-    if let Some(sf) = state_file.as_ref() {
-        sf.restore_partial_read_markers(&mut current_states);
-    }
+    crate::wiring::hydrate_prior_states(
+        &mut current_states,
+        &mut orphans,
+        &provider,
+        &saved_attrs,
+        state_file.as_ref(),
+    )
+    .await?;
     let moved_pairs = {
         let mut pairs = crate::wiring::materialize_moved_states(
             &mut current_states,
+            &mut orphans,
             &mut prev_explicit,
             &mut saved_attrs,
             &parsed.state_blocks,
@@ -1720,6 +1708,7 @@ async fn run_apply_locked(
             &sorted_resources,
             raw_provider_configs,
             &mut current_states,
+            &mut orphans,
             &mut prev_explicit,
             &mut saved_attrs,
             &state_file,
@@ -1839,6 +1828,7 @@ async fn run_apply_locked(
         provider: &provider,
         sorted_resources: &sorted_resources,
         current_states: &mut current_states,
+        orphans: &mut orphans,
         remote_bindings,
         wait_aliases: &wait_aliases,
         moved_targets: &moved_targets,
@@ -1944,6 +1934,7 @@ async fn run_apply_locked(
             &constraint_origin_resources,
             &module_gate,
             &mut current_states,
+            &mut orphans,
             raw_provider_configs,
             &mut data_sources_for_plan,
             &data_sources,
@@ -1979,6 +1970,25 @@ async fn run_apply_locked(
         &resolved_state_block_targets,
         &state_file,
     )?;
+    let reconciled_provider_states = provider_states_for(
+        &current_states,
+        &orphans,
+        override_aware_resources.resources(),
+    );
+    let reconciled_input_states = carina_core::resource::into_plan_input_map(
+        reconciled_provider_states,
+        ctx.schemas(),
+        override_aware_resources.resources(),
+    );
+    override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+        RebuildBindingsInputs {
+            compositions: &pre_resolve_compositions,
+            data_sources: &data_sources,
+            current_states: &reconciled_input_states,
+            remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    );
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     let resolved_resources =
@@ -1990,7 +2000,6 @@ async fn run_apply_locked(
         ctx.schemas(),
         override_aware_resources.resources(),
     );
-
     let directives_map = state_file
         .as_ref()
         .map(|sf| sf.build_directives())
@@ -2001,12 +2010,11 @@ async fn run_apply_locked(
         &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider,
-        &plan_input_states,
+        PlanPriorStates::new(&plan_input_states, &orphans),
         &directives_map,
         schemas,
         &saved_attrs,
         &prev_explicit,
-        &orphan_dependencies,
         &wait_bindings,
     )?;
     crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
@@ -2034,6 +2042,7 @@ async fn run_apply_locked(
         &no_unresolved_upstreams,
     );
     crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
+    current_states = into_all_prior_states(orphans, current_states);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -2604,11 +2613,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 13 keeps host metadata
-    // out of provider-facing resource attributes: default-tag provenance lives
-    // in `Resource::default_tag_keys`, and resource type lives in `Resource::id`.
-    // A v12 plan must be regenerated rather than mixing its synthetic-attribute
-    // representation with the typed fields.
+    // Validate version compatibility. Plan-file version 14 guarantees that
+    // embedded current states were created after legacy `_`-prefixed host
+    // attributes moved behind the state migration boundary and orphan state
+    // became structurally paired with its host metadata during planning.
     //
     // Plan-file version 12 stores secrets as typed placeholders bound to
     // stable, position-unique contexts and makes saved-plan apply re-evaluate

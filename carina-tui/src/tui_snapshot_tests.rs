@@ -94,16 +94,10 @@ fn build_mixed_operations_plan() -> Plan {
     plan.add(Effect::Update {
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-            [
-                (
-                    "cidr_block".to_string(),
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                ),
-                (
-                    "_binding".to_string(),
-                    Value::Concrete(ConcreteValue::String("vpc".into())),
-                ),
-            ]
+            [(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+            )]
             .into_iter()
             .collect(),
         )),
@@ -210,10 +204,6 @@ fn build_map_key_diff_plan() -> Plan {
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [
-                (
-                    "_binding".to_string(),
-                    Value::Concrete(ConcreteValue::String("vpc".into())),
-                ),
                 (
                     "cidr_block".to_string(),
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -561,16 +551,10 @@ fn build_moved_with_changes_plan() -> Plan {
     plan.add(Effect::Update {
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "new_vpc"),
-            [
-                (
-                    "cidr_block".to_string(),
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                ),
-                (
-                    "_binding".to_string(),
-                    Value::Concrete(ConcreteValue::String("new_vpc".into())),
-                ),
-            ]
+            [(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+            )]
             .into_iter()
             .collect(),
         )),

@@ -1268,7 +1268,7 @@ fn build_delete_rows(
 
     let key = DeletedInstanceKey::new(id.clone(), generation.clone(), identifier.to_string());
     if let Some(attrs) = historical_attributes.delete(&key) {
-        let mut keys: Vec<_> = attrs.keys().filter(|k| !k.starts_with('_')).collect();
+        let mut keys: Vec<_> = attrs.keys().collect();
         keys.sort();
         for key in keys {
             let value = &attrs[key];
@@ -3977,7 +3977,7 @@ mod tests {
     /// enum-phantom (`policy`), one truly-unchanged (`region`) → in
     /// Full mode exactly 1 rendered `~` row and a `HiddenUnchanged`
     /// of 2 (policy + region), so rendered + hidden == 3 total
-    /// non-internal attributes. Guards the full tally invariant, not
+    /// attributes. Guards the full tally invariant, not
     /// just `count == 1` in isolation.
     #[test]
     fn update_full_mode_multi_attr_tally_balances() {
@@ -4049,7 +4049,7 @@ mod tests {
             "policy (phantom) + region (unchanged) must be hidden: {rows:?}"
         );
         // The displayed tally adds up: 1 rendered + 2 hidden == 3
-        // total non-internal attributes.
+        // total attributes.
         assert_eq!(changed_rows + hidden.unwrap(), 3);
     }
 

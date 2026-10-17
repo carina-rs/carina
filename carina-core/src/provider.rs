@@ -645,11 +645,11 @@ pub enum PreviousSecretHashAuthority<'a> {
 }
 
 impl<'a> PreviousSecretHashAuthority<'a> {
-    fn protects_key(self, resource: &Resource, key: &str) -> bool {
+    fn protects_key(self, key_is_desired: bool) -> bool {
         match self {
             Self::None => false,
             Self::AllPreviouslyHashedKeys(_) => true,
-            Self::OnlyKeysAbsentFromDesired(_) => !resource.attributes.contains_key(key),
+            Self::OnlyKeysAbsentFromDesired(_) => !key_is_desired,
         }
     }
 
@@ -691,6 +691,11 @@ impl PersistedAttributes {
 
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.contains_key(key)
+    }
+
+    /// Retain top-level persisted attributes selected by `keep`.
+    pub fn retain_keys(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.0.retain(|key, _| keep(key));
     }
 
     /// Return the opaque hash for a top-level persisted secret attribute.
@@ -762,6 +767,30 @@ impl PersistedAttributes {
         Self::protect_serialized(resource, schema, self.0, previous_hash_authority, true)
     }
 
+    /// Protect a provider read for an orphan, where no desired resource is
+    /// available to supply secrets. Previously hashed values remain opaque and
+    /// schema write-only plaintext is not persisted.
+    pub fn protect_for_orphan_refresh(
+        self,
+        display_type: &str,
+        identity: &str,
+        schema: Option<&ResourceSchema>,
+        previous: &PersistedAttributes,
+    ) -> Self {
+        let mut serialized = self.0;
+        let mut protected_secret_keys = std::collections::HashSet::new();
+        protect_previously_hashed_secrets(
+            display_type,
+            identity,
+            |_| false,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
+            &mut serialized,
+            &mut protected_secret_keys,
+        );
+        remove_unprotected_write_only_attributes(schema, &protected_secret_keys, &mut serialized);
+        Self(serialized)
+    }
+
     fn protect_serialized(
         resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
@@ -802,19 +831,12 @@ impl PersistedAttributes {
         protect_previously_hashed_secrets(
             &display_type,
             identity,
-            resource,
+            |key| resource.attributes.contains_key(key),
             previous_hash_authority,
             &mut serialized,
             &mut protected_secret_keys,
         );
-
-        if let Some(schema) = schema {
-            for (key, attribute) in &schema.attributes {
-                if attribute.write_only && !protected_secret_keys.contains(key) {
-                    serialized.remove(key);
-                }
-            }
-        }
+        remove_unprotected_write_only_attributes(schema, &protected_secret_keys, &mut serialized);
 
         Ok(Self(serialized))
     }
@@ -880,7 +902,7 @@ fn contains_secret_hash_json(value: &serde_json::Value) -> bool {
 fn protect_previously_hashed_secrets(
     display_type: &str,
     identity: &str,
-    resource: &Resource,
+    is_desired_key: impl Fn(&str) -> bool,
     authority: PreviousSecretHashAuthority<'_>,
     serialized: &mut HashMap<String, serde_json::Value>,
     protected_secret_keys: &mut std::collections::HashSet<String>,
@@ -889,7 +911,7 @@ fn protect_previously_hashed_secrets(
         return;
     };
     for (key, previous_value) in existing_attributes.encoded() {
-        if protected_secret_keys.contains(key) || !authority.protects_key(resource, key) {
+        if protected_secret_keys.contains(key) || !authority.protects_key(is_desired_key(key)) {
             continue;
         }
         let shape = secret_hash_shape(previous_value);
@@ -919,6 +941,20 @@ fn protect_previously_hashed_secrets(
         };
         serialized.insert(key.clone(), masked);
         protected_secret_keys.insert(key.clone());
+    }
+}
+
+fn remove_unprotected_write_only_attributes(
+    schema: Option<&ResourceSchema>,
+    protected_secret_keys: &std::collections::HashSet<String>,
+    serialized: &mut HashMap<String, serde_json::Value>,
+) {
+    if let Some(schema) = schema {
+        for (key, attribute) in &schema.attributes {
+            if attribute.write_only && !protected_secret_keys.contains(key) {
+                serialized.remove(key);
+            }
+        }
     }
 }
 

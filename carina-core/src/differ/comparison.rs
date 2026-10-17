@@ -582,9 +582,6 @@ pub(crate) fn key_should_enter_patch(
     schema: Option<&ResourceSchema>,
     cmp: AttrComparison<'_>,
 ) -> bool {
-    if key.starts_with('_') {
-        return false;
-    }
     if schema
         .and_then(|s| s.attributes.get(key))
         .is_some_and(|attr| attr.write_only && cmp.from.is_none())
@@ -771,9 +768,6 @@ pub(super) fn find_changed_attributes(
     // apply, after which removal detection works normally.
     if let Some(ExplicitFields::Struct { children }) = prev_explicit {
         for key in children.keys() {
-            if key.starts_with('_') {
-                continue;
-            }
             if desired.contains_key(key) {
                 continue;
             }

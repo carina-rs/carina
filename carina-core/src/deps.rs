@@ -8,8 +8,9 @@ use crate::resource::{Resource, Value};
 ///
 /// Collects dependencies from two sources and merges them:
 /// 1. `ResourceRef` values found in attributes
-/// 2. `_dependency_bindings` metadata (saved by `resolve_refs_with_state`
-///    before ResourceRef values were resolved to plain strings)
+/// 2. Typed `Resource::dependency_bindings` metadata (saved by
+///    `resolve_refs_with_state` before ResourceRef values were resolved to
+///    plain strings)
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
@@ -23,7 +24,7 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     // partially resolved: e.g., `tgw_attach.transit_gateway_id` becomes
     // `ResourceRef { binding: "tgw", attr: "id" }` because tgw_attach's
     // transit_gateway_id is itself `tgw.id`. In this case, collect_dependencies
-    // finds "tgw" but misses "tgw_attach". The _dependency_bindings metadata
+    // finds "tgw" but misses "tgw_attach". The typed dependency_bindings field
     // (saved before resolution) correctly records the original direct dependency.
     for name in &resource.dependency_bindings {
         deps.insert(name.clone());
@@ -341,9 +342,9 @@ mod tests {
     /// transit_gateway_id is itself `tgw.id`), the resolved resource has a
     /// ResourceRef pointing to "tgw" instead of "tgw_attach".
     ///
-    /// `_dependency_bindings` correctly records the original dependency ("tgw_attach"),
-    /// but the fallback only triggers when deps is empty. Since the ResourceRef to
-    /// "tgw" makes deps non-empty, the fallback is skipped, and "tgw_attach" is lost.
+    /// `Resource::dependency_bindings` correctly records the original dependency
+    /// ("tgw_attach"); it must be unioned even when the resolved ResourceRef set is
+    /// already non-empty.
     #[test]
     fn test_dependency_bindings_merged_when_resourceref_partially_resolved() {
         let mut resource = Resource::new("ec2.route", "my-route");

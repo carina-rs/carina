@@ -68,6 +68,58 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
     assert!(orphan.source().is_some(), "orphan cause chain must survive");
 }
 
+#[tokio::test]
+async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
+    let json = serde_json::json!({
+        "version": 10,
+        "serial": 1,
+        "lineage": "legacy-reserved-drift",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "legacy",
+            "provider": "mock",
+            "identifier": "resource-123",
+            "attributes": {
+                "name": "kept",
+                "_binding": "legacy_binding",
+            },
+        }],
+        "exports": {},
+    });
+    let state_file = carina_state::check_and_migrate(&json.to_string())
+        .expect("legacy state should migrate")
+        .into_state();
+    let resource = Resource::with_provider("mock", "test.Resource", "legacy", None)
+        .with_attribute("name", string_value("kept"));
+    let id = resource.id.clone();
+    let planned_state = state_file.build_state_for_resource(&id);
+    assert_eq!(
+        planned_state.attributes.keys().collect::<Vec<_>>(),
+        vec![&"name".to_string()]
+    );
+
+    let shared = ApplyTimeReadShared::default();
+    shared.created_roles.lock().unwrap().insert(
+        "legacy".to_string(),
+        HashMap::from([("name".to_string(), string_value("kept"))]),
+    );
+    let result = detect_drift(
+        &[resource],
+        &[crate::commands::plan::CurrentStateEntry {
+            id,
+            state: planned_state,
+        }],
+        &HistoricalResourceAddresses::default(),
+        &ApplyTimeReadProvider { shared },
+        ApplyTarget::Project(Path::new(".")),
+    )
+    .await
+    .expect("drift check should succeed");
+
+    assert_eq!(result.drift_messages(), None);
+}
+
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
@@ -5795,12 +5847,66 @@ mod saved_plan_version_tests {
             "error must name the rejected v10 version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 13"),
-            "error must name the v13 expected version, got: {msg}",
+            msg.contains("expected 14"),
+            "error must name the v14 expected version, got: {msg}",
         );
         assert!(
             msg.contains(&format!("Re-run `{expected_replan}`")),
             "error must include the path-aware re-plan command, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn version_13_saved_plan_is_rejected_after_orphan_ownership_change() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        let v13 = serde_json::json!({
+            "version": 13,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-10-17T00:00:00Z",
+            "source_path": "infra",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": [] },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(&plan_path, serde_json::to_string(&v13).unwrap()).expect("write plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("v13 saved plan must be rejected after the orphan ownership change");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found,
+            expected,
+            replan_command,
+            ..
+        } = &error
+        else {
+            panic!("expected typed unsupported-version error, got: {error}");
+        };
+        assert_eq!(*found, 13);
+        assert_eq!(*expected, 14);
+        assert_eq!(
+            replan_command.as_deref(),
+            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
         );
     }
 
@@ -5982,11 +6088,13 @@ mod saved_plan_version_tests {
             std::slice::from_ref(&resolved_resource),
             &[],
             &ProviderRouter::new(),
-            &plan_input_states,
+            carina_core::differ::PlanPriorStates::new(
+                &plan_input_states,
+                &carina_core::differ::Orphans::new(),
+            ),
             &std::collections::HashMap::new(),
             &schemas,
             &crate::empty_lifted_saved_attrs(),
-            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &[],
         )
