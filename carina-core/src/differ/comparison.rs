@@ -6,11 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 use indexmap::IndexMap;
 
 use crate::explicit::{self, ExplicitFields};
-use crate::resource::{
-    ConcreteValue, DeferredValue, ResolvedResourceId, SavedValueViews, Value, merge_with_saved,
-};
+use crate::resource::{ConcreteValue, DeferredValue, SavedValueViews, Value, merge_with_saved};
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
-use crate::value::{SecretHashContext, argon2id_hash, contains_secret, value_to_json_with_context};
+use crate::value::{canonical_secret_hash_material, contains_secret, value_to_json};
 
 /// Type-aware semantic comparison of two Values.
 ///
@@ -24,10 +22,6 @@ use crate::value::{SecretHashContext, argon2id_hash, contains_secret, value_to_j
 ///   case-insensitively (e.g., `awscc.s3.Bucket.Type.AES256` equals `"AES256"`)
 ///
 /// Without type information, falls back to `Value::semantically_equal()`.
-///
-/// When `secret_ctx` is provided, it is used for context-specific salt when
-/// comparing `Value::Deferred(DeferredValue::Secret)` against typed persisted
-/// state hashes.
 ///
 /// # Invariant: `Union[String, list(String)]` is canonicalized upstream
 ///
@@ -61,9 +55,8 @@ pub(crate) fn type_aware_equal(
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
-    type_aware_equal_on_path(a, b, attr_type, defs, secret_ctx, &[])
+    type_aware_equal_on_path(a, b, attr_type, defs, &[])
 }
 
 fn type_aware_equal_on_path<'a>(
@@ -71,16 +64,15 @@ fn type_aware_equal_on_path<'a>(
     b: &Value,
     attr_type: Option<&'a AttributeType>,
     defs: &'a BTreeMap<String, AttributeType>,
-    secret_ctx: Option<&SecretHashContext>,
     visited_refs: &[&'a str],
 ) -> bool {
     // Secret comparison: compare the desired secret with the typed hash
     // decoded from state. Desired carries `DeferredValue::Secret(inner)`.
     if let Value::Deferred(DeferredValue::Secret(inner)) = a {
-        return secret_matches_state(inner, b, secret_ctx);
+        return secret_matches_state(inner, b);
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = b {
-        return secret_matches_state(inner, a, secret_ctx);
+        return secret_matches_state(inner, a);
     }
 
     // Retain top-level Ref names across non-consuming Union recursion. Each
@@ -110,11 +102,11 @@ fn type_aware_equal_on_path<'a>(
                 (
                     Value::Concrete(ConcreteValue::Map(ma)),
                     Value::Concrete(ConcreteValue::Map(mb)),
-                ) => type_aware_maps_equal(ma, mb, |_key| None, defs, secret_ctx),
+                ) => type_aware_maps_equal(ma, mb, |_key| None, defs),
                 (
                     Value::Concrete(ConcreteValue::List(la)),
                     Value::Concrete(ConcreteValue::List(lb)),
-                ) => type_aware_lists_equal(la, lb, None, defs, false, secret_ctx),
+                ) => type_aware_lists_equal(la, lb, None, defs, false),
                 _ => a.semantically_equal(b),
             }
         }
@@ -156,14 +148,14 @@ fn type_aware_equal_on_path<'a>(
                     ordered,
                     ..
                 },
-            ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered, secret_ctx),
+            ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered),
 
             // Maps: recursive comparison with inner value type
             (
                 Value::Concrete(ConcreteValue::Map(ma)),
                 Value::Concrete(ConcreteValue::Map(mb)),
                 crate::schema::Shape::Map { value: inner, .. },
-            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner), defs, secret_ctx),
+            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner), defs),
 
             // Struct: per-field type-aware comparison with default-value tolerance
             (
@@ -175,7 +167,7 @@ fn type_aware_equal_on_path<'a>(
                     resolved_attr_type.expect("Some(shape) implies Some(resolved attr_type)");
                 let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
                     .expect("Shape::Struct must expose struct fields internally");
-                type_aware_struct_equal(ma, mb, fields, defs, secret_ctx)
+                type_aware_struct_equal(ma, mb, fields, defs)
             }
 
             // Union: try each member type; if any says equal, they're equal
@@ -204,14 +196,7 @@ fn type_aware_equal_on_path<'a>(
                         (*i as f64) == *f && (*i as f64) as i64 == *i
                     }
                     _ => types.any_on_path(&mut current_path, |member, member_path| {
-                        type_aware_equal_on_path(
-                            a,
-                            b,
-                            Some(member.as_attr()),
-                            defs,
-                            secret_ctx,
-                            member_path,
-                        )
+                        type_aware_equal_on_path(a, b, Some(member.as_attr()), defs, member_path)
                     }),
                 }
             }
@@ -325,7 +310,6 @@ fn type_aware_lists_equal(
     inner: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     ordered: bool,
-    secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
     if a.len() != b.len() {
         return false;
@@ -334,14 +318,14 @@ fn type_aware_lists_equal(
         // Sequential comparison: element order matters
         a.iter()
             .zip(b.iter())
-            .all(|(va, vb)| type_aware_equal(va, vb, inner, defs, secret_ctx))
+            .all(|(va, vb)| type_aware_equal(va, vb, inner, defs))
     } else {
         // Multiset comparison: order-insensitive
         let mut matched = vec![false; b.len()];
         for item_a in a {
             let mut found = false;
             for (j, item_b) in b.iter().enumerate() {
-                if !matched[j] && type_aware_equal(item_a, item_b, inner, defs, secret_ctx) {
+                if !matched[j] && type_aware_equal(item_a, item_b, inner, defs) {
                     matched[j] = true;
                     found = true;
                     break;
@@ -361,7 +345,6 @@ fn type_aware_maps_equal<'a, F>(
     b: &IndexMap<String, Value>,
     get_type: F,
     defs: &BTreeMap<String, AttributeType>,
-    secret_ctx: Option<&SecretHashContext>,
 ) -> bool
 where
     F: Fn(&str) -> Option<&'a AttributeType>,
@@ -371,7 +354,7 @@ where
     }
     a.iter().all(|(k, va)| {
         b.get(k)
-            .map(|vb| type_aware_equal(va, vb, get_type(k), defs, secret_ctx))
+            .map(|vb| type_aware_equal(va, vb, get_type(k), defs))
             .unwrap_or(false)
     })
 }
@@ -387,7 +370,6 @@ fn type_aware_struct_equal(
     b: &IndexMap<String, Value>,
     fields: &[crate::schema::StructField],
     defs: &BTreeMap<String, AttributeType>,
-    secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
     let field_types: HashMap<&str, &AttributeType> = fields
         .iter()
@@ -398,13 +380,7 @@ fn type_aware_struct_equal(
     for (k, va) in a {
         match b.get(k) {
             Some(vb) => {
-                if !type_aware_equal(
-                    va,
-                    vb,
-                    field_types.get(k.as_str()).copied(),
-                    defs,
-                    secret_ctx,
-                ) {
+                if !type_aware_equal(va, vb, field_types.get(k.as_str()).copied(), defs) {
                     return false;
                 }
             }
@@ -505,25 +481,15 @@ fn is_type_default(
 ///    fix for issue #1249 where secrets nested in Maps (e.g., tags) caused false
 ///    diffs because the provider returns plain-text values on read.
 ///
-/// When `context` is provided, uses context-specific salt for hashing.
-fn secret_matches_state(
-    inner: &Value,
-    state_value: &Value,
-    context: Option<&SecretHashContext>,
-) -> bool {
-    let state_hash = match state_value {
-        Value::Deferred(DeferredValue::RedactedSecret { hash }) => Some(hash.as_str()),
-        _ => None,
-    };
-    if let Some(state_hash) = state_hash {
-        let Ok(inner_json) = value_to_json_with_context(inner, context) else {
+fn secret_matches_state(inner: &Value, state_value: &Value) -> bool {
+    if let Value::Deferred(DeferredValue::RedactedSecret { hash }) = state_value {
+        let Ok(inner_json) = value_to_json(inner) else {
             return false;
         };
-        let Ok(json_str) = serde_json::to_string(&inner_json) else {
+        let Some(material) = canonical_secret_hash_material(&inner_json) else {
             return false;
         };
-        let computed_hash = argon2id_hash(json_str.as_bytes(), context);
-        return computed_hash == state_hash;
+        return hash.verify(material);
     }
 
     // Case 2: State has plain-text value (from provider read / --refresh=true).
@@ -553,7 +519,6 @@ pub(crate) struct AttrComparison<'a> {
     pub(crate) to: &'a Value,
     pub(crate) saved: Option<SavedAttr<'a>>,
     pub(crate) type_info: Option<TypedAttr<'a>>,
-    pub(crate) secret_ctx: Option<&'a SecretHashContext>,
 }
 
 /// Return whether a single attribute's values differ semantically.
@@ -570,9 +535,9 @@ pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
         Some(saved) => {
             let effective_to =
                 merge_with_saved(cmp.to, saved.views, saved.authoring, attr_type, defs);
-            !type_aware_equal(from_value, &effective_to, attr_type, defs, cmp.secret_ctx)
+            !type_aware_equal(from_value, &effective_to, attr_type, defs)
         }
-        None => !type_aware_equal(from_value, cmp.to, attr_type, defs, cmp.secret_ctx),
+        None => !type_aware_equal(from_value, cmp.to, attr_type, defs),
     }
 }
 
@@ -671,15 +636,12 @@ pub(crate) fn secret_grafted_comparison_view<'a>(
 /// end of this function: the same set of top-level keys is used to
 /// flag attributes the user *previously* wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used for each attribute.
-/// If `resource_id` is provided, it is used to build context-specific salt for
-/// secret hash comparison.
 pub(super) fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    resource_id: Option<&ResolvedResourceId>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
 
@@ -719,10 +681,6 @@ pub(super) fn find_changed_attributes(
             })
         });
 
-        // Build secret hash context from resource ID and attribute key
-        let secret_ctx =
-            resource_id.map(|id| SecretHashContext::new(id.display_type(), id.identity_str(), key));
-
         if key_should_enter_patch(
             key,
             schema,
@@ -750,7 +708,6 @@ pub(super) fn find_changed_attributes(
                     })
                 }),
                 type_info,
-                secret_ctx: secret_ctx.as_ref(),
             },
         ) {
             changed.push(key.clone());
@@ -801,7 +758,6 @@ mod tests {
             &desired,
             Some(&attr_type),
             empty_defs_for_schema_walks(),
-            None,
         ));
     }
 
@@ -832,7 +788,6 @@ mod tests {
             &consumer,
             Some(&attr_type),
             empty_defs_for_schema_walks(),
-            None,
         ));
     }
 
@@ -863,7 +818,6 @@ mod tests {
             &consumer,
             Some(&attr_type),
             empty_defs_for_schema_walks(),
-            None,
         ));
     }
 }

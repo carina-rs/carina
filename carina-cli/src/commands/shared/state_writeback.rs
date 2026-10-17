@@ -117,7 +117,7 @@ impl PostApplyStates {
                 identity,
                 rs.directives.provider_instance.clone(),
             );
-            let attrs = rs.persisted_attributes().to_values();
+            let attrs = rs.persisted_attributes().to_values_for_resource(&id);
             map.insert(
                 id.clone(),
                 carina_core::resource::State::existing(id, attrs),
@@ -560,8 +560,7 @@ pub(crate) fn dsl_value_to_json(
             // Non-finite floats (NaN / +inf / -inf) cannot be represented
             // in JSON. Surface as `NonFiniteFloat`; silently dropping a
             // non-finite export would hide a real upstream bug. Mirrors
-            // `value_to_json_with_context` in
-            // `carina-core/src/value.rs`. (#2859)
+            // `value_to_json` in `carina-core/src/value.rs`. (#2859)
             let num =
                 serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
                     value: *f,
@@ -1208,6 +1207,20 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
 }
 
 pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, AppError> {
+    build_state_after_apply_inner(save, None)
+}
+
+pub(crate) fn build_state_after_apply_with_planned_secret_hashes(
+    save: ApplyStateSave<'_>,
+    planned_secret_hashes: &HashMap<ResourceId, PersistedAttributes>,
+) -> Result<StateFile, AppError> {
+    build_state_after_apply_inner(save, Some(planned_secret_hashes))
+}
+
+fn build_state_after_apply_inner(
+    save: ApplyStateSave<'_>,
+    planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
+) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
         sorted_resources,
@@ -1255,12 +1268,15 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
             UpsertSource::Applied(s) => (s, true),
             UpsertSource::CurrentState(s) => (s, false),
         };
-        let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-            resource,
-            applied_state,
-            existing,
-            schemas.get_for(resource),
-        )?;
+        let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
+        let mut resource_state =
+            ResourceState::from_provider_state_for_resource_and_schema_with_preferred_hashes(
+                resource,
+                applied_state,
+                existing,
+                schemas.get_for(resource),
+                preferred_hashes,
+            )?;
         if is_applied && let Some(overrides) = permanent_name_overrides.get(id) {
             resource_state.name_overrides = overrides.clone();
         }
@@ -1347,7 +1363,9 @@ pub(crate) fn build_orphan_resource(
     let rs = sf
         .find_resource(&id.provider, &id.resource_type, id.identity_str())
         .expect("orphan must exist in state file");
-    let attributes = rs.persisted_attributes().to_values();
+    let attributes = rs
+        .persisted_attributes()
+        .to_values_for_resource(id.as_inner());
     Resource {
         id: id.as_inner().clone(),
         attributes: attributes.into_iter().collect(),
@@ -1463,7 +1481,7 @@ mod apply_state_save_tests {
         ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State, UnknownReason, Value,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    use carina_core::value::SECRET_PREFIX;
+    use carina_core::value::LEGACY_SECRET_PREFIX;
     use carina_state::{DeposedInstance, DeposedKey, NameOverride};
 
     fn resolved(resource: Resource) -> ResolvedResource {
@@ -2739,7 +2757,7 @@ mod apply_state_save_tests {
             .with_identifier("db-1")
             .with_attribute(
                 "password",
-                serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+                serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
             );
         let mut state_file = StateFile::new();
         state_file
@@ -2828,7 +2846,7 @@ mod apply_state_save_tests {
             .with_identifier("db-1")
             .with_attribute(
                 "password",
-                serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+                serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
             );
         let mut state_file = StateFile::new();
         state_file
@@ -2957,9 +2975,9 @@ mod apply_state_save_tests {
         let stored_secret = persisted
             .redacted_secret_hash("password")
             .expect("secret fallback should be stored as a hash");
-        assert_eq!(stored_secret.as_str().len(), 64);
+        assert!(stored_secret.encoded_digest().starts_with("$argon2id$"));
         assert!(
-            !stored_secret.as_str().contains("plain-secret"),
+            !stored_secret.encoded_digest().contains("plain-secret"),
             "deposed attributes must not persist plaintext secrets"
         );
         assert!(
@@ -3003,7 +3021,7 @@ mod apply_state_save_tests {
             .with_identifier("stale-record-id")
             .with_attribute(
                 "password",
-                serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+                serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
             );
         let mut state_file = StateFile::new();
         state_file
@@ -3039,8 +3057,8 @@ mod apply_state_save_tests {
             .persisted_attributes()
             .redacted_secret_hash("password")
             .expect("old plaintext password should be re-hashed");
-        assert_eq!(stored_secret.as_str().len(), 64);
-        assert!(!stored_secret.as_str().contains("plain-old"));
+        assert!(stored_secret.encoded_digest().starts_with("$argon2id$"));
+        assert!(!stored_secret.encoded_digest().contains("plain-old"));
     }
 
     #[test]

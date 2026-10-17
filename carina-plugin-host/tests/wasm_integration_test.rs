@@ -848,18 +848,26 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_hydrate_read_state_receives_persisted_secret_as_legacy_marker_string() {
+async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
-    let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let persisted_secret: Value = serde_json::from_value(serde_json::json!({
-        "RedactedSecret": { "hash": hash }
-    }))
-    .expect("deserialize persisted secret");
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("wasm-wire-secret".into()),
+    ))));
+    let marker = carina_core::value::value_to_json(&secret)
+        .expect("serialize test secret")
+        .as_str()
+        .expect("secret marker string")
+        .to_string();
+    let expected_hash =
+        carina_core::value::persisted_secret_hash(&marker).expect("parse generated v2 marker");
+    let persisted_secret = Value::Deferred(DeferredValue::RedactedSecret {
+        hash: expected_hash.clone(),
+    });
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-state", None);
     let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
     let saved_attrs = lifted_saved_attrs([(
@@ -875,7 +883,7 @@ async fn test_wasm_hydrate_read_state_receives_persisted_secret_as_legacy_marker
     assert!(matches!(
         states[&id].attributes.get("__mock_hydrated_read_state__"),
         Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-            if loaded.as_str() == hash
+            if loaded == &expected_hash
     ));
 }
 

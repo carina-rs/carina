@@ -14,8 +14,8 @@ use carina_core::resource::{
 };
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{
-    SecretHashContext, contains_unredacted_secret, json_to_dsl_value, persisted_secret_marker,
-    value_to_json, value_to_json_with_context,
+    contains_unredacted_secret, json_to_dsl_value, persisted_secret_marker, value_to_json,
+    value_to_json_reusing_secret_hashes,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -520,14 +520,16 @@ impl StateFile {
             .identity_str()
             .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity));
         if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
-            let attrs = rs.unwrap().persisted_attributes().to_values();
+            let rs = rs.expect("resource row was found above");
+            let stored_id = Self::id_for_resource_state(rs);
+            let attrs = rs.persisted_attributes().to_values_for_resource(&stored_id);
             return State {
                 id: id.clone(),
                 identifier: Some(identifier.to_string()),
                 attributes: attrs,
                 exists: true,
-                dependency_bindings: rs.unwrap().dependency_bindings.clone(),
-                partial_read: rs.unwrap().partial_read.clone(),
+                dependency_bindings: rs.dependency_bindings.clone(),
+                partial_read: rs.partial_read.clone(),
             };
         }
         State::not_found(id.clone())
@@ -550,7 +552,7 @@ impl StateFile {
                 let state = State {
                     id: id.clone(),
                     identifier: Some(identifier),
-                    attributes: rs.persisted_attributes().to_values(),
+                    attributes: rs.persisted_attributes().to_values_for_resource(&id),
                     exists: true,
                     dependency_bindings: rs.dependency_bindings.clone(),
                     partial_read: rs.partial_read.clone(),
@@ -1377,7 +1379,9 @@ impl ResourceState {
             .as_object_mut()
             .expect("persisted attributes serialize as an object");
         for (key, value) in &state.attributes {
-            if let Ok(json_value) = value_to_json(value) {
+            if let Ok(json_value) =
+                Self::provider_state_value_to_json(value, self.attributes.encoded_value(key))
+            {
                 encoded.insert(key.clone(), json_value);
             }
         }
@@ -1460,23 +1464,20 @@ impl ResourceState {
     }
 
     fn attribute_to_state_json(
-        resource_display_type: &str,
-        identity: &str,
-        key: &str,
         value: &Value,
+        previous: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
-        let ctx = SecretHashContext::new(resource_display_type, identity, key);
-        Self::provider_state_value_to_json(value, &ctx).map_err(|e| e.to_string())
+        Self::provider_state_value_to_json(value, previous).map_err(|e| e.to_string())
     }
 
     /// Encode values returned by a provider for persisted state. Opaque hash
     /// values may legitimately be echoed by legacy providers and must retain
-    /// their exact marker bytes; live `Secret` values are hashed with the
-    /// resource context. Desired-side JSON conversion remains strict and
-    /// rejects `RedactedSecret`.
+    /// their exact marker bytes; live `Secret` values receive an embedded
+    /// random salt. Desired-side JSON conversion remains strict and rejects
+    /// `RedactedSecret`.
     fn provider_state_value_to_json(
         value: &Value,
-        context: &SecretHashContext,
+        previous: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, carina_core::value::SerializationError> {
         match value {
             Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
@@ -1484,19 +1485,32 @@ impl ResourceState {
             }
             Value::Concrete(ConcreteValue::List(values)) => values
                 .iter()
-                .map(|value| Self::provider_state_value_to_json(value, context))
+                .enumerate()
+                .map(|(index, value)| {
+                    Self::provider_state_value_to_json(
+                        value,
+                        previous
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|items| items.get(index)),
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map(serde_json::Value::Array),
             Value::Concrete(ConcreteValue::Map(values)) => values
                 .iter()
                 .map(|(key, value)| {
-                    Self::provider_state_value_to_json(value, context)
-                        .map(|value| (key.clone(), value))
+                    Self::provider_state_value_to_json(
+                        value,
+                        previous
+                            .and_then(serde_json::Value::as_object)
+                            .and_then(|values| values.get(key)),
+                    )
+                    .map(|value| (key.clone(), value))
                 })
                 .collect::<Result<serde_json::Map<_, _>, _>>()
                 .map(serde_json::Value::Object),
             _ if contains_unredacted_secret(value) => {
-                value_to_json_with_context(value, Some(context))
+                value_to_json_reusing_secret_hashes(value, previous)
             }
             _ => value_to_json(value),
         }
@@ -1553,30 +1567,17 @@ impl ResourceState {
         refreshed.identifier = state.identifier.clone();
         refreshed.partial_read = state.partial_read.clone();
 
-        let id = ResourceId::with_provider_identity(
-            self.provider.clone(),
-            self.resource_type.clone(),
-            self.identity.clone(),
-            self.directives.provider_instance.clone(),
-        );
-        let display_type = id.display_type();
-        let identity = self.identity.as_str();
         let mut serialized = serde_json::Map::new();
         for (key, value) in &state.attributes {
             serialized.insert(
                 key.clone(),
-                Self::attribute_to_state_json(&display_type, identity, key, value)?,
+                Self::attribute_to_state_json(value, self.attributes.encoded_value(key))?,
             );
         }
         let attributes =
             serde_json::from_value::<PersistedAttributes>(serde_json::Value::Object(serialized))
                 .expect("provider state produces persisted attribute JSON");
-        refreshed.attributes = attributes.protect_for_orphan_refresh(
-            &display_type,
-            identity,
-            schema,
-            &self.attributes,
-        );
+        refreshed.attributes = attributes.protect_for_orphan_refresh(schema, &self.attributes);
         refreshed.explicit =
             refreshed_explicit_without_desired_values(Some(&self.explicit), &state.attributes);
         Ok(refreshed)
@@ -1600,6 +1601,20 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
     ) -> Result<Self, String> {
+        Self::from_provider_state_for_resource_and_schema_with_preferred_hashes(
+            resource, state, existing, schema, None,
+        )
+    }
+
+    /// Saved-plan variant that prefers the exact digest chosen at plan time
+    /// whenever it verifies at the same nested path.
+    pub fn from_provider_state_for_resource_and_schema_with_preferred_hashes(
+        resource: &ResolvedResource,
+        state: &State,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        preferred_hashes: Option<&PersistedAttributes>,
+    ) -> Result<Self, String> {
         let mut rs = Self::new(
             &resource.id.resource_type,
             resource.identity().clone(),
@@ -1607,13 +1622,16 @@ impl ResourceState {
         );
         rs.identifier = state.identifier.clone();
         rs.partial_read = state.partial_read.clone();
-        let resource_display_type = resource.id.display_type();
-        let identity = resource.identity_str();
         let mut serialized = serde_json::Map::new();
         for (k, v) in &state.attributes {
             serialized.insert(
                 k.clone(),
-                Self::attribute_to_state_json(&resource_display_type, identity, k, v)?,
+                Self::attribute_to_state_json(
+                    v,
+                    preferred_hashes
+                        .and_then(|attributes| attributes.encoded_value(k))
+                        .or_else(|| existing.and_then(|row| row.attributes.encoded_value(k))),
+                )?,
             );
         }
         let previous_hash_authority = existing
@@ -1627,7 +1645,12 @@ impl ResourceState {
         rs.attributes =
             serde_json::from_value::<PersistedAttributes>(serde_json::Value::Object(serialized))
                 .expect("provider state produces persisted attribute JSON")
-                .try_protect_for_resource_and_schema(resource, schema, previous_hash_authority)
+                .try_protect_for_resource_and_schema(
+                    resource,
+                    schema,
+                    previous_hash_authority,
+                    preferred_hashes,
+                )
                 .map_err(|error| error.to_string())?;
         rs.directives = resource.directives.clone();
         if rs.directives.provider_instance.is_none() {

@@ -162,41 +162,47 @@ impl ResolvedProviderConfigs {
 #[serde(transparent)]
 pub struct SavedProviderConfigs(Vec<ProviderConfig>);
 
-const PROVIDER_CONFIG_SECTIONS: [crate::value::ProviderConfigSection; 2] = [
-    crate::value::ProviderConfigSection::Attribute,
-    crate::value::ProviderConfigSection::DefaultTag,
+#[derive(Clone, Copy)]
+enum ProviderConfigSection {
+    Attribute,
+    DefaultTag,
+}
+
+const PROVIDER_CONFIG_SECTIONS: [ProviderConfigSection; 2] = [
+    ProviderConfigSection::Attribute,
+    ProviderConfigSection::DefaultTag,
 ];
 
 fn provider_config_section(
     config: &ProviderConfig,
-    section: crate::value::ProviderConfigSection,
+    section: ProviderConfigSection,
 ) -> &IndexMap<String, Value> {
     match section {
-        crate::value::ProviderConfigSection::Attribute => &config.attributes,
-        crate::value::ProviderConfigSection::DefaultTag => &config.default_tags,
+        ProviderConfigSection::Attribute => &config.attributes,
+        ProviderConfigSection::DefaultTag => &config.default_tags,
     }
 }
 
 fn provider_config_section_mut(
     config: &mut ProviderConfig,
-    section: crate::value::ProviderConfigSection,
+    section: ProviderConfigSection,
 ) -> &mut IndexMap<String, Value> {
     match section {
-        crate::value::ProviderConfigSection::Attribute => &mut config.attributes,
-        crate::value::ProviderConfigSection::DefaultTag => &mut config.default_tags,
+        ProviderConfigSection::Attribute => &mut config.attributes,
+        ProviderConfigSection::DefaultTag => &mut config.default_tags,
     }
 }
 
 fn provider_config_secret_location(
     config: &ProviderConfig,
-    section: crate::value::ProviderConfigSection,
+    section: ProviderConfigSection,
     key: &str,
 ) -> String {
     match section {
-        crate::value::ProviderConfigSection::Attribute => {
+        ProviderConfigSection::Attribute => {
             format!("provider {}.{key}", config.name)
         }
-        crate::value::ProviderConfigSection::DefaultTag => {
+        ProviderConfigSection::DefaultTag => {
             format!("provider {}.default_tags.{key}", config.name)
         }
     }
@@ -240,13 +246,7 @@ impl SavedProviderConfigs {
                     let values = provider_config_section(config, section)
                         .iter()
                         .map(|(key, value)| {
-                            let position = crate::value::SecretPosition::provider_config(
-                                &config.name,
-                                config.binding.as_deref(),
-                                section,
-                                key,
-                            );
-                            crate::value::redact_secrets_in_value(value, &position)
+                            crate::value::redact_secrets_in_value(value)
                                 .map(|value| (key.clone(), value))
                         })
                         .collect::<Result<_, _>>()?;
@@ -292,14 +292,6 @@ impl SavedProviderConfigs {
                         let value = crate::value::rehydrate_secret_entry(
                             saved_value,
                             provider_config_section(candidate, section).get(key),
-                            || {
-                                Ok(crate::value::SecretPosition::provider_config(
-                                    &saved.name,
-                                    saved.binding.as_deref(),
-                                    section,
-                                    key,
-                                ))
-                            },
                             provider_config_secret_location(saved, section, key),
                             crate::value::SecretRehydrationCandidate::Evaluated,
                         )?;
@@ -353,25 +345,25 @@ mod saved_provider_config_secret_tests {
         }
     }
 
-    fn placeholder_hash(value: &Value) -> &str {
+    fn placeholder_hash(value: &Value) -> &crate::resource::RedactedSecretHash {
         match value {
-            Value::Deferred(DeferredValue::RedactedSecret { hash }) => hash.as_str(),
+            Value::Deferred(DeferredValue::RedactedSecret { hash }) => hash,
             other => panic!("expected saved-plan secret placeholder, got {other:?}"),
         }
     }
 
     #[test]
-    fn provider_secret_positions_are_distinct_and_rehydrate() {
+    fn provider_secret_placeholders_are_distinct_and_rehydrate() {
         let evaluated = SavedProviderConfigs(vec![provider("SAME_SECRET")]);
         let redacted = evaluated
             .redact_secrets()
-            .expect("provider secrets should have stable saved-plan positions");
+            .expect("provider secrets should redact");
         let saved = &redacted.0[0];
 
         assert_ne!(
             placeholder_hash(saved.attributes.get("token").expect("token")),
             placeholder_hash(saved.default_tags.get("Token").expect("default tag")),
-            "provider attributes and default tags must use disjoint positions",
+            "independent provider secrets must use independent random salts",
         );
 
         assert_eq!(
@@ -383,7 +375,7 @@ mod saved_provider_config_secret_tests {
     }
 
     #[test]
-    fn provider_secret_rehydration_rejects_context_mismatch() {
+    fn provider_secret_rehydration_rejects_missing_matching_instance() {
         let planned = SavedProviderConfigs(vec![provider("SAME_SECRET")]);
         let redacted = planned.redact_secrets().expect("redact provider secret");
         let mut mismatched = provider("SAME_SECRET");
@@ -391,7 +383,7 @@ mod saved_provider_config_secret_tests {
 
         let error = redacted
             .rehydrate_secrets(&SavedProviderConfigs(vec![mismatched]))
-            .expect_err("a placeholder must be bound to its provider instance position");
+            .expect_err("a placeholder must map to its provider instance");
         assert!(matches!(
             error.source,
             crate::value::SecretRehydrationError::HashMismatch

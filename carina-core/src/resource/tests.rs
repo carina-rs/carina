@@ -1449,7 +1449,7 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
-    let state_hash = crate::value::argon2id_hash(serialized.as_bytes(), None);
+    let state_hash = RedactedSecretHash::generate(serialized.as_bytes());
     let persisted_secret = || {
         serde_json::from_value::<Value>(serde_json::json!({
             "RedactedSecret": { "hash": state_hash }

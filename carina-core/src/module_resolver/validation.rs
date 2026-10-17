@@ -870,7 +870,7 @@ mod tests {
 
     fn redacted_secret() -> Value {
         serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": "deadbeef".repeat(8) }
+            "RedactedSecret": { "hash": format!("argon2:{}", "deadbeef".repeat(8)) }
         }))
         .expect("deserialize persisted secret")
     }

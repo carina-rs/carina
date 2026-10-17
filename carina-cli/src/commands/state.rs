@@ -2083,7 +2083,7 @@ mod tests {
         PendingModuleConstraint, Resource, Signature,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    use carina_core::value::SECRET_PREFIX;
+    use carina_core::value::{LEGACY_SECRET_PREFIX, SECRET_PREFIX};
     use carina_state::{DeposedInstance, DeposedKey};
     use indexmap::IndexMap;
     use serde_json::json;
@@ -3882,7 +3882,7 @@ mod tests {
             None,
             HashMap::from([(
                 "password".to_string(),
-                json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+                json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
             )]),
         ));
         state
@@ -3938,7 +3938,7 @@ mod tests {
         let mut state = StateFile::new();
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+            "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
         });
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -4151,7 +4151,7 @@ mod tests {
                     .with_identifier("db-current")
                     .with_attribute(
                         "password",
-                        json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+                        json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
                     ),
             )
             .expect("test state setup must be valid");
@@ -4193,7 +4193,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+            "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
         });
         let mut state = StateFile::new();
         state

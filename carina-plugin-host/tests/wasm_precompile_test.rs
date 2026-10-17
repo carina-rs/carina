@@ -385,7 +385,7 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn protocol_v2_is_rejected_before_v4_world_binding() {
+async fn protocol_v2_is_rejected_before_current_world_binding() {
     let source_dir = tempfile::tempdir().expect("create source temp dir");
     let wasm_path = source_dir.path().join("protocol-v2.wasm");
     std::fs::write(&wasm_path, build_protocol_v2_component()).expect("write protocol-v2 component");
@@ -403,14 +403,14 @@ async fn protocol_v2_is_rejected_before_v4_world_binding() {
     );
     assert!(
         rendered.contains(
-            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 4"
+            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 5"
         ),
         "the stable info preflight must report the protocol mismatch: {rendered}"
     );
     assert!(
         !rendered.contains("failed to convert function to given type")
             && !rendered.contains("normalize-desired"),
-        "v4 world binding must not run before the version check: {rendered}"
+        "provider world binding must not run before the version check: {rendered}"
     );
 }
 

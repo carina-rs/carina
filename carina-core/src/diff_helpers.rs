@@ -19,8 +19,7 @@ use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 /// rows and the hidden-count agree with `find_changed_attributes`.
 /// Without one (no registry — embedded / test callers) fall back to
 /// the schema-blind `Value::semantically_equal`, leaving that path's
-/// behavior unchanged. `secret_ctx` is `None`: a
-/// `Value::Deferred(Secret(_))` would short-circuit
+/// behavior unchanged. A `Value::Deferred(Secret(_))` would short-circuit
 /// `type_aware_equal`'s secret arm and compare unequal, which only ever
 /// *over*-reports a diff (safe-by-default) — it never hides a real
 /// change.
@@ -31,7 +30,7 @@ pub(crate) fn schema_aware_equal(
     defs: &BTreeMap<String, AttributeType>,
 ) -> bool {
     match attr_type {
-        Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs, None),
+        Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs),
         None => old.semantically_equal(new),
     }
 }

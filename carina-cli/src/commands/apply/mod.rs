@@ -26,7 +26,9 @@ use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
-use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    DataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
@@ -53,7 +55,8 @@ use crate::commands::shared::progress::{
 };
 use crate::commands::shared::state_writeback::{
     ApplyStateSave, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
-    SkippedExports, build_state_after_apply, materialize_exports, resolve_export_values_post_apply,
+    SkippedExports, build_state_after_apply, build_state_after_apply_with_planned_secret_hashes,
+    materialize_exports, resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -70,7 +73,8 @@ use crate::wiring::{
 };
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
-    DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, RehydratedPlanFile,
+    DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, PlannedSecretHashes,
+    RehydratedPlanFile,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -733,10 +737,26 @@ pub(crate) async fn finalize_apply(
     input: FinalizeApplyInput<'_>,
     persistence: StatePersistence,
 ) -> Result<SkippedExports, AppError> {
+    finalize_apply_inner(input, persistence, None).await
+}
+
+async fn finalize_apply_with_planned_secret_hashes(
+    input: FinalizeApplyInput<'_>,
+    persistence: StatePersistence,
+    planned_secret_hashes: &PlannedSecretHashes,
+) -> Result<SkippedExports, AppError> {
+    finalize_apply_inner(input, persistence, Some(planned_secret_hashes)).await
+}
+
+async fn finalize_apply_inner(
+    input: FinalizeApplyInput<'_>,
+    persistence: StatePersistence,
+    planned_secret_hashes: Option<&PlannedSecretHashes>,
+) -> Result<SkippedExports, AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
 
-    let mut state = build_state_after_apply(ApplyStateSave {
+    let save = ApplyStateSave {
         state_file: input.state_file,
         sorted_resources: input.sorted_resources,
         runtime_synthesized_resources: &input.result.runtime_synthesized_resources,
@@ -746,7 +766,11 @@ pub(crate) async fn finalize_apply(
         successfully_deleted: &input.result.successfully_deleted,
         failed_refreshes: &input.result.failed_refreshes,
         schemas: input.schemas,
-    })?;
+    };
+    let mut state = match planned_secret_hashes {
+        Some(hashes) => build_state_after_apply_with_planned_secret_hashes(save, hashes)?,
+        None => build_state_after_apply(save)?,
+    };
 
     // `Some([])` is meaningful: the user removed the `exports {}` block,
     // so stale entries the previous apply persisted must be cleared
@@ -1027,18 +1051,23 @@ pub(crate) async fn detect_drift(
                     ));
                 }
             } else if planned.exists && actual_state.exists {
-                let verification = carina_core::value::verify_historical_state_secrets(
+                let historical_row = ResolvedResourceId::try_new(historical_id.clone())
+                    .expect("saved-plan historical resource IDs are resolved");
+                let planned = carina_core::value::bind_legacy_secret_hashes_to_state_row(
                     planned,
-                    &actual_state,
-                    historical_id,
-                )
-                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+                    &historical_row,
+                );
+                let verification =
+                    carina_core::value::verify_historical_state_secrets(&planned, &actual_state)
+                        .map_err(|error| {
+                            saved_plan_secret_rehydration_error(error, apply_target)
+                        })?;
                 let secret_drift = verification.drifted_attributes();
-                let planned = verification.state();
-                verified_planned_states.insert(resource.id.clone(), planned.clone());
+                let verified_planned = verification.state();
+                verified_planned_states.insert(resource.id.clone(), verified_planned.clone());
                 // Compare attributes for existing resources
                 let mut attr_diffs: Vec<String> = Vec::new();
-                for (key, planned_val) in &planned.attributes {
+                for (key, planned_val) in &verified_planned.attributes {
                     let historical_shape = planned_state
                         .and_then(|state| state.attributes.get(key))
                         .unwrap_or(planned_val);
@@ -2398,7 +2427,7 @@ fn import_identifiers_from_current_config(
 }
 
 /// Reproduce the state-aware desired-side preparation that plan runs before
-/// persisting secret positions. This function deliberately builds only
+/// persisting secret placeholders. This function deliberately builds only
 /// normalizers; CRUD-capable providers are created after every desired secret
 /// has been verified.
 async fn prepare_saved_plan_secret_candidates(
@@ -2613,15 +2642,16 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 14 guarantees that
-    // embedded current states were created after legacy `_`-prefixed host
+    // Validate version compatibility. Plan-file version 15 guarantees that
+    // secret placeholders carry embedded salts and that resource placeholders
+    // can be reused byte-for-byte by state writeback. Version 14 guarantees
+    // that embedded current states were created after legacy `_`-prefixed host
     // attributes moved behind the state migration boundary and orphan state
     // became structurally paired with its host metadata during planning.
     //
-    // Plan-file version 12 stores secrets as typed placeholders bound to
-    // stable, position-unique contexts and makes saved-plan apply re-evaluate
-    // and verify them. A v11 plan's secret hashes are indistinguishable from
-    // user strings and must be regenerated.
+    // Plan-file version 12 stores secrets as typed placeholders and makes
+    // saved-plan apply re-evaluate and verify them. A v11 plan's secret hashes
+    // are indistinguishable from user strings and must be regenerated.
     //
     // Plan-file version 10 persists
     // `Effect::Delete.generation`; older binaries would silently
@@ -2991,7 +3021,6 @@ async fn run_apply_from_plan_locked(
             &provider,
             &mut actual_states,
             &mut verified_planned_states,
-            &historical_addresses,
             apply_target,
         )
         .await?;
@@ -3176,7 +3205,7 @@ async fn run_apply_from_plan_locked(
 
     let skipped_exports = finalize_after_execute(
         |persistence| {
-            finalize_apply(
+            finalize_apply_with_planned_secret_hashes(
                 FinalizeApplyInput {
                     result: &result,
                     state_file,
@@ -3203,6 +3232,7 @@ async fn run_apply_from_plan_locked(
                     pre_resolve_compositions: &[],
                 },
                 persistence,
+                rehydrated_plan_file.planned_secret_hashes(),
             )
         },
         cancelled,

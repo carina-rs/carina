@@ -1579,6 +1579,23 @@ fn proto_input_mode_to_core(
 mod tests {
     use super::*;
 
+    fn v2_redacted_secret(plaintext: &str) -> (CoreValue, String) {
+        let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::String(plaintext.into()),
+        ))));
+        let marker = carina_core::value::value_to_json(&secret)
+            .expect("serialize test secret")
+            .as_str()
+            .expect("secret marker string")
+            .to_string();
+        let hash =
+            carina_core::value::persisted_secret_hash(&marker).expect("parse generated v2 marker");
+        (
+            CoreValue::Deferred(DeferredValue::RedactedSecret { hash }),
+            marker,
+        )
+    }
+
     fn proto_string() -> proto::AttributeType {
         proto::AttributeType::String {
             pattern: None,
@@ -2043,7 +2060,7 @@ mod tests {
     #[test]
     fn redacted_saved_plan_secret_is_rejected_at_wasm_boundary() {
         let value: CoreValue = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": "00".repeat(32) }
+            "RedactedSecret": { "hash": format!("argon2:{}", "00".repeat(32)) }
         }))
         .expect("deserialize saved-plan placeholder");
         assert!(matches!(
@@ -2558,13 +2575,8 @@ mod tests {
     }
 
     #[test]
-    fn persisted_state_and_saved_attrs_encode_redacted_secrets_as_legacy_marker_strings() {
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
-        let redacted: CoreValue = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": hash }
-        }))
-        .expect("deserialize persisted secret marker");
+    fn persisted_state_and_saved_attrs_round_trip_v2_marker_strings() {
+        let (redacted, marker) = v2_redacted_secret("wire-secret");
         let id = CoreResourceId::with_provider_identity("aws", "test.Resource", "example", None);
         let state = CoreState::existing(
             id.clone(),
@@ -2572,7 +2584,7 @@ mod tests {
         );
 
         let wit_state = core_to_wit_state(&state)
-            .expect("persisted state must retain the provider's legacy string wire shape");
+            .expect("persisted state must retain the provider's marker string wire shape");
         assert!(matches!(
             wit_state.attributes.as_slice(),
             [(key, wit::Value::StrVal(value))] if key == "token" && value == &marker
@@ -2583,7 +2595,7 @@ mod tests {
         )
         .lift(&carina_core::schema::SchemaRegistry::new());
         let wit_saved = core_saved_attrs_to_wit(saved.as_provider_saved_attrs(), &id)
-            .expect("saved attributes must retain the provider's legacy string wire shape");
+            .expect("saved attributes must retain the provider's marker string wire shape");
         assert!(matches!(
             wit_saved.as_deref(),
             Some([(key, wit::Value::StrVal(value))]) if key == "token" && value == &marker
@@ -2593,7 +2605,7 @@ mod tests {
     #[test]
     fn desired_resource_rejects_redacted_secret_placeholder() {
         let redacted: CoreValue = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": "00".repeat(32) }
+            "RedactedSecret": { "hash": format!("argon2:{}", "00".repeat(32)) }
         }))
         .expect("deserialize saved-plan placeholder");
         let resource = CoreResource::with_provider("aws", "test.Resource", "example", None)
@@ -2608,9 +2620,8 @@ mod tests {
     }
 
     #[test]
-    fn only_state_decode_assigns_secret_marker_semantics() {
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
+    fn only_state_decode_assigns_v2_secret_marker_semantics() {
+        let (expected, marker) = v2_redacted_secret("wire-secret");
         let wire = wit::Value::StrVal(marker.clone());
 
         assert_eq!(
@@ -2622,7 +2633,9 @@ mod tests {
         assert!(matches!(
             state.get("token"),
             Some(CoreValue::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if loaded.as_str() == hash
+                if CoreValue::Deferred(DeferredValue::RedactedSecret {
+                    hash: loaded.clone()
+                }) == expected
         ));
     }
 
@@ -2764,12 +2777,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
         use carina_core::resource::Value as CV;
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
-        let persisted_secret: CV = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": hash }
-        }))
-        .expect("deserialize persisted secret");
+        let (persisted_secret, marker) = v2_redacted_secret("patch-secret");
         let resource = CoreResource::new("test", "patch-round-trip")
             .with_attribute("a", CV::Concrete(ConcreteValue::String("alpha".into())))
             .with_attribute("b", CV::Concrete(ConcreteValue::Int(42)));
@@ -2856,14 +2864,20 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_version_range_is_v5_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 5);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
     fn test_check_protocol_version_rejects_lower_version() {
         let err = check_protocol_version(
-            r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":2}"#,
+            r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":4}"#,
         )
         .unwrap_err();
 
         assert!(err.contains("provider 'aws'"));
-        assert!(err.contains("protocol version 2"));
+        assert!(err.contains("protocol version 4"));
         assert!(err.contains(&format!(
             "requires at least version {}",
             carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION

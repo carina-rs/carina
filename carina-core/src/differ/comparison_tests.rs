@@ -4,6 +4,7 @@ use super::{create_plan_for_tests as create_plan, *};
 use crate::explicit::ExplicitFields;
 use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
 use crate::schema::TypeIdentity;
+use crate::value::value_to_json;
 use indexmap::IndexMap;
 
 fn persisted_secret(marker: &str) -> Value {
@@ -22,14 +23,12 @@ fn type_aware_int_float_coercion() {
         &Value::Concrete(ConcreteValue::Float(42.0)),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Float(42.0)),
         &Value::Concrete(ConcreteValue::Int(42)),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
     // Non-exact conversion should not be equal
     assert!(!type_aware_equal(
@@ -37,7 +36,6 @@ fn type_aware_int_float_coercion() {
         &Value::Concrete(ConcreteValue::Float(42.5)),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
     // Without type info, Int and Float are not equal
     assert!(!type_aware_equal(
@@ -45,7 +43,6 @@ fn type_aware_int_float_coercion() {
         &Value::Concrete(ConcreteValue::Float(42.0)),
         None,
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
 }
 
@@ -57,7 +54,6 @@ fn type_aware_int_float_coercion_for_int_type() {
         &Value::Concrete(ConcreteValue::Float(10.0)),
         Some(&AttributeType::int()),
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
 }
 
@@ -76,7 +72,6 @@ fn type_aware_list_with_inner_type() {
         ])),
         Some(&list_type),
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
 }
 
@@ -112,8 +107,7 @@ fn type_aware_struct_per_field() {
         &a,
         &b,
         Some(&struct_type),
-        crate::schema::empty_defs_for_schema_walks(),
-        None
+        crate::schema::empty_defs_for_schema_walks()
     ));
 }
 
@@ -125,7 +119,6 @@ fn type_aware_union_numeric() {
         &Value::Concrete(ConcreteValue::Float(7.0)),
         Some(&union_type),
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
 }
 
@@ -141,7 +134,6 @@ fn type_aware_custom_delegates_to_base() {
         &Value::Concrete(ConcreteValue::Float(8080.0)),
         Some(&custom_type),
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
 }
 
@@ -221,8 +213,7 @@ fn type_aware_struct_ignores_default_bool_false() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Struct with extra default Bool(false) should be considered equal"
     );
@@ -263,8 +254,7 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Struct with non-default Bool(true) should NOT be considered equal"
     );
@@ -299,7 +289,6 @@ fn type_aware_enum_namespaced_vs_raw() {
             &Value::Concrete(ConcreteValue::String("AES256".into())),
             Some(&enum_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Namespaced enum and raw value should be considered equal"
     );
@@ -319,7 +308,6 @@ fn type_aware_enum_namespaced_vs_raw() {
             )),
             Some(&enum_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Both namespaced should be equal"
     );
@@ -335,7 +323,6 @@ fn type_aware_enum_namespaced_vs_raw() {
             &Value::Concrete(ConcreteValue::String("aws:kms".into())),
             Some(&enum_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Different enum values should not be equal"
     );
@@ -371,7 +358,6 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "AWS-canonical hyphenated form must equal the fully-qualified DSL identifier"
     );
@@ -383,7 +369,6 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Equality must be symmetric"
     );
@@ -399,7 +384,6 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Identical fully-qualified forms must be equal"
     );
@@ -411,7 +395,6 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Identical AWS-canonical forms must be equal"
     );
@@ -427,7 +410,6 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "AWS-canonical String must equal the matching EnumIdentifier shape"
     );
@@ -441,7 +423,6 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Different enum values must not be folded as equal"
     );
@@ -468,7 +449,6 @@ fn type_aware_enum_canonical_enum_value_compares_against_string() {
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "CanonicalEnum API value must compare equal to equivalent DSL String"
     );
@@ -483,7 +463,6 @@ fn type_aware_enum_canonical_enum_value_compares_against_string() {
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
-            None,
         ),
         "Different CanonicalEnum API values must not compare equal"
     );
@@ -533,8 +512,7 @@ fn type_aware_struct_ignores_default_enum_empty() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Struct with extra default Enum empty string should be considered equal"
     );
@@ -579,8 +557,7 @@ fn type_aware_struct_ignores_default_custom_type() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Struct with extra default Custom(Int) zero should be considered equal"
     );
@@ -627,8 +604,7 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Struct with extra default nested Struct empty map should be considered equal"
     );
@@ -654,8 +630,7 @@ fn type_aware_ordered_list_detects_reorder() {
             &a,
             &b,
             Some(&ordered_list_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Ordered list should detect reorder as NOT equal"
     );
@@ -670,8 +645,7 @@ fn type_aware_ordered_list_detects_reorder() {
             &a,
             &c,
             Some(&ordered_list_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Ordered list with same order should be equal"
     );
@@ -696,8 +670,7 @@ fn type_aware_unordered_list_ignores_reorder() {
             &a,
             &b,
             Some(&unordered_list_type),
-            crate::schema::empty_defs_for_schema_walks(),
-            None
+            crate::schema::empty_defs_for_schema_walks()
         ),
         "Unordered list should treat reorder as equal"
     );
@@ -729,7 +702,7 @@ fn write_only_attr_in_desired_not_in_current_no_diff() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
     assert!(
         changed.is_empty(),
         "Write-only attribute absent from current should not trigger a diff, got: {:?}",
@@ -766,7 +739,7 @@ fn write_only_attr_in_both_same_value_no_diff() {
         ),
     ]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
     assert!(
         changed.is_empty(),
         "Write-only attribute with same value should not trigger a diff, got: {:?}",
@@ -803,7 +776,7 @@ fn write_only_attr_in_both_different_value_detects_diff() {
         ),
     ]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
     assert!(
         changed.contains(&"ipv4_netmask_length".to_string()),
         "Write-only attribute with different value should trigger a diff"
@@ -833,7 +806,7 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
     assert!(
         changed.contains(&"enable_dns".to_string()),
         "Non-write-only attribute absent from current should trigger a diff"
@@ -857,7 +830,6 @@ fn secret_unchanged_same_hash() {
         &persisted_secret(&hash_str),
         None,
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
     // Reversed order should also work
     assert!(type_aware_equal(
@@ -865,7 +837,6 @@ fn secret_unchanged_same_hash() {
         &secret_value,
         None,
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
 }
 
@@ -889,7 +860,6 @@ fn secret_changed_different_hash() {
         &persisted_secret(&old_hash_str),
         None,
         crate::schema::empty_defs_for_schema_walks(),
-        None,
     ));
 }
 
@@ -906,7 +876,7 @@ fn secret_in_find_changed_attributes_no_change() {
     let desired = HashMap::from([("password".to_string(), secret_value)]);
     let current = HashMap::from([("password".to_string(), persisted_secret(&hash_str))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
         changed.is_empty(),
         "Secret with matching hash should not show as changed, got: {:?}",
@@ -927,7 +897,7 @@ fn diagnostic_sensitive_string_matches_plain_state_without_diff() {
         Value::Concrete(ConcreteValue::String("hunter2SECRET".into())),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
         changed.is_empty(),
         "marker must not create diff churn: {changed:?}"
@@ -950,7 +920,7 @@ fn secret_in_find_changed_attributes_changed() {
     let desired = HashMap::from([("password".to_string(), new_secret)]);
     let current = HashMap::from([("password".to_string(), persisted_secret(&old_hash_str))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
         changed.contains(&"password".to_string()),
         "Secret with different hash should show as changed"
@@ -999,15 +969,12 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
                 attr_type: &attr_type,
                 defs: crate::schema::empty_defs_for_schema_walks(),
             }),
-            secret_ctx: None,
         },
     ));
 }
 
 #[test]
 fn secret_in_map_no_change_when_hash_matches() {
-    use crate::value::value_to_json;
-
     // Desired: tags map with a secret value
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("super-secret".into()),
@@ -1034,7 +1001,7 @@ fn secret_in_map_no_change_when_hash_matches() {
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
     let current = HashMap::from([("tags".to_string(), state_tags)]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
         changed.is_empty(),
         "Secret in map with matching hash should not show as changed, got: {:?}",
@@ -1043,132 +1010,94 @@ fn secret_in_map_no_change_when_hash_matches() {
 }
 
 #[test]
-fn secret_with_context_no_change_when_hash_matches() {
-    use crate::resource::{ConcreteValue, DeferredValue, ResourceId};
-    use crate::value::{SecretHashContext, value_to_json_with_context};
-
-    let resource_id = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-        "awscc",
-        "rds.db_instance",
-        "my-db",
-        None,
-    ));
-    let ctx = SecretHashContext::new(
-        resource_id.display_type(),
-        resource_id.identity_str(),
-        "master_password",
-    );
-
+fn secret_with_embedded_salt_no_change_when_hash_matches() {
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("my-password".into()),
     ))));
-    // Hash with context (as from_provider_state would do)
-    let hash_json = value_to_json_with_context(&secret_value, Some(&ctx)).unwrap();
+    let hash_json = value_to_json(&secret_value).unwrap();
     let hash_str = hash_json.as_str().unwrap().to_string();
 
     let desired = HashMap::from([("master_password".to_string(), secret_value)]);
     let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_str))]);
 
-    // find_changed_attributes builds context from resource_id
-    let changed = find_changed_attributes(&desired, &current, None, None, None, Some(&resource_id));
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
         changed.is_empty(),
-        "Secret with matching context-hashed value should not show as changed, got: {:?}",
+        "Secret with matching embedded-salt digest should not show as changed, got: {:?}",
         changed
     );
 }
 
 #[test]
-fn secret_with_context_detects_change() {
-    use crate::resource::ResourceId;
-    use crate::value::{SecretHashContext, value_to_json_with_context};
-
-    let resource_id = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-        "awscc",
-        "rds.db_instance",
-        "my-db",
-        None,
-    ));
-    let ctx = SecretHashContext::new(
-        resource_id.display_type(),
-        resource_id.identity_str(),
-        "master_password",
-    );
-
+fn secret_with_embedded_salt_detects_change() {
     let old_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("old-password".into()),
     ))));
     let new_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("new-password".into()),
     ))));
-    // Hash the OLD secret with context
-    let hash_json = value_to_json_with_context(&old_secret, Some(&ctx)).unwrap();
+    let hash_json = value_to_json(&old_secret).unwrap();
     let hash_str = hash_json.as_str().unwrap().to_string();
 
     let desired = HashMap::from([("master_password".to_string(), new_secret)]);
     let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_str))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None, Some(&resource_id));
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
         changed.contains(&"master_password".to_string()),
-        "Secret with different value should show as changed with context"
+        "Secret with different value should show as changed"
     );
 }
 
 #[test]
-fn secret_same_password_different_resources_produces_different_hashes() {
-    use crate::resource::ResourceId;
-    use crate::value::{SecretHashContext, value_to_json_with_context};
-
+fn equal_plaintexts_get_distinct_digests_that_both_verify() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("shared-password".into()),
     ))));
 
-    let ctx1 = SecretHashContext::new("awscc.rds.db_instance", "db-1", "master_password");
-    let ctx2 = SecretHashContext::new("awscc.rds.db_instance", "db-2", "master_password");
-
-    let hash1 = value_to_json_with_context(&secret, Some(&ctx1)).unwrap();
-    let hash2 = value_to_json_with_context(&secret, Some(&ctx2)).unwrap();
+    let hash1 = value_to_json(&secret).unwrap();
+    let hash2 = value_to_json(&secret).unwrap();
 
     assert_ne!(
         hash1, hash2,
-        "Same password on different resources should produce different state hashes"
+        "random salts must hide equality between equal plaintexts"
     );
 
-    // Each hash should match its own context
-    let id1 = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-        "awscc",
-        "rds.db_instance",
-        "db-1",
-        None,
-    ));
-    let desired1 = HashMap::from([("master_password".to_string(), secret.clone())]);
-    let current1 = HashMap::from([(
-        "master_password".to_string(),
-        persisted_secret(hash1.as_str().unwrap()),
-    )]);
-    let changed1 = find_changed_attributes(&desired1, &current1, None, None, None, Some(&id1));
-    assert!(
-        changed1.is_empty(),
-        "Hash should match its own resource context"
-    );
+    let desired = HashMap::from([("master_password".to_string(), secret)]);
+    for hash in [hash1, hash2] {
+        let current = HashMap::from([(
+            "master_password".to_string(),
+            persisted_secret(hash.as_str().unwrap()),
+        )]);
+        assert!(
+            find_changed_attributes(&desired, &current, None, None, None).is_empty(),
+            "each independently salted digest must verify the plaintext",
+        );
+    }
+}
 
-    // But not the other resource's context
-    let id2 = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-        "awscc",
-        "rds.db_instance",
-        "db-2",
-        None,
-    ));
-    let desired2 = HashMap::from([("master_password".to_string(), secret)]);
-    let current2 = HashMap::from([(
-        "master_password".to_string(),
-        persisted_secret(hash1.as_str().unwrap()),
+#[test]
+fn provider_null_fields_do_not_create_a_secret_diff() {
+    let provider_json = serde_json::json!({ "a": "x", "b": null });
+    let marker = crate::provider::hash_provider_json_as_secret(&provider_json, None)
+        .expect("hash provider secret");
+    let current = HashMap::from([(
+        "config".to_string(),
+        persisted_secret(marker.as_str().expect("secret marker")),
     )]);
-    let changed2 = find_changed_attributes(&desired2, &current2, None, None, None, Some(&id2));
+    let desired = HashMap::from([(
+        "config".to_string(),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "a".to_string(),
+                Value::Concrete(ConcreteValue::String("x".into())),
+            )])),
+        )))),
+    )]);
+
     assert!(
-        changed2.contains(&"master_password".to_string()),
-        "Hash from db-1 should not match db-2's context"
+        find_changed_attributes(&desired, &current, None, None, None).is_empty(),
+        "provider-only null fields must not cause a phantom secret update",
     );
 }
 
@@ -1187,7 +1116,6 @@ fn secret_matches_plain_text_state_value() {
             &plain,
             None,
             crate::schema::empty_defs_for_schema_walks(),
-            None
         ),
         "Secret should match plain-text state when inner values are equal"
     );
@@ -1197,7 +1125,6 @@ fn secret_matches_plain_text_state_value() {
             &secret,
             None,
             crate::schema::empty_defs_for_schema_walks(),
-            None
         ),
         "Plain-text state should match secret when inner values are equal"
     );
@@ -1216,7 +1143,6 @@ fn secret_does_not_match_different_plain_text() {
             &plain,
             None,
             crate::schema::empty_defs_for_schema_walks(),
-            None
         ),
         "Secret should not match different plain-text state"
     );
@@ -1229,15 +1155,7 @@ fn secret_does_not_match_different_plain_text() {
 /// the state value is the raw provider response (not a hash).
 #[test]
 fn secret_in_map_with_refresh_no_false_diff() {
-    use crate::resource::ResourceId;
     use crate::schema::{AttributeSchema, ResourceSchema};
-
-    let resource_id = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-        "awscc",
-        "ec2.Vpc",
-        "ec2_vpc_fb75c929",
-        None,
-    ));
 
     // Desired: tags map with a secret value (as written in .crn)
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -1274,14 +1192,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
     let current = HashMap::from([("tags".to_string(), current_tags)]);
 
-    let changed = find_changed_attributes(
-        &desired,
-        &current,
-        None,
-        None,
-        Some(&schema),
-        Some(&resource_id),
-    );
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
     assert!(
         changed.is_empty(),
         "Secret in map should not show false diff when current has plain-text from provider (issue #1249), got changed: {:?}",
@@ -1310,8 +1221,8 @@ fn type_aware_equal_self_cyclic_union_ref_uses_concrete_member() {
     let x = Value::Concrete(ConcreteValue::String("x".into()));
     let y = Value::Concrete(ConcreteValue::String("y".into()));
 
-    assert!(type_aware_equal(&x, &x, Some(&root), &defs, None));
-    assert!(!type_aware_equal(&x, &y, Some(&root), &defs, None));
+    assert!(type_aware_equal(&x, &x, Some(&root), &defs));
+    assert!(!type_aware_equal(&x, &y, Some(&root), &defs));
 }
 
 #[test]
@@ -1323,7 +1234,7 @@ fn type_aware_equal_skips_cyclic_union_member_and_reaches_sibling() {
     )]);
     let value = Value::Concrete(ConcreteValue::String("x".into()));
 
-    assert!(type_aware_equal(&value, &value, Some(&root), &defs, None));
+    assert!(type_aware_equal(&value, &value, Some(&root), &defs));
 }
 
 #[test]
@@ -1338,8 +1249,7 @@ fn union_string_or_list_canonical_string_list_equal_to_self() {
         &a,
         &b,
         Some(&union),
-        crate::schema::empty_defs_for_schema_walks(),
-        None
+        crate::schema::empty_defs_for_schema_walks()
     ));
 }
 
@@ -1352,8 +1262,7 @@ fn union_string_or_list_canonical_string_list_diff_on_different_content() {
         &a,
         &b,
         Some(&union),
-        crate::schema::empty_defs_for_schema_walks(),
-        None
+        crate::schema::empty_defs_for_schema_walks()
     ));
 }
 
@@ -1372,8 +1281,7 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
         &scalar,
         &canonical,
         Some(&union),
-        crate::schema::empty_defs_for_schema_walks(),
-        None
+        crate::schema::empty_defs_for_schema_walks()
     ));
 
     let legacy_list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -1383,8 +1291,7 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
         &legacy_list,
         &canonical,
         Some(&union),
-        crate::schema::empty_defs_for_schema_walks(),
-        None
+        crate::schema::empty_defs_for_schema_walks()
     ));
 }
 
@@ -1397,8 +1304,7 @@ fn union_string_or_list_compares_string_list() {
         &a,
         &b,
         Some(&union),
-        crate::schema::empty_defs_for_schema_walks(),
-        None
+        crate::schema::empty_defs_for_schema_walks()
     ));
 }
 
@@ -1722,7 +1628,7 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
 
     let secret_hash = persisted_secret(&format!(
         "{}{}",
-        crate::value::SECRET_PREFIX,
+        crate::value::LEGACY_SECRET_PREFIX,
         "deadbeef".repeat(8)
     ));
     let persisted_config = || {
@@ -2174,8 +2080,7 @@ fn find_changed_attributes_unrecorded_prev_explicit_is_no_change_when_values_mat
     ]);
     let current = desired.clone();
     let prev_explicit = ExplicitFields::Unrecorded;
-    let changed =
-        find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None, None);
+    let changed = find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None);
     assert!(
         changed.is_empty(),
         "carina#3280: `Unrecorded` is the \"no authoring record\" \
@@ -2202,8 +2107,7 @@ fn find_changed_attributes_unrecorded_prev_explicit_still_detects_real_drift() {
         Value::Concrete(ConcreteValue::String("USER".into())),
     )]);
     let prev_explicit = ExplicitFields::Unrecorded;
-    let changed =
-        find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None, None);
+    let changed = find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None);
     assert_eq!(
         changed,
         vec!["principal_type".to_string()],

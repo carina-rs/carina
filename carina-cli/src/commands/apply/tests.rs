@@ -5847,8 +5847,8 @@ mod saved_plan_version_tests {
             "error must name the rejected v10 version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 14"),
-            "error must name the v14 expected version, got: {msg}",
+            msg.contains("expected 15"),
+            "error must name the v15 expected version, got: {msg}",
         );
         assert!(
             msg.contains(&format!("Re-run `{expected_replan}`")),
@@ -5903,7 +5903,7 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported-version error, got: {error}");
         };
         assert_eq!(*found, 13);
-        assert_eq!(*expected, 14);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
         assert_eq!(
             replan_command.as_deref(),
             Some(format!("carina plan --out {} infra", plan_path.display()).as_str())

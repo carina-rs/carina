@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::value::SECRET_PREFIX;
+use carina_core::value::LEGACY_SECRET_PREFIX;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
 
@@ -1627,7 +1627,7 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
                 .with_identifier("mock-id")
                 .with_attribute(
                     "comment".to_string(),
-                    serde_json::json!(format!("{SECRET_PREFIX}{hash}")),
+                    serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}")),
                 ),
         )
         .expect("test state setup must be valid");
@@ -1644,7 +1644,10 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
     ] {
         match loaded {
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })) => {
-                assert_eq!(loaded.as_str(), hash)
+                assert_eq!(
+                    loaded.persisted_marker(),
+                    format!("{LEGACY_SECRET_PREFIX}{hash}")
+                );
             }
             other => panic!("persisted secret hash lost its type at the state boundary: {other:?}"),
         }
@@ -1656,7 +1659,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
     use carina_core::resource::{DeferredValue, Value};
 
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let marker = serde_json::json!(format!("{SECRET_PREFIX}{hash}"));
+    let marker = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}"));
     let row =
         ResourceState::new("test.resource", "main", "mock").with_attribute("token", marker.clone());
     let deposed = DeposedInstance {
@@ -1677,7 +1680,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
         assert!(matches!(
             decoded.get("token"),
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if loaded.as_str() == hash
+                if loaded.persisted_marker() == format!("{LEGACY_SECRET_PREFIX}{hash}")
         ));
     }
 }
@@ -1685,7 +1688,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
 #[test]
 fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let marker = serde_json::json!(format!("{SECRET_PREFIX}{hash}"));
+    let marker = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}"));
     let mut row = ResourceState::new("test.resource", "main", "mock")
         .with_identifier("current-id")
         .with_attribute("token", marker.clone());
@@ -2856,7 +2859,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -2902,7 +2905,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     )]);
     let existing = persisted_attributes_from_state_json(&HashMap::from([(
         "password".to_string(),
-        serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+        serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
     )]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
@@ -2922,12 +2925,35 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
 }
 
 #[test]
+fn with_attributes_from_state_reuses_matching_secret_digest() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, State, Value};
+
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "stable", None);
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("stable-secret".into()),
+    ))));
+    let provider_state = State::existing(id, HashMap::from([("comment".to_string(), secret)]));
+    let first = ResourceState::new("test.resource", "stable", "mock")
+        .with_attributes_from_state(&provider_state);
+    let first_marker =
+        persisted_json_attribute(&first.attributes, "comment").expect("first secret marker");
+
+    let second = first.with_attributes_from_state(&provider_state);
+    let second_marker =
+        persisted_json_attribute(&second.attributes, "comment").expect("second secret marker");
+
+    assert_eq!(
+        first_marker, second_marker,
+        "unchanged secret marker churned"
+    );
+}
+
+#[test]
 fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let previous = serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32)));
+    let previous = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)));
     let attrs = HashMap::from([(
         "password".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -2953,7 +2979,6 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
 #[test]
 fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
@@ -2963,7 +2988,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -2997,7 +3022,6 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
 #[test]
 fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
@@ -3007,7 +3031,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         .with_identifier("db-old")
         .with_attribute(
             "password",
-            serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
+            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
         );
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -3044,7 +3068,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+        "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
     });
     let mut provider_tags = IndexMap::new();
     provider_tags.insert(
@@ -3103,13 +3127,12 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
 #[test]
 fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::value::SECRET_PREFIX;
     use indexmap::IndexMap;
 
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+        "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
     });
     let attrs = HashMap::from([(
         "tags".to_string(),
@@ -3135,7 +3158,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         .expect("missing secret tag should keep the previous hash");
 
     assert!(!stored_tags.contains_key("Name"));
-    assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+    assert!(secret.starts_with(LEGACY_SECRET_PREFIX), "got {secret}");
 }
 
 #[test]
@@ -3148,7 +3171,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
     let previous_items = serde_json::json!([
         {
             "Name": "one",
-            "Token": format!("{SECRET_PREFIX}{}", "ab".repeat(32)),
+            "Token": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
         },
         {
             "Name": "two",

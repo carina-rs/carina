@@ -45,6 +45,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-
 tokio-util = "0.7"
 
 [dev-dependencies]
+argon2 = "0.5"
 async-trait = "0.1"
 carina-core = { path = "../carina-core", features = ["test-shutdown"] }
 carina-state = { path = "../carina-state", features = ["test-utils"] }

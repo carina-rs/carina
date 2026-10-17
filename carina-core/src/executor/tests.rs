@@ -4387,13 +4387,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     ))));
     to_resource.set_attr("master_password", secret_value.clone());
 
-    let secret_ctx = crate::value::SecretHashContext::new(
-        rid.display_type(),
-        rid.identity_str().expect("resolved identity"),
-        "master_password",
-    );
-    let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
-        .expect("secret hash must serialize");
+    let hash_json = crate::value::value_to_json(&secret_value).expect("secret hash must serialize");
     let hash_str = hash_json
         .as_str()
         .expect("secret hash must serialize to a string")
@@ -4459,13 +4453,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         ])),
     );
 
-    let secret_ctx = crate::value::SecretHashContext::new(
-        rid.display_type(),
-        rid.identity_str().expect("resolved identity"),
-        "master_password",
-    );
-    let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
-        .expect("secret hash must serialize");
+    let hash_json = crate::value::value_to_json(&secret_value).expect("secret hash must serialize");
     let hash_str = hash_json
         .as_str()
         .expect("secret hash must serialize to a string")

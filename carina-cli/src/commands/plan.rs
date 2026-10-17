@@ -19,6 +19,7 @@ use carina_core::resource::DeferredValue;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{
     redact_secrets_in_plan_with_desired_and_historical, redact_secrets_in_resource,
+    redact_secrets_in_resource_reusing_persisted_hashes,
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
@@ -153,7 +154,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 14;
+    pub const CURRENT_VERSION: u32 = 15;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -622,16 +623,12 @@ fn build_plan_file<E>(
         .map(|resource| (resource.id.clone(), resource.clone()))
         .collect();
     let provider_configs = SavedProviderConfigs::from(provider_configs).redact_secrets()?;
-    for (binding, attributes) in &ctx.upstream_snapshot {
-        for (key, value) in attributes {
+    for attributes in ctx.upstream_snapshot.values() {
+        for value in attributes.values() {
             // Export validation rejects secret-valued exports before an
             // upstream state snapshot can be produced. Keep this guard for
-            // malformed/tampered in-memory input rather than defining a
-            // position that valid plans cannot reach.
-            carina_core::value::reject_secret_without_saved_plan_position(
-                value,
-                format!("upstream_state {binding}.{key}"),
-            )?;
+            // malformed/tampered in-memory input.
+            carina_core::value::reject_secret_in_saved_plan_field(value)?;
         }
     }
     let upstream_snapshot = ctx.upstream_snapshot.clone();
@@ -656,45 +653,67 @@ fn build_plan_file<E>(
         .current_states
         .iter()
         .map(|(id, state)| {
-            let hash_context_id = ctx.moved_origins.get(id).unwrap_or(id);
+            let persisted_id = ctx.moved_origins.get(id).unwrap_or(id);
             let persisted = persisted_resources.as_ref().and_then(|resources| {
-                let identity = hash_context_id.identity_str()?;
+                let identity = persisted_id.identity_str()?;
                 resources
                     .get(&(
-                        hash_context_id.provider.as_str(),
-                        hash_context_id.resource_type.as_str(),
+                        persisted_id.provider.as_str(),
+                        persisted_id.resource_type.as_str(),
                         identity,
-                        hash_context_id.provider_instance.as_deref(),
+                        persisted_id.provider_instance.as_deref(),
                     ))
                     .copied()
             });
-            // A moved state keeps the hash produced under its source address
-            // until execution writes the destination row. Both persisted
-            // lookup and fresh-read redaction therefore use that source
-            // address as the historical hash context.
+            // A moved resource's previous state row still lives at its source
+            // address until execution writes the destination row.
             let redacted = match persisted {
                 Some(persisted) => {
                     let persisted_attributes = persisted.persisted_attributes();
-                    redact_secrets_in_state_using_persisted(
-                        state,
-                        persisted_attributes,
-                        hash_context_id,
-                    )?
+                    redact_secrets_in_state_using_persisted(state, persisted_attributes)?
                 }
                 None => state.clone(),
             };
             let redacted = match desired_resources.get(id) {
-                Some(desired) => {
-                    redact_secrets_in_state_using_resource(&redacted, desired, hash_context_id)?
-                }
+                Some(desired) => redact_secrets_in_state_using_resource(&redacted, desired)?,
                 None if persisted.is_some() => redacted,
                 None => redact_secrets_in_state(&redacted)?,
             };
             Ok((id.clone(), redacted))
         })
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
+    let redacted_sorted_resources = ctx
+        .sorted_resources
+        .iter()
+        .map(|resource| {
+            let persisted_id = ctx.moved_origins.get(&resource.id).unwrap_or(&resource.id);
+            let persisted = persisted_resources.as_ref().and_then(|resources| {
+                let identity = persisted_id.identity_str()?;
+                resources
+                    .get(&(
+                        persisted_id.provider.as_str(),
+                        persisted_id.resource_type.as_str(),
+                        identity,
+                        persisted_id.provider_instance.as_deref(),
+                    ))
+                    .copied()
+            });
+            match persisted {
+                Some(persisted) => redact_secrets_in_resource_reusing_persisted_hashes(
+                    resource,
+                    persisted.persisted_attributes(),
+                ),
+                None => redact_secrets_in_resource(resource),
+            }
+        })
+        .collect::<Result<Vec<_>, carina_core::value::SerializationError>>()?;
 
     Ok(PlanFile {
+        // carina#3863 / carina#3865: bumped 14→15 — secret digests now
+        // embed a random salt and saved-plan resource placeholders carry the
+        // exact digest that state writeback must reuse. A v14 plan contains
+        // context-derived digests and cannot satisfy that contract.
+        //
         // carina#3871: bumped 13→14 — orphan state and host metadata now
         // travel as one typed value until planning finishes. V13
         // `CurrentStateEntry` values may also contain legacy `_`-prefixed
@@ -707,13 +726,10 @@ fn build_plan_file<E>(
         // from `Resource::id`. A v12 plan must be regenerated rather than
         // mixing its synthetic-attribute representation with v13 apply.
         //
-        // carina#3861 / carina#2674: bumped 11→12 — secrets now use a typed
-        // placeholder bound to a stable, position-unique hash context, and
-        // saved-plan apply must re-evaluate and verify it. Resource positions
-        // stay byte-identical to state writeback; other positions use disjoint
-        // namespaces. A v11 plan represents secret hashes as ordinary strings
-        // and could send those hashes to a provider, so it must never cross
-        // this seam.
+        // carina#3861 / carina#2674: bumped 11→12 — secrets now use typed
+        // placeholders, and saved-plan apply must re-evaluate and verify them.
+        // A v11 plan represents secret hashes as ordinary strings and could
+        // send those hashes to a provider, so it must never cross this seam.
         //
         // carina#3805: bumped 10→11 — `compositions` stores the pending module
         // constraints required by apply, and `data_source_origins` preserves
@@ -759,11 +775,7 @@ fn build_plan_file<E>(
             &desired_resources,
             &redacted_current_states,
         )?,
-        sorted_resources: ctx
-            .sorted_resources
-            .iter()
-            .map(redact_secrets_in_resource)
-            .collect::<Result<Vec<_>, _>>()?,
+        sorted_resources: redacted_sorted_resources,
         unresolved_resources: ctx
             .unresolved_resources
             .iter()

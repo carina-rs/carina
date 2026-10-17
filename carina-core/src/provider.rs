@@ -663,6 +663,20 @@ impl<'a> PreviousSecretHashAuthority<'a> {
 }
 
 impl PersistedAttributes {
+    /// Encode the typed placeholders captured in a saved-plan resource into
+    /// their state-marker representation.
+    pub fn from_saved_plan_attributes<'a>(
+        attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+    ) -> Result<Self, crate::value::SerializationError> {
+        let encoded = attributes
+            .into_iter()
+            .filter_map(|(key, value)| {
+                saved_plan_secret_hashes(value).map(|value| (key.clone(), value))
+            })
+            .collect();
+        Ok(Self(encoded))
+    }
+
     /// Decode one stored attribute with persisted secret-marker semantics.
     pub fn get(&self, key: &str) -> Option<Value> {
         self.0
@@ -680,6 +694,27 @@ impl PersistedAttributes {
             .collect()
     }
 
+    /// Decode state attributes while binding legacy hashes to their stored
+    /// resource row. New PHC hashes remain context-free.
+    pub fn to_values_for_resource(&self, id: &ResourceId) -> HashMap<String, Value> {
+        let display_type = id.display_type();
+        let identity = id
+            .identity_str()
+            .expect("persisted resource IDs always have an identity");
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                crate::value::persisted_json_to_dsl_value_for_state_row(
+                    value,
+                    &display_type,
+                    identity,
+                    key,
+                )
+                .map(|value| (key.clone(), value))
+            })
+            .collect()
+    }
+
     /// Iterate stored attribute names without exposing their encoded values.
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.0.keys()
@@ -691,6 +726,11 @@ impl PersistedAttributes {
 
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.contains_key(key)
+    }
+
+    /// Borrow the persisted JSON representation for one attribute.
+    pub fn encoded_value(&self, key: &str) -> Option<&serde_json::Value> {
+        self.0.get(key)
     }
 
     /// Retain top-level persisted attributes selected by `keep`.
@@ -730,19 +770,23 @@ impl PersistedAttributes {
         attributes: &HashMap<String, Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> Self {
-        let display_type = resource.id.display_type();
-        let identity = resource.identity_str();
         let serialized = attributes
             .iter()
             .filter_map(|(key, value)| {
-                let context = crate::value::SecretHashContext::new(&display_type, identity, key);
-                persisted_state_value_to_json(value, &context)
+                persisted_state_value_to_json(value)
                     .ok()
                     .map(|value| (key.clone(), value))
             })
             .collect();
-        Self::protect_serialized(resource, schema, serialized, previous_hash_authority, false)
-            .expect("lossy secret protection does not return serialization errors")
+        Self::protect_serialized(
+            resource,
+            schema,
+            serialized,
+            previous_hash_authority,
+            None,
+            false,
+        )
+        .expect("lossy secret protection does not return serialization errors")
     }
 
     /// Apply desired/schema/previous-state secret protection to values already
@@ -753,18 +797,34 @@ impl PersistedAttributes {
         schema: Option<&ResourceSchema>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> Self {
-        Self::protect_serialized(resource, schema, self.0, previous_hash_authority, false)
-            .expect("lossy secret protection does not return serialization errors")
+        Self::protect_serialized(
+            resource,
+            schema,
+            self.0,
+            previous_hash_authority,
+            None,
+            false,
+        )
+        .expect("lossy secret protection does not return serialization errors")
     }
 
-    /// Strict variant used after a provider read has already been encoded.
+    /// Strict protection used after a provider read has already been encoded.
+    /// `preferred` supplies same-path hashes committed by a saved plan.
     pub fn try_protect_for_resource_and_schema(
         self,
         resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        preferred: Option<&PersistedAttributes>,
     ) -> Result<Self, crate::value::SerializationError> {
-        Self::protect_serialized(resource, schema, self.0, previous_hash_authority, true)
+        Self::protect_serialized(
+            resource,
+            schema,
+            self.0,
+            previous_hash_authority,
+            preferred,
+            true,
+        )
     }
 
     /// Protect a provider read for an orphan, where no desired resource is
@@ -772,16 +832,12 @@ impl PersistedAttributes {
     /// schema write-only plaintext is not persisted.
     pub fn protect_for_orphan_refresh(
         self,
-        display_type: &str,
-        identity: &str,
         schema: Option<&ResourceSchema>,
         previous: &PersistedAttributes,
     ) -> Self {
         let mut serialized = self.0;
         let mut protected_secret_keys = std::collections::HashSet::new();
         protect_previously_hashed_secrets(
-            display_type,
-            identity,
             |_| false,
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
             &mut serialized,
@@ -796,25 +852,30 @@ impl PersistedAttributes {
         schema: Option<&ResourceSchema>,
         mut serialized: HashMap<String, serde_json::Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        preferred: Option<&PersistedAttributes>,
         strict_desired: bool,
     ) -> Result<Self, crate::value::SerializationError> {
-        let display_type = resource.id.display_type();
-        let identity = resource.identity_str();
         let mut protected_secret_keys = std::collections::HashSet::new();
 
         for (key, desired_value) in &resource.attributes {
             if !crate::value::contains_unredacted_secret(desired_value) {
                 continue;
             }
-            let context = crate::value::SecretHashContext::new(&display_type, identity, key);
+            let previous = preferred
+                .and_then(|attributes| attributes.encoded().get(key))
+                .or_else(|| {
+                    previous_hash_authority
+                        .attributes()
+                        .and_then(|attributes| attributes.encoded().get(key))
+                });
             let masked = if let Some(provider_json) = serialized.get(key).cloned() {
                 crate::value::merge_secrets_into_provider_json(
                     desired_value,
                     &provider_json,
-                    Some(&context),
+                    previous,
                 )
             } else {
-                crate::value::value_to_json_with_context(desired_value, Some(&context))
+                crate::value::value_to_json_reusing_secret_hashes(desired_value, previous)
             };
             match masked {
                 Ok(masked) => {
@@ -829,8 +890,6 @@ impl PersistedAttributes {
         }
 
         protect_previously_hashed_secrets(
-            &display_type,
-            identity,
             |key| resource.attributes.contains_key(key),
             previous_hash_authority,
             &mut serialized,
@@ -846,9 +905,43 @@ impl PersistedAttributes {
     }
 }
 
+/// Extract only redacted-secret leaves from a saved-plan value.
+///
+/// Maps omit unrelated siblings. Lists retain their indices with `null`
+/// placeholders so a preferred hash still addresses the same nested path.
+fn saved_plan_secret_hashes(value: &Value) -> Option<serde_json::Value> {
+    match value {
+        Value::Deferred(DeferredValue::RedactedSecret { hash }) => Some(serde_json::Value::String(
+            crate::value::persisted_secret_marker(hash),
+        )),
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            let values: serde_json::Map<_, _> = values
+                .iter()
+                .filter_map(|(key, value)| {
+                    saved_plan_secret_hashes(value).map(|value| (key.clone(), value))
+                })
+                .collect();
+            (!values.is_empty()).then_some(serde_json::Value::Object(values))
+        }
+        Value::Concrete(ConcreteValue::List(values)) => {
+            let mut found = false;
+            let values = values
+                .iter()
+                .map(|value| {
+                    saved_plan_secret_hashes(value).map_or(serde_json::Value::Null, |value| {
+                        found = true;
+                        value
+                    })
+                })
+                .collect();
+            found.then_some(serde_json::Value::Array(values))
+        }
+        _ => None,
+    }
+}
+
 fn persisted_state_value_to_json(
     value: &Value,
-    context: &crate::value::SecretHashContext,
 ) -> Result<serde_json::Value, crate::value::SerializationError> {
     match value {
         Value::Deferred(DeferredValue::RedactedSecret { hash }) => Ok(serde_json::Value::String(
@@ -856,19 +949,16 @@ fn persisted_state_value_to_json(
         )),
         Value::Concrete(ConcreteValue::List(values)) => values
             .iter()
-            .map(|value| persisted_state_value_to_json(value, context))
+            .map(persisted_state_value_to_json)
             .collect::<Result<Vec<_>, _>>()
             .map(serde_json::Value::Array),
         Value::Concrete(ConcreteValue::Map(values)) => values
             .iter()
             .map(|(key, value)| {
-                persisted_state_value_to_json(value, context).map(|value| (key.clone(), value))
+                persisted_state_value_to_json(value).map(|value| (key.clone(), value))
             })
             .collect::<Result<serde_json::Map<_, _>, _>>()
             .map(serde_json::Value::Object),
-        _ if crate::value::contains_unredacted_secret(value) => {
-            crate::value::value_to_json_with_context(value, Some(context))
-        }
         _ => crate::value::value_to_json(value),
     }
 }
@@ -900,8 +990,6 @@ fn contains_secret_hash_json(value: &serde_json::Value) -> bool {
 }
 
 fn protect_previously_hashed_secrets(
-    display_type: &str,
-    identity: &str,
     is_desired_key: impl Fn(&str) -> bool,
     authority: PreviousSecretHashAuthority<'_>,
     serialized: &mut HashMap<String, serde_json::Value>,
@@ -918,7 +1006,6 @@ fn protect_previously_hashed_secrets(
         if shape == SecretHashShape::None {
             continue;
         }
-        let context = crate::value::SecretHashContext::new(display_type, identity, key);
         let masked = match (shape, serialized.get(key)) {
             (SecretHashShape::TopLevel, Some(provider_json))
                 if secret_hash_shape(provider_json) == SecretHashShape::TopLevel =>
@@ -926,16 +1013,12 @@ fn protect_previously_hashed_secrets(
                 provider_json.clone()
             }
             (SecretHashShape::TopLevel, Some(provider_json)) => {
-                hash_provider_json_as_secret(provider_json, &context)
+                hash_provider_json_as_secret(provider_json, Some(previous_value))
                     .unwrap_or_else(|_| previous_value.clone())
             }
             (SecretHashShape::TopLevel, None) => previous_value.clone(),
             (SecretHashShape::Nested, provider_json) => {
-                merge_previous_secret_hashes_into_provider_json(
-                    previous_value,
-                    provider_json,
-                    &context,
-                )
+                merge_previous_secret_hashes_into_provider_json(previous_value, provider_json)
             }
             (SecretHashShape::None, _) => unreachable!("None shape is filtered above"),
         };
@@ -961,7 +1044,6 @@ fn remove_unprotected_write_only_attributes(
 fn merge_previous_secret_hashes_into_provider_json(
     previous_value: &serde_json::Value,
     provider_value: Option<&serde_json::Value>,
-    context: &crate::value::SecretHashContext,
 ) -> serde_json::Value {
     match previous_value {
         serde_json::Value::String(stored) if crate::value::is_persisted_secret(stored) => {
@@ -971,7 +1053,7 @@ fn merge_previous_secret_hashes_into_provider_json(
             if secret_hash_shape(provider_value) == SecretHashShape::TopLevel {
                 return provider_value.clone();
             }
-            hash_provider_json_as_secret(provider_value, context)
+            hash_provider_json_as_secret(provider_value, Some(previous_value))
                 .unwrap_or_else(|_| previous_value.clone())
         }
         serde_json::Value::Object(previous_object) => {
@@ -986,7 +1068,6 @@ fn merge_previous_secret_hashes_into_provider_json(
                         merge_previous_secret_hashes_into_provider_json(
                             previous_child,
                             provider_object.get(key),
-                            context,
                         ),
                     );
                 }
@@ -1000,7 +1081,7 @@ fn merge_previous_secret_hashes_into_provider_json(
             if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
                 return hash_provider_json_as_secret(
                     &serde_json::Value::Array(provider_items.clone()),
-                    context,
+                    Some(previous_value),
                 )
                 .unwrap_or_else(|_| previous_value.clone());
             }
@@ -1010,7 +1091,6 @@ fn merge_previous_secret_hashes_into_provider_json(
                     merged[index] = merge_previous_secret_hashes_into_provider_json(
                         previous_child,
                         provider_items.get(index),
-                        context,
                     );
                 }
             }
@@ -1050,15 +1130,14 @@ fn previous_secret_hash_array_alignment_is_trusted(
             })
 }
 
-fn hash_provider_json_as_secret(
+pub(crate) fn hash_provider_json_as_secret(
     provider_json: &serde_json::Value,
-    context: &crate::value::SecretHashContext,
+    previous: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let provider_value = crate::value::json_to_dsl_value(provider_json)
-        .ok_or_else(|| "cannot hash null provider secret".to_string())?;
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(provider_value)));
-    crate::value::value_to_json_with_context(&secret_value, Some(context))
-        .map_err(|error| error.to_string())
+    if provider_json.is_null() {
+        return Err("cannot hash null provider secret".to_string());
+    }
+    Ok(crate::value::persist_secret_json(provider_json, previous))
 }
 
 /// Saved attributes decoded from persisted state but not yet reconciled
@@ -1085,7 +1164,10 @@ impl RawSavedAttrs {
         Self(SavedAttrs(
             saved_attrs
                 .into_iter()
-                .map(|(id, attributes)| (id, attributes.to_values()))
+                .map(|(id, attributes)| {
+                    let values = attributes.to_values_for_resource(&id);
+                    (id, values)
+                })
                 .collect(),
         ))
     }
@@ -1644,8 +1726,7 @@ pub fn merge_default_tags(
             }
             Err(
                 source @ (SerializationError::NonFiniteFloat { .. }
-                | SerializationError::RedactedSecretNotAllowed { .. }
-                | SerializationError::SavedPlanSecretContextUnavailable { .. }),
+                | SerializationError::RedactedSecretNotAllowed { .. }),
             ) => {
                 return Err(ProviderError::invalid_input(format!(
                     "failed to encode default tag '{key}' for provider '{}'",
@@ -2286,6 +2367,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saved_plan_hash_inventory_ignores_non_placeholder_siblings() {
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("SAVED_PLAN_SECRET".into()),
+        ))));
+        let placeholder =
+            crate::value::redact_secrets_in_value(&secret).expect("redact saved-plan secret");
+        let attributes = HashMap::from([
+            (
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("S".to_string(), placeholder.clone()),
+                    (
+                        "Vpc".to_string(),
+                        Value::resource_ref("vpc", "identifier", Vec::new()),
+                    ),
+                ]))),
+            ),
+            (
+                "items".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::resource_ref("vpc", "identifier", Vec::new()),
+                    placeholder,
+                ])),
+            ),
+        ]);
+
+        let hashes = PersistedAttributes::from_saved_plan_attributes(&attributes)
+            .expect("non-placeholder siblings must not be serialized");
+        let tags = hashes
+            .encoded_value("tags")
+            .and_then(serde_json::Value::as_object)
+            .expect("sparse marker object");
+        assert!(
+            tags.get("S")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(crate::value::is_persisted_secret),
+        );
+        assert!(!tags.contains_key("Vpc"));
+        let items = hashes
+            .encoded_value("items")
+            .and_then(serde_json::Value::as_array)
+            .expect("sparse marker list");
+        assert!(items[0].is_null(), "list indexes must remain stable");
+        assert!(
+            items[1]
+                .as_str()
+                .is_some_and(crate::value::is_persisted_secret),
+        );
+    }
+
+    #[test]
+    fn provider_secret_hash_drops_null_fields_before_hashing() {
+        let provider_json = serde_json::json!({ "a": "x", "b": null });
+        let marker = hash_provider_json_as_secret(&provider_json, None)
+            .expect("hash canonical provider secret");
+        let digest =
+            crate::value::persisted_secret_hash(marker.as_str().expect("persisted marker string"))
+                .expect("typed secret digest");
+        let desired_material =
+            serde_json::to_vec(&serde_json::json!({ "a": "x" })).expect("serialize desired secret");
+
+        assert!(
+            digest.verify(desired_material),
+            "provider-only null fields must not create a phantom secret diff",
+        );
+    }
+
+    #[test]
     fn merge_default_tags_skips_unresolved_values() {
         let config = ProviderConfig {
             name: "aws".to_string(),
@@ -2661,7 +2810,7 @@ mod tests {
 
         let id = ResourceId::with_provider_identity("test", "service.Widget", "widget", None);
         let secret_hash: Value = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": "deadbeef".repeat(8) }
+            "RedactedSecret": { "hash": format!("argon2:{}", "deadbeef".repeat(8)) }
         }))
         .expect("deserialize persisted secret");
         let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(

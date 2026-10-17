@@ -9,7 +9,9 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
+use argon2::{Algorithm, Argon2, Params, Version};
 use indexmap::IndexMap;
+use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use serde::{Deserialize, Serialize};
 
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
@@ -1521,21 +1523,222 @@ impl fmt::Debug for DeferredValue {
     }
 }
 
-/// Opaque hash carried by [`DeferredValue::RedactedSecret`].
+/// Typed digest carried by [`DeferredValue::RedactedSecret`].
 ///
-/// The constructor is crate-private so ordinary consumers cannot manufacture
-/// a value that masquerades as a saved-plan placeholder.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RedactedSecretHash(String);
+/// New digests retain a validated Argon2id PHC string verbatim. The PHC
+/// string embeds the salt, algorithm version, and m/t/p parameters needed for
+/// context-free verification. Legacy state markers carry their historical
+/// hash plus an optional typed origin context; only the persisted-state lift
+/// seam can bind that context.
+#[derive(Clone)]
+pub struct RedactedSecretHash(RedactedSecretHashKind);
+
+#[derive(Clone)]
+enum RedactedSecretHashKind {
+    Argon2idPhc {
+        encoded: String,
+    },
+    LegacyArgon2 {
+        hash: [u8; RedactedSecretHash::HASH_LEN],
+        context: Option<LegacySecretHashContext>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LegacySecretHashContext {
+    display_type: String,
+    identity: String,
+    top_level_attribute_key: String,
+}
+
+impl LegacySecretHashContext {
+    fn salt(&self) -> String {
+        format!(
+            "carina:{}:{}:{}",
+            self.display_type, self.identity, self.top_level_attribute_key
+        )
+    }
+}
 
 impl RedactedSecretHash {
-    pub(crate) fn new(hash: String) -> Self {
-        Self(hash)
+    const SALT_LEN: usize = 16;
+    pub const HASH_LEN: usize = 32;
+    /// Complete prefix of every new state marker. The bytes after `_secret:`
+    /// are a standard PHC string, for example
+    /// `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`.
+    pub const V2_MARKER_PREFIX: &'static str = "_secret:$argon2id$";
+    pub const LEGACY_MARKER_PREFIX: &'static str = "_secret:argon2:";
+    const STATE_MARKER_PREFIX: &'static str = "_secret:";
+    const LEGACY_DIGEST_PREFIX: &'static str = "argon2:";
+
+    pub(crate) fn generate(plaintext: &[u8]) -> Self {
+        let salt = SaltString::generate(&mut OsRng);
+        let encoded = Argon2::default()
+            .hash_password(plaintext, &salt)
+            .expect("Argon2id hashing with a generated salt should not fail")
+            .to_string();
+        Self(RedactedSecretHashKind::Argon2idPhc { encoded })
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Reuse a matching self-contained digest or generate a fresh PHC digest.
+    /// Legacy hashes are verification-only and are always upgraded on write.
+    pub(crate) fn reuse_or_generate(plaintext: &[u8], previous: Option<&Self>) -> Self {
+        if let Some(previous @ Self(RedactedSecretHashKind::Argon2idPhc { .. })) = previous
+            && previous.verify(plaintext)
+        {
+            return previous.clone();
+        }
+        Self::generate(plaintext)
+    }
+
+    /// Verify a candidate against this typed digest.
+    ///
+    /// New PHC digests use only their embedded algorithm parameters. A legacy
+    /// digest verifies only after the persisted-state lift seam binds the
+    /// originating row's display type, identity, and top-level attribute key.
+    pub fn verify(&self, plaintext: impl AsRef<[u8]>) -> bool {
+        match &self.0 {
+            RedactedSecretHashKind::Argon2idPhc { encoded } => PasswordHash::new(encoded)
+                .is_ok_and(|parsed| {
+                    Argon2::default()
+                        .verify_password(plaintext.as_ref(), &parsed)
+                        .is_ok()
+                }),
+            RedactedSecretHashKind::LegacyArgon2 {
+                hash,
+                context: Some(context),
+            } => {
+                let mut candidate = [0_u8; Self::HASH_LEN];
+                legacy_argon2()
+                    .hash_password_into(
+                        plaintext.as_ref(),
+                        context.salt().as_bytes(),
+                        &mut candidate,
+                    )
+                    .is_ok()
+                    && candidate == *hash
+            }
+            RedactedSecretHashKind::LegacyArgon2 { context: None, .. } => false,
+        }
+    }
+
+    pub(crate) fn parse_persisted_marker(marker: &str) -> Option<Self> {
+        marker
+            .strip_prefix(Self::STATE_MARKER_PREFIX)
+            .and_then(Self::parse_encoded_digest)
+    }
+
+    fn parse_encoded_digest(encoded: &str) -> Option<Self> {
+        if encoded.starts_with("$argon2id$") {
+            let parsed = PasswordHash::new(encoded).ok()?;
+            if parsed.algorithm != argon2::ARGON2ID_IDENT
+                || parsed.version.is_none()
+                || parsed.params.get("m").is_none()
+                || parsed.params.get("t").is_none()
+                || parsed.params.get("p").is_none()
+                || parsed.hash.as_ref()?.len() != Self::HASH_LEN
+            {
+                return None;
+            }
+            let mut salt = [0_u8; Self::SALT_LEN];
+            if parsed.salt?.decode_b64(&mut salt).ok()?.len() != Self::SALT_LEN {
+                return None;
+            }
+            Version::try_from(parsed.version?).ok()?;
+            Params::try_from(&parsed).ok()?;
+            return Some(Self(RedactedSecretHashKind::Argon2idPhc {
+                encoded: encoded.to_string(),
+            }));
+        }
+        let encoded = encoded.strip_prefix(Self::LEGACY_DIGEST_PREFIX)?;
+        let mut hash = [0_u8; Self::HASH_LEN];
+        hex::decode_to_slice(encoded, &mut hash).ok()?;
+        Some(Self(RedactedSecretHashKind::LegacyArgon2 {
+            hash,
+            context: None,
+        }))
+    }
+
+    pub fn encoded_digest(&self) -> String {
+        match &self.0 {
+            RedactedSecretHashKind::Argon2idPhc { encoded } => encoded.clone(),
+            RedactedSecretHashKind::LegacyArgon2 { hash, .. } => {
+                format!("{}{}", Self::LEGACY_DIGEST_PREFIX, hex::encode(hash))
+            }
+        }
+    }
+
+    pub fn persisted_marker(&self) -> String {
+        format!("{}{}", Self::STATE_MARKER_PREFIX, self.encoded_digest())
+    }
+
+    pub(crate) fn bind_legacy_state_row(
+        mut self,
+        display_type: impl Into<String>,
+        identity: impl Into<String>,
+        top_level_attribute_key: impl Into<String>,
+    ) -> Self {
+        if let RedactedSecretHashKind::LegacyArgon2 { context, .. } = &mut self.0 {
+            *context = Some(LegacySecretHashContext {
+                display_type: display_type.into(),
+                identity: identity.into(),
+                top_level_attribute_key: top_level_attribute_key.into(),
+            });
+        }
+        self
+    }
+}
+
+fn legacy_argon2() -> Argon2<'static> {
+    let params = Params::new(19 * 1024, 2, 1, Some(RedactedSecretHash::HASH_LEN))
+        .expect("origin/main legacy Argon2 parameters are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+impl PartialEq for RedactedSecretHash {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (
+                RedactedSecretHashKind::Argon2idPhc { encoded: left },
+                RedactedSecretHashKind::Argon2idPhc { encoded: right },
+            ) => left == right,
+            (
+                RedactedSecretHashKind::LegacyArgon2 { hash: left, .. },
+                RedactedSecretHashKind::LegacyArgon2 { hash: right, .. },
+            ) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RedactedSecretHash {}
+
+impl Hash for RedactedSecretHash {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match &self.0 {
+            RedactedSecretHashKind::Argon2idPhc { encoded } => {
+                0_u8.hash(state);
+                encoded.hash(state);
+            }
+            RedactedSecretHashKind::LegacyArgon2 { hash, .. } => {
+                1_u8.hash(state);
+                hash.hash(state);
+            }
+        }
+    }
+}
+
+impl Serialize for RedactedSecretHash {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.encoded_digest())
+    }
+}
+
+impl<'de> Deserialize<'de> for RedactedSecretHash {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        Self::parse_encoded_digest(&encoded)
+            .ok_or_else(|| serde::de::Error::custom("invalid persisted secret digest"))
     }
 }
 
@@ -2319,7 +2522,7 @@ impl Value {
                 inner.hash_into(hasher);
             }
             Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
-                hash.as_str().hash(hasher);
+                hash.hash(hasher);
             }
             Value::Deferred(DeferredValue::Unknown(reason)) => {
                 // `Value::Unknown` reaches `merge_lists_hashed` → this

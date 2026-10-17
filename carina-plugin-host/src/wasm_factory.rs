@@ -3355,12 +3355,51 @@ fn apply_wit_state_attribute_updates(
         })
         .collect::<ProviderResult<Vec<_>>>()?;
 
-    for (id, attributes) in decoded {
+    for (id, mut attributes) in decoded {
         if let Some(state) = current_states.get_mut(&id) {
+            for (key, value) in &mut attributes {
+                if let Some(previous) = state.attributes.get(key) {
+                    preserve_matching_secret_hash(value, previous);
+                }
+            }
             state.attributes = attributes;
         }
     }
     Ok(())
+}
+
+/// Keep the opaque metadata that is intentionally absent from the plugin
+/// wire when a normalizer returns the same persisted digest at the same path.
+/// In particular, legacy hashes carry their originating state-row binding in
+/// memory; a marker introduced or moved by the guest remains unbound.
+fn preserve_matching_secret_hash(value: &mut Value, previous: &Value) {
+    match (value, previous) {
+        (
+            Value::Deferred(carina_core::resource::DeferredValue::RedactedSecret { hash }),
+            Value::Deferred(carina_core::resource::DeferredValue::RedactedSecret {
+                hash: previous_hash,
+            }),
+        ) if hash == previous_hash => *hash = previous_hash.clone(),
+        (
+            Value::Concrete(carina_core::resource::ConcreteValue::Map(values)),
+            Value::Concrete(carina_core::resource::ConcreteValue::Map(previous_values)),
+        ) => {
+            for (key, value) in values {
+                if let Some(previous) = previous_values.get(key) {
+                    preserve_matching_secret_hash(value, previous);
+                }
+            }
+        }
+        (
+            Value::Concrete(carina_core::resource::ConcreteValue::List(values)),
+            Value::Concrete(carina_core::resource::ConcreteValue::List(previous_values)),
+        ) => {
+            for (value, previous) in values.iter_mut().zip(previous_values) {
+                preserve_matching_secret_hash(value, previous);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn finish_guest_call<T>(
@@ -4353,6 +4392,48 @@ mod tests {
         assert_eq!(
             states, before,
             "decode failure must not partially mutate state"
+        );
+    }
+
+    #[test]
+    fn normalized_state_roundtrip_preserves_legacy_secret_row_binding() {
+        use argon2::Argon2;
+        use carina_core::provider::PersistedAttributes;
+        use wit_types::Value as WitValue;
+
+        let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
+        let material = br#"\"wire-legacy\""#;
+        let salt = b"carina:mock.test.resource:legacy:comment";
+        let mut output = [0_u8; 32];
+        Argon2::default()
+            .hash_password_into(material, salt, &mut output)
+            .expect("hash legacy state fixture");
+        let marker = format!("_secret:argon2:{}", hex::encode(output));
+        let persisted: PersistedAttributes = serde_json::from_value(serde_json::json!({
+            "comment": marker,
+        }))
+        .expect("deserialize persisted attributes");
+        let attributes = persisted.to_values_for_resource(&id);
+        let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
+
+        apply_wit_state_attribute_updates(
+            "normalize_state",
+            &mut states,
+            vec![(
+                id.clone(),
+                vec![("comment".to_string(), WitValue::StrVal(marker))],
+            )],
+        )
+        .expect("apply normalized state");
+
+        let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
+            states[&id].attributes.get("comment")
+        else {
+            panic!("normalized legacy marker must remain a typed secret hash")
+        };
+        assert!(
+            hash.verify(material),
+            "the normalizer roundtrip must retain the marker's originating row context"
         );
     }
 
