@@ -5947,6 +5947,61 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
+    async fn version_15_saved_plan_is_rejected_after_wait_rhs_typing_change() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        let v15 = serde_json::json!({
+            "version": 15,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-10-18T00:00:00Z",
+            "source_path": "infra",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": [] },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "data_source_origins": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(&plan_path, serde_json::to_string(&v15).unwrap()).expect("write plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("v15 saved plans must be regenerated with typed wait RHS values");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found,
+            expected,
+            replan_command,
+            ..
+        } = &error
+        else {
+            panic!("expected typed unsupported-version error, got: {error}");
+        };
+        assert_eq!(*found, 15);
+        assert_eq!(*expected, 16);
+        assert_eq!(
+            replan_command.as_deref(),
+            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn saved_plan_decode_rejects_legacy_import_shape_by_version() {
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan");

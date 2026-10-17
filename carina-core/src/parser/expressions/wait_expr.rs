@@ -322,10 +322,10 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
             )))
         }
         Rule::variable_ref => {
-            // Treat dotted variable refs as namespaced enum identifiers
-            // (e.g. `aws.acm.Certificate.Status.Issued`). The differ
-            // resolves these to canonical AWS string values at plan
-            // time via the existing enum-conversion machinery.
+            // Treat every unquoted variable-ref shape as an enum identifier,
+            // from a bare `ready` through a fully-qualified
+            // `aws.acm.Certificate.Status.Issued`. The plan pipeline resolves
+            // it through schema metadata or rejects it with quoting guidance.
             let mut segments: Vec<String> = Vec::new();
             for child in primary.into_inner() {
                 match child.as_rule() {
@@ -348,12 +348,11 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
                     }
                 }
             }
-            // Surface form is the dotted identifier exactly as the user
-            // wrote it; the differ's enum-resolution pass converts it to
-            // the AWS canonical value when the target attribute is
-            // declared as an enum.
-            Ok(Value::Concrete(ConcreteValue::String(
-                segments.join(".").into(),
+            // Preserve the source distinction between an unquoted enum
+            // identifier and a quoted string. Schema-driven enum resolution
+            // downstream must dispatch on this variant, never on text shape.
+            Ok(Value::Concrete(ConcreteValue::enum_identifier(
+                segments.join("."),
             )))
         }
         Rule::null_literal => Err(ParseError::InvalidExpression {
@@ -397,17 +396,14 @@ mod tests {
             "cert.status == aws.acm.Certificate.Status.Issued"
         );
         assert_eq!(we.until_predicate.lhs_segments, vec!["cert", "status"]);
-        // The RHS is kept as the RAW dotted identifier here; enum-alias
-        // resolution to the canonical AWS value happens downstream in the
-        // plan/apply pipeline (`resolve_enum_aliases_in_wait_bindings`,
-        // carina#3358). If this ever pre-resolves at parse time, that
-        // wiring step — and its tests — must be revisited.
-        assert_eq!(
-            we.until_predicate.rhs,
-            Value::Concrete(ConcreteValue::String(
-                "aws.acm.Certificate.Status.Issued".into()
-            ))
-        );
+        // The RHS is kept as the typed RAW dotted identifier here; enum-alias
+        // resolution to the canonical AWS value happens downstream when
+        // `create_plan` resolves the predicate against the target schema.
+        assert!(matches!(
+            &we.until_predicate.rhs,
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw))
+                if raw.as_str() == "aws.acm.Certificate.Status.Issued"
+        ));
         assert!(we.timeout_secs.is_none());
         assert!(we.depends_on.is_empty());
     }
@@ -419,6 +415,25 @@ mod tests {
             we.until_predicate.rhs,
             Value::Concrete(ConcreteValue::String("ISSUED".into()))
         );
+    }
+
+    #[test]
+    fn parses_quoted_dotted_string_rhs_as_string() {
+        let we = parse_one("wait cert {\n    until = cert.status == 'A.json'\n}");
+        assert!(matches!(
+            &we.until_predicate.rhs,
+            Value::Concrete(ConcreteValue::String(value))
+                if value.expose_plaintext() == "A.json"
+        ));
+    }
+
+    #[test]
+    fn parses_bare_identifier_rhs_as_enum_identifier() {
+        let we = parse_one("wait job {\n    until = job.state == ready\n}");
+        assert!(matches!(
+            &we.until_predicate.rhs,
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) if raw.as_str() == "ready"
+        ));
     }
 
     #[test]

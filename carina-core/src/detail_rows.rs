@@ -1863,25 +1863,69 @@ fn compute_string_list_change(
     };
     // carina#3075: when the element type is a `Enum`, the set-diff
     // must compare enum *values*, not raw spellings — otherwise a
-    // DSL-alias element (`"allow"`) vs its API-canonical form
-    // (`"Allow"`) is reported as a phantom `- allow / + Allow` pair
-    // alongside any genuine add/remove. Canonicalize every element to
-    // the API spelling first, mirroring the differ's `Enum` arm
-    // (`extract_enum_value_with_values` → `DslMap::api_for`).
-    if let Some((_, Some(values), _, _, dsl_map)) = attr_type
+    // DSL-alias element (`allow`) vs its API-canonical form (`Allow`) is
+    // reported as a phantom `- allow / + Allow` pair alongside any genuine
+    // add/remove. Canonicalize only typed enum values to the API spelling;
+    // ordinary strings remain literal (including dotted prefixes) and share
+    // only the differ's case-insensitive equality.
+    let is_enum_list = if let Some((_, values, _, _, dsl_map)) = attr_type
         .and_then(|attr_type| string_list_inner_type(attr_type, defs))
         .and_then(|t| t.enum_parts())
     {
-        let valid: Vec<&str> = values.iter().map(String::as_str).collect();
-        for s in old_list.iter_mut().chain(new_list.iter_mut()) {
-            *s = crate::utils::canonicalize_enum_to_api(s, &valid, &dsl_map);
-        }
-    }
-    let diff = crate::diff_helpers::compute_string_list_diff(&old_list, &new_list);
+        let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
+        new_list = enum_string_list_for_diff(new_value, &valid, &dsl_map)?;
+        old_list = match old_value {
+            Some(value) => enum_string_list_for_diff(value, &valid, &dsl_map)?,
+            None => Vec::new(),
+        };
+        true
+    } else {
+        false
+    };
+    let diff = if is_enum_list {
+        crate::diff_helpers::compute_string_list_diff_by(
+            &old_list,
+            &new_list,
+            crate::resource::enum_values_equal,
+        )
+    } else {
+        crate::diff_helpers::compute_string_list_diff(&old_list, &new_list)
+    };
     if diff.added.is_empty() && diff.removed.is_empty() {
         return None;
     }
     Some(diff)
+}
+
+fn enum_string_list_for_diff(
+    value: &Value,
+    valid_values: &[&str],
+    dsl_map: &crate::schema::DslMap<'_>,
+) -> Option<Vec<String>> {
+    match value {
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(
+            items
+                .iter()
+                .map(|item| item.expose_plaintext().to_string())
+                .collect(),
+        ),
+        Value::Concrete(ConcreteValue::List(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::Concrete(ConcreteValue::String(text)) => {
+                    Some(text.expose_plaintext().to_string())
+                }
+                Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) => {
+                    Some(identifier.canonical_api_spelling(valid_values, dsl_map))
+                }
+                Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+                    Some(value.api_value().to_string())
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
 }
 
 /// Return a `List`'s element type, descending recursively through the lazy,
@@ -4071,6 +4115,119 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema);
         registry
+    }
+
+    #[test]
+    fn enum_list_diff_keeps_dotted_string_elements_literal() {
+        let attr_type = AttributeType::unordered_list(AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Format"),
+            Some(vec!["json".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        ));
+        let old = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("A.json".into()),
+        )]));
+        let new = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("json".into()),
+        )]));
+
+        let diff = compute_string_list_change(
+            Some(&old),
+            &new,
+            Some(&attr_type),
+            crate::schema::empty_defs_for_schema_walks(),
+        )
+        .expect("literal dotted strings must produce a visible list diff");
+
+        assert_eq!(diff.removed, vec!["A.json"]);
+        assert_eq!(diff.added, vec!["json"]);
+    }
+
+    #[test]
+    fn enum_list_diff_case_folds_literal_strings_like_the_differ() {
+        let attr_type = AttributeType::unordered_list(AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Mode"),
+            Some(vec!["Allow".to_string(), "X".to_string(), "Y".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        ));
+        let old = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("allow".into())),
+            Value::Concrete(ConcreteValue::String("X".into())),
+        ]));
+        let new = enum_list(&["Allow", "Y"]);
+
+        let diff = compute_string_list_change(
+            Some(&old),
+            &new,
+            Some(&attr_type),
+            crate::schema::empty_defs_for_schema_walks(),
+        )
+        .expect("X → Y must remain a visible list diff");
+
+        assert_eq!(diff.unchanged, vec!["Allow"]);
+        assert_eq!(diff.removed, vec!["X"]);
+        assert_eq!(diff.added, vec!["Y"]);
+    }
+
+    #[test]
+    fn enum_list_diff_preserves_dotted_api_values() {
+        for api_value in ["TLSv1.1", "ipsec.1"] {
+            let attr_type = AttributeType::unordered_list(AttributeType::enum_(
+                crate::schema::TypeIdentity::bare("Protocol"),
+                Some(vec![api_value.to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ));
+            let old = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String(api_value.into()),
+            )]));
+            let new = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::CanonicalEnum(crate::resource::CanonicalEnumValue::new_for_test(
+                    crate::schema::TypeIdentity::bare("Protocol"),
+                    api_value,
+                )),
+            )]));
+
+            assert!(
+                compute_string_list_change(
+                    Some(&old),
+                    &new,
+                    Some(&attr_type),
+                    crate::schema::empty_defs_for_schema_walks(),
+                )
+                .is_none(),
+                "{api_value} must remain one literal API value"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_list_diff_uses_the_same_dsl_fold_as_the_differ() {
+        let attr_type = AttributeType::unordered_list(AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Hostname"),
+            Some(vec!["FriendlyNameType".to_string()]),
+            Vec::new(),
+            None,
+            Some(crate::schema::DslTransform::StripSuffix("Type".to_string())),
+        ));
+        let old = enum_list(&["FriendlyNameType"]);
+        let new = enum_list(&["FriendlyName"]);
+
+        assert!(
+            compute_string_list_change(
+                Some(&old),
+                &new,
+                Some(&attr_type),
+                crate::schema::empty_defs_for_schema_walks(),
+            )
+            .is_none(),
+            "the renderer must use the differ's API → DSL → API fold"
+        );
     }
 
     /// Real apply/plan-path element shape for a `List<Enum>`:

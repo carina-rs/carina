@@ -89,6 +89,42 @@ impl RawEnumIdentifier {
     pub fn as_str(&self) -> &str {
         &self.text
     }
+
+    /// Fold this typed identifier through the schema's API → DSL → API
+    /// mapping, including namespace extraction that is valid only for an
+    /// [`RawEnumIdentifier`].
+    ///
+    /// When the folded result case-insensitively matches a declared value,
+    /// return the schema's spelling. Plain string values must not call this
+    /// helper: their text stays literal and callers apply
+    /// [`enum_values_equal`] after variant-specific normalization.
+    pub(crate) fn canonical_api_spelling(
+        &self,
+        valid_values: &[&str],
+        dsl_map: &DslMap<'_>,
+    ) -> String {
+        let extracted = extract_enum_value_with_values(self.as_str(), valid_values);
+        let dsl = dsl_map.dsl_for(extracted);
+        let folded = dsl_map.api_for(dsl.as_ref());
+        valid_values
+            .iter()
+            .find(|value| enum_values_equal(value, &folded))
+            .map_or(folded, |value| (*value).to_string())
+    }
+}
+
+/// Compare two already-normalized enum spellings using the equality shared by
+/// the differ, list-detail renderer, and resource pairing hash.
+///
+/// This deliberately performs no namespace extraction: a plain string such as
+/// `A.json` remains distinct from `json`.
+pub(crate) fn enum_values_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+/// Produce the hash key corresponding to [`enum_values_equal`].
+pub(crate) fn enum_value_comparison_key(value: &str) -> String {
+    value.to_ascii_lowercase()
 }
 
 impl fmt::Display for RawEnumIdentifier {
@@ -247,11 +283,9 @@ impl<'a> EnumValueResolver<'a> {
         let direct_match = valid.iter().any(|v| enum_value_matches(text, v));
         let variant = if let Some(value) = prefix_escaped_value {
             value.to_string()
-        } else if phase == EnumInputPhase::StateText && values.is_none() {
-            state_text_open_enum_value(text, identity)
         } else if let StateTextValidValueMatch::Unique(value) = state_text_direct_match {
             value.to_string()
-        } else if phase != EnumInputPhase::StateText && direct_match {
+        } else if phase == EnumInputPhase::StateText || direct_match {
             text.to_string()
         } else {
             extract_enum_value_with_values(text, &valid).to_string()
@@ -347,19 +381,6 @@ fn raw_dsl_prefix_escaped_value<'a>(
         .iter()
         .map(String::as_str)
         .find(|value| *value == tail)
-}
-
-fn state_text_open_enum_value(text: &str, identity: &TypeIdentity) -> String {
-    match RawEnumIdentifier::parse(text).parsed() {
-        RawEnumIdentifierParts::TypeQualified { type_name, value }
-        | RawEnumIdentifierParts::ProviderQualified {
-            type_name, value, ..
-        }
-        | RawEnumIdentifierParts::FullyQualified {
-            type_name, value, ..
-        } if type_name == &identity.kind => value.clone(),
-        _ => text.to_string(),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_state_text_open_enum_preserves_dotted_values() {
+    fn resolve_state_text_open_enum_preserves_dotted_values_literally() {
         let open = AttributeType::enum_(
             enum_identity("Type", Some("awscc.ec2.vpn_gateway")),
             None,
@@ -800,15 +821,31 @@ mod tests {
                 .resolve_state_text("awscc.ec2.vpn_gateway.Type.ipsec.1")
                 .unwrap()
                 .api_value(),
-            "ipsec.1"
+            "awscc.ec2.vpn_gateway.Type.ipsec.1"
         );
         assert_eq!(
             resolver
                 .resolve_state_text("aws.ec2.vpn_gateway.Type.ipsec.1")
                 .unwrap()
                 .api_value(),
-            "ipsec.1"
+            "aws.ec2.vpn_gateway.Type.ipsec.1"
         );
+    }
+
+    #[test]
+    fn resolve_state_text_does_not_strip_a_dotted_prefix() {
+        let attr = AttributeType::enum_(
+            TypeIdentity::bare("Format"),
+            Some(vec!["json".to_string()]),
+            vec![],
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            EnumValueResolver::new(&attr).resolve_state_text("A.json"),
+            Err(TypeError::InvalidEnumVariant { .. })
+        ));
     }
 
     #[test]

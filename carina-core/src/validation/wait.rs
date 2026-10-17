@@ -6,6 +6,8 @@
 //!   known resource binding in the merged directory parse.
 //! - **attribute not in target schema**: `until = cert.statu == ...`
 //!   where the target's schema has `status` but not `statu`.
+//! - **unresolved enum identifier**: an unquoted RHS is not a member of the
+//!   target attribute's enum type (or the attribute is not an enum).
 //! - **unsupported composition target**: a module-call composition has
 //!   exported values but no provider-backed state for the wait executor
 //!   to poll.
@@ -16,6 +18,7 @@
 
 use crate::parser::{File, ResourceRef};
 use crate::schema::{SchemaKind, SchemaRegistry};
+use crate::wait::predicate::resolve_wait_predicate;
 
 enum WaitTarget {
     Pollable {
@@ -36,6 +39,7 @@ pub struct WaitDiagnostic {
     pub binding_name: String,
     pub target: String,
     pub attribute: Option<String>,
+    pub rhs: Option<String>,
 }
 
 /// Run all wait diagnostics against a parsed file + schema registry.
@@ -88,6 +92,7 @@ pub fn validate_wait_bindings<E>(
                 binding_name: wb.binding.as_str().to_string(),
                 target: wb.target.as_str().to_string(),
                 attribute: None,
+                rhs: None,
             });
             continue;
         };
@@ -105,13 +110,8 @@ pub fn validate_wait_bindings<E>(
                 binding_name: wb.binding.as_str().to_string(),
                 target: wb.target.as_str().to_string(),
                 attribute: None,
+                rhs: None,
             });
-            continue;
-        };
-        // Attribute existence check against the target's schema. MVP
-        // supports only top-level attributes; nested struct fields
-        // (`renewal_summary.renewal_status`) are deferred to a follow-up.
-        let Some(attr_name) = wb.until_predicate.lhs_segments.get(1) else {
             continue;
         };
         let Some(schema) = schemas.get(provider, resource_type, *schema_kind) else {
@@ -120,17 +120,253 @@ pub fn validate_wait_bindings<E>(
             // diagnostic from the upstream identifier-scope pass.
             continue;
         };
-        if !schema.attributes.contains_key(attr_name) {
+        if let Err(error) = resolve_wait_predicate(
+            &wb.until_predicate.lhs_segments,
+            wb.until_predicate.rhs.clone(),
+            Some(schema),
+        ) {
+            let attribute = wb
+                .until_predicate
+                .lhs_segments
+                .get(1..)
+                .filter(|segments| !segments.is_empty())
+                .map(|segments| segments.join("."));
             out.push(WaitDiagnostic {
-                message: format!(
-                    "wait `{}`: `until` references unknown attribute `{}.{}` on `{}.{}`",
-                    wb.binding, wb.target, attr_name, provider, resource_type
-                ),
+                message: format!("wait `{}`: {error}", wb.binding),
                 binding_name: wb.binding.as_str().to_string(),
                 target: wb.target.as_str().to_string(),
-                attribute: Some(attr_name.clone()),
+                attribute,
+                rhs: error.rhs_anchor().map(str::to_string),
             });
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{ProviderContext, parse};
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    };
+
+    fn wait_schemas() -> SchemaRegistry {
+        let status = AttributeType::enum_(
+            TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Status"),
+            Some(vec!["ISSUED".to_string()]),
+            vec![("ISSUED".to_string(), "issued".to_string())],
+            None,
+            None,
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("acm.Certificate")
+                .attribute(AttributeSchema::new("state", AttributeType::string()))
+                .attribute(AttributeSchema::new("status", status)),
+        );
+        schemas
+    }
+
+    #[test]
+    fn unresolved_wait_enum_identifiers_require_string_quotes() {
+        let parsed = parse(
+            r#"
+let cert = aws.acm.Certificate {}
+let state_ready = wait cert {
+    until = cert.state == ready
+}
+let status_ready = wait cert {
+    until = cert.status == aws.acm.Certificate.Status.bogus
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+
+        let diagnostics = validate_wait_bindings(&parsed, &wait_schemas());
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages.contains(&"wait `state_ready`: cannot resolve `ready` as an enum value of `cert.state`; quote it to compare as a string"));
+        assert!(messages.contains(&"wait `status_ready`: cannot resolve `aws.acm.Certificate.Status.bogus` as an enum value of `cert.status`; quote it to compare as a string"));
+    }
+
+    #[test]
+    fn quoted_string_and_known_enum_wait_values_are_accepted() {
+        let parsed = parse(
+            r#"
+let cert = aws.acm.Certificate {}
+let state_ready = wait cert {
+    until = cert.state == 'ready'
+}
+let status_ready = wait cert {
+    until = cert.status == aws.acm.Certificate.Status.issued
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+
+        assert!(validate_wait_bindings(&parsed, &wait_schemas()).is_empty());
+    }
+
+    #[test]
+    fn nested_struct_enum_wait_value_is_resolved_at_the_full_lhs_path() {
+        let renewal_status = AttributeType::enum_(
+            TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
+            Some(vec!["SUCCESS".to_string()]),
+            vec![("SUCCESS".to_string(), "success".to_string())],
+            None,
+            None,
+        );
+        let renewal_summary = AttributeType::struct_(
+            "RenewalSummary",
+            vec![StructField::new("renewal_status", renewal_status)],
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("acm.Certificate")
+                .attribute(AttributeSchema::new("renewal_summary", renewal_summary)),
+        );
+        let parsed = parse(
+            r#"
+let cert = aws.acm.Certificate {}
+let renewed = wait cert {
+    until = cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.success
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+
+        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+    }
+
+    #[test]
+    fn quoted_wait_value_can_traverse_a_string_map() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("job.Job").attribute(AttributeSchema::new(
+                "labels",
+                AttributeType::map(AttributeType::string()),
+            )),
+        );
+        let parsed = parse(
+            r#"
+let job = test.job.Job {}
+let ready = wait job {
+    until = job.labels.state == 'ready'
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+
+        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+    }
+
+    #[test]
+    fn typed_enum_wait_value_can_traverse_an_enum_map() {
+        let status = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["job", "Job"], "Status"),
+            Some(vec!["READY".to_string()]),
+            vec![("READY".to_string(), "ready".to_string())],
+            None,
+            None,
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("job.Job")
+                .attribute(AttributeSchema::new("statuses", AttributeType::map(status))),
+        );
+        let parsed = parse(
+            r#"
+let job = test.job.Job {}
+let ready = wait job {
+    until = job.statuses.primary == test.job.Job.Status.ready
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+
+        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+    }
+
+    #[test]
+    fn quoted_wait_value_cannot_traverse_a_list() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("job.Job").attribute(AttributeSchema::new(
+                "states",
+                AttributeType::list(AttributeType::string()),
+            )),
+        );
+        let parsed = parse(
+            r#"
+let job = test.job.Job {}
+let ready = wait job {
+    until = job.states.first == 'ready'
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+
+        let diagnostics = validate_wait_bindings(&parsed, &schemas);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message,
+            "wait `ready`: cannot resolve wait attribute path `job.states.first`: `job.states` has type List<String>; only struct fields and map values can be traversed"
+        );
+    }
+
+    #[test]
+    fn data_source_wait_uses_data_source_schema_when_managed_type_matches() {
+        let managed_status = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
+            Some(vec!["READY".to_string()]),
+            vec![("READY".to_string(), "ready".to_string())],
+            None,
+            None,
+        );
+        let data_source_status = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
+            Some(vec!["FOUND".to_string()]),
+            vec![("FOUND".to_string(), "found".to_string())],
+            None,
+            None,
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("lookup.Job")
+                .attribute(AttributeSchema::new("status", managed_status)),
+        );
+        schemas.insert(
+            "test",
+            ResourceSchema::new("lookup.Job")
+                .as_data_source()
+                .attribute(AttributeSchema::new("status", data_source_status)),
+        );
+        let parsed = parse(
+            r#"
+let lookup = read test.lookup.Job {}
+let found = wait lookup {
+    until = lookup.status == test.lookup.Job.Status.found
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+
+        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+    }
 }

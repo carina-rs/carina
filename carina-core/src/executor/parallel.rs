@@ -1093,10 +1093,11 @@ mod tests {
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
@@ -1191,10 +1192,11 @@ mod tests {
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),

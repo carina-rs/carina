@@ -7,10 +7,9 @@ use thiserror::Error;
 
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, RedactedSecretHash,
-    UnknownReason, Value, ValueString,
+    UnknownReason, Value,
 };
 use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
-use crate::utils::{enum_display_value, extract_enum_value_with_values};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
 /// caller of a failing serialization (e.g. `--out plan.json`) can
@@ -641,21 +640,14 @@ pub(crate) fn format_value_into<S: FormatSink>(
 ) -> Result<(), Overflow> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => {
-            // Namespaced enum text: shorten for display before quoting.
-            if let Some(resolved) = enum_display_value(s.expose_plaintext()) {
-                sink.write_str("\"")?;
-                sink.write_str(resolved)?;
-                return sink.write_str("\"");
-            }
             sink.write_str("\"")?;
             sink.write_str(s.expose_plaintext())?;
             sink.write_str("\"")
         }
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-            // Enum identifiers render unquoted in plan/diff output to
-            // match how the user typed them. The resolver has already
-            // canonicalized any namespaced form, so `s` is the bare
-            // identifier ready for direct display.
+            // Preserve unresolved parser-surface enum syntax verbatim. The
+            // typed variant, rather than its text shape, is what authorizes
+            // unquoted rendering.
             sink.write_str(s.as_str())
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => sink.write_str(c.api_value()),
@@ -1197,11 +1189,7 @@ pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) ->
             timeout: _timeout,
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
-        } => match until {
-            crate::wait::predicate::WaitPredicate::Equals { attr: _attr, value } => {
-                contains_redacted_secret(value)
-            }
-        },
+        } => contains_redacted_secret(until.value()),
         Effect::DeferredCreate {
             id: _id,
             upstream_binding: _upstream_binding,
@@ -3062,14 +3050,9 @@ pub fn is_list_of_maps(value: &Value) -> bool {
 /// list shrinking to empty still routes through per-element `-` lines
 /// instead of the inline `[a, b] → []` form.
 ///
-/// `EnumIdentifier` is accepted (carina#3075): a `List<Enum>`
-/// reaches the renderer with `EnumIdentifier` elements on both sides
-/// (state lifted by `lift_saved_state_enums`, desired emitted
-/// by the parser per carina#2986). Treating it as its string payload —
-/// the same `String`/`EnumIdentifier` interchangeability the differ's
-/// `Enum` arm already relies on — lets the string-list diff path
-/// (and its schema-aware enum canonicalization) engage instead of the
-/// value falling to a coarse inline `Changed` row.
+/// `EnumIdentifier` and `CanonicalEnum` are accepted so `List<Enum>` can use
+/// the per-element display path. This function only projects text; callers
+/// that apply schema semantics must still distinguish the original variants.
 pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
     match value {
         Value::Concrete(ConcreteValue::StringList(items)) => Some(
@@ -3198,6 +3181,39 @@ fn canonicalize_with_type_for_enum_phase(
     defs: &std::collections::BTreeMap<String, AttributeType>,
     enum_identifier_phase: EnumIdentifierPhase,
 ) -> Value {
+    canonicalize_with_type_mode(
+        value,
+        attr_type,
+        defs,
+        CanonicalizationMode::Full(enum_identifier_phase),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CanonicalizationMode {
+    Full(EnumIdentifierPhase),
+    TypedEnumIdentifiersOnly,
+}
+
+fn canonicalize_typed_enum_identifiers_with_type(
+    value: Value,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Value {
+    canonicalize_with_type_mode(
+        value,
+        attr_type,
+        defs,
+        CanonicalizationMode::TypedEnumIdentifiersOnly,
+    )
+}
+
+fn canonicalize_with_type_mode(
+    value: Value,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    mode: CanonicalizationMode,
+) -> Value {
     let mut visited_refs = Vec::new();
     let mut unwrapped = peel_custom(
         attr_type
@@ -3207,19 +3223,16 @@ fn canonicalize_with_type_for_enum_phase(
     let value = match value {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             return Value::Deferred(DeferredValue::Secret(Box::new(
-                canonicalize_with_type_for_enum_phase(
-                    *inner,
-                    attr_type,
-                    defs,
-                    enum_identifier_phase,
-                ),
+                canonicalize_with_type_mode(*inner, attr_type, defs, mode),
             )));
         }
         value => value,
     };
 
     loop {
-        if is_string_or_list_of_strings(unwrapped, defs) {
+        if matches!(mode, CanonicalizationMode::Full(_))
+            && is_string_or_list_of_strings(unwrapped, defs)
+        {
             return canonicalize_to_string_list(value);
         }
         let shape = unwrapped
@@ -3252,9 +3265,7 @@ fn canonicalize_with_type_for_enum_phase(
             ) => {
                 let canonicalized = items
                     .into_iter()
-                    .map(|v| {
-                        canonicalize_with_type_for_enum_phase(v, inner, defs, enum_identifier_phase)
-                    })
+                    .map(|v| canonicalize_with_type_mode(v, inner, defs, mode))
                     .collect();
                 Value::Concrete(ConcreteValue::List(canonicalized))
             }
@@ -3264,17 +3275,7 @@ fn canonicalize_with_type_for_enum_phase(
             ) => {
                 let canonicalized = map
                     .into_iter()
-                    .map(|(k, v)| {
-                        (
-                            k,
-                            canonicalize_with_type_for_enum_phase(
-                                v,
-                                vt,
-                                defs,
-                                enum_identifier_phase,
-                            ),
-                        )
-                    })
+                    .map(|(k, v)| (k, canonicalize_with_type_mode(v, vt, defs, mode)))
                     .collect();
                 Value::Concrete(ConcreteValue::Map(canonicalized))
             }
@@ -3289,12 +3290,7 @@ fn canonicalize_with_type_for_enum_phase(
                             .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
                             .map(|f| &f.field_type);
                         let canon = match field_type {
-                            Some(ft) => canonicalize_with_type_for_enum_phase(
-                                v,
-                                ft,
-                                defs,
-                                enum_identifier_phase,
-                            ),
+                            Some(ft) => canonicalize_with_type_mode(v, ft, defs, mode),
                             None => v,
                         };
                         (k, canon)
@@ -3310,20 +3306,28 @@ fn canonicalize_with_type_for_enum_phase(
                 let resolver = crate::resource::EnumValueResolver::with_defs(unwrapped, defs);
                 match val {
                     Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                        let resolved = match enum_identifier_phase {
-                            EnumIdentifierPhase::RawDsl => resolver.resolve_raw(&raw),
-                            EnumIdentifierPhase::StateText => {
+                        let resolved = match mode {
+                            CanonicalizationMode::Full(EnumIdentifierPhase::StateText) => {
                                 resolver.resolve_state_text(raw.as_str())
+                            }
+                            CanonicalizationMode::Full(EnumIdentifierPhase::RawDsl)
+                            | CanonicalizationMode::TypedEnumIdentifiersOnly => {
+                                resolver.resolve_raw(&raw)
                             }
                         };
                         resolved
                             .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
                             .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw)))
                     }
-                    Value::Concrete(ConcreteValue::String(s)) => resolver
-                        .resolve_state_text(s.expose_plaintext())
-                        .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
-                        .unwrap_or_else(|_| Value::Concrete(ConcreteValue::String(s))),
+                    Value::Concrete(ConcreteValue::String(s)) => match mode {
+                        CanonicalizationMode::Full(_) => resolver
+                            .resolve_state_text(s.expose_plaintext())
+                            .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+                            .unwrap_or_else(|_| Value::Concrete(ConcreteValue::String(s))),
+                        CanonicalizationMode::TypedEnumIdentifiersOnly => {
+                            Value::Concrete(ConcreteValue::String(s))
+                        }
+                    },
                     Value::Concrete(ConcreteValue::CanonicalEnum(_)) => val,
                     other => other,
                 }
@@ -3462,7 +3466,39 @@ impl CanonicalizedProviderConfigs {
 
 fn canonicalize_provider_config_with_type(value: Value, attr_type: &AttributeType) -> Value {
     let defs = crate::schema::empty_defs_for_schema_walks();
-    canonicalize_with_type_for_enum_phase(value, attr_type, defs, EnumIdentifierPhase::StateText)
+    // Provider configs are authored DSL. Their parser-produced
+    // EnumIdentifier values therefore use DSL namespace/alias resolution,
+    // just like resource and data-source attributes.
+    let canonical =
+        canonicalize_with_type_for_enum_phase(value, attr_type, defs, EnumIdentifierPhase::RawDsl);
+    let Value::Concrete(ConcreteValue::EnumIdentifier(raw)) = &canonical else {
+        return canonical;
+    };
+    let Some((identity, ..)) = attr_type.enum_parts() else {
+        return canonical;
+    };
+    let member = match raw.parsed() {
+        crate::resource::RawEnumIdentifierParts::TypeQualified { type_name, value }
+        | crate::resource::RawEnumIdentifierParts::ProviderQualified {
+            type_name, value, ..
+        }
+        | crate::resource::RawEnumIdentifierParts::FullyQualified {
+            type_name, value, ..
+        } if type_name == &identity.kind => value,
+        _ => return canonical,
+    };
+
+    // Provider configs may intentionally source a compatible enum from a
+    // sibling provider namespace (for example `aws.Region.*` on an `awscc`
+    // config). The source is still a typed EnumIdentifier, so resolve its
+    // typed member against the receiving schema rather than inspecting a
+    // String's dotted shape.
+    canonicalize_with_type_for_enum_phase(
+        Value::Concrete(ConcreteValue::enum_identifier(member.clone())),
+        attr_type,
+        defs,
+        EnumIdentifierPhase::RawDsl,
+    )
 }
 
 /// Walk every provider config's attributes, canonicalizing enum-typed leaves
@@ -3545,83 +3581,23 @@ pub fn canonicalize_states_with_schemas(
     }
 }
 
-/// Resolve a single value's enum alias (DSL spelling → AWS canonical,
-/// e.g. `IpProtocol.all` → `"-1"`), recursing into lists and maps.
-///
-/// Moved here from carina-cli (`resolve_value_alias`) so the apply
-/// executor can re-apply it post reference-resolution — it is plan-time
-/// pipeline stage 3 and, like `normalize_desired`, undone by apply-time
-/// re-resolution (carina#3063). Pure: depends only on
-/// `crate::utils` + the `ProviderFactory` trait (already carina-core).
-/// Public so the carina-cli state-side alias pass
-/// (`resolve_enum_aliases_in_states`) reuses this exact implementation
-/// rather than keeping a divergent copy.
-///
-/// Single-shot convenience wrapper. Callers resolving multiple values for
-/// the same factory should fetch [`crate::provider::ProviderFactory::schemas`]
-/// once and call [`resolve_value_alias_with_schemas`] to avoid cloning the
-/// provider's full schema list per attribute.
-pub fn resolve_value_alias(
+/// Resolve typed enum identifiers within one attribute using the selected
+/// resource schema. The walk follows declared list, map, and struct types and
+/// converts only [`ConcreteValue::EnumIdentifier`] leaves to
+/// [`ConcreteValue::CanonicalEnum`]; plain [`ConcreteValue::String`] and
+/// already-canonical values stay unchanged. Plan, apply, and state-side alias
+/// passes share this implementation. Callers resolving multiple attributes
+/// should fetch one schema snapshot and reuse it.
+pub fn resolve_value_alias_with_schema(
     value: &mut Value,
-    resource_type: &str,
     attr_name: &str,
-    factory: &dyn crate::provider::ProviderFactory,
+    schema: &crate::schema::ResourceSchema,
 ) {
-    let schemas = factory.schemas();
-    resolve_value_alias_with_schemas(value, resource_type, attr_name, factory, &schemas);
-}
-
-/// Resolve a single value's enum alias using a caller-provided schema snapshot.
-///
-/// This is the hot-loop variant of [`resolve_value_alias`]. `schemas` must be
-/// the result of [`crate::provider::ProviderFactory::schemas`] for `factory`.
-pub fn resolve_value_alias_with_schemas(
-    value: &mut Value,
-    resource_type: &str,
-    attr_name: &str,
-    factory: &dyn crate::provider::ProviderFactory,
-    schemas: &[crate::schema::ResourceSchema],
-) {
-    match value {
-        Value::Concrete(ConcreteValue::String(s))
-            if enum_display_value(s.expose_plaintext()).is_some() =>
-        {
-            let valid_values: Vec<String> = schemas
-                .iter()
-                .filter(|schema| schema.resource_type == resource_type)
-                .flat_map(|schema| {
-                    schema.enum_valid_values_for_attr_alias(attr_name, s.expose_plaintext())
-                })
-                .collect();
-            // If the schema snapshot does not know `(resource_type, attr_name)`
-            // as an enum field, a reverse-alias hit would mean the schema and
-            // factory have drifted. Do not heal that silently with schema-free
-            // extraction; leave the value unchanged.
-            if !valid_values.is_empty() {
-                let valid_refs: Vec<&str> = valid_values.iter().map(String::as_str).collect();
-                let raw = extract_enum_value_with_values(s.expose_plaintext(), &valid_refs);
-                if let Some(canonical) =
-                    factory.get_enum_alias_reverse(resource_type, attr_name, raw)
-                {
-                    *s = ValueString::derived_from(canonical, [&*s]);
-                }
-            }
-        }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items.iter_mut() {
-                resolve_value_alias_with_schemas(item, resource_type, attr_name, factory, schemas);
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let map_keys: Vec<String> = map.keys().cloned().collect();
-            for map_key in map_keys {
-                if let Some(v) = map.get_mut(&map_key) {
-                    resolve_value_alias_with_schemas(v, resource_type, &map_key, factory, schemas);
-                }
-            }
-        }
-        _ => {}
-    }
+    let Some(attr) = schema.attributes.get(attr_name) else {
+        return;
+    };
+    *value =
+        canonicalize_typed_enum_identifiers_with_type(value.clone(), &attr.attr_type, &schema.defs);
 }
 
 /// Re-apply enum-alias resolution to every resource, looking up the
@@ -3641,11 +3617,17 @@ pub fn resolve_enum_aliases_for_resources(
             continue;
         };
         let resource_type = resource.id.resource_type.clone();
-        let keys: Vec<String> = resource.attributes.keys().cloned().collect();
         let schemas = factory.schemas();
+        let Some(schema) = schemas.iter().find(|schema| {
+            schema.resource_type == resource_type
+                && schema.kind == crate::schema::SchemaKind::Resource
+        }) else {
+            continue;
+        };
+        let keys: Vec<String> = resource.attributes.keys().cloned().collect();
         for key in keys {
             if let Some(value) = resource.attributes.get_mut(&key) {
-                resolve_value_alias_with_schemas(value, &resource_type, &key, factory, &schemas);
+                resolve_value_alias_with_schema(value, &key, schema);
             }
         }
     }
@@ -3659,69 +3641,6 @@ mod tests {
         Value::Deferred(DeferredValue::RedactedSecret {
             hash: RedactedSecretHash::generate(material.as_bytes()),
         })
-    }
-
-    #[derive(Clone)]
-    struct SchemaAliasFactory {
-        schemas: Vec<crate::schema::ResourceSchema>,
-        resource_type: &'static str,
-        attr_name: &'static str,
-        alias_value: &'static str,
-        canonical: Option<&'static str>,
-    }
-
-    impl crate::provider::ProviderFactory for SchemaAliasFactory {
-        fn name(&self) -> &str {
-            "aws"
-        }
-
-        fn display_name(&self) -> &str {
-            "AWS"
-        }
-
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
-        }
-
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
-        }
-
-        fn create_provider(
-            &self,
-            _binding: Option<&str>,
-            _config: &crate::provider::ProviderReadyConfig,
-        ) -> futures::future::BoxFuture<
-            '_,
-            crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
-        > {
-            unreachable!("SchemaAliasFactory::create_provider is not used in these tests")
-        }
-
-        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-            self.schemas.clone()
-        }
-
-        fn get_enum_alias_reverse(
-            &self,
-            resource_type: &str,
-            attr_name: &str,
-            value: &str,
-        ) -> Option<String> {
-            match (
-                resource_type == self.resource_type,
-                attr_name == self.attr_name,
-                value == self.alias_value,
-                self.canonical,
-            ) {
-                (true, true, true, Some(canonical)) => Some(canonical.to_string()),
-                _ => None,
-            }
-        }
     }
 
     fn status_enum(namespace: Option<&str>) -> AttributeType {
@@ -3748,80 +3667,192 @@ mod tests {
         ResourceSchema::new(resource_type).attribute(AttributeSchema::new(attr_name, attr_type))
     }
 
-    fn resolve_with_schema_alias_factory(
+    fn resolve_with_schema(
         schema: crate::schema::ResourceSchema,
-        resource_type: &'static str,
         attr_name: &'static str,
         input: &str,
     ) -> Value {
-        let factory = SchemaAliasFactory {
-            schemas: vec![schema],
-            resource_type,
-            attr_name,
-            alias_value: "disabled",
-            canonical: Some("Disabled"),
-        };
-        let mut value = Value::Concrete(ConcreteValue::String(input.to_string().into()));
-        resolve_value_alias(&mut value, resource_type, attr_name, &factory);
+        let mut value = Value::Concrete(ConcreteValue::enum_identifier(input));
+        resolve_value_alias_with_schema(&mut value, attr_name, &schema);
         value
     }
 
     #[test]
-    fn resolve_value_alias_skips_schema_free_fallback_when_valid_values_empty() {
-        let factory = SchemaAliasFactory {
-            schemas: Vec::new(),
-            resource_type: "ec2.Subnet",
-            attr_name: "hostname_type",
-            alias_value: "HostnameType.ip_name",
-            canonical: Some("ip-name"),
-        };
-        let original = "aws.ec2.Subnet.PrivateDnsNameOptionsOnLaunch.HostnameType.ip_name";
-        let mut value = Value::Concrete(ConcreteValue::String(original.to_string().into()));
-
-        resolve_value_alias_with_schemas(&mut value, "ec2.Subnet", "hostname_type", &factory, &[]);
-
-        assert_eq!(
-            value,
-            Value::Concrete(ConcreteValue::String(original.to_string().into()))
+    fn resolve_value_alias_does_not_reclassify_quoted_dotted_string() {
+        let schema = schema_with_attr(
+            "svc.Resource",
+            "status",
+            AttributeType::enum_(
+                crate::schema::TypeIdentity::bare("A"),
+                Some(vec!["json".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
         );
+        let mut value = Value::Concrete(ConcreteValue::String("A.json".into()));
+
+        resolve_value_alias_with_schema(&mut value, "status", &schema);
+
+        assert!(matches!(
+            value,
+            Value::Concrete(ConcreteValue::String(text))
+                if text.expose_plaintext() == "A.json"
+        ));
     }
 
     #[test]
-    fn resolve_value_alias_extracts_top_level_list_enum() {
+    fn resolve_value_alias_uses_typed_schema_dsl_map() {
+        let schema = schema_with_attr(
+            "acm.Certificate",
+            "status",
+            AttributeType::enum_(
+                crate::schema::enum_identity("Status", Some("aws.acm.Certificate")),
+                Some(vec!["ISSUED".to_string()]),
+                vec![("ISSUED".to_string(), "issued".to_string())],
+                None,
+                None,
+            ),
+        );
+        let mut value = Value::Concrete(ConcreteValue::enum_identifier(
+            "aws.acm.Certificate.Status.issued",
+        ));
+
+        resolve_value_alias_with_schema(&mut value, "status", &schema);
+
+        assert!(matches!(
+            value,
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
+                if canonical.api_value() == "ISSUED"
+                    && canonical.identity().to_string() == "aws.acm.Certificate.Status"
+        ));
+    }
+
+    #[test]
+    fn schema_resolved_enum_stays_canonical_when_legacy_alias_exists() {
+        let schema = schema_with_attr(
+            "acm.Certificate",
+            "status",
+            AttributeType::enum_(
+                crate::schema::enum_identity("Status", Some("aws.acm.Certificate")),
+                Some(vec!["ISSUED".to_string()]),
+                vec![("ISSUED".to_string(), "issued".to_string())],
+                None,
+                None,
+            ),
+        );
+        let mut value = Value::Concrete(ConcreteValue::enum_identifier(
+            "aws.acm.Certificate.Status.issued",
+        ));
+
+        resolve_value_alias_with_schema(&mut value, "status", &schema);
+
+        assert!(matches!(
+            value,
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
+                if canonical.api_value() == "ISSUED"
+                    && canonical.identity().to_string() == "aws.acm.Certificate.Status"
+        ));
+    }
+
+    #[test]
+    fn resolve_value_alias_does_not_apply_list_schema_to_scalar_value() {
         let schema = schema_with_attr(
             "svc.Resource",
             "statuses",
             AttributeType::list(status_enum(Some("aws.svc.Resource"))),
         );
 
-        assert_eq!(
-            resolve_with_schema_alias_factory(
+        assert!(matches!(
+            resolve_with_schema(
                 schema,
-                "svc.Resource",
                 "statuses",
                 "aws.svc.Resource.Status.disabled",
             ),
-            Value::Concrete(ConcreteValue::String("Disabled".into()))
-        );
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw))
+                if raw.as_str() == "aws.svc.Resource.Status.disabled"
+        ));
     }
 
     #[test]
-    fn resolve_value_alias_extracts_map_value_enum() {
-        let schema = schema_with_attr(
-            "svc.Resource",
-            "status_by_name",
-            AttributeType::map(status_enum(Some("aws.svc.Resource"))),
-        );
+    fn resolve_value_alias_uses_the_nested_struct_field_type() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
 
-        assert_eq!(
-            resolve_with_schema_alias_factory(
-                schema,
-                "svc.Resource",
-                "status_by_name",
-                "aws.svc.Resource.Status.disabled",
-            ),
-            Value::Concrete(ConcreteValue::String("Disabled".into()))
+        let top_level_status = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget", "Widget"], "TopLevelStatus"),
+            Some(vec!["TOP_LEVEL".to_string()]),
+            vec![("TOP_LEVEL".to_string(), "ready".to_string())],
+            None,
+            None,
         );
+        let nested_status = AttributeType::enum_(
+            TypeIdentity::new(
+                Some("test"),
+                ["widget", "Widget", "Settings"],
+                "NestedStatus",
+            ),
+            Some(vec!["NESTED".to_string()]),
+            vec![("NESTED".to_string(), "ready".to_string())],
+            None,
+            None,
+        );
+        let schema = ResourceSchema::new("widget.Widget")
+            .attribute(AttributeSchema::new("status", top_level_status))
+            .attribute(AttributeSchema::new(
+                "settings",
+                AttributeType::struct_("Settings", vec![StructField::new("status", nested_status)]),
+            ));
+        let mut value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "test.widget.Widget.Settings.NestedStatus.ready",
+            )),
+        )])));
+
+        resolve_value_alias_with_schema(&mut value, "settings", &schema);
+
+        assert!(matches!(
+            value,
+            Value::Concrete(ConcreteValue::Map(ref map))
+                if matches!(
+                    map.get("status"),
+                    Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+                        if canonical.identity().to_string()
+                            == "test.widget.Widget.Settings.NestedStatus"
+                            && canonical.api_value() == "NESTED"
+                )
+        ));
+    }
+
+    #[test]
+    fn resolve_value_alias_uses_the_map_value_type() {
+        let status = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget", "Widget"], "Status"),
+            Some(vec!["READY".to_string()]),
+            vec![("READY".to_string(), "ready".to_string())],
+            None,
+            None,
+        );
+        let schema = schema_with_attr("widget.Widget", "statuses", AttributeType::map(status));
+        let mut value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "primary".to_string(),
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "test.widget.Widget.Status.ready",
+            )),
+        )])));
+
+        resolve_value_alias_with_schema(&mut value, "statuses", &schema);
+
+        assert!(matches!(
+            value,
+            Value::Concrete(ConcreteValue::Map(ref map))
+                if matches!(
+                    map.get("primary"),
+                    Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+                        if canonical.identity().to_string() == "test.widget.Widget.Status"
+                            && canonical.api_value() == "READY"
+                )
+        ));
     }
 
     #[test]
@@ -3835,25 +3866,28 @@ mod tests {
             ]),
         );
 
-        assert_eq!(
-            resolve_with_schema_alias_factory(
+        assert!(matches!(
+            resolve_with_schema(
                 schema,
-                "svc.Resource",
                 "status",
                 "aws.svc.Resource.Status.disabled",
             ),
-            Value::Concrete(ConcreteValue::String("Disabled".into()))
-        );
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
+                if canonical.identity().to_string() == "aws.svc.Resource.Status"
+                    && canonical.api_value() == "disabled"
+        ));
     }
 
     #[test]
     fn resolve_value_alias_extracts_bare_enum_by_name() {
         let schema = schema_with_attr("svc.Resource", "status", status_enum(None));
 
-        assert_eq!(
-            resolve_with_schema_alias_factory(schema, "svc.Resource", "status", "Status.disabled"),
-            Value::Concrete(ConcreteValue::String("Disabled".into()))
-        );
+        assert!(matches!(
+            resolve_with_schema(schema, "status", "Status.disabled"),
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
+                if canonical.identity().to_string() == "Status"
+                    && canonical.api_value() == "disabled"
+        ));
     }
 
     #[test]
@@ -3934,33 +3968,28 @@ mod tests {
                 AttributeType::ref_("Statement"),
             ))
             .with_def("Statement", recursive_statement_def());
-        let factory = SchemaAliasFactory {
-            schemas: vec![schema.clone()],
-            resource_type: "wafv2.WebAcl",
-            attr_name: "scope",
-            alias_value: "CLOUDFRONT",
-            canonical: Some("CLOUDFRONT"),
-        };
-        let mut value = Value::Concrete(ConcreteValue::String(
-            "aws.wafv2.WebAcl.Scope.CLOUDFRONT".into(),
+        let mut value = Value::Concrete(ConcreteValue::enum_identifier(
+            "aws.wafv2.WebAcl.Scope.CLOUDFRONT",
         ));
 
         let started = std::time::Instant::now();
-        resolve_value_alias_with_schemas(&mut value, "wafv2.WebAcl", "scope", &factory, &[schema]);
+        resolve_value_alias_with_schema(&mut value, "scope", &schema);
 
         assert!(
             started.elapsed() < std::time::Duration::from_millis(100),
             "recursive schema enum alias lookup should stay O(1), elapsed {:?}",
             started.elapsed()
         );
-        assert_eq!(
+        assert!(matches!(
             value,
-            Value::Concrete(ConcreteValue::String("CLOUDFRONT".into()))
-        );
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
+                if canonical.identity().to_string() == "aws.wafv2.WebAcl.Scope"
+                    && canonical.api_value() == "CLOUDFRONT"
+        ));
     }
 
     #[test]
-    fn resolve_value_alias_does_not_collect_values_for_mismatched_identity() {
+    fn resolve_value_alias_does_not_resolve_mismatched_identity() {
         let schema = schema_with_attr(
             "s3.BucketLifecycleConfiguration",
             "status",
@@ -3968,15 +3997,14 @@ mod tests {
         );
         let original = "aws.s3.BucketLifecycleConfiguration.Rules.Status.disabled";
 
-        assert_eq!(
-            resolve_with_schema_alias_factory(
+        assert!(matches!(
+            resolve_with_schema(
                 schema,
-                "s3.BucketLifecycleConfiguration",
                 "status",
                 original,
             ),
-            Value::Concrete(ConcreteValue::String(original.to_string().into()))
-        );
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) if raw.as_str() == original
+        ));
     }
 
     #[test]
@@ -4533,6 +4561,19 @@ mod tests {
     }
 
     #[test]
+    fn test_format_value_string_preserves_dotted_text() {
+        for text in [
+            "A.json",
+            "Config.json",
+            "A.x",
+            "aws.s3.VersioningStatus.Enabled",
+        ] {
+            let value = Value::Concrete(ConcreteValue::String(text.into()));
+            assert_eq!(format_value(&value), format!("\"{text}\""));
+        }
+    }
+
+    #[test]
     fn test_format_value_user_facing_string_is_unquoted() {
         let v = Value::Concrete(ConcreteValue::String("hello".into()));
         assert_eq!(format_value_user_facing(&v), "hello");
@@ -4550,35 +4591,11 @@ mod tests {
     }
 
     #[test]
-    fn test_format_value_dsl_enum() {
-        let v = Value::Concrete(ConcreteValue::String(
-            "aws.s3.VersioningStatus.Enabled".into(),
+    fn test_format_value_enum_identifier_unquoted() {
+        let v = Value::Concrete(ConcreteValue::EnumIdentifier(
+            crate::resource::RawEnumIdentifier::parse("dedicated"),
         ));
-        assert_eq!(format_value(&v), "\"Enabled\"");
-    }
-
-    #[test]
-    fn test_format_value_dsl_enum_region() {
-        // Region displays in DSL form (underscored) until provider alias tables
-        // are extended to include to_dsl reverse mappings (see issue #1675).
-        let v = Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".into()));
-        assert_eq!(format_value(&v), "\"ap_northeast_1\"");
-    }
-
-    #[test]
-    fn test_format_value_dsl_enum_5_part() {
-        let v = Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
-        ));
-        assert_eq!(format_value(&v), "\"dedicated\"");
-    }
-
-    #[test]
-    fn test_format_value_two_part_enum_string() {
-        // Two-part enum strings like "InstanceTenancy.dedicated" are formatted
-        // through the display-shortening helper, which extracts the value part.
-        let v = Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into()));
-        assert_eq!(format_value(&v), "\"dedicated\"");
+        assert_eq!(format_value(&v), "dedicated");
     }
 
     #[test]
@@ -6993,11 +7010,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_width_parity_for_dsl_enum_string() {
-        // DSL enum identifiers (e.g. `aws.s3.VersioningStatus.Enabled`)
-        // resolve to their provider value before being quoted in
-        // `format_value_with_key`. inline_width must follow the same
-        // resolution to match the rendered byte length.
+    fn inline_width_parity_for_dotted_string() {
+        // Dotted strings retain their complete text. `inline_width` must
+        // still match the rendered byte length.
         let v = Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".into()));
         assert_inline_width_matches_build(&v);
     }

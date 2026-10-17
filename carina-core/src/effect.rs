@@ -640,10 +640,11 @@ impl Effect {
                 Effect::Wait {
                     identity: ResourceIdentity::new("w"),
                     target_id: crate::resource::ResolvedResourceId::new(id.clone()),
-                    until: WaitPredicate::Equals {
-                        attr: AttrPath::single("status"),
-                        value: Value::Concrete(ConcreteValue::String("ready".into())),
-                    },
+                    until: WaitPredicate::equals(
+                        AttrPath::single("status"),
+                        Value::Concrete(ConcreteValue::String("ready".into())),
+                    )
+                    .unwrap(),
                     until_surface: "status == 'ready'".to_string(),
                     timeout: Duration::from_secs(60),
                     interval: Duration::from_secs(1),
@@ -1405,10 +1406,11 @@ mod tests {
                 Effect::Wait {
                     identity: ResourceIdentity::new("w"),
                     target_id: crate::resource::ResolvedResourceId::new(rid),
-                    until: WaitPredicate::Equals {
-                        attr: AttrPath::single("status"),
-                        value: Value::Concrete(ConcreteValue::String("ready".into())),
-                    },
+                    until: WaitPredicate::equals(
+                        AttrPath::single("status"),
+                        Value::Concrete(ConcreteValue::String("ready".into())),
+                    )
+                    .unwrap(),
                     until_surface: "status == 'ready'".to_string(),
                     timeout: Duration::from_secs(60),
                     interval: Duration::from_secs(1),
@@ -1938,10 +1940,11 @@ mod tests {
                 "acm.Certificate",
                 "cert",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
             interval: Duration::from_secs(5),
@@ -1961,10 +1964,11 @@ mod tests {
                 "acm.Certificate",
                 "cert",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
@@ -1985,10 +1989,11 @@ mod tests {
                 "acm.Certificate",
                 "cert",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
@@ -2010,10 +2015,11 @@ mod tests {
                 "acm.Certificate",
                 "cert",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(4500),
             interval: Duration::from_secs(5),
@@ -2098,12 +2104,13 @@ mod tests {
         let wait = Effect::Wait {
             identity: ResourceIdentity::new("w"),
             target_id: crate::resource::ResolvedResourceId::new(rid.clone()),
-            until: WaitPredicate::Equals {
-                attr: crate::wait::predicate::AttrPath::single("status"),
-                value: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            until: WaitPredicate::equals(
+                crate::wait::predicate::AttrPath::single("status"),
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
                     "ready".into(),
                 )),
-            },
+            )
+            .unwrap(),
             until_surface: "status == 'ready'".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_secs(1),

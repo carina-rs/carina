@@ -2993,7 +2993,7 @@ impl DiagnosticEngine {
     /// shared `carina_core::validation::wait` pass. The diagnostics
     /// produced here use the same wording as `carina validate`; the
     /// LSP just adds source anchors via `wait_target_anchor` /
-    /// `wait_until_attr_anchor`.
+    /// `wait_until_attr_anchor` / `wait_until_rhs_anchor`.
     pub(super) fn check_wait_bindings(
         &self,
         doc: &Document,
@@ -3007,9 +3007,12 @@ impl DiagnosticEngine {
         diags
             .into_iter()
             .map(|d| {
-                let (line, col, end_col) = match d.attribute.as_deref() {
-                    Some(attr) => wait_until_attr_anchor(&text, &d.binding_name, &d.target, attr),
-                    None => wait_target_anchor(&text, &d.binding_name, &d.target),
+                let (line, col, end_col) = if let Some(rhs) = d.rhs.as_deref() {
+                    wait_until_rhs_anchor(&text, &d.binding_name, rhs)
+                } else if let Some(attr) = d.attribute.as_deref() {
+                    wait_until_attr_anchor(&text, &d.binding_name, &d.target, attr)
+                } else {
+                    wait_target_anchor(&text, &d.binding_name, &d.target)
                 };
                 carina_diagnostic(line, col, end_col, DiagnosticSeverity::ERROR, d.message)
             })
@@ -3113,6 +3116,31 @@ fn wait_until_attr_anchor(text: &str, binding: &str, target: &str, attr: &str) -
         }
     }
     wait_target_anchor(text, binding, target)
+}
+
+/// Find the source anchor for the RHS of an `until = ... == <value>`
+/// expression. The scan starts after `==`, so an identifier repeated on the
+/// LHS cannot steal the diagnostic intended for the value the user must quote.
+fn wait_until_rhs_anchor(text: &str, binding: &str, rhs: &str) -> (u32, u32, u32) {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = find_binding_line(&lines, binding).unwrap_or(0);
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        if !line.contains("until") {
+            continue;
+        }
+        let Some(operator_pos) = line.find("==") else {
+            continue;
+        };
+        let rhs_start = operator_pos + 2;
+        let Some(relative_pos) = line[rhs_start..].find(rhs) else {
+            continue;
+        };
+        let byte_pos = rhs_start + relative_pos;
+        let col = line[..byte_pos].chars().count() as u32;
+        let end_col = col + rhs.chars().count() as u32;
+        return (i as u32, col, end_col);
+    }
+    wait_target_anchor(text, binding, rhs)
 }
 
 /// Resolve the source anchor for a depends_on diagnostic.

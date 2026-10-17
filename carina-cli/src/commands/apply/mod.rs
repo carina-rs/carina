@@ -1925,10 +1925,8 @@ async fn run_apply_locked(
     let constraint_origin_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     // Run the normalization pipeline (same as plan path in wiring.rs).
-    // `prepare` also canonicalizes the wait `until` predicate enum
-    // aliases (carina#3358); the apply path is a separate pipeline that
-    // calls `create_plan` directly, so it relies on the same shared seam.
-    let mut wait_bindings = parsed.wait_bindings.clone();
+    // `create_plan` resolves typed wait RHS values against target schemas.
+    let wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
     let preparation = preprocessor
         .prepare(
@@ -1940,7 +1938,6 @@ async fn run_apply_locked(
             raw_provider_configs,
             &mut data_sources_for_plan,
             &data_sources,
-            &mut wait_bindings,
         )
         .await;
     if let Err(error) = preparation {
@@ -2616,9 +2613,12 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 15 guarantees that
-    // secret placeholders carry self-contained salts and that resource
-    // placeholders can be reused byte-for-byte by state writeback. Version 14 guarantees
+    // Validate version compatibility. Plan-file version 16 guarantees that
+    // unquoted wait RHS identifiers use the typed enum representation; v15
+    // encoded them as Strings indistinguishable from intentionally quoted
+    // comparisons and must be regenerated. Version 15 guarantees that secret
+    // placeholders carry self-contained salts and that resource placeholders
+    // can be reused byte-for-byte by state writeback. Version 14 guarantees
     // that embedded current states were created after legacy `_`-prefixed host
     // attributes moved behind the state migration boundary and orphan state
     // became structurally paired with its host metadata during planning.

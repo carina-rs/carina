@@ -1422,24 +1422,20 @@ fn diff_no_change_for_compound_word_dsl_alias() {
             ),
         ));
 
-    // Desired: API-canonical bare spelling (output of pass-2 in
-    // AwsNormalizer::resolve_enum_identifiers).
+    // Desired: typed DSL alias emitted by the parser.
     let desired = Resource::with_provider("aws", "s3.BucketOwnershipControls", "test", None)
         .with_attribute(
             "object_ownership",
-            Value::Concrete(ConcreteValue::String("BucketOwnerEnforced".into())),
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.s3.BucketOwnershipControls.ObjectOwnership.bucket_owner_enforced",
+            )),
         );
 
-    // Current state: fully-qualified namespaced DSL form with snake_case
-    // alias (output of normalize_state_enums).
+    // Current state: provider API spelling.
     let mut attrs = HashMap::new();
     attrs.insert(
         "object_ownership".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "aws.s3.BucketOwnershipControls.ObjectOwnership.bucket_owner_enforced"
-                .to_string()
-                .into(),
-        )),
+        Value::Concrete(ConcreteValue::String("BucketOwnerEnforced".into())),
     );
     let current = State::existing(
         ResourceId::with_provider_identity("aws", "s3.BucketOwnershipControls", "test", None),

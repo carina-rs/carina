@@ -276,38 +276,33 @@ fn is_intermediate_segment(s: &str) -> bool {
 /// recognised when `TypeName` matches the identity's enum type name
 /// (its last segment, or the kind if segments are empty).
 ///
-/// Accepts the three input shapes the DSL allows for `Enum` and
-/// enum-like `Custom` attributes:
+/// Expands the typed [`ConcreteValue::EnumIdentifier`] shapes the DSL allows
+/// for `Enum` and enum-like `Custom` attributes:
 ///
 /// - bare member (`dedicated`) → `{identity}.dedicated`
 /// - `TypeName.member` shorthand (`InstanceTenancy.dedicated`) →
 ///   `{identity}.dedicated`, only when the type name matches the
 ///   identity's enum type name
-/// - any other input (already-qualified, foreign type name, identity
-///   with no provider axis, non-string) → returned unchanged
+/// - any other identifier (already-qualified, foreign type name, identity
+///   with no provider axis) → returned unchanged as text
+///
+/// Values of every other concrete type, especially quoted
+/// [`ConcreteValue::String`] values, are returned unchanged.
 ///
 /// Used by both `AttributeType::resolve_value` and the LSP diagnostic
 /// pipeline so the two paths cannot drift.
 pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdentity) -> Value {
-    // Phase 4 of carina#2986: `EnumIdentifier` carries the same textual
-    // payload as `String` (only the source-shape tag differs) and goes
-    // through the same namespace expansion. The result is materialized as
-    // `String` because every downstream consumer
-    // (`validate_enum`, the LSP completion helpers, and display shortening)
-    // reads through the `Value::Concrete(ConcreteValue::String)` arm. The
-    // `EnumIdentifier`
-    // distinction is a parser-level signal used for strict shape
-    // enforcement at the validator entry, not a wire-level form.
+    // Only the parser's typed `EnumIdentifier` form is eligible for namespace
+    // expansion. Quoted strings remain literal even when their text resembles
+    // `TypeName.member`.
     //
     // The expanded form is the dotted display of the structured
     // identity followed by the value: `{provider}.{segments...}.{kind}.{value}`
     // — same shape as the type's `TypeIdentity::Display`. For a bare
     // identity with no provider axis the shorthand passes through
     // unchanged (no namespace to prefix).
-    let (text_form, sensitive_source) = match value {
-        Value::Concrete(ConcreteValue::String(s)) => (Some(s.expose_plaintext()), Some(s)),
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => (Some(s.as_str()), None),
-        _ => (None, None),
+    let Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) = value else {
+        return value.clone();
     };
     // The kind is the type's own name and matches the leading
     // `TypeName` of the 2-part `TypeName.value` shorthand:
@@ -315,12 +310,12 @@ pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdenti
     // `InstanceTenancy`, or `ZoneName.us_east_1a` against the
     // zone-name AvailabilityZone type.
     let enum_type_name: &str = &identity.kind;
-    let text = match text_form {
-        Some(s) if !s.contains('.') && identity.provider.is_some() => {
+    let text = match identifier.as_str() {
+        s if !s.contains('.') && identity.provider.is_some() => {
             format!("{identity}.{s}")
         }
-        Some(s) if !s.contains('.') => s.to_string(),
-        Some(s) => {
+        s if !s.contains('.') => s.to_string(),
+        s => {
             if let Some(NamespacedId::TypeQualified {
                 type_name: ident,
                 value: member,
@@ -333,12 +328,8 @@ pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdenti
                 s.to_string()
             }
         }
-        None => return value.clone(),
     };
-    Value::Concrete(ConcreteValue::String(ValueString::derived_from(
-        text,
-        sensitive_source,
-    )))
+    Value::Concrete(ConcreteValue::String(text.into()))
 }
 
 /// A `TypeName` segment — first char uppercase ASCII.
@@ -409,11 +400,10 @@ pub(crate) fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&st
 /// namespace prefix with `extract_enum_value_with_values` then map the
 /// DSL alias to the API form via [`crate::schema::DslMap::api_for`].
 ///
-/// This is the exact-match canonicalization used by the plan renderer's
-/// `Enum`-list diff (carina#3075) and the carina-provider
-/// `api_canonicalize` normalizers. (The differ's `Enum` equality
-/// arm uses a deliberately *case-insensitive* alias fold for comparison
-/// — a different operation — and is intentionally not routed here.)
+/// This exact-match helper is part of the provider-facing API and is used by
+/// provider `api_canonicalize` normalizers. Core comparison, pairing, and plan
+/// rendering operate on typed [`crate::resource::RawEnumIdentifier`] values
+/// and share that type's API → DSL → API comparison fold instead.
 ///
 /// ```
 /// use carina_core::schema::DslMap;
@@ -438,26 +428,6 @@ pub fn canonicalize_enum_to_api(
     dsl_map: &crate::schema::DslMap<'_>,
 ) -> String {
     dsl_map.api_for(extract_enum_value_with_values(s, valid_values))
-}
-
-/// Return the display value for namespaced enum text.
-///
-/// Handles the following patterns:
-/// - 2-part: `TypeName.value_name` -> `value_name`
-/// - 3-part: `provider.TypeName.value_name` -> `value_name`
-/// - 4-part: `provider.resource.TypeName.value_name` -> `value_name`
-/// - 5-part: `provider.service.resource.TypeName.value_name` -> `value_name`
-///
-/// The first component of TypeName must be uppercase.
-/// The extracted value is returned as-is without any transformation. Returns
-/// `None` if the input doesn't match any pattern.
-///
-/// This uses the positional [`NamespacedId::parse`] legacy shape, where the
-/// 5+-segment branch pins `TypeName` at index 3. Structural identities with
-/// intermediate struct segments can therefore mis-split 6+-segment values, so
-/// this helper is display-only and must never feed a provider wire path.
-pub(crate) fn enum_display_value(s: &str) -> Option<&str> {
-    NamespacedId::parse(s).map(|id| id.value())
 }
 
 /// Validate namespace format for an enum identifier.
@@ -553,210 +523,6 @@ pub fn validate_enum_namespace(
     }
 }
 
-/// Resolve a single string value to its fully-qualified namespaced DSL format.
-///
-/// Given a value and the enum parts (type_name, namespace, DSL alias map),
-/// resolves:
-/// - Bare identifiers: `"Enabled"` -> `"aws.s3.Bucket.VersioningStatus.Enabled"`
-/// - TypeName.value shorthand: `"VersioningStatus.Enabled"` -> `"aws.s3.Bucket.VersioningStatus.Enabled"`
-/// - Already-qualified values pass through unchanged (via the `_` arm)
-///
-/// Returns `None` if the value doesn't need resolution (non-text or already qualified).
-///
-/// Phase 4 of carina#2986: bare DSL enum values arrive as
-/// `ConcreteValue::EnumIdentifier`, not `ConcreteValue::String`, when
-/// they come straight from the parser. Both carry the same textual
-/// payload and resolve identically — only the source-shape tag differs —
-/// so this matches the [`expand_enum_shorthand`] convention: extract the
-/// text from either variant and materialize the resolved value as
-/// `String` (every downstream consumer reads through the `String` arm;
-/// the `EnumIdentifier` tag is a parser-level strict-shape signal, not a
-/// wire form). Without the `EnumIdentifier` arm, bare struct-field enums
-/// (e.g. `effect = allow`) were left unresolved and diverged from the
-/// AWS-read side, which produces the fully-qualified form (aws#313).
-pub fn resolve_enum_value(value: &Value, parts: &EnumParts<'_>) -> Option<Value> {
-    let (identity, _, _, _, dsl_map) = parts;
-    let type_name = identity.kind.as_str();
-    let ns = identity.dotted_prefix()?;
-    let (s, sensitive_source) = match value {
-        Value::Concrete(ConcreteValue::String(s)) => (s.expose_plaintext(), Some(s)),
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => (s.as_str(), None),
-        _ => return None,
-    };
-    let resolved = if !s.contains('.') {
-        // bare identifier: "Enabled" -> ns.TypeName.Enabled
-        let dsl_val = dsl_map.dsl_for(s);
-        format!("{ns}.{type_name}.{dsl_val}")
-    } else if let Some((ident, member)) = s.split_once('.')
-        && ident == type_name
-        && !member.contains('.')
-    {
-        // TypeName.value: "VersioningStatus.Enabled" -> ns.TypeName.Enabled
-        let dsl_val = dsl_map.dsl_for(member);
-        format!("{ns}.{type_name}.{dsl_val}")
-    } else {
-        return None;
-    };
-    Some(Value::Concrete(ConcreteValue::String(
-        ValueString::derived_from(resolved, sensitive_source),
-    )))
-}
-
-/// Resolve every enum value reachable from `value` through `attr_type` to
-/// its fully-qualified namespaced DSL format, descending into struct
-/// fields, list elements, and map values.
-///
-/// At each position the function asks the schema what type of value
-/// lives there. If the position is a `Enum` (or a `Custom` with a
-/// namespaced enum), [`resolve_enum_value`] runs on it. If the position
-/// is a `Struct`/`List`/`Map`, recursion continues into the children.
-/// All other types pass through unchanged.
-///
-/// Returns `Some(new_value)` when at least one nested value was
-/// rewritten, `None` when nothing changed (mirroring
-/// [`resolve_enum_value`]'s contract so callers can keep a "rewrite
-/// only on diff" pattern).
-///
-/// `Union` types are not recursed into — there is no way to tell which
-/// arm a runtime value belongs to without re-running the validator, and
-/// AWS schemas use `Union` only for shapes where each arm is itself a
-/// scalar (so there are no nested enums to find anyway).
-///
-/// # Examples
-///
-/// ```
-/// use carina_core::resource::{ConcreteValue, Value};
-/// use carina_core::schema::{AttributeType, StructField};
-/// use carina_core::utils::resolve_enum_value_recursive;
-/// use indexmap::IndexMap;
-///
-/// let status_enum = AttributeType::enum_(
-///     carina_core::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
-///     Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
-///     vec![],
-///     None,
-///     None,
-/// );
-/// let config = AttributeType::struct_(
-///     "VersioningConfiguration".to_string(),
-///     vec![StructField::new("status", status_enum)],
-/// );
-///
-/// let mut inner = IndexMap::new();
-/// inner.insert("status".to_string(),
-///     Value::Concrete(ConcreteValue::String("Enabled".into())));
-/// let input = Value::Concrete(ConcreteValue::Map(inner));
-///
-/// let resolved = resolve_enum_value_recursive(&input, &config).unwrap();
-/// // Bare "Enabled" → fully-qualified DSL form.
-/// match resolved {
-///     Value::Concrete(ConcreteValue::Map(m)) => {
-///         match m.get("status").unwrap() {
-///             Value::Concrete(ConcreteValue::String(s)) => {
-///                 assert_eq!(s, "aws.s3.Bucket.VersioningStatus.Enabled");
-///             }
-///             _ => panic!("status should be String"),
-///         }
-///     }
-///     _ => panic!("result should be Map"),
-/// }
-/// ```
-pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) -> Option<Value> {
-    resolve_enum_value_recursive_projected(value, attr_type, None)
-}
-
-/// Same as [`resolve_enum_value_recursive`] but takes the enclosing
-/// [`ResourceSchema::defs`] map so cyclic CFN definitions
-/// (`AttributeType::Ref`) can be followed during the type walk
-/// (carina#3340). Callers that hold a resource schema should prefer
-/// this entry point so a `Ref` chain inside a value tree (e.g. WAFv2
-/// `WebACL.Statement -> AndStatement -> List<Statement>`) doesn't
-/// silently lose enum normalization on the recursed cycle.
-pub fn resolve_enum_value_recursive_with_defs(
-    value: &Value,
-    attr_type: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> Option<Value> {
-    resolve_enum_value_recursive_projected(value, attr_type, Some(defs))
-}
-
-fn resolve_enum_value_recursive_projected(
-    value: &Value,
-    attr_type: &AttributeType,
-    defs: Option<&std::collections::BTreeMap<String, AttributeType>>,
-) -> Option<Value> {
-    // First, try the leaf case: this position is itself an enum.
-    if let Some(parts) = attr_type.enum_parts()
-        && let Some(resolved) = resolve_enum_value(value, &parts)
-    {
-        return Some(resolved);
-    }
-
-    // Project onto Shape so `Ref` is either peeled through schema defs
-    // or rejected by the bare ref-free path. The wildcard arm cannot
-    // silently swallow a `Ref` because `Shape` has no `Ref` variant.
-    match shape_for_projection(attr_type, defs)? {
-        crate::schema::Shape::Struct { .. } => {
-            let fields = match defs {
-                Some(defs) => crate::schema::struct_fields_with_defs(attr_type, defs)?,
-                None => match attr_type.raw_shape() {
-                    crate::schema::RawShape::Struct { fields, .. } => fields,
-                    _ => return None,
-                },
-            };
-            let Value::Concrete(ConcreteValue::Map(map)) = value else {
-                return None;
-            };
-            let mut rewritten = map.clone();
-            let mut changed = false;
-            for field in fields {
-                if let Some(field_value) = map.get(&field.name)
-                    && let Some(new_field) =
-                        resolve_enum_value_recursive_projected(field_value, &field.field_type, defs)
-                {
-                    rewritten.insert(field.name.clone(), new_field);
-                    changed = true;
-                }
-            }
-            changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
-        }
-        crate::schema::Shape::List {
-            element_type: inner,
-            ..
-        } => {
-            let Value::Concrete(ConcreteValue::List(items)) = value else {
-                return None;
-            };
-            let mut rewritten = items.clone();
-            let mut changed = false;
-            for (i, item) in items.iter().enumerate() {
-                if let Some(new_item) = resolve_enum_value_recursive_projected(item, inner, defs) {
-                    rewritten[i] = new_item;
-                    changed = true;
-                }
-            }
-            changed.then_some(Value::Concrete(ConcreteValue::List(rewritten)))
-        }
-        crate::schema::Shape::Map { value: inner, .. } => {
-            let Value::Concrete(ConcreteValue::Map(map)) = value else {
-                return None;
-            };
-            let mut rewritten = map.clone();
-            let mut changed = false;
-            for (k, v) in map {
-                if let Some(new_v) = resolve_enum_value_recursive_projected(v, inner, defs) {
-                    rewritten.insert(k.clone(), new_v);
-                    changed = true;
-                }
-            }
-            changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
-        }
-        // Scalars and Union: nothing to descend into. `Ref` is
-        // already peeled by `shape(defs)` above.
-        _ => None,
-    }
-}
-
 fn shape_for_projection<'a>(
     attr_type: &'a AttributeType,
     defs: Option<&'a std::collections::BTreeMap<String, AttributeType>>,
@@ -789,13 +555,11 @@ fn shape_for_projection<'a>(
 /// schema, and the loaded `String` is rejected at the now-`Enum`
 /// position even though the stored value is perfectly valid.
 ///
-/// This function is the read/state-load counterpart to
-/// [`resolve_enum_value_recursive`] (which handles the desired-side,
-/// parser-fed direction). It is intentionally schema-aware and general:
-/// it does not name IAM, `version`, or `effect` anywhere, so any
-/// current or future `Custom`→`Enum` migration is covered without
-/// further changes. It is *not* a validator carve-out — the validator
-/// stays strict; old state is migrated in memory before validation.
+/// This function is intentionally schema-aware and general: it does not name
+/// IAM, `version`, or `effect` anywhere, so any current or future
+/// `Custom`→`Enum` migration is covered without further changes. It is *not* a
+/// validator carve-out — the validator stays strict; old state is migrated in
+/// memory before validation.
 ///
 /// Only recognized members are lifted. A string is recognized when it
 /// equals one of the enum's API-canonical `values` or appears on either
@@ -803,18 +567,14 @@ fn shape_for_projection<'a>(
 /// `ConcreteValue::String` so the strict validator still rejects
 /// genuinely-invalid state instead of silently masking it.
 ///
-/// The variant tag changes from `String` to `EnumIdentifier` (mirroring
-/// the carina#2996 map-key precedent in `AttributeType::validate_map`,
-/// schema/mod.rs). The text is normalized to the **DSL spelling** via
-/// `DslMap::dsl_for` because the strict validator rejects the
-/// API-canonical form whenever a `dsl_aliases` entry rewrites it (the
-/// DSL surface convention is the alias spelling — see
-/// `feedback_dsl_enum_snake_case_convention.md` and carina#2980). For
-/// enums with no rewriting alias the DSL spelling equals the API
-/// spelling, so the text is unchanged in that case.
+/// Recognized leaves become `CanonicalEnum`, retaining both the schema type
+/// identity and provider API spelling. A plain `String` is matched literally
+/// against schema values or aliases; its dotted text is never treated as a
+/// namespace. A typed `EnumIdentifier` may use namespace extraction and DSL
+/// alias mapping because its variant already carries enum intent.
 ///
-/// `Union` types are not recursed into, matching
-/// [`resolve_enum_value_recursive`]'s documented contract.
+/// `Union` types are not recursed into because the active arm cannot be known
+/// without re-running validation.
 pub fn lift_state_enum_leaves(
     attributes: &mut std::collections::HashMap<String, Value>,
     schema: &crate::schema::ResourceSchema,
@@ -920,10 +680,8 @@ pub fn lift_current_state_enum_leaves_for_data_sources(
 
 /// Value-level worker for [`lift_state_enum_leaves`].
 ///
-/// Returns `Some(new_value)` when at least one nested value was lifted,
-/// `None` when nothing changed — mirroring
-/// [`resolve_enum_value_recursive`]'s "rewrite only on diff" contract so
-/// callers can skip cloning.
+/// Returns `Some(new_value)` when at least one nested value was lifted and
+/// `None` when nothing changed, so callers can skip cloning.
 pub fn lift_enum_leaves(value: &Value, attr_type: &AttributeType) -> Option<Value> {
     lift_enum_leaves_projected(value, attr_type, None)
 }
@@ -961,10 +719,22 @@ fn lift_enum_leaves_projected(
             && enum_member_is_recognized_for_state_lift(
                 identity, values, validate, dsl_map, s, source,
             )
-            && let Ok(canonical) = match defs {
-                Some(defs) => crate::resource::EnumValueResolver::with_defs(attr_type, defs)
-                    .resolve_state_text(s),
-                None => crate::resource::EnumValueResolver::new(attr_type).resolve_state_text(s),
+            && let Ok(canonical) = match (defs, source) {
+                (Some(defs), EnumLeafSource::String) => {
+                    crate::resource::EnumValueResolver::with_defs(attr_type, defs)
+                        .resolve_state_text(s)
+                }
+                (None, EnumLeafSource::String) => {
+                    crate::resource::EnumValueResolver::new(attr_type).resolve_state_text(s)
+                }
+                (Some(defs), EnumLeafSource::EnumIdentifier) => {
+                    crate::resource::EnumValueResolver::with_defs(attr_type, defs)
+                        .resolve_raw(&crate::resource::RawEnumIdentifier::parse(s))
+                }
+                (None, EnumLeafSource::EnumIdentifier) => {
+                    crate::resource::EnumValueResolver::new(attr_type)
+                        .resolve_raw(&crate::resource::RawEnumIdentifier::parse(s))
+                }
             }
         {
             return Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)));
@@ -1047,7 +817,10 @@ fn enum_member_is_recognized_for_state_lift(
     source: EnumLeafSource,
 ) -> bool {
     let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
-    let trailing = extract_enum_value_with_values(value, &valid);
+    let trailing = match source {
+        EnumLeafSource::String => value,
+        EnumLeafSource::EnumIdentifier => extract_enum_value_with_values(value, &valid),
+    };
     let api = dsl_map.api_for(trailing);
     let dsl = dsl_map.dsl_for(trailing);
     if values.into_iter().flatten().any(|candidate| {
@@ -1076,7 +849,9 @@ fn dynamic_enum_member_is_structural(
     original: &str,
     source: EnumLeafSource,
 ) -> bool {
-    if NamespacedId::parse(original).is_some_and(|id| id.matches_identity(identity)) {
+    if source == EnumLeafSource::EnumIdentifier
+        && NamespacedId::parse(original).is_some_and(|id| id.matches_identity(identity))
+    {
         return true;
     }
     let full = identity
@@ -1101,9 +876,9 @@ fn is_dynamic_dsl_member_segment(s: &str) -> bool {
 
 /// Normalize a single state enum value to its fully-qualified namespaced DSL format.
 ///
-/// Unlike `resolve_enum_value`, this also handles values that contain dots but are
-/// raw enum values (e.g., `"ipsec.1"`) rather than already-namespaced identifiers.
-/// Uses `enum_parts` from the attribute type to distinguish between the two cases.
+/// This handles values that contain dots but are raw enum values (for example,
+/// `"ipsec.1"`) rather than already-namespaced identifiers. It uses
+/// `enum_parts` from the attribute type to distinguish between the two cases.
 ///
 /// Returns `None` if the value doesn't need normalization.
 pub fn normalize_state_enum_value(
@@ -1367,72 +1142,6 @@ mod tests {
         assert_eq!(extract_enum_value("Enabled"), "Enabled");
         assert_eq!(extract_enum_value("default"), "default");
         assert_eq!(extract_enum_value("ap-northeast-1"), "ap-northeast-1");
-    }
-
-    #[test]
-    fn test_enum_display_value_extracts_2_part() {
-        assert_eq!(
-            enum_display_value("Region.ap_northeast_1"),
-            Some("ap_northeast_1")
-        );
-    }
-
-    #[test]
-    fn test_enum_display_value_extracts_3_part() {
-        assert_eq!(
-            enum_display_value("aws.Region.ap_northeast_1"),
-            Some("ap_northeast_1")
-        );
-        assert_eq!(
-            enum_display_value("aws.Region.us_east_1"),
-            Some("us_east_1")
-        );
-        assert_eq!(
-            enum_display_value("aws.AvailabilityZone.ap_northeast_1a"),
-            Some("ap_northeast_1a")
-        );
-        assert_eq!(
-            enum_display_value("aws.AvailabilityZone.us_east_1b"),
-            Some("us_east_1b")
-        );
-    }
-
-    #[test]
-    fn test_enum_display_value_extracts_4_part() {
-        assert_eq!(
-            enum_display_value("aws.s3.VersioningStatus.Enabled"),
-            Some("Enabled")
-        );
-        assert_eq!(enum_display_value("aws.ec2.IpProtocol.tcp"), Some("tcp"));
-    }
-
-    #[test]
-    fn test_enum_display_value_extracts_5_part() {
-        assert_eq!(
-            enum_display_value("awscc.ec2.ipam.Tier.advanced"),
-            Some("advanced")
-        );
-        assert_eq!(
-            enum_display_value("awscc.ec2.ipam_pool.AddressFamily.IPv4"),
-            Some("IPv4")
-        );
-        assert_eq!(
-            enum_display_value("awscc.ec2.Vpc.InstanceTenancy.default"),
-            Some("default")
-        );
-    }
-
-    #[test]
-    fn test_enum_display_value_passthrough_is_none() {
-        assert_eq!(enum_display_value("eu-west-1"), None);
-        assert_eq!(enum_display_value("ap-northeast-1a"), None);
-    }
-
-    #[test]
-    fn test_enum_display_value_invalid_patterns_are_none() {
-        // lowercase first part in 2-part -> not a TypeName pattern
-        assert_eq!(enum_display_value("region.us_east_1"), None);
-        assert_eq!(enum_display_value("Enabled"), None);
     }
 
     // validate_enum_namespace tests
@@ -1706,62 +1415,6 @@ mod tests {
         );
     }
 
-    // enum_display_value shape-detection tests
-
-    #[test]
-    fn test_enum_display_value_detects_2_part() {
-        assert!(enum_display_value("Region.ap_northeast_1").is_some());
-        assert!(enum_display_value("VersioningStatus.Enabled").is_some());
-        // lowercase first part → not a TypeName
-        assert!(enum_display_value("region.ap_northeast_1").is_none());
-    }
-
-    #[test]
-    fn test_enum_display_value_detects_3_part() {
-        assert!(enum_display_value("aws.Region.ap_northeast_1").is_some());
-        assert!(enum_display_value("gcp.Region.us_central1").is_some());
-        // uppercase provider → not valid
-        assert!(enum_display_value("AWS.Region.ap_northeast_1").is_none());
-        // lowercase TypeName → not valid
-        assert!(enum_display_value("aws.region.ap_northeast_1").is_none());
-    }
-
-    #[test]
-    fn test_enum_display_value_detects_4_part() {
-        assert!(enum_display_value("aws.s3.VersioningStatus.Enabled").is_some());
-        assert!(enum_display_value("aws.ec2.IpProtocol.tcp").is_some());
-        // resource with digits
-        assert!(enum_display_value("aws.s3.VersioningStatus.Suspended").is_some());
-    }
-
-    #[test]
-    fn test_enum_display_value_detects_5_part() {
-        assert!(enum_display_value("awscc.ec2.Vpc.InstanceTenancy.default").is_some());
-        assert!(enum_display_value("awscc.ec2.ipam_pool.AddressFamily.IPv4").is_some());
-    }
-
-    #[test]
-    fn test_enum_display_value_detects_6_part_dotted_value() {
-        // 6-part: provider.service.resource.TypeName.value.with.dots
-        assert!(enum_display_value("awscc.ec2.vpn_gateway.Type.ipsec.1").is_some());
-    }
-
-    #[test]
-    fn test_enum_display_value_detects_deep_structural_plain_value() {
-        assert!(
-            enum_display_value("aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_enum_display_value_non_matching() {
-        assert!(enum_display_value("my-bucket").is_none());
-        assert!(enum_display_value("ap-northeast-1").is_none());
-        assert!(enum_display_value("some.random.string").is_none());
-        assert!(enum_display_value("a.b.c.d.e.f").is_none());
-    }
-
     // extract_enum_value_with_values tests
 
     #[test]
@@ -1848,35 +1501,6 @@ mod tests {
         );
     }
 
-    // enum_display_value with dotted values
-
-    #[test]
-    fn test_enum_display_value_6_part_dotted_value() {
-        assert_eq!(
-            enum_display_value("awscc.ec2.vpn_gateway.Type.ipsec.1"),
-            Some("ipsec.1")
-        );
-    }
-
-    // enum_display_value: underscores in enum values must be preserved (#1675)
-
-    #[test]
-    fn test_enum_display_value_preserves_underscores() {
-        // Enum values like AWS_ACCOUNT must not have underscores converted to hyphens
-        assert_eq!(
-            enum_display_value("awscc.sso.Assignment.TargetType.AWS_ACCOUNT"),
-            Some("AWS_ACCOUNT")
-        );
-        assert_eq!(
-            enum_display_value("TargetType.AWS_ACCOUNT"),
-            Some("AWS_ACCOUNT")
-        );
-        assert_eq!(
-            enum_display_value("awscc.sso.Assignment.PrincipalType.GROUP"),
-            Some("GROUP")
-        );
-    }
-
     // convert_region_value tests
 
     #[test]
@@ -1950,55 +1574,6 @@ mod tests {
     }
 
     #[test]
-    fn enum_display_value_detection_table() {
-        let cases: &[(&str, bool)] = &[
-            ("Type.gp2", true),
-            ("Iops.100", true),
-            ("region.ap_northeast_1", false),
-            ("AWS.Region.ap_northeast_1", false),
-            ("aws.route53.RecordType.A", true),
-            ("aws.s-3.VersioningStatus.Enabled", false),
-            ("awscc.route53.HostedZone.RecordType.A", true),
-            ("awscc.ec2.ipam_pool.AddressFamily.IPv4", true),
-            ("awscc.ec2.vpn_gateway.Type.ipsec.1", true),
-            ("some.random.string", false),
-            ("a.b.c.d.e.f", false),
-            ("aws.s3.versioningstatus.Enabled", false),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(
-                enum_display_value(input).is_some(),
-                *expected,
-                "input={input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn enum_display_value_table() {
-        let cases: &[(&str, Option<&str>)] = &[
-            ("Type.gp2", Some("gp2")),
-            ("Iops.100", Some("100")),
-            ("aws.Region.ap_northeast_1", Some("ap_northeast_1")),
-            ("aws.route53.RecordType.AAAA", Some("AAAA")),
-            ("aws.ec2.Volume.Iops.100", Some("100")),
-            ("awscc.ec2.vpn_gateway.Type.ipsec.1", Some("ipsec.1")),
-            ("awscc.ec2.Vpc.InstanceTenancy.default", Some("default")),
-            ("TargetType.AWS_ACCOUNT", Some("AWS_ACCOUNT")),
-            (
-                "awscc.sso.Assignment.TargetType.AWS_ACCOUNT",
-                Some("AWS_ACCOUNT"),
-            ),
-            ("eu-west-1", None),
-            ("region.us_east_1", None),
-            ("Enabled", None),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(enum_display_value(input), *expected, "input={input:?}");
-        }
-    }
-
-    #[test]
     fn validate_enum_namespace_table() {
         let cases: &[(&str, &str, &str, bool)] = &[
             ("Enabled", "VersioningStatus", "aws.s3.Bucket", true),
@@ -2061,7 +1636,7 @@ mod tests {
         let cases: &[(Value, TypeIdentity, Value)] = &[
             // bare member + provider-scoped identity → fully qualified
             (
-                Value::Concrete(ConcreteValue::String("dedicated".into())),
+                Value::Concrete(ConcreteValue::enum_identifier("dedicated")),
                 TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String(
                     "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
@@ -2069,13 +1644,13 @@ mod tests {
             ),
             // bare member, bare identity → passthrough
             (
-                Value::Concrete(ConcreteValue::String("dedicated".into())),
+                Value::Concrete(ConcreteValue::enum_identifier("dedicated")),
                 crate::schema::TypeIdentity::bare("InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String("dedicated".into())),
             ),
             // TypeName.member matching the enum type name → fully qualified
             (
-                Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into())),
+                Value::Concrete(ConcreteValue::enum_identifier("InstanceTenancy.dedicated")),
                 TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String(
                     "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
@@ -2083,15 +1658,15 @@ mod tests {
             ),
             // TypeName.member with foreign type name → passthrough
             (
-                Value::Concrete(ConcreteValue::String("Tenancy.dedicated".into())),
+                Value::Concrete(ConcreteValue::enum_identifier("Tenancy.dedicated")),
                 TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String("Tenancy.dedicated".into())),
             ),
             // Already-fully-qualified → passthrough (parser returns
             // `FullyQualified`, helper only acts on `TypeQualified`)
             (
-                Value::Concrete(ConcreteValue::String(
-                    "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
+                Value::Concrete(ConcreteValue::enum_identifier(
+                    "awscc.ec2.Vpc.InstanceTenancy.dedicated",
                 )),
                 TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String(
@@ -2100,7 +1675,7 @@ mod tests {
             ),
             // Lowercase first segment → not a TypeName; passthrough
             (
-                Value::Concrete(ConcreteValue::String("instanceTenancy.dedicated".into())),
+                Value::Concrete(ConcreteValue::enum_identifier("instanceTenancy.dedicated")),
                 TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String("instanceTenancy.dedicated".into())),
             ),
@@ -2114,11 +1689,18 @@ mod tests {
             // — `aws.AvailabilityZone.ZoneName.us_east_1a`): bare value
             // expands into the full dotted form including the kind.
             (
-                Value::Concrete(ConcreteValue::String("us_east_1a".into())),
+                Value::Concrete(ConcreteValue::enum_identifier("us_east_1a")),
                 TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName"),
                 Value::Concrete(ConcreteValue::String(
                     "aws.AvailabilityZone.ZoneName.us_east_1a".into(),
                 )),
+            ),
+            // Quoted text remains text even when its shape resembles a typed
+            // enum shorthand.
+            (
+                Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into())),
+                TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
+                Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into())),
             ),
         ];
         for (input, identity, expected) in cases {
@@ -2222,281 +1804,6 @@ mod tests {
         // The exact message is serde_json's; we only assert that a
         // serialization failure surfaces as an Err.
         assert!(!err.to_string().is_empty());
-    }
-
-    mod resolve_enum_value_recursive {
-        use super::*;
-        use crate::schema::StructField;
-        use indexmap::IndexMap;
-
-        fn versioning_status() -> AttributeType {
-            AttributeType::enum_(
-                crate::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
-                Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
-                vec![],
-                None,
-                None,
-            )
-        }
-
-        fn s(s: &str) -> Value {
-            Value::Concrete(ConcreteValue::String(s.to_string().into()))
-        }
-
-        fn ei(s: &str) -> Value {
-            Value::Concrete(ConcreteValue::enum_identifier(s.to_string()))
-        }
-
-        /// Regression for aws#313: post-carina#2986 the parser emits
-        /// bare DSL enum values as `EnumIdentifier`, not `String`.
-        /// `resolve_enum_value` must resolve them identically (and
-        /// materialize the result as the fully-qualified `String`
-        /// form), otherwise bare struct-field enums like
-        /// `effect = allow` are left unresolved and diverge from the
-        /// AWS-read side which produces the namespaced spelling.
-        #[test]
-        fn leaf_enum_identifier_resolves_like_string() {
-            let aliased = AttributeType::enum_(
-                crate::schema::enum_identity("Effect", Some("aws.iam.PolicyDocument")),
-                Some(vec!["Allow".to_string(), "Deny".to_string()]),
-                vec![
-                    ("Allow".to_string(), "allow".to_string()),
-                    ("Deny".to_string(), "deny".to_string()),
-                ],
-                None,
-                None,
-            );
-            // Bare EnumIdentifier resolves to the fully-qualified String
-            // form — identical to what the String input would produce.
-            let from_ei = resolve_enum_value_recursive(&ei("allow"), &aliased).unwrap();
-            assert_eq!(from_ei, s("aws.iam.PolicyDocument.Effect.allow"));
-            let from_str = resolve_enum_value_recursive(&s("allow"), &aliased).unwrap();
-            assert_eq!(from_ei, from_str);
-
-            // TypeName.value shorthand as an EnumIdentifier resolves too.
-            let from_tn = resolve_enum_value_recursive(&ei("Effect.deny"), &aliased).unwrap();
-            assert_eq!(from_tn, s("aws.iam.PolicyDocument.Effect.deny"));
-        }
-
-        #[test]
-        fn leaf_enum_resolves_bare_value() {
-            let resolved = resolve_enum_value_recursive(&s("Enabled"), &versioning_status());
-            assert_eq!(resolved, Some(s("aws.s3.Bucket.VersioningStatus.Enabled")));
-        }
-
-        #[test]
-        fn non_enum_scalar_passes_through() {
-            let resolved = resolve_enum_value_recursive(&s("hello"), &AttributeType::string());
-            assert_eq!(resolved, None);
-        }
-
-        #[test]
-        fn struct_with_enum_field_resolves_field() {
-            let config = AttributeType::struct_(
-                "VersioningConfiguration".to_string(),
-                vec![StructField::new("status", versioning_status())],
-            );
-            let mut inner = IndexMap::new();
-            inner.insert("status".to_string(), s("Enabled"));
-            let input = Value::Concrete(ConcreteValue::Map(inner));
-
-            let resolved = resolve_enum_value_recursive(&input, &config).unwrap();
-            match resolved {
-                Value::Concrete(ConcreteValue::Map(m)) => {
-                    assert_eq!(
-                        m.get("status"),
-                        Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
-                    );
-                }
-                _ => panic!("expected Map"),
-            }
-        }
-
-        #[test]
-        fn struct_with_no_enum_changes_returns_none() {
-            let config = AttributeType::struct_(
-                "Config".to_string(),
-                vec![StructField::new("name", AttributeType::string())],
-            );
-            let mut inner = IndexMap::new();
-            inner.insert("name".to_string(), s("foo"));
-            let input = Value::Concrete(ConcreteValue::Map(inner));
-
-            assert_eq!(resolve_enum_value_recursive(&input, &config), None);
-        }
-
-        #[test]
-        fn list_of_enum_resolves_every_item() {
-            let list_t = AttributeType::list(versioning_status());
-            let input = Value::Concrete(ConcreteValue::List(vec![s("Enabled"), s("Suspended")]));
-            let resolved = resolve_enum_value_recursive(&input, &list_t).unwrap();
-            match resolved {
-                Value::Concrete(ConcreteValue::List(items)) => {
-                    assert_eq!(items.len(), 2);
-                    assert_eq!(items[0], s("aws.s3.Bucket.VersioningStatus.Enabled"));
-                    assert_eq!(items[1], s("aws.s3.Bucket.VersioningStatus.Suspended"));
-                }
-                _ => panic!("expected List"),
-            }
-        }
-
-        #[test]
-        fn map_of_enum_resolves_every_value() {
-            let map_t = AttributeType::map_with_key(AttributeType::string(), versioning_status());
-            let mut input_map = IndexMap::new();
-            input_map.insert("primary".to_string(), s("Enabled"));
-            input_map.insert("secondary".to_string(), s("Suspended"));
-            let input = Value::Concrete(ConcreteValue::Map(input_map));
-
-            let resolved = resolve_enum_value_recursive(&input, &map_t).unwrap();
-            match resolved {
-                Value::Concrete(ConcreteValue::Map(m)) => {
-                    assert_eq!(
-                        m.get("primary"),
-                        Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
-                    );
-                    assert_eq!(
-                        m.get("secondary"),
-                        Some(&s("aws.s3.Bucket.VersioningStatus.Suspended"))
-                    );
-                }
-                _ => panic!("expected Map"),
-            }
-        }
-
-        #[test]
-        fn list_of_struct_with_enum_field_descends_into_each_item() {
-            // List<Struct{status: VersioningStatus}>
-            let item_t = AttributeType::struct_(
-                "Rule".to_string(),
-                vec![StructField::new("status", versioning_status())],
-            );
-            let list_t = AttributeType::unordered_list(item_t);
-            let mut item1 = IndexMap::new();
-            item1.insert("status".to_string(), s("Enabled"));
-            let mut item2 = IndexMap::new();
-            item2.insert("status".to_string(), s("Suspended"));
-            let input = Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::Map(item1)),
-                Value::Concrete(ConcreteValue::Map(item2)),
-            ]));
-
-            let resolved = resolve_enum_value_recursive(&input, &list_t).unwrap();
-            let Value::Concrete(ConcreteValue::List(items)) = resolved else {
-                panic!("expected List");
-            };
-            for (item, expected) in items.iter().zip(
-                [
-                    "aws.s3.Bucket.VersioningStatus.Enabled",
-                    "aws.s3.Bucket.VersioningStatus.Suspended",
-                ]
-                .iter(),
-            ) {
-                let Value::Concrete(ConcreteValue::Map(m)) = item else {
-                    panic!("expected Map");
-                };
-                assert_eq!(m.get("status"), Some(&s(expected)));
-            }
-        }
-
-        #[test]
-        fn nested_struct_descends_recursively() {
-            // Struct{outer_field: Struct{status: VersioningStatus}}
-            let inner_t = AttributeType::struct_(
-                "Inner".to_string(),
-                vec![StructField::new("status", versioning_status())],
-            );
-            let outer_t = AttributeType::struct_(
-                "Outer".to_string(),
-                vec![StructField::new("inner", inner_t)],
-            );
-
-            let mut inner_map = IndexMap::new();
-            inner_map.insert("status".to_string(), s("Enabled"));
-            let mut outer_map = IndexMap::new();
-            outer_map.insert(
-                "inner".to_string(),
-                Value::Concrete(ConcreteValue::Map(inner_map)),
-            );
-            let input = Value::Concrete(ConcreteValue::Map(outer_map));
-
-            let resolved = resolve_enum_value_recursive(&input, &outer_t).unwrap();
-            let Value::Concrete(ConcreteValue::Map(om)) = resolved else {
-                panic!("expected Map");
-            };
-            let Some(Value::Concrete(ConcreteValue::Map(im))) = om.get("inner") else {
-                panic!("expected nested Map");
-            };
-            assert_eq!(
-                im.get("status"),
-                Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
-            );
-        }
-
-        #[test]
-        fn already_qualified_value_is_unchanged() {
-            // Fully-qualified DSL form should pass through unchanged
-            // (resolve_enum_value's contract — we exercise it through
-            // the recursive entry point to confirm passthrough
-            // propagates to None at this level too).
-            let resolved = resolve_enum_value_recursive(
-                &s("aws.s3.Bucket.VersioningStatus.Enabled"),
-                &versioning_status(),
-            );
-            assert_eq!(resolved, None);
-        }
-
-        #[test]
-        fn dsl_alias_resolves_via_dsl_for() {
-            // Enum with a DSL alias: dsl_aliases maps API "Enabled" → DSL "enabled".
-            // resolve_enum_value calls dsl_for(api) to render the alias,
-            // so the resolved fully-qualified form uses the DSL spelling.
-            let aliased = AttributeType::enum_(
-                crate::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
-                Some(vec!["Enabled".to_string()]),
-                vec![("Enabled".to_string(), "enabled".to_string())],
-                None,
-                None,
-            );
-            let resolved = resolve_enum_value_recursive(&s("Enabled"), &aliased).unwrap();
-            assert_eq!(resolved, s("aws.s3.Bucket.VersioningStatus.enabled"));
-        }
-
-        #[test]
-        fn map_of_struct_with_enum_field_descends() {
-            // Map<String, Struct{status: VersioningStatus}>
-            let item_t = AttributeType::struct_(
-                "Rule".to_string(),
-                vec![StructField::new("status", versioning_status())],
-            );
-            let map_t = AttributeType::map_with_key(AttributeType::string(), item_t);
-            let mut item = IndexMap::new();
-            item.insert("status".to_string(), s("Enabled"));
-            let mut input_map = IndexMap::new();
-            input_map.insert("a".to_string(), Value::Concrete(ConcreteValue::Map(item)));
-            let input = Value::Concrete(ConcreteValue::Map(input_map));
-
-            let resolved = resolve_enum_value_recursive(&input, &map_t).unwrap();
-            let Value::Concrete(ConcreteValue::Map(om)) = resolved else {
-                panic!("expected Map");
-            };
-            let Some(Value::Concrete(ConcreteValue::Map(im))) = om.get("a") else {
-                panic!("expected nested Map");
-            };
-            assert_eq!(
-                im.get("status"),
-                Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
-            );
-        }
-
-        #[test]
-        fn union_is_not_recursed_into() {
-            // Union types are documented as not recursed; assert by
-            // construction that a Union wrapping an enum yields None
-            // even when the value would resolve for the enum directly.
-            let union_t = AttributeType::union(vec![versioning_status(), AttributeType::string()]);
-            assert_eq!(resolve_enum_value_recursive(&s("Enabled"), &union_t), None);
-        }
     }
 
     /// carina#3021: `extract_region_from_attrs` is the canonical answer
@@ -2702,5 +2009,19 @@ mod tests {
             ),
             "provider-read state String must be lifted to CanonicalEnum"
         );
+    }
+
+    #[test]
+    fn lift_enum_leaves_does_not_strip_a_dotted_string_prefix() {
+        let attr_type = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Format"),
+            Some(vec!["json".to_string()]),
+            vec![],
+            None,
+            None,
+        );
+        let quoted = Value::Concrete(ConcreteValue::String("A.json".into()));
+
+        assert_eq!(lift_enum_leaves(&quoted, &attr_type), None);
     }
 }

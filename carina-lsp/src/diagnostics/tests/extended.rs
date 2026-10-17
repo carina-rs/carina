@@ -7649,6 +7649,40 @@ let waited = wait cert {
 }
 
 #[test]
+fn lsp_requires_quotes_for_unresolved_wait_enum_identifiers() {
+    let engine = test_engine_with_wait_target();
+    let source = r#"
+let cert = aws.acm.Certificate {
+    domain_name = "example.com"
+    status = "PENDING"
+}
+let state_ready = wait cert {
+    until = cert.status == ready
+}
+let enum_ready = wait cert {
+    until = cert.enum_status == aws.acm.Certificate.Status.bogus
+}
+"#;
+    let document = create_document(source);
+    let diagnostics = engine.analyze(&document, None);
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(messages.contains(&"wait `state_ready`: cannot resolve `ready` as an enum value of `cert.status`; quote it to compare as a string"));
+    assert!(messages.contains(&"wait `enum_ready`: cannot resolve `aws.acm.Certificate.Status.bogus` as an enum value of `cert.enum_status`; quote it to compare as a string"));
+
+    let ready = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("cannot resolve `ready`"))
+        .expect("ready diagnostic");
+    assert_eq!(ready.range.start.line, 6);
+    assert_eq!(ready.range.start.character, 27);
+    assert_eq!(ready.range.end.line, 6);
+    assert_eq!(ready.range.end.character, 32);
+}
+
+#[test]
 fn lsp_accepts_valid_wait_block() {
     let engine = test_engine_with_wait_target();
     let src = r#"

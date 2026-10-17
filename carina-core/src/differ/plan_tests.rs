@@ -2340,25 +2340,30 @@ fn wait_binding_lowers_to_wait_effect() {
     let wait = WaitBinding {
         binding: "cert_issued".into(),
         target: "cert".into(),
-        until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+        until_raw: "cert.status == 'ready'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String(
-                "aws.acm.Certificate.Status.Issued".into(),
-            )),
+            rhs: Value::Concrete(ConcreteValue::String("ready".into())),
         },
         timeout_secs: Some(75 * 60),
         depends_on: vec![],
         line: 1,
     };
 
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        crate::schema::ResourceSchema::new("acm.Certificate").attribute(
+            crate::schema::AttributeSchema::new("status", crate::schema::AttributeType::string()),
+        ),
+    );
     let plan = create_plan(
         &resources,
         &[],
         &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -2386,18 +2391,457 @@ fn wait_binding_lowers_to_wait_effect() {
     assert_eq!(target_id.resource_type, "acm.Certificate");
     assert_eq!(
         until,
-        &WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String(
-                "aws.acm.Certificate.Status.Issued".into()
-            )),
-        }
+        &WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ready".into())),
+        )
+        .unwrap()
     );
     assert_eq!(*timeout, std::time::Duration::from_secs(75 * 60));
-    assert_eq!(
-        until_surface,
-        "cert.status == aws.acm.Certificate.Status.Issued"
+    assert_eq!(until_surface, "cert.status == 'ready'");
+}
+
+#[test]
+fn unresolved_wait_enum_identifier_is_a_plan_error() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    let job = Resource::new("job.Job", "job").with_binding("job");
+    let mut consumer = Resource::new("job.Consumer", "consumer").with_binding("consumer");
+    consumer.dependency_bindings.insert("job_ready".to_string());
+    let wait = WaitBinding {
+        binding: "job_ready".into(),
+        target: "job".into(),
+        until_raw: "job.state == ready".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["job".to_string(), "state".to_string()],
+            rhs: Value::Concrete(ConcreteValue::enum_identifier("ready")),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        crate::schema::ResourceSchema::new("job.Job").attribute(
+            crate::schema::AttributeSchema::new("state", crate::schema::AttributeType::string()),
+        ),
     );
+    let plan = create_plan(
+        &[job, consumer],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[wait],
+    );
+
+    assert!(plan.effects().iter().all(|effect| !effect.is_wait()));
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(
+        plan.errors()[0].to_string(),
+        "job.Job.job: wait `job_ready`: cannot resolve `ready` as an enum value of `job.state`; quote it to compare as a string"
+    );
+}
+
+#[test]
+fn nested_wait_enum_resolves_and_matches_provider_state() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField, TypeIdentity};
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert");
+    let mut consumer =
+        Resource::with_provider("aws", "consumer.Thing", "consumer", None).with_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert("cert_renewed".to_string());
+    let wait = WaitBinding {
+        binding: "cert_renewed".into(),
+        target: "cert".into(),
+        until_raw:
+            "cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.success"
+                .to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec![
+                "cert".to_string(),
+                "renewal_summary".to_string(),
+                "renewal_status".to_string(),
+            ],
+            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.acm.Certificate.RenewalStatus.success",
+            )),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+    let renewal_status = AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
+        Some(vec!["SUCCESS".to_string()]),
+        vec![("SUCCESS".to_string(), "success".to_string())],
+        None,
+        None,
+    );
+    let renewal_summary = AttributeType::struct_(
+        "RenewalSummary",
+        vec![StructField::new("renewal_status", renewal_status)],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::new("renewal_summary", renewal_summary)),
+    );
+
+    let plan = create_plan(
+        &[cert, consumer],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[wait],
+    );
+
+    assert!(
+        plan.errors().is_empty(),
+        "unexpected errors: {:?}",
+        plan.errors()
+    );
+    let Effect::Wait { until, .. } = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.is_wait())
+        .expect("nested wait should be emitted")
+    else {
+        unreachable!();
+    };
+    assert!(matches!(
+        until.value(),
+        Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            if value.api_value() == "SUCCESS"
+    ));
+    let observed = HashMap::from([(
+        "renewal_summary".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "renewal_status".to_string(),
+            Value::Concrete(ConcreteValue::String("SUCCESS".into())),
+        )]))),
+    )]);
+    assert!(until.evaluate(&observed));
+}
+
+#[test]
+fn quoted_wait_value_traverses_a_string_map_when_planning() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let job = Resource::with_provider("test", "job.Job", "job", None).with_binding("job");
+    let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
+        .with_binding("consumer");
+    consumer.dependency_bindings.insert("job_ready".to_string());
+    let wait = WaitBinding {
+        binding: "job_ready".into(),
+        target: "job".into(),
+        until_raw: "job.labels.state == 'ready'".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["job".into(), "labels".into(), "state".into()],
+            rhs: Value::Concrete(ConcreteValue::String("ready".into())),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("job.Job").attribute(AttributeSchema::new(
+            "labels",
+            AttributeType::map(AttributeType::string()),
+        )),
+    );
+
+    let plan = create_plan(
+        &[job, consumer],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[wait],
+    );
+
+    assert!(
+        plan.errors().is_empty(),
+        "unexpected errors: {:?}",
+        plan.errors()
+    );
+    let Effect::Wait { until, .. } = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.is_wait())
+        .expect("map-backed wait should be emitted")
+    else {
+        unreachable!();
+    };
+    let observed = HashMap::from([(
+        "labels".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "state".to_string(),
+            Value::Concrete(ConcreteValue::String("ready".into())),
+        )]))),
+    )]);
+    assert!(until.evaluate(&observed));
+}
+
+#[test]
+fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::schema::{AttributeSchema, ResourceSchema, TypeIdentity};
+
+    let job = Resource::with_provider("test", "job.Job", "job", None).with_binding("job");
+    let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
+        .with_binding("consumer");
+    consumer.dependency_bindings.insert("job_ready".to_string());
+    let wait = WaitBinding {
+        binding: "job_ready".into(),
+        target: "job".into(),
+        until_raw: "job.statuses.primary == test.job.Job.Status.ready".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["job".into(), "statuses".into(), "primary".into()],
+            rhs: Value::Concrete(ConcreteValue::enum_identifier("test.job.Job.Status.ready")),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+    let status = AttributeType::enum_(
+        TypeIdentity::new(Some("test"), ["job", "Job"], "Status"),
+        Some(vec!["READY".to_string()]),
+        vec![("READY".to_string(), "ready".to_string())],
+        None,
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("job.Job")
+            .attribute(AttributeSchema::new("statuses", AttributeType::map(status))),
+    );
+
+    let plan = create_plan(
+        &[job, consumer],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[wait],
+    );
+
+    assert!(
+        plan.errors().is_empty(),
+        "unexpected errors: {:?}",
+        plan.errors()
+    );
+    let Effect::Wait { until, .. } = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.is_wait())
+        .expect("map-backed enum wait should be emitted")
+    else {
+        unreachable!();
+    };
+    assert!(matches!(
+        until.value(),
+        Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            if value.api_value() == "READY"
+    ));
+    let observed = HashMap::from([(
+        "statuses".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "primary".to_string(),
+            Value::Concrete(ConcreteValue::String("READY".into())),
+        )]))),
+    )]);
+    assert!(until.evaluate(&observed));
+}
+
+#[test]
+fn nested_wait_resolution_error_matches_validation_message() {
+    use crate::parser::{ProviderContext, UntilPredicateAst, WaitBinding, parse};
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField, TypeIdentity};
+
+    let renewal_status = AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
+        Some(vec!["SUCCESS".to_string()]),
+        vec![("SUCCESS".to_string(), "success".to_string())],
+        None,
+        None,
+    );
+    let renewal_summary = AttributeType::struct_(
+        "RenewalSummary",
+        vec![StructField::new("renewal_status", renewal_status)],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::new("renewal_summary", renewal_summary)),
+    );
+    let source = r#"
+let cert = aws.acm.Certificate {}
+let renewed = wait cert {
+    until = cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.bogus
+}
+"#;
+    let parsed = parse(source, &ProviderContext::default()).expect("fixture must parse");
+    let validation = crate::validation::wait::validate_wait_bindings(&parsed, &schemas);
+    assert_eq!(validation.len(), 1);
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert");
+    let mut consumer =
+        Resource::with_provider("aws", "consumer.Thing", "consumer", None).with_binding("consumer");
+    consumer.dependency_bindings.insert("renewed".to_string());
+    let wait = WaitBinding {
+        binding: "renewed".into(),
+        target: "cert".into(),
+        until_raw: "cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.bogus"
+            .to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec![
+                "cert".to_string(),
+                "renewal_summary".to_string(),
+                "renewal_status".to_string(),
+            ],
+            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.acm.Certificate.RenewalStatus.bogus",
+            )),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+    let plan = create_plan(
+        &[cert, consumer],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[wait],
+    );
+
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(plan.errors()[0].kind.to_string(), validation[0].message);
+    assert!(
+        validation[0]
+            .message
+            .contains("cert.renewal_summary.renewal_status")
+    );
+}
+
+#[test]
+fn data_source_wait_uses_the_data_source_schema_for_enum_resolution() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::resource::DataSource;
+    use crate::schema::{AttributeSchema, ResourceSchema, TypeIdentity};
+
+    let lookup =
+        DataSource::with_provider("test", "lookup.Job", "lookup", None).with_binding("lookup");
+    let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
+        .with_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert("lookup_found".to_string());
+    let wait = WaitBinding {
+        binding: "lookup_found".into(),
+        target: "lookup".into(),
+        until_raw: "lookup.status == test.lookup.Job.Status.found".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["lookup".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+                "test.lookup.Job.Status.found",
+            )),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+    let managed_status = AttributeType::enum_(
+        TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
+        Some(vec!["READY".to_string()]),
+        vec![("READY".to_string(), "ready".to_string())],
+        None,
+        None,
+    );
+    let data_source_status = AttributeType::enum_(
+        TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
+        Some(vec!["FOUND".to_string()]),
+        vec![("FOUND".to_string(), "found".to_string())],
+        None,
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("lookup.Job").attribute(AttributeSchema::new("status", managed_status)),
+    );
+    schemas.insert(
+        "test",
+        ResourceSchema::new("lookup.Job")
+            .as_data_source()
+            .attribute(AttributeSchema::new("status", data_source_status)),
+    );
+
+    let plan = create_plan(
+        &[consumer],
+        &[lookup],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[wait],
+    );
+
+    assert!(
+        plan.errors().is_empty(),
+        "unexpected errors: {:?}",
+        plan.errors()
+    );
+    let Effect::Wait { until, .. } = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.is_wait())
+        .expect("data-source wait should be emitted")
+    else {
+        unreachable!();
+    };
+    assert!(matches!(
+        until.value(),
+        Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            if value.api_value() == "FOUND"
+    ));
 }
 
 #[test]
@@ -2650,7 +3094,10 @@ fn wait_with_unknown_target_emits_plan_error() {
         until_raw: "nonexistent.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["nonexistent".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            // Target lookup must win over predicate sealing even when the
+            // parser has correctly typed an unquoted RHS as an enum
+            // identifier.
+            rhs: Value::Concrete(ConcreteValue::enum_identifier("ISSUED")),
         },
         timeout_secs: None,
         depends_on: vec![],
@@ -2815,10 +3262,11 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
 #[test]
 fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
     // cert: exists with status == ISSUED and is unchanged (desired
     // matches state) → NoChange, no mutating effect on the target.
-    let cert = Resource::new("acm.Certificate", "cert")
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
         .with_binding("cert")
         .with_attribute(
             "status",
@@ -2836,39 +3284,49 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
         Value::Concrete(ConcreteValue::String("ISSUED".into())),
     );
     let mut current_states = HashMap::new();
+    let cert_id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
     current_states.insert(
-        ResourceId::with_identity("acm.Certificate", "cert"),
-        State::existing(
-            ResourceId::with_identity("acm.Certificate", "cert"),
-            cert_state_attrs,
-        )
-        .with_identifier("arn:aws:acm:::certificate/abc"),
+        cert_id.clone(),
+        State::existing(cert_id, cert_state_attrs).with_identifier("arn:aws:acm:::certificate/abc"),
     );
 
     let wait = WaitBinding {
         binding: "cert_issued".into(),
         target: "cert".into(),
-        until_raw: "cert.status == ISSUED".to_string(),
+        until_raw: "cert.status == aws.acm.Certificate.Status.issued".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.acm.Certificate.Status.issued",
+            )),
         },
         timeout_secs: Some(60),
         depends_on: vec![],
         line: 1,
     };
 
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("acm.Certificate").attribute(AttributeSchema::new(
+            "status",
+            AttributeType::enum_(
+                TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Status"),
+                Some(vec!["ISSUED".to_string()]),
+                vec![("ISSUED".to_string(), "issued".to_string())],
+                None,
+                None,
+            ),
+        )),
+    );
+
     let plan = create_plan(
         &resources,
         &[],
         &HintProvider { hints: Vec::new() },
-        &crate::resource::into_plan_input_map(
-            current_states.clone(),
-            &crate::schema::SchemaRegistry::new(),
-            &[],
-        ),
+        &crate::resource::into_plan_input_map(current_states.clone(), &schemas, &resources),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -2881,6 +3339,11 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
          must be elided even when a consumer has a pending change that \
          merely references it; effects were {:?}",
         plan.effects()
+    );
+    assert!(
+        plan.errors().is_empty(),
+        "the typed alias must resolve to canonical ISSUED: {:?}",
+        plan.errors()
     );
 }
 

@@ -24,6 +24,7 @@ use crate::schema::{
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
+pub(crate) use enum_value::{enum_value_comparison_key, enum_values_equal};
 
 #[derive(Clone, Copy)]
 pub struct EnumAttr<'a> {
@@ -1855,10 +1856,10 @@ pub enum ConcreteValueRef<'a> {
 }
 
 impl<'a> ConcreteValueRef<'a> {
-    /// Return the inner `&str` for both `String` and `EnumIdentifier`
-    /// variants. The vast majority of consumers (formatter, plan
-    /// display, differ, state writer) treat the two identically —
-    /// only the validator cares about the distinction.
+    /// Return the inner `&str` for either textual variant at call sites where
+    /// source shape is deliberately irrelevant (for example, generic custom
+    /// scalar validation). Enum-aware formatting, comparison, and resolution
+    /// must match the variants directly instead.
     pub fn as_string_like(&self) -> Option<&'a str> {
         match self {
             ConcreteValueRef::String(s) => Some(s.expose_plaintext()),
@@ -2083,17 +2084,12 @@ impl PartialEq for Value {
                 Value::Concrete(ConcreteValue::String(a)),
                 Value::Concrete(ConcreteValue::String(b)),
             ) => a == b,
-            // `EnumIdentifier` is structurally equal to `String` (and to
-            // itself) when the carried text matches. The source-shape
-            // distinction lives on the variant tag — validator and other
-            // pattern-matching sites stay strict because they `match` on
-            // the variant directly, not through `PartialEq`. Value-tree
-            // comparison (differ, state round-trip checks, diff_tests)
-            // treats the two as the same textual payload; otherwise every
-            // provider `read` (which round-trips through plain JSON
-            // strings on the WIT boundary) would produce a phantom diff
-            // against a desired-side identifier form. See carina#2986
-            // Phase 5.
+            // Generic value-tree equality keeps same-text compatibility
+            // between `EnumIdentifier` and `String`. Enum-sensitive consumers
+            // (schema-aware differ paths, rendering, alias resolution) match
+            // the variants directly and must not infer enum semantics from a
+            // String's text. This equality never strips a namespace or applies
+            // an alias. See carina#2986 Phase 5.
             (
                 Value::Concrete(ConcreteValue::EnumIdentifier(a)),
                 Value::Concrete(ConcreteValue::EnumIdentifier(b)),
@@ -3287,21 +3283,25 @@ fn append_schema_pairing_hashes(
             to_dsl,
             ..
         } => {
-            let text = match value {
-                Value::Concrete(ConcreteValue::String(text)) => Some(text.expose_plaintext()),
-                Value::Concrete(ConcreteValue::EnumIdentifier(text)) => Some(text.as_str()),
-                Value::Concrete(ConcreteValue::CanonicalEnum(value)) => Some(value.api_value()),
+            let canonical = match value {
+                Value::Concrete(ConcreteValue::String(text)) => {
+                    Some(text.expose_plaintext().to_string())
+                }
+                Value::Concrete(ConcreteValue::EnumIdentifier(text)) => {
+                    let valid_values: Vec<&str> =
+                        values.into_iter().flatten().map(String::as_str).collect();
+                    let dsl_map = DslMap::new(dsl_aliases, to_dsl);
+                    Some(text.canonical_api_spelling(&valid_values, &dsl_map))
+                }
+                Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+                    Some(value.api_value().to_string())
+                }
                 _ => None,
             };
-            if let Some(text) = text {
-                let valid_values: Vec<&str> =
-                    values.into_iter().flatten().map(String::as_str).collect();
-                let trailing = crate::utils::extract_enum_value_with_values(text, &valid_values);
-                let dsl_map = DslMap::new(dsl_aliases, to_dsl);
-                let canonical = dsl_map.api_for(&dsl_map.dsl_for(trailing));
+            if let Some(canonical) = canonical {
                 hashes.push(pairing_component_hash(
                     0x02,
-                    &canonical.to_ascii_lowercase(),
+                    &enum_value_comparison_key(&canonical),
                 ));
             }
         }

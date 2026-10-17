@@ -1707,6 +1707,27 @@ fn union_typed_string_or_list_pairing_uses_the_list_element_schema() {
 }
 
 #[test]
+fn enum_pairing_hashes_keep_dotted_strings_literal() {
+    let attr_type = AttributeType::enum_(
+        TypeIdentity::bare("Format"),
+        Some(vec!["json".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let dotted = Value::Concrete(ConcreteValue::String("A.json".into()));
+    let api = Value::Concrete(ConcreteValue::String("json".into()));
+    let defs = crate::schema::empty_defs_for_schema_walks();
+    let dotted_hashes = pairing_hashes(&dotted, Some(&attr_type), defs);
+    let api_hashes = pairing_hashes(&api, Some(&attr_type), defs);
+
+    assert!(
+        dotted_hashes.iter().all(|hash| !api_hashes.contains(hash)),
+        "literal strings that compare differently must not share a pairing hash"
+    );
+}
+
+#[test]
 fn similarity_score_counts_shared_map_entries() {
     let first = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),

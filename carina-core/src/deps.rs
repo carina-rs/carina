@@ -233,10 +233,11 @@ mod tests {
                 "acm.Certificate",
                 "cert",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(crate::resource::ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(crate::resource::ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),

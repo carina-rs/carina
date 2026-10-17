@@ -22,7 +22,8 @@ use crate::schema::{
     WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::augment::satisfier_augmentation;
-use crate::wait::predicate::{AttrPath, WaitPredicate};
+use crate::wait::find_wait_target_with_schema_kind;
+use crate::wait::predicate::resolve_wait_predicate;
 
 use super::{Diff, PlanPriorStates, diff};
 
@@ -563,29 +564,26 @@ fn create_plan_parts(
         // compositions are post-apply attribute containers and don't carry
         // `until`-pollable state, so excluding them (by construction
         // via the typed-slice split) matches the runtime invariant.
-        let resolved = managed
-            .iter()
-            .find(|r| r.binding.as_deref() == Some(wb.target.as_str()))
-            .map(|r| r.id.clone())
-            .or_else(|| {
-                data_sources
-                    .iter()
-                    .find(|r| r.binding.as_deref() == Some(wb.target.as_str()))
-                    .map(|r| r.id.clone())
-            })
-            .or_else(|| {
-                managed
-                    .iter()
-                    .find(|r| r.id.identity_str() == Some(wb.target.as_str()))
-                    .map(|r| r.id.clone())
-            })
-            .or_else(|| {
-                data_sources
-                    .iter()
-                    .find(|r| r.id.identity_str() == Some(wb.target.as_str()))
-                    .map(|r| r.id.clone())
-            });
-        let Some(target_id_resolved) = resolved else {
+        let resolved = find_wait_target_with_schema_kind(
+            wb.target.as_str(),
+            managed
+                .iter()
+                .map(|resource| {
+                    (
+                        &resource.id,
+                        resource.binding.as_deref(),
+                        SchemaKind::Resource,
+                    )
+                })
+                .chain(data_sources.iter().map(|resource| {
+                    (
+                        &resource.id,
+                        resource.binding.as_deref(),
+                        SchemaKind::DataSource,
+                    )
+                })),
+        );
+        let Some((target_id_resolved, target_schema_kind)) = resolved else {
             plan.add_error(PlanError::new(
                 ResourceId::with_identity("__wait", ResourceIdentity::new(wb.binding.to_string())),
                 PlanErrorKind::WaitTargetMissing {
@@ -595,6 +593,41 @@ fn create_plan_parts(
             ));
             continue;
         };
+        let target_id_resolved = target_id_resolved.clone();
+        let diagnostic_id = target_id_resolved.clone();
+
+        // Once the target is known, resolve against the exact schema kind and
+        // the full nested attribute path. The same function drives validation
+        // (and therefore LSP diagnostics), so resolution and wording cannot
+        // drift between those entry points.
+        let schema = registry.get(
+            &target_id_resolved.provider,
+            &target_id_resolved.resource_type,
+            target_schema_kind,
+        );
+        let until = match resolve_wait_predicate(
+            &wb.until_predicate.lhs_segments,
+            wb.until_predicate.rhs.clone(),
+            schema,
+        ) {
+            Ok(until) => until,
+            Err(error) => {
+                plan.add_error(PlanError::new(
+                    diagnostic_id,
+                    PlanErrorKind::WaitPredicateInvalid {
+                        wait_binding: wb.binding.to_string(),
+                        reason: error.to_string(),
+                    },
+                ));
+                continue;
+            }
+        };
+        let attr = until
+            .watched_attrs()
+            .into_iter()
+            .next()
+            .expect("Equals wait predicate must expose its attribute")
+            .clone();
         // A `wait`'s only purpose is to gate downstream resources that
         // reference `<wait-binding>.<attr>` until the `until` predicate
         // holds (design value semantics: consumers that don't need the
@@ -624,36 +657,7 @@ fn create_plan_parts(
         if !gates_a_pending_change {
             continue;
         }
-        // `lhs_segments` is guaranteed non-empty and the first segment
-        // equals `wb.target` (enforced by `parse_wait_expr`). The
-        // predicate attribute path is therefore `lhs_segments[1..]`.
-        // This `try_new` branch is defense in depth: the parser rejects
-        // bare-target LHS values like `until = cert == ...`, but keep a
-        // plan-level error here in case a future parser path relaxes
-        // that rule or constructs `WaitBinding` directly.
-        let attr = match AttrPath::try_new(wb.until_predicate.lhs_segments[1..].to_vec()) {
-            Ok(attr) => attr,
-            Err(err) => {
-                plan.add_error(PlanError::new(
-                    target_id_resolved.clone(),
-                    PlanErrorKind::WaitPredicateInvalid {
-                        wait_binding: wb.binding.to_string(),
-                        reason: err.to_string(),
-                    },
-                ));
-                continue;
-            }
-        };
-        let until = WaitPredicate::Equals {
-            attr: attr.clone(),
-            value: wb.until_predicate.rhs.clone(),
-        };
         let target_id = target_id_resolved;
-        let schema = registry.get(
-            &target_id.provider,
-            &target_id.resource_type,
-            SchemaKind::Resource,
-        );
         let schema_timeout = schema.and_then(|s| s.default_wait_timeout);
         let schema_interval = schema.and_then(|s| s.default_wait_interval);
         let timeout = wb

@@ -285,13 +285,11 @@ fn type_aware_enum_namespaced_vs_raw() {
         None,
     );
 
-    // Namespaced form vs raw string
+    // Typed namespaced form vs provider/API string.
     assert!(
         type_aware_equal(
-            &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
-                    .to_string()
-                    .into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             )),
             &Value::Concrete(ConcreteValue::String("AES256".into())),
             Some(&enum_type),
@@ -300,18 +298,14 @@ fn type_aware_enum_namespaced_vs_raw() {
         "Namespaced enum and raw value should be considered equal"
     );
 
-    // Both in namespaced form
+    // Both in typed namespaced form.
     assert!(
         type_aware_equal(
-            &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
-                    .to_string()
-                    .into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             )),
-            &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
-                    .to_string()
-                    .into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             )),
             Some(&enum_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -322,10 +316,8 @@ fn type_aware_enum_namespaced_vs_raw() {
     // Different values should not match
     assert!(
         !type_aware_equal(
-            &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
-                    .to_string()
-                    .into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             )),
             &Value::Concrete(ConcreteValue::String("aws:kms".into())),
             Some(&enum_type),
@@ -337,11 +329,8 @@ fn type_aware_enum_namespaced_vs_raw() {
 
 /// Regression for carina#3312: `Enum` attributes with a `to_dsl`
 /// callback (e.g. `aws.AvailabilityZone`, where `to_dsl = |s|
-/// s.replace('-', '_')`) must compare equal across the `String("ap-northeast-1a")`
-/// vs `String("aws.AvailabilityZone.ap_northeast_1a")` / `EnumIdentifier(...)`
-/// pairs that arise naturally between provider-read state (AWS canonical)
-/// and DSL-side desired (fully-qualified identifier). Without this arm
-/// the differ reports a phantom replacement on every post-apply plan.
+/// s.replace('-', '_')`) must compare equal across the provider/API
+/// `String("ap-northeast-1a")` and typed DSL `EnumIdentifier(...)` shapes.
 #[test]
 fn type_aware_enum_canonical_vs_namespaced_identifier() {
     let az_type = AttributeType::enum_(
@@ -353,15 +342,13 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     );
 
     // Provider-read AWS canonical form vs DSL fully-qualified identifier.
-    // State side stores `String("ap-northeast-1a")`; the DSL parser turns
-    // `aws.AvailabilityZone.ap_northeast_1a` into an `EnumIdentifier` and
-    // `resolve_enum_value_recursive` rewrites it to a `String` carrying
-    // the same dotted form. Both shapes need to compare equal.
+    // State side stores `String("ap-northeast-1a")`; the DSL parser emits a
+    // typed `EnumIdentifier` for the fully-qualified source form.
     assert!(
         type_aware_equal(
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
-            &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.AvailabilityZone.ap_northeast_1a"
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -370,8 +357,8 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     );
     assert!(
         type_aware_equal(
-            &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.AvailabilityZone.ap_northeast_1a"
             )),
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             Some(&az_type),
@@ -380,14 +367,14 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
         "Equality must be symmetric"
     );
 
-    // Same dotted DSL form on both sides — identical strings, trivially equal.
+    // Same dotted DSL form on both sides.
     assert!(
         type_aware_equal(
-            &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.AvailabilityZone.ap_northeast_1a"
             )),
-            &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.AvailabilityZone.ap_northeast_1a"
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -406,9 +393,7 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
         "Identical AWS-canonical forms must be equal"
     );
 
-    // Cross-shape: state String vs DSL EnumIdentifier (the parser
-    // produces this for the `aws.AvailabilityZone.ap_northeast_1a` literal
-    // before resolve_enum_value_recursive rewrites it).
+    // Cross-shape: state String vs the parser's DSL EnumIdentifier.
     assert!(
         type_aware_equal(
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
@@ -425,8 +410,8 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     assert!(
         !type_aware_equal(
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
-            &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1c".into()
+            &Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.AvailabilityZone.ap_northeast_1c"
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -436,7 +421,7 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
 }
 
 #[test]
-fn type_aware_enum_canonical_enum_value_compares_against_string() {
+fn type_aware_enum_canonical_enum_value_compares_against_api_string() {
     let az_identity = TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName");
     let az_type = AttributeType::enum_(
         az_identity.clone(),
@@ -451,13 +436,25 @@ fn type_aware_enum_canonical_enum_value_compares_against_string() {
             &Value::Concrete(ConcreteValue::CanonicalEnum(
                 CanonicalEnumValue::new_for_test(az_identity.clone(), "ap-northeast-1a"),
             )),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
+            Some(&az_type),
+            crate::schema::empty_defs_for_schema_walks(),
+        ),
+        "CanonicalEnum API value must compare equal to provider API text"
+    );
+
+    assert!(
+        !type_aware_equal(
+            &Value::Concrete(ConcreteValue::CanonicalEnum(
+                CanonicalEnumValue::new_for_test(az_identity.clone(), "ap-northeast-1a"),
+            )),
             &Value::Concrete(ConcreteValue::String(
                 "aws.AvailabilityZone.ap_northeast_1a".into()
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
         ),
-        "CanonicalEnum API value must compare equal to equivalent DSL String"
+        "a dotted String must remain literal provider/API text"
     );
 
     assert!(

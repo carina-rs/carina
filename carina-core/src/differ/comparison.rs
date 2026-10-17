@@ -18,7 +18,7 @@ use crate::value::{canonical_secret_hash_material, contains_secret};
 /// - List/Map: recurse with inner element type
 /// - Struct: recurse with per-field type information, tolerating extra fields
 ///   with default values (e.g., `false` for Bool)
-/// - Enum: extract enum values from namespaced identifiers and compare
+/// - Enum: resolve typed enum identifiers and compare API spellings
 ///   case-insensitively (e.g., `awscc.s3.Bucket.Type.AES256` equals `"AES256"`)
 ///
 /// Without type information, falls back to `Value::semantically_equal()`.
@@ -201,8 +201,8 @@ fn type_aware_equal_on_path<'a>(
                 }
             }
 
-            // Enum: extract enum values from namespaced identifiers
-            // and compare. Phase 5 of carina#2986: accept the cross-shape
+            // Enum: resolve namespaced text only for typed EnumIdentifier
+            // values, then compare. Phase 5 of carina#2986: accept the cross-shape
             // `String × EnumIdentifier` pair so the differ is stable
             // across "state file stores plain string, desired-side parsed
             // as identifier short form" — the steady-state shape for any
@@ -249,43 +249,30 @@ fn type_aware_equal_on_path<'a>(
                 // provider API text? If strict equality fails, fall through to
                 // the canonical text comparison below so cross-provider export
                 // flows do not produce phantom updates.
-                let text = |v: &Value| -> Option<String> {
-                    match v {
+                // Provider-read/state paths may still surface API values as
+                // String. Treat that text literally; only typed enum variants
+                // may strip a namespace or apply a DSL alias.
+                let valid_values: Vec<&str> =
+                    values.into_iter().flatten().map(String::as_str).collect();
+                let dsl_map = crate::schema::DslMap::new(dsl_aliases, to_dsl);
+                let canonical = |value: &Value| -> Option<String> {
+                    match value {
                         Value::Concrete(ConcreteValue::String(s)) => {
                             Some(s.expose_plaintext().to_owned())
                         }
-                        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.to_string()),
-                        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-                            Some(c.api_value().to_string())
+                        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                            Some(raw.canonical_api_spelling(&valid_values, &dsl_map))
+                        }
+                        Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+                            Some(canonical.api_value().to_string())
                         }
                         _ => None,
                     }
                 };
-                let (Some(sa), Some(sb)) = (text(a), text(b)) else {
+                let (Some(left), Some(right)) = (canonical(a), canonical(b)) else {
                     return a.semantically_equal(b);
                 };
-                if sa == sb {
-                    return true;
-                }
-                // Temporary compatibility while some provider-read/state
-                // paths can still surface unresolved strings. Once every
-                // enum-typed state leaf is resolver-lifted, comparison above
-                // should be CanonicalEnum × CanonicalEnum.
-                //
-                // Provider response spellings must pass through
-                // `into_plan_input_map` before planning; that StateText
-                // canonicalization is where separator-equivalent enum
-                // response values converge to schema spellings. Keep this
-                // string fallback on the legacy alias round-trip only so DSL
-                // validation semantics are not widened here.
-                let dsl_map = crate::schema::DslMap::new(dsl_aliases, to_dsl);
-                let canonical = |s: &str| -> String {
-                    let valid_values: Vec<&str> =
-                        values.into_iter().flatten().map(String::as_str).collect();
-                    let trailing = crate::utils::extract_enum_value_with_values(s, &valid_values);
-                    dsl_map.api_for(&dsl_map.dsl_for(trailing))
-                };
-                canonical(&sa).eq_ignore_ascii_case(&canonical(&sb))
+                crate::resource::enum_values_equal(&left, &right)
             }
 
             // `Shape` has no `Ref` variant by construction (see
@@ -830,5 +817,52 @@ mod tests {
             Some(&attr_type),
             empty_defs_for_schema_walks(),
         ));
+    }
+
+    #[test]
+    fn dotted_string_on_enum_attribute_is_compared_literally() {
+        let attr_type = AttributeType::enum_(
+            TypeIdentity::bare("Format"),
+            Some(vec!["json".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let desired = Value::Concrete(ConcreteValue::String("A.json".into()));
+        let state = Value::Concrete(ConcreteValue::String("json".into()));
+
+        assert!(!type_aware_equal(
+            &desired,
+            &state,
+            Some(&attr_type),
+            empty_defs_for_schema_walks(),
+        ));
+    }
+
+    #[test]
+    fn dotted_api_enum_strings_remain_literal_values() {
+        for api_value in ["TLSv1.1", "ipsec.1"] {
+            let attr_type = AttributeType::enum_(
+                TypeIdentity::bare("Protocol"),
+                Some(vec![api_value.to_string()]),
+                Vec::new(),
+                None,
+                None,
+            );
+            let string = Value::Concrete(ConcreteValue::String(api_value.into()));
+            let canonical = Value::Concrete(ConcreteValue::CanonicalEnum(
+                crate::resource::CanonicalEnumValue::new_for_test(
+                    TypeIdentity::bare("Protocol"),
+                    api_value,
+                ),
+            ));
+
+            assert!(type_aware_equal(
+                &string,
+                &canonical,
+                Some(&attr_type),
+                empty_defs_for_schema_walks(),
+            ));
+        }
     }
 }

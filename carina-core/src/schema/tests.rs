@@ -134,6 +134,27 @@ fn validate_enum_rejects_quoted_string_literal() {
 }
 
 #[test]
+fn validate_enum_rejects_quoted_dotted_string_without_stripping_prefix() {
+    let attr_type = AttributeType::enum_(
+        TypeIdentity::bare("Format"),
+        Some(vec!["json".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
+
+    let err = attr_type
+        .validate(&Value::Concrete(ConcreteValue::String("A.json".into())))
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        TypeError::StringLiteralExpectedEnum { ref user_typed, .. }
+            if user_typed.as_plain() == Some("A.json")
+    ));
+}
+
+#[test]
 fn enum_type_name_uses_dotted_identity() {
     let t = AttributeType::enum_(
         crate::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),

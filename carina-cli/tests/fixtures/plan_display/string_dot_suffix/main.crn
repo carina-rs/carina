@@ -1,0 +1,11 @@
+# Dotted string suffixes must remain strings in plan output (#3855).
+
+provider mock {}
+
+mock.test.resource {
+  name = 'A.json'
+}
+
+mock.test.Thing {
+  name = "${upper('a')}.json"
+}

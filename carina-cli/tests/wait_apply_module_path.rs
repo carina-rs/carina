@@ -515,7 +515,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     .expect("override-aware resolve");
 
     let provider = NoopProvider { cert_publishes_arn };
-    let mut wait_bindings = parsed.wait_bindings.clone();
+    let wait_bindings = parsed.wait_bindings.clone();
     let compositions = parsed.compositions.clone();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
     let mut data_sources = parsed.data_sources.clone();
@@ -531,7 +531,6 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             &parsed.providers,
             &mut data_sources,
             &parsed.data_sources,
-            &mut wait_bindings,
         )
         .await
         .expect("plan preprocessing");

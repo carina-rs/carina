@@ -369,7 +369,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     let prepared_compositions = parsed.compositions.clone();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&prepared_compositions);
-    let mut wait_bindings = parsed.wait_bindings.clone();
+    let wait_bindings = parsed.wait_bindings.clone();
     let mut provider_router = ProviderRouter::new();
     let preparation = {
         // Provider config validation may use `block_in_place` to bridge a
@@ -410,7 +410,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                     raw_provider_configs,
                     &mut data_sources_for_plan,
                     &data_sources,
-                    &mut wait_bindings,
                 )
                 .await
         })

@@ -52,7 +52,7 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    CustomTypeLookup, ResourceSchema, SchemaRegistry, TypeError, resolve_block_names,
+    CustomTypeLookup, ResourceSchema, SchemaKind, SchemaRegistry, TypeError, resolve_block_names,
 };
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
@@ -945,7 +945,8 @@ pub fn compute_anonymous_identifiers_with_ctx(
 ///    (current desired-resource states and typed orphans) to match DSL format
 /// 3. Host default-tag merge — add tags from each routed provider instance
 ///    (must run after `normalize_desired`)
-/// 4. `resolve_enum_aliases` — convert to canonical AWS values in both resources and states
+/// 4. `resolve_enum_aliases` — resolve any surviving typed enum identifiers
+///    in both resources and states
 pub struct PlanPreprocessor<'a> {
     normalizer: &'a dyn ProviderNormalizer,
     ctx: &'a WiringContext,
@@ -975,6 +976,7 @@ async fn normalize_prior_states(
     orphans: &mut Orphans,
     normalizer: &dyn ProviderNormalizer,
     ctx: &WiringContext,
+    data_sources: &[DataSource],
 ) -> Result<(), ProviderError> {
     transform_prior_provider_states(current_states, orphans, async |states| {
         // Hard assert (not debug_assert): RFC #2371 constraint b says state
@@ -984,7 +986,7 @@ async fn normalize_prior_states(
             "Value::Deferred(DeferredValue::Unknown) found in prior states — RFC #2371 constraint b violated"
         );
         normalizer.normalize_state(states).await?;
-        resolve_enum_aliases_in_states(ctx, states);
+        resolve_enum_aliases_in_states(ctx, states, data_sources);
         Ok(())
     })
     .await
@@ -1171,17 +1173,14 @@ impl<'a> PlanPreprocessor<'a> {
         Self { normalizer, ctx }
     }
 
-    /// Run the full normalization pipeline on desired resources, all prior
-    /// states, and `wait` predicates.
+    /// Run the full normalization pipeline on desired resources and all prior
+    /// states.
     ///
     /// Call after `resolve_refs_with_state_and_remote()` and before
     /// `create_plan()`. This is the single seam both the plan and apply
-    /// pipelines traverse, so the three enum-alias passes
-    /// (resources, states, and — carina#3358 — wait `until` predicates)
-    /// live here together: a `create_plan` caller that runs `prepare`
-    /// cannot canonicalize resources/prior states while silently skipping
-    /// waits. `wait_bindings` is mutated in place; pass the same slice
-    /// on to `create_plan`.
+    /// pipelines traverse for provider normalization and enum-alias resolution
+    /// in resources and prior states. `create_plan()` resolves typed wait RHS
+    /// values directly against the selected target schema.
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare(
         &self,
@@ -1193,7 +1192,6 @@ impl<'a> PlanPreprocessor<'a> {
         provider_configs: &[ProviderConfig],
         data_sources: &mut [DataSource],
         data_source_origins: &[DataSource],
-        wait_bindings: &mut [carina_core::parser::WaitBinding],
     ) -> Result<(), PlanPreparationError> {
         let mut errors = validate_resolved_value_constraints(
             self.ctx,
@@ -1218,14 +1216,14 @@ impl<'a> PlanPreprocessor<'a> {
             self.ctx,
         )
         .await?;
-        normalize_prior_states(current_states, orphans, self.normalizer, self.ctx).await?;
-        // carina#3358: the `until` predicate RHS is the third enum-alias
-        // axis. Resolve it here, beside the resource/state passes, so the
-        // shared seam keeps all three in lockstep. Desired resources retain
-        // every attribute throughout the core/CLI pipeline; any transport-level
-        // hiding is internal to the WASM provider boundary. Target lookup uses
-        // each resource's stable `id`/`binding`.
-        resolve_enum_aliases_in_wait_bindings(self.ctx, wait_bindings, resources, data_sources);
+        normalize_prior_states(
+            current_states,
+            orphans,
+            self.normalizer,
+            self.ctx,
+            data_sources,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -1288,108 +1286,42 @@ pub fn normalize_state_with_ctx(
     rt.block_on(router.normalize_state(current_states))
 }
 
-/// Resolve enum alias values in current states to their canonical AWS form.
+/// Resolve any typed enum identifiers that survive in current states.
 ///
-/// Ensures that read-back state attributes use canonical AWS values (e.g., `"-1"`)
-/// instead of DSL aliases (e.g., `"all"`), matching the resolved desired values.
+/// Provider/API [`ConcreteValue::String`] values remain literal. Only a typed
+/// identifier is eligible for schema-driven conversion to `CanonicalEnum`.
 pub fn resolve_enum_aliases_in_states(
     ctx: &WiringContext,
     current_states: &mut HashMap<ResourceId, State>,
+    data_sources: &[DataSource],
 ) {
+    let data_source_ids: HashSet<&ResourceId> = data_sources
+        .iter()
+        .map(|data_source| &data_source.id)
+        .collect();
     for (id, state) in current_states.iter_mut() {
         if !state.exists || id.provider.is_empty() {
             continue;
         }
-        let factory = match provider_mod::find_factory(ctx.factories(), &id.provider) {
-            Some(f) => f,
-            None => continue,
+        let schema_kind = if data_source_ids.contains(id) {
+            SchemaKind::DataSource
+        } else {
+            SchemaKind::Resource
         };
-        let schemas = factory.schemas();
+        let Some(schema) = ctx
+            .schemas()
+            .get(&id.provider, &id.resource_type, schema_kind)
+        else {
+            continue;
+        };
         // Reuse the core per-value alias resolver (single source of
         // truth shared with the resource path, carina#3063).
         let keys: Vec<String> = state.attributes.keys().cloned().collect();
         for key in keys {
             if let Some(value) = state.attributes.get_mut(&key) {
-                carina_core::value::resolve_value_alias_with_schemas(
-                    value,
-                    &id.resource_type,
-                    &key,
-                    factory,
-                    &schemas,
-                );
+                carina_core::value::resolve_value_alias_with_schema(value, &key, schema);
             }
         }
-    }
-}
-
-/// Resolve enum-alias values in each `wait` binding's `until` predicate
-/// RHS to their canonical AWS form, mirroring [`resolve_enum_aliases_in_states`]
-/// for resources/states.
-///
-/// carina#3358: the parser lowers an enum-form predicate
-/// (`until = cert.status == aws.acm.Certificate.Status.Issued`) into a
-/// raw dotted-identifier string (`"aws.acm.Certificate.Status.Issued"`)
-/// — see `lower_until_rhs` in
-/// `carina-core/src/parser/expressions/wait_expr.rs`, whose comment
-/// promises "the differ resolves these to canonical AWS string values at
-/// plan time". Nothing did: the plan-path enum-alias pass canonicalized
-/// `resources` and `current_states` but never `wait_bindings`. So
-/// `WaitPredicate::evaluate` compared the raw DSL identifier against the
-/// AWS-canonical state value (`"ISSUED"`) and never matched — both in the
-/// plan-time elision gate (carina#3359) and in the executor's apply-time
-/// poll (`carina-core/src/executor/wait.rs`), which would poll to
-/// timeout. This closes that gap at the single seam by reusing the exact
-/// per-value resolver (`resolve_value_alias`) the resource/state passes
-/// use, so the `Effect::Wait.until.value` `create_plan` persists is
-/// canonical.
-///
-/// The predicate attribute is `lhs_segments[1]` (segment 0 is the target
-/// binding root). The target resource's `(provider, resource_type)` is
-/// recovered by matching `wb.target` against the already-resolved managed
-/// resources and data sources. Bindings whose target/attr/factory cannot
-/// be resolved are left unchanged (target validation lives in
-/// `carina_core::validation::wait`).
-pub(crate) fn resolve_enum_aliases_in_wait_bindings(
-    ctx: &WiringContext,
-    wait_bindings: &mut [carina_core::parser::WaitBinding],
-    resources: &[Resource],
-    data_sources: &[carina_core::resource::DataSource],
-) {
-    for wb in wait_bindings.iter_mut() {
-        let Some(attr_name) = wb.until_predicate.lhs_segments.get(1).cloned() else {
-            continue;
-        };
-        let target = wb.target.as_str();
-        // Recover the target's identity from the resolved sets that
-        // `create_plan` itself consumes, so provider/resource_type match
-        // what the differ sees.
-        let target_id = resources
-            .iter()
-            .find(|r| r.binding.as_deref() == Some(target))
-            .map(|r| &r.id)
-            .or_else(|| {
-                data_sources
-                    .iter()
-                    .find(|d| d.binding.as_deref() == Some(target))
-                    .map(|d| &d.id)
-            });
-        let Some(id) = target_id else { continue };
-        if id.provider.is_empty() {
-            continue;
-        }
-        let Some(factory) = provider_mod::find_factory(ctx.factories(), &id.provider) else {
-            continue;
-        };
-        // One schema snapshot per wait binding is acceptable: this path is
-        // bounded by wait-binding count, not resource attribute fanout.
-        let schemas = factory.schemas();
-        carina_core::value::resolve_value_alias_with_schemas(
-            &mut wb.until_predicate.rhs,
-            &id.resource_type,
-            &attr_name,
-            factory,
-            &schemas,
-        );
     }
 }
 
@@ -2934,9 +2866,9 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let prepared_compositions = parsed.compositions.clone();
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
-    // host default-tag merge → resolve_enum_aliases (resources, states, and
-    // wait `until` predicates — carina#3358). Order matters.
-    let mut wait_bindings = parsed.wait_bindings.clone();
+    // host default-tag merge → resolve_enum_aliases (resources and states).
+    // Order matters. `create_plan` resolves typed wait RHS values itself.
+    let wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, ctx);
     let preparation = if refresh_module_constraint_errors.is_empty() {
         preprocessor
@@ -2949,7 +2881,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 raw_provider_configs,
                 &mut data_sources_for_plan,
                 &data_sources,
-                &mut wait_bindings,
             )
             .await
     } else {

@@ -150,8 +150,9 @@ fn string_literal_expected_enum_custom_namespaced_display() {
             AttributeType::enum_(
                 // Structured identity matching the legacy `namespace: "test.r"`
                 // shorthand prefix: provider=test, segments=[r], kind=Mode.
-                // The dotted display is `test.r.Mode`, which is the prefix
-                // `expand_enum_shorthand` now derives from `identity`.
+                // The dotted enum identity is `test.r.Mode`. The quoted
+                // String below must nevertheless reach the validator
+                // literally; only a typed EnumIdentifier is expanded.
                 carina_core::schema::TypeIdentity::new(Some("test"), ["r"], "Mode"),
                 None,
                 vec![],

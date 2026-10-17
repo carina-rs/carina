@@ -52,6 +52,8 @@ plan-nested-list-of-maps-all-dropped:
 	$(PLAN_FIXTURE) nested_list_of_maps_all_dropped
 plan-enum-display:
 	$(PLAN_FIXTURE) enum_display
+plan-string-dot-suffix:
+	$(PLAN_FIXTURE) string_dot_suffix
 plan-no-changes-enum:
 	$(PLAN_FIXTURE) no_changes_enum
 plan-dynamic-enum-az-no-diff:
@@ -326,7 +328,7 @@ plan-multi-instance-module:
         plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \
-        plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
+        plan-enum-display plan-string-dot-suffix plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-moved-claims-precede-heuristics \
