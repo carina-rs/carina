@@ -745,7 +745,6 @@ pub(crate) async fn finalize_apply(
         current_states: input.current_states,
         applied_states: &input.result.applied_states,
         plan: input.plan,
-        moved_origins: input.moved_origins,
         successfully_deleted: &input.result.successfully_deleted,
         failed_refreshes: &input.result.failed_refreshes,
         schemas: input.schemas,
@@ -1003,10 +1002,10 @@ pub(crate) async fn detect_drift(
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
         let historical_id = planned_state
             .map(|_| historical_addresses.origin_for(&resource.id))
-            .unwrap_or_else(|| resource.id.clone());
+            .unwrap_or(&resource.id);
 
         let mut actual_state = provider
-            .read(&historical_id, identifier, ReadRequest)
+            .read(historical_id, identifier, ReadRequest)
             .await
             .map_err(AppError::Provider)?;
         // The provider read uses the pre-move address, but every downstream
@@ -2076,7 +2075,7 @@ async fn run_apply_locked(
                 data_sources: &parsed.data_sources,
                 current_states: &current_states,
                 state_file: state_file.as_ref(),
-                moved_origins: &moved_origins,
+                plan: &plan,
                 schemas: ctx.schemas(),
                 wait_aliases: &wait_aliases,
                 provider_context,
@@ -2161,7 +2160,7 @@ async fn run_apply_locked(
             data_sources: &parsed.data_sources,
             current_states: &current_states,
             state_file: state_file.as_ref(),
-            moved_origins: &moved_origins,
+            plan: &plan,
             schemas: ctx.schemas(),
             wait_aliases: &wait_aliases,
             provider_context,
@@ -2246,7 +2245,6 @@ async fn run_apply_locked(
                     data_sources: &data_sources_for_plan,
                     current_states: &current_states,
                     plan: &plan,
-                    moved_origins: &moved_origins,
                     backend,
                     lock,
                     schemas,
@@ -3190,7 +3188,6 @@ async fn run_apply_from_plan_locked(
                     data_sources: plan_data_sources,
                     current_states: &current_states,
                     plan,
-                    moved_origins: historical_addresses.moved_origins(),
                     backend,
                     lock,
                     schemas: ctx.schemas(),

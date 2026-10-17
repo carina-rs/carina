@@ -4359,7 +4359,7 @@ mod tests {
     #[test]
     fn normalized_state_roundtrip_preserves_self_contained_legacy_secret() {
         use argon2::Argon2;
-        use carina_core::provider::PersistedAttributes;
+        use carina_core::provider::EncodedStateRowAttributes;
         use wit_types::Value as WitValue;
 
         let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
@@ -4370,10 +4370,17 @@ mod tests {
             .hash_password_into(material, salt, &mut output)
             .expect("hash legacy state fixture");
         let marker = format!("_secret:argon2:{}", hex::encode(output));
-        let persisted = PersistedAttributes::from_state_row_json(
-            &id,
-            HashMap::from([("comment".to_string(), serde_json::json!(marker))]),
-        );
+        let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "legacy",
+            "attributes": { "comment": marker },
+        }))
+        .expect("decode test state row");
+        let (_, _, _, persisted) = encoded
+            .decode()
+            .expect("upgrade test state row")
+            .into_parts();
         let upgraded_marker = persisted
             .encoded_value("comment")
             .and_then(serde_json::Value::as_str)

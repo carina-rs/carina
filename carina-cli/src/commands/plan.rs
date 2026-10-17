@@ -436,14 +436,14 @@ pub(crate) fn collect_historical_display_attributes(
     state_file: Option<&StateFile>,
 ) -> HistoricalDisplayAttributes {
     let mut display = HistoricalDisplayAttributes::for_plan(plan);
-    let moved_origins = moved_origins_for_plan(plan);
+    let moved_origins = MovedOrigins::from_plan(plan);
 
     for effect in plan.effects() {
         for key in effect.deleted_resource_attribute_keys() {
             match key.generation() {
                 carina_core::effect::EffectGeneration::Current => {
                     if let Some(state) = current_states.get(key.id()) {
-                        let persisted_id = moved_origins.get(key.id()).unwrap_or(key.id());
+                        let persisted_id = moved_origins.origin_for(key.id());
                         let persisted = state_file
                             .and_then(|file| file.find_resource_for_id(persisted_id))
                             .map(|resource| resource.persisted_attributes());
@@ -469,7 +469,7 @@ pub(crate) fn collect_historical_display_attributes(
         // Mask that shape in place instead of replacing it with the raw
         // refreshed state used by Delete effects.
         if let Effect::Update { from, .. } = effect {
-            let persisted_id = moved_origins.get(&from.id).unwrap_or(&from.id);
+            let persisted_id = moved_origins.origin_for(&from.id);
             let persisted = state_file
                 .and_then(|file| file.find_resource_for_id(persisted_id))
                 .map(|resource| resource.persisted_attributes());
@@ -484,15 +484,56 @@ pub(crate) fn collect_historical_display_attributes(
     display
 }
 
-/// Map each post-move address to the persisted row that owns its history.
-pub(crate) fn moved_origins_for_plan(plan: &Plan) -> HashMap<ResourceId, ResourceId> {
-    plan.effects()
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Move { from, to } => Some((to.as_inner().clone(), from.as_inner().clone())),
-            _ => None,
-        })
-        .collect()
+/// Resolves a plan address to the state row that owns its persisted history.
+///
+/// The mapping cannot be supplied independently of a plan: move effects are
+/// the sole authority for historical state-row ownership during planning,
+/// saved-plan verification, and writeback.
+pub(crate) struct MovedOrigins {
+    by_destination: HashMap<ResourceId, ResourceId>,
+}
+
+impl MovedOrigins {
+    pub(crate) fn from_plan(plan: &Plan) -> Self {
+        let by_destination = plan
+            .effects()
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Move { from, to } => Some((to.as_inner().clone(), from.as_inner().clone())),
+                _ => None,
+            })
+            .collect();
+        Self { by_destination }
+    }
+
+    pub(crate) fn origin_for<'a>(&'a self, id: &'a ResourceId) -> &'a ResourceId {
+        self.by_destination.get(id).unwrap_or(id)
+    }
+
+    pub(crate) fn find_persisted_row<'a>(
+        &self,
+        state_file: &'a StateFile,
+        id: &ResourceId,
+    ) -> Option<&'a carina_state::ResourceState> {
+        state_file.find_resource_for_id(self.origin_for(id))
+    }
+
+    /// Resolve the row by state address while deliberately retaining its
+    /// stored provider-instance routing. Replacement writeback uses this when
+    /// a create changes provider instances and the old instance must be
+    /// deposed through its original route.
+    pub(crate) fn find_persisted_row_at_address<'a>(
+        &self,
+        state_file: &'a StateFile,
+        id: &ResourceId,
+    ) -> Option<&'a carina_state::ResourceState> {
+        let origin = self.origin_for(id);
+        state_file.find_resource(
+            &origin.provider,
+            &origin.resource_type,
+            origin.identity_str()?,
+        )
+    }
 }
 
 type PersistedResourceLookup<'a> =
@@ -500,10 +541,10 @@ type PersistedResourceLookup<'a> =
 
 fn persisted_resource_for_plan_address<'a>(
     persisted_resources: Option<&PersistedResourceLookup<'a>>,
-    moved_origins: &HashMap<ResourceId, ResourceId>,
+    moved_origins: &MovedOrigins,
     id: &ResourceId,
 ) -> Option<&'a carina_state::ResourceState> {
-    let persisted_id = moved_origins.get(id).unwrap_or(id);
+    let persisted_id = moved_origins.origin_for(id);
     let identity = persisted_id.identity_str()?;
     persisted_resources?
         .get(&(
@@ -676,13 +717,14 @@ fn build_plan_file<E>(
             })
             .collect::<PersistedResourceLookup<'_>>()
     });
+    let moved_origins = MovedOrigins::from_plan(&ctx.plan);
     let redacted_current_states = ctx
         .current_states
         .iter()
         .map(|(id, state)| {
             let persisted = persisted_resource_for_plan_address(
                 persisted_resources.as_ref(),
-                &ctx.moved_origins,
+                &moved_origins,
                 id,
             );
             // A moved resource's previous state row still lives at its source
@@ -708,7 +750,7 @@ fn build_plan_file<E>(
         .map(|resource| {
             let persisted = persisted_resource_for_plan_address(
                 persisted_resources.as_ref(),
-                &ctx.moved_origins,
+                &moved_origins,
                 &resource.id,
             );
             match persisted {
@@ -1300,7 +1342,7 @@ pub async fn run_plan(
         data_sources: &parsed.data_sources,
         current_states: &ctx.current_states,
         state_file: state_file.as_ref(),
-        moved_origins: &ctx.moved_origins,
+        plan: &ctx.plan,
         schemas: wiring.schemas(),
         wait_aliases: &export_wait_aliases,
         provider_context,
@@ -1493,9 +1535,9 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
     /// Persisted secret shapes that classify provider-returned plaintext before
     /// it enters export resolution.
     pub state_file: Option<&'a StateFile>,
-    /// A moved resource's persisted hash shape still lives at its source
-    /// address until writeback completes.
-    pub moved_origins: &'a HashMap<ResourceId, ResourceId>,
+    /// The plan is the only authority for resolving destination addresses back
+    /// to the persisted rows that own their historical secret shapes.
+    pub plan: &'a Plan,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
     pub provider_context: &'a ProviderContext,
@@ -1514,9 +1556,9 @@ pub(crate) fn check_exports_pre_apply(
     // composition to the managed sibling literal (carina#3246).
     let mut secret_aware_states = input.current_states.clone();
     if let Some(state_file) = input.state_file {
+        let moved_origins = MovedOrigins::from_plan(input.plan);
         for (id, state) in &mut secret_aware_states {
-            let persisted_id = input.moved_origins.get(id).unwrap_or(id);
-            let Some(persisted) = state_file.find_resource_for_id(persisted_id) else {
+            let Some(persisted) = moved_origins.find_persisted_row(state_file, id) else {
                 continue;
             };
             let persisted_attributes = persisted.persisted_attributes();
@@ -2768,8 +2810,24 @@ mod run_plan_out_tests {
         let path = tmp.path().join("main.crn");
         fs::write(&path, "provider mock {}\n").unwrap();
 
-        let created = resource_with_secret("created", "CREATE_SECRET");
-        let updated = resource_with_secret("updated", "UPDATE_SECRET");
+        let created = resource_with_secret("created", "CREATE_SECRET").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("created".into())),
+        );
+        let created_effect = resource_with_secret("created", "CREATE_SECRET").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("created-temporary".into())),
+        );
+        let updated = resource_with_secret("updated", "UPDATE_SECRET").with_attribute(
+            "web_acl_arn",
+            Value::Concrete(ConcreteValue::String("resolved-at-plan-time".into())),
+        );
+        let updated_effect = resource_with_secret("updated", "UPDATE_SECRET").with_attribute(
+            "web_acl_arn",
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("producer", "identifier"),
+            }),
+        );
         let persisted_update_marker = carina_core::value::value_to_json(
             updated.attributes.get("comment").expect("updated secret"),
         )
@@ -2784,14 +2842,14 @@ mod run_plan_out_tests {
             .expect("persisted update row");
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(created.clone()),
+            carina_core::resource::ResolvedResource::new(created_effect),
         ));
         plan.add(Effect::Update {
             from: Box::new(
                 State::existing(updated.id.clone(), HashMap::new()).with_identifier("updated-id"),
             ),
-            to: carina_core::resource::ResolvedResource::new(updated.clone()),
-            changed_attributes: vec!["comment".to_string()],
+            to: carina_core::resource::ResolvedResource::new(updated_effect),
+            changed_attributes: vec!["comment".to_string(), "web_acl_arn".to_string()],
         });
         let parsed = carina_core::parser::ParsedFile::default();
         let ctx = crate::wiring::PlanContext {
@@ -2838,8 +2896,20 @@ mod run_plan_out_tests {
             "create effect and sorted resource must share one digest",
         );
         assert_eq!(
+            created_effect.attributes["name"],
+            Value::Concrete(ConcreteValue::String("created-temporary".into())),
+            "saved-plan redaction must retain a create-before-destroy temporary name",
+        );
+        assert_eq!(
             updated_effect.attributes["comment"], saved.sorted_resources[1].attributes["comment"],
             "update effect and sorted resource must share one digest",
+        );
+        assert!(
+            matches!(
+                updated_effect.attributes.get("web_acl_arn"),
+                Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+            ),
+            "saved-plan redaction must retain unresolved cascade-consumer references",
         );
         assert_eq!(
             saved.sorted_resources[1].attributes["comment"],

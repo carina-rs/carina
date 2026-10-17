@@ -841,6 +841,77 @@ let item = mock.test.resource {
 }
 
 #[test]
+fn saved_plan_cbd_secret_replacement_keeps_temporary_name_and_applies() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name            = "cbd-secret"
+  replacement_key = "before"
+  comment         = secret("CBD_SECRET_PLAIN_3863")
+  directives {
+    create_before_destroy = true
+  }
+}
+"#,
+    );
+    assert_success(
+        "initial CBD fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name            = "cbd-secret"
+  replacement_key = "after"
+  comment         = secret("CBD_SECRET_PLAIN_3863")
+  directives {
+    create_before_destroy = true
+  }
+}
+"#,
+    );
+
+    assert_success("CBD saved plan", &scenario.plan());
+    let plan = read_json(&scenario.project.join("plan.json"));
+    let create = plan["plan"]["effects"]
+        .as_array()
+        .expect("saved plan effects")
+        .iter()
+        .find_map(|effect| effect.get("Create"))
+        .expect("CBD replacement create effect");
+    let create_name = create
+        .pointer("/attributes/name/String")
+        .and_then(Value::as_str)
+        .expect("CBD create name");
+    assert!(
+        create_name.starts_with("cbd-secret-") && create_name != "cbd-secret",
+        "saved Create effect lost its temporary name: {create_name}"
+    );
+    assert_eq!(
+        plan_resource_by_name(&plan, "cbd-secret")
+            .pointer("/attributes/name/String")
+            .and_then(Value::as_str),
+        Some("cbd-secret"),
+        "the planned resource remains the permanent desired value",
+    );
+
+    let apply = scenario.apply_plan();
+    assert_success("CBD saved-plan apply", &apply);
+    assert_output_has_no_plaintext("CBD saved-plan apply", &apply, &["CBD_SECRET_PLAIN_3863"]);
+    let state = scenario.state_json();
+    let row = state["resources"]
+        .as_array()
+        .and_then(|resources| resources.first())
+        .expect("CBD state row");
+    assert_eq!(row["identity"], "item");
+    assert_secret_hash(&row["attributes"]["comment"]);
+}
+
+#[test]
 fn pre_typed_secret_plan_format_requires_replan() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }

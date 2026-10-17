@@ -14,10 +14,11 @@ fn persisted_secret(marker: &str) -> Value {
         }))
         .expect("deserialize persisted secret");
     }
-    crate::provider::PersistedAttributes::from_state_row_json(
+    crate::provider::persisted_attributes_from_test_state_row(
         &ResourceId::with_provider_identity("test", "service.Widget", "widget", None),
         HashMap::from([("config".to_string(), serde_json::json!(marker))]),
     )
+    .expect("state row decode")
     .get("config")
     .expect("test fixture must be a complete persisted secret marker")
 }

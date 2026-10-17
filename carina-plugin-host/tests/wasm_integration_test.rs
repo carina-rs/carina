@@ -891,7 +891,7 @@ async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change() {
     use argon2::Argon2;
-    use carina_core::provider::PersistedAttributes;
+    use carina_core::provider::EncodedStateRowAttributes;
 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -909,13 +909,17 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
         .hash_password_into(&material, salt, &mut output)
         .expect("hash legacy write-only fixture");
     let marker = format!("_secret:argon2:{}", hex::encode(output));
-    let persisted = PersistedAttributes::from_state_row_json(
-        &id,
-        HashMap::from([(
-            "__mock_write_only_secret__".to_string(),
-            serde_json::json!(marker),
-        )]),
-    );
+    let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "legacy-write-only",
+        "attributes": { "__mock_write_only_secret__": marker },
+    }))
+    .expect("decode test state row");
+    let (_, _, _, persisted) = encoded
+        .decode()
+        .expect("upgrade test state row")
+        .into_parts();
     let saved_attrs = lifted_saved_attrs([(id.clone(), persisted.to_values())]);
     let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
 

@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 fn persisted_attributes_from_state_json(
     attributes: &HashMap<String, serde_json::Value>,
 ) -> PersistedAttributes {
-    PersistedAttributes::from_state_row_json(
+    persisted_attributes_for_test_state_row(
         &ResourceId::with_provider_identity("test", "test.resource", "fixture-row", None),
         attributes.clone(),
     )
@@ -2133,6 +2133,32 @@ fn v11_state_migrates_to_v12_and_upgrades_raw_legacy_secrets_at_row_load() {
         marker.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
         "row load must make the legacy marker self-contained: {marker}",
     );
+}
+
+#[test]
+fn state_row_load_rejects_raw_legacy_salt_that_cannot_round_trip() {
+    let json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "oversized-legacy-salt",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.resource",
+            "identity": "x".repeat(5000),
+            "provider": "mock",
+            "identifier": "legacy-id",
+            "attributes": {
+                "comment": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
+            },
+        }],
+    })
+    .to_string();
+
+    let error = check_and_migrate(&json)
+        .expect_err("state load must reject a legacy salt that its marker parser cannot reload");
+    let message = error.to_string();
+    assert!(message.contains("comment"), "{message}");
+    assert!(message.contains("maximum is 4096 bytes"), "{message}");
 }
 
 #[test]

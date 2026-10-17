@@ -1548,6 +1548,7 @@ enum RedactedSecretHashKind {
 
 impl RedactedSecretHash {
     const SALT_LEN: usize = 16;
+    const MAX_EXPLICIT_LEGACY_SALT_LEN: usize = 4096;
     pub const HASH_LEN: usize = 32;
     /// Complete prefix of every new state marker. The bytes after `_secret:`
     /// are a standard PHC string, for example
@@ -1619,27 +1620,35 @@ impl RedactedSecretHash {
 
     pub(crate) fn upgrade_raw_legacy_marker_for_state_row(
         marker: &str,
-        id: &ResourceId,
+        display_type: &str,
+        identity: &str,
         top_level_attribute_key: &str,
-    ) -> Option<Self> {
-        let encoded = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX)?;
+    ) -> Result<Option<Self>, ExplicitLegacySaltTooLong> {
+        let Some(encoded) = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX) else {
+            return Ok(None);
+        };
         let mut hash = [0_u8; Self::HASH_LEN];
-        hex::decode_to_slice(encoded, &mut hash).ok()?;
-        let identity = id.identity_str()?;
+        if hex::decode_to_slice(encoded, &mut hash).is_err() {
+            return Ok(None);
+        }
         let row_salt = format!(
             "carina:{}:{}:{}",
-            id.display_type(),
-            identity,
-            top_level_attribute_key
+            display_type, identity, top_level_attribute_key
         )
         .into_bytes();
-        Some(Self(RedactedSecretHashKind::ExplicitSaltLegacy {
+        if row_salt.len() > Self::MAX_EXPLICIT_LEGACY_SALT_LEN {
+            return Err(ExplicitLegacySaltTooLong {
+                actual: row_salt.len(),
+                maximum: Self::MAX_EXPLICIT_LEGACY_SALT_LEN,
+            });
+        }
+        Ok(Some(Self(RedactedSecretHashKind::ExplicitSaltLegacy {
             // Pre-v12 write-only attributes could use a context-free fallback
             // salt. Verification tries that fixed constant from code after
             // the row-derived salt, so the marker need not store it.
             salt: row_salt,
             hash,
-        }))
+        })))
     }
 
     pub(crate) fn is_persisted_marker(marker: &str) -> bool {
@@ -1740,10 +1749,16 @@ fn legacy_argon2() -> Argon2<'static> {
 fn valid_legacy_salt_hex(value: &str) -> bool {
     !value.is_empty()
         && value.len().is_multiple_of(2)
-        && value.len() <= 8192
+        && value.len() <= RedactedSecretHash::MAX_EXPLICIT_LEGACY_SALT_LEN * 2
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExplicitLegacySaltTooLong {
+    pub(crate) actual: usize,
+    pub(crate) maximum: usize,
 }
 
 impl PartialEq for RedactedSecretHash {

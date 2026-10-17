@@ -21,6 +21,7 @@ use carina_state::{
 };
 use colored::Colorize;
 
+use crate::commands::plan::MovedOrigins;
 use crate::error::AppError;
 
 /// Apply permanent name overrides from state to desired resources.
@@ -155,9 +156,6 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// (carina#3266).
     pub current_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
-    /// Destination address to persisted source address for every move in
-    /// `plan`, constructed once by the planning/apply boundary.
-    pub moved_origins: &'a HashMap<ResourceId, ResourceId>,
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
     pub schemas: &'a SchemaRegistry,
@@ -637,7 +635,6 @@ pub(crate) struct ApplyStateSave<'a> {
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
-    pub moved_origins: &'a HashMap<ResourceId, ResourceId>,
     pub successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
     pub schemas: &'a SchemaRegistry,
@@ -849,6 +846,7 @@ fn classify_replacement_outcome(
     create_upsert: Option<&PlannedUpsert<'_>>,
     state_file: &StateFile,
     current_states: &HashMap<ResourceId, State>,
+    moved_origins: &MovedOrigins,
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
 ) -> ReplacementOutcome {
@@ -875,6 +873,7 @@ fn classify_replacement_outcome(
                 schemas.get_for(upsert.resource),
                 state_file,
                 current_states,
+                moved_origins,
             ))
         }
         None if delete_succeeded(
@@ -896,12 +895,9 @@ fn planned_depose(
     schema: Option<&ResourceSchema>,
     state_file: &StateFile,
     current_states: &HashMap<ResourceId, State>,
+    moved_origins: &MovedOrigins,
 ) -> PlannedDepose {
-    let existing = state_file.find_resource(
-        &delete.id.provider,
-        &delete.id.resource_type,
-        delete.id.identity_str(),
-    );
+    let existing = moved_origins.find_persisted_row_at_address(state_file, delete.id.as_inner());
     let current = current_states.get(delete.id.as_inner());
     let existing_attributes = existing.map(ResourceState::persisted_attributes);
 
@@ -1014,14 +1010,10 @@ fn create_side_upsert_ids(plan: &Plan) -> HashSet<ResourceId> {
 
 fn plan_displaced_identifier_deposes(
     wb: &mut WritebackPlan<'_>,
-    state_file: &StateFile,
-    current_states: &HashMap<ResourceId, State>,
-    plan: &Plan,
-    successfully_deleted: &HashSet<DeletedInstanceKey>,
-    failed_refreshes: &HashSet<ResourceId>,
-    schemas: &SchemaRegistry,
+    input: &DecomposeInput<'_, '_>,
+    moved_origins: &MovedOrigins,
 ) {
-    let create_side_ids = create_side_upsert_ids(plan);
+    let create_side_ids = create_side_upsert_ids(input.plan);
     for (id, upsert) in &wb.upserts {
         if !upsert.source.is_applied() {
             continue;
@@ -1031,15 +1023,16 @@ fn plan_displaced_identifier_deposes(
         }
         let id = upsert.resource.resolved_id();
         let Some(existing) =
-            state_file.find_resource(&id.provider, &id.resource_type, id.identity_str())
+            moved_origins.find_persisted_row_at_address(input.state_file, id.as_inner())
         else {
             continue;
         };
         let Some(displaced_identifier) = existing.identifier.as_deref() else {
             continue;
         };
-        if !failed_refreshes.contains(id.as_inner())
-            && current_states
+        if !input.failed_refreshes.contains(id.as_inner())
+            && input
+                .current_states
                 .get(id.as_inner())
                 .is_some_and(|state| !state.exists)
         {
@@ -1050,7 +1043,7 @@ fn plan_displaced_identifier_deposes(
             continue;
         }
         if identifier_was_successfully_deleted(
-            successfully_deleted,
+            input.successfully_deleted,
             &id,
             &existing.directives.provider_instance,
             displaced_identifier,
@@ -1075,9 +1068,10 @@ fn plan_displaced_identifier_deposes(
                 previous_attributes: None,
             },
             upsert.resource,
-            schemas.get_for(upsert.resource),
-            state_file,
-            current_states,
+            input.schemas.get_for(upsert.resource),
+            input.state_file,
+            input.current_states,
+            moved_origins,
         ));
     }
 }
@@ -1104,18 +1098,25 @@ struct DecomposeInput<'a, 's> {
     schemas: &'a SchemaRegistry,
 }
 
+#[cfg(test)]
 fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, WritebackConflict> {
-    let DecomposeInput {
-        state_file,
-        sorted_resources,
-        runtime_synthesized_resources,
-        current_states,
-        applied_states,
-        plan,
-        successfully_deleted,
-        failed_refreshes,
-        schemas,
-    } = input;
+    let moved_origins = MovedOrigins::from_plan(input.plan);
+    decompose_with_moved_origins(input, &moved_origins)
+}
+
+fn decompose_with_moved_origins<'a>(
+    input: DecomposeInput<'a, '_>,
+    moved_origins: &MovedOrigins,
+) -> Result<WritebackPlan<'a>, WritebackConflict> {
+    let state_file = input.state_file;
+    let sorted_resources = input.sorted_resources;
+    let runtime_synthesized_resources = input.runtime_synthesized_resources;
+    let current_states = input.current_states;
+    let applied_states = input.applied_states;
+    let plan = input.plan;
+    let successfully_deleted = input.successfully_deleted;
+    let failed_refreshes = input.failed_refreshes;
+    let schemas = input.schemas;
     let mut wb = WritebackPlan::new();
 
     for resource in sorted_resources {
@@ -1156,6 +1157,7 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
                     wb.upserts.get(create_id),
                     state_file,
                     current_states,
+                    moved_origins,
                     successfully_deleted,
                     schemas,
                 );
@@ -1173,6 +1175,7 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
                     create_upsert,
                     state_file,
                     current_states,
+                    moved_origins,
                     successfully_deleted,
                     schemas,
                 );
@@ -1197,15 +1200,7 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
         }
     }
 
-    plan_displaced_identifier_deposes(
-        &mut wb,
-        state_file,
-        current_states,
-        plan,
-        successfully_deleted,
-        failed_refreshes,
-        schemas,
-    );
+    plan_displaced_identifier_deposes(&mut wb, &input, moved_origins);
 
     Ok(wb)
 }
@@ -1221,29 +1216,31 @@ pub(crate) fn build_state_after_apply(
         current_states,
         applied_states,
         plan,
-        moved_origins,
         successfully_deleted,
         failed_refreshes,
         schemas,
     } = save;
     let mut state = state_file.unwrap_or_default();
+    let moved_origins = MovedOrigins::from_plan(plan);
 
-    let writeback = decompose(DecomposeInput {
-        state_file: &state,
-        sorted_resources,
-        runtime_synthesized_resources,
-        current_states,
-        applied_states,
-        plan,
-        successfully_deleted,
-        failed_refreshes,
-        schemas,
-    })?;
+    let writeback = decompose_with_moved_origins(
+        DecomposeInput {
+            state_file: &state,
+            sorted_resources,
+            runtime_synthesized_resources,
+            current_states,
+            applied_states,
+            plan,
+            successfully_deleted,
+            failed_refreshes,
+            schemas,
+        },
+        &moved_origins,
+    )?;
     let permanent_name_overrides = plan.permanent_name_overrides_for_state();
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
-        let previous_id = moved_origins.get(id).unwrap_or(id);
-        let existing = state.find_resource_for_id(previous_id);
+        let existing = moved_origins.find_persisted_row(&state, id);
         let write_only_keys: Vec<String> = schemas
             .get_for(resource)
             .map(|schema| {
@@ -1549,7 +1546,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &Plan::new(),
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -1633,7 +1629,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -1687,7 +1682,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -1733,7 +1727,6 @@ mod apply_state_save_tests {
                 applied_states: &HashMap::from([(child_id.clone(), child_state)]),
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 plan: &Plan::new(),
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -1793,7 +1786,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::new(),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -1885,7 +1877,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::new(),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2045,7 +2036,6 @@ mod apply_state_save_tests {
                 current_states: &current_states,
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -2099,7 +2089,6 @@ mod apply_state_save_tests {
                 current_states: &current_states,
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -2165,7 +2154,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2222,7 +2210,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2285,7 +2272,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::from([(id.clone(), current_state)]),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2343,7 +2329,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2441,7 +2426,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(create_id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2503,7 +2487,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(create_id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2604,7 +2587,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2720,7 +2702,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2787,7 +2768,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::from([(id, refreshed_state)]),
                 applied_states: &HashMap::new(),
                 plan: &Plan::new(),
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2854,7 +2834,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id.clone(), applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -2925,7 +2904,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id.clone(), applied_state)]),
                 plan: &Plan::new(),
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &schemas,
@@ -2995,7 +2973,6 @@ mod apply_state_save_tests {
                 current_states: &HashMap::new(),
                 applied_states: &HashMap::from([(id.clone(), applied_state)]),
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &schemas,
@@ -3083,7 +3060,6 @@ mod apply_state_save_tests {
                 current_states: &current_states,
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -3168,7 +3144,6 @@ mod apply_state_save_tests {
                 current_states: &current_states,
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &SchemaRegistry::new(),
@@ -3243,7 +3218,6 @@ mod apply_state_save_tests {
                 current_states: &current_states,
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &schemas,
@@ -3442,7 +3416,6 @@ mod apply_state_save_tests {
                 current_states: &current_states,
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -3578,10 +3551,16 @@ mod apply_state_save_tests {
         let sorted_resources = vec![resolved(resource)];
         let current_state = State::existing(
             id.clone(),
-            HashMap::from([(
-                "bucket_name".to_string(),
-                Value::Concrete(ConcreteValue::String("old-name".into())),
-            )]),
+            HashMap::from([
+                (
+                    "bucket_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("old-name".into())),
+                ),
+                (
+                    "comment".to_string(),
+                    Value::Concrete(ConcreteValue::String("previously-secret".into())),
+                ),
+            ]),
         )
         .with_identifier("bucket-old-id");
         let current_states = HashMap::from([(id.clone(), current_state)]);
@@ -3592,6 +3571,7 @@ mod apply_state_save_tests {
                 .attribute(
                     AttributeSchema::new("bucket_name", AttributeType::string()).create_only(),
                 )
+                .attribute(AttributeSchema::new("comment", AttributeType::string()))
                 .with_coexisting_replacement(),
         );
         let mut plan = create_plan(
@@ -3648,9 +3628,16 @@ mod apply_state_save_tests {
             "replacement Delete for moved target must not be suppressed"
         );
 
-        let mut existing = ResourceState::new("s3.Bucket", "new_bucket", "awscc")
+        let persisted_secret = carina_core::value::value_to_json(&Value::Deferred(
+            carina_core::resource::DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("previously-secret".into()),
+            ))),
+        ))
+        .expect("persist previous secret marker");
+        let mut existing = ResourceState::new("s3.Bucket", "old_bucket", "awscc")
             .with_identifier("bucket-old-id")
-            .with_attribute("bucket_name", serde_json::json!("old-name"));
+            .with_attribute("bucket_name", serde_json::json!("old-name"))
+            .with_attribute("comment", persisted_secret.clone());
         existing.dependency_bindings.insert("logs".to_string());
         let mut state_file = StateFile::new();
         state_file
@@ -3674,7 +3661,6 @@ mod apply_state_save_tests {
                 current_states: &current_states,
                 applied_states: &applied_states,
                 plan: &plan,
-                moved_origins: &HashMap::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
                 schemas: &schemas,
@@ -3693,6 +3679,12 @@ mod apply_state_save_tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("bucket_name"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("old-name"))
+        );
+        let deposed_attributes = serde_json::to_value(row.deposed[0].persisted_attributes())
+            .expect("serialize deposed attributes");
+        assert_eq!(
+            deposed_attributes["comment"], persisted_secret,
+            "Move + Replace must use the source row as previous-hash authority when deposing the old generation",
         );
     }
 

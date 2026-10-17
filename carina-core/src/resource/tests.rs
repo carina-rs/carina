@@ -4,7 +4,6 @@ use crate::explicit::ExplicitFields;
 #[test]
 fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_hashes() {
     let plaintext = br#""legacy-constant-time""#;
-    let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
     let salt = b"carina:mock.test.resource:legacy:comment";
     let mut output = [0_u8; RedactedSecretHash::HASH_LEN];
     legacy_argon2()
@@ -15,9 +14,14 @@ fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_has
         RedactedSecretHash::LEGACY_MARKER_PREFIX,
         hex::encode(output)
     );
-    let matching =
-        RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(&marker, &id, "comment")
-            .expect("upgrade legacy fixture");
+    let matching = RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
+        &marker,
+        "mock.test.resource",
+        "legacy",
+        "comment",
+    )
+    .expect("legacy salt is representable")
+    .expect("upgrade legacy fixture");
     assert!(matching.verify(plaintext));
     assert_eq!(
         matching.encoded_digest(),
@@ -37,9 +41,11 @@ fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_has
     );
     let mismatched = RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
         &mismatched_marker,
-        &id,
+        "mock.test.resource",
+        "legacy",
         "comment",
     )
+    .expect("legacy salt is representable")
     .expect("upgrade mismatched legacy fixture");
     assert!(!mismatched.verify(plaintext));
 }

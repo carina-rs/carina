@@ -7,8 +7,8 @@ use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    CurrentStateEntry, PlanFile, PlanWaitBinding, ResolvedProviderInputs, UpstreamSource,
-    moved_origins_for_plan,
+    CurrentStateEntry, MovedOrigins, PlanFile, PlanWaitBinding, ResolvedProviderInputs,
+    UpstreamSource,
 };
 use crate::error::AppError;
 
@@ -32,34 +32,7 @@ fn planned_secret_hashes(resources: &[Resource]) -> PlannedSecretHashes {
         .collect()
 }
 
-/// Historical provider/hash address for each saved-plan resource address.
-///
-/// A `moved` block rewrites the runtime state key to its destination, while
-/// the persisted secret hash and remote object still belong to the source
-/// address until execution completes. This typed map keeps both drift reads
-/// and hash verification on that source address.
-#[derive(Default)]
-pub(crate) struct HistoricalResourceAddresses {
-    moved_origins: HashMap<ResourceId, ResourceId>,
-}
-
-impl HistoricalResourceAddresses {
-    fn from_plan(plan: &Plan) -> Self {
-        let moved_origins = moved_origins_for_plan(plan);
-        Self { moved_origins }
-    }
-
-    pub(super) fn origin_for(&self, id: &ResourceId) -> ResourceId {
-        self.moved_origins
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| id.clone())
-    }
-
-    pub(super) fn moved_origins(&self) -> &HashMap<ResourceId, ResourceId> {
-        &self.moved_origins
-    }
-}
+pub(crate) type HistoricalResourceAddresses = MovedOrigins;
 
 /// Result of the one typed placeholder inventory performed after decoding.
 ///
@@ -172,7 +145,7 @@ impl DesiredPlanFile {
             Self::Verified(plan) => plan.plan(),
             Self::NeedsHistoricalVerification(plan) => &plan.plan_file.plan,
         };
-        HistoricalResourceAddresses::from_plan(plan)
+        MovedOrigins::from_plan(plan)
     }
 
     pub(super) async fn verify_historical(
@@ -257,7 +230,7 @@ impl DesiredVerifiedPlanFile {
                 let historical_id = historical_addresses.origin_for(&entry.id);
                 let mut actual = provider
                     .read(
-                        &historical_id,
+                        historical_id,
                         entry.state.identifier.as_deref(),
                         ReadRequest,
                     )

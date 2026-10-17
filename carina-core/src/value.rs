@@ -1870,6 +1870,28 @@ pub fn redact_secrets_in_resource_reusing_persisted_hashes(
     })
 }
 
+/// Redact an effect resource in place, using a separately redacted planned
+/// resource only as the source of reusable secret digests. Non-secret values
+/// stay exactly as they appear in the effect: replacement creates may carry a
+/// temporary name, and cascade updates may deliberately retain unresolved
+/// references for apply-time resolution.
+fn redact_resource_using_redacted_shape(
+    resource: &crate::resource::Resource,
+    guide: &crate::resource::Resource,
+) -> Result<crate::resource::Resource, SerializationError> {
+    let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| match guide
+        .attributes
+        .get(key)
+    {
+        Some(shape) => redact_using_redacted_shape(value, shape),
+        None => redact_secrets_only(value),
+    })?;
+    Ok(crate::resource::Resource {
+        attributes,
+        ..resource.clone()
+    })
+}
+
 /// Redact an authored resource by pairing it with the evaluator's resource at
 /// the same identity. Attribute names form the first path segment; nested
 /// paths are handled by [`redact_secrets_using_evaluated`].
@@ -2307,9 +2329,11 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
         .map(|effect| {
             let mut effect = match effect {
                 crate::effect::Effect::Create(resource) => match reusable_resource(&resource.id) {
-                    Some(planned) => crate::effect::Effect::Create(
-                        crate::resource::ResolvedResource::new(planned.clone()),
-                    ),
+                    Some(planned) => {
+                        crate::effect::Effect::Create(crate::resource::ResolvedResource::new(
+                            redact_resource_using_redacted_shape(resource, planned)?,
+                        ))
+                    }
                     None => redact_secrets_in_effect(effect)?,
                 },
                 crate::effect::Effect::Update {
@@ -2319,7 +2343,9 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                 } => crate::effect::Effect::Update {
                     from: Box::new(redact_secrets_in_state(from)?),
                     to: match reusable_resource(&to.id) {
-                        Some(planned) => crate::resource::ResolvedResource::new(planned.clone()),
+                        Some(planned) => crate::resource::ResolvedResource::new(
+                            redact_resource_using_redacted_shape(to, planned)?,
+                        ),
                         None => {
                             crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?)
                         }
@@ -4288,10 +4314,11 @@ mod tests {
             "old",
             None,
         );
-        let attributes = crate::provider::PersistedAttributes::from_state_row_json(
+        let attributes = crate::provider::persisted_attributes_from_test_state_row(
             &id,
             HashMap::from([("tags".to_string(), json)]),
-        );
+        )
+        .expect("state row decode");
         let upgraded = attributes
             .encoded_value("tags")
             .expect("upgraded persisted JSON");
@@ -4333,10 +4360,11 @@ mod tests {
             "old",
             None,
         );
-        let attributes = crate::provider::PersistedAttributes::from_state_row_json(
+        let attributes = crate::provider::persisted_attributes_from_test_state_row(
             &id,
             HashMap::from([("comment".to_string(), serde_json::json!(marker))]),
-        );
+        )
+        .expect("state row decode");
         let digest = attributes
             .redacted_secret_hash("comment")
             .expect("state load must upgrade a raw legacy marker");

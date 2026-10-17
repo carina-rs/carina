@@ -45,11 +45,14 @@ When applying a saved plan, Carina checks the state lineage and serial number ag
 
 When a saved plan contains secret placeholders, Carina also re-reads and
 evaluates the configuration from the source directory recorded in the plan.
-Each saved secret hash embeds its own random salt and Argon2id parameters.
-Carina verifies the re-evaluated plaintext against that self-contained digest,
-including for resource attributes, provider configuration, and deferred templates.
-The provider then receives the rehydrated plaintext, while state stores the
-normal Argon2id hash. If a secret changed or can no longer be found, apply stops
+New saved secret hashes are PHC strings that embed their random salt and
+Argon2id parameters; an unchanged secret may reuse the exact digest and salt
+already in state. Upgraded pre-v12 values use the self-contained
+`argon2-legacy` form until a plaintext write replaces them with PHC. Carina
+verifies the re-evaluated plaintext against the digest, including for resource
+attributes, provider configuration, and deferred templates. The provider then
+receives the rehydrated plaintext, while state stores the exact digest carried
+by the plan placeholder. If a secret changed or can no longer be found, apply stops
 before any planned provider mutation or state write and asks you to run
 `carina plan --out` again. Saved-plan verification may perform additional
 provider reads, including reads for resources scheduled for deletion. A saved

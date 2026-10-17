@@ -14,7 +14,7 @@ use crate::effect::PlanOp;
 use crate::parser::ProviderConfig;
 use crate::resource::{
     ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
-    ResourceId, State, Value,
+    ResourceId, ResourceIdentity, State, Value,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
@@ -631,10 +631,10 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// complete persisted secret markers as typed `RedactedSecret` values rather
 /// than ordinary strings.
 ///
-/// Raw JSON cannot be inserted after construction. Callers must construct a
-/// complete value through [`Self::from_encoded`] or
-/// [`Self::from_state_row_json`], so the legacy-marker invariant is checked at
-/// the type boundary.
+/// Raw JSON cannot be inserted after construction. Context-free callers use
+/// [`Self::from_encoded`]. A state row that may contain raw pre-v12 markers is
+/// decoded through [`EncodedStateRowAttributes`], which obtains the legacy
+/// salt inputs from the same serialized row as the attributes.
 ///
 /// ```compile_fail
 /// use carina_core::provider::PersistedAttributes;
@@ -648,22 +648,75 @@ pub struct PersistedAttributes {
     encoded: HashMap<String, serde_json::Value>,
 }
 
-/// A context-free persisted attribute contained a raw pre-v12 secret marker.
-///
-/// The top-level attribute key is retained so state writeback can attach the
-/// resource address without flattening the source error into a string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "persisted attribute {attribute_key:?} contains a raw pre-v12 secret marker; raw pre-v12 markers are accepted only from a state-file row"
-)]
-pub struct PersistedAttributesError {
-    attribute_key: String,
+pub enum PersistedAttributesError {
+    /// A context-free persisted attribute contained a raw pre-v12 marker.
+    #[error(
+        "persisted attribute {attribute_key:?} contains a raw pre-v12 secret marker; raw pre-v12 markers are accepted only from a state-file row"
+    )]
+    RawLegacyMarker { attribute_key: String },
+    /// The row-derived salt cannot be represented by the self-contained
+    /// legacy marker format.
+    #[error(
+        "persisted attribute {attribute_key:?} has a pre-v12 legacy salt of {actual} bytes; the maximum is {maximum} bytes"
+    )]
+    LegacySaltTooLong {
+        attribute_key: String,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
 impl PersistedAttributesError {
     pub fn attribute_key(&self) -> &str {
-        &self.attribute_key
+        match self {
+            Self::RawLegacyMarker { attribute_key }
+            | Self::LegacySaltTooLong { attribute_key, .. } => attribute_key,
+        }
     }
+}
+
+/// The identity and raw attributes decoded together from one state-file row.
+///
+/// Fields are private, so callers cannot pair a raw marker with a separately
+/// supplied resource id. Serde is the only constructor; decoding immediately
+/// upgrades raw pre-v12 markers using this row's own provider, type, and
+/// identity.
+///
+/// ```compile_fail
+/// use carina_core::provider::EncodedStateRowAttributes;
+///
+/// let _ = EncodedStateRowAttributes {
+///     provider: "mock".to_string(),
+///     resource_type: "test.resource".to_string(),
+///     identity: "wrong-row".try_into().unwrap(),
+///     attributes: Default::default(),
+/// };
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct EncodedStateRowAttributes {
+    provider: String,
+    resource_type: String,
+    #[serde(alias = "name")]
+    identity: ResourceIdentity,
+    attributes: HashMap<String, serde_json::Value>,
+}
+
+/// A decoded state row plus the private origin needed to decode its deposed
+/// generations through the same raw-legacy upgrade boundary.
+#[derive(Debug)]
+pub struct DecodedStateRowAttributes {
+    provider: String,
+    resource_type: String,
+    identity: ResourceIdentity,
+    origin: StateRowLegacyOrigin,
+    attributes: PersistedAttributes,
+}
+
+#[derive(Debug)]
+struct StateRowLegacyOrigin {
+    display_type: String,
+    identity: String,
 }
 
 impl PartialEq for PersistedAttributes {
@@ -715,6 +768,65 @@ impl<'a> PreviousSecretHashAuthority<'a> {
     }
 }
 
+impl EncodedStateRowAttributes {
+    pub fn decode(self) -> Result<DecodedStateRowAttributes, PersistedAttributesError> {
+        let display_type = if self.provider.is_empty() {
+            self.resource_type.clone()
+        } else {
+            format!("{}.{}", self.provider, self.resource_type)
+        };
+        let origin = StateRowLegacyOrigin {
+            display_type,
+            identity: self.identity.as_str().to_string(),
+        };
+        let attributes = PersistedAttributes::from_state_row_origin(self.attributes, &origin)?;
+        Ok(DecodedStateRowAttributes {
+            provider: self.provider,
+            resource_type: self.resource_type,
+            identity: self.identity,
+            origin,
+            attributes,
+        })
+    }
+}
+
+impl DecodedStateRowAttributes {
+    /// Decode another attribute map stored in the same state row, such as a
+    /// deposed generation, using the row's original legacy salt inputs.
+    pub fn decode_related_attributes(
+        &self,
+        encoded: HashMap<String, serde_json::Value>,
+    ) -> Result<PersistedAttributes, PersistedAttributesError> {
+        PersistedAttributes::from_state_row_origin(encoded, &self.origin)
+    }
+
+    pub fn into_parts(self) -> (String, String, ResourceIdentity, PersistedAttributes) {
+        (
+            self.provider,
+            self.resource_type,
+            self.identity,
+            self.attributes,
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn persisted_attributes_from_test_state_row(
+    id: &ResourceId,
+    attributes: HashMap<String, serde_json::Value>,
+) -> Result<PersistedAttributes, PersistedAttributesError> {
+    let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
+        "provider": id.provider,
+        "resource_type": id.resource_type,
+        "identity": id.identity_str().expect("test state row has a resolved identity"),
+        "attributes": attributes,
+    }))
+    .expect("test state row uses the encoded state shape");
+    let decoded = encoded.decode()?;
+    let (_, _, _, attributes) = decoded.into_parts();
+    Ok(attributes)
+}
+
 impl PersistedAttributes {
     /// Encode the typed placeholders captured in a saved-plan resource into
     /// their state-marker representation.
@@ -730,18 +842,14 @@ impl PersistedAttributes {
         Self { encoded }
     }
 
-    /// Construct persisted JSON from a state-file row. This is the only
-    /// decoder allowed to admit raw pre-v12 legacy markers; each one is
-    /// immediately rewritten with its row-derived salt embedded in the marker.
-    /// The one historical fallback salt remains a fixed code constant.
-    pub fn from_state_row_json(
-        id: &ResourceId,
+    fn from_state_row_origin(
         mut encoded: HashMap<String, serde_json::Value>,
-    ) -> Self {
+        origin: &StateRowLegacyOrigin,
+    ) -> Result<Self, PersistedAttributesError> {
         for (key, value) in &mut encoded {
-            upgrade_raw_legacy_markers_for_state_row(value, id, key);
+            upgrade_raw_legacy_markers_for_state_row(value, origin, key)?;
         }
-        Self { encoded }
+        Ok(Self { encoded })
     }
 
     /// Construct persisted JSON at a context-free boundary such as a provider
@@ -755,7 +863,7 @@ impl PersistedAttributes {
             .map(|(key, _)| key)
             .min()
         {
-            return Err(PersistedAttributesError {
+            return Err(PersistedAttributesError::RawLegacyMarker {
                 attribute_key: attribute_key.clone(),
             });
         }
@@ -999,33 +1107,41 @@ fn contains_raw_legacy_secret_marker_json(value: &serde_json::Value) -> bool {
 
 fn upgrade_raw_legacy_markers_for_state_row(
     value: &mut serde_json::Value,
-    id: &ResourceId,
+    origin: &StateRowLegacyOrigin,
     top_level_attribute_key: &str,
-) {
+) -> Result<(), PersistedAttributesError> {
     match value {
         serde_json::Value::String(marker) => {
-            if let Some(hash) =
-                crate::resource::RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
-                    marker,
-                    id,
-                    top_level_attribute_key,
-                )
-            {
-                *marker = hash.persisted_marker();
+            match crate::resource::RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
+                marker,
+                &origin.display_type,
+                &origin.identity,
+                top_level_attribute_key,
+            ) {
+                Ok(Some(hash)) => *marker = hash.persisted_marker(),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(PersistedAttributesError::LegacySaltTooLong {
+                        attribute_key: top_level_attribute_key.to_string(),
+                        actual: error.actual,
+                        maximum: error.maximum,
+                    });
+                }
             }
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                upgrade_raw_legacy_markers_for_state_row(value, id, top_level_attribute_key);
+                upgrade_raw_legacy_markers_for_state_row(value, origin, top_level_attribute_key)?;
             }
         }
         serde_json::Value::Object(values) => {
             for value in values.values_mut() {
-                upgrade_raw_legacy_markers_for_state_row(value, id, top_level_attribute_key);
+                upgrade_raw_legacy_markers_for_state_row(value, origin, top_level_attribute_key)?;
             }
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
+    Ok(())
 }
 
 /// Extract only redacted-secret leaves from a saved-plan value.
@@ -2505,10 +2621,11 @@ mod tests {
         assert_eq!(error.attribute_key(), "token");
 
         let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
-        let persisted = PersistedAttributes::from_state_row_json(
+        let persisted = persisted_attributes_from_test_state_row(
             &id,
             serde_json::from_value(encoded).expect("attribute object"),
-        );
+        )
+        .expect("state row decode");
         assert!(matches!(
             persisted.get("token"),
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash }))
@@ -2522,10 +2639,11 @@ mod tests {
     fn state_loaded_legacy_attributes_round_trip_through_context_free_serde() {
         let marker = format!("{}{}", crate::value::LEGACY_SECRET_PREFIX, "ab".repeat(32));
         let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
-        let loaded = PersistedAttributes::from_state_row_json(
+        let loaded = persisted_attributes_from_test_state_row(
             &id,
             HashMap::from([("token".to_string(), serde_json::json!(marker))]),
-        );
+        )
+        .expect("state row decode");
 
         let host_wire = serde_json::to_value(&loaded).expect("serialize host saved attributes");
         let guest: PersistedAttributes = serde_json::from_value(host_wire)
@@ -2554,10 +2672,11 @@ mod tests {
             hex::encode(output)
         );
         let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
-        let loaded = PersistedAttributes::from_state_row_json(
+        let loaded = persisted_attributes_from_test_state_row(
             &id,
             HashMap::from([("password".to_string(), serde_json::json!(marker))]),
-        );
+        )
+        .expect("state row decode");
         let round_trip: PersistedAttributes = serde_json::from_value(
             serde_json::to_value(loaded).expect("serialize upgraded legacy digest"),
         )
@@ -2571,6 +2690,27 @@ mod tests {
             hash.persisted_marker()
                 .starts_with(crate::value::EXPLICIT_LEGACY_SECRET_PREFIX)
         );
+    }
+
+    #[test]
+    fn state_row_upgrade_rejects_legacy_salt_too_long_for_its_marker_format() {
+        let marker = format!("{}{}", crate::value::LEGACY_SECRET_PREFIX, "ab".repeat(32));
+        let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "x".repeat(5000),
+            "attributes": { "token": marker },
+        }))
+        .expect("decode oversized state row shape");
+
+        let error = encoded
+            .decode()
+            .expect_err("an upgraded marker must never exceed the parser's salt bound");
+        assert_eq!(error.attribute_key(), "token");
+        assert!(matches!(
+            error,
+            PersistedAttributesError::LegacySaltTooLong { .. }
+        ));
     }
 
     #[test]

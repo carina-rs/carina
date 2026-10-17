@@ -35,11 +35,15 @@ Save the plan to a JSON file for later use with `carina apply`. The saved plan i
 Saved plans never contain secret plaintext. Carina stores each secret as a
 typed placeholder containing only an Argon2id hash, including secrets nested
 inside lists or maps and values derived from `decrypt()` or other expressions.
-Each placeholder is a self-contained PHC string with a randomly generated salt
-and the Argon2id version and cost parameters used to create it. Equal secrets
-therefore receive unrelated hashes, and a resource move does not change how a
-stored digest is verified. The placeholder is not a provider value and cannot
-be applied directly. Backend
+New placeholders use a self-contained PHC string with a randomly generated
+salt and the Argon2id version and cost parameters used to create it. When an
+unchanged secret already exists in state, the plan reuses that exact digest
+and therefore keeps its salt. A pre-v12 digest may instead appear in the
+self-contained `argon2-legacy` form until the next write that has the
+plaintext available. Equal newly written secrets receive unrelated hashes,
+and a resource move does not change how a stored digest is verified. State
+writeback stores the same digest carried by the plan placeholder. The
+placeholder is not a provider value and cannot be applied directly. Backend
 attributes cannot be secret-derived because backend implementations accept only
 ordinary configuration values; validation rejects `secret()` and `decrypt()`
 results there.

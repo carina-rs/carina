@@ -6,7 +6,9 @@ use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
 pub use carina_core::provider::PreviousSecretHashAuthority;
-use carina_core::provider::{PersistedAttributes, PersistedAttributesError, RawSavedAttrs};
+use carina_core::provider::{
+    EncodedStateRowAttributes, PersistedAttributes, PersistedAttributesError, RawSavedAttrs,
+};
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
@@ -21,6 +23,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::backend::{BackendError, InvalidResourceIdentityError};
+
+#[cfg(any(test, feature = "test-utils"))]
+fn persisted_attributes_for_test_state_row(
+    row_id: &ResourceId,
+    attributes: HashMap<String, serde_json::Value>,
+) -> PersistedAttributes {
+    let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
+        "provider": row_id.provider,
+        "resource_type": row_id.resource_type,
+        "identity": row_id.identity_str().expect("test state row has a resolved identity"),
+        "attributes": attributes,
+    }))
+    .expect("test state row uses the encoded state shape");
+    let decoded = encoded
+        .decode()
+        .expect("test state row legacy salt is representable");
+    let (_, _, _, attributes) = decoded.into_parts();
+    attributes
+}
 
 /// A provider or desired value could not be encoded into persisted state.
 #[derive(Debug, thiserror::Error)]
@@ -1164,7 +1185,7 @@ impl DeposedInstance {
             key,
             identifier,
             provider_instance,
-            PersistedAttributes::from_state_row_json(row_id, attributes),
+            persisted_attributes_for_test_state_row(row_id, attributes),
             dependency_bindings,
         )
     }
@@ -1266,13 +1287,10 @@ struct EncodedDeposedInstance {
 
 #[derive(Deserialize)]
 struct EncodedResourceState {
-    resource_type: String,
-    #[serde(alias = "name")]
-    identity: ResourceIdentity,
-    provider: String,
+    #[serde(flatten)]
+    persisted: EncodedStateRowAttributes,
     #[serde(default)]
     identifier: Option<String>,
-    attributes: HashMap<String, serde_json::Value>,
     #[serde(default)]
     deposed: Vec<EncodedDeposedInstance>,
     #[serde(default)]
@@ -1298,28 +1316,30 @@ struct EncodedResourceState {
 impl<'de> Deserialize<'de> for ResourceState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = EncodedResourceState::deserialize(deserializer)?;
-        let row_id = ResourceId::with_provider_identity(
-            encoded.provider.clone(),
-            encoded.resource_type.clone(),
-            encoded.identity.clone(),
-            encoded.directives.provider_instance.clone(),
-        );
-        let attributes = PersistedAttributes::from_state_row_json(&row_id, encoded.attributes);
+        let persisted = encoded
+            .persisted
+            .decode()
+            .map_err(serde::de::Error::custom)?;
         let deposed = encoded
             .deposed
             .into_iter()
-            .map(|instance| DeposedInstance {
-                key: instance.key,
-                identifier: instance.identifier,
-                provider_instance: instance.provider_instance,
-                attributes: PersistedAttributes::from_state_row_json(&row_id, instance.attributes),
-                dependency_bindings: instance.dependency_bindings,
+            .map(|instance| {
+                Ok(DeposedInstance {
+                    key: instance.key,
+                    identifier: instance.identifier,
+                    provider_instance: instance.provider_instance,
+                    attributes: persisted
+                        .decode_related_attributes(instance.attributes)
+                        .map_err(serde::de::Error::custom)?,
+                    dependency_bindings: instance.dependency_bindings,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, D::Error>>()?;
+        let (provider, resource_type, identity, attributes) = persisted.into_parts();
         Ok(Self {
-            resource_type: encoded.resource_type,
-            identity: encoded.identity,
-            provider: encoded.provider,
+            resource_type,
+            identity,
+            provider,
             identifier: encoded.identifier,
             attributes,
             deposed,
@@ -1377,7 +1397,7 @@ impl ResourceState {
             self.directives.provider_instance.clone(),
         );
         let upgraded =
-            PersistedAttributes::from_state_row_json(&id, HashMap::from([(key.clone(), value)]));
+            persisted_attributes_for_test_state_row(&id, HashMap::from([(key.clone(), value)]));
         self.attributes.extend(upgraded);
     }
 

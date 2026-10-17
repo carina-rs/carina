@@ -11,6 +11,18 @@ When you run `carina apply`, Carina records each managed resource and its attrib
 
 By default, state is stored locally as `carina.state.json`. For team usage, configure a remote S3 backend.
 
+### State format upgrades
+
+State format v12 upgrades old raw secret markers when the state file is read.
+An `_secret:argon2:<hash>` value from an earlier state version is bound to the
+provider, resource type, stored identity, and top-level attribute key from its
+own row, then represented as the self-contained
+`_secret:argon2-legacy:<row-salt-hex>:<hash-hex>` form. This load-time upgrade
+does not require the plaintext and does not create a resource change. The next
+state write that has the matching plaintext replaces the legacy form with a
+standard `_secret:$argon2id$...` PHC digest containing a fresh random salt and
+explicit Argon2 parameters.
+
 ## Configuring the S3 backend
 
 Add a `backend` block to your `.crn` file:
