@@ -9,7 +9,8 @@ use carina_core::provider::{
     ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, UnknownReason, Value,
+    ConcreteValue, DataSource, DeferredValue, ResolvedResource, Resource, ResourceId, State,
+    UnknownReason, Value,
 };
 use carina_plugin_host::WasmProviderFactory;
 
@@ -885,6 +886,71 @@ async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
         Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
             if loaded == &expected_hash
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change() {
+    use argon2::Argon2;
+    use carina_core::provider::PersistedAttributes;
+
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy-write-only", None);
+    let plaintext = "wasm-write-only-legacy";
+    let material = serde_json::to_vec(&serde_json::Value::String(plaintext.to_string()))
+        .expect("serialize legacy plaintext");
+    let salt = b"carina:mock.test.resource:legacy-write-only:__mock_write_only_secret__";
+    let mut output = [0_u8; 32];
+    Argon2::default()
+        .hash_password_into(&material, salt, &mut output)
+        .expect("hash legacy write-only fixture");
+    let marker = format!("_secret:argon2:{}", hex::encode(output));
+    let persisted = PersistedAttributes::from_state_row_json(
+        &id,
+        HashMap::from([(
+            "__mock_write_only_secret__".to_string(),
+            serde_json::json!(marker),
+        )]),
+    );
+    let saved_attrs = lifted_saved_attrs([(id.clone(), persisted.to_values())]);
+    let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+
+    normalizer
+        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
+        .await
+        .expect("hydrate write-only legacy secret");
+
+    let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
+        states[&id].attributes.get("__mock_write_only_secret__")
+    else {
+        panic!("hydrated write-only legacy marker must remain typed")
+    };
+    assert!(
+        hash.verify(&material),
+        "the returned marker must retain the saved row's origin without a previous current-state leaf",
+    );
+
+    let desired = Resource::from_id(id.clone()).with_attribute(
+        "__mock_write_only_secret__",
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String(plaintext.into()),
+        )))),
+    );
+    let diff = carina_core::differ::diff(
+        &ResolvedResource::new(desired),
+        &states[&id],
+        None,
+        None,
+        None,
+    );
+    assert!(
+        !diff.is_change(),
+        "refresh hydration of an unchanged write-only legacy secret must not plan an update: {diff:?}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

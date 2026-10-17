@@ -370,6 +370,15 @@ impl CarinaProvider for MockProcessProvider {
                         .attributes
                         .insert("__mock_hydrated_read_state__".to_string(), marker);
                 }
+                if let Some(marker) = saved_attrs
+                    .get(&input_key)
+                    .and_then(|attrs| attrs.get("__mock_write_only_secret__"))
+                    .cloned()
+                {
+                    state
+                        .attributes
+                        .insert("__mock_write_only_secret__".to_string(), marker);
+                }
                 (Self::resource_id_wire_key(&state.id), state)
             })
             .collect();

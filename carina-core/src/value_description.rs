@@ -70,10 +70,9 @@ mod tests {
 
     #[test]
     fn typed_persisted_secret_is_masked() {
-        let value: Value = serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": format!("argon2:{}", "deadbeef".repeat(8)) }
-        }))
-        .expect("deserialize persisted secret");
+        let value = Value::Deferred(crate::resource::DeferredValue::RedactedSecret {
+            hash: crate::resource::RedactedSecretHash::generate(b"description-test"),
+        });
 
         assert_eq!(ValueDescription::of(&value).to_string(), "secret");
     }

@@ -3875,21 +3875,24 @@ mod tests {
     #[tokio::test]
     async fn refresh_deposed_generation_rehashes_existing_hash_without_desired_secret() {
         let mut state = StateFile::new();
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
-        row.deposed.push(deposed_instance(
-            deposed_key("secret-key"),
-            "db-old",
-            None,
-            HashMap::from([(
-                "password".to_string(),
-                json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-            )]),
-        ));
+        row.deposed
+            .push(DeposedInstance::from_persisted_json_for_resource(
+                &id,
+                deposed_key("secret-key"),
+                "db-old".to_string(),
+                None,
+                HashMap::from([(
+                    "password".to_string(),
+                    json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
+                )]),
+                BTreeSet::new(),
+            ));
         state
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &ResolvedResourceId::new(id.clone()),
             "db-old",
@@ -3936,22 +3939,25 @@ mod tests {
     #[tokio::test]
     async fn refresh_deposed_generation_merges_nested_secret_hash_per_leaf_and_converges() {
         let mut state = StateFile::new();
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
             "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
         });
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
-        row.deposed.push(deposed_instance(
-            deposed_key("nested-secret-key"),
-            "vpc-old",
-            None,
-            HashMap::from([("tags".to_string(), previous_tags.clone())]),
-        ));
+        row.deposed
+            .push(DeposedInstance::from_persisted_json_for_resource(
+                &id,
+                deposed_key("nested-secret-key"),
+                "vpc-old".to_string(),
+                None,
+                HashMap::from([("tags".to_string(), previous_tags.clone())]),
+                BTreeSet::new(),
+            ));
         state
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let mut provider_tags = indexmap::IndexMap::new();
         provider_tags.insert("Name".to_string(), string_value("new-name"));
         provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));

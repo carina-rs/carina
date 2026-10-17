@@ -6,10 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 fn persisted_attributes_from_state_json(
     attributes: &HashMap<String, serde_json::Value>,
 ) -> PersistedAttributes {
-    serde_json::from_value(
-        serde_json::to_value(attributes).expect("test state JSON is serializable"),
+    PersistedAttributes::from_state_row_json(
+        &ResourceId::with_provider_identity("test", "test.resource", "fixture-row", None),
+        attributes.clone(),
     )
-    .expect("test attributes use the persisted JSON shape")
 }
 
 fn state_json_from_persisted_attributes(

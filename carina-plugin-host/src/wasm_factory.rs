@@ -30,8 +30,8 @@ use carina_core::provider::{
     SavedAttrs, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
-    Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
-    value_contains_unknown,
+    LegacySecretRowOrigin, Resource, ResourceId, ResourceIdentityState, State, Value,
+    contains_resource_ref, value_contains_unknown,
 };
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
@@ -3343,11 +3343,12 @@ fn apply_wit_state_attribute_updates(
     operation: &'static str,
     current_states: &mut HashMap<ResourceId, State>,
     updates: Vec<WitStateAttributeUpdate>,
+    legacy_origins: &HashMap<ResourceId, LegacySecretRowOrigin>,
 ) -> ProviderResult<()> {
     let decoded = updates
         .into_iter()
         .map(|(id, attributes)| {
-            wasm_convert::wit_to_core_persisted_value_map(&attributes)
+            wasm_convert::wit_to_core_persisted_value_map(&attributes, legacy_origins.get(&id))
                 .map(|attributes| (id.clone(), attributes))
                 .map_err(|error| {
                     wasm_value_decode_provider_error(operation, error).for_resource(id)
@@ -3355,51 +3356,33 @@ fn apply_wit_state_attribute_updates(
         })
         .collect::<ProviderResult<Vec<_>>>()?;
 
-    for (id, mut attributes) in decoded {
+    for (id, attributes) in decoded {
         if let Some(state) = current_states.get_mut(&id) {
-            for (key, value) in &mut attributes {
-                if let Some(previous) = state.attributes.get(key) {
-                    preserve_matching_secret_hash(value, previous);
-                }
-            }
             state.attributes = attributes;
         }
     }
     Ok(())
 }
 
-/// Keep the opaque metadata that is intentionally absent from the plugin
-/// wire when a normalizer returns the same persisted digest at the same path.
-/// In particular, legacy hashes carry their originating state-row binding in
-/// memory; a marker introduced or moved by the guest remains unbound.
-fn preserve_matching_secret_hash(value: &mut Value, previous: &Value) {
-    match (value, previous) {
-        (
-            Value::Deferred(carina_core::resource::DeferredValue::RedactedSecret { hash }),
-            Value::Deferred(carina_core::resource::DeferredValue::RedactedSecret {
-                hash: previous_hash,
-            }),
-        ) if hash == previous_hash => *hash = previous_hash.clone(),
-        (
-            Value::Concrete(carina_core::resource::ConcreteValue::Map(values)),
-            Value::Concrete(carina_core::resource::ConcreteValue::Map(previous_values)),
-        ) => {
-            for (key, value) in values {
-                if let Some(previous) = previous_values.get(key) {
-                    preserve_matching_secret_hash(value, previous);
-                }
-            }
-        }
-        (
-            Value::Concrete(carina_core::resource::ConcreteValue::List(values)),
-            Value::Concrete(carina_core::resource::ConcreteValue::List(previous_values)),
-        ) => {
-            for (value, previous) in values.iter_mut().zip(previous_values) {
-                preserve_matching_secret_hash(value, previous);
-            }
-        }
-        _ => {}
-    }
+fn collect_legacy_row_origins(
+    current_states: &HashMap<ResourceId, State>,
+    saved_attrs: Option<&SavedAttrs>,
+) -> HashMap<ResourceId, LegacySecretRowOrigin> {
+    current_states
+        .iter()
+        .filter_map(|(id, state)| {
+            saved_attrs
+                .and_then(|saved| saved.legacy_row_origin(id))
+                .or_else(|| {
+                    state
+                        .attributes
+                        .values()
+                        .find_map(carina_core::value::legacy_secret_row_origin)
+                })
+                .cloned()
+                .map(|origin| (id.clone(), origin))
+        })
+        .collect()
 }
 
 fn finish_guest_call<T>(
@@ -3570,6 +3553,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         current_states: &'a mut HashMap<ResourceId, State>,
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
+            let legacy_origins = collect_legacy_row_origins(current_states, None);
             let mut resolved_by_key = HashMap::new();
             let mut colliding_keys = HashSet::new();
             let mut single_wit_states = Vec::new();
@@ -3656,7 +3640,12 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 updates.push(take_single_wit_state_result("normalize_state", id, result)?);
             }
 
-            apply_wit_state_attribute_updates("normalize_state", current_states, updates)?;
+            apply_wit_state_attribute_updates(
+                "normalize_state",
+                current_states,
+                updates,
+                &legacy_origins,
+            )?;
             Ok(())
         })
     }
@@ -3667,6 +3656,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         saved_attrs: &'a SavedAttrs,
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
+            let legacy_origins = collect_legacy_row_origins(current_states, Some(saved_attrs));
             let mut resolved_by_key = HashMap::new();
             let mut colliding_keys = HashSet::new();
             let mut single_batches = Vec::new();
@@ -3780,7 +3770,12 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 )?);
             }
 
-            apply_wit_state_attribute_updates("hydrate_read_state", current_states, updates)?;
+            apply_wit_state_attribute_updates(
+                "hydrate_read_state",
+                current_states,
+                updates,
+                &legacy_origins,
+            )?;
             Ok(())
         })
     }
@@ -4379,8 +4374,13 @@ mod tests {
             ),
         ];
 
-        let error = apply_wit_state_attribute_updates("normalize_state", &mut states, updates)
-            .expect_err("malformed guest output must fail normalization");
+        let error = apply_wit_state_attribute_updates(
+            "normalize_state",
+            &mut states,
+            updates,
+            &HashMap::new(),
+        )
+        .expect_err("malformed guest output must fail normalization");
 
         assert!(error.to_string().contains("map-val"));
         assert!(std::error::Error::source(&error).is_some());
@@ -4402,19 +4402,20 @@ mod tests {
         use wit_types::Value as WitValue;
 
         let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
-        let material = br#"\"wire-legacy\""#;
+        let material = b"\"wire-legacy\"";
         let salt = b"carina:mock.test.resource:legacy:comment";
         let mut output = [0_u8; 32];
         Argon2::default()
             .hash_password_into(material, salt, &mut output)
             .expect("hash legacy state fixture");
         let marker = format!("_secret:argon2:{}", hex::encode(output));
-        let persisted: PersistedAttributes = serde_json::from_value(serde_json::json!({
-            "comment": marker,
-        }))
-        .expect("deserialize persisted attributes");
-        let attributes = persisted.to_values_for_resource(&id);
+        let persisted = PersistedAttributes::from_state_row_json(
+            &id,
+            HashMap::from([("comment".to_string(), serde_json::json!(marker))]),
+        );
+        let attributes = persisted.to_values();
         let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
+        let origins = collect_legacy_row_origins(&states, None);
 
         apply_wit_state_attribute_updates(
             "normalize_state",
@@ -4423,6 +4424,7 @@ mod tests {
                 id.clone(),
                 vec![("comment".to_string(), WitValue::StrVal(marker))],
             )],
+            &origins,
         )
         .expect("apply normalized state");
 
@@ -4434,6 +4436,53 @@ mod tests {
         assert!(
             hash.verify(material),
             "the normalizer roundtrip must retain the marker's originating row context"
+        );
+    }
+
+    #[test]
+    fn normalized_state_binds_legacy_marker_moved_to_a_new_attribute() {
+        use argon2::Argon2;
+        use carina_core::provider::PersistedAttributes;
+        use wit_types::Value as WitValue;
+
+        let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
+        let material = br#"\"wire-legacy\""#;
+        let salt = b"carina:mock.test.resource:legacy:comment";
+        let mut output = [0_u8; 32];
+        Argon2::default()
+            .hash_password_into(material, salt, &mut output)
+            .expect("hash legacy state fixture");
+        let marker = format!("_secret:argon2:{}", hex::encode(output));
+        let persisted = PersistedAttributes::from_state_row_json(
+            &id,
+            HashMap::from([(
+                "historical".to_string(),
+                serde_json::json!(format!("_secret:argon2:{}", "00".repeat(32))),
+            )]),
+        );
+        let attributes = persisted.to_values();
+        let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
+        let origins = collect_legacy_row_origins(&states, None);
+
+        apply_wit_state_attribute_updates(
+            "hydrate_read_state",
+            &mut states,
+            vec![(
+                id.clone(),
+                vec![("comment".to_string(), WitValue::StrVal(marker))],
+            )],
+            &origins,
+        )
+        .expect("apply hydrated state");
+
+        let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
+            states[&id].attributes.get("comment")
+        else {
+            panic!("hydrated legacy marker must remain a typed secret hash")
+        };
+        assert!(
+            hash.verify(material),
+            "every returned legacy marker must bind to the row origin, not a matching old path",
         );
     }
 

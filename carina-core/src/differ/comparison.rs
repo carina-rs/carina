@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use crate::explicit::{self, ExplicitFields};
 use crate::resource::{ConcreteValue, DeferredValue, SavedValueViews, Value, merge_with_saved};
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
-use crate::value::{canonical_secret_hash_material, contains_secret, value_to_json};
+use crate::value::{canonical_secret_hash_material, contains_secret};
 
 /// Type-aware semantic comparison of two Values.
 ///
@@ -483,10 +483,7 @@ fn is_type_default(
 ///
 fn secret_matches_state(inner: &Value, state_value: &Value) -> bool {
     if let Value::Deferred(DeferredValue::RedactedSecret { hash }) = state_value {
-        let Ok(inner_json) = value_to_json(inner) else {
-            return false;
-        };
-        let Some(material) = canonical_secret_hash_material(&inner_json) else {
+        let Ok(material) = canonical_secret_hash_material(inner) else {
             return false;
         };
         return hash.verify(material);

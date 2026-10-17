@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use carina_core::parser::{BackendConfig, SavedProviderConfigs};
 use carina_core::plan::Plan;
 use carina_core::provider::{PersistedAttributes, Provider, ReadRequest};
-use carina_core::resource::{
-    Composition, DataSource, ResolvedResourceId, Resource, ResourceId, State, Value,
-};
+use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State, Value};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
@@ -58,8 +56,14 @@ impl HistoricalResourceAddresses {
         Self { moved_origins }
     }
 
-    pub(super) fn origin_for(&self, id: &ResourceId) -> Option<&ResourceId> {
-        self.moved_origins.get(id)
+    pub(super) fn origin_for_state(&self, id: &ResourceId, state: &State) -> ResourceId {
+        state
+            .attributes
+            .values()
+            .find_map(carina_core::value::legacy_secret_row_origin)
+            .and_then(|origin| origin.historical_resource_id_like(id))
+            .or_else(|| self.moved_origins.get(id).cloned())
+            .unwrap_or_else(|| id.clone())
     }
 }
 
@@ -182,6 +186,7 @@ impl DesiredPlanFile {
         provider: &dyn Provider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
+        historical_addresses: &HistoricalResourceAddresses,
         apply_target: ApplyTarget<'_>,
     ) -> Result<RehydratedPlanFile, AppError> {
         match self {
@@ -191,6 +196,7 @@ impl DesiredPlanFile {
                     provider,
                     actual_states,
                     verified_planned_states,
+                    historical_addresses,
                     apply_target,
                 )
                 .await
@@ -227,6 +233,7 @@ impl DesiredVerifiedPlanFile {
         provider: &dyn Provider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
+        historical_addresses: &HistoricalResourceAddresses,
         apply_target: ApplyTarget<'_>,
     ) -> Result<RehydratedPlanFile, AppError> {
         let redacted_states: HashMap<_, _> = self
@@ -250,20 +257,16 @@ impl DesiredVerifiedPlanFile {
                 continue;
             }
 
-            let historical_row =
-                ResolvedResourceId::try_new(entry.id.clone()).ok_or_else(|| {
-                    super::saved_plan_secret_shape_error(entry.id.to_string(), apply_target)
-                })?;
-            entry.state = carina_core::value::bind_legacy_secret_hashes_to_state_row(
-                &entry.state,
-                &historical_row,
-            );
-
             // Orphans do not participate in ordinary drift reads. Read them
             // here because their historical secret still needs verification.
             if !actual_states.contains_key(&entry.id) {
-                let actual = provider
-                    .read(&entry.id, entry.state.identifier.as_deref(), ReadRequest)
+                let historical_id = historical_addresses.origin_for_state(&entry.id, &entry.state);
+                let mut actual = provider
+                    .read(
+                        &historical_id,
+                        entry.state.identifier.as_deref(),
+                        ReadRequest,
+                    )
                     .await
                     .map_err(AppError::Provider)?;
                 if !actual.exists {
@@ -272,6 +275,7 @@ impl DesiredVerifiedPlanFile {
                         apply_target,
                     ));
                 }
+                actual.id = entry.id.clone();
                 actual_states.insert(entry.id.clone(), actual);
             }
             let actual = actual_states.get(&entry.id).ok_or_else(|| {

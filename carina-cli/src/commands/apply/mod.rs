@@ -26,9 +26,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
-use carina_core::resource::{
-    DataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
-};
+use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
@@ -1021,12 +1019,12 @@ pub(crate) async fn detect_drift(
         // resources.
         let planned_state = planned_states.get(&resource.id).copied();
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
-        let historical_id = historical_addresses
-            .origin_for(&resource.id)
-            .unwrap_or(&resource.id);
+        let historical_id = planned_state
+            .map(|state| historical_addresses.origin_for_state(&resource.id, state))
+            .unwrap_or_else(|| resource.id.clone());
 
         let mut actual_state = provider
-            .read(historical_id, identifier, ReadRequest)
+            .read(&historical_id, identifier, ReadRequest)
             .await
             .map_err(AppError::Provider)?;
         // The provider read uses the pre-move address, but every downstream
@@ -1051,14 +1049,8 @@ pub(crate) async fn detect_drift(
                     ));
                 }
             } else if planned.exists && actual_state.exists {
-                let historical_row = ResolvedResourceId::try_new(historical_id.clone())
-                    .expect("saved-plan historical resource IDs are resolved");
-                let planned = carina_core::value::bind_legacy_secret_hashes_to_state_row(
-                    planned,
-                    &historical_row,
-                );
                 let verification =
-                    carina_core::value::verify_historical_state_secrets(&planned, &actual_state)
+                    carina_core::value::verify_historical_state_secrets(planned, &actual_state)
                         .map_err(|error| {
                             saved_plan_secret_rehydration_error(error, apply_target)
                         })?;
@@ -2642,9 +2634,11 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 15 guarantees that
-    // secret placeholders carry embedded salts and that resource placeholders
-    // can be reused byte-for-byte by state writeback. Version 14 guarantees
+    // Validate version compatibility. Plan-file version 16 guarantees that
+    // legacy secret placeholders in current states carry their originating
+    // state-row context. Version 15 guarantees that new secret placeholders
+    // carry embedded salts and that resource placeholders can be reused
+    // byte-for-byte by state writeback. Version 14 guarantees
     // that embedded current states were created after legacy `_`-prefixed host
     // attributes moved behind the state migration boundary and orphan state
     // became structurally paired with its host metadata during planning.
@@ -3021,6 +3015,7 @@ async fn run_apply_from_plan_locked(
             &provider,
             &mut actual_states,
             &mut verified_planned_states,
+            &historical_addresses,
             apply_target,
         )
         .await?;

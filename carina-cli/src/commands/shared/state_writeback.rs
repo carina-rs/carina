@@ -117,7 +117,7 @@ impl PostApplyStates {
                 identity,
                 rs.directives.provider_instance.clone(),
             );
-            let attrs = rs.persisted_attributes().to_values_for_resource(&id);
+            let attrs = rs.persisted_attributes().to_values();
             map.insert(
                 id.clone(),
                 carina_core::resource::State::existing(id, attrs),
@@ -1249,9 +1249,17 @@ fn build_state_after_apply_inner(
 
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
-        let existing = id
-            .identity_str()
-            .and_then(|identity| state.find_resource(&id.provider, &id.resource_type, identity));
+        let previous_id = plan
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Move { from, to } if to.as_inner() == id => Some(from.as_inner()),
+                _ => None,
+            })
+            .unwrap_or(id);
+        let existing = previous_id.identity_str().and_then(|identity| {
+            state.find_resource(&previous_id.provider, &previous_id.resource_type, identity)
+        });
         let write_only_keys: Vec<String> = schemas
             .get_for(resource)
             .map(|schema| {
@@ -1363,9 +1371,7 @@ pub(crate) fn build_orphan_resource(
     let rs = sf
         .find_resource(&id.provider, &id.resource_type, id.identity_str())
         .expect("orphan must exist in state file");
-    let attributes = rs
-        .persisted_attributes()
-        .to_values_for_resource(id.as_inner());
+    let attributes = rs.persisted_attributes().to_values();
     Resource {
         id: id.as_inner().clone(),
         attributes: attributes.into_iter().collect(),

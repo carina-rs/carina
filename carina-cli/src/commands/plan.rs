@@ -154,7 +154,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 15;
+    pub const CURRENT_VERSION: u32 = 16;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -709,6 +709,11 @@ fn build_plan_file<E>(
         .collect::<Result<Vec<_>, carina_core::value::SerializationError>>()?;
 
     Ok(PlanFile {
+        // Round 1 follow-up: bumped 15→16 — legacy placeholders in embedded
+        // current states now serialize their originating row context. A v15
+        // plan can contain an unbound legacy digest and cannot safely verify
+        // it after an anonymous reconciliation or move.
+        //
         // carina#3863 / carina#3865: bumped 14→15 — secret digests now
         // embed a random salt and saved-plan resource placeholders carry the
         // exact digest that state writeback must reuse. A v14 plan contains

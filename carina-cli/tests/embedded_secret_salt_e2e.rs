@@ -49,6 +49,27 @@ impl Scenario {
         )
         .expect("parse state")
     }
+
+    fn write_state_json(&self, state: &Value) {
+        fs::write(
+            self.project.join("carina.state.json"),
+            serde_json::to_vec_pretty(state).expect("encode state"),
+        )
+        .expect("write state");
+    }
+
+    fn provider_json(&self) -> Value {
+        serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock provider state"))
+            .expect("parse mock provider state")
+    }
+
+    fn write_provider_json(&self, state: &Value) {
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(state).expect("encode mock provider state"),
+        )
+        .expect("write mock provider state");
+    }
 }
 
 fn assert_success(label: &str, output: &Output) {
@@ -192,6 +213,7 @@ let old = mock.test.resource {
         "initial moved-secret apply",
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
+    let before_move = comment_marker(&scenario.state_json(), "old");
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -210,6 +232,175 @@ let renamed = mock.test.resource {
 
     assert_plan_counts(&scenario.carina(&["plan", "--refresh=false", "."]), 0, 0, 0);
     assert_plan_counts(&scenario.carina(&["plan", "."]), 0, 0, 0);
+    assert_success(
+        "apply pure moved-secret rename",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    assert_eq!(
+        comment_marker(&scenario.state_json(), "renamed"),
+        before_move,
+        "a pure move must reuse the source row's byte-identical digest",
+    );
+}
+
+#[test]
+fn nested_secret_wrappers_converge_and_saved_plan_applies() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let nested = mock.test.resource {
+  name = "nested-secret-wrapper"
+  tags = secret({
+    a = secret("NESTED_WRAPPER_PLAIN")
+  })
+}
+"#,
+    );
+    assert_success(
+        "apply nested secret wrapper",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    assert_plan_counts(&scenario.carina(&["plan", "--refresh=false", "."]), 0, 0, 0);
+    assert_plan_counts(
+        &scenario.carina(&["plan", "--refresh=false", "--out", "nested-plan.json", "."]),
+        0,
+        0,
+        0,
+    );
+    assert_success(
+        "apply nested-secret saved plan",
+        &scenario.carina(&[
+            "apply",
+            "--auto-approve",
+            "--lock=false",
+            "nested-plan.json",
+        ]),
+    );
+}
+
+#[test]
+fn orphan_rekey_with_legacy_secret_applies_saved_plan() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let old = mock.test.resource {
+  name    = "orphan-rekey-legacy"
+  comment = secret("ORPHAN_REKEY_LEGACY_PLAIN")
+}
+"#,
+    );
+    assert_success(
+        "apply orphan-rekey fixture",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let mut state = scenario.state_json();
+    state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
+        &Value::String("ORPHAN_REKEY_LEGACY_PLAIN".to_string()),
+        "mock.test.resource",
+        "old",
+        "comment",
+    ));
+    scenario.write_state_json(&state);
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+moved {
+  from = mock.test.resource "old"
+  to   = mock.test.resource "renamed_orphan"
+}
+"#,
+    );
+
+    assert_success(
+        "plan orphan rekey",
+        &scenario.carina(&["plan", "--refresh=false", "--out", "orphan-rekey.json", "."]),
+    );
+    assert_success(
+        "apply orphan-rekey saved plan",
+        &scenario.carina(&[
+            "apply",
+            "--auto-approve",
+            "--lock=false",
+            "orphan-rekey.json",
+        ]),
+    );
+}
+
+#[test]
+fn anonymous_identity_reconcile_preserves_legacy_origin_for_plan_and_apply() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+mock.example.consumer {
+  name  = "anonymous-legacy-reconcile"
+  plain = secret("ANONYMOUS_LEGACY_RECONCILE_PLAIN")
+}
+"#,
+    );
+    assert_success(
+        "apply anonymous legacy fixture",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+
+    let mut state = scenario.state_json();
+    let old_identity = state["resources"][0]["identity"]
+        .as_str()
+        .expect("anonymous state identity")
+        .to_string();
+    let stored_identity = old_identity
+        .strip_prefix("mock_")
+        .expect("current anonymous identity includes the provider prefix")
+        .to_string();
+    state["resources"][0]["identity"] = Value::String(stored_identity.clone());
+    state["resources"][0]["attributes"]["plain"] = Value::String(legacy_marker(
+        &Value::String("ANONYMOUS_LEGACY_RECONCILE_PLAIN".to_string()),
+        "mock.example.consumer",
+        &stored_identity,
+        "plain",
+    ));
+    scenario.write_state_json(&state);
+
+    let mut provider = scenario.provider_json();
+    let provider_rows = provider.as_object_mut().expect("mock provider object");
+    let old_key = provider_rows
+        .keys()
+        .find(|key| key.ends_with(&old_identity))
+        .expect("anonymous provider key")
+        .clone();
+    let provider_row = provider_rows
+        .remove(&old_key)
+        .expect("anonymous provider row");
+    provider_rows.insert(
+        old_key.replace(&old_identity, &stored_identity),
+        provider_row,
+    );
+    scenario.write_provider_json(&provider);
+
+    assert_plan_counts(
+        &scenario.carina(&[
+            "plan",
+            "--refresh=false",
+            "--out",
+            "anonymous-legacy.json",
+            ".",
+        ]),
+        0,
+        0,
+        0,
+    );
+    assert_success(
+        "apply anonymous legacy saved plan",
+        &scenario.carina(&[
+            "apply",
+            "--auto-approve",
+            "--lock=false",
+            "anonymous-legacy.json",
+        ]),
+    );
 }
 
 #[test]
