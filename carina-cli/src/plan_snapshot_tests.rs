@@ -945,6 +945,23 @@ fn snapshot_default_tags() {
 }
 
 #[test]
+fn snapshot_default_tags_update_replace() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("default_tags_update_replace");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_state_blocks() {
     let (plan, schemas, _moved) = build_plan_from_fixture("state_blocks");
     let output = strip_ansi(&format_plan(

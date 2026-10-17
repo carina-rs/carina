@@ -340,6 +340,17 @@ fn apply_updates_default_tags_without_persisting_host_metadata() {
 "#,
     )
     .expect("update provider configuration");
+
+    let plan = run_cli(project.path(), &["plan", "."]);
+    assert_success(&plan, "plan");
+    let stdout = String::from_utf8_lossy(&plan.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim() == r#"+ Team: "x"  # default_tags"#),
+        "update plan must annotate the newly injected default tag; stdout:\n{stdout}"
+    );
+
     assert_success(
         &run_cli(project.path(), &["apply", ".", "--auto-approve"]),
         "apply",

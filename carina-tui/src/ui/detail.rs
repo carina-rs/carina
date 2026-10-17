@@ -9,6 +9,7 @@ use crate::app::{App, FocusedPanel};
 use super::diff::{
     render_list_of_maps_diff, render_map_diff_entries, render_string_list_diff_entries,
 };
+use super::push_annotation_span;
 use super::style::effect_style;
 use super::value_view::{value_spans, value_spans_dimmed};
 
@@ -101,12 +102,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            if let Some(ann) = annotation {
-                spans.push(Span::styled(
-                    format!("  {}", ann),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
+            push_annotation_span(&mut spans, annotation.as_deref());
             let mut line = Line::from(spans);
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
@@ -153,12 +149,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 let pretty = carina_core::value::format_value_pretty(&entry.value, layout);
                 let mut spans = vec![Span::raw(format!("    {}: ", entry.key))];
                 spans.extend(value_spans(&pretty, false));
-                if let Some(ann) = &entry.annotation {
-                    spans.push(Span::styled(
-                        format!("  {}", ann),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
+                push_annotation_span(&mut spans, entry.annotation.as_deref());
                 lines.push(Line::from(spans));
             }
         }

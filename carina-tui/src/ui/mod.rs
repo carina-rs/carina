@@ -20,6 +20,15 @@ use self::help::draw_help;
 use self::search::draw_search_bar;
 use self::tree::draw_tree;
 
+fn push_annotation_span(spans: &mut Vec<Span<'_>>, annotation: Option<&str>) {
+    if let Some(annotation) = annotation {
+        spans.push(Span::styled(
+            format!("  {annotation}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+}
+
 /// Draw the main layout: tree (70%), detail panel (30%), help/search bar (1 line)
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()

@@ -1,0 +1,18 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -/+ awscc.ec2.Vpc replaced (must be replaced)
+      cidr_block: "10.1.0.0/16" → "10.2.0.0/16" (forces replacement)
+      tags:
+        ~ ManagedBy: "legacy" → "carina"  # default_tags
+        + Team: "x"  # default_tags
+  ~ awscc.ec2.Vpc updated
+      tags:
+        + Team: "x"  # default_tags
+      # (1 unchanged attribute hidden)
+
+Plan: 0 to add, 1 to change, 1 to replace, 0 to destroy.
+

@@ -343,6 +343,8 @@ pub enum MapDiffEntryIR {
     Added {
         key: String,
         value: String,
+        /// Optional annotation (e.g., "# default_tags") shown after the value.
+        annotation: Option<String>,
     },
     Removed {
         key: String,
@@ -352,6 +354,8 @@ pub enum MapDiffEntryIR {
         key: String,
         old: String,
         new: String,
+        /// Optional annotation (e.g., "# default_tags") shown after the new value.
+        annotation: Option<String>,
     },
     /// Nested map diff: when both old and new values are maps,
     /// recursively compute key-level diffs instead of showing as one-liner.
@@ -671,11 +675,7 @@ fn build_expanded_tags_row(
         .into_iter()
         .map(|key| {
             let value = &map[key];
-            let annotation = if default_tag_keys.contains(key) {
-                Some("# default_tags".to_string())
-            } else {
-                None
-            };
+            let annotation = default_tag_annotation(default_tag_keys, key);
             MapExpandedEntry {
                 key: key.clone(),
                 value: value.clone(),
@@ -687,6 +687,12 @@ fn build_expanded_tags_row(
         key: "tags".to_string(),
         entries,
     }
+}
+
+fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Option<String> {
+    default_tag_keys
+        .contains(key)
+        .then(|| "# default_tags".to_string())
 }
 
 fn build_update_rows(
@@ -981,6 +987,7 @@ fn build_attribute_diff_rows(
                 ctx.defs,
                 ctx.detail,
                 forces_replacement,
+                (key == "tags").then_some(&to.default_tag_keys),
             ) {
                 Some(row) => rows.push(row),
                 None if forces_replacement => rows.push(DetailRow::ForceReplaceMapHeader {
@@ -1334,6 +1341,10 @@ fn build_map_removed_row(key: &str, old_value: &Value) -> Option<DetailRow> {
 /// (#2910), so the caller can fold the attribute into the trailing
 /// `# (n unchanged attributes hidden)` count — same shape as
 /// `build_list_of_maps_diff_row` (#2886).
+/// When `default_tag_keys` is `Some`, top-level `Added` and `Changed` entries
+/// whose key is in the set receive the `# default_tags` annotation; `Removed`
+/// and nested entries never do.
+#[allow(clippy::too_many_arguments)]
 fn build_map_diff_row(
     key: &str,
     old_value: Option<&Value>,
@@ -1342,10 +1353,28 @@ fn build_map_diff_row(
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
     forces_replacement: bool,
+    default_tag_keys: Option<&DefaultTagKeys>,
 ) -> Option<DetailRow> {
-    let entries = NonEmptyVec::from_vec(compute_map_diff_entries(
-        old_value, new_value, attr_type, defs, detail,
-    ))?;
+    let mut entries = compute_map_diff_entries(old_value, new_value, attr_type, defs, detail);
+    if let Some(default_tag_keys) = default_tag_keys {
+        for entry in &mut entries {
+            match entry {
+                MapDiffEntryIR::Added {
+                    key, annotation, ..
+                }
+                | MapDiffEntryIR::Changed {
+                    key, annotation, ..
+                } => {
+                    *annotation = default_tag_annotation(default_tag_keys, key);
+                }
+                MapDiffEntryIR::Removed { .. }
+                | MapDiffEntryIR::NestedMapDiff { .. }
+                | MapDiffEntryIR::NestedListOfMapsDiff { .. }
+                | MapDiffEntryIR::StringListChanged { .. } => {}
+            }
+        }
+    }
+    let entries = NonEmptyVec::from_vec(entries)?;
     Some(map_diff_row(key.to_string(), entries, forces_replacement))
 }
 
@@ -1371,6 +1400,7 @@ fn compute_map_diff_entries(
                 .map(|entry| MapDiffEntryIR::Added {
                     key: entry.key.clone(),
                     value: format_value_with_key(&entry.value, Some(&entry.key)),
+                    annotation: None,
                 })
                 .collect();
         }
@@ -1473,6 +1503,7 @@ fn compute_map_diff_entries(
                         key: e.key.clone(),
                         old: old_s,
                         new: new_s,
+                        annotation: None,
                     });
                 }
             }
@@ -1480,6 +1511,7 @@ fn compute_map_diff_entries(
                 entries.push(MapDiffEntryIR::Added {
                     key: e.key.clone(),
                     value: format_value_with_key(&e.value, Some(&e.key)),
+                    annotation: None,
                 });
             }
             crate::diff_helpers::MapDiffItem::Removed(e) => {
@@ -1959,6 +1991,39 @@ mod tests {
         )
     }
 
+    fn resource_with_merged_default_tags(
+        explicit_tags: IndexMap<String, Value>,
+        default_tags: IndexMap<String, Value>,
+    ) -> Resource {
+        let mut resource = Resource::with_provider("test", "test.Widget", "widget", None)
+            .with_attribute("tags", Value::Concrete(ConcreteValue::Map(explicit_tags)));
+        let config = ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags,
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "test",
+            ResourceSchema::new("test.Widget").attribute(crate::schema::AttributeSchema::new(
+                "tags",
+                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+            )),
+        );
+        crate::provider::merge_default_tags(
+            &config,
+            std::slice::from_mut(&mut resource),
+            &registry,
+        )
+        .expect("default tags must merge");
+        resource
+    }
+
     #[test]
     fn non_empty_list_of_maps_block_rejects_all_empty() {
         assert!(
@@ -2088,6 +2153,269 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::Changed { key, old, new }
             if key == "versioning" && old == "\"Disabled\"" && new == "\"Enabled\""));
+    }
+
+    #[test]
+    fn update_tags_annotate_only_desired_default_tag_entries() {
+        let to = resource_with_merged_default_tags(
+            IndexMap::from([(
+                "UserWins".to_string(),
+                Value::Concrete(ConcreteValue::String("user-new".into())),
+            )]),
+            IndexMap::from([
+                (
+                    "Added".to_string(),
+                    Value::Concrete(ConcreteValue::String("added".into())),
+                ),
+                (
+                    "Changed".to_string(),
+                    Value::Concrete(ConcreteValue::String("default-new".into())),
+                ),
+                (
+                    "UserWins".to_string(),
+                    Value::Concrete(ConcreteValue::String("provider-default".into())),
+                ),
+            ]),
+        );
+        let from = State::existing(
+            to.id.clone(),
+            [(
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "Changed".to_string(),
+                        Value::Concrete(ConcreteValue::String("default-old".into())),
+                    ),
+                    (
+                        "Removed".to_string(),
+                        Value::Concrete(ConcreteValue::String("removed".into())),
+                    ),
+                    (
+                        "UserWins".to_string(),
+                        Value::Concrete(ConcreteValue::String("user-old".into())),
+                    ),
+                ]))),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let effect = Effect::Update {
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["tags".to_string()],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let entries = rows
+            .iter()
+            .find_map(|row| match row {
+                DetailRow::MapDiff { key, entries } if key == "tags" => Some(entries.as_slice()),
+                _ => None,
+            })
+            .expect("tags must render as a map diff");
+
+        assert_eq!(
+            entries,
+            [
+                MapDiffEntryIR::Added {
+                    key: "Added".to_string(),
+                    value: "\"added\"".to_string(),
+                    annotation: Some("# default_tags".to_string()),
+                },
+                MapDiffEntryIR::Changed {
+                    key: "Changed".to_string(),
+                    old: "\"default-old\"".to_string(),
+                    new: "\"default-new\"".to_string(),
+                    annotation: Some("# default_tags".to_string()),
+                },
+                MapDiffEntryIR::Removed {
+                    key: "Removed".to_string(),
+                    value: "\"removed\"".to_string(),
+                },
+                MapDiffEntryIR::Changed {
+                    key: "UserWins".to_string(),
+                    old: "\"user-old\"".to_string(),
+                    new: "\"user-new\"".to_string(),
+                    annotation: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn update_tags_annotates_defaults_when_old_resource_has_no_tags() {
+        let to = resource_with_merged_default_tags(
+            IndexMap::new(),
+            IndexMap::from([
+                (
+                    "ManagedBy".to_string(),
+                    Value::Concrete(ConcreteValue::String("carina".into())),
+                ),
+                (
+                    "Team".to_string(),
+                    Value::Concrete(ConcreteValue::String("x".into())),
+                ),
+            ]),
+        );
+        let from = State::existing(to.id.clone(), HashMap::new());
+        let effect = Effect::Update {
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["tags".to_string()],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let entries = rows
+            .iter()
+            .find_map(|row| match row {
+                DetailRow::MapDiff { key, entries } if key == "tags" => Some(entries.as_slice()),
+                _ => None,
+            })
+            .expect("tags must render as a map diff");
+
+        assert_eq!(
+            entries,
+            [
+                MapDiffEntryIR::Added {
+                    key: "ManagedBy".to_string(),
+                    value: "\"carina\"".to_string(),
+                    annotation: Some("# default_tags".to_string()),
+                },
+                MapDiffEntryIR::Added {
+                    key: "Team".to_string(),
+                    value: "\"x\"".to_string(),
+                    annotation: Some("# default_tags".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_tags_annotate_only_desired_default_tag_entries() {
+        let to = resource_with_merged_default_tags(
+            IndexMap::from([(
+                "UserWins".to_string(),
+                Value::Concrete(ConcreteValue::String("user-new".into())),
+            )]),
+            IndexMap::from([
+                (
+                    "Added".to_string(),
+                    Value::Concrete(ConcreteValue::String("added".into())),
+                ),
+                (
+                    "Changed".to_string(),
+                    Value::Concrete(ConcreteValue::String("default-new".into())),
+                ),
+                (
+                    "UserWins".to_string(),
+                    Value::Concrete(ConcreteValue::String("provider-default".into())),
+                ),
+            ]),
+        )
+        .with_attribute(
+            "replacement_key",
+            Value::Concrete(ConcreteValue::String("new".into())),
+        );
+        let previous_attributes = [
+            (
+                "replacement_key".to_string(),
+                Value::Concrete(ConcreteValue::String("old".into())),
+            ),
+            (
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "Changed".to_string(),
+                        Value::Concrete(ConcreteValue::String("default-old".into())),
+                    ),
+                    (
+                        "Removed".to_string(),
+                        Value::Concrete(ConcreteValue::String("removed".into())),
+                    ),
+                    (
+                        "UserWins".to_string(),
+                        Value::Concrete(ConcreteValue::String("user-old".into())),
+                    ),
+                ]))),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(to.clone())));
+        plan.add(Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(to.id.clone()),
+            identifier: "old-widget".to_string(),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.replace_display_mut().push(ReplaceDisplayMetadata {
+            create_idx: 0,
+            delete_idx: 1,
+            create_before_destroy: false,
+            changed_create_only: ChangedCreateOnly::try_from(vec!["replacement_key".to_string()])
+                .unwrap(),
+            cascade_ref_hints: Vec::new(),
+            temporary_name: None,
+            previous_attributes,
+        });
+
+        // Saved-plan apply decodes this same Create resource and replacement
+        // metadata. Round-trip here so the display path proves that desired
+        // default-tag provenance survives serialization without being copied
+        // into ReplaceDisplayMetadata.
+        let plan: Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let Effect::Create(saved_to) = &plan.effects()[0] else {
+            panic!("replacement create effect must survive saved-plan round trip");
+        };
+        let historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let rows = build_replace_detail_rows_from_display(
+            &plan,
+            saved_to,
+            plan.replace_display_info().next().unwrap(),
+            &historical,
+            None,
+            DetailLevel::Explicit,
+            None,
+        );
+        let entries = rows
+            .iter()
+            .find_map(|row| match row {
+                DetailRow::MapDiff { key, entries } if key == "tags" => Some(entries.as_slice()),
+                _ => None,
+            })
+            .expect("tags must render as a map diff during replacement");
+
+        assert_eq!(
+            entries,
+            [
+                MapDiffEntryIR::Added {
+                    key: "Added".to_string(),
+                    value: "\"added\"".to_string(),
+                    annotation: Some("# default_tags".to_string()),
+                },
+                MapDiffEntryIR::Changed {
+                    key: "Changed".to_string(),
+                    old: "\"default-old\"".to_string(),
+                    new: "\"default-new\"".to_string(),
+                    annotation: Some("# default_tags".to_string()),
+                },
+                MapDiffEntryIR::Removed {
+                    key: "Removed".to_string(),
+                    value: "\"removed\"".to_string(),
+                },
+                MapDiffEntryIR::Changed {
+                    key: "UserWins".to_string(),
+                    old: "\"user-old\"".to_string(),
+                    new: "\"user-new\"".to_string(),
+                    annotation: None,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -4032,7 +4360,7 @@ mod tests {
         );
 
         for entry in &entries {
-            if let MapDiffEntryIR::Changed { key, old, new } = entry {
+            if let MapDiffEntryIR::Changed { key, old, new, .. } = entry {
                 assert_ne!(
                     old, new,
                     "key `{key}` rendered as Changed with old == new = {old:?}; \
