@@ -4004,6 +4004,14 @@ mod tests {
                 Box::pin(async move {
                     for resource in resources.iter_mut() {
                         if resource.id.provider == "normalizing" {
+                            assert!(matches!(
+                                resource.get_attr("peer"),
+                                Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+                            ));
+                            assert!(matches!(
+                                resource.get_attr("pending"),
+                                Some(Value::Deferred(DeferredValue::Unknown(_)))
+                            ));
                             for value in resource.attributes.values_mut() {
                                 if let Value::Concrete(ConcreteValue::String(s)) = value {
                                     *s = format!("norm:{}", s.expose_plaintext()).into();
@@ -4035,14 +4043,27 @@ mod tests {
         router.add_provider("normalizing".to_string(), Box::new(NormalizingProvider));
         router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
+        let peer_ref = Value::resource_ref("peer", "identifier", Vec::new());
+        let pending = Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ForValue,
+        ));
         let mut resources = vec![
             Resource::with_provider("normalizing", "test", "example", None)
-                .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into()))),
+                .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
+                .with_attribute("peer", peer_ref.clone())
+                .with_attribute("pending", pending.clone()),
         ];
         router.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),
             Some(&Value::Concrete(ConcreteValue::String("norm:val".into())))
         );
+        assert_eq!(resources[0].get_attr("peer"), Some(&peer_ref));
+        assert!(matches!(
+            resources[0].get_attr("pending"),
+            Some(Value::Deferred(DeferredValue::Unknown(
+                crate::resource::UnknownReason::ForValue
+            )))
+        ));
     }
 }

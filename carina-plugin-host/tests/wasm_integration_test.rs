@@ -9,7 +9,7 @@ use carina_core::provider::{
     ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, UnknownReason, Value,
 };
 use carina_plugin_host::WasmProviderFactory;
 
@@ -450,6 +450,60 @@ async fn test_wasm_mock_provider_normalizer() {
             .get("__mock_normalized_state__"),
         Some(&Value::Concrete(ConcreteValue::String("second".into()))),
         "the second pending state must receive its own normalized WASM result"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attributes() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+
+    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
+    let mut resource = Resource::with_provider("mock", "test.resource", "ref-bearing", None);
+    resource.set_attr(
+        "tags",
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+            (
+                "Name".to_string(),
+                Value::Concrete(ConcreteValue::String("ref-bearing".into())),
+            ),
+            ("Peer".to_string(), peer_ref),
+        ]))),
+    );
+    resource.set_attr(
+        "pending",
+        Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+            DeferredValue::Unknown(UnknownReason::ForValue),
+        )])),
+    );
+    let mut resources = vec![resource];
+    let expected_tags = resources[0]
+        .get_attr("tags")
+        .expect("tags must be present")
+        .clone();
+
+    normalizer
+        .normalize_desired(&mut resources)
+        .await
+        .expect("the WASM boundary must hide values its transport cannot encode");
+
+    assert_eq!(resources[0].get_attr("tags"), Some(&expected_tags));
+    assert!(matches!(
+        resources[0].get_attr("pending"),
+        Some(Value::Concrete(ConcreteValue::List(values)))
+            if matches!(
+                values.as_slice(),
+                [Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))]
+            )
+    ));
+    assert_eq!(
+        resources[0].attributes.keys().collect::<Vec<_>>(),
+        vec!["tags", "pending"],
+        "ref/Unknown-bearing attributes must be restored unchanged after the guest call"
     );
 }
 
@@ -980,6 +1034,10 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         "__mock_normalize_desired_error__",
         None,
     )];
+    desired_resources[0].set_attr(
+        "peer",
+        Value::resource_ref("peer", "identifier", Vec::new()),
+    );
     let desired_before = desired_resources.clone();
     let error = normalizer
         .normalize_desired(&mut desired_resources)
@@ -995,7 +1053,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     assert_eq!(error.detail().provider_name.as_deref(), Some("mock"));
     assert_eq!(
         desired_resources, desired_before,
-        "provider normalizer errors must be atomic"
+        "provider normalizer errors must be atomic and restore stripped attributes"
     );
 
     let mut recovery_resources = vec![Resource::with_provider(

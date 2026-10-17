@@ -29,7 +29,10 @@ use carina_core::provider::{
     ProviderFactory, ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadRequest,
     SavedAttrs, UpdateOutcome, UpdateRequest,
 };
-use carina_core::resource::{Resource, ResourceId, ResourceIdentityState, State, Value};
+use carina_core::resource::{
+    Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
+    value_contains_unknown,
+};
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
@@ -3403,40 +3406,123 @@ fn finish_normalizer_guest_call<T>(
     .map_err(wasm_convert::wit_to_core_provider_error)
 }
 
+/// One stripped attribute retained so it can be reinserted at its original
+/// position after WASM desired normalization returns.
+struct StrippedAttribute {
+    insert_index: usize,
+    key: String,
+    value: Value,
+}
+
+/// Attributes removed from a resource slice, grouped by slice position.
+struct StrippedAttributes(Vec<Vec<StrippedAttribute>>);
+
+/// Strip every resource attribute that the WASM provider boundary refuses to
+/// serialize, retaining the original `IndexMap` positions for restoration.
+fn strip_provider_boundary_attributes(resources: &mut [Resource]) -> StrippedAttributes {
+    let mut out = Vec::with_capacity(resources.len());
+    for resource in resources.iter_mut() {
+        let mut stripped = Vec::new();
+        let to_remove: Vec<(usize, String)> = resource
+            .attributes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, value))| value_contains_unknown(value) || contains_resource_ref(value))
+            .map(|(i, (key, _))| (i, key.clone()))
+            .collect();
+
+        for (insert_index, key) in to_remove.into_iter().rev() {
+            if let Some(value) = resource.attributes.shift_remove(&key) {
+                stripped.push(StrippedAttribute {
+                    insert_index,
+                    key,
+                    value,
+                });
+            }
+        }
+
+        stripped.sort_by_key(|entry| entry.insert_index);
+        out.push(stripped);
+    }
+    StrippedAttributes(out)
+}
+
+/// Reinsert attributes removed by [`strip_provider_boundary_attributes`] at
+/// their original positions.
+fn restore_stripped_attributes(resources: &mut [Resource], stripped: StrippedAttributes) {
+    for (resource, entries) in resources.iter_mut().zip(stripped.0) {
+        for entry in entries {
+            let target = entry.insert_index.min(resource.attributes.len());
+            resource
+                .attributes
+                .shift_insert(target, entry.key, entry.value);
+        }
+    }
+}
+
+/// Run one WASM desired-normalization boundary call with unsupported
+/// attributes temporarily removed.
+///
+/// The higher-ranked callback keeps the stripped slice scoped to this one
+/// operation. Attributes are restored before returning on both success and
+/// error.
+async fn with_wasm_serializable_resources<F>(
+    resources: &mut [Resource],
+    operation: F,
+) -> ProviderResult<()>
+where
+    F: for<'a> FnOnce(&'a mut [Resource]) -> BoxFuture<'a, ProviderResult<()>>,
+{
+    let stripped = strip_provider_boundary_attributes(resources);
+    let result = operation(resources).await;
+    restore_stripped_attributes(resources, stripped);
+    result
+}
+
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [Resource],
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
+        let instance = Arc::clone(&self.instance);
         Box::pin(async move {
-            let (sealed, unsealer) = secret_seal::seal(resources)
-                .map_err(|error| wasm_value_encode_provider_error("normalize_desired", error))?;
+            with_wasm_serializable_resources(resources, move |resources| {
+                Box::pin(async move {
+                    let (sealed, unsealer) = secret_seal::seal(resources).map_err(|error| {
+                        wasm_value_encode_provider_error("normalize_desired", error)
+                    })?;
 
-            // Plain `.await`, not a nested `block_on`: the guarded store is
-            // acquired and dropped within this one polled future, so the
-            // apply-path `renormalize` calling this once per resource cannot
-            // self-deadlock (carina#3112).
-            let result = {
-                let mut locked = LockedStore::acquire(&self.instance, "normalize_desired").await?;
-                let call = self
-                    .instance
-                    .bindings
-                    .call_normalize_desired(locked.store(), &sealed)
-                    .await;
-                finish_normalizer_guest_call(&self.instance, "normalize_desired", &mut locked, call)
-            };
-            let result = result?;
-            // `PlanPreprocessor::prepare` strips every attribute that
-            // recursively contains `Value::Deferred(DeferredValue::ResourceRef)` (alongside
-            // `Value::Deferred(DeferredValue::Unknown)`) before this normalizer runs and
-            // restores them afterwards (#2387). Secret restoration
-            // filters mangled attributes before guest values are
-            // written back.
-            let restored = unsealer
-                .try_restore(result)
-                .map_err(|error| wasm_value_decode_provider_error("normalize_desired", error))?;
-            restored.apply_to(resources);
-            Ok(())
+                    // Plain `.await`, not a nested `block_on`: the guarded store is
+                    // acquired and dropped within this one polled future, so the
+                    // apply-path `renormalize` calling this once per resource cannot
+                    // self-deadlock (carina#3112).
+                    let result = {
+                        let mut locked =
+                            LockedStore::acquire(&instance, "normalize_desired").await?;
+                        let call = instance
+                            .bindings
+                            .call_normalize_desired(locked.store(), &sealed)
+                            .await;
+                        finish_normalizer_guest_call(
+                            &instance,
+                            "normalize_desired",
+                            &mut locked,
+                            call,
+                        )
+                    }?;
+
+                    // The scoped host helper hides ref/Unknown-bearing attributes only
+                    // while this WASM transport call is in flight and restores them on
+                    // every return path. Secret restoration filters mangled attributes
+                    // before guest values are written back.
+                    let restored = unsealer.try_restore(result).map_err(|error| {
+                        wasm_value_decode_provider_error("normalize_desired", error)
+                    })?;
+                    restored.apply_to(resources);
+                    Ok(())
+                })
+            })
+            .await
         })
     }
 
@@ -3664,6 +3750,309 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason,
+    };
+
+    fn test_string_value(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.to_string().into()))
+    }
+
+    fn assert_value_structure_eq(actual: &Value, expected: &Value) {
+        match (actual, expected) {
+            (
+                Value::Deferred(DeferredValue::Unknown(actual)),
+                Value::Deferred(DeferredValue::Unknown(expected)),
+            ) => assert_eq!(actual, expected),
+            (
+                Value::Concrete(ConcreteValue::List(actual)),
+                Value::Concrete(ConcreteValue::List(expected)),
+            ) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_value_structure_eq(actual, expected);
+                }
+            }
+            (
+                Value::Concrete(ConcreteValue::Map(actual)),
+                Value::Concrete(ConcreteValue::Map(expected)),
+            ) => {
+                assert_eq!(
+                    actual.keys().collect::<Vec<_>>(),
+                    expected.keys().collect::<Vec<_>>()
+                );
+                for (key, expected) in expected {
+                    assert_value_structure_eq(&actual[key], expected);
+                }
+            }
+            (
+                Value::Deferred(DeferredValue::Interpolation(actual)),
+                Value::Deferred(DeferredValue::Interpolation(expected)),
+            ) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    match (actual, expected) {
+                        (
+                            InterpolationPart::Literal(actual),
+                            InterpolationPart::Literal(expected),
+                        ) => assert_eq!(actual, expected),
+                        (InterpolationPart::Expr(actual), InterpolationPart::Expr(expected)) => {
+                            assert_value_structure_eq(actual, expected)
+                        }
+                        _ => panic!("interpolation part variants differ"),
+                    }
+                }
+            }
+            (
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: actual_name,
+                    args: actual_args,
+                }),
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: expected_name,
+                    args: expected_args,
+                }),
+            ) => {
+                assert_eq!(actual_name, expected_name);
+                assert_eq!(actual_args.len(), expected_args.len());
+                for (actual, expected) in actual_args.iter().zip(expected_args) {
+                    assert_value_structure_eq(actual, expected);
+                }
+            }
+            (
+                Value::Deferred(DeferredValue::Secret(actual)),
+                Value::Deferred(DeferredValue::Secret(expected)),
+            ) => assert_value_structure_eq(actual, expected),
+            _ => assert_eq!(actual, expected),
+        }
+    }
+
+    #[tokio::test]
+    async fn wasm_serializable_resources_restores_original_attribute_order() {
+        let mut resource = Resource::new("test.t", "n");
+        resource.set_attr("before", test_string_value("before"));
+        resource.set_attr(
+            "pending",
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
+        );
+        resource.set_attr("middle", test_string_value("middle"));
+        resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        resource.set_attr("after", test_string_value("after"));
+        let mut resources = vec![resource];
+        let original_attributes = resources[0].attributes.clone();
+
+        with_wasm_serializable_resources(&mut resources, |resources| {
+            Box::pin(async move {
+                assert_eq!(
+                    resources[0].attributes.keys().collect::<Vec<_>>(),
+                    vec!["before", "middle", "after"]
+                );
+                resources[0].set_attr("guest_added", test_string_value("new"));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resources[0].attributes.keys().collect::<Vec<_>>(),
+            vec![
+                "before",
+                "pending",
+                "middle",
+                "peer",
+                "after",
+                "guest_added"
+            ],
+            "restoration must preserve original positions and trail guest-added attributes"
+        );
+        for (key, value) in original_attributes {
+            assert_value_structure_eq(
+                resources[0]
+                    .get_attr(&key)
+                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
+                &value,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wasm_serializable_resources_restores_duplicate_resource_ids_by_position() {
+        let first_hidden = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex));
+        let second_hidden = Value::resource_ref("peer", "identifier", vec![]);
+
+        let mut first = Resource::new("test.t", "shared");
+        first.set_attr("visible", test_string_value("first"));
+        first.set_attr("hidden", first_hidden.clone());
+
+        let mut second = Resource::new("test.t", "shared");
+        second.set_attr("visible", test_string_value("second"));
+        second.set_attr("hidden", second_hidden.clone());
+
+        assert_eq!(first.id, second.id, "the regression requires duplicate IDs");
+        let mut resources = vec![first, second];
+
+        with_wasm_serializable_resources(&mut resources, |resources| {
+            Box::pin(async move {
+                for resource in resources {
+                    assert_eq!(
+                        resource.attributes.keys().collect::<Vec<_>>(),
+                        vec!["visible"]
+                    );
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_value_structure_eq(
+            resources[0]
+                .get_attr("hidden")
+                .expect("the first resource's attribute must be restored"),
+            &first_hidden,
+        );
+        assert_value_structure_eq(
+            resources[1]
+                .get_attr("hidden")
+                .expect("the second resource's attribute must be restored"),
+            &second_hidden,
+        );
+    }
+
+    #[tokio::test]
+    async fn wasm_serializable_resources_strips_values_in_nested_wrappers() {
+        let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let unknown = || {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+                path: upstream_path.clone(),
+            }))
+        };
+        let resource_ref = || Value::resource_ref("admins", "group_id", vec![]);
+
+        let mut resource = Resource::new("test.t", "n");
+        resource.set_attr("stable", test_string_value("visible"));
+        resource.set_attr(
+            "unknown_list",
+            Value::Concrete(ConcreteValue::List(vec![unknown()])),
+        );
+        resource.set_attr(
+            "unknown_map",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".to_string(),
+                unknown(),
+            )]))),
+        );
+        resource.set_attr(
+            "unknown_interpolation",
+            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+                unknown(),
+            )])),
+        );
+        resource.set_attr(
+            "unknown_function",
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "identity".into(),
+                args: vec![unknown()],
+            }),
+        );
+        resource.set_attr(
+            "unknown_secret",
+            Value::Deferred(DeferredValue::Secret(Box::new(unknown()))),
+        );
+        resource.set_attr(
+            "ref_map",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".to_string(),
+                resource_ref(),
+            )]))),
+        );
+        resource.set_attr(
+            "ref_interpolation",
+            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+                resource_ref(),
+            )])),
+        );
+        resource.set_attr(
+            "ref_function",
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "identity".into(),
+                args: vec![resource_ref()],
+            }),
+        );
+        resource.set_attr(
+            "ref_secret",
+            Value::Deferred(DeferredValue::Secret(Box::new(resource_ref()))),
+        );
+        let mut resources = vec![resource];
+        let original_attributes = resources[0].attributes.clone();
+
+        with_wasm_serializable_resources(&mut resources, |resources| {
+            Box::pin(async move {
+                assert_eq!(
+                    resources[0].attributes.keys().collect::<Vec<_>>(),
+                    vec!["stable"],
+                    "the WASM transport operation must see only serializable attributes"
+                );
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resources[0].attributes.keys().collect::<Vec<_>>(),
+            original_attributes.keys().collect::<Vec<_>>()
+        );
+        for (key, value) in original_attributes {
+            assert_value_structure_eq(
+                resources[0]
+                    .get_attr(&key)
+                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
+                &value,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wasm_serializable_resources_restores_attributes_on_error() {
+        let mut resource = Resource::new("test.t", "n");
+        resource.set_attr("stable", test_string_value("visible"));
+        resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        resource.set_attr(
+            "pending",
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
+        );
+        let mut resources = vec![resource];
+        let before = resources[0].attributes.clone();
+
+        let error = with_wasm_serializable_resources(&mut resources, |resources| {
+            Box::pin(async move {
+                assert_eq!(
+                    resources[0].attributes.keys().collect::<Vec<_>>(),
+                    vec!["stable"]
+                );
+                Err(ProviderError::internal("boundary failed"))
+            })
+        })
+        .await
+        .expect_err("the boundary error must propagate");
+
+        assert_eq!(error.message(), "boundary failed");
+        assert_eq!(
+            resources[0].attributes.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>(),
+            "restored attributes must retain their original order"
+        );
+        for (key, value) in before {
+            assert_value_structure_eq(
+                resources[0]
+                    .get_attr(&key)
+                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
+                &value,
+            );
+        }
+    }
 
     #[test]
     fn malformed_config_completions_metadata_is_rejected() {

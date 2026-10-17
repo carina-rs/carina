@@ -58,8 +58,8 @@ impl std::fmt::Display for SerializationContext {
 pub enum SerializationError {
     /// A `Value::Deferred(DeferredValue::Unknown)` reached a serialization boundary. Producers
     /// must strip / resolve it before this point — see
-    /// `PlanPreprocessor::strip_unknown_attributes` for the WASM
-    /// boundary stripping pass.
+    /// [`crate::resource::value_contains_unknown`] for recursive
+    /// detection before crossing a serialization boundary.
     #[error("cannot serialize at {context}: value is not yet known ({reason})")]
     UnknownNotAllowed {
         reason: UnknownReason,

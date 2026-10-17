@@ -2184,6 +2184,27 @@ pub fn contains_resource_ref(value: &Value) -> bool {
     found
 }
 
+/// Return whether `value` recursively contains
+/// `Value::Deferred(DeferredValue::Unknown)`.
+pub fn value_contains_unknown(value: &Value) -> bool {
+    match value {
+        Value::Deferred(DeferredValue::Unknown(_)) => true,
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(value_contains_unknown),
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unknown),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+            matches!(
+                part,
+                InterpolationPart::Expr(value) if value_contains_unknown(value)
+            )
+        }),
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            args.iter().any(value_contains_unknown)
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
+        _ => false,
+    }
+}
+
 impl Value {
     /// Semantic equality: for Lists, compares as multisets (order-insensitive);
     /// for Maps, compares values recursively with semantic equality;
