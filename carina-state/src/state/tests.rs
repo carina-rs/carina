@@ -2079,6 +2079,53 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 }
 
 #[test]
+fn v11_state_migrates_to_v12_and_upgrades_raw_legacy_secrets_at_row_load() {
+    use super::check_and_migrate;
+
+    assert_eq!(StateFile::CURRENT_VERSION, 12);
+    let json = format!(
+        r#"{{
+        "version": 11,
+        "serial": 5,
+        "lineage": "v11-secret-lineage",
+        "carina_version": "0.4.0",
+        "resources": [
+            {{
+                "resource_type": "test.resource",
+                "identity": "legacy",
+                "provider": "mock",
+                "identifier": "legacy-id",
+                "attributes": {{
+                    "comment": "{LEGACY_SECRET_PREFIX}{}"
+                }}
+            }}
+        ]
+    }}"#,
+        "ab".repeat(32),
+    );
+
+    let outcome = check_and_migrate(&json).expect("v11 state should migrate to v12");
+    assert_eq!(
+        outcome.migration(),
+        Some(MigrationInfo { from: 11, to: 12 })
+    );
+    assert_eq!(outcome.state().version, 12);
+    let row = outcome
+        .state()
+        .find_resource("mock", "test.resource", "legacy")
+        .expect("legacy row should survive migration");
+    let marker = row
+        .persisted_attributes()
+        .encoded_value("comment")
+        .and_then(serde_json::Value::as_str)
+        .expect("legacy marker should remain persisted");
+    assert!(
+        marker.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
+        "row load must make the legacy marker self-contained: {marker}",
+    );
+}
+
+#[test]
 fn v9_deposed_entries_round_trip() {
     use super::check_and_migrate;
 

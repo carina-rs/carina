@@ -13,7 +13,7 @@ use carina_core::provider::{
     UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
+    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives, RedactedSecretHash,
     Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentity,
     ResourceIdentityError, ResourceIdentityState, State as CoreState, Value as CoreValue,
 };
@@ -23,8 +23,7 @@ use carina_core::schema::{
     StructField as CoreStructField, UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
 };
 use carina_core::value::{
-    LEGACY_SECRET_PREFIX, SerializationContext, SerializationError, persisted_json_to_dsl_value,
-    persisted_secret_marker,
+    SerializationContext, SerializationError, persisted_json_to_dsl_value, persisted_secret_marker,
 };
 use carina_core::wait::BindingPattern as CoreBindingPattern;
 use carina_core::wait::predicate::{AttrPath as CoreAttrPath, AttrPathError};
@@ -749,7 +748,7 @@ pub(crate) fn wit_to_core_persisted_value_map(
 }
 
 fn decode_persisted_json_string(value: &str) -> Result<CoreValue, WasmValueDecodeError> {
-    if value.starts_with(LEGACY_SECRET_PREFIX) {
+    if RedactedSecretHash::is_raw_legacy_marker(value) {
         return Err(WasmValueDecodeError::new(
             WitValueVariant::StrVal,
             WasmValueDecodeErrorKind::RawLegacySecretMarker,
@@ -2650,7 +2649,11 @@ mod tests {
 
     #[test]
     fn persisted_wasm_decode_rejects_raw_legacy_marker() {
-        let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+        let marker = format!(
+            "{}{}",
+            RedactedSecretHash::LEGACY_MARKER_PREFIX,
+            "ab".repeat(32)
+        );
         let error =
             wit_to_core_persisted_value_map(&[("token".to_string(), wit::Value::StrVal(marker))])
                 .expect_err("raw legacy state markers must fail closed outside state-file load");
@@ -2660,6 +2663,21 @@ mod tests {
             WasmValueDecodeErrorKind::RawLegacySecretMarker
         ));
         assert_eq!(error.attribute_path, ["token"]);
+    }
+
+    #[test]
+    fn persisted_wasm_decode_keeps_malformed_legacy_looking_text_plain() {
+        let marker = "_secret:argon2:xyz";
+        let state = wit_to_core_persisted_value_map(&[(
+            "token".to_string(),
+            wit::Value::StrVal(marker.to_string()),
+        )])
+        .expect("an invalid raw legacy marker is ordinary persisted text");
+
+        assert_eq!(
+            state.get("token"),
+            Some(&CoreValue::Concrete(ConcreteValue::String(marker.into())))
+        );
     }
 
     // -- Value map helpers --

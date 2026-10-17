@@ -630,6 +630,19 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// value layer only through [`Self::get`] or [`Self::to_values`], which decode
 /// complete persisted secret markers as typed `RedactedSecret` values rather
 /// than ordinary strings.
+///
+/// Raw JSON cannot be inserted after construction. Callers must construct a
+/// complete value through [`Self::from_encoded`] or
+/// [`Self::from_state_row_json`], so the legacy-marker invariant is checked at
+/// the type boundary.
+///
+/// ```compile_fail
+/// use carina_core::provider::PersistedAttributes;
+///
+/// let mut attributes = PersistedAttributes::default();
+/// attributes.insert_encoded("token".to_string(), serde_json::json!("plaintext"));
+/// attributes.replace_encoded(Default::default());
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct PersistedAttributes {
     encoded: HashMap<String, serde_json::Value>,
@@ -936,12 +949,12 @@ impl PersistedAttributes {
         &self.encoded
     }
 
-    pub fn insert_encoded(&mut self, key: String, value: serde_json::Value) {
-        self.encoded.insert(key, value);
-    }
-
-    pub fn replace_encoded(&mut self, encoded: HashMap<String, serde_json::Value>) {
-        self.encoded = encoded;
+    /// Merge another already-validated persisted value.
+    ///
+    /// Taking `Self` rather than raw JSON keeps context-free and state-row
+    /// decoding as the only construction boundaries.
+    pub fn extend(&mut self, other: Self) {
+        self.encoded.extend(other.encoded);
     }
 }
 
@@ -2462,6 +2475,13 @@ mod tests {
         assert!(
             serde_json::from_value::<PersistedAttributes>(encoded.clone()).is_err(),
             "context-free serde must not construct a typed legacy digest",
+        );
+        assert!(
+            PersistedAttributes::from_encoded(
+                serde_json::from_value(encoded.clone()).expect("attribute object")
+            )
+            .is_err(),
+            "the checked context-free constructor must reject raw legacy markers",
         );
 
         let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);

@@ -13,6 +13,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use indexmap::IndexMap;
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
 use crate::explicit::ExplicitFields;
@@ -1601,7 +1602,7 @@ impl RedactedSecretHash {
                     legacy_argon2()
                         .hash_password_into(plaintext.as_ref(), salt, &mut candidate)
                         .is_ok()
-                        && candidate == *hash
+                        && bool::from(candidate.ct_eq(hash))
                 })
             }
         }
@@ -1645,7 +1646,12 @@ impl RedactedSecretHash {
         Self::parse_persisted_marker(marker).is_some()
     }
 
-    pub(crate) fn is_raw_legacy_marker(marker: &str) -> bool {
+    /// Whether `marker` is the exact raw digest shape written before state v12.
+    ///
+    /// Prefix lookalikes with a malformed or non-32-byte hash are ordinary
+    /// strings. All persisted and plugin boundaries use this classifier so
+    /// they agree on that distinction.
+    pub fn is_raw_legacy_marker(marker: &str) -> bool {
         let Some(encoded) = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX) else {
             return false;
         };

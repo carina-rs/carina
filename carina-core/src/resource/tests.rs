@@ -2,6 +2,40 @@ use super::*;
 use crate::explicit::ExplicitFields;
 
 #[test]
+fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_hashes() {
+    let plaintext = br#""legacy-constant-time""#;
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
+    let salt = b"carina:mock.test.resource:legacy:comment";
+    let mut output = [0_u8; RedactedSecretHash::HASH_LEN];
+    legacy_argon2()
+        .hash_password_into(plaintext, salt, &mut output)
+        .expect("hash legacy fixture");
+    let marker = format!(
+        "{}{}",
+        RedactedSecretHash::LEGACY_MARKER_PREFIX,
+        hex::encode(output)
+    );
+    let matching =
+        RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(&marker, &id, "comment")
+            .expect("upgrade legacy fixture");
+    assert!(matching.verify(plaintext));
+
+    output[0] ^= 1;
+    let mismatched_marker = format!(
+        "{}{}",
+        RedactedSecretHash::LEGACY_MARKER_PREFIX,
+        hex::encode(output)
+    );
+    let mismatched = RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
+        &mismatched_marker,
+        &id,
+        "comment",
+    )
+    .expect("upgrade mismatched legacy fixture");
+    assert!(!mismatched.verify(plaintext));
+}
+
+#[test]
 fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

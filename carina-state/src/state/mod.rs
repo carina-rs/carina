@@ -163,7 +163,9 @@ impl StateFile {
     ///      stored list value in the same resource row.
     /// v11: Removed legacy host-reserved `_`-prefixed keys from current and
     ///      deposed provider attributes and from the top-level explicit tree.
-    pub const CURRENT_VERSION: u32 = 11;
+    /// v12: Persisted secret markers carry their own salt. Raw v11 legacy
+    ///      markers are upgraded while each resource row is deserialized.
+    pub const CURRENT_VERSION: u32 = 12;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -1014,6 +1016,9 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             if v <= 10 {
                 migrate_v10_reserved_attributes(&mut state);
             }
+            // v11 → v12 needs no additional tree walk. ResourceState's custom
+            // deserializer has already converted every current and deposed raw
+            // legacy marker using the row identity stored in the v11 file.
             state.version = StateFile::CURRENT_VERSION;
             state
         }
@@ -1364,11 +1369,7 @@ impl ResourceState {
         );
         let upgraded =
             PersistedAttributes::from_state_row_json(&id, HashMap::from([(key.clone(), value)]));
-        let value = upgraded
-            .encoded_value(&key)
-            .expect("single state attribute remains present")
-            .clone();
-        self.attributes.insert_encoded(key, value);
+        self.attributes.extend(upgraded);
     }
 
     /// Render the sorted attribute map for `carina state show` without
@@ -1485,26 +1486,18 @@ impl ResourceState {
 
     /// Populate attributes from a provider-returned State
     pub fn with_attributes_from_state(mut self, state: &State) -> Self {
-        let mut attributes =
-            serde_json::to_value(&self.attributes).expect("persisted attributes are serializable");
-        let encoded = attributes
-            .as_object_mut()
-            .expect("persisted attributes serialize as an object");
-        for (key, value) in &state.attributes {
-            if let Ok(json_value) =
+        let encoded = state
+            .attributes
+            .iter()
+            .filter_map(|(key, value)| {
                 Self::provider_state_value_to_json(value, self.attributes.encoded_value(key))
-            {
-                encoded.insert(key.clone(), json_value);
-            }
-        }
-        self.attributes.replace_encoded(
-            attributes
-                .as_object()
-                .expect("persisted attributes serialize as an object")
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        );
+                    .ok()
+                    .map(|value| (key.clone(), value))
+            })
+            .collect();
+        let attributes = PersistedAttributes::from_encoded(encoded)
+            .expect("provider state encoding cannot emit raw legacy markers");
+        self.attributes.extend(attributes);
         if let Some(identifier) = &state.identifier {
             self.identifier = Some(identifier.clone());
         }
@@ -1543,9 +1536,12 @@ impl ResourceState {
         let mut state = Self::new(resource_type, resource_identity, provider)
             .with_identifier(&bucket_name)
             .with_protected(true);
-        state
-            .attributes
-            .insert_encoded("bucket".to_string(), serde_json::json!(bucket_name));
+        let attributes = PersistedAttributes::from_encoded(HashMap::from([(
+            "bucket".to_string(),
+            serde_json::json!(bucket_name),
+        )]))
+        .expect("a backend bucket name cannot be a raw legacy secret marker");
+        state.attributes.extend(attributes);
         state
     }
 
@@ -1560,30 +1556,21 @@ impl ResourceState {
     /// in the resource schema.
     pub fn merge_write_only_attributes(&mut self, resource: &Resource, write_only_keys: &[String]) {
         let mut merged = Vec::new();
-        let mut attributes =
-            serde_json::to_value(&self.attributes).expect("persisted attributes are serializable");
-        let encoded = attributes
-            .as_object_mut()
-            .expect("persisted attributes serialize as an object");
+        let mut encoded = HashMap::new();
         for key in write_only_keys {
             // Only merge if the user specified this attribute and it's not already
             // in the provider-returned state
             if let Some(value) = resource.attributes.get(key)
-                && !encoded.contains_key(key)
+                && !self.attributes.contains_key(key)
                 && let Ok(json_value) = value_to_json(value)
             {
                 encoded.insert(key.clone(), json_value);
                 merged.push(key.clone());
             }
         }
-        self.attributes.replace_encoded(
-            attributes
-                .as_object()
-                .expect("persisted attributes serialize as an object")
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        );
+        let attributes = PersistedAttributes::from_encoded(encoded)
+            .expect("desired write-only encoding cannot emit raw legacy markers");
+        self.attributes.extend(attributes);
         merged.sort();
         self.write_only_attributes = merged;
     }
