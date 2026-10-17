@@ -1236,7 +1236,11 @@ pub fn reject_secret_in_saved_plan_field(
 enum SecretRedactionGuide<'a> {
     Evaluated(&'a Value),
     SecretShape(&'a Value),
+    /// The redacted guide classifies provider/historical plaintext as secret.
     RedactedShape(&'a Value),
+    /// The source value is authoritative for secret semantics; the redacted
+    /// guide supplies only a same-path digest that may be reused.
+    RedactedDesired(&'a Value),
     /// Persisted state is authoritative for classifying provider plaintext.
     Persisted(&'a serde_json::Value),
     /// Desired `Secret` wrappers are authoritative; persisted state supplies
@@ -1255,6 +1259,14 @@ impl<'a> SecretRedactionGuide<'a> {
             Self::SecretShape(Value::Deferred(DeferredValue::Secret(_))) => Some(plaintext),
             Self::RedactedShape(Value::Deferred(DeferredValue::RedactedSecret { .. })) => {
                 Some(plaintext)
+            }
+            Self::RedactedDesired(Value::Deferred(DeferredValue::RedactedSecret { .. })) => {
+                match source {
+                    Value::Deferred(
+                        DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. },
+                    ) => Some(plaintext),
+                    _ => None,
+                }
             }
             Self::Persisted(serde_json::Value::String(value)) if is_persisted_secret(value) => {
                 Some(plaintext)
@@ -1275,7 +1287,8 @@ impl<'a> SecretRedactionGuide<'a> {
 
     fn previous_hash(self) -> Option<RedactedSecretHash> {
         match self {
-            Self::RedactedShape(Value::Deferred(DeferredValue::RedactedSecret { hash })) => {
+            Self::RedactedShape(Value::Deferred(DeferredValue::RedactedSecret { hash }))
+            | Self::RedactedDesired(Value::Deferred(DeferredValue::RedactedSecret { hash })) => {
                 Some(hash.clone())
             }
             Self::Persisted(serde_json::Value::String(marker))
@@ -1297,6 +1310,9 @@ impl<'a> SecretRedactionGuide<'a> {
             Self::RedactedShape(Value::Concrete(ConcreteValue::Map(values))) => {
                 values.get(key).map(Self::RedactedShape)
             }
+            Self::RedactedDesired(Value::Concrete(ConcreteValue::Map(values))) => {
+                values.get(key).map(Self::RedactedDesired)
+            }
             Self::Persisted(serde_json::Value::Object(values)) => {
                 values.get(key).map(Self::Persisted)
             }
@@ -1317,6 +1333,9 @@ impl<'a> SecretRedactionGuide<'a> {
             }
             Self::RedactedShape(Value::Concrete(ConcreteValue::List(values))) => {
                 values.get(index).map(Self::RedactedShape)
+            }
+            Self::RedactedDesired(Value::Concrete(ConcreteValue::List(values))) => {
+                values.get(index).map(Self::RedactedDesired)
             }
             Self::Persisted(serde_json::Value::Array(values)) => {
                 values.get(index).map(Self::Persisted)
@@ -1414,6 +1433,13 @@ fn redact_using_redacted_shape(
     redacted_shape: &Value,
 ) -> Result<Value, SerializationError> {
     redact_with_guide(value, SecretRedactionGuide::RedactedShape(redacted_shape))
+}
+
+fn redact_desired_reusing_redacted_shape(
+    value: &Value,
+    redacted_shape: &Value,
+) -> Result<Value, SerializationError> {
+    redact_with_guide(value, SecretRedactionGuide::RedactedDesired(redacted_shape))
 }
 
 /// Redact provider plaintext at paths marked secret by the desired value.
@@ -1883,7 +1909,7 @@ fn redact_resource_using_redacted_shape(
         .attributes
         .get(key)
     {
-        Some(shape) => redact_using_redacted_shape(value, shape),
+        Some(shape) => redact_desired_reusing_redacted_shape(value, shape),
         None => redact_secrets_only(value),
     })?;
     Ok(crate::resource::Resource {
@@ -5302,6 +5328,55 @@ mod tests {
             .expect("redact resource");
 
         assert_eq!(resource_comment_placeholder_hash(&redacted), &state_hash);
+    }
+
+    #[test]
+    fn effect_redaction_uses_effect_values_to_classify_nested_secrets() {
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("MAP_SECRET".into()),
+        ))));
+        let reusable_secret = redact_secrets_in_value(&secret).expect("redact reusable secret");
+        let resolved_reference_secret =
+            redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("RESOLVED_REFERENCE_SECRET".into())),
+            ))))
+            .expect("redact resolved reference secret");
+        let reference = Value::resource_ref("producer", "comment", vec![]);
+
+        let resource = crate::resource::Resource::new("mock.test.resource", "consumer")
+            .with_attribute(
+                "settings",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("secret".to_string(), secret),
+                    ("reference".to_string(), reference.clone()),
+                ]))),
+            );
+        let guide = crate::resource::Resource::new("mock.test.resource", "consumer")
+            .with_attribute(
+                "settings",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("secret".to_string(), reusable_secret.clone()),
+                    ("reference".to_string(), resolved_reference_secret),
+                ]))),
+            );
+
+        let redacted = redact_resource_using_redacted_shape(&resource, &guide)
+            .expect("effect resource redaction");
+        let Some(Value::Concrete(ConcreteValue::Map(settings))) =
+            redacted.attributes.get("settings")
+        else {
+            panic!("expected redacted settings map")
+        };
+        assert_eq!(
+            settings.get("secret"),
+            Some(&reusable_secret),
+            "an effect-side secret must reuse the planned resource's digest",
+        );
+        assert_eq!(
+            settings.get("reference"),
+            Some(&reference),
+            "a planned secret must not turn an effect-side ResourceRef into a placeholder",
+        );
     }
 
     #[test]

@@ -912,6 +912,77 @@ let item = mock.test.resource {
 }
 
 #[test]
+fn saved_plan_cascade_keeps_secret_resource_ref_and_applies() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let producer = mock.test.resource {
+  name            = "cascade-producer"
+  replacement_key = "before"
+  comment         = secret("CASCADE_SECRET_PLAIN_3863")
+}
+
+let consumer = mock.test.resource {
+  name    = "cascade-consumer"
+  comment = producer.comment
+}
+"#,
+    );
+    assert_success(
+        "initial cascade fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let producer = mock.test.resource {
+  name            = "cascade-producer"
+  replacement_key = "after"
+  comment         = secret("CASCADE_SECRET_PLAIN_3863")
+}
+
+let consumer = mock.test.resource {
+  name    = "cascade-consumer"
+  comment = producer.comment
+}
+"#,
+    );
+
+    assert_success("cascade saved plan", &scenario.plan());
+    let plan = read_json(&scenario.project.join("plan.json"));
+    let consumer_update = plan["plan"]["effects"]
+        .as_array()
+        .expect("saved plan effects")
+        .iter()
+        .filter_map(|effect| effect.get("Update"))
+        .find(|update| {
+            update.pointer("/to/attributes/name/String")
+                == Some(&Value::String("cascade-consumer".to_string()))
+        })
+        .unwrap_or_else(|| panic!("saved plan has no cascade consumer update: {plan:#}"));
+    assert!(
+        consumer_update
+            .pointer("/to/attributes/comment/ResourceRef")
+            .is_some(),
+        "cascade consumer effect lost its ResourceRef: {consumer_update:#}",
+    );
+
+    let apply = scenario.apply_plan();
+    assert_success("cascade saved-plan apply", &apply);
+    assert_output_has_no_plaintext(
+        "cascade saved-plan apply",
+        &apply,
+        &["CASCADE_SECRET_PLAIN_3863"],
+    );
+    let state = scenario.state_json();
+    assert_secret_hash(
+        &state_resource_by_name(&state, "cascade-consumer")["attributes"]["comment"],
+    );
+}
+
+#[test]
 fn pre_typed_secret_plan_format_requires_replan() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
