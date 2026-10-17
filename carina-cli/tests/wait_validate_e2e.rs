@@ -15,7 +15,9 @@ use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -70,6 +72,13 @@ impl ProviderFactory for WaitTestFactory {
 }
 
 fn cert_schema() -> ResourceSchema {
+    let status_enum = AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Status"),
+        Some(vec!["ISSUED".to_string()]),
+        vec![("ISSUED".to_string(), "issued".to_string())],
+        None,
+        None,
+    );
     ResourceSchema::new("acm.Certificate")
         .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
         .attribute(AttributeSchema::new(
@@ -77,6 +86,7 @@ fn cert_schema() -> ResourceSchema {
             AttributeType::string(),
         ))
         .attribute(AttributeSchema::new("status", AttributeType::string()))
+        .attribute(AttributeSchema::new("enum_status", status_enum))
         .attribute(AttributeSchema::new(
             "certificate_arn",
             AttributeType::string(),
@@ -284,6 +294,46 @@ fn validate_flags_wait_unknown_attribute() {
         "validate must surface unknown wait attribute; got: {:?}",
         diags
     );
+}
+
+#[test]
+fn validate_requires_quotes_for_unresolved_wait_enum_identifiers() {
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            r#"provider aws {
+    region = "us-east-1"
+}
+"#,
+        ),
+        (
+            "main.crn",
+            r#"let cert = aws.acm.Certificate {
+    domain_name       = "registry.example.com"
+    validation_method = "DNS"
+}
+"#,
+        ),
+        (
+            "wait.crn",
+            r#"let state_ready = wait cert {
+    until = cert.status == ready
+}
+
+let enum_ready = wait cert {
+    until = cert.enum_status == aws.acm.Certificate.Status.bogus
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = cli_validate(&fixture);
+    assert!(diagnostics.iter().any(|diagnostic| diagnostic.contains(
+        "wait `state_ready`: cannot resolve `ready` as an enum value of `cert.status`; quote it to compare as a string"
+    )), "validate must reject an unquoted identifier on a string attribute; got: {diagnostics:?}");
+    assert!(diagnostics.iter().any(|diagnostic| diagnostic.contains(
+        "wait `enum_ready`: cannot resolve `aws.acm.Certificate.Status.bogus` as an enum value of `cert.enum_status`; quote it to compare as a string"
+    )), "validate must reject an unknown enum member; got: {diagnostics:?}");
 }
 
 #[test]

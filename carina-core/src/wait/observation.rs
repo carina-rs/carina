@@ -91,10 +91,7 @@ mod tests {
     }
 
     fn equals_predicate(attr: AttrPath, value: &str) -> WaitPredicate {
-        WaitPredicate::Equals {
-            attr,
-            value: string_value(value),
-        }
+        WaitPredicate::equals(attr, string_value(value)).unwrap()
     }
 
     #[test]

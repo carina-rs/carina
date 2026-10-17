@@ -178,18 +178,31 @@ impl ProviderFactory for AliasFactory {
     }
 
     fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
+        };
 
-        vec![ResourceSchema::new("thing").attribute(AttributeSchema::new(
-            "mode",
-            AttributeType::enum_(
-                enum_identity("Mode", Some("test.thing")),
-                Some(vec!["friendly".to_string()]),
-                Vec::new(),
-                None,
-                None,
-            ),
-        ))]
+        let mode = AttributeType::enum_(
+            enum_identity("Mode", Some("test.thing")),
+            Some(vec!["friendly".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        vec![
+            ResourceSchema::new("thing")
+                .attribute(AttributeSchema::new("mode", mode.clone()))
+                .attribute(AttributeSchema::new(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::new("mode", mode),
+                            StructField::new("peer", AttributeType::string()),
+                        ],
+                    ),
+                )),
+        ]
     }
 
     fn get_enum_alias_reverse(
@@ -202,9 +215,69 @@ impl ProviderFactory for AliasFactory {
     }
 }
 
-fn order_schema() -> SchemaRegistry {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+struct RecordingAliasFactory {
+    calls: Arc<Mutex<Vec<String>>>,
+}
 
+impl ProviderFactory for RecordingAliasFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "Test"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &crate::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn crate::provider::Provider>>> {
+        unreachable!("test factory does not create providers")
+    }
+
+    fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push("resolve_enum_aliases".to_string());
+        AliasFactory.schemas()
+    }
+
+    fn get_enum_alias_reverse(
+        &self,
+        resource_type: &str,
+        attr_name: &str,
+        value: &str,
+    ) -> Option<String> {
+        AliasFactory.get_enum_alias_reverse(resource_type, attr_name, value)
+    }
+}
+
+fn order_schema() -> SchemaRegistry {
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
+    };
+
+    let mode = AttributeType::enum_(
+        enum_identity("Mode", Some("test.thing")),
+        Some(vec!["friendly".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -226,6 +299,17 @@ fn order_schema() -> SchemaRegistry {
             .attribute(AttributeSchema::new(
                 "tags",
                 AttributeType::map(AttributeType::string()),
+            ))
+            .attribute(AttributeSchema::new("mode", mode.clone()))
+            .attribute(AttributeSchema::new(
+                "settings",
+                AttributeType::struct_(
+                    "Settings",
+                    vec![
+                        StructField::new("mode", mode),
+                        StructField::new("peer", AttributeType::string()),
+                    ],
+                ),
             )),
     );
     schemas
@@ -248,7 +332,9 @@ async fn desired_normalization_runs_stages_in_order() {
                     .lock()
                     .unwrap()
                     .push(format!("normalize_desired:{subjects:?}"));
-                resources[0].set_attr("mode", string_value("Mode.friendly"));
+                // Model the real WASM ABI result: provider normalization
+                // returns the enum's API spelling as an ordinary string.
+                resources[0].set_attr("mode", string_value("friendly"));
                 resources[0].set_attr(
                     "tags",
                     Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -284,7 +370,9 @@ async fn desired_normalization_runs_stages_in_order() {
     resource.set_attr("subjects", string_value("one"));
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RecordingAliasFactory {
+        calls: Arc::clone(&calls),
+    })];
     let schemas = order_schema();
 
     let normalized = apply_desired_normalization(
@@ -299,13 +387,16 @@ async fn desired_normalization_runs_stages_in_order() {
 
     assert_eq!(
         calls.lock().unwrap().clone(),
-        vec![format!(
-            "normalize_desired:{:?}",
-            Some(Value::Concrete(ConcreteValue::StringList(vec![
-                "one".into()
-            ])))
-        )],
-        "canonicalize must run before normalize_desired"
+        vec![
+            format!(
+                "normalize_desired:{:?}",
+                Some(Value::Concrete(ConcreteValue::StringList(vec![
+                    "one".into()
+                ])))
+            ),
+            "resolve_enum_aliases".to_string(),
+        ],
+        "canonicalize must run before normalize_desired, and enum resolution must run after it"
     );
     assert_eq!(
         normalized.as_resource().get_attr("tags"),
@@ -317,8 +408,8 @@ async fn desired_normalization_runs_stages_in_order() {
     );
     assert_eq!(
         normalized.as_resource().get_attr("mode"),
-        Some(&string_value("canonical")),
-        "resolve_enum_aliases must run after desired normalization"
+        Some(&string_value("friendly")),
+        "the typed alias pass must not reclassify the normalizer's API string"
     );
 }
 
@@ -408,7 +499,10 @@ async fn desired_normalization_resolves_enum_alias_nested_with_resource_ref() {
     resource.set_attr(
         "settings",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
-            ("mode".to_string(), string_value("Mode.friendly")),
+            (
+                "mode".to_string(),
+                Value::Concrete(ConcreteValue::enum_identifier("Mode.friendly")),
+            ),
             ("peer".to_string(), peer_ref.clone()),
         ]))),
     );
@@ -419,14 +513,18 @@ async fn desired_normalization_resolves_enum_alias_nested_with_resource_ref() {
             .await
             .unwrap();
 
-    assert_eq!(
-        normalized.as_resource().get_attr("settings"),
-        Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([
-            ("mode".to_string(), string_value("canonical")),
-            ("peer".to_string(), peer_ref),
-        ])))),
-        "host enum-alias resolution must see full ref-bearing attributes"
-    );
+    let Some(Value::Concrete(ConcreteValue::Map(settings))) =
+        normalized.as_resource().get_attr("settings")
+    else {
+        panic!("settings must remain a map");
+    };
+    assert!(matches!(
+        settings.get("mode"),
+        Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+            if canonical.identity().to_string() == "test.thing.Mode"
+                && canonical.api_value() == "friendly"
+    ));
+    assert_eq!(settings.get("peer"), Some(&peer_ref));
 }
 
 #[tokio::test]
@@ -641,7 +739,10 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
                     .lock()
                     .unwrap()
                     .push("normalize_desired".to_string());
-                resources[0].set_attr("mode", string_value("Mode.friendly"));
+                resources[0].set_attr(
+                    "mode",
+                    Value::Concrete(ConcreteValue::enum_identifier("Mode.friendly")),
+                );
                 Ok(())
             })
         }
@@ -714,9 +815,13 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
         )])))),
         "slice wrapper must run host default-tag merging on the full resource"
     );
-    assert_eq!(
-        resources[0].get_attr("mode"),
-        Some(&string_value("canonical")),
+    assert!(
+        matches!(
+            resources[0].get_attr("mode"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+                if canonical.identity().to_string() == "test.thing.Mode"
+                    && canonical.api_value() == "friendly"
+        ),
         "slice wrapper must run enum alias resolution after provider stages"
     );
 }

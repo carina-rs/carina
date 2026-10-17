@@ -2710,8 +2710,13 @@ impl AttributeType {
             let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
             let variant = if direct_match {
                 s.expose_plaintext()
+            } else if let Some(user_input) = user_input {
+                // Namespace extraction is authorized by the parser's typed
+                // EnumIdentifier source, never by this temporary String
+                // representation's text shape.
+                extract_enum_value_with_values(user_input, &valid)
             } else {
-                extract_enum_value_with_values(s.expose_plaintext(), &valid)
+                s.expose_plaintext()
             };
 
             // Non-direct matches must have the exact form
@@ -5512,6 +5517,29 @@ pub enum SchemaKind {
     DataSource,
 }
 
+/// Failure to resolve a dotted attribute path through one resource schema.
+///
+/// The first segment names a top-level attribute. Every following segment
+/// names either a field on a `Struct` or a key in a `Map`. List indexing is
+/// unsupported because dotted wait predicates do not carry an index syntax.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AttributePathTypeError {
+    #[error("attribute path cannot be empty")]
+    Empty,
+    #[error("unknown top-level attribute `{attribute}`")]
+    UnknownAttribute { attribute: String },
+    #[error("unknown field `{field}` on struct `{struct_name}` after `{parent_path}`")]
+    UnknownStructField {
+        parent_path: String,
+        field: String,
+        struct_name: String,
+    },
+    #[error(
+        "cannot traverse `{path}` because it has type {type_name}; only struct fields and map values can be traversed"
+    )]
+    CannotTraverse { path: String, type_name: String },
+}
+
 pub(crate) fn struct_fields_with_defs<'a>(
     attr_type: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
@@ -5736,6 +5764,57 @@ impl ResourceSchema {
             return None;
         }
         struct_fields_with_defs(ty, &self.defs)
+    }
+
+    /// Resolve the type at a full dotted attribute path.
+    ///
+    /// The path excludes a resource binding root, so
+    /// `cert.renewal_summary.renewal_status` is supplied as
+    /// `["renewal_summary", "renewal_status"]`. Nested descent follows
+    /// named `Struct` fields and arbitrary `Map` keys, matching the runtime
+    /// [`crate::wait::predicate::AttrPath`] evaluator.
+    pub fn type_at_attribute_path<'a>(
+        &'a self,
+        path: &[String],
+    ) -> Result<&'a AttributeType, AttributePathTypeError> {
+        let (first, rest) = path.split_first().ok_or(AttributePathTypeError::Empty)?;
+        let attribute =
+            self.attributes
+                .get(first)
+                .ok_or_else(|| AttributePathTypeError::UnknownAttribute {
+                    attribute: first.clone(),
+                })?;
+        let mut current = &attribute.attr_type;
+        let mut traversed = first.clone();
+
+        for segment in rest {
+            current = match self.shape_of(current) {
+                Shape::Struct { name: struct_name } => {
+                    let fields = struct_fields_with_defs(current, &self.defs)
+                        .expect("Shape::Struct must expose struct fields internally");
+                    &fields
+                        .iter()
+                        .find(|field| field.name == *segment)
+                        .ok_or_else(|| AttributePathTypeError::UnknownStructField {
+                            parent_path: traversed.clone(),
+                            field: segment.clone(),
+                            struct_name: struct_name.to_string(),
+                        })?
+                        .field_type
+                }
+                Shape::Map { value, .. } => value,
+                _ => {
+                    return Err(AttributePathTypeError::CannotTraverse {
+                        path: traversed,
+                        type_name: current.type_name(),
+                    });
+                }
+            };
+            traversed.push('.');
+            traversed.push_str(segment);
+        }
+
+        Ok(current)
     }
 
     pub fn union_members_with_budget<'a>(

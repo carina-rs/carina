@@ -623,9 +623,9 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     reg
 });
 
-/// Factory that maps the enum DSL alias `all` → AWS canonical `"-1"`
-/// for the `ip_protocol` attribute, modeling plan-time stage 3
-/// (`resolve_enum_aliases`). carina#3063: apply must re-apply this.
+/// Factory with a modern enum schema plus a conflicting legacy reverse-alias
+/// entry. Schema resolution must retain `CanonicalEnum("all")` and must not
+/// consult the legacy table.
 struct AliasFactory;
 impl ProviderFactory for AliasFactory {
     fn name(&self) -> &str {
@@ -3010,10 +3010,11 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("target_ready"),
         target_id: crate::resource::ResolvedResourceId::new(target_id.clone()),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("READY".into())),
-        },
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("READY".into())),
+        )
+        .unwrap(),
         until_surface: "wait-target.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
@@ -3193,10 +3194,11 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_ready"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("READY".into())),
-        },
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("READY".into())),
+        )
+        .unwrap(),
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_secs(60),
@@ -3257,10 +3259,11 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_ready"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("READY".into())),
-        },
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("READY".into())),
+        )
+        .unwrap(),
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_secs(60),
@@ -3881,13 +3884,10 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     assert_eq!(provider.captured_data_source_reads().len(), 1);
 }
 
-/// carina#3063: the apply path must also re-apply plan-time stage 3
-/// (enum-alias resolution, `get_enum_alias_reverse`), not just
-/// `normalize_desired` (stage 2). After plan-time normalization the
-/// value is the namespaced DSL form (`...IpProtocol.all`); apply
-/// re-resolves from the un-normalized source, so without re-applying
-/// the alias stage the provider receives the namespaced/aliased form
-/// instead of the AWS canonical `"-1"`.
+/// carina#3063: the apply path must re-apply the plan-time typed enum stage,
+/// not just `normalize_desired`. Apply re-resolves from the authored source;
+/// without this stage the provider would receive an unresolved
+/// `EnumIdentifier` instead of a `CanonicalEnum`.
 #[tokio::test]
 async fn test_apply_reapplies_enum_alias_stage() {
     let provider = MockProvider::new();
@@ -3895,11 +3895,11 @@ async fn test_apply_reapplies_enum_alias_stage() {
     // `AliasFactory` (whose `name()` is `"test"`).
     let mut resource = Resource::with_provider("test", "sg", "a", None);
     resource.binding = Some("a".to_string());
-    // Post-normalize_desired shape: namespaced DSL enum identifier.
+    // Authored parser shape: a typed namespaced DSL enum identifier.
     resource.set_attr(
         "ip_protocol",
-        Value::Concrete(ConcreteValue::String(
-            "test.ec2.SecurityGroup.IpProtocol.all".into(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "test.ec2.SecurityGroup.IpProtocol.all",
         )),
     );
     let rid = resource.id.clone();
@@ -3930,19 +3930,21 @@ async fn test_apply_reapplies_enum_alias_stage() {
 
     let captured = provider.captured_create_resources();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].get_attr("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
-        "apply path must re-apply the enum-alias stage so the provider \
-         receives the AWS canonical value, not the namespaced DSL form"
+    assert!(
+        matches!(
+            captured[0].get_attr("ip_protocol"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+                if canonical.identity().to_string() == "test.ec2.SecurityGroup.IpProtocol"
+                    && canonical.api_value() == "all"
+        ),
+        "apply path must re-apply typed enum resolution"
     );
 }
 
 /// carina#3063, Update path: the enum-alias stage must be re-applied on
 /// Update too, not just Create (carina#3060's lesson — aws#315 was an
 /// Update bug). The `UpdateRequest.patch` is built from the re-resolved
-/// `to`; without the apply-path enum-alias re-resolution the patch
-/// would carry the namespaced DSL form instead of the AWS canonical.
+/// `to`; without the apply-path pass it would carry the unresolved DSL form.
 #[tokio::test]
 async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let provider = MockProvider::new();
@@ -3950,8 +3952,8 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     to_resource.binding = Some("a".to_string());
     to_resource.set_attr(
         "ip_protocol",
-        Value::Concrete(ConcreteValue::String(
-            "test.ec2.SecurityGroup.IpProtocol.all".into(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "test.ec2.SecurityGroup.IpProtocol.all",
         )),
     );
     let rid = to_resource.id.clone();
@@ -3999,11 +4001,14 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
         .iter()
         .find(|op| op.key == "ip_protocol")
         .expect("patch must contain the changed `ip_protocol` attribute");
-    assert_eq!(
-        op.value,
-        Some(Value::Concrete(ConcreteValue::String("-1".into()))),
-        "Update patch must carry the enum-alias-canonical value, not \
-         the namespaced DSL form"
+    assert!(
+        matches!(
+            &op.value,
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+                if canonical.identity().to_string() == "test.ec2.SecurityGroup.IpProtocol"
+                    && canonical.api_value() == "all"
+        ),
+        "Update patch must carry the schema-resolved enum value"
     );
 }
 
@@ -6470,10 +6475,11 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-        },
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+        )
+        .unwrap(),
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
@@ -6623,10 +6629,11 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-        },
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+        )
+        .unwrap(),
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
@@ -6727,10 +6734,11 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-        },
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+        )
+        .unwrap(),
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
@@ -7257,10 +7265,11 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("issued".into())),
-        },
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("issued".into())),
+        )
+        .unwrap(),
         until_surface: "cert.status == \"issued\"".to_string(),
         timeout: std::time::Duration::from_secs(5),
         interval: std::time::Duration::from_millis(10),

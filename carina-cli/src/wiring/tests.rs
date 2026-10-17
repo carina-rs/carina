@@ -249,7 +249,6 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             &[],
             &mut [],
             &[],
-            &mut [],
         )
         .await
         .expect_err("normalizer failure must abort plan preprocessing");
@@ -378,7 +377,6 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             &[],
             &mut [],
             &[],
-            &mut [],
         )
         .await
         .unwrap();
@@ -983,16 +981,13 @@ use carina_core::parser::ParsedFile;
 #[test]
 #[ignore = "requires provider binary for enum alias resolution"]
 fn test_resolve_enum_aliases_ip_protocol_all() {
-    // After normalize_desired, ip_protocol "all" becomes a namespaced DSL value.
-    // resolve_enum_aliases should resolve the alias "all" -> "-1".
+    // Parser-authored enum syntax stays typed until alias resolution.
     let mut resource =
         Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.all"
-                .to_string()
-                .into(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "awscc.ec2.security_group_egress.IpProtocol.all",
         )),
     );
 
@@ -1008,8 +1003,7 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
 
 #[test]
 fn test_resolve_enum_aliases_no_alias() {
-    // "tcp" has no alias mapping here, so schema-free extraction must not
-    // rewrite the namespaced DSL value.
+    // A plain string is never reclassified as an enum from its text.
     let mut resource =
         Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     resource.set_attr(
@@ -1024,7 +1018,7 @@ fn test_resolve_enum_aliases_no_alias() {
     let mut resources = vec![resource];
     resolve_enum_aliases(&mut resources);
 
-    // "tcp" has no alias, so it remains as the namespaced DSL value
+    // It remains the exact string value.
     assert_eq!(
         resources[0].get_attr("ip_protocol"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -1043,10 +1037,8 @@ fn test_resolve_enum_aliases_aws_provider() {
         Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "aws.ec2.security_group_ingress.IpProtocol.all"
-                .to_string()
-                .into(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "aws.ec2.security_group_ingress.IpProtocol.all",
         )),
     );
 
@@ -1069,17 +1061,15 @@ fn test_resolve_enum_aliases_in_states() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.all"
-                .to_string()
-                .into(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "awscc.ec2.security_group_egress.IpProtocol.all",
         )),
     );
     let state = State::existing(id.clone(), attrs);
     let mut current_states = HashMap::new();
     current_states.insert(id.clone(), state);
 
-    super::resolve_enum_aliases_in_states(&ctx, &mut current_states);
+    super::resolve_enum_aliases_in_states(&ctx, &mut current_states, &[]);
 
     assert_eq!(
         current_states[&id].attributes.get("ip_protocol"),
@@ -1095,8 +1085,8 @@ fn test_resolve_enum_aliases_in_struct_field() {
     let mut egress_map = IndexMap::new();
     egress_map.insert(
         "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.SecurityGroup.IpProtocol.all".into(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "awscc.ec2.SecurityGroup.IpProtocol.all",
         )),
     );
     egress_map.insert(
@@ -1152,13 +1142,17 @@ fn test_normalize_state_prevents_false_enum_diff() {
 
     let ctx = WiringContext::new(vec![], &[]);
 
-    // Desired resource with normalized DSL enum value (after normalize_desired)
+    // Desired resource with the parser-authored typed enum value.
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc", None);
     resource.set_attr(
         "instance_tenancy".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.Vpc.InstanceTenancy.default".into(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "awscc.ec2.Vpc.InstanceTenancy.default",
         )),
+    );
+    carina_core::value::canonicalize_resources_with_schemas(
+        std::slice::from_mut(&mut resource),
+        ctx.schemas(),
     );
 
     // State with raw AWS value (as returned by provider.read())
@@ -5829,313 +5823,6 @@ mod kind_default_source_tests {
     }
 }
 
-/// carina#3358 (reopened after PR #3359): an enum-form `until` predicate
-/// must be resolved to the canonical AWS value before the differ lowers
-/// the wait into `Effect::Wait`, so an already-satisfied wait is elided.
-///
-/// PR #3359's gate calls `until.evaluate(&state.attributes)`. The parser
-/// lowers `until = cert.status == aws.acm.Certificate.Status.Issued` into
-/// the RAW dotted string `"aws.acm.Certificate.Status.Issued"`; the
-/// canonical state value is `"ISSUED"`. Unless the alias is resolved the
-/// two never compare equal, so the gate's `target_needs_wait` stays
-/// `true` and the no-op wait is emitted — the exact registry-dev repro.
-mod wait_until_enum_alias {
-    use super::super::*;
-    use carina_core::parser::{UntilPredicateAst, WaitBinding};
-    use carina_core::provider::{
-        BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
-    };
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
-
-    /// Minimal aws-like factory that mirrors the REAL
-    /// `carina-provider-aws` ACM `status` enum reverse alias:
-    /// `("status", "issued") => "ISSUED"` (snake_case DSL spelling →
-    /// canonical AWS value; verified against
-    /// `carina-provider-aws/.../acm/certificate.rs`). The DSL value
-    /// `aws.acm.Certificate.Status.issued` — the exact form in the
-    /// reopened issue #3358 — is shortened by
-    /// `resolve_value_alias_with_schemas` to the trailing segment `"issued"`,
-    /// which is the alias-map key. Keying on
-    /// PascalCase `"Issued"` would NOT match the real provider, so the
-    /// test would prove a path production never exercises. Everything
-    /// else is stubbed to the minimum the helper needs: an enum schema for
-    /// `status` and `get_enum_alias_reverse`.
-    struct AcmAliasFactory;
-
-    impl ProviderFactory for AcmAliasFactory {
-        fn name(&self) -> &str {
-            "aws"
-        }
-        fn display_name(&self) -> &str {
-            "AWS (carina#3358 enum-alias stub)"
-        }
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
-        }
-        fn validate_config(&self, _a: &IndexMap<String, Value>) -> Result<(), String> {
-            Ok(())
-        }
-        fn extract_region(&self, _a: &IndexMap<String, Value>) -> String {
-            "us-east-1".to_string()
-        }
-        fn create_provider(
-            &self,
-            _b: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-            Box::pin(async { Ok(Box::new(StubProvider) as Box<dyn Provider>) })
-        }
-        fn create_normalizer(
-            &self,
-            _b: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
-            Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
-        }
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            vec![
-                ResourceSchema::new("acm.Certificate").attribute(AttributeSchema::new(
-                    "status",
-                    AttributeType::enum_(
-                        enum_identity("Status", Some("aws.acm.Certificate")),
-                        Some(vec!["issued".to_string(), "pending_validation".to_string()]),
-                        Vec::new(),
-                        None,
-                        None,
-                    ),
-                )),
-            ]
-        }
-        fn get_enum_alias_reverse(
-            &self,
-            resource_type: &str,
-            attr_name: &str,
-            value: &str,
-        ) -> Option<String> {
-            match (resource_type, attr_name, value) {
-                ("acm.Certificate", "status", "issued") => Some("ISSUED".to_string()),
-                _ => None,
-            }
-        }
-    }
-
-    // The plan-seam test uses this provider only for its default empty
-    // satisfier hint. CRUD methods remain unreachable.
-    struct StubProvider;
-    impl Provider for StubProvider {
-        fn name(&self) -> &str {
-            "aws"
-        }
-        fn read(
-            &self,
-            id: &ResourceId,
-            _i: Option<&str>,
-            _r: carina_core::provider::ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
-        }
-        fn read_data_source(
-            &self,
-            r: &carina_core::provider::ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = r.id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
-        }
-        fn create(
-            &self,
-            id: &ResourceId,
-            _r: carina_core::provider::CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-            let id = id.clone();
-            Box::pin(async move {
-                Ok(carina_core::provider::CreateOutcome::Success {
-                    state: State::existing(id, HashMap::new()),
-                })
-            })
-        }
-        fn update(
-            &self,
-            id: &ResourceId,
-            _i: &str,
-            _r: carina_core::provider::UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
-            let id = id.clone();
-            Box::pin(async move {
-                Ok(carina_core::provider::UpdateOutcome::Success {
-                    state: State::existing(id, HashMap::new()),
-                })
-            })
-        }
-        fn delete(
-            &self,
-            _id: &ResourceId,
-            _i: &str,
-            _r: carina_core::provider::DeleteRequest,
-        ) -> BoxFuture<'_, ProviderResult<()>> {
-            Box::pin(async move { Ok(()) })
-        }
-
-        fn required_permissions(
-            &self,
-            _id: &ResourceId,
-            _op: carina_core::effect::PlanOp,
-        ) -> ProviderResult<Vec<String>> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn enum_wait_binding() -> WaitBinding {
-        WaitBinding {
-            binding: "cert_issued".into(),
-            target: "cert".into(),
-            // The exact DSL form from the reopened issue #3358
-            // (snake_case `issued`, matching the real provider alias).
-            until_raw: "cert.status == aws.acm.Certificate.Status.issued".to_string(),
-            until_predicate: UntilPredicateAst {
-                lhs_segments: vec!["cert".to_string(), "status".to_string()],
-                // Exactly what `lower_until_rhs` produces for the enum form:
-                // the raw dotted identifier, NOT the canonical value.
-                rhs: Value::Concrete(ConcreteValue::String(
-                    "aws.acm.Certificate.Status.issued".into(),
-                )),
-            },
-            timeout_secs: Some(60),
-            depends_on: vec![],
-            line: 1,
-        }
-    }
-
-    fn cert_resource() -> Resource {
-        // Unchanged cert: desired matches state (status already ISSUED).
-        let mut r = Resource::with_provider("aws", "acm.Certificate", "cert", None);
-        r.binding = Some("cert".to_string());
-        r.set_attr(
-            "status".to_string(),
-            Value::Concrete(ConcreteValue::String("ISSUED".into())),
-        );
-        r
-    }
-
-    fn changed_consumer() -> Resource {
-        // New (absent from state) → Create → mutating; references the
-        // wait binding so `gates_a_pending_change` is satisfied.
-        let mut r = Resource::with_provider("aws", "cloudfront.Distribution", "dist", None);
-        r.binding = Some("dist".to_string());
-        r.dependency_bindings.insert("cert_issued".to_string());
-        r
-    }
-
-    fn cert_state() -> HashMap<ResourceId, State> {
-        let id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
-        let mut attrs = HashMap::new();
-        attrs.insert(
-            "status".to_string(),
-            Value::Concrete(ConcreteValue::String("ISSUED".into())),
-        );
-        let mut states = HashMap::new();
-        states.insert(
-            id.clone(),
-            State::existing(id, attrs).with_identifier("arn:aws:acm:::certificate/abc"),
-        );
-        states
-    }
-
-    /// The fix's core: `resolve_enum_aliases_in_wait_bindings` rewrites
-    /// the raw enum RHS to the canonical AWS value using the target
-    /// resource's `(provider, resource_type)` and the factory alias map.
-    #[test]
-    fn helper_resolves_until_rhs_enum_alias_to_canonical() {
-        let ctx = WiringContext::new(
-            vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>],
-            &[],
-        );
-        let mut waits = vec![enum_wait_binding()];
-        let resources = vec![cert_resource()];
-
-        resolve_enum_aliases_in_wait_bindings(&ctx, &mut waits, &resources, &[]);
-
-        assert_eq!(
-            waits[0].until_predicate.rhs,
-            Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            "until RHS enum identifier must resolve to the canonical AWS value"
-        );
-    }
-
-    /// End-to-end logic at the plan seam: with the RAW enum RHS the
-    /// differ emits a no-op wait (the bug); after the wiring's
-    /// enum-alias resolution it is elided. Drives the real
-    /// `resolve_enum_aliases_in_wait_bindings` -> `create_plan` pair the
-    /// plan path uses.
-    #[test]
-    fn create_plan_elides_already_satisfied_wait_after_enum_alias_resolution() {
-        let ctx = WiringContext::new(
-            vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>],
-            &[],
-        );
-        let resources = vec![cert_resource(), changed_consumer()];
-        let states = cert_state();
-
-        // Bug repro: unresolved RAW enum RHS → wait wrongly emitted.
-        let raw_waits = vec![enum_wait_binding()];
-        let resolved_resources = ResolvedResource::collect_resolved(resources.clone()).unwrap();
-        let plan_raw = carina_core::differ::create_plan(
-            &resolved_resources,
-            &[],
-            &StubProvider,
-            carina_core::differ::PlanPriorStates::new(
-                &carina_core::resource::into_plan_input_map(
-                    states.clone(),
-                    &carina_core::schema::SchemaRegistry::new(),
-                    &[],
-                ),
-                &Orphans::new(),
-            ),
-            &HashMap::new(),
-            ctx.schemas(),
-            &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
-            &raw_waits,
-        )
-        .expect("test provider hints should succeed");
-        assert!(
-            plan_raw.effects().iter().any(|e| e.is_wait()),
-            "precondition: with the raw enum RHS the differ emits the no-op \
-             wait (the carina#3358 bug); effects were {:?}",
-            plan_raw.effects()
-        );
-
-        // Fixed: resolve the alias first → predicate satisfied → elided.
-        let mut waits = vec![enum_wait_binding()];
-        resolve_enum_aliases_in_wait_bindings(&ctx, &mut waits, &resources, &[]);
-        let plan_fixed = carina_core::differ::create_plan(
-            &resolved_resources,
-            &[],
-            &StubProvider,
-            carina_core::differ::PlanPriorStates::new(
-                &carina_core::resource::into_plan_input_map(
-                    states.clone(),
-                    &carina_core::schema::SchemaRegistry::new(),
-                    &[],
-                ),
-                &Orphans::new(),
-            ),
-            &HashMap::new(),
-            ctx.schemas(),
-            &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
-            &waits,
-        )
-        .expect("test provider hints should succeed");
-        assert!(
-            !plan_fixed.effects().iter().any(|e| e.is_wait()),
-            "carina#3358: after enum-alias resolution the already-satisfied \
-             wait must be elided; effects were {:?}",
-            plan_fixed.effects()
-        );
-    }
-}
-
 /// carina#3688 composition regression: the CLI's one provider-loader seam
 /// must combine the host's structured instantiation diagnostic with the
 /// resolver's typed lock provenance. Neither half may be re-derived at a
@@ -6784,8 +6471,6 @@ mod resolved_value_constraint_gate {
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
-        let mut wait_bindings = Vec::new();
-
         PlanPreprocessor::new(normalizer, &ctx)
             .prepare(
                 &mut resources,
@@ -6796,7 +6481,6 @@ mod resolved_value_constraint_gate {
                 &[],
                 &mut data_sources,
                 &data_source_origins,
-                &mut wait_bindings,
             )
             .await
             .map_err(into_plan_errors)
@@ -6872,7 +6556,6 @@ mod resolved_value_constraint_gate {
         let mut states = HashMap::new();
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
-        let mut waits = Vec::new();
         let module_gate =
             carina_core::executor::ModuleConstraintGate::new(std::slice::from_ref(composition));
 
@@ -6886,7 +6569,6 @@ mod resolved_value_constraint_gate {
                 &[],
                 &mut data_sources,
                 &[],
-                &mut waits,
             )
             .await
             .map_err(into_plan_errors)
@@ -7025,7 +6707,6 @@ mod resolved_value_constraint_gate {
                 &[],
                 &mut data_sources,
                 &data_source_origins,
-                &mut [],
             )
             .await
             .expect_err("invalid resolved data-source input must fail planning");

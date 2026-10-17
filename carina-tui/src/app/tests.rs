@@ -620,31 +620,28 @@ fn tab_complete_with_provider_prefix() {
 }
 
 #[test]
-fn format_value_resolves_dsl_enum_identifiers() {
-    // 5-part DSL enum: should resolve to quoted value
+fn format_value_preserves_strings_that_resemble_enum_identifiers() {
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface"
                 .to_string()
                 .into()
         ))),
-        "\"Interface\""
+        "\"awscc.ec2.vpc_endpoint.VpcEndpointType.Interface\""
     );
 
-    // 4-part DSL enum
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
             "aws.s3.VersioningStatus.Enabled".into()
         ))),
-        "\"Enabled\""
+        "\"aws.s3.VersioningStatus.Enabled\""
     );
 
-    // 3-part DSL enum: namespace stripped, value returned as-is
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
             "aws.Region.ap_northeast_1".into()
         ))),
-        "\"ap_northeast_1\""
+        "\"aws.Region.ap_northeast_1\""
     );
 
     // Regular string should be quoted as-is
@@ -665,17 +662,13 @@ fn format_value_resolves_dsl_enum_identifiers() {
 }
 
 #[test]
-fn create_effect_attributes_resolve_enum_values() {
+fn create_effect_attributes_preserve_dotted_string_values() {
     let mut plan = Plan::new();
     plan.add(create(
         Resource::new("ec2.vpc_endpoint", "my-endpoint")
             .with_attribute(
-                "vpc_endpoint_type",
-                Value::Concrete(ConcreteValue::String(
-                    "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface"
-                        .to_string()
-                        .into(),
-                )),
+                "name",
+                Value::Concrete(ConcreteValue::String("A.json".into())),
             )
             .with_attribute(
                 "vpc_id",
@@ -686,13 +679,12 @@ fn create_effect_attributes_resolve_enum_values() {
     let app = App::for_plan(&plan, &SchemaRegistry::new());
     let node = &app.nodes[0];
 
-    // Enum value should be resolved in detail rows
-    let enum_row = node
+    let string_row = node
         .detail_rows
         .iter()
-        .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "vpc_endpoint_type"))
-        .expect("vpc_endpoint_type detail row should exist");
-    assert!(matches!(enum_row, DetailRow::Attribute { value, .. } if value == "\"Interface\""));
+        .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "name"))
+        .expect("name detail row should exist");
+    assert!(matches!(string_row, DetailRow::Attribute { value, .. } if value == "\"A.json\""));
 
     // ResourceRef should remain unresolved
     let ref_row = node

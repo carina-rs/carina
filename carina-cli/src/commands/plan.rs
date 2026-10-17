@@ -154,7 +154,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 15;
+    pub const CURRENT_VERSION: u32 = 16;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -768,6 +768,11 @@ fn build_plan_file<E>(
         .collect();
 
     Ok(PlanFile {
+        // carina#3855: bumped 15→16 — unquoted wait RHS identifiers are
+        // persisted as typed enum values. A v15 plan may contain the same
+        // dotted text as an ordinary String, which cannot be distinguished
+        // safely from an intentionally quoted comparison; require replanning.
+        //
         // carina#3863 / carina#3865: bumped 14→15 — secret digests now
         // carry their salt, including upgraded legacy placeholders in embedded
         // current states. Saved-plan resource placeholders carry the exact

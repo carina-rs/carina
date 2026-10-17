@@ -711,9 +711,9 @@ fn test_shorten_attr_name_ids_suffix() {
     assert_eq!(shorten_attr_name("service_name"), "service");
 }
 
-/// Test that extract_compact_hint resolves DSL enum identifiers.
+/// String values retain their full text even when they resemble enum identifiers.
 #[test]
-fn test_extract_compact_hint_resolves_dsl_enum() {
+fn test_extract_compact_hint_preserves_namespaced_string() {
     let mut r = Resource::new("ec2.Subnet", "hash_enum");
     r.set_attr(
         "availability_zone".to_string(),
@@ -723,12 +723,10 @@ fn test_extract_compact_hint_resolves_dsl_enum() {
     );
 
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
-    // Displays DSL form (underscored) until provider alias tables include
-    // to_dsl reverse mappings (see issue #1675).
     assert_eq!(
         hint,
-        Some("availability_zone: ap_northeast_1a".to_string()),
-        "DSL enum identifiers should be stripped of namespace prefix"
+        Some("availability_zone: awscc.AvailabilityZone.ap_northeast_1a".to_string()),
+        "string values must not be reclassified as enum identifiers"
     );
 }
 

@@ -639,10 +639,11 @@ mod tests {
     }
 
     fn equals_status(value: &str) -> WaitPredicate {
-        WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String(value.to_string().into())),
-        }
+        WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String(value.to_string().into())),
+        )
+        .unwrap()
     }
 
     struct NoopWaitObserver;

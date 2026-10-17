@@ -84,12 +84,11 @@ pub struct ExecutionInput<'a> {
     /// normalization before provider patch construction.
     pub provider_configs: &'a [ProviderConfig],
     /// Provider factories, looked up per-resource by `id.provider`
-    /// (same `find_factory` dispatch the plan path uses) to re-apply
-    /// enum-alias resolution (`get_enum_alias_reverse`, e.g.
-    /// `IpProtocol.all` → `"-1"`) on the apply path. carina#3063:
-    /// plan-time pipeline stage 3 — like `normalize_desired`, undone by
-    /// apply-time re-resolution. A multi-provider plan needs the slice,
-    /// not a single factory.
+    /// (same `find_factory` dispatch the plan path uses) to re-apply typed
+    /// enum resolution on the apply path. carina#3063: like
+    /// `normalize_desired`, this final plan-time stage is undone by apply-time
+    /// re-resolution. A multi-provider plan needs the slice, not a single
+    /// factory.
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     /// Schema registry used to re-apply `Union[String, list(String)]`
     /// canonicalization (`canonicalize_resources_with_schemas`) — plan

@@ -11,7 +11,6 @@ use crate::resource::{
     Composition, ConcreteValue, DeferredValue, ModuleConstraintId, PendingModuleConstraint,
     ResourceId, Value,
 };
-use crate::utils::enum_display_value;
 
 use super::ModuleError;
 
@@ -598,7 +597,7 @@ fn format_constraint_actual(value: &Value) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => value
             .diagnostic_literal()
-            .map(format_constraint_string)
+            .map(display_string_literal)
             .unwrap_or_else(|| "string".to_string()),
         Value::Concrete(ConcreteValue::List(values)) => format!(
             "[{}]",
@@ -615,7 +614,7 @@ fn format_constraint_actual(value: &Value) -> String {
                 .map(|value| {
                     value
                         .diagnostic_literal()
-                        .map(format_constraint_string)
+                        .map(display_string_literal)
                         .unwrap_or_else(|| "string".to_string())
                 })
                 .collect::<Vec<_>>()
@@ -634,10 +633,6 @@ fn format_constraint_actual(value: &Value) -> String {
         }
         _ => crate::value::format_value(value),
     }
-}
-
-fn format_constraint_string(value: &str) -> String {
-    display_string_literal(enum_display_value(value).unwrap_or(value))
 }
 
 fn is_recursively_concrete(value: &Value) -> bool {
@@ -1008,7 +1003,7 @@ mod tests {
     fn constraint_actuals_render_strings_and_mask_hashed_secrets() {
         let names = vec![
             "plain".to_string(),
-            "enum_text".to_string(),
+            "dotted_text".to_string(),
             "secret_hash".to_string(),
         ];
         let values = HashMap::from([
@@ -1017,7 +1012,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("abc".into())),
             ),
             (
-                "enum_text".to_string(),
+                "dotted_text".to_string(),
                 Value::Concrete(ConcreteValue::String("aws.Region.us_east_1".into())),
             ),
             ("secret_hash".to_string(), redacted_secret()),
@@ -1027,7 +1022,10 @@ mod tests {
             constraint_actuals(&names, &values),
             vec![
                 ("plain".to_string(), "'abc'".to_string()),
-                ("enum_text".to_string(), "'us_east_1'".to_string()),
+                (
+                    "dotted_text".to_string(),
+                    "'aws.Region.us_east_1'".to_string()
+                ),
                 ("secret_hash".to_string(), "(secret)".to_string()),
             ]
         );

@@ -1,0 +1,14 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 795
+expression: output
+---
+Execution Plan:
+
+  + mock.test.Thing mock_test_thing_362266d1c2f2db7d
+      name: "A.json"
+  + mock.test.resource mock_test_resource_02661172
+      name: "A.json"
+      identifier: (known after apply)
+
+Plan: 2 to add, 0 to change, 0 to destroy.

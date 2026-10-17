@@ -148,10 +148,7 @@ impl std::fmt::Display for PlanErrorKind {
             Self::WaitPredicateInvalid {
                 wait_binding,
                 reason,
-            } => write!(
-                f,
-                "wait `{wait_binding}`: invalid predicate attribute path: {reason}"
-            ),
+            } => write!(f, "wait `{wait_binding}`: {reason}"),
             Self::ResolvedValueConstraint {
                 attributes,
                 origins,
@@ -1056,10 +1053,11 @@ mod tests {
                 "acm.Certificate",
                 "cert",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
             interval: Duration::from_secs(5),
@@ -1088,10 +1086,11 @@ mod tests {
                 "acm.Certificate",
                 "cert",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            )
+            .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
@@ -1532,7 +1531,7 @@ mod tests {
         assert_eq!(
             PlanErrorKind::WaitPredicateInvalid {
                 wait_binding: "cert_issued".to_string(),
-                reason: "empty attribute path".to_string(),
+                reason: "invalid predicate attribute path: empty attribute path".to_string(),
             }
             .to_string(),
             "wait `cert_issued`: invalid predicate attribute path: empty attribute path"

@@ -774,6 +774,28 @@ fn snapshot_enum_display() {
 }
 
 #[test]
+fn snapshot_string_dot_suffix() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("string_dot_suffix");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert_eq!(
+        output.matches("name: \"A.json\"").count(),
+        2,
+        "literal and evaluated string values must both retain their dotted suffix:\n{output}"
+    );
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_no_changes_enum() {
     let (plan, _schemas, _moved) = build_plan_from_fixture("no_changes_enum");
     let output = strip_ansi(&format_plan(

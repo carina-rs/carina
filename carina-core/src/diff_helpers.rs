@@ -340,14 +340,20 @@ pub struct StringListDiff {
 /// Set semantics: equality is by value, not position, and duplicate
 /// elements are conflated.
 pub fn compute_string_list_diff(old: &[String], new: &[String]) -> StringListDiff {
-    use std::collections::HashSet;
-    let old_set: HashSet<&str> = old.iter().map(String::as_str).collect();
-    let new_set: HashSet<&str> = new.iter().map(String::as_str).collect();
+    compute_string_list_diff_by(old, new, |left, right| left == right)
+}
 
+/// Diff two string slices with caller-provided set-membership equality while
+/// preserving the original spellings and ordering in the result.
+pub(crate) fn compute_string_list_diff_by(
+    old: &[String],
+    new: &[String],
+    equivalent: impl Fn(&str, &str) -> bool,
+) -> StringListDiff {
     let mut unchanged = Vec::new();
     let mut added = Vec::new();
     for s in new {
-        if old_set.contains(s.as_str()) {
+        if old.iter().any(|old| equivalent(old, s)) {
             unchanged.push(s.clone());
         } else {
             added.push(s.clone());
@@ -355,7 +361,7 @@ pub fn compute_string_list_diff(old: &[String], new: &[String]) -> StringListDif
     }
     let mut removed = Vec::new();
     for s in old {
-        if !new_set.contains(s.as_str()) {
+        if !new.iter().any(|new| equivalent(s, new)) {
             removed.push(s.clone());
         }
     }

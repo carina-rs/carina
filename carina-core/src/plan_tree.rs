@@ -13,7 +13,6 @@ use crate::detail_rows::DetailRow;
 use crate::effect::Effect;
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::utils::enum_display_value;
 use crate::value::format_value_with_key;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,10 +519,7 @@ pub fn extract_compact_hint(
             && !s.expose_plaintext().is_empty()
         {
             let short_key = shorten_attr_name(key);
-            // Strip namespace from DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap_northeast_1a")
-            let resolved =
-                enum_display_value(s.expose_plaintext()).unwrap_or_else(|| s.expose_plaintext());
-            let display_value = shorten_service_name(key, resolved);
+            let display_value = shorten_service_name(key, s.expose_plaintext());
             return Some(format!("{}: {}", short_key, display_value));
         }
     }
@@ -602,6 +598,19 @@ mod tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    #[test]
+    fn compact_hint_preserves_dotted_string_value() {
+        let resource = Resource::new("test.resource", "dotted-name").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("A.json".into())),
+        );
+
+        assert_eq!(
+            extract_compact_hint(crate::parser::ResourceRef::Resource(&resource), None),
+            Some("name: A.json".to_string())
+        );
     }
 
     #[test]
@@ -877,10 +886,11 @@ mod tests {
                 "route53.Record",
                 "validation_records[0]",
             )),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ready".into())),
-            },
+            until: WaitPredicate::equals(
+                AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ready".into())),
+            )
+            .unwrap(),
             until_surface: "status == 'ready'".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(1),

@@ -433,10 +433,11 @@ mod tests {
     }
 
     fn equals_predicate(attr: AttrPath, value: &str) -> WaitPredicate {
-        WaitPredicate::Equals {
+        WaitPredicate::equals(
             attr,
-            value: Value::Concrete(ConcreteValue::String(value.to_string().into())),
-        }
+            Value::Concrete(ConcreteValue::String(value.to_string().into())),
+        )
+        .unwrap()
     }
 
     #[test]

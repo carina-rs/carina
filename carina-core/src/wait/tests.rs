@@ -1,16 +1,40 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::resource::{ConcreteValue, Value};
-use crate::wait::BindingPattern;
+use crate::resource::{ConcreteValue, ResourceId, Value};
+use crate::schema::SchemaKind;
 use crate::wait::predicate::{AttrPath, WaitPredicate};
+use crate::wait::{BindingPattern, find_wait_target_with_schema_kind};
+
+#[test]
+fn target_lookup_prefers_bindings_then_falls_back_to_identity() {
+    let identity_match = ResourceId::with_provider_identity("aws", "test.Resource", "target", None);
+    let binding_match =
+        ResourceId::with_provider_identity("aws", "test.Resource", "different", None);
+
+    let found = find_wait_target_with_schema_kind(
+        "target",
+        [
+            (&identity_match, None, SchemaKind::DataSource),
+            (&binding_match, Some("target"), SchemaKind::Resource),
+        ],
+    );
+    assert_eq!(found, Some((&binding_match, SchemaKind::Resource)));
+
+    let found = find_wait_target_with_schema_kind(
+        "target",
+        [(&identity_match, None, SchemaKind::DataSource)],
+    );
+    assert_eq!(found, Some((&identity_match, SchemaKind::DataSource)));
+}
 
 #[test]
 fn equals_returns_true_when_attribute_matches() {
-    let pred = WaitPredicate::Equals {
-        attr: AttrPath::single("status"),
-        value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-    };
+    let pred = WaitPredicate::equals(
+        AttrPath::single("status"),
+        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+    )
+    .unwrap();
     let mut attrs = HashMap::new();
     attrs.insert(
         "status".to_string(),
@@ -21,10 +45,11 @@ fn equals_returns_true_when_attribute_matches() {
 
 #[test]
 fn equals_returns_false_when_attribute_differs() {
-    let pred = WaitPredicate::Equals {
-        attr: AttrPath::single("status"),
-        value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-    };
+    let pred = WaitPredicate::equals(
+        AttrPath::single("status"),
+        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+    )
+    .unwrap();
     let mut attrs = HashMap::new();
     attrs.insert(
         "status".to_string(),
@@ -35,10 +60,11 @@ fn equals_returns_false_when_attribute_differs() {
 
 #[test]
 fn equals_returns_false_when_attribute_absent() {
-    let pred = WaitPredicate::Equals {
-        attr: AttrPath::single("status"),
-        value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
-    };
+    let pred = WaitPredicate::equals(
+        AttrPath::single("status"),
+        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+    )
+    .unwrap();
     let attrs: HashMap<String, Value> = HashMap::new();
     assert!(!pred.evaluate(&attrs));
 }
