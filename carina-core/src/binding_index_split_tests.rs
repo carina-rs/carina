@@ -32,6 +32,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         binding: Some(binding.into()),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
+        default_tag_keys: Default::default(),
         quoted_string_attrs: Default::default(),
     }
 }

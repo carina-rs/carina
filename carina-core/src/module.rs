@@ -383,22 +383,10 @@ impl RootConfigSignature {
         for (declaration_index, resource) in rs.enumerate() {
             let binding_name = resource_graph_binding(resource, declaration_index);
 
-            let resource_type_str = resource
-                .attributes
-                .get("_type")
-                .and_then(|v| match v {
-                    Value::Concrete(ConcreteValue::String(s)) => {
-                        Some(s.expose_plaintext().to_owned())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| resource.id.resource_type.clone());
-
-            let resource_type =
-                ResourceTypePath::parse(&resource_type_str).unwrap_or_else(|| ResourceTypePath {
-                    provider: "unknown".to_string(),
-                    resource_type: resource_type_str.clone(),
-                });
+            let resource_type = ResourceTypePath::new(
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            );
 
             binding_types.insert(binding_name.clone(), resource_type.clone());
 
@@ -428,9 +416,6 @@ impl RootConfigSignature {
             let binding_name = resource_graph_binding(resource, declaration_index);
 
             for (attr_key, value) in &resource.attributes {
-                if attr_key.starts_with('_') {
-                    continue;
-                }
                 Self::collect_typed_dependencies(
                     &binding_name,
                     attr_key,
@@ -859,22 +844,10 @@ impl ModuleSignature {
         for (declaration_index, resource) in rs.enumerate() {
             let binding_name = resource_graph_binding(resource, declaration_index);
 
-            let resource_type_str = resource
-                .attributes
-                .get("_type")
-                .and_then(|v| match v {
-                    Value::Concrete(ConcreteValue::String(s)) => {
-                        Some(s.expose_plaintext().to_owned())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| resource.id.resource_type.clone());
-
-            let resource_type =
-                ResourceTypePath::parse(&resource_type_str).unwrap_or_else(|| ResourceTypePath {
-                    provider: "unknown".to_string(),
-                    resource_type: resource_type_str.clone(),
-                });
+            let resource_type = ResourceTypePath::new(
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            );
 
             binding_types.insert(binding_name.clone(), resource_type.clone());
 
@@ -893,9 +866,6 @@ impl ModuleSignature {
             let binding_name = resource_graph_binding(resource, declaration_index);
 
             for (attr_key, value) in &resource.attributes {
-                if attr_key.starts_with('_') {
-                    continue;
-                }
                 Self::collect_typed_dependencies(
                     &binding_name,
                     attr_key,

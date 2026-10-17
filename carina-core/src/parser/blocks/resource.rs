@@ -36,15 +36,15 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let attributes = parse_block_contents_with_quoted(iter, ctx, &mut quoted_out)?;
+    let attributes = parse_block_contents_with_quoted(
+        iter,
+        ctx,
+        &mut quoted_out,
+        ReservedAttributeNamePolicy::Reject,
+    )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
 
     let mut attributes = attributes;
-    attributes.insert(
-        "_type".to_string(),
-        Value::Concrete(ConcreteValue::String(namespaced_type.clone().into())),
-    );
-
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
 
@@ -62,6 +62,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
         binding: None,
         dependency_bindings: BTreeSet::new(),
         module_source: None,
+        default_tag_keys: Default::default(),
         quoted_string_attrs,
     })
 }
@@ -74,7 +75,13 @@ pub(crate) fn parse_block_contents(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
 ) -> Result<IndexMap<String, Value>, ParseError> {
-    parse_block_contents_with_quoted(pairs, ctx, &mut None)
+    parse_block_contents_with_quoted(pairs, ctx, &mut None, ReservedAttributeNamePolicy::Allow)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::parser) enum ReservedAttributeNamePolicy {
+    Allow,
+    Reject,
 }
 
 /// As [`parse_block_contents`], but if `quoted_out` is `Some`, populate it
@@ -86,6 +93,7 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
     quoted_out: &mut Option<HashSet<String>>,
+    reserved_attribute_names: ReservedAttributeNamePolicy,
 ) -> Result<IndexMap<String, Value>, ParseError> {
     // `IndexMap` so the order in which the user wrote attributes in the
     // .crn file flows all the way to `Resource.attributes` and to
@@ -119,7 +127,13 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
                         let mut attr_inner = inner.into_inner();
                         let key_pair =
                             next_pair(&mut attr_inner, "attribute name", "block content")?;
+                        let key_span = key_pair.as_span();
                         let key = extract_key_string(key_pair)?;
+                        reject_reserved_resource_attribute(
+                            &key,
+                            key_span,
+                            reserved_attribute_names,
+                        )?;
                         let value_pair =
                             next_pair(&mut attr_inner, "attribute value", "block content")?;
                         record_quoted_if_literal(quoted_out, &key, &value_pair);
@@ -149,7 +163,9 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
             Rule::attribute => {
                 let mut attr_inner = content_pair.into_inner();
                 let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
+                let key_span = key_pair.as_span();
                 let key = extract_key_string(key_pair)?;
+                reject_reserved_resource_attribute(&key, key_span, reserved_attribute_names)?;
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
                 let value = parse_expression(value_pair, &local_ctx)?;
@@ -165,6 +181,25 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
     }
 
     Ok(attributes)
+}
+
+fn reject_reserved_resource_attribute(
+    key: &str,
+    span: pest::Span<'_>,
+    reserved_attribute_names: ReservedAttributeNamePolicy,
+) -> Result<(), ParseError> {
+    if reserved_attribute_names == ReservedAttributeNamePolicy::Reject && key.starts_with('_') {
+        let (line, column) = span.start_pos().line_col();
+        let (end_line, end_column) = span.end_pos().line_col();
+        return Err(ParseError::ReservedResourceAttribute {
+            attribute: key.to_string(),
+            line,
+            column,
+            end_line,
+            end_column,
+        });
+    }
+    Ok(())
 }
 
 /// If `quoted_out` is enabled and `value_pair` is a plain quoted string
@@ -204,7 +239,12 @@ pub(crate) fn parse_resource_expr(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let mut attributes = parse_block_contents_with_quoted(inner, ctx, &mut quoted_out)?;
+    let mut attributes = parse_block_contents_with_quoted(
+        inner,
+        ctx,
+        &mut quoted_out,
+        ReservedAttributeNamePolicy::Reject,
+    )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
 
     // All providers: use binding name as identifier.
@@ -212,11 +252,6 @@ pub(crate) fn parse_resource_expr(
 
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
-
-    attributes.insert(
-        "_type".to_string(),
-        Value::Concrete(ConcreteValue::String(namespaced_type.clone().into())),
-    );
 
     let id = ResourceId::with_provider_identity(
         provider,
@@ -233,6 +268,7 @@ pub(crate) fn parse_resource_expr(
         binding: Some(binding_name.to_string()),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
+        default_tag_keys: Default::default(),
         quoted_string_attrs,
     })
 }
@@ -260,7 +296,12 @@ pub(crate) fn parse_read_resource_expr(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let mut attributes = parse_block_contents_with_quoted(inner, ctx, &mut quoted_out)?;
+    let mut attributes = parse_block_contents_with_quoted(
+        inner,
+        ctx,
+        &mut quoted_out,
+        ReservedAttributeNamePolicy::Reject,
+    )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
 
     // All providers: use binding name as identifier.
@@ -268,11 +309,6 @@ pub(crate) fn parse_read_resource_expr(
 
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
-
-    attributes.insert(
-        "_type".to_string(),
-        Value::Concrete(ConcreteValue::String(namespaced_type.clone().into())),
-    );
 
     let id = ResourceId::with_provider_identity(
         provider,

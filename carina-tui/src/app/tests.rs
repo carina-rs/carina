@@ -176,7 +176,7 @@ fn update_effect_has_detail_rows() {
 }
 
 #[test]
-fn internal_attributes_filtered() {
+fn host_metadata_fields_are_not_rendered_as_attributes() {
     let mut plan = Plan::new();
     plan.add(create(
         Resource::new("s3.Bucket", "my-bucket")
@@ -189,7 +189,7 @@ fn internal_attributes_filtered() {
     ));
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
-    // Only "name" should appear (not _binding or _module)
+    // Binding and module source live on typed fields, so only "name" appears.
     let attr_rows: Vec<_> = app.nodes[0]
         .detail_rows
         .iter()

@@ -384,12 +384,20 @@ async fn desired_normalization_merges_default_tags_into_ref_bearing_tags() {
         ])))),
         "host default-tag merging must see the full ref-bearing tags map"
     );
-    assert_eq!(
-        normalized.as_resource().get_attr("_default_tag_keys"),
-        Some(&Value::Concrete(ConcreteValue::List(vec![string_value(
-            "ManagedBy"
-        )]))),
-        "default-tag metadata must match the keys actually merged into tags"
+    assert!(
+        normalized
+            .as_resource()
+            .default_tag_keys
+            .contains("ManagedBy"),
+        "default-tag metadata must include the key actually merged into tags"
+    );
+    assert!(
+        normalized
+            .as_resource()
+            .attributes
+            .keys()
+            .all(|key| !key.starts_with('_')),
+        "host metadata must not enter normalized provider attributes"
     );
 }
 

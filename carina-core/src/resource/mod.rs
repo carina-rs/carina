@@ -3374,6 +3374,32 @@ impl ModuleSource {
     }
 }
 
+/// The sorted tag keys injected by a provider's `default_tags` configuration.
+///
+/// The inner set is intentionally private, so other crates cannot add individual
+/// keys. Non-empty provenance is produced by `carina-core`'s default-tag merge
+/// or decoded from a saved plan. This is display-only provenance: the merge
+/// never deletes or overwrites tags based on it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DefaultTagKeys(BTreeSet<String>);
+
+impl DefaultTagKeys {
+    /// Returns whether `key` was injected from provider `default_tags`.
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains(key)
+    }
+
+    /// Returns whether no tag keys were injected from provider `default_tags`.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn insert(&mut self, key: String) {
+        self.0.insert(key);
+    }
+}
+
 /// A managed infrastructure resource declared in DSL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
@@ -3408,6 +3434,14 @@ pub struct Resource {
     /// Module source info for resources that belong to a module
     #[serde(default)]
     pub module_source: Option<ModuleSource>,
+    /// Tag keys injected by the routed provider's `default_tags` during
+    /// desired-side normalization.
+    ///
+    /// This is host-owned provenance, not a provider attribute. It is
+    /// serialized with saved plans so plan display can retain annotations
+    /// after a plan round-trip, but it never enters persisted provider state.
+    #[serde(default, skip_serializing_if = "DefaultTagKeys::is_empty")]
+    pub default_tag_keys: DefaultTagKeys,
     /// Top-level attribute names whose value was written as a quoted
     /// string literal (`attr = "..."`) in the source `.crn`.
     ///
@@ -3436,6 +3470,7 @@ impl Resource {
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            default_tag_keys: DefaultTagKeys::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }

@@ -579,13 +579,9 @@ pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
 
             // Must be a simple identifier (no dots, no spaces, not empty)
             if !key_part.is_empty()
-                && key_part
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_')
+                && key_part.chars().all(|c| c.is_alphanumeric() || c == '_')
                 && key_part.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-                // Skip internal attributes
-                && !key_part.starts_with('_')
-            && let Some((current_block, suppress_duplicate)) = block_stack.last_mut()
+                && let Some((current_block, suppress_duplicate)) = block_stack.last_mut()
             {
                 if let Some(&first_line) = current_block.get(key_part) {
                     if !*suppress_duplicate {

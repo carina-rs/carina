@@ -1398,8 +1398,8 @@ impl ResolvedBindings {
     /// Each data-source binding carries two layers, in this order:
     ///
     /// 1. `DataSource.attributes` — the parsed DSL attributes (input
-    ///    filters like `path_prefix` / `name_regex`, plus the parser's
-    ///    `_type` marker).
+    ///    filters like `path_prefix` / `name_regex`). Resource type identity
+    ///    lives on `DataSource.id`, outside the provider-facing map.
     /// 2. `current_states[ds.id].attributes` — the **read result** the
     ///    provider returned: `arns`, `user_id`, `account_id`, etc.
     ///    Populated by `read_data_source_with_retry` (apply path) or

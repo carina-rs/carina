@@ -5795,8 +5795,8 @@ mod saved_plan_version_tests {
             "error must name the rejected v10 version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 12"),
-            "error must name the v12 expected version, got: {msg}",
+            msg.contains("expected 13"),
+            "error must name the v13 expected version, got: {msg}",
         );
         assert!(
             msg.contains(&format!("Re-run `{expected_replan}`")),

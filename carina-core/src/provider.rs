@@ -1578,8 +1578,8 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
 /// - If the resource has no `tags`, set it to the config's `default_tags`
 /// - If the resource has `tags`, merge defaults in (resource-level tags win)
 ///
-/// Records which tag keys came from defaults in the `_default_tag_keys` internal
-/// metadata attribute.
+/// Records which tag keys came from defaults as host-owned provenance on the
+/// resource, separate from provider-facing attributes.
 pub fn merge_default_tags(
     config: &ProviderConfig,
     resources: &mut [Resource],
@@ -1648,20 +1648,21 @@ pub fn merge_default_tags(
             continue;
         }
 
-        // Merge default_tags into the resource's tags
-        let mut default_tag_keys: Vec<String> = Vec::new();
-        match resource.get_attr_mut("tags") {
+        let default_tag_keys = &mut resource.default_tag_keys;
+        match resource.attributes.get_mut("tags") {
             Some(Value::Concrete(ConcreteValue::Map(existing_tags))) => {
                 for (key, value) in &default_tags {
                     if !existing_tags.contains_key(key) {
                         existing_tags.insert(key.clone(), value.clone());
-                        default_tag_keys.push(key.clone());
+                        default_tag_keys.insert(key.clone());
                     }
                 }
             }
             None => {
-                default_tag_keys = default_tags.keys().cloned().collect();
-                resource.set_attr(
+                for key in default_tags.keys() {
+                    default_tag_keys.insert(key.clone());
+                }
+                resource.attributes.insert(
                     "tags".to_string(),
                     Value::Concrete(ConcreteValue::Map(default_tags.clone())),
                 );
@@ -1669,19 +1670,6 @@ pub fn merge_default_tags(
             _ => {
                 continue;
             }
-        }
-
-        if !default_tag_keys.is_empty() {
-            default_tag_keys.sort();
-            resource.set_attr(
-                "_default_tag_keys".to_string(),
-                Value::Concrete(ConcreteValue::List(
-                    default_tag_keys
-                        .into_iter()
-                        .map(|s| Value::Concrete(ConcreteValue::String(s.into())))
-                        .collect(),
-                )),
-            );
         }
     }
 
@@ -2308,12 +2296,106 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("carina".into())),
             )]))))
         );
-        assert_eq!(
-            resources[0].get_attr("_default_tag_keys"),
-            Some(&Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("ManagedBy".into())),
-            ])))
+        assert!(resources[0].default_tag_keys.contains("ManagedBy"));
+        assert!(!resources[0].default_tag_keys.contains("Owner"));
+        assert!(
+            resources[0]
+                .attributes
+                .keys()
+                .all(|key| !key.starts_with('_')),
+            "host-owned default-tag provenance must not enter provider attributes"
         );
+    }
+
+    #[test]
+    fn merge_default_tags_remerge_is_idempotent_and_never_removes_existing_tags() {
+        let mut config = ProviderConfig {
+            name: "aws".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::from([(
+                "ManagedBy".to_string(),
+                Value::Concrete(ConcreteValue::String("carina".into())),
+            )]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+        let mut resources = vec![
+            Resource::with_provider("aws", "service.Widget", "example", None).with_attribute(
+                "tags",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "Name".to_string(),
+                    Value::Concrete(ConcreteValue::String("example".into())),
+                )]))),
+            ),
+        ];
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            crate::schema::ResourceSchema::new("service.Widget").attribute(
+                crate::schema::AttributeSchema::new(
+                    "tags",
+                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                ),
+            ),
+        );
+
+        merge_default_tags(&config, &mut resources, &registry).unwrap();
+        let Some(Value::Concrete(ConcreteValue::Map(tags))) = resources[0].get_attr_mut("tags")
+        else {
+            panic!("merged tags must remain a concrete map");
+        };
+        tags.insert(
+            "ManagedBy".to_string(),
+            Value::Concrete(ConcreteValue::String("rehydrated-carina".into())),
+        );
+        // Simulate provenance decoded from an untrusted saved plan. Even if it
+        // claims an authored tag, merging must never delete that tag.
+        resources[0].default_tag_keys.insert("Name".to_string());
+        let before_remerge = resources[0].clone();
+
+        merge_default_tags(&config, &mut resources, &registry).unwrap();
+
+        assert_eq!(
+            resources[0], before_remerge,
+            "re-merging the same defaults must not overwrite rehydrated values, remove tags, or change provenance"
+        );
+
+        config.default_tags.insert(
+            "ManagedBy".to_string(),
+            Value::resource_ref("management", "owner", Vec::new()),
+        );
+        config.default_tags.insert(
+            "Team".to_string(),
+            Value::Concrete(ConcreteValue::String("platform".into())),
+        );
+        merge_default_tags(&config, &mut resources, &registry).unwrap();
+
+        let Some(Value::Concrete(ConcreteValue::Map(tags))) = resources[0].get_attr("tags") else {
+            panic!("merged tags must remain a concrete map");
+        };
+        assert_eq!(
+            tags.get("ManagedBy"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "rehydrated-carina".into()
+            ))),
+            "a skipped default must not overwrite its existing tag"
+        );
+        assert_eq!(
+            tags.get("Name"),
+            Some(&Value::Concrete(ConcreteValue::String("example".into()))),
+            "pre-existing provenance must never cause an authored tag to be removed"
+        );
+        assert_eq!(
+            tags.get("Team"),
+            Some(&Value::Concrete(ConcreteValue::String("platform".into()))),
+            "the valid default keeps the merge loop non-vacuous"
+        );
+        assert!(resources[0].default_tag_keys.contains("ManagedBy"));
+        assert!(resources[0].default_tag_keys.contains("Name"));
+        assert!(resources[0].default_tag_keys.contains("Team"));
     }
 
     fn widget_status_registry() -> SchemaRegistry {

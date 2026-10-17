@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn reserved_resource_attribute_surfaces_parser_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document("let bucket = aws.s3.Bucket {\n  \"_x\" = 1\n}\n");
+
+    let diagnostics = engine.analyze(&doc, None);
+    let expected_message =
+        "Reserved attribute name '_x': names starting with '_' are reserved for Carina";
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message == expected_message)
+        .unwrap_or_else(|| {
+            panic!(
+                "reserved resource attribute must surface as an LSP diagnostic, got: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| &diagnostic.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    assert_eq!(diagnostic.range.start.line, 1);
+    assert_eq!(diagnostic.range.start.character, 2);
+    assert_eq!(diagnostic.range.end.line, 1);
+    assert_eq!(diagnostic.range.end.character, 6);
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn unknown_field_in_struct_block() {
     let engine = test_engine();

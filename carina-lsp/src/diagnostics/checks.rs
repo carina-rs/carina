@@ -2742,10 +2742,7 @@ impl DiagnosticEngine {
 
         for rref in parsed.iter_all_resources() {
             let attrs = rref.attributes();
-            for (attr_name, attr_value) in attrs.iter() {
-                if attr_name.starts_with('_') {
-                    continue;
-                }
+            for attr_value in attrs.values() {
                 self.collect_ref_attr_diagnostics(doc, attr_value, binding_index, &mut diagnostics);
             }
         }

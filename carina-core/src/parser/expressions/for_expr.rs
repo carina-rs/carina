@@ -308,7 +308,6 @@ pub(crate) fn parse_for_expr(
                 let attrs: Vec<(String, Value)> = resource
                     .attributes
                     .iter()
-                    .filter(|(k, _)| !k.starts_with('_'))
                     .map(|(k, value)| (k.clone(), value.clone()))
                     .collect();
                 ctx.deferred_for_expressions.push(DeferredForExpression {
@@ -395,7 +394,6 @@ pub(crate) fn parse_for_expr(
                     let attrs: Vec<(String, Value)> = resource
                         .attributes
                         .iter()
-                        .filter(|(k, _)| !k.starts_with('_'))
                         .map(|(k, value)| (k.clone(), value.clone()))
                         .collect();
                     ctx.deferred_for_expressions.push(DeferredForExpression {

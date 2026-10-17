@@ -16,6 +16,17 @@ pub enum ParseError {
     InvalidExpression { line: usize, message: String },
 
     #[error(
+        "Reserved attribute name '{attribute}' at line {line}, column {column}: names starting with '_' are reserved for Carina"
+    )]
+    ReservedResourceAttribute {
+        attribute: String,
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+    },
+
+    #[error(
         "Invalid expression at line {line}: backend {backend_type} attribute '{attribute}' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed"
     )]
     SecretDerivedBackendAttribute {

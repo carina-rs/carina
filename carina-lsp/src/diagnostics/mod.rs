@@ -709,10 +709,6 @@ impl DiagnosticEngine {
                         } else {
                             authored_attr_value
                         };
-                        if attr_name.starts_with('_') {
-                            continue; // Skip internal attributes
-                        }
-
                         // Resolve block_name to canonical attribute name
                         let canonical_name = bn_map
                             .get(attr_name)
@@ -1770,6 +1766,28 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             100,
             DiagnosticSeverity::ERROR,
             message.clone(),
+        ),
+        ParseError::ReservedResourceAttribute {
+            attribute,
+            line,
+            column,
+            end_line,
+            end_column,
+        } => carina_diagnostic_range(
+            Range {
+                start: Position {
+                    line: line.saturating_sub(1) as u32,
+                    character: column.saturating_sub(1) as u32,
+                },
+                end: Position {
+                    line: end_line.saturating_sub(1) as u32,
+                    character: end_column.saturating_sub(1) as u32,
+                },
+            },
+            DiagnosticSeverity::ERROR,
+            format!(
+                "Reserved attribute name '{attribute}': names starting with '_' are reserved for Carina"
+            ),
         ),
         ParseError::SecretDerivedBackendAttribute {
             line,

@@ -2604,10 +2604,16 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 12 stores secrets as
-    // typed placeholders bound to stable, position-unique contexts and makes
-    // saved-plan apply re-evaluate and verify them. A v11 plan's secret hashes
-    // are indistinguishable from user strings and must be regenerated.
+    // Validate version compatibility. Plan-file version 13 keeps host metadata
+    // out of provider-facing resource attributes: default-tag provenance lives
+    // in `Resource::default_tag_keys`, and resource type lives in `Resource::id`.
+    // A v12 plan must be regenerated rather than mixing its synthetic-attribute
+    // representation with the typed fields.
+    //
+    // Plan-file version 12 stores secrets as typed placeholders bound to
+    // stable, position-unique contexts and makes saved-plan apply re-evaluate
+    // and verify them. A v11 plan's secret hashes are indistinguishable from
+    // user strings and must be regenerated.
     //
     // Plan-file version 10 persists
     // `Effect::Delete.generation`; older binaries would silently

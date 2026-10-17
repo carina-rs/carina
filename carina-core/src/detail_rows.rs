@@ -16,7 +16,9 @@ use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::non_empty::NonEmptyVec;
 use crate::plan::{Plan, ReplaceDisplayInfo};
 use crate::provider::PersistedAttributes;
-use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value, pair_list_elements};
+use crate::resource::{
+    ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value, pair_list_elements,
+};
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
 use crate::value::{format_value, format_value_with_key, is_list_of_maps};
 
@@ -510,7 +512,7 @@ pub fn build_detail_rows_by_instance(
     match effect {
         Effect::Create(r) => {
             let schema = registry.and_then(|reg| reg.get_for(r));
-            build_create_rows(&r.attributes, schema, detail)
+            build_create_rows(&r.attributes, &r.default_tag_keys, schema, detail)
         }
         Effect::Update {
             from,
@@ -540,7 +542,12 @@ pub fn build_detail_rows_by_instance(
         } => build_delete_rows(id, identifier, generation, historical_attributes),
         Effect::Read { resource } => {
             let schema = registry.and_then(|reg| reg.get_for_data_source(resource));
-            build_create_rows(&resource.attributes, schema, detail)
+            build_create_rows(
+                &resource.attributes,
+                &DefaultTagKeys::default(),
+                schema,
+                detail,
+            )
         }
         Effect::Import { identifier, .. } => {
             // carina#3329: the identifier is carried as a `Value` so a
@@ -567,31 +574,13 @@ pub fn build_detail_rows_by_instance(
 
 fn build_create_rows(
     attributes: &IndexMap<String, Value>,
+    default_tag_keys: &DefaultTagKeys,
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
 
-    // Collect default_tag_keys for annotation
-    let default_tag_keys: HashSet<String> = attributes
-        .get("_default_tag_keys")
-        .and_then(|v| match v {
-            Value::Concrete(ConcreteValue::List(items)) => Some(
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Value::Concrete(ConcreteValue::String(s)) => {
-                            Some(s.expose_plaintext().to_owned())
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    let mut keys: Vec<_> = attributes.keys().filter(|k| !k.starts_with('_')).collect();
+    let mut keys: Vec<_> = attributes.keys().collect();
     keys.sort();
 
     for key in &keys {
@@ -601,7 +590,7 @@ fn build_create_rows(
             && !default_tag_keys.is_empty()
             && let Value::Concrete(ConcreteValue::Map(map)) = value
         {
-            rows.push(build_expanded_tags_row(map, &default_tag_keys));
+            rows.push(build_expanded_tags_row(map, default_tag_keys));
             continue;
         }
         // `Value::Concrete(ConcreteValue::List)` (any element type) goes through PrettyAttribute so
@@ -674,7 +663,7 @@ fn build_expanded_map_row(key: &str, map: &IndexMap<String, Value>) -> DetailRow
 /// Build a `DetailRow::MapExpanded` for tags with `default_tags` annotations.
 fn build_expanded_tags_row(
     map: &IndexMap<String, Value>,
-    default_tag_keys: &HashSet<String>,
+    default_tag_keys: &DefaultTagKeys,
 ) -> DetailRow {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort();
@@ -907,11 +896,7 @@ fn build_attribute_diff_rows(
 ) -> AttributeDiffRows {
     let mut rows = Vec::new();
 
-    let mut keys: Vec<_> = to
-        .attributes
-        .keys()
-        .filter(|k| !k.starts_with('_'))
-        .collect();
+    let mut keys: Vec<_> = to.attributes.keys().collect();
     keys.sort();
 
     // Attributes where `semantically_equal` reported a diff but the
@@ -1913,6 +1898,7 @@ fn string_list_inner_type<'a>(
 mod tests {
     use super::*;
     use crate::effect::{ChangedCreateOnly, EffectGeneration};
+    use crate::parser::ProviderConfig;
     use crate::plan::ReplaceDisplayMetadata;
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
     use std::collections::HashSet;
@@ -2018,6 +2004,64 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0], DetailRow::Attribute { key, .. } if key == "bucket"));
         assert!(matches!(&rows[1], DetailRow::Attribute { key, .. } if key == "region"));
+    }
+
+    #[test]
+    fn create_tags_annotate_typed_default_tag_provenance() {
+        let mut resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None)
+            .with_attribute(
+                "tags",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "Name".to_string(),
+                    Value::Concrete(ConcreteValue::String("my-bucket".into())),
+                )]))),
+            );
+        let config = ProviderConfig {
+            name: "aws".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::from([(
+                "ManagedBy".to_string(),
+                Value::Concrete(ConcreteValue::String("carina".into())),
+            )]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            ResourceSchema::new("s3.Bucket").attribute(crate::schema::AttributeSchema::new(
+                "tags",
+                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+            )),
+        );
+        crate::provider::merge_default_tags(
+            &config,
+            std::slice::from_mut(&mut resource),
+            &registry,
+        )
+        .expect("default tags must merge");
+        let effect = Effect::Create(resolved(resource));
+
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
+
+        let entries = rows
+            .iter()
+            .find_map(|row| match row {
+                DetailRow::MapExpanded { key, entries } if key == "tags" => Some(entries),
+                _ => None,
+            })
+            .expect("tags must render as an expanded map");
+        assert!(entries.iter().any(|entry| {
+            entry.key == "ManagedBy" && entry.annotation.as_deref() == Some("# default_tags")
+        }));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.key == "Name" && entry.annotation.is_none() })
+        );
     }
 
     #[test]

@@ -6174,14 +6174,6 @@ impl ResourceSchema {
 
         // Type check each attribute and reject unknown ones
         for (name, value) in attributes {
-            // Skip parser-internal attributes (leading `_`, e.g.
-            // `_type`, `_default_tag_keys`); they have no schema entry.
-            // Prefer a typed field on `Resource` for new internal state
-            // — see #2224.
-            if name.starts_with('_') {
-                continue;
-            }
-
             if selected.is_some_and(|selected| !selected.contains(name)) {
                 continue;
             }
