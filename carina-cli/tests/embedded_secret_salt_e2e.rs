@@ -128,7 +128,7 @@ fn legacy_marker(
     let mut output = [0_u8; 32];
     Argon2::default()
         .hash_password_into(&material, salt.as_bytes(), &mut output)
-        .expect("hash origin/main legacy fixture");
+        .expect("hash pre-v12 legacy fixture");
     let hash = output
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -543,6 +543,18 @@ let stable = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let first = comment_marker(&scenario.state_json(), "stable");
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let stable = mock.test.resource {
+  name        = "stable-secret"
+  comment     = secret("STABLE_PLAIN")
+  web_acl_arn = "force-second-writeback"
+}
+"#,
+    );
+    assert_plan_counts(&scenario.carina(&["plan", "--refresh=false", "."]), 0, 1, 0);
     assert_success(
         "second stable-secret apply",
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),

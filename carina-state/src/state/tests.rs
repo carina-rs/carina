@@ -869,6 +869,7 @@ fn test_from_provider_state() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .unwrap();
 
@@ -905,6 +906,7 @@ fn test_from_provider_state_without_existing() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -964,6 +966,7 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     let row = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -1049,6 +1052,7 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .unwrap();
 
@@ -1096,6 +1100,7 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -1149,6 +1154,7 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .unwrap();
 
@@ -1183,6 +1189,7 @@ fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_
         &resolved(&resource),
         &provider_state,
         Some(&existing),
+        None,
         None,
     )
     .unwrap();
@@ -1237,6 +1244,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
         &resolved(&resource),
         &reordered_provider,
         Some(&existing),
+        None,
         None,
     )
     .unwrap();
@@ -1298,6 +1306,7 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
         &resolved(&resource),
         &provider_state,
         Some(&existing),
+        None,
         None,
     )
     .unwrap();
@@ -1792,6 +1801,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -2700,12 +2710,14 @@ fn test_merge_write_only_attributes() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
     // Merge write-only attributes
     let write_only_keys = vec!["ipv4_netmask_length".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys);
+    rs.merge_write_only_attributes(&resource, &write_only_keys)
+        .unwrap();
 
     // The write-only attribute should be persisted in state
     assert_eq!(
@@ -2752,12 +2764,14 @@ fn test_merge_write_only_attributes_not_in_desired() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
     // Try to merge a write-only attribute that the user didn't specify
     let write_only_keys = vec!["ipv4_netmask_length".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys);
+    rs.merge_write_only_attributes(&resource, &write_only_keys)
+        .unwrap();
 
     // Should NOT be in state since user didn't specify it
     assert!(!rs.attributes.contains_key("ipv4_netmask_length"));
@@ -2796,11 +2810,13 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
     let write_only_keys = vec!["some_attr".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys);
+    rs.merge_write_only_attributes(&resource, &write_only_keys)
+        .unwrap();
 
     // Should keep the API-returned value, not overwrite with desired
     assert_eq!(
@@ -2880,6 +2896,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -2929,6 +2946,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         &resolved(&resource),
         &provider_state,
         Some(&existing),
+        None,
         None,
     )
     .expect("provider state should serialize");
@@ -2983,11 +3001,12 @@ fn with_attributes_from_state_reuses_matching_secret_digest() {
     ))));
     let provider_state = State::existing(id, HashMap::from([("comment".to_string(), secret)]));
     let first = ResourceState::new("test.resource", "stable", "mock")
-        .with_attributes_from_state(&provider_state);
+        .with_attributes_from_state(&provider_state)
+        .unwrap();
     let first_marker =
         persisted_json_attribute(&first.attributes, "comment").expect("first secret marker");
 
-    let second = first.with_attributes_from_state(&provider_state);
+    let second = first.with_attributes_from_state(&provider_state).unwrap();
     let second_marker =
         persisted_json_attribute(&second.attributes, "comment").expect("second secret marker");
 
@@ -2995,6 +3014,49 @@ fn with_attributes_from_state_reuses_matching_secret_digest() {
         first_marker, second_marker,
         "unchanged secret marker churned"
     );
+}
+
+#[test]
+fn with_attributes_from_state_reports_raw_legacy_attribute_key() {
+    use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "plain", None);
+    let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+    let provider_state = State::existing(
+        id,
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String(marker.into())),
+        )]),
+    );
+
+    let error = ResourceState::new("test.resource", "plain", "mock")
+        .with_attributes_from_state(&provider_state)
+        .expect_err("marker-shaped provider plaintext must fail closed");
+    let ResourceStateEncodingError::PersistedAttributes(source) = error else {
+        panic!("expected persisted-attribute validation error")
+    };
+    assert_eq!(source.attribute_key(), "comment");
+}
+
+#[test]
+fn merge_write_only_attributes_reports_raw_legacy_attribute_key() {
+    use carina_core::resource::{ConcreteValue, Resource, Value};
+
+    let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+    let resource = Resource::with_provider("mock", "test.resource", "plain", None).with_attribute(
+        "password",
+        Value::Concrete(ConcreteValue::String(marker.into())),
+    );
+    let mut row = ResourceState::new("test.resource", "plain", "mock");
+
+    let error = row
+        .merge_write_only_attributes(&resource, &["password".to_string()])
+        .expect_err("marker-shaped desired plaintext must fail closed");
+    let ResourceStateEncodingError::PersistedAttributes(source) = error else {
+        panic!("expected persisted-attribute validation error")
+    };
+    assert_eq!(source.attribute_key(), "password");
 }
 
 #[test]
@@ -3063,6 +3125,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .expect("provider state should serialize");
 
@@ -3101,9 +3164,11 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         &provider_state,
         Some(&existing),
         None,
+        None,
     )
     .expect("provider state should serialize");
-    rs.merge_write_only_attributes(&resource, &["password".to_string()]);
+    rs.merge_write_only_attributes(&resource, &["password".to_string()])
+        .unwrap();
 
     assert_eq!(
         persisted_json_attribute(&rs.attributes, "password"),
@@ -3337,6 +3402,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -3416,6 +3482,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -3481,6 +3548,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
+        None,
         None,
         None,
     )
@@ -3628,10 +3696,12 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         &provider_state,
         None,
         None,
+        None,
     )
     .unwrap_err();
+    let rendered = err.to_string();
     assert!(
-        err.contains("unresolved reference") && err.contains("net.vpc.vpc_id"),
+        rendered.contains("unresolved reference") && rendered.contains("net.vpc.vpc_id"),
         "expected UnresolvedResourceRef diagnostic in error, got: {err}"
     );
 }
@@ -3835,6 +3905,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
         &current,
         Some(row),
         None,
+        None,
     )
     .unwrap();
     let ExplicitFields::Struct { children } = rewritten.explicit else {
@@ -3874,6 +3945,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
     let first_row = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&authored),
         &first_provider,
+        None,
         None,
         None,
     )
@@ -3977,6 +4049,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         &resolved(&authored),
         &reordered_provider,
         Some(&first_row),
+        None,
         None,
     )
     .unwrap();

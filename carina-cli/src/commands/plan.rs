@@ -436,21 +436,14 @@ pub(crate) fn collect_historical_display_attributes(
     state_file: Option<&StateFile>,
 ) -> HistoricalDisplayAttributes {
     let mut display = HistoricalDisplayAttributes::for_plan(plan);
-    let moved_origins: HashMap<_, _> = plan
-        .effects()
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Move { from, to } => Some((to.as_inner(), from.as_inner())),
-            _ => None,
-        })
-        .collect();
+    let moved_origins = moved_origins_for_plan(plan);
 
     for effect in plan.effects() {
         for key in effect.deleted_resource_attribute_keys() {
             match key.generation() {
                 carina_core::effect::EffectGeneration::Current => {
                     if let Some(state) = current_states.get(key.id()) {
-                        let persisted_id = moved_origins.get(key.id()).copied().unwrap_or(key.id());
+                        let persisted_id = moved_origins.get(key.id()).unwrap_or(key.id());
                         let persisted = state_file
                             .and_then(|file| file.find_resource_for_id(persisted_id))
                             .map(|resource| resource.persisted_attributes());
@@ -476,7 +469,7 @@ pub(crate) fn collect_historical_display_attributes(
         // Mask that shape in place instead of replacing it with the raw
         // refreshed state used by Delete effects.
         if let Effect::Update { from, .. } = effect {
-            let persisted_id = moved_origins.get(&from.id).copied().unwrap_or(&from.id);
+            let persisted_id = moved_origins.get(&from.id).unwrap_or(&from.id);
             let persisted = state_file
                 .and_then(|file| file.find_resource_for_id(persisted_id))
                 .map(|resource| resource.persisted_attributes());
@@ -489,6 +482,37 @@ pub(crate) fn collect_historical_display_attributes(
     }
 
     display
+}
+
+/// Map each post-move address to the persisted row that owns its history.
+pub(crate) fn moved_origins_for_plan(plan: &Plan) -> HashMap<ResourceId, ResourceId> {
+    plan.effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Move { from, to } => Some((to.as_inner().clone(), from.as_inner().clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+type PersistedResourceLookup<'a> =
+    HashMap<(&'a str, &'a str, &'a str, Option<&'a str>), &'a carina_state::ResourceState>;
+
+fn persisted_resource_for_plan_address<'a>(
+    persisted_resources: Option<&PersistedResourceLookup<'a>>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+    id: &ResourceId,
+) -> Option<&'a carina_state::ResourceState> {
+    let persisted_id = moved_origins.get(id).unwrap_or(id);
+    let identity = persisted_id.identity_str()?;
+    persisted_resources?
+        .get(&(
+            persisted_id.provider.as_str(),
+            persisted_id.resource_type.as_str(),
+            identity,
+            persisted_id.provider_instance.as_deref(),
+        ))
+        .copied()
 }
 
 fn deposed_attributes_for_display(
@@ -650,24 +674,17 @@ fn build_plan_file<E>(
                     resource,
                 )
             })
-            .collect::<HashMap<_, _>>()
+            .collect::<PersistedResourceLookup<'_>>()
     });
     let redacted_current_states = ctx
         .current_states
         .iter()
         .map(|(id, state)| {
-            let persisted_id = ctx.moved_origins.get(id).unwrap_or(id);
-            let persisted = persisted_resources.as_ref().and_then(|resources| {
-                let identity = persisted_id.identity_str()?;
-                resources
-                    .get(&(
-                        persisted_id.provider.as_str(),
-                        persisted_id.resource_type.as_str(),
-                        identity,
-                        persisted_id.provider_instance.as_deref(),
-                    ))
-                    .copied()
-            });
+            let persisted = persisted_resource_for_plan_address(
+                persisted_resources.as_ref(),
+                &ctx.moved_origins,
+                id,
+            );
             // A moved resource's previous state row still lives at its source
             // address until execution writes the destination row.
             let redacted = match persisted {
@@ -689,18 +706,11 @@ fn build_plan_file<E>(
         .sorted_resources
         .iter()
         .map(|resource| {
-            let persisted_id = ctx.moved_origins.get(&resource.id).unwrap_or(&resource.id);
-            let persisted = persisted_resources.as_ref().and_then(|resources| {
-                let identity = persisted_id.identity_str()?;
-                resources
-                    .get(&(
-                        persisted_id.provider.as_str(),
-                        persisted_id.resource_type.as_str(),
-                        identity,
-                        persisted_id.provider_instance.as_deref(),
-                    ))
-                    .copied()
-            });
+            let persisted = persisted_resource_for_plan_address(
+                persisted_resources.as_ref(),
+                &ctx.moved_origins,
+                &resource.id,
+            );
             match persisted {
                 Some(persisted) => redact_secrets_in_resource_reusing_persisted_hashes(
                     resource,
@@ -710,6 +720,10 @@ fn build_plan_file<E>(
             }
         })
         .collect::<Result<Vec<_>, carina_core::value::SerializationError>>()?;
+    let redacted_desired_resources: HashMap<ResourceId, Resource> = redacted_sorted_resources
+        .iter()
+        .map(|resource| (resource.id.clone(), resource.clone()))
+        .collect();
 
     Ok(PlanFile {
         // carina#3863 / carina#3865: bumped 14→15 — secret digests now
@@ -776,7 +790,7 @@ fn build_plan_file<E>(
         backend_config,
         plan: redact_secrets_in_plan_with_desired_and_historical(
             &ctx.plan,
-            &desired_resources,
+            &redacted_desired_resources,
             &redacted_current_states,
         )?,
         sorted_resources: redacted_sorted_resources,
@@ -2732,6 +2746,108 @@ mod run_plan_out_tests {
         ModuleConstraintId, PendingModuleConstraint, ResourceId, Signature, Value,
     };
     use std::fs;
+
+    fn resource_with_secret(identity: &str, plaintext: &str) -> Resource {
+        Resource::with_provider(
+            "mock",
+            "test.resource",
+            carina_core::resource::ResourceIdentity::try_from(identity.to_string()).unwrap(),
+            None,
+        )
+        .with_attribute(
+            "comment",
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(plaintext.to_string().into()),
+            )))),
+        )
+    }
+
+    #[test]
+    fn saved_plan_effects_share_sorted_resource_secret_placeholders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+
+        let created = resource_with_secret("created", "CREATE_SECRET");
+        let updated = resource_with_secret("updated", "UPDATE_SECRET");
+        let persisted_update_marker = carina_core::value::value_to_json(
+            updated.attributes.get("comment").expect("updated secret"),
+        )
+        .expect("persisted update marker");
+        let mut state_file = StateFile::new();
+        state_file
+            .upsert_resource(
+                carina_state::ResourceState::new("test.resource", "updated", "mock")
+                    .with_identifier("updated-id")
+                    .with_attribute("comment", persisted_update_marker.clone()),
+            )
+            .expect("persisted update row");
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(created.clone()),
+        ));
+        plan.add(Effect::Update {
+            from: Box::new(
+                State::existing(updated.id.clone(), HashMap::new()).with_identifier("updated-id"),
+            ),
+            to: carina_core::resource::ResolvedResource::new(updated.clone()),
+            changed_attributes: vec!["comment".to_string()],
+        });
+        let parsed = carina_core::parser::ParsedFile::default();
+        let ctx = crate::wiring::PlanContext {
+            plan,
+            provider: ProviderRouter::new(),
+            sorted_resources: vec![created.clone(), updated.clone()],
+            unresolved_resources: vec![created, updated],
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            current_states: HashMap::new(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: Vec::new(),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .unwrap();
+
+        let saved = build_plan_file(
+            &path,
+            &parsed,
+            &provider_configs,
+            None,
+            &Some(state_file),
+            &ctx,
+        )
+        .expect("saved plan should serialize");
+        let Effect::Create(created_effect) = &saved.plan.effects()[0] else {
+            panic!("expected create effect")
+        };
+        let Effect::Update {
+            to: updated_effect, ..
+        } = &saved.plan.effects()[1]
+        else {
+            panic!("expected update effect")
+        };
+        assert_eq!(
+            created_effect.attributes["comment"], saved.sorted_resources[0].attributes["comment"],
+            "create effect and sorted resource must share one digest",
+        );
+        assert_eq!(
+            updated_effect.attributes["comment"], saved.sorted_resources[1].attributes["comment"],
+            "update effect and sorted resource must share one digest",
+        );
+        assert_eq!(
+            saved.sorted_resources[1].attributes["comment"],
+            carina_core::value::persisted_json_to_dsl_value(&persisted_update_marker)
+                .expect("lift persisted update marker"),
+            "both saved-plan copies must use the matching persisted digest",
+        );
+    }
 
     #[tokio::test]
     async fn provider_attributes_observe_reconciled_prefixed_resource_names() {

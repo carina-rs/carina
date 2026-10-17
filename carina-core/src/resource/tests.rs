@@ -19,6 +19,15 @@ fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_has
         RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(&marker, &id, "comment")
             .expect("upgrade legacy fixture");
     assert!(matching.verify(plaintext));
+    assert_eq!(
+        matching.encoded_digest(),
+        format!(
+            "argon2-legacy:{}:{}",
+            hex::encode(salt),
+            hex::encode(output),
+        ),
+        "the self-contained marker stores only the row salt and digest",
+    );
 
     output[0] ^= 1;
     let mismatched_marker = format!(

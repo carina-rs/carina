@@ -1946,7 +1946,11 @@ fn diff_display_update_resource(
                         fresh_state,
                         Some(existing_rs),
                         schema,
-                    )?;
+                        None,
+                    )
+                    .map_err(|source| {
+                        AppError::from_resource_state_encoding(resource.id.clone(), source)
+                    })?;
                 let write_only_keys: Vec<String> = schema
                     .map(|schema| {
                         schema
@@ -1958,7 +1962,11 @@ fn diff_display_update_resource(
                     })
                     .unwrap_or_default();
                 if !write_only_keys.is_empty() {
-                    resource_state.merge_write_only_attributes(resource, &write_only_keys);
+                    resource_state
+                        .merge_write_only_attributes(resource, &write_only_keys)
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(resource.id.clone(), source)
+                        })?;
                 }
                 Some(resource_state)
             }
@@ -1968,7 +1976,13 @@ fn diff_display_update_resource(
                     &id.resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 );
-                Some(existing_rs.refreshed_from_provider_state(fresh_state, schema)?)
+                Some(
+                    existing_rs
+                        .refreshed_from_provider_state(fresh_state, schema)
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.as_inner().clone(), source)
+                        })?,
+                )
             }
         }
     } else {
@@ -4313,6 +4327,52 @@ mod tests {
         );
         assert_eq!(counts.updated, 0);
         assert_eq!(counts.unchanged, 1);
+    }
+
+    #[test]
+    fn current_refresh_locates_plain_raw_legacy_marker_in_write_only_attribute() {
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
+        let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+        let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
+            .with_attribute("password", string_value(&marker));
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::new("db.Instance", "main", "awscc").with_identifier("db-current"),
+            )
+            .expect("test state setup must be valid");
+        let fresh = State::existing(id.clone(), HashMap::new()).with_identifier("db-current");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "awscc",
+            ResourceSchema::new("db.Instance")
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+
+        let error = diff_display_update_resource(
+            &ResolvedResourceId::new(id.clone()),
+            &fresh,
+            &mut state,
+            Some(&resolved(desired)),
+            &schemas,
+            "",
+            &mut StateRefreshCounts::default(),
+        )
+        .expect_err("marker-shaped write-only plaintext must fail closed without panicking");
+
+        let AppError::ResourceStateEncoding(located) = &error else {
+            panic!("expected typed resource-state encoding error, got {error:?}")
+        };
+        assert_eq!(located.resource(), &id);
+        let carina_state::ResourceStateEncodingError::PersistedAttributes(attribute_error) =
+            located.encoding_error()
+        else {
+            panic!("expected persisted-attribute validation error")
+        };
+        assert_eq!(attribute_error.attribute_key(), "password");
+        let rendered = error.to_string();
+        assert!(rendered.contains(&id.to_string()), "{rendered}");
+        assert!(rendered.contains("password"), "{rendered}");
     }
 
     #[tokio::test]

@@ -648,6 +648,24 @@ pub struct PersistedAttributes {
     encoded: HashMap<String, serde_json::Value>,
 }
 
+/// A context-free persisted attribute contained a raw pre-v12 secret marker.
+///
+/// The top-level attribute key is retained so state writeback can attach the
+/// resource address without flattening the source error into a string.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "persisted attribute {attribute_key:?} contains a raw pre-v12 secret marker; raw pre-v12 markers are accepted only from a state-file row"
+)]
+pub struct PersistedAttributesError {
+    attribute_key: String,
+}
+
+impl PersistedAttributesError {
+    pub fn attribute_key(&self) -> &str {
+        &self.attribute_key
+    }
+}
+
 impl PartialEq for PersistedAttributes {
     fn eq(&self, other: &Self) -> bool {
         self.encoded == other.encoded
@@ -665,12 +683,7 @@ impl Serialize for PersistedAttributes {
 impl<'de> Deserialize<'de> for PersistedAttributes {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
-        if encoded.values().any(contains_raw_legacy_secret_marker_json) {
-            return Err(serde::de::Error::custom(
-                "raw legacy secret markers are accepted only from a state-file row",
-            ));
-        }
-        Ok(Self { encoded })
+        Self::from_encoded(encoded).map_err(serde::de::Error::custom)
     }
 }
 
@@ -707,20 +720,20 @@ impl PersistedAttributes {
     /// their state-marker representation.
     pub fn from_saved_plan_attributes<'a>(
         attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
-    ) -> Result<Self, crate::value::SerializationError> {
+    ) -> Self {
         let encoded = attributes
             .into_iter()
             .filter_map(|(key, value)| {
                 saved_plan_secret_hashes(value).map(|value| (key.clone(), value))
             })
             .collect();
-        Ok(Self { encoded })
+        Self { encoded }
     }
 
     /// Construct persisted JSON from a state-file row. This is the only
-    /// decoder allowed to admit raw origin/main legacy markers; each one is
-    /// immediately rewritten with the finite historical salt candidates
-    /// embedded in its marker.
+    /// decoder allowed to admit raw pre-v12 legacy markers; each one is
+    /// immediately rewritten with its row-derived salt embedded in the marker.
+    /// The one historical fallback salt remains a fixed code constant.
     pub fn from_state_row_json(
         id: &ResourceId,
         mut encoded: HashMap<String, serde_json::Value>,
@@ -732,10 +745,19 @@ impl PersistedAttributes {
     }
 
     /// Construct persisted JSON at a context-free boundary such as a provider
-    /// or saved plan. Raw origin/main legacy markers are rejected.
-    pub fn from_encoded(encoded: HashMap<String, serde_json::Value>) -> Result<Self, &'static str> {
-        if encoded.values().any(contains_raw_legacy_secret_marker_json) {
-            return Err("raw legacy secret markers are accepted only from a state-file row");
+    /// or saved plan. Raw pre-v12 legacy markers are rejected.
+    pub fn from_encoded(
+        encoded: HashMap<String, serde_json::Value>,
+    ) -> Result<Self, PersistedAttributesError> {
+        if let Some(attribute_key) = encoded
+            .iter()
+            .filter(|(_, value)| contains_raw_legacy_secret_marker_json(value))
+            .map(|(key, _)| key)
+            .min()
+        {
+            return Err(PersistedAttributesError {
+                attribute_key: attribute_key.clone(),
+            });
         }
         Ok(Self { encoded })
     }
@@ -2476,13 +2498,11 @@ mod tests {
             serde_json::from_value::<PersistedAttributes>(encoded.clone()).is_err(),
             "context-free serde must not construct a typed legacy digest",
         );
-        assert!(
-            PersistedAttributes::from_encoded(
-                serde_json::from_value(encoded.clone()).expect("attribute object")
-            )
-            .is_err(),
-            "the checked context-free constructor must reject raw legacy markers",
-        );
+        let error = PersistedAttributes::from_encoded(
+            serde_json::from_value(encoded.clone()).expect("attribute object"),
+        )
+        .expect_err("the checked context-free constructor must reject raw legacy markers");
+        assert_eq!(error.attribute_key(), "token");
 
         let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
         let persisted = PersistedAttributes::from_state_row_json(
@@ -2527,7 +2547,7 @@ mod tests {
         let mut output = [0_u8; 32];
         argon2::Argon2::default()
             .hash_password_into(material, b"carina-secret-v1", &mut output)
-            .expect("hash origin/main fallback-salt fixture");
+            .expect("hash pre-v12 fallback-salt fixture");
         let marker = format!(
             "{}{}",
             crate::value::LEGACY_SECRET_PREFIX,
@@ -2580,8 +2600,7 @@ mod tests {
             ),
         ]);
 
-        let hashes = PersistedAttributes::from_saved_plan_attributes(&attributes)
-            .expect("non-placeholder siblings must not be serialized");
+        let hashes = PersistedAttributes::from_saved_plan_attributes(&attributes);
         let tags = hashes
             .encoded_value("tags")
             .and_then(serde_json::Value::as_object)

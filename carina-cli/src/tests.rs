@@ -200,17 +200,21 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
         )
         .expect("test state setup must be valid");
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(existing_state),
-        sorted_resources: &[resolved(resource)],
-        runtime_synthesized_resources: &[],
-        current_states: &current_states,
-        applied_states: &HashMap::new(),
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &failed_refreshes,
-        schemas: &SchemaRegistry::new(),
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(existing_state),
+            sorted_resources: &[resolved(resource)],
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &HashMap::new(),
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &failed_refreshes,
+            schemas: &SchemaRegistry::new(),
+        },
+        None,
+    )
     .unwrap();
 
     let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
@@ -253,17 +257,21 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
         )
         .expect("test state setup must be valid");
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(existing_state),
-        sorted_resources: &[resolved(resource)],
-        runtime_synthesized_resources: &[],
-        current_states: &current_states,
-        applied_states: &HashMap::new(),
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &failed_refreshes,
-        schemas: &SchemaRegistry::new(),
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(existing_state),
+            sorted_resources: &[resolved(resource)],
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &HashMap::new(),
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &failed_refreshes,
+            schemas: &SchemaRegistry::new(),
+        },
+        None,
+    )
     .unwrap();
 
     assert!(saved.find_resource("aws", "s3.Bucket", "bucket").is_none());
@@ -302,17 +310,21 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
         )
         .expect("test state setup must be valid");
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(existing_state),
-        sorted_resources: &[resolved(resource)],
-        runtime_synthesized_resources: &[],
-        current_states: &current_states,
-        applied_states: &HashMap::new(),
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &failed_refreshes,
-        schemas: &SchemaRegistry::new(),
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(existing_state),
+            sorted_resources: &[resolved(resource)],
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &HashMap::new(),
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &failed_refreshes,
+            schemas: &SchemaRegistry::new(),
+        },
+        None,
+    )
     .unwrap();
 
     let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
@@ -995,6 +1007,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         &applied_state,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -1114,6 +1127,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
         &ResolvedResource::new(resources_run1[0].clone()),
         &applied_state,
+        None,
         None,
         None,
     )
@@ -1486,6 +1500,7 @@ async fn lock_released_on_write_state_failure() {
             data_sources: &[],
             current_states: &HashMap::new(),
             plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
@@ -1495,6 +1510,7 @@ async fn lock_released_on_write_state_failure() {
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
+        None,
     )
     .await;
 
@@ -1630,6 +1646,7 @@ async fn finalize_apply_uses_write_state_locked() {
             data_sources: &[],
             current_states: &HashMap::new(),
             plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
@@ -1639,6 +1656,7 @@ async fn finalize_apply_uses_write_state_locked() {
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
+        None,
     )
     .await;
 
@@ -1947,6 +1965,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
             data_sources: &[],
             current_states: &HashMap::new(),
             plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
             backend: &backend,
             lock: None, // No lock
             schemas: &SchemaRegistry::new(),
@@ -1956,6 +1975,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
+        None,
     )
     .await;
 
@@ -2342,17 +2362,21 @@ fn import_effect_preserves_resource_metadata_in_state() {
         identifier: Value::Concrete(ConcreteValue::String(identifier.to_string().into())),
     });
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &[resolved(resource)],
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &SchemaRegistry::new(),
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &[resolved(resource)],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        },
+        None,
+    )
     .unwrap();
 
     let saved_resource = saved.find_resource("awscc", "ec2.Vpc", "my-vpc").unwrap();
@@ -2437,17 +2461,21 @@ fn build_state_after_apply_persists_write_only_attributes() {
             ),
     );
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &[resolved(resource)],
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &[resolved(resource)],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
     .unwrap();
 
     let saved_resource = saved.find_resource("awscc", "ec2.Vpc", "my-vpc").unwrap();
@@ -2516,17 +2544,21 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
             .attribute(AttributeSchema::new("domain", domain_type).write_only()),
     );
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &[resolved(resource.clone())],
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &[resolved(resource.clone())],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
     .unwrap();
     let reloaded = PostApplyStates::from_current_and_state(&HashMap::new(), &saved);
 
@@ -2611,17 +2643,21 @@ fn build_state_after_apply_write_only_detects_value_change() {
             ),
     );
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(existing_state),
-        sorted_resources: &[resolved(resource)],
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(existing_state),
+            sorted_resources: &[resolved(resource)],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
     .unwrap();
 
     let saved_resource = saved.find_resource("awscc", "ec2.Vpc", "my-vpc").unwrap();
@@ -3029,6 +3065,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
             data_sources: &[],
             current_states: &HashMap::new(),
             plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
@@ -3038,6 +3075,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
+        None,
     )
     .await;
 
@@ -3095,6 +3133,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             data_sources: &[],
             current_states: &HashMap::new(),
             plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
@@ -3104,6 +3143,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
+        None,
     )
     .await;
 
@@ -3184,6 +3224,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             data_sources: &[],
             current_states: &result.current_states,
             plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
@@ -3193,6 +3234,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
+        None,
     )
     .await;
 
@@ -3279,6 +3321,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
             data_sources: &[],
             current_states: &result.current_states,
             plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
@@ -3288,6 +3331,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
+        None,
     )
     .await
     .expect_err("non-finite export must still be reported");

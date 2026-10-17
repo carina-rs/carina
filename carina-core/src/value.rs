@@ -423,7 +423,7 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
 
 /// Convert persisted state JSON to a DSL value, lifting self-contained PHC and
 /// explicit-salt legacy markers into their opaque typed representation.
-/// Raw origin/main legacy markers are accepted only by the state-file loader,
+/// Raw pre-v12 legacy markers are accepted only by the state-file loader,
 /// which upgrades them before this conversion runs.
 pub fn persisted_json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
     json_to_dsl_value_inner(json, true)
@@ -2292,15 +2292,42 @@ fn create_effect_ids(plan: &crate::plan::Plan) -> Vec<Option<crate::resource::Re
 
 pub fn redact_secrets_in_plan_with_desired_and_historical(
     plan: &crate::plan::Plan,
-    desired: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
+    planned_resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     historical: &HashMap<crate::resource::ResourceId, crate::resource::State>,
 ) -> Result<crate::plan::Plan, SerializationError> {
+    let reusable_resource = |id: &crate::resource::ResourceId| {
+        planned_resources
+            .get(id)
+            .filter(|resource| resource.attributes.values().any(contains_redacted_secret))
+    };
     let mut redacted = plan.clone();
     let redacted_effects: Vec<_> = plan
         .effects()
         .iter()
         .map(|effect| {
-            let mut effect = redact_secrets_in_effect(effect)?;
+            let mut effect = match effect {
+                crate::effect::Effect::Create(resource) => match reusable_resource(&resource.id) {
+                    Some(planned) => crate::effect::Effect::Create(
+                        crate::resource::ResolvedResource::new(planned.clone()),
+                    ),
+                    None => redact_secrets_in_effect(effect)?,
+                },
+                crate::effect::Effect::Update {
+                    from,
+                    to,
+                    changed_attributes,
+                } => crate::effect::Effect::Update {
+                    from: Box::new(redact_secrets_in_state(from)?),
+                    to: match reusable_resource(&to.id) {
+                        Some(planned) => crate::resource::ResolvedResource::new(planned.clone()),
+                        None => {
+                            crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?)
+                        }
+                    },
+                    changed_attributes: changed_attributes.clone(),
+                },
+                _ => redact_secrets_in_effect(effect)?,
+            };
             if let crate::effect::Effect::Update { from, .. } = &mut effect {
                 if let Some(state) = historical.get(&from.id) {
                     for (key, value) in &mut from.attributes {
@@ -2309,8 +2336,22 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                         };
                         *value = redact_using_redacted_shape(value, shape)?;
                     }
-                } else if let Some(guide) = desired.get(&from.id) {
-                    **from = redact_secrets_in_state_using_resource(from, guide)?;
+                } else if let Some(guide) = planned_resources.get(&from.id) {
+                    **from = if reusable_resource(&from.id).is_some() {
+                        let attributes = redact_attrs_with_guide(
+                            from.attributes.iter(),
+                            |key, value| match guide.attributes.get(key) {
+                                Some(shape) => redact_using_redacted_shape(value, shape),
+                                None => redact_secrets_only(value),
+                            },
+                        )?;
+                        crate::resource::State {
+                            attributes,
+                            ..from.as_ref().clone()
+                        }
+                    } else {
+                        redact_secrets_in_state_using_resource(from, guide)?
+                    };
                 }
             }
             Ok(effect)
@@ -2322,12 +2363,15 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
     for metadata in redacted.replace_display_mut() {
         let resource_id = create_ids.get(metadata.create_idx).and_then(Option::as_ref);
         let historical = resource_id.and_then(|id| historical.get(id));
-        let guide = resource_id.and_then(|id| desired.get(id));
+        let guide = resource_id.and_then(|id| planned_resources.get(id));
         for (key, value) in &mut metadata.previous_attributes {
             *value = if let Some(shape) = historical.and_then(|state| state.attributes.get(key)) {
                 redact_using_redacted_shape(value, shape)?
             } else {
                 match guide.and_then(|resource| resource.attributes.get(key)) {
+                    Some(shape) if contains_redacted_secret(shape) => {
+                        redact_using_redacted_shape(value, shape)?
+                    }
                     Some(shape) => redact_plaintext_using_secret_shape(value, shape)?,
                     None => redact_secrets_in_value(value)?,
                 }

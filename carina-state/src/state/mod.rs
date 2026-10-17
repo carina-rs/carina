@@ -6,7 +6,7 @@ use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
 pub use carina_core::provider::PreviousSecretHashAuthority;
-use carina_core::provider::{PersistedAttributes, RawSavedAttrs};
+use carina_core::provider::{PersistedAttributes, PersistedAttributesError, RawSavedAttrs};
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
@@ -14,13 +14,22 @@ use carina_core::resource::{
 };
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{
-    contains_unredacted_secret, json_to_dsl_value, persisted_secret_marker, value_to_json,
-    value_to_json_reusing_secret_hashes,
+    SerializationError, contains_unredacted_secret, json_to_dsl_value, persisted_secret_marker,
+    value_to_json, value_to_json_reusing_secret_hashes,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::backend::{BackendError, InvalidResourceIdentityError};
+
+/// A provider or desired value could not be encoded into persisted state.
+#[derive(Debug, thiserror::Error)]
+pub enum ResourceStateEncodingError {
+    #[error(transparent)]
+    Serialization(#[from] SerializationError),
+    #[error(transparent)]
+    PersistedAttributes(#[from] PersistedAttributesError),
+}
 
 /// The main state file structure that persists to the backend
 #[derive(Debug, Clone, Serialize)]
@@ -1485,7 +1494,10 @@ impl ResourceState {
     }
 
     /// Populate attributes from a provider-returned State
-    pub fn with_attributes_from_state(mut self, state: &State) -> Self {
+    pub fn with_attributes_from_state(
+        mut self,
+        state: &State,
+    ) -> Result<Self, ResourceStateEncodingError> {
         let encoded = state
             .attributes
             .iter()
@@ -1495,14 +1507,13 @@ impl ResourceState {
                     .map(|value| (key.clone(), value))
             })
             .collect();
-        let attributes = PersistedAttributes::from_encoded(encoded)
-            .expect("provider state encoding cannot emit raw legacy markers");
+        let attributes = PersistedAttributes::from_encoded(encoded)?;
         self.attributes.extend(attributes);
         if let Some(identifier) = &state.identifier {
             self.identifier = Some(identifier.clone());
         }
         self.partial_read = state.partial_read.clone();
-        self
+        Ok(self)
     }
 
     /// Mark this resource as protected
@@ -1554,7 +1565,11 @@ impl ResourceState {
     ///
     /// `write_only_keys` is the set of attribute names that are marked write-only
     /// in the resource schema.
-    pub fn merge_write_only_attributes(&mut self, resource: &Resource, write_only_keys: &[String]) {
+    pub fn merge_write_only_attributes(
+        &mut self,
+        resource: &Resource,
+        write_only_keys: &[String],
+    ) -> Result<(), ResourceStateEncodingError> {
         let mut merged = Vec::new();
         let mut encoded = HashMap::new();
         for key in write_only_keys {
@@ -1568,18 +1583,18 @@ impl ResourceState {
                 merged.push(key.clone());
             }
         }
-        let attributes = PersistedAttributes::from_encoded(encoded)
-            .expect("desired write-only encoding cannot emit raw legacy markers");
+        let attributes = PersistedAttributes::from_encoded(encoded)?;
         self.attributes.extend(attributes);
         merged.sort();
         self.write_only_attributes = merged;
+        Ok(())
     }
 
     fn attribute_to_state_json(
         value: &Value,
         previous: Option<&serde_json::Value>,
-    ) -> Result<serde_json::Value, String> {
-        Self::provider_state_value_to_json(value, previous).map_err(|e| e.to_string())
+    ) -> Result<serde_json::Value, SerializationError> {
+        Self::provider_state_value_to_json(value, previous)
     }
 
     /// Encode values returned by a provider for persisted state. Opaque hash
@@ -1674,7 +1689,7 @@ impl ResourceState {
         &self,
         state: &State,
         schema: Option<&ResourceSchema>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ResourceStateEncodingError> {
         let mut refreshed = self.clone();
         refreshed.identifier = state.identifier.clone();
         refreshed.partial_read = state.partial_read.clone();
@@ -1686,8 +1701,7 @@ impl ResourceState {
                 Self::attribute_to_state_json(value, self.attributes.encoded_value(key))?,
             );
         }
-        let attributes = PersistedAttributes::from_encoded(serialized.into_iter().collect())
-            .map_err(str::to_string)?;
+        let attributes = PersistedAttributes::from_encoded(serialized.into_iter().collect())?;
         refreshed.attributes = attributes.protect_for_orphan_refresh(schema, &self.attributes);
         refreshed.explicit =
             refreshed_explicit_without_desired_values(Some(&self.explicit), &state.attributes);
@@ -1711,21 +1725,8 @@ impl ResourceState {
         state: &State,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
-    ) -> Result<Self, String> {
-        Self::from_provider_state_for_resource_and_schema_with_preferred_hashes(
-            resource, state, existing, schema, None,
-        )
-    }
-
-    /// Saved-plan variant that prefers the exact digest chosen at plan time
-    /// whenever it verifies at the same nested path.
-    pub fn from_provider_state_for_resource_and_schema_with_preferred_hashes(
-        resource: &ResolvedResource,
-        state: &State,
-        existing: Option<&ResourceState>,
-        schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ResourceStateEncodingError> {
         let mut rs = Self::new(
             &resource.id.resource_type,
             resource.identity().clone(),
@@ -1753,15 +1754,13 @@ impl ResourceState {
             rs.protected = existing.protected;
             rs.name_overrides = existing.name_overrides.clone();
         }
-        rs.attributes = PersistedAttributes::from_encoded(serialized.into_iter().collect())
-            .map_err(str::to_string)?
+        rs.attributes = PersistedAttributes::from_encoded(serialized.into_iter().collect())?
             .try_protect_for_resource_and_schema(
                 resource,
                 schema,
                 previous_hash_authority,
                 preferred_hashes,
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
         rs.directives = resource.directives.clone();
         if rs.directives.provider_instance.is_none() {
             rs.directives.provider_instance = resource.id.provider_instance.clone();

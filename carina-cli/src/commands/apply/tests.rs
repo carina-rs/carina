@@ -2540,17 +2540,21 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
     let applied_states = HashMap::from([(id.clone(), applied_state)]);
     let plan = plan_with_name_override(&id, "legacy-temp", "legacy");
 
-    let migrated = build_state_after_apply(ApplyStateSave {
-        state_file: Some(state_file),
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &SchemaRegistry::new(),
-    })
+    let migrated = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        },
+        None,
+    )
     .expect("writeback should migrate legacy override");
 
     assert!(!migrated.has_legacy_name_overrides());
@@ -3779,17 +3783,21 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let successfully_deleted = HashSet::new();
     let failed_refreshes = HashSet::new();
 
-    let result = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &current_states,
-        applied_states: &applied_states,
-        plan: &plan,
-        successfully_deleted: &successfully_deleted,
-        failed_refreshes: &failed_refreshes,
-        schemas: &schemas,
-    })
+    let result = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        },
+        None,
+    )
     .unwrap();
 
     // The write-only attribute should be merged from the desired resource into state
@@ -3893,17 +3901,21 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     let successfully_deleted = HashSet::new();
     let failed_refreshes = HashSet::new();
 
-    let state = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &current_states,
-        applied_states: &applied_states,
-        plan: &plan,
-        successfully_deleted: &successfully_deleted,
-        failed_refreshes: &failed_refreshes,
-        schemas: &schemas,
-    })
+    let state = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        },
+        None,
+    )
     .unwrap();
 
     // Verify state has the policies attribute
@@ -4127,17 +4139,21 @@ fn block_unique_name_attribute_state_roundtrip() {
     let mut applied_states = HashMap::new();
     applied_states.insert(sorted_resources[0].id.clone(), applied_state);
 
-    let state = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
+    let state = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
     .unwrap();
 
     // Verify state contains operating_regions
@@ -4256,17 +4272,21 @@ fn move_plus_update_keeps_post_update_attributes() {
         to: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
     });
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(state_file),
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
     .expect("writeback should succeed");
 
     assert!(
@@ -4335,17 +4355,21 @@ fn move_alone_carries_attributes_via_current_states() {
         to: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
     });
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(state_file),
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &current_states,
-        applied_states: &HashMap::new(),
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &HashMap::new(),
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
     .expect("writeback should succeed");
 
     assert!(
@@ -4387,17 +4411,21 @@ fn move_with_absent_from_is_no_op() {
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
     });
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(StateFile::default()),
-        sorted_resources: &[],
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &HashMap::new(),
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(StateFile::default()),
+            sorted_resources: &[],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::new(),
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
     .expect("writeback should succeed");
 
     assert!(
@@ -4438,17 +4466,21 @@ fn failed_refresh_preserves_existing_row() {
         .upsert_resource(existing)
         .expect("test state setup must be valid");
 
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(state_file),
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &HashMap::new(),
-        plan: &Plan::new(),
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &failed_refreshes,
-        schemas: &schemas,
-    })
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::new(),
+            plan: &Plan::new(),
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        },
+        None,
+    )
     .expect("writeback should succeed");
 
     let row = saved
@@ -4495,17 +4527,21 @@ fn move_from_overlapping_desired_resource_errors() {
         to: carina_core::resource::ResolvedResourceId::new(to_id),
     });
 
-    let result = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied,
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    });
+    let result = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    );
 
     let err = result.expect_err("overlap must surface as a writeback error");
     let msg = err.to_string();
@@ -4550,17 +4586,21 @@ fn remove_overlapping_desired_resource_errors() {
         id: carina_core::resource::ResolvedResourceId::new(id.clone()),
     });
 
-    let result = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied,
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    });
+    let result = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    );
 
     let err = result.expect_err("overlap must surface as a writeback error");
     assert!(
@@ -4604,17 +4644,21 @@ fn self_move_overlapping_desired_resource_errors() {
         to: carina_core::resource::ResolvedResourceId::new(id.clone()),
     });
 
-    let result = build_state_after_apply(ApplyStateSave {
-        state_file: None,
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied,
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    });
+    let result = build_state_after_apply(
+        ApplyStateSave {
+            state_file: None,
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied,
+            plan: &plan,
+            moved_origins: &HashMap::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    );
 
     let err = result.expect_err("self-move must surface as a writeback error");
     assert!(

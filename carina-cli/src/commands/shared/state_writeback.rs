@@ -155,6 +155,9 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// (carina#3266).
     pub current_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
+    /// Destination address to persisted source address for every move in
+    /// `plan`, constructed once by the planning/apply boundary.
+    pub moved_origins: &'a HashMap<ResourceId, ResourceId>,
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
     pub schemas: &'a SchemaRegistry,
@@ -634,6 +637,7 @@ pub(crate) struct ApplyStateSave<'a> {
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
+    pub moved_origins: &'a HashMap<ResourceId, ResourceId>,
     pub successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
     pub schemas: &'a SchemaRegistry,
@@ -1206,18 +1210,7 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
     Ok(wb)
 }
 
-pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, AppError> {
-    build_state_after_apply_inner(save, None)
-}
-
-pub(crate) fn build_state_after_apply_with_planned_secret_hashes(
-    save: ApplyStateSave<'_>,
-    planned_secret_hashes: &HashMap<ResourceId, PersistedAttributes>,
-) -> Result<StateFile, AppError> {
-    build_state_after_apply_inner(save, Some(planned_secret_hashes))
-}
-
-fn build_state_after_apply_inner(
+pub(crate) fn build_state_after_apply(
     save: ApplyStateSave<'_>,
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
 ) -> Result<StateFile, AppError> {
@@ -1228,6 +1221,7 @@ fn build_state_after_apply_inner(
         current_states,
         applied_states,
         plan,
+        moved_origins,
         successfully_deleted,
         failed_refreshes,
         schemas,
@@ -1246,20 +1240,10 @@ fn build_state_after_apply_inner(
         schemas,
     })?;
     let permanent_name_overrides = plan.permanent_name_overrides_for_state();
-
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
-        let previous_id = plan
-            .effects()
-            .iter()
-            .find_map(|effect| match effect {
-                Effect::Move { from, to } if to.as_inner() == id => Some(from.as_inner()),
-                _ => None,
-            })
-            .unwrap_or(id);
-        let existing = previous_id.identity_str().and_then(|identity| {
-            state.find_resource(&previous_id.provider, &previous_id.resource_type, identity)
-        });
+        let previous_id = moved_origins.get(id).unwrap_or(id);
+        let existing = state.find_resource_for_id(previous_id);
         let write_only_keys: Vec<String> = schemas
             .get_for(resource)
             .map(|schema| {
@@ -1277,19 +1261,21 @@ fn build_state_after_apply_inner(
             UpsertSource::CurrentState(s) => (s, false),
         };
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let mut resource_state =
-            ResourceState::from_provider_state_for_resource_and_schema_with_preferred_hashes(
-                resource,
-                applied_state,
-                existing,
-                schemas.get_for(resource),
-                preferred_hashes,
-            )?;
+        let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
+            resource,
+            applied_state,
+            existing,
+            schemas.get_for(resource),
+            preferred_hashes,
+        )
+        .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
         if is_applied && let Some(overrides) = permanent_name_overrides.get(id) {
             resource_state.name_overrides = overrides.clone();
         }
         if !write_only_keys.is_empty() {
-            resource_state.merge_write_only_attributes(resource, &write_only_keys);
+            resource_state
+                .merge_write_only_attributes(resource, &write_only_keys)
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
         }
         state.upsert_resource(resource_state)?;
     }
@@ -1555,17 +1541,21 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("listener-id");
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: None,
-            sorted_resources: &[resolved(resource)],
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id, applied_state)]),
-            plan: &Plan::new(),
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: &[resolved(resource)],
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id, applied_state)]),
+                plan: &Plan::new(),
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("apply writeback");
 
         let assert_aligned = |state: &StateFile| {
@@ -1634,18 +1624,22 @@ mod apply_state_save_tests {
         let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "new-temp"))]);
         let plan = plan_with_name_override(&id, "new-temp", "dsl-new");
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
-                .unwrap(),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
+                    .unwrap(),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &carina_core::schema::SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("state writeback should succeed");
 
         let saved = state
@@ -1684,18 +1678,22 @@ mod apply_state_save_tests {
         let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "legacy-temp"))]);
         let plan = plan_with_name_override(&id, "legacy-temp", "dsl-value");
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
-                .unwrap(),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
+                    .unwrap(),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &carina_core::schema::SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("state writeback should succeed");
 
         let saved = state
@@ -1727,17 +1725,21 @@ mod apply_state_save_tests {
         )
         .with_identifier("record-id");
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(StateFile::new()),
-            sorted_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(child_id.clone(), child_state)]),
-            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-            plan: &Plan::new(),
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(StateFile::new()),
+                sorted_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(child_id.clone(), child_state)]),
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                plan: &Plan::new(),
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &carina_core::schema::SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("state writeback should accept runtime-synthesized child");
 
         assert!(
@@ -1783,17 +1785,21 @@ mod apply_state_save_tests {
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id_a.clone(), "a-old")]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &[],
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::new(),
-            plan: &plan,
-            successfully_deleted: &successfully_deleted,
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &[],
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::new(),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &successfully_deleted,
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should accept independent deletes");
 
         assert!(
@@ -1871,17 +1877,21 @@ mod apply_state_save_tests {
             "old-record-id",
         )]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &[],
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::new(),
-            plan: &plan,
-            successfully_deleted: &successfully_deleted,
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &[],
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::new(),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &successfully_deleted,
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should remove successful top-level deposed delete");
 
         let row = state
@@ -2027,17 +2037,21 @@ mod apply_state_save_tests {
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-            current_states: &current_states,
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                current_states: &current_states,
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &carina_core::schema::SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should preserve old absorbed delete as deposed");
 
         let saved = state
@@ -2077,17 +2091,21 @@ mod apply_state_save_tests {
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(StateFile::new()),
-            sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-            current_states: &current_states,
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(StateFile::new()),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                current_states: &current_states,
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &carina_core::schema::SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("same-identifier replacement should write only the current row");
 
         let saved = state
@@ -2139,17 +2157,21 @@ mod apply_state_save_tests {
             changed_attributes: vec!["cidr_block".to_string()],
         });
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("update writeback should not depose canonicalized identifiers");
 
         let row = state
@@ -2192,17 +2214,21 @@ mod apply_state_save_tests {
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should depose the displaced current identifier");
 
         let row = state
@@ -2251,17 +2277,21 @@ mod apply_state_save_tests {
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::from([(id.clone(), current_state)]),
-            applied_states: &HashMap::from([(id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::from([(id.clone(), current_state)]),
+                applied_states: &HashMap::from([(id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should treat the old identifier as already absent");
 
         let row = state
@@ -2305,17 +2335,21 @@ mod apply_state_save_tests {
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should depose the displaced current identifier");
 
         let row = state
@@ -2399,17 +2433,21 @@ mod apply_state_save_tests {
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(delete_id, "vpc-old")]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(create_id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &successfully_deleted,
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(create_id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &successfully_deleted,
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should treat the old routed delete as successful");
 
         let row = state
@@ -2457,17 +2495,21 @@ mod apply_state_save_tests {
             "shared-name",
         )]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(create_id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &successfully_deleted,
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(create_id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &successfully_deleted,
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should not confuse provider-instance-local identifiers");
 
         let row = state
@@ -2554,17 +2596,21 @@ mod apply_state_save_tests {
         let plan: Plan =
             serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should preserve both failed old delete and displaced current");
 
         let row = state
@@ -2666,17 +2712,21 @@ mod apply_state_save_tests {
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id, applied_state)]),
-            plan: &plan,
-            successfully_deleted: &successfully_deleted,
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id, applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &successfully_deleted,
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should depose displaced current and retain existing deposed entry");
 
         let row = state
@@ -2729,17 +2779,21 @@ mod apply_state_save_tests {
         )
         .with_identifier("vpc-new");
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::from([(id, refreshed_state)]),
-            applied_states: &HashMap::new(),
-            plan: &Plan::new(),
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::from([(id, refreshed_state)]),
+                applied_states: &HashMap::new(),
+                plan: &Plan::new(),
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("refresh writeback should update the current row only");
 
         let row = state
@@ -2792,17 +2846,21 @@ mod apply_state_save_tests {
             changed_attributes: vec!["password".to_string()],
         });
 
-        let saved = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id.clone(), applied_state)]),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("secret-to-plain demotion should write state");
 
         let row = saved
@@ -2842,6 +2900,62 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn apply_writeback_locates_plain_raw_legacy_marker_in_write_only_attribute() {
+        let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+        let desired = Resource::with_provider("mock", "test.resource", "plain-marker", None)
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String(marker.into())),
+            );
+        let id = desired.id.clone();
+        let applied_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+
+        let error = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), applied_state)]),
+                plan: &Plan::new(),
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect_err("a marker-shaped plain string must fail closed without panicking");
+
+        let AppError::ResourceStateEncoding(located) = &error else {
+            panic!("expected typed resource-state encoding error, got {error:?}")
+        };
+        assert_eq!(located.resource(), &id);
+        let carina_state::ResourceStateEncodingError::PersistedAttributes(attribute_error) =
+            located.encoding_error()
+        else {
+            panic!("expected persisted-attribute validation error")
+        };
+        assert_eq!(attribute_error.attribute_key(), "password");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&id.to_string()),
+            "error must name the resource: {rendered}",
+        );
+        assert!(
+            rendered.contains("password"),
+            "error must name the top-level attribute: {rendered}",
+        );
+    }
+
+    #[test]
     fn apply_writeback_write_only_secret_to_plain_demotion_converges() {
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
             "password",
@@ -2873,17 +2987,21 @@ mod apply_state_save_tests {
                 .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
         );
 
-        let saved = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
-            applied_states: &HashMap::from([(id.clone(), applied_state)]),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &schemas,
-        })
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                current_states: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), applied_state)]),
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
         .expect("write-only secret-to-plain demotion should write state");
 
         let row = saved
@@ -2957,17 +3075,21 @@ mod apply_state_save_tests {
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(StateFile::new()),
-            sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-            current_states: &current_states,
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(StateFile::new()),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                current_states: &current_states,
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &carina_core::schema::SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("unknown deposed fallback attributes should be skipped, not fail writeback");
 
         let saved = state
@@ -3038,17 +3160,21 @@ mod apply_state_save_tests {
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-            current_states: &current_states,
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                current_states: &current_states,
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("deferred replacement should write state");
 
         let saved = state
@@ -3109,17 +3235,21 @@ mod apply_state_save_tests {
                 .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
         );
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(StateFile::new()),
-            sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-            current_states: &current_states,
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &schemas,
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(StateFile::new()),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                current_states: &current_states,
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
         .expect("schema-protected removed attributes should not fail writeback");
 
         let row = state
@@ -3304,17 +3434,21 @@ mod apply_state_save_tests {
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-            current_states: &current_states,
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                current_states: &current_states,
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &carina_core::schema::SchemaRegistry::new(),
+            },
+            None,
+        )
         .expect("writeback should preserve existing deposed entries and append the new one");
 
         let saved = state
@@ -3532,17 +3666,21 @@ mod apply_state_save_tests {
         .with_identifier("bucket-new-id");
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
 
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: &sorted_resources,
-            runtime_synthesized_resources: &[],
-            current_states: &current_states,
-            applied_states: &applied_states,
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &schemas,
-        })
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &sorted_resources,
+                runtime_synthesized_resources: &[],
+                current_states: &current_states,
+                applied_states: &applied_states,
+                plan: &plan,
+                moved_origins: &HashMap::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
         .expect("moved replacement writeback should preserve the failed delete as deposed");
 
         let row = state

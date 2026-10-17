@@ -63,6 +63,7 @@ pub use backends::{
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, DeposedInstance, DeposedKey, LoadedState, MigratedStateFile, MigrationInfo,
-    NameOverride, PreviousSecretHashAuthority, ResourceState, StateFile, check_and_migrate,
-    check_and_migrate_bytes, log_state_migration_once, should_apply_override,
+    NameOverride, PreviousSecretHashAuthority, ResourceState, ResourceStateEncodingError,
+    StateFile, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
+    should_apply_override,
 };

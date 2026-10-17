@@ -8,12 +8,13 @@ use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
     CurrentStateEntry, PlanFile, PlanWaitBinding, ResolvedProviderInputs, UpstreamSource,
+    moved_origins_for_plan,
 };
 use crate::error::AppError;
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
-fn planned_secret_hashes(resources: &[Resource]) -> Result<PlannedSecretHashes, AppError> {
+fn planned_secret_hashes(resources: &[Resource]) -> PlannedSecretHashes {
     resources
         .iter()
         .filter(|resource| {
@@ -23,9 +24,10 @@ fn planned_secret_hashes(resources: &[Resource]) -> Result<PlannedSecretHashes, 
                 .any(carina_core::value::contains_redacted_secret)
         })
         .map(|resource| {
-            PersistedAttributes::from_saved_plan_attributes(&resource.attributes)
-                .map(|attributes| (resource.id.clone(), attributes))
-                .map_err(AppError::from)
+            (
+                resource.id.clone(),
+                PersistedAttributes::from_saved_plan_attributes(&resource.attributes),
+            )
         })
         .collect()
 }
@@ -43,16 +45,7 @@ pub(crate) struct HistoricalResourceAddresses {
 
 impl HistoricalResourceAddresses {
     fn from_plan(plan: &Plan) -> Self {
-        let moved_origins = plan
-            .effects()
-            .iter()
-            .filter_map(|effect| match effect {
-                carina_core::effect::Effect::Move { from, to } => {
-                    Some((to.as_inner().clone(), from.as_inner().clone()))
-                }
-                _ => None,
-            })
-            .collect();
+        let moved_origins = moved_origins_for_plan(plan);
         Self { moved_origins }
     }
 
@@ -61,6 +54,10 @@ impl HistoricalResourceAddresses {
             .get(id)
             .cloned()
             .unwrap_or_else(|| id.clone())
+    }
+
+    pub(super) fn moved_origins(&self) -> &HashMap<ResourceId, ResourceId> {
+        &self.moved_origins
     }
 }
 
@@ -125,7 +122,7 @@ impl PendingPlanFile {
         provider_inputs: &ResolvedProviderInputs,
         apply_target: ApplyTarget<'_>,
     ) -> Result<DesiredPlanFile, AppError> {
-        let planned_secret_hashes = planned_secret_hashes(&self.plan_file.sorted_resources)?;
+        let planned_secret_hashes = planned_secret_hashes(&self.plan_file.sorted_resources);
         let plan_file = super::rehydrate_desired_plan_file(
             self.plan_file,
             parsed,

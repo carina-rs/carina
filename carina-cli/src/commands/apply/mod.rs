@@ -53,8 +53,7 @@ use crate::commands::shared::progress::{
 };
 use crate::commands::shared::state_writeback::{
     ApplyStateSave, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
-    SkippedExports, build_state_after_apply, build_state_after_apply_with_planned_secret_hashes,
-    materialize_exports, resolve_export_values_post_apply,
+    SkippedExports, build_state_after_apply, materialize_exports, resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -734,21 +733,6 @@ pub async fn refresh_pending_states(
 pub(crate) async fn finalize_apply(
     input: FinalizeApplyInput<'_>,
     persistence: StatePersistence,
-) -> Result<SkippedExports, AppError> {
-    finalize_apply_inner(input, persistence, None).await
-}
-
-async fn finalize_apply_with_planned_secret_hashes(
-    input: FinalizeApplyInput<'_>,
-    persistence: StatePersistence,
-    planned_secret_hashes: &PlannedSecretHashes,
-) -> Result<SkippedExports, AppError> {
-    finalize_apply_inner(input, persistence, Some(planned_secret_hashes)).await
-}
-
-async fn finalize_apply_inner(
-    input: FinalizeApplyInput<'_>,
-    persistence: StatePersistence,
     planned_secret_hashes: Option<&PlannedSecretHashes>,
 ) -> Result<SkippedExports, AppError> {
     println!();
@@ -761,14 +745,12 @@ async fn finalize_apply_inner(
         current_states: input.current_states,
         applied_states: &input.result.applied_states,
         plan: input.plan,
+        moved_origins: input.moved_origins,
         successfully_deleted: &input.result.successfully_deleted,
         failed_refreshes: &input.result.failed_refreshes,
         schemas: input.schemas,
     };
-    let mut state = match planned_secret_hashes {
-        Some(hashes) => build_state_after_apply_with_planned_secret_hashes(save, hashes)?,
-        None => build_state_after_apply(save)?,
-    };
+    let mut state = build_state_after_apply(save, planned_secret_hashes)?;
 
     // `Some([])` is meaningful: the user removed the `exports {}` block,
     // so stale entries the previous apply persisted must be cleared
@@ -2264,6 +2246,7 @@ async fn run_apply_locked(
                     data_sources: &data_sources_for_plan,
                     current_states: &current_states,
                     plan: &plan,
+                    moved_origins: &moved_origins,
                     backend,
                     lock,
                     schemas,
@@ -2273,6 +2256,7 @@ async fn run_apply_locked(
                     pre_resolve_compositions: &pre_resolve_compositions,
                 },
                 persistence,
+                None,
             )
         },
         cancelled,
@@ -3198,7 +3182,7 @@ async fn run_apply_from_plan_locked(
 
     let skipped_exports = finalize_after_execute(
         |persistence| {
-            finalize_apply_with_planned_secret_hashes(
+            finalize_apply(
                 FinalizeApplyInput {
                     result: &result,
                     state_file,
@@ -3206,6 +3190,7 @@ async fn run_apply_from_plan_locked(
                     data_sources: plan_data_sources,
                     current_states: &current_states,
                     plan,
+                    moved_origins: historical_addresses.moved_origins(),
                     backend,
                     lock,
                     schemas: ctx.schemas(),
@@ -3225,7 +3210,7 @@ async fn run_apply_from_plan_locked(
                     pre_resolve_compositions: &[],
                 },
                 persistence,
-                rehydrated_plan_file.planned_secret_hashes(),
+                Some(rehydrated_plan_file.planned_secret_hashes()),
             )
         },
         cancelled,
