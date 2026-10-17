@@ -7,6 +7,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 const V2_SECRET_PREFIX: &str = "_secret:$argon2id$";
+const SELF_CONTAINED_LEGACY_PREFIX: &str = "_secret:argon2-legacy:";
 
 struct Scenario {
     _temp: TempDir,
@@ -56,19 +57,6 @@ impl Scenario {
             serde_json::to_vec_pretty(state).expect("encode state"),
         )
         .expect("write state");
-    }
-
-    fn provider_json(&self) -> Value {
-        serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock provider state"))
-            .expect("parse mock provider state")
-    }
-
-    fn write_provider_json(&self, state: &Value) {
-        fs::write(
-            &self.mock_state,
-            serde_json::to_vec_pretty(state).expect("encode mock provider state"),
-        )
-        .expect("write mock provider state");
     }
 }
 
@@ -244,6 +232,67 @@ let renamed = mock.test.resource {
 }
 
 #[test]
+fn moved_legacy_secret_is_a_pure_move_and_saved_plan_applies() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let old = mock.test.resource {
+  name    = "moved-legacy-secret"
+  comment = secret("MOVED_LEGACY_PLAIN")
+}
+"#,
+    );
+    assert_success(
+        "apply moved legacy fixture",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let mut state = scenario.state_json();
+    state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
+        &Value::String("MOVED_LEGACY_PLAIN".to_string()),
+        "mock.test.resource",
+        "old",
+        "comment",
+    ));
+    scenario.write_state_json(&state);
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+moved {
+  from = mock.test.resource "old"
+  to   = mock.test.resource "renamed"
+}
+
+let renamed = mock.test.resource {
+  name    = "moved-legacy-secret"
+  comment = secret("MOVED_LEGACY_PLAIN")
+}
+"#,
+    );
+
+    assert_plan_counts(
+        &scenario.carina(&["plan", "--refresh=false", "--out", "moved-legacy.json", "."]),
+        0,
+        0,
+        0,
+    );
+    assert_success(
+        "apply moved legacy saved plan",
+        &scenario.carina(&[
+            "apply",
+            "--auto-approve",
+            "--lock=false",
+            "moved-legacy.json",
+        ]),
+    );
+    assert_marker_verifies(
+        &comment_marker(&scenario.state_json(), "renamed"),
+        "MOVED_LEGACY_PLAIN",
+    );
+}
+
+#[test]
 fn nested_secret_wrappers_converge_and_saved_plan_applies() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
@@ -314,9 +363,17 @@ moved {
 "#,
     );
 
-    assert_success(
-        "plan orphan rekey",
+    assert_plan_counts(
         &scenario.carina(&["plan", "--refresh=false", "--out", "orphan-rekey.json", "."]),
+        0,
+        0,
+        0,
+    );
+    let plan = fs::read_to_string(scenario.project.join("orphan-rekey.json"))
+        .expect("read orphan-rekey saved plan");
+    assert!(
+        plan.contains("argon2-legacy:"),
+        "the saved plan must carry the orphan's self-contained legacy digest",
     );
     assert_success(
         "apply orphan-rekey saved plan",
@@ -327,10 +384,92 @@ moved {
             "orphan-rekey.json",
         ]),
     );
+    assert!(
+        scenario.state_json()["resources"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "the undeclared orphan destination must be removed after apply",
+    );
 }
 
 #[test]
-fn anonymous_identity_reconcile_preserves_legacy_origin_for_plan_and_apply() {
+fn moved_removed_legacy_secret_can_be_readded_without_an_update() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let old = mock.test.resource {
+  name    = "round-two-legacy"
+  comment = secret("ROUND_TWO_SAME_PLAIN")
+}
+"#,
+    );
+    assert_success(
+        "apply round-two legacy fixture",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let mut state = scenario.state_json();
+    state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
+        &Value::String("ROUND_TWO_SAME_PLAIN".to_string()),
+        "mock.test.resource",
+        "old",
+        "comment",
+    ));
+    scenario.write_state_json(&state);
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+moved {
+  from = mock.test.resource "old"
+  to   = mock.test.resource "renamed"
+}
+
+let renamed = mock.test.resource {
+  name = "round-two-legacy"
+}
+"#,
+    );
+    assert_success(
+        "plan move while removing legacy secret",
+        &scenario.carina(&[
+            "plan",
+            "--refresh=false",
+            "--out",
+            "remove-secret.json",
+            ".",
+        ]),
+    );
+    assert_success(
+        "apply move while removing legacy secret",
+        &scenario.carina(&[
+            "apply",
+            "--auto-approve",
+            "--lock=false",
+            "remove-secret.json",
+        ]),
+    );
+    let carried = comment_marker(&scenario.state_json(), "renamed");
+    assert!(
+        carried.starts_with(SELF_CONTAINED_LEGACY_PREFIX),
+        "a copied legacy marker must carry its original salt: {carried}",
+    );
+
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let renamed = mock.test.resource {
+  name    = "round-two-legacy"
+  comment = secret("ROUND_TWO_SAME_PLAIN")
+}
+"#,
+    );
+    assert_plan_counts(&scenario.carina(&["plan", "--refresh=false", "."]), 0, 0, 0);
+}
+
+#[test]
+fn anonymous_identity_reconcile_preserves_self_contained_legacy_digest() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -363,22 +502,6 @@ mock.example.consumer {
         "plain",
     ));
     scenario.write_state_json(&state);
-
-    let mut provider = scenario.provider_json();
-    let provider_rows = provider.as_object_mut().expect("mock provider object");
-    let old_key = provider_rows
-        .keys()
-        .find(|key| key.ends_with(&old_identity))
-        .expect("anonymous provider key")
-        .clone();
-    let provider_row = provider_rows
-        .remove(&old_key)
-        .expect("anonymous provider row");
-    provider_rows.insert(
-        old_key.replace(&old_identity, &stored_identity),
-        provider_row,
-    );
-    scenario.write_provider_json(&provider);
 
     assert_plan_counts(
         &scenario.carina(&[

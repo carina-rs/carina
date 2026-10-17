@@ -2,33 +2,24 @@ use super::comparison::SavedAttr;
 use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
-use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, LegacySecretRowOrigin, Value, ValueString,
-};
+use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
 use crate::schema::TypeIdentity;
 use crate::value::value_to_json;
 use indexmap::IndexMap;
 
 fn persisted_secret(marker: &str) -> Value {
-    let hash = crate::value::persisted_secret_hash(marker)
-        .or_else(|| {
-            crate::resource::RedactedSecretHash::parse_persisted_marker_for_state_row(
-                marker,
-                &LegacySecretRowOrigin::from_resource_id(&ResourceId::with_provider_identity(
-                    "test",
-                    "service.Widget",
-                    "widget",
-                    None,
-                ))
-                .expect("test row has an identity"),
-                "config",
-            )
-        })
-        .expect("test fixture must be a complete persisted secret marker");
-    serde_json::from_value(serde_json::json!({
-        "RedactedSecret": { "hash": hash }
-    }))
-    .expect("deserialize persisted secret")
+    if let Some(hash) = crate::value::persisted_secret_hash(marker) {
+        return serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": hash }
+        }))
+        .expect("deserialize persisted secret");
+    }
+    crate::provider::PersistedAttributes::from_state_row_json(
+        &ResourceId::with_provider_identity("test", "service.Widget", "widget", None),
+        HashMap::from([("config".to_string(), serde_json::json!(marker))]),
+    )
+    .get("config")
+    .expect("test fixture must be a complete persisted secret marker")
 }
 
 #[test]

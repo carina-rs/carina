@@ -1020,7 +1020,7 @@ pub(crate) async fn detect_drift(
         let planned_state = planned_states.get(&resource.id).copied();
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
         let historical_id = planned_state
-            .map(|state| historical_addresses.origin_for_state(&resource.id, state))
+            .map(|_| historical_addresses.origin_for(&resource.id))
             .unwrap_or_else(|| resource.id.clone());
 
         let mut actual_state = provider
@@ -2634,11 +2634,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 16 guarantees that
-    // legacy secret placeholders in current states carry their originating
-    // state-row context. Version 15 guarantees that new secret placeholders
-    // carry embedded salts and that resource placeholders can be reused
-    // byte-for-byte by state writeback. Version 14 guarantees
+    // Validate version compatibility. Plan-file version 15 guarantees that
+    // secret placeholders carry self-contained salts and that resource
+    // placeholders can be reused byte-for-byte by state writeback. Version 14 guarantees
     // that embedded current states were created after legacy `_`-prefixed host
     // attributes moved behind the state migration boundary and orphan state
     // became structurally paired with its host metadata during planning.

@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::value::LEGACY_SECRET_PREFIX;
+use carina_core::value::{EXPLICIT_LEGACY_SECRET_PREFIX, LEGACY_SECRET_PREFIX};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
 
@@ -1644,9 +1644,11 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
     ] {
         match loaded {
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })) => {
-                assert_eq!(
-                    loaded.persisted_marker(),
-                    format!("{LEGACY_SECRET_PREFIX}{hash}")
+                assert!(
+                    loaded
+                        .persisted_marker()
+                        .starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
+                    "state load must make the legacy salt self-contained",
                 );
             }
             other => panic!("persisted secret hash lost its type at the state boundary: {other:?}"),
@@ -1680,7 +1682,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
         assert!(matches!(
             decoded.get("token"),
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if loaded.persisted_marker() == format!("{LEGACY_SECRET_PREFIX}{hash}")
+                if loaded.persisted_marker().starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
         ));
     }
 }
@@ -2954,16 +2956,20 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
     let previous = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)));
-    let attrs = HashMap::from([(
-        "password".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            previous.as_str().unwrap().to_string().into(),
-        )),
-    )]);
     let existing = persisted_attributes_from_state_json(&HashMap::from([(
         "password".to_string(),
         previous.clone(),
     )]));
+    let upgraded = existing
+        .encoded_value("password")
+        .expect("legacy state marker is upgraded")
+        .clone();
+    let attrs = HashMap::from([(
+        "password".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            upgraded.as_str().unwrap().to_string().into(),
+        )),
+    )]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
         &resolved(&resource),
@@ -2973,7 +2979,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     );
 
     let stored = state_json_from_persisted_attributes(&stored);
-    assert_eq!(stored.get("password"), Some(&previous));
+    assert_eq!(stored.get("password"), Some(&upgraded));
 }
 
 #[test]
@@ -3158,7 +3164,10 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         .expect("missing secret tag should keep the previous hash");
 
     assert!(!stored_tags.contains_key("Name"));
-    assert!(secret.starts_with(LEGACY_SECRET_PREFIX), "got {secret}");
+    assert!(
+        secret.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
+        "got {secret}"
+    );
 }
 
 #[test]

@@ -1527,9 +1527,9 @@ impl fmt::Debug for DeferredValue {
 ///
 /// New digests retain a validated Argon2id PHC string verbatim. The PHC
 /// string embeds the salt, algorithm version, and m/t/p parameters needed for
-/// context-free verification. Legacy state markers carry their historical
-/// hash plus the typed origin context captured when their state row was
-/// decoded. There is no representable unbound legacy digest.
+/// context-free verification. Legacy state markers are upgraded at state-file
+/// load to carry the exact historical salt bytes alongside the hash. There is
+/// no representable legacy digest whose verification depends on row context.
 #[derive(Clone)]
 pub struct RedactedSecretHash(RedactedSecretHashKind);
 
@@ -1538,62 +1538,10 @@ enum RedactedSecretHashKind {
     Argon2idPhc {
         encoded: String,
     },
-    LegacyArgon2 {
+    ExplicitSaltLegacy {
+        salts: [Vec<u8>; 2],
         hash: [u8; RedactedSecretHash::HASH_LEN],
-        context: LegacySecretHashContext,
     },
-}
-
-/// Persisted row provenance needed only to verify pre-PHC secret markers.
-///
-/// The top-level attribute key is attached separately for every decoded leaf.
-/// Keeping the row origin typed lets state and WASM decode carry it through
-/// identity reconciliation and moves without teaching comparison about
-/// resource addresses.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacySecretRowOrigin {
-    display_type: String,
-    identity: String,
-}
-
-impl LegacySecretRowOrigin {
-    pub fn from_resource_id(id: &ResourceId) -> Option<Self> {
-        Some(Self {
-            display_type: id.display_type(),
-            identity: id.identity_str()?.to_string(),
-        })
-    }
-
-    /// Restore the historical address while preserving the caller's provider
-    /// routing. Provenance from a different resource type is rejected.
-    pub fn historical_resource_id_like(&self, current: &ResourceId) -> Option<ResourceId> {
-        if self.display_type != current.display_type() {
-            return None;
-        }
-        Some(ResourceId::with_provider_identity(
-            current.provider.clone(),
-            current.resource_type.clone(),
-            ResourceIdentity::try_from(self.identity.clone()).ok()?,
-            current.provider_instance.clone(),
-        ))
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacySecretHashContext {
-    origin: LegacySecretRowOrigin,
-    top_level_attribute_key: String,
-}
-
-impl LegacySecretHashContext {
-    fn salt(&self) -> String {
-        format!(
-            "carina:{}:{}:{}",
-            self.origin.display_type, self.origin.identity, self.top_level_attribute_key
-        )
-    }
 }
 
 impl RedactedSecretHash {
@@ -1603,9 +1551,16 @@ impl RedactedSecretHash {
     /// are a standard PHC string, for example
     /// `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`.
     pub const V2_MARKER_PREFIX: &'static str = "_secret:$argon2id$";
+    /// Marker used after an origin/main legacy digest has been bound at
+    /// state-file load. Its exact format is
+    /// `_secret:argon2-legacy:<row-salt-hex>:<fallback-salt-hex>:<hash-hex>`.
+    /// Both historical salt candidates are necessary because the old marker
+    /// did not identify whether the row-aware or write-only fallback path
+    /// created it.
+    pub const EXPLICIT_LEGACY_MARKER_PREFIX: &'static str = "_secret:argon2-legacy:";
     pub const LEGACY_MARKER_PREFIX: &'static str = "_secret:argon2:";
     const STATE_MARKER_PREFIX: &'static str = "_secret:";
-    const LEGACY_DIGEST_PREFIX: &'static str = "argon2:";
+    const EXPLICIT_LEGACY_DIGEST_PREFIX: &'static str = "argon2-legacy:";
 
     pub(crate) fn generate(plaintext: &[u8]) -> Self {
         let salt = SaltString::generate(&mut OsRng);
@@ -1629,9 +1584,9 @@ impl RedactedSecretHash {
 
     /// Verify a candidate against this typed digest.
     ///
-    /// New PHC digests use only their embedded algorithm parameters. A legacy
-    /// digest always carries the originating row's display type, identity,
-    /// and top-level attribute key, captured by the persisted decode seam.
+    /// New PHC digests use only their embedded algorithm parameters. An
+    /// upgraded legacy digest carries its finite historical salt candidates
+    /// as bytes, so verification is context-free for both representations.
     pub fn verify(&self, plaintext: impl AsRef<[u8]>) -> bool {
         match &self.0 {
             RedactedSecretHashKind::Argon2idPhc { encoded } => PasswordHash::new(encoded)
@@ -1640,53 +1595,57 @@ impl RedactedSecretHash {
                         .verify_password(plaintext.as_ref(), &parsed)
                         .is_ok()
                 }),
-            RedactedSecretHashKind::LegacyArgon2 { hash, context } => {
-                let mut candidate = [0_u8; Self::HASH_LEN];
-                legacy_argon2()
-                    .hash_password_into(
-                        plaintext.as_ref(),
-                        context.salt().as_bytes(),
-                        &mut candidate,
-                    )
-                    .is_ok()
-                    && candidate == *hash
+            RedactedSecretHashKind::ExplicitSaltLegacy { salts, hash } => {
+                salts.iter().any(|salt| {
+                    let mut candidate = [0_u8; Self::HASH_LEN];
+                    legacy_argon2()
+                        .hash_password_into(plaintext.as_ref(), salt, &mut candidate)
+                        .is_ok()
+                        && candidate == *hash
+                })
             }
         }
     }
 
-    /// Parse a self-contained state marker. Legacy markers deliberately fail:
-    /// their digest cannot be constructed without its originating row.
+    /// Parse a self-contained state marker. Raw origin/main legacy markers
+    /// deliberately fail; only the state-file row decoder may upgrade those.
     pub(crate) fn parse_persisted_marker(marker: &str) -> Option<Self> {
         marker
             .strip_prefix(Self::STATE_MARKER_PREFIX)
             .and_then(Self::parse_encoded_digest)
     }
 
-    pub(crate) fn parse_persisted_marker_for_state_row(
+    pub(crate) fn upgrade_raw_legacy_marker_for_state_row(
         marker: &str,
-        origin: &LegacySecretRowOrigin,
+        id: &ResourceId,
         top_level_attribute_key: &str,
     ) -> Option<Self> {
-        let encoded = marker.strip_prefix(Self::STATE_MARKER_PREFIX)?;
-        if let Some(hash) = Self::parse_encoded_digest(encoded) {
-            return Some(hash);
-        }
-        let encoded = encoded.strip_prefix(Self::LEGACY_DIGEST_PREFIX)?;
+        let encoded = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX)?;
         let mut hash = [0_u8; Self::HASH_LEN];
         hex::decode_to_slice(encoded, &mut hash).ok()?;
-        Some(Self(RedactedSecretHashKind::LegacyArgon2 {
+        let identity = id.identity_str()?;
+        let row_salt = format!(
+            "carina:{}:{}:{}",
+            id.display_type(),
+            identity,
+            top_level_attribute_key
+        )
+        .into_bytes();
+        Some(Self(RedactedSecretHashKind::ExplicitSaltLegacy {
+            // origin/main also had a context-free state write path for
+            // write-only attributes. A raw marker has no tag identifying
+            // which legacy salt produced it, so the upgraded marker carries
+            // both finite historical candidates and remains context-free.
+            salts: [row_salt, b"carina-secret-v1".to_vec()],
             hash,
-            context: LegacySecretHashContext {
-                origin: origin.clone(),
-                top_level_attribute_key: top_level_attribute_key.to_string(),
-            },
         }))
     }
 
     pub(crate) fn is_persisted_marker(marker: &str) -> bool {
-        if Self::parse_persisted_marker(marker).is_some() {
-            return true;
-        }
+        Self::parse_persisted_marker(marker).is_some()
+    }
+
+    pub(crate) fn is_raw_legacy_marker(marker: &str) -> bool {
         let Some(encoded) = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX) else {
             return false;
         };
@@ -1724,14 +1683,46 @@ impl RedactedSecretHash {
                 encoded: encoded.to_string(),
             }));
         }
-        None
+        let mut fields = encoded
+            .strip_prefix(Self::EXPLICIT_LEGACY_DIGEST_PREFIX)?
+            .split(':');
+        let row_salt_hex = fields.next()?;
+        let fallback_salt_hex = fields.next()?;
+        let hash_hex = fields.next()?;
+        if fields.next().is_some()
+            || !valid_legacy_salt_hex(row_salt_hex)
+            || !valid_legacy_salt_hex(fallback_salt_hex)
+            || hex::decode(fallback_salt_hex).ok()?.as_slice() != b"carina-secret-v1"
+            || hash_hex.len() != Self::HASH_LEN * 2
+            || !hash_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let salts = [
+            hex::decode(row_salt_hex).ok()?,
+            hex::decode(fallback_salt_hex).ok()?,
+        ];
+        let mut hash = [0_u8; Self::HASH_LEN];
+        hex::decode_to_slice(hash_hex, &mut hash).ok()?;
+        Some(Self(RedactedSecretHashKind::ExplicitSaltLegacy {
+            salts,
+            hash,
+        }))
     }
 
     pub fn encoded_digest(&self) -> String {
         match &self.0 {
             RedactedSecretHashKind::Argon2idPhc { encoded } => encoded.clone(),
-            RedactedSecretHashKind::LegacyArgon2 { hash, .. } => {
-                format!("{}{}", Self::LEGACY_DIGEST_PREFIX, hex::encode(hash))
+            RedactedSecretHashKind::ExplicitSaltLegacy { salts, hash } => {
+                format!(
+                    "{}{}:{}:{}",
+                    Self::EXPLICIT_LEGACY_DIGEST_PREFIX,
+                    hex::encode(&salts[0]),
+                    hex::encode(&salts[1]),
+                    hex::encode(hash)
+                )
             }
         }
     }
@@ -1739,19 +1730,21 @@ impl RedactedSecretHash {
     pub fn persisted_marker(&self) -> String {
         format!("{}{}", Self::STATE_MARKER_PREFIX, self.encoded_digest())
     }
-
-    pub fn legacy_row_origin(&self) -> Option<&LegacySecretRowOrigin> {
-        match &self.0 {
-            RedactedSecretHashKind::LegacyArgon2 { context, .. } => Some(&context.origin),
-            RedactedSecretHashKind::Argon2idPhc { .. } => None,
-        }
-    }
 }
 
 fn legacy_argon2() -> Argon2<'static> {
     let params = Params::new(19 * 1024, 2, 1, Some(RedactedSecretHash::HASH_LEN))
         .expect("origin/main legacy Argon2 parameters are valid");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+fn valid_legacy_salt_hex(value: &str) -> bool {
+    !value.is_empty()
+        && value.len().is_multiple_of(2)
+        && value.len() <= 8192
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl PartialEq for RedactedSecretHash {
@@ -1762,9 +1755,15 @@ impl PartialEq for RedactedSecretHash {
                 RedactedSecretHashKind::Argon2idPhc { encoded: right },
             ) => left == right,
             (
-                RedactedSecretHashKind::LegacyArgon2 { hash: left, .. },
-                RedactedSecretHashKind::LegacyArgon2 { hash: right, .. },
-            ) => left == right,
+                RedactedSecretHashKind::ExplicitSaltLegacy {
+                    salts: left_salts,
+                    hash: left_hash,
+                },
+                RedactedSecretHashKind::ExplicitSaltLegacy {
+                    salts: right_salts,
+                    hash: right_hash,
+                },
+            ) => left_salts == right_salts && left_hash == right_hash,
             _ => false,
         }
     }
@@ -1779,8 +1778,9 @@ impl Hash for RedactedSecretHash {
                 0_u8.hash(state);
                 encoded.hash(state);
             }
-            RedactedSecretHashKind::LegacyArgon2 { hash, .. } => {
+            RedactedSecretHashKind::ExplicitSaltLegacy { salts, hash } => {
                 1_u8.hash(state);
+                salts.hash(state);
                 hash.hash(state);
             }
         }
@@ -1789,66 +1789,15 @@ impl Hash for RedactedSecretHash {
 
 impl Serialize for RedactedSecretHash {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "snake_case")]
-        enum BoundDigest<'a> {
-            LegacyArgon2 {
-                hash: String,
-                context: &'a LegacySecretHashContext,
-            },
-        }
-
-        match &self.0 {
-            RedactedSecretHashKind::Argon2idPhc { encoded } => serializer.serialize_str(encoded),
-            RedactedSecretHashKind::LegacyArgon2 { hash, context } => BoundDigest::LegacyArgon2 {
-                hash: hex::encode(hash),
-                context,
-            }
-            .serialize(serializer),
-        }
+        serializer.serialize_str(&self.encoded_digest())
     }
 }
 
 impl<'de> Deserialize<'de> for RedactedSecretHash {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case", deny_unknown_fields)]
-        enum BoundDigest {
-            LegacyArgon2 {
-                hash: String,
-                context: LegacySecretHashContext,
-            },
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Digest {
-            SelfContained(String),
-            Bound(BoundDigest),
-        }
-
-        match Digest::deserialize(deserializer)? {
-            Digest::SelfContained(encoded) => Self::parse_encoded_digest(&encoded)
-                .ok_or_else(|| serde::de::Error::custom("invalid self-contained secret digest")),
-            Digest::Bound(BoundDigest::LegacyArgon2 { hash, context }) => {
-                if hash.len() != Self::HASH_LEN * 2
-                    || !hash
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err(serde::de::Error::custom(
-                        "invalid bound legacy secret digest",
-                    ));
-                }
-                let mut decoded = [0_u8; Self::HASH_LEN];
-                hex::decode_to_slice(hash, &mut decoded)
-                    .map_err(|_| serde::de::Error::custom("invalid bound legacy secret digest"))?;
-                Ok(Self(RedactedSecretHashKind::LegacyArgon2 {
-                    hash: decoded,
-                    context,
-                }))
-            }
-        }
+        let encoded = String::deserialize(deserializer)?;
+        Self::parse_encoded_digest(&encoded)
+            .ok_or_else(|| serde::de::Error::custom("invalid self-contained secret digest"))
     }
 }
 

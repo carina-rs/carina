@@ -6,8 +6,8 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, LegacySecretRowOrigin,
-    RedactedSecretHash, UnknownReason, Value, ValueString,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, RedactedSecretHash,
+    UnknownReason, Value, ValueString,
 };
 use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
 use crate::utils::{enum_display_value, extract_enum_value_with_values};
@@ -107,6 +107,10 @@ pub enum SerializationError {
     /// the original value.
     #[error("cannot serialize at {context}: secret values are not allowed")]
     SecretNotAllowed { context: SerializationContext },
+    /// A secret was found in a named saved-plan field that cannot safely
+    /// persist plaintext or a placeholder.
+    #[error("cannot serialize saved-plan field {location}: secret values are not allowed")]
+    SavedPlanFieldSecretNotAllowed { location: String },
     /// A saved-plan placeholder reached a runtime serialization boundary
     /// without first being rehydrated and verified.
     #[error("cannot serialize at {context}: saved-plan secret was not rehydrated")]
@@ -211,6 +215,7 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
 /// Secret value prefix used in state serialization.
 pub const SECRET_PREFIX: &str = RedactedSecretHash::V2_MARKER_PREFIX;
 pub const LEGACY_SECRET_PREFIX: &str = RedactedSecretHash::LEGACY_MARKER_PREFIX;
+pub const EXPLICIT_LEGACY_SECRET_PREFIX: &str = RedactedSecretHash::EXPLICIT_LEGACY_MARKER_PREFIX;
 
 /// Convert `Value` to `serde_json::Value`.
 ///
@@ -358,17 +363,17 @@ fn value_to_json_inner(
 pub(crate) fn persist_secret_json(
     plaintext: &serde_json::Value,
     previous: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let plaintext = json_to_dsl_value(plaintext)
-        .expect("materialized secret JSON must have a non-null DSL representation");
-    let material = canonical_secret_hash_material(&plaintext)
-        .expect("materialized secret JSON must be canonicalizable");
+) -> Result<serde_json::Value, SerializationError> {
+    let plaintext = json_to_dsl_value(plaintext).ok_or(SerializationError::SecretNotAllowed {
+        context: SerializationContext::StateWriteback,
+    })?;
+    let material = canonical_secret_hash_material(&plaintext)?;
     let previous = previous
         .and_then(serde_json::Value::as_str)
         .and_then(persisted_secret_hash);
-    serde_json::Value::String(
+    Ok(serde_json::Value::String(
         RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()).persisted_marker(),
-    )
+    ))
 }
 
 /// Produce the only byte representation that may be hashed as secret material.
@@ -413,41 +418,21 @@ pub fn canonical_enum_to_json(c: &CanonicalEnumValue) -> serde_json::Value {
 /// rather than a meaningful attribute value. Callers should filter out `None`
 /// entries when building attribute maps.
 pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
-    json_to_dsl_value_inner(json, false, None)
+    json_to_dsl_value_inner(json, false)
 }
 
-/// Convert persisted state JSON to a DSL value, lifting self-contained PHC
-/// markers into their opaque typed representation at the storage boundary.
-///
-/// A legacy marker is deliberately left as an ordinary, non-verifiable string
-/// because this context-free entry point cannot construct a legacy digest.
-/// State rows and WASM persisted responses must use
-/// [`persisted_json_to_dsl_value_for_state_row`] with their captured origin.
+/// Convert persisted state JSON to a DSL value, lifting self-contained PHC and
+/// explicit-salt legacy markers into their opaque typed representation.
+/// Raw origin/main legacy markers are accepted only by the state-file loader,
+/// which upgrades them before this conversion runs.
 pub fn persisted_json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
-    json_to_dsl_value_inner(json, true, None)
+    json_to_dsl_value_inner(json, true)
 }
 
-pub fn persisted_json_to_dsl_value_for_state_row(
-    json: &serde_json::Value,
-    origin: &LegacySecretRowOrigin,
-    top_level_attribute_key: &str,
-) -> Option<Value> {
-    json_to_dsl_value_inner(json, true, Some((origin, top_level_attribute_key)))
-}
-
-fn json_to_dsl_value_inner(
-    json: &serde_json::Value,
-    lift_secret_hashes: bool,
-    legacy_state_row: Option<(&LegacySecretRowOrigin, &str)>,
-) -> Option<Value> {
+fn json_to_dsl_value_inner(json: &serde_json::Value, lift_secret_hashes: bool) -> Option<Value> {
     match json {
         serde_json::Value::String(s) => {
-            let hash = lift_secret_hashes.then(|| match legacy_state_row {
-                Some((origin, key)) => {
-                    RedactedSecretHash::parse_persisted_marker_for_state_row(s, origin, key)
-                }
-                None => persisted_secret_hash(s),
-            });
+            let hash = lift_secret_hashes.then(|| persisted_secret_hash(s));
             match hash.flatten() {
                 Some(hash) => Some(Value::Deferred(DeferredValue::RedactedSecret { hash })),
                 None => Some(Value::Concrete(ConcreteValue::String(s.clone().into()))),
@@ -466,9 +451,7 @@ fn json_to_dsl_value_inner(
         serde_json::Value::Array(items) => Some(Value::Concrete(ConcreteValue::List(
             items
                 .iter()
-                .filter_map(|item| {
-                    json_to_dsl_value_inner(item, lift_secret_hashes, legacy_state_row)
-                })
+                .filter_map(|item| json_to_dsl_value_inner(item, lift_secret_hashes))
                 .collect(),
         ))),
         serde_json::Value::Object(map) => {
@@ -478,8 +461,7 @@ fn json_to_dsl_value_inner(
             let m: IndexMap<_, _> = map
                 .iter()
                 .filter_map(|(k, v)| {
-                    json_to_dsl_value_inner(v, lift_secret_hashes, legacy_state_row)
-                        .map(|val| (k.clone(), val))
+                    json_to_dsl_value_inner(v, lift_secret_hashes).map(|val| (k.clone(), val))
                 })
                 .collect();
             Some(Value::Concrete(ConcreteValue::Map(m)))
@@ -856,7 +838,7 @@ pub fn merge_secrets_into_provider_json(
     match desired {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             match value_to_json_inner(inner, None, false) {
-                Ok(plaintext) => Ok(persist_secret_json(&plaintext, previous)),
+                Ok(plaintext) => persist_secret_json(&plaintext, previous),
                 Err(
                     SerializationError::UnresolvedResourceRef { .. }
                     | SerializationError::UnresolvedInterpolation { .. }
@@ -867,7 +849,7 @@ pub fn merge_secrets_into_provider_json(
                     {
                         return Ok(provider_json.clone());
                     }
-                    Ok(persist_secret_json(provider_json, previous))
+                    persist_secret_json(provider_json, previous)
                 }
                 Err(error) => Err(error),
             }
@@ -1147,30 +1129,6 @@ pub fn contains_redacted_secret(value: &Value) -> bool {
     }
 }
 
-/// Return the originating state row carried by the first legacy secret leaf.
-/// New PHC digests deliberately have no row provenance because they are fully
-/// self-contained.
-pub fn legacy_secret_row_origin(value: &Value) -> Option<&LegacySecretRowOrigin> {
-    match value {
-        Value::Deferred(DeferredValue::RedactedSecret { hash }) => hash.legacy_row_origin(),
-        Value::Deferred(DeferredValue::Secret(inner)) => legacy_secret_row_origin(inner),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().find_map(|part| {
-            let InterpolationPart::Expr(value) = part else {
-                return None;
-            };
-            legacy_secret_row_origin(value)
-        }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. })
-        | Value::Concrete(ConcreteValue::List(args)) => {
-            args.iter().find_map(legacy_secret_row_origin)
-        }
-        Value::Concrete(ConcreteValue::Map(values)) => {
-            values.values().find_map(legacy_secret_row_origin)
-        }
-        _ => None,
-    }
-}
-
 fn attributes_contain_redacted_secret<'a>(values: impl Iterator<Item = &'a Value>) -> bool {
     values.into_iter().any(contains_redacted_secret)
 }
@@ -1262,10 +1220,13 @@ pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) ->
 }
 
 /// Reject a secret from a saved-plan field whose contract forbids secrets.
-pub fn reject_secret_in_saved_plan_field(value: &Value) -> Result<(), SerializationError> {
+pub fn reject_secret_in_saved_plan_field(
+    value: &Value,
+    location: impl Into<String>,
+) -> Result<(), SerializationError> {
     if contains_secret(value) {
-        return Err(SerializationError::SecretNotAllowed {
-            context: SerializationContext::SecretRedaction,
+        return Err(SerializationError::SavedPlanFieldSecretNotAllowed {
+            location: location.into(),
         });
     }
     Ok(())
@@ -4263,10 +4224,10 @@ mod tests {
     }
 
     #[test]
-    fn persisted_json_requires_row_context_to_lift_legacy_markers() {
+    fn state_row_load_upgrades_raw_legacy_markers_to_self_contained_markers() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let marker = format!("{LEGACY_SECRET_PREFIX}{hash}");
-        let json = serde_json::json!({ "nested": [marker] });
+        let json = serde_json::json!({ "nested": [marker.clone()] });
 
         let ordinary = json_to_dsl_value(&json).expect("ordinary JSON value");
         assert!(!contains_redacted_secret(&ordinary));
@@ -4274,20 +4235,28 @@ mod tests {
         let context_free = persisted_json_to_dsl_value(&json).expect("persisted JSON value");
         assert!(
             !contains_redacted_secret(&context_free),
-            "a legacy marker without its originating row must remain non-verifiable",
+            "a raw legacy marker is not a context-free persisted encoding",
         );
 
-        let origin = LegacySecretRowOrigin::from_resource_id(
-            &crate::resource::ResourceId::with_provider_identity(
-                "mock",
-                "test.resource",
-                "old",
-                None,
-            ),
-        )
-        .expect("test row has an identity");
-        let persisted = persisted_json_to_dsl_value_for_state_row(&json, &origin, "tags")
-            .expect("row-bound persisted JSON value");
+        let id = crate::resource::ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "old",
+            None,
+        );
+        let attributes = crate::provider::PersistedAttributes::from_state_row_json(
+            &id,
+            HashMap::from([("tags".to_string(), json)]),
+        );
+        let upgraded = attributes
+            .encoded_value("tags")
+            .expect("upgraded persisted JSON");
+        assert!(
+            upgraded["nested"][0]
+                .as_str()
+                .is_some_and(|marker| marker.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)),
+        );
+        let persisted = attributes.get("tags").expect("persisted JSON value");
         let Value::Concrete(ConcreteValue::Map(map)) = persisted else {
             panic!("persisted object must remain a map")
         };
@@ -4297,17 +4266,16 @@ mod tests {
         assert!(matches!(
             values.as_slice(),
             [Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })]
-                if loaded.persisted_marker() == marker
-                    && loaded.legacy_row_origin() == Some(&origin)
+                if loaded.persisted_marker().starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
         ));
     }
 
     #[test]
-    fn unbound_legacy_secret_digest_cannot_verify() {
+    fn raw_legacy_secret_digest_is_not_context_free() {
         let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
         assert!(
             persisted_secret_hash(&marker).is_none(),
-            "constructing a typed legacy digest must require its originating row",
+            "a raw legacy digest must first be upgraded by its state-file row",
         );
     }
 
@@ -4315,24 +4283,28 @@ mod tests {
     fn redacted_secret_hash_deserialize_accepts_only_its_serialized_encoding() {
         let bare_hash = "ab".repeat(32);
         let marker = format!("{LEGACY_SECRET_PREFIX}{bare_hash}");
-        let origin = LegacySecretRowOrigin::from_resource_id(
-            &crate::resource::ResourceId::with_provider_identity(
-                "mock",
-                "test.resource",
-                "old",
-                None,
-            ),
-        )
-        .expect("test row has an identity");
-        let digest =
-            RedactedSecretHash::parse_persisted_marker_for_state_row(&marker, &origin, "comment")
-                .expect("row-bound legacy marker must remain loadable");
+        let id = crate::resource::ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "old",
+            None,
+        );
+        let attributes = crate::provider::PersistedAttributes::from_state_row_json(
+            &id,
+            HashMap::from([("comment".to_string(), serde_json::json!(marker))]),
+        );
+        let digest = attributes
+            .redacted_secret_hash("comment")
+            .expect("state load must upgrade a raw legacy marker");
         let encoded = serde_json::to_value(&digest).expect("serialize typed digest");
 
         let round_trip: RedactedSecretHash =
             serde_json::from_value(encoded).expect("deserialize serialized digest");
-        assert_eq!(round_trip.persisted_marker(), marker);
-        assert_eq!(round_trip.legacy_row_origin(), Some(&origin));
+        assert!(
+            round_trip
+                .persisted_marker()
+                .starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
+        );
         assert!(
             serde_json::from_value::<RedactedSecretHash>(serde_json::json!(marker)).is_err(),
             "the full state marker is not the typed digest's serde encoding",
@@ -4348,11 +4320,14 @@ mod tests {
             .is_err(),
             "an unbound encoded legacy digest is not a typed digest",
         );
-        let mut extra_field = serde_json::to_value(&digest).expect("serialize bound digest");
-        extra_field["legacy_argon2"]["unexpected"] = serde_json::json!(true);
         assert!(
-            serde_json::from_value::<RedactedSecretHash>(extra_field).is_err(),
-            "bound legacy serde must accept exactly the fields it writes",
+            serde_json::from_value::<RedactedSecretHash>(serde_json::json!(format!(
+                "argon2-legacy:{}:{}:extra",
+                hex::encode(b"salt"),
+                bare_hash
+            )))
+            .is_err(),
+            "explicit legacy serde must accept exactly the string shape it writes",
         );
 
         let v2 = RedactedSecretHash::generate(b"serde-v2");
@@ -5081,6 +5056,19 @@ mod tests {
                 "state must reject a non-Carina Argon2 {label}",
             );
         }
+    }
+
+    #[test]
+    fn unresolved_secret_with_null_provider_value_returns_an_error() {
+        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+            "upstream",
+            "value",
+            Vec::new(),
+        ))));
+
+        let error = merge_secrets_into_provider_json(&desired, &serde_json::Value::Null, None)
+            .expect_err("top-level null secret material must be rejected without panicking");
+        assert!(matches!(error, SerializationError::SecretNotAllowed { .. }));
     }
 
     #[test]

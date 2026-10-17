@@ -13,7 +13,7 @@ use carina_core::provider::{
     UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives, LegacySecretRowOrigin,
+    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
     Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentity,
     ResourceIdentityError, ResourceIdentityState, State as CoreState, Value as CoreValue,
 };
@@ -24,7 +24,7 @@ use carina_core::schema::{
 };
 use carina_core::value::{
     LEGACY_SECRET_PREFIX, SerializationContext, SerializationError, persisted_json_to_dsl_value,
-    persisted_json_to_dsl_value_for_state_row, persisted_secret_marker,
+    persisted_secret_marker,
 };
 use carina_core::wait::BindingPattern as CoreBindingPattern;
 use carina_core::wait::predicate::{AttrPath as CoreAttrPath, AttrPathError};
@@ -177,7 +177,7 @@ enum WasmValueDecodeErrorKind {
     ExpectedString { index: usize },
     Null,
     UnsupportedNumber,
-    LegacySecretOriginMissing,
+    RawLegacySecretMarker,
 }
 
 impl WasmValueDecodeError {
@@ -214,8 +214,8 @@ impl fmt::Display for WasmValueDecodeError {
             WasmValueDecodeErrorKind::UnsupportedNumber => {
                 f.write_str(": JSON number cannot be represented by the value protocol")
             }
-            WasmValueDecodeErrorKind::LegacySecretOriginMissing => {
-                f.write_str(": legacy secret marker has no originating state row")
+            WasmValueDecodeErrorKind::RawLegacySecretMarker => {
+                f.write_str(": raw legacy secret marker is valid only in a state file")
             }
         }
     }
@@ -230,7 +230,7 @@ impl std::error::Error for WasmValueDecodeError {
             | WasmValueDecodeErrorKind::ExpectedString { .. }
             | WasmValueDecodeErrorKind::Null
             | WasmValueDecodeErrorKind::UnsupportedNumber
-            | WasmValueDecodeErrorKind::LegacySecretOriginMissing => None,
+            | WasmValueDecodeErrorKind::RawLegacySecretMarker => None,
         }
     }
 }
@@ -380,27 +380,21 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
 }
 
 #[derive(Clone, Copy)]
-enum ValueDecodeSource<'a> {
+enum ValueDecodeSource {
     Provider,
-    PersistedState {
-        origin: Option<&'a LegacySecretRowOrigin>,
-        top_level_attribute_key: &'a str,
-    },
+    PersistedState,
 }
 
 fn wit_to_core_value_from(
     v: &wit::Value,
-    source: ValueDecodeSource<'_>,
+    source: ValueDecodeSource,
 ) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
         wit::Value::StrVal(s) => match source {
             ValueDecodeSource::Provider => {
                 Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
             }
-            ValueDecodeSource::PersistedState {
-                origin,
-                top_level_attribute_key,
-            } => decode_persisted_json_string(s, origin, top_level_attribute_key),
+            ValueDecodeSource::PersistedState => decode_persisted_json_string(s),
         },
         wit::Value::IntVal(i) => Ok(CoreValue::Concrete(ConcreteValue::Int(*i))),
         wit::Value::FloatVal(f) => Ok(CoreValue::Concrete(ConcreteValue::Float(*f))),
@@ -634,17 +628,14 @@ fn core_value_to_json_from(
 fn json_to_core_value(
     v: &serde_json::Value,
     wit_variant: WitValueVariant,
-    source: ValueDecodeSource<'_>,
+    source: ValueDecodeSource,
 ) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
         serde_json::Value::String(s) => match source {
             ValueDecodeSource::Provider => {
                 Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
             }
-            ValueDecodeSource::PersistedState {
-                origin,
-                top_level_attribute_key,
-            } => decode_persisted_json_string(s, origin, top_level_attribute_key),
+            ValueDecodeSource::PersistedState => decode_persisted_json_string(s),
         },
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -746,43 +737,26 @@ pub(crate) fn wit_to_core_value_map(
 /// [`wit_to_core_value_map`] and never acquire marker semantics.
 pub(crate) fn wit_to_core_persisted_value_map(
     entries: &[(String, wit::Value)],
-    origin: Option<&LegacySecretRowOrigin>,
 ) -> Result<HashMap<String, CoreValue>, WasmValueDecodeError> {
     entries
         .iter()
         .map(|(key, value)| {
-            wit_to_core_value_from(
-                value,
-                ValueDecodeSource::PersistedState {
-                    origin,
-                    top_level_attribute_key: key,
-                },
-            )
-            .map(|value| (key.clone(), value))
-            .map_err(|error| error.prepend_attribute(key))
+            wit_to_core_value_from(value, ValueDecodeSource::PersistedState)
+                .map(|value| (key.clone(), value))
+                .map_err(|error| error.prepend_attribute(key))
         })
         .collect()
 }
 
-fn decode_persisted_json_string(
-    value: &str,
-    origin: Option<&LegacySecretRowOrigin>,
-    top_level_attribute_key: &str,
-) -> Result<CoreValue, WasmValueDecodeError> {
-    if value.starts_with(LEGACY_SECRET_PREFIX) && origin.is_none() {
+fn decode_persisted_json_string(value: &str) -> Result<CoreValue, WasmValueDecodeError> {
+    if value.starts_with(LEGACY_SECRET_PREFIX) {
         return Err(WasmValueDecodeError::new(
             WitValueVariant::StrVal,
-            WasmValueDecodeErrorKind::LegacySecretOriginMissing,
+            WasmValueDecodeErrorKind::RawLegacySecretMarker,
         ));
     }
     let json = serde_json::Value::String(value.to_string());
-    Ok(match origin {
-        Some(origin) => {
-            persisted_json_to_dsl_value_for_state_row(&json, origin, top_level_attribute_key)
-        }
-        None => persisted_json_to_dsl_value(&json),
-    }
-    .expect("a JSON string always converts to a DSL value"))
+    Ok(persisted_json_to_dsl_value(&json).expect("a JSON string always converts to a DSL value"))
 }
 
 // -- ResourceId --
@@ -2663,7 +2637,7 @@ mod tests {
             wit_to_core_value(&wire).expect("ordinary provider value"),
             CoreValue::Concrete(ConcreteValue::String(marker.into()))
         );
-        let state = wit_to_core_persisted_value_map(&[("token".to_string(), wire)], None)
+        let state = wit_to_core_persisted_value_map(&[("token".to_string(), wire)])
             .expect("persisted state value");
         assert!(matches!(
             state.get("token"),
@@ -2675,17 +2649,15 @@ mod tests {
     }
 
     #[test]
-    fn persisted_wasm_decode_rejects_legacy_marker_without_row_origin() {
+    fn persisted_wasm_decode_rejects_raw_legacy_marker() {
         let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
-        let error = wit_to_core_persisted_value_map(
-            &[("token".to_string(), wit::Value::StrVal(marker))],
-            None,
-        )
-        .expect_err("legacy state marker without a row origin must fail closed");
+        let error =
+            wit_to_core_persisted_value_map(&[("token".to_string(), wit::Value::StrVal(marker))])
+                .expect_err("raw legacy state markers must fail closed outside state-file load");
 
         assert!(matches!(
             error.kind,
-            WasmValueDecodeErrorKind::LegacySecretOriginMissing
+            WasmValueDecodeErrorKind::RawLegacySecretMarker
         ));
         assert_eq!(error.attribute_path, ["token"]);
     }

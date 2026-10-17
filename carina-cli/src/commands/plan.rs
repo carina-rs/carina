@@ -154,7 +154,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 16;
+    pub const CURRENT_VERSION: u32 = 15;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -623,12 +623,15 @@ fn build_plan_file<E>(
         .map(|resource| (resource.id.clone(), resource.clone()))
         .collect();
     let provider_configs = SavedProviderConfigs::from(provider_configs).redact_secrets()?;
-    for attributes in ctx.upstream_snapshot.values() {
-        for value in attributes.values() {
+    for (binding, attributes) in &ctx.upstream_snapshot {
+        for (key, value) in attributes {
             // Export validation rejects secret-valued exports before an
             // upstream state snapshot can be produced. Keep this guard for
             // malformed/tampered in-memory input.
-            carina_core::value::reject_secret_in_saved_plan_field(value)?;
+            carina_core::value::reject_secret_in_saved_plan_field(
+                value,
+                format!("upstream_state {binding}.{key}"),
+            )?;
         }
     }
     let upstream_snapshot = ctx.upstream_snapshot.clone();
@@ -709,15 +712,11 @@ fn build_plan_file<E>(
         .collect::<Result<Vec<_>, carina_core::value::SerializationError>>()?;
 
     Ok(PlanFile {
-        // Round 1 follow-up: bumped 15→16 — legacy placeholders in embedded
-        // current states now serialize their originating row context. A v15
-        // plan can contain an unbound legacy digest and cannot safely verify
-        // it after an anonymous reconciliation or move.
-        //
         // carina#3863 / carina#3865: bumped 14→15 — secret digests now
-        // embed a random salt and saved-plan resource placeholders carry the
-        // exact digest that state writeback must reuse. A v14 plan contains
-        // context-derived digests and cannot satisfy that contract.
+        // carry their salt, including upgraded legacy placeholders in embedded
+        // current states. Saved-plan resource placeholders carry the exact
+        // digest that state writeback must reuse. A v14 plan contains
+        // context-derived digests and cannot satisfy those contracts.
         //
         // carina#3871: bumped 13→14 — orphan state and host metadata now
         // travel as one typed value until planning finishes. V13
@@ -2967,6 +2966,48 @@ mod run_plan_out_tests {
                 .len(),
             1,
             "the prepared pending constraint must survive into the plan file"
+        );
+    }
+
+    #[test]
+    fn saved_plan_upstream_secret_error_names_binding_and_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+        let parsed = carina_core::parser::ParsedFile::default();
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            carina_core::resource::ConcreteValue::String("upstream-secret".into()),
+        ))));
+        let ctx = crate::wiring::PlanContext {
+            plan: Plan::new(),
+            provider: ProviderRouter::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            current_states: HashMap::new(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::from([(
+                "network".to_string(),
+                HashMap::from([("password".to_string(), secret)]),
+            )]),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: Vec::new(),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .unwrap();
+
+        let error = build_plan_file(&path, &parsed, &provider_configs, None, &None, &ctx)
+            .expect_err("a secret-bearing upstream snapshot must be rejected")
+            .to_string();
+        assert!(
+            error.contains("upstream_state network.password"),
+            "saved-plan error lost the upstream field location: {error}",
         );
     }
 }

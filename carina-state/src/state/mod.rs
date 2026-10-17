@@ -1134,8 +1134,8 @@ impl DeposedInstance {
     }
 
     /// Construct a deposed generation from raw state JSON that may contain
-    /// legacy secret markers. The containing resource row is mandatory so no
-    /// typed legacy digest can be created without its original salt context.
+    /// legacy secret markers. The containing resource row is mandatory so the
+    /// raw marker can be upgraded with its historical salt bytes immediately.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn from_persisted_json_for_resource(
@@ -1355,7 +1355,20 @@ impl ResourceState {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn set_persisted_attribute(&mut self, key: impl Into<String>, value: serde_json::Value) {
-        self.attributes.insert_encoded(key.into(), value);
+        let key = key.into();
+        let id = ResourceId::with_provider_identity(
+            self.provider.clone(),
+            self.resource_type.clone(),
+            self.identity.clone(),
+            self.directives.provider_instance.clone(),
+        );
+        let upgraded =
+            PersistedAttributes::from_state_row_json(&id, HashMap::from([(key.clone(), value)]));
+        let value = upgraded
+            .encoded_value(&key)
+            .expect("single state attribute remains present")
+            .clone();
+        self.attributes.insert_encoded(key, value);
     }
 
     /// Render the sorted attribute map for `carina state show` without
@@ -1437,18 +1450,12 @@ impl ResourceState {
         let resource_type = resource_type.into();
         let identity = identity.into();
         let provider = provider.into();
-        let row_id = ResourceId::with_provider_identity(
-            provider.clone(),
-            resource_type.clone(),
-            identity.clone(),
-            None,
-        );
         Self {
             resource_type,
             identity,
             provider,
             identifier: None,
-            attributes: PersistedAttributes::empty_for_state_row(&row_id),
+            attributes: PersistedAttributes::default(),
             deposed: Vec::new(),
             protected: false,
             directives: Directives::default(),
@@ -1692,25 +1699,8 @@ impl ResourceState {
                 Self::attribute_to_state_json(value, self.attributes.encoded_value(key))?,
             );
         }
-        let current_id = ResourceId::with_provider_identity(
-            self.provider.clone(),
-            self.resource_type.clone(),
-            self.identity.clone(),
-            self.directives.provider_instance.clone(),
-        );
-        let origin_id = state
-            .attributes
-            .values()
-            .find_map(carina_core::value::legacy_secret_row_origin)
-            .and_then(|origin| origin.historical_resource_id_like(&current_id))
-            .or_else(|| {
-                self.attributes
-                    .legacy_row_origin()
-                    .and_then(|origin| origin.historical_resource_id_like(&current_id))
-            })
-            .unwrap_or(current_id);
-        let attributes =
-            PersistedAttributes::from_state_row_json(&origin_id, serialized.into_iter().collect());
+        let attributes = PersistedAttributes::from_encoded(serialized.into_iter().collect())
+            .map_err(str::to_string)?;
         refreshed.attributes = attributes.protect_for_orphan_refresh(schema, &self.attributes);
         refreshed.explicit =
             refreshed_explicit_without_desired_values(Some(&self.explicit), &state.attributes);
@@ -1776,31 +1766,15 @@ impl ResourceState {
             rs.protected = existing.protected;
             rs.name_overrides = existing.name_overrides.clone();
         }
-        let origin_id = state
-            .attributes
-            .values()
-            .find_map(carina_core::value::legacy_secret_row_origin)
-            .and_then(|origin| origin.historical_resource_id_like(&resource.id))
-            .or_else(|| {
-                preferred_hashes
-                    .and_then(PersistedAttributes::legacy_row_origin)
-                    .and_then(|origin| origin.historical_resource_id_like(&resource.id))
-            })
-            .or_else(|| {
-                existing
-                    .and_then(|row| row.attributes.legacy_row_origin())
-                    .and_then(|origin| origin.historical_resource_id_like(&resource.id))
-            })
-            .unwrap_or_else(|| resource.id.clone());
-        rs.attributes =
-            PersistedAttributes::from_state_row_json(&origin_id, serialized.into_iter().collect())
-                .try_protect_for_resource_and_schema(
-                    resource,
-                    schema,
-                    previous_hash_authority,
-                    preferred_hashes,
-                )
-                .map_err(|error| error.to_string())?;
+        rs.attributes = PersistedAttributes::from_encoded(serialized.into_iter().collect())
+            .map_err(str::to_string)?
+            .try_protect_for_resource_and_schema(
+                resource,
+                schema,
+                previous_hash_authority,
+                preferred_hashes,
+            )
+            .map_err(|error| error.to_string())?;
         rs.directives = resource.directives.clone();
         if rs.directives.provider_instance.is_none() {
             rs.directives.provider_instance = resource.id.provider_instance.clone();

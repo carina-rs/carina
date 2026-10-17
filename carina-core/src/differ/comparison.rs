@@ -677,12 +677,26 @@ pub(super) fn find_changed_attributes(
                 defs,
             })
         });
+        // A previously unmanaged attribute is normally absent from the
+        // projected current view. If its persisted value is an opaque secret
+        // digest and the user now authors a secret at that key, the digest is
+        // nevertheless authoritative comparison material: it cannot smuggle
+        // a provider default into desired state, and verification proves
+        // whether the newly-authored plaintext is the value already stored.
+        let current_value = projected_current.get(key).or_else(|| {
+            if !contains_secret(desired_value) {
+                return None;
+            }
+            raw_saved?
+                .get(key)
+                .filter(|value| crate::value::contains_redacted_secret(value))
+        });
 
         if key_should_enter_patch(
             key,
             schema,
             AttrComparison {
-                from: projected_current.get(key),
+                from: current_value,
                 to: desired_value,
                 saved: projected_saved.and_then(|projected_saved| {
                     projected_saved.get(key).map(|projected_value| SavedAttr {

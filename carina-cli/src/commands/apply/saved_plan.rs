@@ -56,13 +56,10 @@ impl HistoricalResourceAddresses {
         Self { moved_origins }
     }
 
-    pub(super) fn origin_for_state(&self, id: &ResourceId, state: &State) -> ResourceId {
-        state
-            .attributes
-            .values()
-            .find_map(carina_core::value::legacy_secret_row_origin)
-            .and_then(|origin| origin.historical_resource_id_like(id))
-            .or_else(|| self.moved_origins.get(id).cloned())
+    pub(super) fn origin_for(&self, id: &ResourceId) -> ResourceId {
+        self.moved_origins
+            .get(id)
+            .cloned()
             .unwrap_or_else(|| id.clone())
     }
 }
@@ -260,7 +257,7 @@ impl DesiredVerifiedPlanFile {
             // Orphans do not participate in ordinary drift reads. Read them
             // here because their historical secret still needs verification.
             if !actual_states.contains_key(&entry.id) {
-                let historical_id = historical_addresses.origin_for_state(&entry.id, &entry.state);
+                let historical_id = historical_addresses.origin_for(&entry.id);
                 let mut actual = provider
                     .read(
                         &historical_id,
