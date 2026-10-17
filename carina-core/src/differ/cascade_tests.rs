@@ -108,20 +108,20 @@ fn plan_for(
         .expect("cascade test resources must have resolved identities");
     let resolved = ResolvedResource::collect_resolved(managed.resources().iter().cloned())
         .expect("cascade test resources must have resolved identities");
+    let plan_input_states = crate::resource::into_plan_input_map(
+        current_states,
+        &crate::schema::SchemaRegistry::new(),
+        &[],
+    );
     create_plan_with_cascades(
         &resolved,
         &unresolved,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
-            current_states,
-            &crate::schema::SchemaRegistry::new(),
-            &[],
-        ),
+        crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
         &HashMap::new(),
         schemas,
         &empty_lifted_saved_attrs(),
-        &HashMap::new(),
         &HashMap::new(),
         &[],
     )

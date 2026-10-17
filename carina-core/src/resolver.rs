@@ -20,9 +20,10 @@ use crate::resource::{
 /// Builds a binding map from resource attributes and state, then resolves
 /// all ResourceRef values across all resources.
 ///
-/// Before resolving, saves dependency binding names as `_dependency_bindings`
-/// metadata on each resource. This preserves dependency information that would
-/// otherwise be lost when ResourceRef values are replaced with plain strings.
+/// Before resolving, saves dependency binding names in the typed
+/// `Resource::dependency_bindings` field. This preserves dependency information
+/// that would otherwise be lost when ResourceRef values are replaced with plain
+/// strings.
 ///
 /// `remote_bindings` provides external bindings from upstream state data sources.
 /// Each entry maps an upstream_state binding name to a map of resource binding names

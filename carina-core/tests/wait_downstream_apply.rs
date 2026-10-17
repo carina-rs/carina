@@ -276,15 +276,17 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &resolved_resources_for_plan,
         &[],
         &MockProvider,
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
         &registry,
         &empty_lifted_saved_attrs(),
-        &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
     )
@@ -448,15 +450,17 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &resolved_resources_for_plan,
         &[],
         &MockProvider,
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
         &registry,
         &empty_lifted_saved_attrs(),
-        &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
     )
@@ -628,15 +632,17 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &resolved_resources_for_plan,
         &[],
         &MockProvider,
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
         &registry,
         &empty_lifted_saved_attrs(),
-        &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
     )

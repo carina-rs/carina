@@ -144,7 +144,7 @@ fn create_plan_from_resources() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -179,7 +179,7 @@ fn create_plan_with_read_only_resource() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -254,9 +254,7 @@ fn diff_update_when_list_of_maps_changed() {
 }
 
 #[test]
-fn create_plan_detects_orphaned_resources_for_deletion() {
-    // A resource exists in current_states but NOT in desired list
-    // create_plan() should generate a Delete effect for it
+fn create_plan_detects_typed_orphan_for_deletion() {
     let desired = vec![Resource::new("bucket", "keep-this")];
 
     let mut current_states = HashMap::new();
@@ -274,13 +272,12 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("orphaned-bucket".into())),
     );
-    current_states.insert(
-        ResourceId::with_identity("bucket", "orphaned-bucket"),
-        State::existing(
-            ResourceId::with_identity("bucket", "orphaned-bucket"),
-            orphan_attrs,
-        ),
-    );
+    let orphan_id = ResourceId::with_identity("bucket", "orphaned-bucket");
+    let orphans = Orphans::from([Orphan::new(
+        State::existing(orphan_id, orphan_attrs),
+        None,
+        Directives::default(),
+    )]);
 
     let plan = create_plan(
         &desired,
@@ -295,7 +292,7 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -354,7 +351,7 @@ fn read_only_resource_always_generates_read_effect() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -431,7 +428,7 @@ fn replace_when_create_only_attr_changed() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -488,7 +485,7 @@ fn normal_update_when_non_create_only_attr_changed() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -555,7 +552,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -621,7 +618,7 @@ fn replace_carries_create_before_destroy_directives() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -743,7 +740,7 @@ fn replace_with_provider_prefixed_schema_key() {
         &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &Orphans::new(),
         &[],
     );
 
@@ -997,35 +994,26 @@ fn diff_works_without_saved_state() {
 }
 
 #[test]
-fn orphan_delete_preserves_binding_and_dependencies() {
-    // Orphan resources (in state but not in desired) should carry
-    // binding and dependencies extracted from the state attributes.
+fn orphan_delete_preserves_typed_binding_and_dependencies() {
+    // Orphan resources (in state but not in desired) carry host metadata
+    // separately from provider-facing state attributes.
     let desired = vec![];
 
-    let mut current_states = HashMap::new();
-    let mut orphan_attrs = HashMap::new();
-    orphan_attrs.insert(
-        "_binding".to_string(),
-        Value::Concrete(ConcreteValue::String("my_subnet".into())),
-    );
-    orphan_attrs.insert(
-        "vpc_id".to_string(),
-        Value::resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
-    );
-    current_states.insert(
-        ResourceId::with_identity("subnet", "my-subnet"),
-        State::existing(
-            ResourceId::with_identity("subnet", "my-subnet"),
-            orphan_attrs,
-        ),
-    );
+    let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
+    let orphan_state = State::existing(orphan_id.clone(), HashMap::new())
+        .with_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
+    let orphans = crate::differ::Orphans::from([Orphan::new(
+        orphan_state,
+        Some("my_subnet".to_string()),
+        crate::resource::Directives::default(),
+    )]);
 
     let plan = create_plan(
         &desired,
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(
-            current_states.clone(),
+            HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
@@ -1033,7 +1021,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &HashMap::new(),
+        &orphans,
         &[],
     );
 
@@ -1053,11 +1041,11 @@ fn orphan_delete_preserves_binding_and_dependencies() {
             assert_eq!(
                 binding.as_deref(),
                 Some("my_subnet"),
-                "Orphan Delete should preserve _binding from state"
+                "Orphan Delete should preserve the typed binding"
             );
             assert!(
                 dependencies.contains("my_vpc"),
-                "Orphan Delete should extract dependencies from ResourceRef values in state"
+                "Orphan Delete should preserve typed dependency bindings"
             );
         }
         _ => unreachable!(),

@@ -4311,7 +4311,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 }
 
 #[tokio::test]
-async fn test_apply_effective_changed_skips_internal_and_write_only_attributes() {
+async fn test_apply_effective_changed_includes_underscore_and_skips_write_only_attributes() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
     to_resource.binding = Some("a".to_string());
@@ -4372,7 +4372,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
         .iter()
         .map(|op| op.key.as_str())
         .collect();
-    assert_eq!(patched_keys, vec!["description"]);
+    assert_eq!(patched_keys, vec!["description", "_provider_only"]);
 }
 
 #[tokio::test]
@@ -5754,32 +5754,28 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         )]),
     )
     .with_dependency_bindings(std::collections::BTreeSet::from(["dependency".to_string()]));
-    let orphan_state = State::existing(
-        orphan_id.clone(),
-        HashMap::from([(
-            "_binding".to_string(),
-            Value::Concrete(ConcreteValue::String("dependency".into())),
-        )]),
-    )
-    .with_identifier("dependency-id");
-    let current_states = HashMap::from([
-        (consumer_id, consumer_state),
-        (orphan_id.clone(), orphan_state),
-    ]);
+    let orphan_state =
+        State::existing(orphan_id.clone(), HashMap::new()).with_identifier("dependency-id");
+    let current_states = HashMap::from([(consumer_id, consumer_state)]);
     let desired = ResolvedResource::collect_resolved([desired]).unwrap();
+    let orphans = crate::differ::Orphans::from([crate::differ::Orphan::new(
+        orphan_state,
+        Some("dependency".to_string()),
+        Directives::default(),
+    )]);
+    let plan_input_states = crate::resource::into_plan_input_map(
+        current_states,
+        &crate::schema::SchemaRegistry::new(),
+        &[],
+    );
     let plan = crate::differ::create_plan(
         &desired,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
-            current_states,
-            &crate::schema::SchemaRegistry::new(),
-            &[],
-        ),
+        crate::differ::PlanPriorStates::new(&plan_input_states, &orphans),
         &HashMap::new(),
         &crate::schema::SchemaRegistry::new(),
         &crate::provider::RawSavedAttrs::default().lift(&crate::schema::SchemaRegistry::new()),
-        &HashMap::new(),
         &HashMap::new(),
         &[],
     )
@@ -6377,11 +6373,10 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &unresolved,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &plan_input_states,
+        crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
         &HashMap::new(),
         &schemas,
         &crate::provider::RawSavedAttrs::default().lift(&crate::schema::SchemaRegistry::new()),
-        &HashMap::new(),
         &HashMap::new(),
         &[],
     )

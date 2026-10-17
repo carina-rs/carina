@@ -180,10 +180,9 @@ pub(crate) fn list_element_type<'a>(
     }
 }
 
-/// Count non-internal attributes that are equal in both `from` and `to`.
+/// Count attributes that are equal in both `from` and `to`.
 ///
-/// Internal attributes (prefixed with `_`) are excluded from the count.
-/// An optional `exclude` set can be provided to skip additional attribute names
+/// An optional `exclude` set can be provided to skip attribute names
 /// (e.g., `changed_create_only` attributes in Replace effects).
 ///
 /// When `schema` is provided, equality is schema-aware (carina#3073):
@@ -207,8 +206,7 @@ pub fn compute_unchanged_count(
     from_attrs
         .iter()
         .filter(|(k, v)| {
-            !k.starts_with('_')
-                && exclude.is_none_or(|set| !set.contains(k.as_str()))
+            exclude.is_none_or(|set| !set.contains(k.as_str()))
                 && to_attrs
                     .get(k.as_str())
                     .map(|nv| {
@@ -516,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_unchanged_count_excludes_internal() {
+    fn test_compute_unchanged_count_includes_underscore_prefixed_attributes() {
         let from: HashMap<String, Value> = [
             (
                 "name".to_string(),
@@ -543,7 +541,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert_eq!(compute_unchanged_count(&from, &to, None, None), 1);
+        assert_eq!(compute_unchanged_count(&from, &to, None, None), 2);
     }
 
     #[test]

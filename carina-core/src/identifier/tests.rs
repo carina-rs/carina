@@ -3603,7 +3603,7 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
 #[test]
 fn test_reconcile_skips_let_bound_resources() {
     // Let-bound (named) resources should never be reconciled, even if their
-    // name doesn't exist in state. The _binding attribute marks them as named.
+    // name doesn't exist in state. The typed binding marks them as named.
     let schema = ResourceSchema::new("ec2.security_group_ingress")
         .attribute(AttributeSchema::new("cidr_ip", AttributeType::string()).create_only())
         .attribute(AttributeSchema::new("ip_protocol", AttributeType::string()).create_only())

@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::create_plan_with_cascades;
-use carina_core::override_aware::OverrideAwareResources;
+use carina_core::differ::{
+    Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
+};
+use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
 use carina_core::resource::{ResourceId, State, Value};
@@ -228,6 +230,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut orphans = Orphans::new();
     if let Some(sf) = state_file.as_ref() {
         for resource in &sorted_resources {
             let state = sf.build_state_for_resource(&resource.id);
@@ -243,9 +246,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .map(|r| r.id.clone())
             .chain(data_sources.iter().map(|d| d.id.clone()))
             .collect();
-        for (id, state) in sf.build_orphan_states(&desired_ids) {
-            current_states.entry(id).or_insert(state);
-        }
+        orphans = sf.build_orphans(&desired_ids);
     } else {
         for resource in &sorted_resources {
             current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
@@ -398,16 +399,21 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                 Box::new(carina_provider_mock::MockProvider::new()),
             );
         }
-        rt.block_on(PlanPreprocessor::new(&provider_router, &wiring).prepare(
-            &mut override_aware_resources,
-            &constraint_origin_resources,
-            &module_gate,
-            &mut current_states,
-            raw_provider_configs,
-            &mut data_sources_for_plan,
-            &data_sources,
-            &mut wait_bindings,
-        ))
+        rt.block_on(async {
+            PlanPreprocessor::new(&provider_router, &wiring)
+                .prepare(
+                    &mut override_aware_resources,
+                    &constraint_origin_resources,
+                    &module_gate,
+                    &mut current_states,
+                    &mut orphans,
+                    raw_provider_configs,
+                    &mut data_sources_for_plan,
+                    &data_sources,
+                    &mut wait_bindings,
+                )
+                .await
+        })
     };
     if let Err(error) = preparation {
         let errors = match error {
@@ -420,6 +426,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         for error in errors {
             plan.add_error(error);
         }
+        current_states = into_all_prior_states(orphans, current_states);
         return FixturePlan {
             plan,
             current_states,
@@ -449,19 +456,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("fixture late anonymous identities must resolve uniquely");
 
-    let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> = override_aware_resources
-            .resources()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        sf.build_orphan_dependencies(&desired_ids)
-    } else {
-        HashMap::new()
-    };
-
     let moved_pairs = crate::wiring::materialize_moved_states(
         &mut current_states,
+        &mut orphans,
         &mut prev_explicit,
         &mut saved_attrs,
         &parsed.state_blocks,
@@ -474,6 +471,26 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &state_file,
     )
     .expect("state block collision validation failed");
+
+    let reconciled_provider_states = provider_states_for(
+        &current_states,
+        &orphans,
+        override_aware_resources.resources(),
+    );
+    let reconciled_input_states = carina_core::resource::into_plan_input_map(
+        reconciled_provider_states,
+        wiring.schemas(),
+        override_aware_resources.resources(),
+    );
+    override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+        RebuildBindingsInputs {
+            compositions: &parsed.compositions,
+            data_sources: &data_sources,
+            current_states: &reconciled_input_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    );
 
     let deferred_for_expansion = expand_same_config_deferred_for(
         &parsed,
@@ -503,11 +520,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .filter(|deferred| !managed_bindings.contains(&deferred.iterable_binding))
             .cloned(),
     );
-    let plan_input_states = carina_core::resource::into_plan_input_map(
-        current_states.clone(),
-        wiring.schemas(),
-        override_aware_resources.resources(),
-    );
     let resolved_resources = carina_core::resource::ResolvedResource::collect_resolved(
         override_aware_resources.resources().iter().cloned(),
     )
@@ -516,17 +528,21 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         override_aware_resources.paired_unresolved_resources(),
     )
     .expect("fixture unresolved resources must have paired identities");
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        wiring.schemas(),
+        override_aware_resources.resources(),
+    );
     let mut plan = create_plan_with_cascades(
         &resolved_resources,
         &unresolved_resources,
         &data_sources_for_plan,
         &provider_router,
-        &plan_input_states,
+        PlanPriorStates::new(&plan_input_states, &orphans),
         &directives_map,
         wiring.schemas(),
         &saved_attrs,
         &prev_explicit,
-        &orphan_dependencies,
         &wait_bindings,
     )
     .expect("fixture providers must return valid satisfier hints");
@@ -542,6 +558,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &upstream_binding_names,
     );
     add_deferred_create_effects(&mut plan, &deferred_create_targets);
+    current_states = into_all_prior_states(orphans, current_states);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()

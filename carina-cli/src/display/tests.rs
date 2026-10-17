@@ -625,8 +625,7 @@ fn test_print_plan_compact_does_not_panic() {
     );
 }
 
-/// Test compact mode skips attributes by checking that _binding attribute
-/// keys are not printed (attributes are hidden in compact mode).
+/// Test compact mode hides provider attributes for anonymous resources.
 #[test]
 fn test_print_plan_compact_with_anonymous_resources() {
     let mut anon = Resource::new("ec2.route", "hash_anon");

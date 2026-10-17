@@ -1338,9 +1338,8 @@ pub(crate) struct DestroyedInstance {
 
 /// Build a minimal `Resource` for an orphaned resource from the state file.
 ///
-/// This creates a Resource with attributes reconstructed from state data,
-/// including `_binding` and `_dependency_bindings` so that dependency ordering
-/// and tree display work correctly.
+/// Provider attributes and host-owned metadata come from the same persisted
+/// row, so callers cannot join independently-built orphan views.
 pub(crate) fn build_orphan_resource(
     sf: &carina_state::StateFile,
     id: &ResolvedResourceId,
@@ -2791,17 +2790,21 @@ mod apply_state_save_tests {
         );
 
         let current_states = HashMap::from([(id.clone(), saved.build_state_for_resource(&id))]);
-        let plan_input_states =
-            carina_core::resource::into_plan_input_map(current_states, &SchemaRegistry::new(), &[]);
         let second_plan = create_plan(
             std::slice::from_ref(&resolved(desired.clone())),
             &[],
             &ProviderRouter::new(),
-            &plan_input_states,
+            carina_core::differ::PlanPriorStates::new(
+                &carina_core::resource::into_plan_input_map(
+                    current_states.clone(),
+                    &SchemaRegistry::new(),
+                    &[],
+                ),
+                &carina_core::differ::Orphans::new(),
+            ),
             &HashMap::new(),
             &SchemaRegistry::new(),
             &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
             &HashMap::new(),
             &[],
         )
@@ -2869,17 +2872,17 @@ mod apply_state_save_tests {
         assert_eq!(row.write_only_attributes, vec!["password"]);
 
         let current_states = HashMap::from([(id.clone(), saved.build_state_for_resource(&id))]);
-        let plan_input_states =
-            carina_core::resource::into_plan_input_map(current_states, &schemas, &[]);
         let second_plan = create_plan(
             std::slice::from_ref(&resolved(desired.clone())),
             &[],
             &ProviderRouter::new(),
-            &plan_input_states,
+            carina_core::differ::PlanPriorStates::new(
+                &carina_core::resource::into_plan_input_map(current_states.clone(), &schemas, &[]),
+                &carina_core::differ::Orphans::new(),
+            ),
             &HashMap::new(),
             &schemas,
             &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
             &HashMap::new(),
             &[],
         )
@@ -3359,20 +3362,21 @@ mod apply_state_save_tests {
                 AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
             ),
         );
-        let plan_input_states = carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &SchemaRegistry::new(),
-            &[],
-        );
         let plan = create_plan(
             &sorted_resources,
             &[],
             &ProviderRouter::new(),
-            &plan_input_states,
+            carina_core::differ::PlanPriorStates::new(
+                &carina_core::resource::into_plan_input_map(
+                    current_states.clone(),
+                    &SchemaRegistry::new(),
+                    &[],
+                ),
+                &carina_core::differ::Orphans::new(),
+            ),
             &HashMap::new(),
             &schemas,
             &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
             &HashMap::new(),
             &[],
         )
@@ -3432,17 +3436,17 @@ mod apply_state_save_tests {
                 )
                 .with_coexisting_replacement(),
         );
-        let plan_input_states =
-            carina_core::resource::into_plan_input_map(current_states.clone(), &schemas, &[]);
         let mut plan = create_plan(
             &sorted_resources,
             &[],
             &ProviderRouter::new(),
-            &plan_input_states,
+            carina_core::differ::PlanPriorStates::new(
+                &carina_core::resource::into_plan_input_map(current_states.clone(), &schemas, &[]),
+                &carina_core::differ::Orphans::new(),
+            ),
             &HashMap::new(),
             &schemas,
             &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
             &HashMap::new(),
             &[],
         )

@@ -8,6 +8,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
+use carina_core::differ::{Orphans, into_all_prior_states};
 use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
@@ -1160,14 +1161,30 @@ async fn run_state_refresh_locked_with_ctx(
             Some((resource.id.clone(), identifier))
         })
         .collect();
-    let (mut current_states, already_refreshed) =
+    let (managed_states, mut already_refreshed) =
         refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
+    let mut current_states = managed_states;
     match cancel.phase() {
         ShutdownPhase::Running => {}
         ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
             return Err(AppError::Interrupted);
         }
     }
+
+    // Build and refresh typed orphans before expansion. A persisted loop
+    // child is still classified as an orphan at this point; expansion keeps
+    // that ownership intact and the shared prior-state view supplies it to
+    // every hydration/lift stage.
+    let pre_expansion_desired_ids: HashSet<ResourceId> =
+        sorted_resources.iter().map(|r| r.id.clone()).collect();
+    let mut orphans = state_file
+        .as_ref()
+        .map(|sf| sf.build_orphans(&pre_expansion_desired_ids))
+        .unwrap_or_default();
+    let (refreshed_orphans, refreshed_orphan_ids) =
+        refresh_orphans_until_cancelled(&provider, orphans, &cancel).await?;
+    orphans = refreshed_orphans;
+    already_refreshed.extend(refreshed_orphan_ids);
 
     // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
     // way `run_apply_locked` does, so the materialised children land
@@ -1198,6 +1215,14 @@ async fn run_state_refresh_locked_with_ctx(
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default()
         .lift(ctx.schemas());
+    crate::wiring::hydrate_prior_states(
+        &mut current_states,
+        &mut orphans,
+        &provider,
+        &saved_attrs_for_expansion,
+        state_file.as_ref(),
+    )
+    .await?;
     let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
         .as_ref()
         .map(|sf| {
@@ -1228,6 +1253,7 @@ async fn run_state_refresh_locked_with_ctx(
         provider: &provider,
         sorted_resources: &sorted_resources,
         current_states: &mut current_states,
+        orphans: &mut orphans,
         remote_bindings: &HashMap::new(),
         wait_aliases: &wait_aliases_for_expansion,
         moved_targets: &HashSet::new(),
@@ -1247,41 +1273,16 @@ async fn run_state_refresh_locked_with_ctx(
         }
     }
 
-    // Also read states for orphaned resources (in state but removed from config)
+    // Expansion can make a pre-expansion orphan desired. Keep orphan metadata
+    // typed until this non-planning command needs one unified writeback view.
     let desired_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
-    let orphan_ids: Vec<(ResolvedResourceId, String)> = state_file
-        .as_ref()
-        .map(|sf| {
-            sf.resources()
-                .iter()
-                .filter_map(|rs| {
-                    let identity = rs.identity.clone();
-                    let id = ResolvedResourceId::with_provider_identity(
-                        rs.provider.clone(),
-                        rs.resource_type.clone(),
-                        identity,
-                        rs.directives.provider_instance.clone(),
-                    );
-                    if desired_ids.contains(id.as_inner()) {
-                        return None;
-                    }
-                    rs.identifier.as_ref().map(|ident| (id, ident.clone()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let orphan_reads = orphan_ids
-        .iter()
-        .map(|(id, identifier)| (id.as_inner().clone(), identifier.clone()))
+    let orphan_ids: Vec<ResolvedResourceId> = orphans
+        .keys()
+        .filter(|id| !desired_ids.contains(*id))
+        .cloned()
+        .map(ResolvedResourceId::new)
         .collect();
-    let orphan_states =
-        refresh_existing_resources_until_cancelled(&provider, orphan_reads, &cancel)
-            .await?
-            .0;
-    for (id, fresh_state) in orphan_states {
-        current_states.insert(id, fresh_state);
-    }
+    current_states = into_all_prior_states(orphans, current_states);
 
     // carina#3271: re-read every `read aws.*` data source. Without
     // this, `current_states` has no entry for any data source and
@@ -1406,7 +1407,7 @@ async fn run_state_refresh_locked_with_ctx(
     }
 
     // Process orphaned resources (in state but removed from config)
-    for (orphan_id, _) in &orphan_ids {
+    for orphan_id in &orphan_ids {
         let fresh_state = match current_states.get(orphan_id.as_inner()) {
             Some(s) => s,
             None => continue,
@@ -1637,6 +1638,25 @@ async fn refresh_existing_resources_until_cancelled(
     }
 
     Ok((current_states, refreshed))
+}
+
+async fn refresh_orphans_until_cancelled(
+    provider: &dyn Provider,
+    mut orphans: Orphans,
+    cancel: &ShutdownToken,
+) -> Result<(Orphans, HashSet<ResourceId>), AppError> {
+    let reads = orphans
+        .iter()
+        .filter_map(|(id, orphan)| Some((id.clone(), orphan.state().identifier.clone()?)))
+        .collect();
+    let (states, refreshed) =
+        refresh_existing_resources_until_cancelled(provider, reads, cancel).await?;
+    for (id, state) in states {
+        if let Some(orphan) = orphans.remove(&id) {
+            orphans.insert(orphan.with_refreshed_state(state));
+        }
+    }
+    Ok((orphans, refreshed))
 }
 
 #[derive(Clone)]
@@ -1889,9 +1909,9 @@ fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
 /// Compare old state with fresh provider state for a single resource,
 /// display any changes, and update the state file accordingly.
 ///
-/// When `resource` is `Some`, directives, prefixes, and desired keys
-/// are preserved from it. When `None` (orphan resources), a minimal
-/// `Resource` is constructed from the id.
+/// When `resource` is `Some`, desired metadata is rebuilt from it. When
+/// `None`, the existing orphan row keeps every host-owned field and only its
+/// provider-observed state is replaced.
 ///
 /// `label_suffix` is appended to the resource header (e.g., `" (orphan)"`).
 #[derive(Default)]
@@ -1917,37 +1937,40 @@ fn diff_display_update_resource(
     };
 
     let refreshed_resource_state = if fresh_state.exists {
-        let owned_resource;
-        let res = match resource {
-            Some(r) => r,
-            None => {
-                owned_resource = ResolvedResource::from_id(id.clone());
-                &owned_resource
+        match resource {
+            Some(resource) => {
+                let schema = schemas.get_for(resource);
+                let mut resource_state =
+                    ResourceState::from_provider_state_for_resource_and_schema(
+                        resource,
+                        fresh_state,
+                        Some(existing_rs),
+                        schema,
+                    )?;
+                let write_only_keys: Vec<String> = schema
+                    .map(|schema| {
+                        schema
+                            .attributes
+                            .iter()
+                            .filter(|(_, attr)| attr.write_only)
+                            .map(|(name, _)| name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !write_only_keys.is_empty() {
+                    resource_state.merge_write_only_attributes(resource, &write_only_keys);
+                }
+                Some(resource_state)
             }
-        };
-        let schema = schemas.get_for(res);
-        let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-            res,
-            fresh_state,
-            Some(existing_rs),
-            schema,
-        )?;
-        if let Some(resource) = resource {
-            let write_only_keys: Vec<String> = schema
-                .map(|schema| {
-                    schema
-                        .attributes
-                        .iter()
-                        .filter(|(_, attr)| attr.write_only)
-                        .map(|(name, _)| name.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !write_only_keys.is_empty() {
-                resource_state.merge_write_only_attributes(resource, &write_only_keys);
+            None => {
+                let schema = schemas.get(
+                    &id.provider,
+                    &id.resource_type,
+                    carina_core::schema::SchemaKind::Resource,
+                );
+                Some(existing_rs.refreshed_from_provider_state(fresh_state, schema)?)
             }
         }
-        Some(resource_state)
     } else {
         None
     };
@@ -3017,27 +3040,36 @@ mod tests {
         // This is the saved-attribute construction used by
         // `run_state_refresh_locked` before the shared expansion path.
         let saved_attrs_for_expansion = state_file.build_saved_attrs().lift(&schemas);
-        let state_file = Some(state_file);
+        let desired_ids = sorted_resources
+            .iter()
+            .map(|resource| resource.id.clone())
+            .collect();
+        let refreshed =
+            State::existing(child.id.clone(), HashMap::new()).with_identifier("widget-1");
         let provider = DeposedRefreshTestProvider::default()
             .with_saved_attr_hydration()
-            .with_read_state(
-                &child.id,
-                "widget-1",
-                State::existing(child.id.clone(), HashMap::new()).with_identifier("widget-1"),
-            );
+            .with_read_state(&child.id, "widget-1", refreshed);
+        let (mut orphans, already_refreshed) = refresh_orphans_until_cancelled(
+            &provider,
+            state_file.build_orphans(&desired_ids),
+            &ShutdownToken::running(),
+        )
+        .await
+        .expect("production orphan refresh should succeed");
+        let state_file = Some(state_file);
         let multi =
             indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
-
         let expanded = crate::wiring::expand_refresh_and_lift_states(
             crate::wiring::ExpandRefreshAndLiftInputs {
                 parsed: &parsed,
                 provider: &provider,
                 sorted_resources: &sorted_resources,
                 current_states: &mut current_states,
+                orphans: &mut orphans,
                 remote_bindings: &HashMap::new(),
                 wait_aliases: &[],
                 moved_targets: &HashSet::new(),
-                already_refreshed: &HashSet::new(),
+                already_refreshed: &already_refreshed,
                 state_file: &state_file,
                 saved_dep_bindings: &HashMap::new(),
                 saved_attrs: &saved_attrs_for_expansion,
@@ -3048,6 +3080,11 @@ mod tests {
         .await
         .expect("refresh expansion should succeed");
         assert_eq!(expanded.new_child_ids, HashSet::from([child.id.clone()]));
+        assert!(
+            !current_states.contains_key(&child.id),
+            "expansion must not duplicate an orphan-owned child into current states"
+        );
+        assert!(orphans.contains_key(&child.id));
 
         let hydrated = provider
             .hydrated_saved_values
@@ -3974,6 +4011,134 @@ mod tests {
             .get("tags")
             .expect("tags should still be stored");
         assert_eq!(stored_again, stored_tags);
+    }
+
+    #[test]
+    fn current_orphan_refresh_preserves_all_host_metadata_and_prevent_destroy() {
+        let id = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Subnet",
+            "main",
+            Some("west".to_string()),
+        );
+        let mut row =
+            ResourceState::new("ec2.Subnet", "main", "awscc").with_identifier("subnet-current");
+        row.directives = carina_core::resource::Directives {
+            force_delete: true,
+            create_before_destroy: true,
+            prevent_destroy: true,
+            depends_on: vec!["security_group".to_string()],
+            provider_instance: Some("west".to_string()),
+        };
+        row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
+        row.protected = true;
+        row.name_overrides.insert(
+            "name".to_string(),
+            carina_state::NameOverride {
+                temp_value: "prod-replacement".to_string(),
+                original_value: Some("prod-original".to_string()),
+            },
+        );
+        row.binding = Some("subnet".to_string());
+        row.dependency_bindings = BTreeSet::from(["vpc".to_string()]);
+        row.explicit = carina_core::explicit::ExplicitFields::Struct {
+            children: HashMap::from([(
+                "cidr_block".to_string(),
+                carina_core::explicit::ExplicitFields::Leaf,
+            )]),
+        };
+        row.write_only_attributes = vec!["token".to_string()];
+        let deposed_key = deposed_key("prior-generation");
+        row.deposed.push(deposed_instance(
+            deposed_key.clone(),
+            "subnet-prior",
+            Some("west"),
+            HashMap::from([("cidr_block".to_string(), json!("10.0.0.0/24"))]),
+        ));
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
+
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([("cidr_block".to_string(), string_value("10.0.1.0/24"))]),
+        )
+        .with_identifier("subnet-current");
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &ResolvedResourceId::new(id.clone()),
+            &fresh,
+            &mut state,
+            None,
+            &SchemaRegistry::new(),
+            " (orphan)",
+            &mut counts,
+        )
+        .unwrap();
+
+        let refreshed = state
+            .find_resource("awscc", "ec2.Subnet", "main")
+            .expect("refreshed orphan row must remain");
+        assert_eq!(refreshed.binding.as_deref(), Some("subnet"));
+        assert_eq!(
+            refreshed.dependency_bindings,
+            BTreeSet::from(["vpc".to_string()])
+        );
+        assert_eq!(
+            refreshed.directives,
+            carina_core::resource::Directives {
+                force_delete: true,
+                create_before_destroy: true,
+                prevent_destroy: true,
+                depends_on: vec!["security_group".to_string()],
+                provider_instance: Some("west".to_string()),
+            }
+        );
+        assert_eq!(
+            refreshed.prefixes,
+            HashMap::from([("name".to_string(), "prod-".to_string())])
+        );
+        assert!(matches!(
+            &refreshed.explicit,
+            carina_core::explicit::ExplicitFields::Struct { children }
+                if children.contains_key("cidr_block")
+        ));
+        assert_eq!(refreshed.write_only_attributes, vec!["token".to_string()]);
+        assert!(refreshed.protected);
+        assert_eq!(
+            refreshed.name_overrides.get("name"),
+            Some(&carina_state::NameOverride {
+                temp_value: "prod-replacement".to_string(),
+                original_value: Some("prod-original".to_string()),
+            })
+        );
+        assert_eq!(refreshed.deposed.len(), 1);
+        assert_eq!(refreshed.deposed[0].key, deposed_key);
+        assert_eq!(refreshed.deposed[0].identifier, "subnet-prior");
+
+        let desired_ids = HashSet::new();
+        let orphans = state.build_orphans(&desired_ids);
+        let plan = carina_core::differ::create_plan(
+            &[],
+            &[],
+            &carina_core::provider::ProviderRouter::new(),
+            carina_core::differ::PlanPriorStates::new(&HashMap::new(), &orphans),
+            &state.build_directives(),
+            &SchemaRegistry::new(),
+            &RawSavedAttrs::default().lift(&SchemaRegistry::new()),
+            &HashMap::new(),
+            &[],
+        )
+        .expect("orphan plan should build");
+        assert!(plan.effects().is_empty());
+        assert!(matches!(
+            &plan.errors()[0].kind,
+            carina_core::plan::PlanErrorKind::PreventDestroy {
+                action: carina_core::plan::PreventDestroyAction::DeleteRemovedFromConfiguration
+            }
+        ));
     }
 
     #[test]

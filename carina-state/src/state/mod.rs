@@ -1,6 +1,7 @@
 //! State file structures for persisting infrastructure state
 
 use carina_core::deps::get_resource_dependencies;
+use carina_core::differ::Orphan;
 use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
@@ -160,7 +161,9 @@ impl StateFile {
     ///     non-empty.
     /// v10: Added `ExplicitFields::ListElements`, aligned by index with the
     ///      stored list value in the same resource row.
-    pub const CURRENT_VERSION: u32 = 10;
+    /// v11: Removed legacy host-reserved `_`-prefixed keys from current and
+    ///      deposed provider attributes and from the top-level explicit tree.
+    pub const CURRENT_VERSION: u32 = 11;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -530,60 +533,35 @@ impl StateFile {
         State::not_found(id.clone())
     }
 
-    /// Build state entries for resources tracked in the state file but absent from the
-    /// desired resource set.  These "orphan" entries are injected into `current_states`
-    /// so that `create_plan()` can detect them and emit Delete effects.
-    pub fn build_orphan_states(
+    /// Build each persisted orphan as one typed value containing its
+    /// provider-facing state and host-owned binding/directive metadata.
+    pub fn build_orphans(
         &self,
         desired_ids: &std::collections::HashSet<ResourceId>,
-    ) -> HashMap<ResourceId, State> {
-        let mut result = HashMap::new();
-        for rs in &self.resources {
-            let id = Self::id_for_resource_state(rs);
-            if desired_ids.contains(&id) {
-                continue;
-            }
-            // Only include resources that actually have an identifier (i.e. exist in infra)
-            if let Some(ref identifier) = rs.identifier {
-                let mut attrs = rs.persisted_attributes().to_values();
-                // Inject _binding so orphan Delete effects can have tree structure
-                if let Some(ref binding) = rs.binding {
-                    attrs.insert(
-                        "_binding".to_string(),
-                        Value::Concrete(ConcreteValue::String(binding.clone().into())),
-                    );
+    ) -> carina_core::differ::Orphans {
+        self.resources
+            .iter()
+            .filter_map(|rs| {
+                let id = Self::id_for_resource_state(rs);
+                if desired_ids.contains(&id) {
+                    return None;
                 }
+                let identifier = rs.identifier.clone()?;
                 let state = State {
                     id: id.clone(),
-                    identifier: Some(identifier.clone()),
-                    attributes: attrs,
+                    identifier: Some(identifier),
+                    attributes: rs.persisted_attributes().to_values(),
                     exists: true,
                     dependency_bindings: rs.dependency_bindings.clone(),
                     partial_read: rs.partial_read.clone(),
                 };
-                result.insert(id, state);
-            }
-        }
-        result
-    }
-
-    /// Build a map of ResourceId -> dependency binding names for orphaned resources.
-    /// Used by the differ to set dependencies on orphan Delete effects.
-    pub fn build_orphan_dependencies(
-        &self,
-        desired_ids: &std::collections::HashSet<ResourceId>,
-    ) -> HashMap<ResourceId, BTreeSet<String>> {
-        let mut result = HashMap::new();
-        for rs in &self.resources {
-            let id = Self::id_for_resource_state(rs);
-            if desired_ids.contains(&id) {
-                continue;
-            }
-            if rs.identifier.is_some() && !rs.dependency_bindings.is_empty() {
-                result.insert(id, rs.dependency_bindings.clone());
-            }
-        }
-        result
+                Some(Orphan::new(
+                    state,
+                    rs.binding.clone(),
+                    rs.directives.clone(),
+                ))
+            })
+            .collect()
     }
 
     /// Build a map of ResourceId -> name overrides from this state file.
@@ -1027,6 +1005,14 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             if v <= 6 {
                 migrate_v6_empty_struct_to_unrecorded(&mut state);
             }
+            // v10 → v11: host metadata used to be stored inside provider
+            // attributes. Once consumers stopped filtering `_`-prefixed keys,
+            // those legacy values became provider-visible removals. Strip them
+            // once at the state load boundary, including historical/deposed
+            // display data and the matching top-level authoring record.
+            if v <= 10 {
+                migrate_v10_reserved_attributes(&mut state);
+            }
             state.version = StateFile::CURRENT_VERSION;
             state
         }
@@ -1229,6 +1215,29 @@ pub struct ResourceState {
     /// Marker for a state produced by a partial-success create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_read: Option<PartialReadMarker>,
+}
+
+fn refreshed_explicit_without_desired_values(
+    prior: Option<&ExplicitFields>,
+    attributes: &HashMap<String, Value>,
+) -> ExplicitFields {
+    match prior {
+        Some(ExplicitFields::Unrecorded) if !attributes.is_empty() => {
+            let children = attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), explicit::build_from_value(value)))
+                .collect();
+            ExplicitFields::Struct { children }
+        }
+        Some(prior @ ExplicitFields::Struct { children }) if !children.is_empty() => {
+            explicit::demote_list_elements_to_union(prior)
+        }
+        Some(prior @ ExplicitFields::List { .. })
+        | Some(prior @ ExplicitFields::ListElements { .. }) => {
+            explicit::demote_list_elements_to_union(prior)
+        }
+        _ => ExplicitFields::Unrecorded,
+    }
 }
 
 impl ResourceState {
@@ -1525,6 +1534,54 @@ impl ResourceState {
         serialized.protect_for_resource_and_schema(resource, schema, previous_hash_authority)
     }
 
+    /// Replace the provider-observed portion of an orphan row while retaining
+    /// every host-owned field from the existing state entry.
+    ///
+    /// Unlike desired-resource writeback, this path has no `Resource` from the
+    /// current configuration. Directives, prefixes, binding metadata,
+    /// write-only metadata, protection flags, name overrides, and deposed
+    /// generations therefore remain untouched. The explicit-authoring tree is
+    /// refreshed through the same conservative no-desired-values path as a
+    /// desired row: aligned list elements are demoted to a union, and legacy
+    /// `Unrecorded` rows self-heal from the provider attributes.
+    pub fn refreshed_from_provider_state(
+        &self,
+        state: &State,
+        schema: Option<&ResourceSchema>,
+    ) -> Result<Self, String> {
+        let mut refreshed = self.clone();
+        refreshed.identifier = state.identifier.clone();
+        refreshed.partial_read = state.partial_read.clone();
+
+        let id = ResourceId::with_provider_identity(
+            self.provider.clone(),
+            self.resource_type.clone(),
+            self.identity.clone(),
+            self.directives.provider_instance.clone(),
+        );
+        let display_type = id.display_type();
+        let identity = self.identity.as_str();
+        let mut serialized = serde_json::Map::new();
+        for (key, value) in &state.attributes {
+            serialized.insert(
+                key.clone(),
+                Self::attribute_to_state_json(&display_type, identity, key, value)?,
+            );
+        }
+        let attributes =
+            serde_json::from_value::<PersistedAttributes>(serde_json::Value::Object(serialized))
+                .expect("provider state produces persisted attribute JSON");
+        refreshed.attributes = attributes.protect_for_orphan_refresh(
+            &display_type,
+            identity,
+            schema,
+            &self.attributes,
+        );
+        refreshed.explicit =
+            refreshed_explicit_without_desired_values(Some(&self.explicit), &state.attributes);
+        Ok(refreshed)
+    }
+
     /// Build a `ResourceState` from a desired resource, provider-returned
     /// state, optional previous row state, and optional schema.
     ///
@@ -1615,47 +1672,10 @@ impl ResourceState {
                 // 3. Green-field write: prior row is `None` or
                 //    `Leaf`. There is genuinely no authoring record
                 //    yet. Emit `Unrecorded`.
-                match existing.map(|e| &e.explicit) {
-                    Some(ExplicitFields::Unrecorded) if !state.attributes.is_empty() => {
-                        let rebuilt: HashMap<String, ExplicitFields> = state
-                            .attributes
-                            .iter()
-                            .filter(|(k, _)| !k.starts_with('_'))
-                            .map(|(k, v)| (k.clone(), explicit::build_from_value(v)))
-                            .collect();
-                        if rebuilt.is_empty() {
-                            ExplicitFields::Unrecorded
-                        } else {
-                            ExplicitFields::Struct { children: rebuilt }
-                        }
-                    }
-                    Some(prior @ ExplicitFields::Struct { children }) if !children.is_empty() => {
-                        // No desired values exist to realign vectors after this provider read.
-                        // Preserve the tree while demoting every aligned list to its conservative
-                        // union so a same-length reorder cannot leave stale index attribution.
-                        explicit::demote_list_elements_to_union(prior)
-                    }
-                    Some(prior @ ExplicitFields::List { .. }) => {
-                        // Top-level `List` is structurally improbable
-                        // (the resource builders always produce a
-                        // root `Struct`), but if a prior write ever
-                        // landed one, preserve its conservative shape
-                        // while recursively demoting nested vectors.
-                        explicit::demote_list_elements_to_union(prior)
-                    }
-                    Some(prior @ ExplicitFields::ListElements { .. }) => {
-                        // A top-level aligned vector cannot be realigned without desired values.
-                        // Demote it rather than preserving stale stored-index attribution.
-                        explicit::demote_list_elements_to_union(prior)
-                    }
-                    // None (no prior row), Leaf (default), or
-                    // Some(Struct { children: {} }) — the last is
-                    // unreachable post-migration but kept here so a
-                    // pre-migration in-memory `StateFile` (e.g.
-                    // constructed in tests) still emits the typed
-                    // signal rather than the ambiguous shape.
-                    _ => ExplicitFields::Unrecorded,
-                }
+                refreshed_explicit_without_desired_values(
+                    existing.map(|entry| &entry.explicit),
+                    &state.attributes,
+                )
             }
             other => other,
         };
@@ -1751,6 +1771,20 @@ fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {
             && children.is_empty()
         {
             rs.explicit = ExplicitFields::Unrecorded;
+        }
+    }
+}
+
+/// v10 → v11: remove host-reserved top-level attributes written by older
+/// Carina versions and the built-in mock provider.
+fn migrate_v10_reserved_attributes(state: &mut StateFile) {
+    for resource in &mut state.resources {
+        resource.attributes.retain_keys(|key| !key.starts_with('_'));
+        for deposed in &mut resource.deposed {
+            deposed.attributes.retain_keys(|key| !key.starts_with('_'));
+        }
+        if let ExplicitFields::Struct { children } = &mut resource.explicit {
+            children.retain(|key, _| !key.starts_with('_'));
         }
     }
 }

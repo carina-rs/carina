@@ -1330,11 +1330,9 @@ fn orphaned_state_resource_produces_delete_effect() {
         );
     }
 
-    // Seed orphaned state entries -- this is the fix for #844
-    let orphan_states = state_file.build_orphan_states(&desired_ids);
-    for (id, state) in orphan_states {
-        current_states.entry(id).or_insert(state);
-    }
+    // Orphans remain in their typed collection rather than being duplicated
+    // into the desired-resource current-state map.
+    let orphans = state_file.build_orphans(&desired_ids);
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
@@ -1344,16 +1342,18 @@ fn orphaned_state_resource_produces_delete_effect() {
         &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &orphans,
         ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_explicit,
-        &HashMap::new(),
         &[],
     )
     .expect("test provider hints should succeed");
@@ -2018,7 +2018,7 @@ fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
 
 /// Issue #931: orphaned resources that no longer exist in infrastructure should not
 /// produce a Delete effect. The plan path now calls `provider.read()`
-/// for each orphan returned by `build_orphan_states()` and skips those that no longer
+/// for each orphan returned by `build_orphans()` and skips those that no longer
 /// exist.
 ///
 /// This test simulates the fixed code path:
@@ -2044,24 +2044,21 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     let desired: Vec<Resource> = vec![];
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
 
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    let current_states: HashMap<ResourceId, State> = HashMap::new();
 
-    // Simulate the fixed plan path:
-    // For each orphan, call provider.read(). If the provider returns not-found
-    // (resource was deleted externally), skip inserting it into current_states.
-    let orphan_states = state_file.build_orphan_states(&desired_ids);
-    for (id, state) in orphan_states {
-        // Simulate provider.read() returning not-found for this identifier.
-        // In the real code, provider.read(&id, state.identifier.as_deref())
-        // would return State { exists: false, .. }.
-        let refreshed = State::not_found(id.clone());
-        if refreshed.exists {
-            current_states.entry(id).or_insert(refreshed);
-        }
-        // "state" from build_orphan_states is intentionally unused — the fix
-        // replaces it with the provider-refreshed result.
-        let _ = state;
-    }
+    // Simulate provider refresh replacing only the provider-observed state
+    // inside each typed orphan.
+    let orphans = state_file.build_orphans(&desired_ids);
+    let orphans: carina_core::differ::Orphans = orphans
+        .into_iter()
+        .map(|(id, orphan)| {
+            // Simulate provider.read() returning not-found for this identifier.
+            // In the real code, provider.read(&id, state.identifier.as_deref())
+            // would return State { exists: false, .. }.
+            let refreshed = State::not_found(id.clone());
+            orphan.with_refreshed_state(refreshed)
+        })
+        .collect();
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
@@ -2071,16 +2068,18 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &orphans,
         ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_explicit,
-        &HashMap::new(),
         &[],
     )
     .expect("test provider hints should succeed");
@@ -2163,16 +2162,18 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &carina_core::differ::Orphans::new(),
         ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_explicit,
-        &HashMap::new(),
         &[],
     )
     .expect("test provider hints should succeed");
@@ -2204,12 +2205,11 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     let desired: Vec<Resource> = vec![];
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
 
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    let current_states: HashMap<ResourceId, State> = HashMap::new();
 
-    // Simulate refresh=false code path: include orphans directly from state file
-    for (id, state) in state_file.build_orphan_states(&desired_ids) {
-        current_states.entry(id).or_insert(state);
-    }
+    // Simulate refresh=false: the typed orphan state is the cached state-file
+    // value and is not duplicated into `current_states`.
+    let orphans = state_file.build_orphans(&desired_ids);
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
@@ -2219,16 +2219,18 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &orphans,
         ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_explicit,
-        &HashMap::new(),
         &[],
     )
     .expect("test provider hints should succeed");
@@ -2271,15 +2273,17 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
         &SchemaRegistry::new(),
         &crate::empty_lifted_saved_attrs(),
-        &HashMap::new(),
         &HashMap::new(),
         &[],
     )
@@ -2531,15 +2535,17 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
         &ResolvedResource::collect_resolved(resources.iter().cloned()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
-            reloaded.as_map().clone(),
-            &schemas,
-            &resources,
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                reloaded.as_map().clone(),
+                &schemas,
+                &resources,
+            ),
+            &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
         &schemas,
         &crate::empty_lifted_saved_attrs(),
-        &HashMap::new(),
         &HashMap::new(),
         &[],
     )

@@ -1799,32 +1799,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
 }
 
 #[test]
-fn test_build_orphan_states_injects_binding() {
-    use carina_core::resource::{ConcreteValue, ResourceId, Value};
-
-    let mut state = StateFile::new();
-    let mut rs =
-        ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc").with_identifier("subnet-123");
-    rs.binding = Some("my_subnet".to_string());
-    rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
-    state
-        .upsert_resource(rs)
-        .expect("test state setup must be valid");
-
-    let desired_ids = std::collections::HashSet::new();
-    let orphans = state.build_orphan_states(&desired_ids);
-
-    let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "orphan-subnet", None);
-    let orphan_state = orphans.get(&id).unwrap();
-    assert!(orphan_state.exists);
-    assert_eq!(
-        orphan_state.attributes.get("_binding"),
-        Some(&Value::Concrete(ConcreteValue::String("my_subnet".into())))
-    );
-}
-
-#[test]
-fn test_build_orphan_dependencies() {
+fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     use carina_core::resource::ResourceId;
 
     let mut state = StateFile::new();
@@ -1832,28 +1807,237 @@ fn test_build_orphan_dependencies() {
         ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc").with_identifier("subnet-123");
     rs.binding = Some("my_subnet".to_string());
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
+    rs.directives.prevent_destroy = true;
+    rs.directives.depends_on = vec!["security_group".to_string()];
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
 
     let desired_ids = std::collections::HashSet::new();
-    let deps = state.build_orphan_dependencies(&desired_ids);
+    let mut orphans = state.build_orphans(&desired_ids);
 
     let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "orphan-subnet", None);
+    let orphan = orphans.remove(&id).unwrap();
+    let orphan_state = orphan.state();
+    assert!(orphan_state.exists);
+    assert!(
+        orphan_state
+            .attributes
+            .keys()
+            .all(|key| !key.starts_with('_')),
+        "provider-facing orphan state must not contain host metadata"
+    );
+    assert_eq!(orphan.binding(), Some("my_subnet"));
+    assert!(orphan.directives().prevent_destroy);
+    assert_eq!(orphan.directives().depends_on, ["security_group"]);
     assert_eq!(
-        deps.get(&id).unwrap(),
-        &BTreeSet::from(["my_vpc".to_string()])
+        orphan_state.dependency_bindings,
+        BTreeSet::from(["my_vpc".to_string()])
+    );
+
+    let fresh = carina_core::resource::State::existing(
+        id.clone(),
+        HashMap::from([(
+            "cidr_block".to_string(),
+            carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
+                "10.0.1.0/24".into(),
+            )),
+        )]),
+    )
+    .with_identifier("subnet-123");
+    let refreshed = orphan.with_refreshed_state(fresh);
+    assert_eq!(refreshed.binding(), Some("my_subnet"));
+    assert_eq!(refreshed.state().id, id);
+    assert!(refreshed.directives().prevent_destroy);
+    assert_eq!(refreshed.directives().depends_on, ["security_group"]);
+    assert_eq!(
+        refreshed.state().dependency_bindings,
+        BTreeSet::from(["my_vpc".to_string()])
+    );
+    assert!(refreshed.state().attributes.contains_key("cidr_block"));
+}
+
+#[test]
+fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
+    let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
+    let mut row =
+        ResourceState::new("test.Resource", "orphan", "mock").with_identifier("resource-123");
+    row.explicit = ExplicitFields::ListElements {
+        elements: vec![ExplicitFields::Struct {
+            children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)]),
+        }],
+    };
+    let fresh = State::existing(
+        id,
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("fresh".into())),
+        )]),
+    )
+    .with_identifier("resource-123");
+
+    let refreshed = row.refreshed_from_provider_state(&fresh, None).unwrap();
+
+    assert_eq!(
+        refreshed.explicit,
+        ExplicitFields::List {
+            element: Box::new(ExplicitFields::Struct {
+                children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)]),
+            }),
+        }
     );
 }
 
 #[test]
-fn test_state_file_version_is_v10() {
-    let state = StateFile::new();
-    assert_eq!(state.version, 10);
+fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
+    let legacy_keys = [
+        "_binding",
+        "_dependency_bindings",
+        "_virtual",
+        "_type",
+        "_default_tag_keys",
+    ];
+    let attributes = serde_json::Map::from_iter(
+        std::iter::once(("name".to_string(), serde_json::json!("kept"))).chain(
+            legacy_keys
+                .iter()
+                .map(|key| ((*key).to_string(), serde_json::json!("legacy"))),
+        ),
+    );
+    let explicit_children = serde_json::Map::from_iter(
+        std::iter::once(("name".to_string(), serde_json::json!({ "kind": "leaf" }))).chain(
+            legacy_keys
+                .iter()
+                .map(|key| ((*key).to_string(), serde_json::json!({ "kind": "leaf" }))),
+        ),
+    );
+    let json = serde_json::json!({
+        "version": 10,
+        "serial": 1,
+        "lineage": "legacy-reserved-attributes",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "legacy",
+            "provider": "mock",
+            "identifier": "resource-123",
+            "attributes": attributes,
+            "explicit": {
+                "kind": "struct",
+                "children": explicit_children,
+            },
+            "deposed": [{
+                "key": "old",
+                "identifier": "resource-old",
+                "attributes": {
+                    "name": "old",
+                    "_binding": "legacy_binding",
+                    "_type": "test.Resource",
+                },
+                "dependency_bindings": [],
+            }],
+        }],
+        "exports": {},
+    });
+
+    let state = check_and_migrate(&json.to_string())
+        .expect("legacy state should migrate")
+        .into_state();
+    let desired = Resource::with_provider("mock", "test.Resource", "legacy", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("kept".into())),
+    );
+    let resolved = ResolvedResource::new(desired);
+    let id = resolved.id.clone();
+    let current_states = HashMap::from([(id.clone(), state.build_state_for_resource(&id))]);
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        current_states,
+        &carina_core::schema::SchemaRegistry::new(),
+        &[],
+    );
+    let plan = carina_core::differ::create_plan(
+        &[resolved],
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        carina_core::differ::PlanPriorStates::new(
+            &plan_input_states,
+            &carina_core::differ::Orphans::new(),
+        ),
+        &state.build_directives(),
+        &carina_core::schema::SchemaRegistry::new(),
+        &state
+            .build_saved_attrs()
+            .lift(&carina_core::schema::SchemaRegistry::new()),
+        &state.build_explicit(),
+        &[],
+    )
+    .expect("legacy state plan should build");
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, carina_core::effect::Effect::Update { .. })),
+        "legacy host attributes must not produce an Update or provider patch: {:?}",
+        plan.effects()
+    );
+
+    let row = state
+        .find_resource("mock", "test.Resource", "legacy")
+        .expect("legacy row should remain");
+    assert_eq!(
+        row.persisted_attributes().keys().collect::<Vec<_>>(),
+        vec![&"name".to_string()]
+    );
+    assert_eq!(
+        row.deposed[0]
+            .persisted_attributes()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec![&"name".to_string()]
+    );
+    assert_explicit_struct_keys(&row.explicit, &["name"]);
+    assert!(!row.format_generations_for_state_show().contains("_binding"));
+    assert!(!row.format_generations_for_state_show().contains("_type"));
+
+    let generation = carina_core::effect::EffectGeneration::Deposed(row.deposed[0].key.clone());
+    let delete = carina_core::effect::Effect::Delete {
+        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+        identifier: "resource-old".to_string(),
+        generation: generation.clone(),
+        directives: Directives::default(),
+        binding: None,
+        dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
+    };
+    let mut delete_plan = carina_core::plan::Plan::new();
+    delete_plan.add(delete.clone());
+    let mut historical =
+        carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&delete_plan);
+    historical.set_delete_from_persisted(
+        carina_core::effect::DeletedInstanceKey::new(id, generation, "resource-old".to_string()),
+        row.deposed[0].persisted_attributes(),
+    );
+    let delete_rows = carina_core::detail_rows::build_detail_rows_by_instance(
+        &delete,
+        None,
+        carina_core::detail_rows::DetailLevel::Full,
+        &historical,
+        None,
+    );
+    assert_eq!(
+        delete_rows,
+        vec![carina_core::detail_rows::DetailRow::Attribute {
+            key: "name".to_string(),
+            value: "\"old\"".to_string(),
+            ref_binding: None,
+            annotation: None,
+        }]
+    );
 }
 
 #[test]
-fn v8_state_migrates_to_v10_with_empty_deposed() {
+fn v8_state_migrates_to_current_with_empty_deposed() {
     use super::check_and_migrate;
 
     let json = r#"{
@@ -1872,10 +2056,10 @@ fn v8_state_migrates_to_v10_with_empty_deposed() {
         ]
     }"#;
 
-    let outcome = check_and_migrate(json).expect("v8 state should migrate to v10");
+    let outcome = check_and_migrate(json).expect("v8 state should migrate to current");
     let migration = outcome
         .migration
-        .expect("v8 read should report a v10 migration");
+        .expect("v8 read should report a migration");
     assert_eq!(migration.from, 8);
     assert_eq!(migration.to, StateFile::CURRENT_VERSION);
     let row = outcome
@@ -1990,7 +2174,7 @@ fn check_and_migrate_retains_identifier_none_rows_only_when_deposed_is_non_empty
 }
 
 #[test]
-fn test_build_orphan_dependencies_excludes_desired() {
+fn test_build_orphans_excludes_desired() {
     use carina_core::resource::ResourceId;
 
     let mut state = StateFile::new();
@@ -2005,8 +2189,8 @@ fn test_build_orphan_dependencies_excludes_desired() {
     let mut desired_ids = std::collections::HashSet::new();
     desired_ids.insert(id.clone());
 
-    let deps = state.build_orphan_dependencies(&desired_ids);
-    assert!(deps.is_empty());
+    let orphans = state.build_orphans(&desired_ids);
+    assert!(orphans.is_empty());
 }
 
 #[test]
@@ -3456,7 +3640,7 @@ fn current_state_writes_and_reads_full_explicit_tree() {
 }
 
 #[test]
-fn v10_list_elements_state_round_trip_preserves_empty_and_populated_vectors() {
+fn current_list_elements_state_round_trip_preserves_empty_and_populated_vectors() {
     let mut state = StateFile::new();
     let mut populated =
         ResourceState::new("listener.Listener", "populated", "mock").with_identifier("one");
@@ -3480,13 +3664,13 @@ fn v10_list_elements_state_round_trip_preserves_empty_and_populated_vectors() {
     assert!(json.contains(r#""elements":[]"#));
     let back = check_and_migrate(&json).unwrap().into_state();
 
-    assert_eq!(back.version, 10);
+    assert_eq!(back.version, StateFile::CURRENT_VERSION);
     assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
     assert_eq!(back.resources[1].explicit, state.resources[1].explicit);
 }
 
 #[test]
-fn v9_legacy_list_survives_v10_lift_stays_conservative_and_self_heals_on_writeback() {
+fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_writeback() {
     use carina_core::differ::{Diff, diff};
 
     let json = r#"{
@@ -3524,7 +3708,7 @@ fn v9_legacy_list_survives_v10_lift_stays_conservative_and_self_heals_on_writeba
     }"#;
     let outcome = check_and_migrate(json).expect("v9 state must lift without a custom migration");
     assert_eq!(outcome.migration.unwrap().from, 9);
-    assert_eq!(outcome.state.version, 10);
+    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
     let state = outcome.state;
     let row = state
         .find_resource("mock", "listener.Listener", "listener")

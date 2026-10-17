@@ -31,7 +31,7 @@ use carina_cli::wiring::{PlanPreprocessor, WiringContext};
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::create_plan;
+use carina_core::differ::{Orphans, create_plan};
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     ProviderCheckInputs, UnresolvedResource, execute_plan,
@@ -519,6 +519,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let compositions = parsed.compositions.clone();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
     let mut data_sources = parsed.data_sources.clone();
+    let mut orphans = Orphans::new();
     let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
     preprocessor
         .prepare(
@@ -526,6 +527,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             &resource_origins,
             &module_gate,
             &mut current_states,
+            &mut orphans,
             &parsed.providers,
             &mut data_sources,
             &parsed.data_sources,
@@ -542,15 +544,17 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &resolved_resources_for_plan,
         &parsed.data_sources,
         &provider,
-        &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            ctx.schemas(),
-            &resources_for_plan,
+        carina_core::differ::PlanPriorStates::new(
+            &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                ctx.schemas(),
+                &resources_for_plan,
+            ),
+            &orphans,
         ),
         &HashMap::new(),
         ctx.schemas(),
         &saved_attrs,
-        &HashMap::new(),
         &HashMap::new(),
         &wait_bindings,
     )
