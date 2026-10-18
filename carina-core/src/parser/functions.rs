@@ -9,6 +9,7 @@ use super::types::parse_type_expr;
 use super::util::value_type_name;
 use super::{ProviderContext, Rule, parse_expression};
 use crate::eval_value::EvalValue;
+use crate::provider::CanonicalCustomTypeValue;
 use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
 use crate::schema::{
     TypeIdentity, validate_http_response_status_code, validate_ipv4_address, validate_ipv4_cidr,
@@ -259,9 +260,10 @@ pub fn validate_custom_type(
     // Built-in DSL custom types carry no provider axis — match on `kind`.
     let builtin = identity.provider.is_none() && identity.segments.is_empty();
     fn text(value: &Value) -> Option<&str> {
-        value
-            .as_concrete()
-            .and_then(|concrete| concrete.as_string_like())
+        match value.as_concrete()? {
+            crate::resource::ConcreteValueRef::CanonicalEnum(value) => Some(value.api_value()),
+            concrete => concrete.as_string_like(),
+        }
     }
     match (builtin.then_some(identity.kind.as_str()), value) {
         (Some("Ipv4Cidr"), value) if text(value).is_some() => {
@@ -310,13 +312,22 @@ pub fn validate_custom_type(
             // Check custom validators from config (schema-extracted),
             // keyed by the full structured identity so two providers'
             // same-named types do not collide.
-            let s = text(value).unwrap();
+            let authored_text = text(value).unwrap();
+            let canonical = canonical_custom_type_value(identity, value, config)?;
+            let validation_text = canonical
+                .as_ref()
+                .map_or(authored_text, CanonicalCustomTypeValue::as_str);
             if let Some(validator) = config.validators.get(identity) {
-                validator(s)?;
+                validator(validation_text)?;
             }
             // Fall back to factory-based validator (e.g., WASM providers)
             if let Some(ref factory_validator) = config.custom_type_validator {
-                factory_validator(identity, s)
+                let canonical = canonical.ok_or_else(|| {
+                    format!(
+                        "cannot resolve enum identifier `{authored_text}` through declared type {identity}"
+                    )
+                })?;
+                factory_validator(identity, &canonical)
             } else {
                 Ok(())
             }
@@ -329,6 +340,61 @@ pub fn validate_custom_type(
     }
 }
 
+fn canonical_custom_type_value(
+    identity: &TypeIdentity,
+    value: &Value,
+    config: &ProviderContext,
+) -> Result<Option<CanonicalCustomTypeValue>, String> {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => {
+            if let Some(declared_type) = config.custom_type_attribute_types.get(identity)
+                && declared_type.enum_parts().is_some()
+            {
+                let canonical = crate::resource::EnumValueResolver::new(declared_type)
+                    .resolve_state_text(value.expose_plaintext())
+                    .map_err(|error| error.to_string())?;
+                if !canonical.identity().same_type(identity) {
+                    return Err(format!(
+                        "expected {identity}, got resolved enum {}",
+                        canonical.identity()
+                    ));
+                }
+                return Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(
+                    &canonical,
+                )));
+            }
+            Ok(Some(CanonicalCustomTypeValue::from_literal_string(value)))
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+            if !value.identity().same_type(identity) {
+                return Err(format!(
+                    "expected {identity}, got canonical enum {}",
+                    value.identity()
+                ));
+            }
+            Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(value)))
+        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+            let Some(declared_type) = config.custom_type_attribute_types.get(identity) else {
+                return Ok(None);
+            };
+            let canonical = crate::resource::EnumValueResolver::new(declared_type)
+                .resolve_raw(raw)
+                .map_err(|error| error.to_string())?;
+            if !canonical.identity().same_type(identity) {
+                return Err(format!(
+                    "expected {identity}, got resolved enum {}",
+                    canonical.identity()
+                ));
+            }
+            Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(
+                &canonical,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Check that a function argument matches the declared parameter type.
 fn check_fn_arg_type(
     fn_name: &str,
@@ -337,6 +403,14 @@ fn check_fn_arg_type(
     value: &Value,
     ctx: &ParseContext,
 ) -> Result<(), ParseError> {
+    // Function annotations are parsed before provider schemas are necessarily
+    // available, so dotted types intentionally enter the AST unresolved. When
+    // this call runs with an enriched context, resolve the annotation at the
+    // checking seam so provider custom-type validation receives the same
+    // canonical API spelling as module arguments, attributes, and exports.
+    let resolved_type_expr = crate::validation::resolve_type_expr(type_expr, ctx.config).ok();
+    let type_expr = resolved_type_expr.as_ref().unwrap_or(type_expr);
+
     if let Err(mismatch) =
         crate::validation::typecheck::check_type_expr_value(type_expr, value, ctx.config)
     {

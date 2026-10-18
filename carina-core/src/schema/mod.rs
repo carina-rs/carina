@@ -12,11 +12,11 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::parser::display_string_literal;
 use crate::resource::{
-    ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver, RawEnumIdentifier, Resource,
-    Value, ValueString,
+    CanonicalEnumValue, ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver,
+    RawEnumIdentifier, Resource, Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
-use crate::value::format_value_with_key;
+use crate::value::{CanonicalizationPurpose, DesiredValueSource, format_value_with_key};
 
 mod resolved_attr_type;
 mod resolved_union_members;
@@ -226,7 +226,26 @@ fn walk_custom_lookup_on_path<'a>(
             run_identified_lookup(identity.as_ref(), value, attr_name, lookup, errors)
         }
         AttrTypeKind::Enum { identity, .. } => {
-            if let Err(e) = lookup(identity, value) {
+            let resolver = EnumValueResolver::with_defs(attr_type, defs);
+            let canonical = match value {
+                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver.resolve_raw(raw),
+                Value::Concrete(ConcreteValue::String(text)) => {
+                    resolver.resolve_state_text(text.expose_plaintext())
+                }
+                Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                    if value.identity().same_type(identity) =>
+                {
+                    Ok(value.clone())
+                }
+                _ => return,
+            };
+            let Ok(canonical) = canonical else {
+                // The schema validation pass reports the resolver failure. Do
+                // not call a provider validator with an unresolved spelling.
+                return;
+            };
+            let resolved = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
+            if let Err(e) = lookup(identity, &resolved) {
                 let message = match e {
                     TypeError::ValidationFailed { message } => message,
                     other => other.to_string(),
@@ -1207,20 +1226,17 @@ impl Schema {
         self.validate_attr(&self.root, value)
     }
 
-    /// Canonicalize a `Value` against `attr_type` using this schema's
-    /// `defs` map. The Schema-aware entry point for the
-    /// `string_or_list_of_strings` and `Ref` walks (carina#3345). This
-    /// is the only way to invoke canonicalization from outside
-    /// `carina-core`, so callers cannot accidentally drop `defs`.
-    pub fn canonicalize_attr(&self, attr: &AttributeType, value: Value) -> Value {
-        crate::value::canonicalize_with_type(value, attr, &self.defs)
+    /// Canonicalize provider or persisted state against `attr_type` using this
+    /// schema's `defs` map. Unrecognized enum-positioned strings remain
+    /// literal state text. Desired values use the strict host pipeline rather
+    /// than this state-only entry point.
+    pub fn canonicalize_state_attr(&self, attr: &AttributeType, value: Value) -> Value {
+        crate::value::canonicalize_state_with_type(value, attr, &self.defs)
     }
 
-    /// Canonicalize a `Value` against this schema's `root`. Wrapper
-    /// over [`Self::canonicalize_attr`] for the common case where the
-    /// caller is driving from `Schema::root`.
-    pub fn canonicalize(&self, value: Value) -> Value {
-        self.canonicalize_attr(&self.root, value)
+    /// Canonicalize provider or persisted state against this schema's root.
+    pub fn canonicalize_state(&self, value: Value) -> Value {
+        self.canonicalize_state_attr(&self.root, value)
     }
 
     /// Schema-aware path-collecting validator. Equivalent to
@@ -1246,8 +1262,26 @@ impl Schema {
         value: &Value,
         out: &mut Vec<(FieldPath, TypeError)>,
     ) {
+        if fit_value_to_type(
+            attr,
+            value,
+            &self.defs,
+            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+        )
+        .is_some()
+        {
+            return;
+        }
+
+        let error_count = out.len();
         let mut visited_refs = Vec::new();
         self.collect_attr_into_on_path(attr, path, value, out, &mut visited_refs);
+        if out.len() == error_count {
+            let error = self
+                .validate_attr(attr, value)
+                .expect_err("a rejected fit must produce a validation diagnostic");
+            out.push((path.clone(), error));
+        }
     }
 
     fn collect_attr_into_on_path<'a>(
@@ -1313,13 +1347,12 @@ impl Schema {
                     return;
                 };
 
-                let accepted = build_accepted_field_map(fields);
                 let canonical_field_names: Vec<&str> =
                     fields.iter().map(|f| f.name.as_str()).collect();
 
                 // Required-field check.
                 for f in fields {
-                    if f.is_required() && !map.contains_key(&f.name) {
+                    if f.is_required() && !struct_field_is_present(fields, map, f) {
                         let field_path = path.push_field(f.name.clone());
                         out.push((
                             field_path,
@@ -1331,7 +1364,7 @@ impl Schema {
                 }
 
                 for (k, v) in map {
-                    match accepted.get(k.as_str()) {
+                    match struct_field_for_key(fields, k) {
                         Some(field) => {
                             let next_path = path.push_field(k.clone());
                             if let Some(error) = validate_struct_field_assignment(field, k) {
@@ -1356,6 +1389,8 @@ impl Schema {
             }
             AttrTypeKind::List {
                 element_type: inner,
+                length,
+                validate,
                 ..
             } => {
                 let Some(items) = (match concrete {
@@ -1371,9 +1406,19 @@ impl Schema {
                     ));
                     return;
                 };
+                if let Err(error) = validate_list_length(*length, items.len()) {
+                    out.push((path.clone(), error));
+                    return;
+                }
+                let error_count = out.len();
                 for (i, item) in items.iter().enumerate() {
                     let next_path = path.push_index(i);
                     self.collect_attr_into(inner, &next_path, item, out);
+                }
+                if out.len() == error_count
+                    && let Err(error) = validate(value)
+                {
+                    out.push((path.clone(), error));
                 }
             }
             // Keep Union membership and best-scoring failure selection
@@ -1403,8 +1448,7 @@ impl Schema {
     /// resource's attribute type plus the resource's struct-definition
     /// map) can validate without re-rooting the schema.
     pub fn validate_attr(&self, attr: &AttributeType, value: &Value) -> Result<(), TypeError> {
-        let mut visited_refs = Vec::new();
-        self.validate_attr_on_path(attr, value, &mut visited_refs)
+        validate_attr_with_defs(attr, value, &self.defs)
     }
 
     fn validate_attr_on_path<'a>(
@@ -1413,128 +1457,186 @@ impl Schema {
         value: &Value,
         visited_refs: &mut Vec<&'a str>,
     ) -> Result<(), TypeError> {
-        if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            return self
-                .validate_attr_on_path(attr, inner, visited_refs)
-                .map_err(TypeError::masked_for_secret);
+        validate_attr_with_defs_on_path(attr, value, &self.defs, visited_refs)
+    }
+}
+
+fn validate_attr_with_defs(
+    attr: &AttributeType,
+    value: &Value,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Result<(), TypeError> {
+    if fit_value_to_type(
+        attr,
+        value,
+        defs,
+        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+    )
+    .is_some()
+    {
+        return Ok(());
+    }
+
+    let mut visited_refs = Vec::new();
+    validation_error_with_defs_on_path(attr, value, defs, &mut visited_refs).and_then(|()| {
+        Err(TypeError::TypeMismatch {
+            expected: attr.type_name(),
+            got: value.type_name(),
+        })
+    })
+}
+
+fn validate_attr_with_defs_on_path<'a>(
+    attr: &'a AttributeType,
+    value: &Value,
+    defs: &'a BTreeMap<String, AttributeType>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Result<(), TypeError> {
+    if fit_value_to_type_on_path(
+        attr,
+        value,
+        defs,
+        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+        visited_refs,
+    )
+    .is_some()
+    {
+        return Ok(());
+    }
+
+    validation_error_with_defs_on_path(attr, value, defs, visited_refs).and_then(|()| {
+        Err(TypeError::TypeMismatch {
+            expected: attr.type_name(),
+            got: value.type_name(),
+        })
+    })
+}
+
+/// Produce the existing path-rich diagnostic after the authoritative fit
+/// computation has rejected a value. This walker is deliberately off the
+/// success path: acceptance is exactly `fit.is_some()`, while the established
+/// shape-based Union error attribution remains unchanged.
+fn validation_error_with_defs_on_path<'a>(
+    attr: &'a AttributeType,
+    value: &Value,
+    defs: &'a BTreeMap<String, AttributeType>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Result<(), TypeError> {
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        return validation_error_with_defs_on_path(attr, inner, defs, visited_refs)
+            .map_err(TypeError::masked_for_secret);
+    }
+    match &attr.kind {
+        AttrTypeKind::Ref(_) => {
+            let resolution = resolve_refs_on_path(attr, defs, visited_refs)
+                .map_err(RefResolutionFailure::into_validation_error)?;
+            let result =
+                validation_error_with_defs_on_path(resolution.attr, value, defs, visited_refs);
+            visited_refs.truncate(resolution.restore_len);
+            result
         }
-        match &attr.kind {
-            AttrTypeKind::Ref(_) => {
-                let resolution = resolve_refs_on_path(attr, &self.defs, visited_refs)
-                    .map_err(RefResolutionFailure::into_validation_error)?;
-                let result = self.validate_attr_on_path(resolution.attr, value, visited_refs);
-                visited_refs.truncate(resolution.restore_len);
-                result
-            }
-            AttrTypeKind::List {
-                element_type: inner,
-                ordered,
-                length,
-                validate,
-            } => {
-                if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
-                    for (i, item) in items.iter().enumerate() {
-                        if let Err(inner_err) = self.validate_attr(inner, item) {
-                            return Err(TypeError::ListItemError {
-                                index: i,
-                                inner: Box::new(inner_err),
-                            });
-                        }
+        AttrTypeKind::List {
+            element_type: inner,
+            ordered,
+            length,
+            validate,
+        } => {
+            if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
+                validate_list_length(*length, items.len())?;
+                for (i, item) in items.iter().enumerate() {
+                    if let Err(inner_err) = validate_attr_with_defs(inner, item, defs) {
+                        return Err(TypeError::ListItemError {
+                            index: i,
+                            inner: Box::new(inner_err),
+                        });
                     }
-                    Ok(())
-                } else if value.as_concrete().is_none() {
-                    // Deferred — leave for the deferred-aware checker.
-                    Ok(())
-                } else {
-                    // Fall back to the standalone validator for the
-                    // not-a-list error. `ordered` is irrelevant when
-                    // the value is not even a list.
-                    let _ = ordered;
-                    AttributeType {
-                        kind: AttrTypeKind::List {
-                            element_type: inner.clone(),
-                            ordered: *ordered,
-                            length: *length,
-                            validate: validate.clone(),
-                        },
-                    }
-                    .validate(value)
                 }
-            }
-            AttrTypeKind::Map { key, value: val_ty } => {
-                if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
-                    for (k, v) in map.iter() {
-                        let key_val = lift_map_key(key, k);
-                        if let Err(inner_err) = self.validate_attr(key, &key_val) {
-                            return Err(TypeError::MapKeyError {
-                                key: k.clone(),
-                                inner: Box::new(inner_err),
-                            });
-                        }
-                        if let Err(inner_err) = self.validate_attr(val_ty, v) {
-                            return Err(TypeError::MapValueError {
-                                key: k.clone(),
-                                inner: Box::new(inner_err),
-                            });
-                        }
-                    }
-                    Ok(())
-                } else {
-                    AttributeType {
-                        kind: AttrTypeKind::Map {
-                            key: key.clone(),
-                            value: val_ty.clone(),
-                        },
-                    }
-                    .validate(value)
+                validate(value)
+            } else if value.as_concrete().is_none() {
+                Ok(())
+            } else {
+                AttributeType {
+                    kind: AttrTypeKind::List {
+                        element_type: inner.clone(),
+                        ordered: *ordered,
+                        length: *length,
+                        validate: validate.clone(),
+                    },
                 }
+                .validate(value)
             }
-            AttrTypeKind::Struct { name, fields } => {
-                if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
-                    validate_struct_fields(
-                        name,
-                        fields,
-                        map,
-                        |field| TypeError::MissingRequired {
-                            name: field.name.clone(),
-                        },
-                        |input_name, field, field_value| {
-                            self.validate_attr(&field.field_type, field_value).map_err(
-                                |inner_err| TypeError::StructFieldError {
-                                    field: input_name.to_string(),
-                                    inner: Box::new(inner_err),
-                                },
-                            )
-                        },
-                    )
-                } else {
-                    AttributeType {
-                        kind: AttrTypeKind::Struct {
-                            name: name.clone(),
-                            fields: fields.clone(),
-                        },
+        }
+        AttrTypeKind::Map { key, value: val_ty } => {
+            if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
+                for (k, v) in map.iter() {
+                    let key_val = lift_map_key(key, k, defs);
+                    if let Err(inner_err) = validate_attr_with_defs(key, &key_val, defs) {
+                        return Err(TypeError::MapKeyError {
+                            key: k.clone(),
+                            inner: Box::new(inner_err),
+                        });
                     }
-                    .validate(value)
+                    if let Err(inner_err) = validate_attr_with_defs(val_ty, v, defs) {
+                        return Err(TypeError::MapValueError {
+                            key: k.clone(),
+                            inner: Box::new(inner_err),
+                        });
+                    }
                 }
+                Ok(())
+            } else {
+                AttributeType {
+                    kind: AttrTypeKind::Map {
+                        key: key.clone(),
+                        value: val_ty.clone(),
+                    },
+                }
+                .validate(value)
             }
-            AttrTypeKind::Union(members) => {
-                let Some(concrete) = value.as_concrete() else {
-                    return Ok(());
-                };
-                validate_union_members(
-                    members.as_raw_slice(),
-                    concrete,
-                    attr.type_name(),
-                    &self.defs,
-                    visited_refs,
-                    |member, visited_refs| self.validate_attr_on_path(member, value, visited_refs),
+        }
+        AttrTypeKind::Struct { name, fields } => {
+            if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
+                validate_struct_fields(
+                    name,
+                    fields,
+                    map,
+                    |field| TypeError::MissingRequired {
+                        name: field.name.clone(),
+                    },
+                    |input_name, field, field_value| {
+                        validate_attr_with_defs(&field.field_type, field_value, defs).map_err(
+                            |inner_err| TypeError::StructFieldError {
+                                field: input_name.to_string(),
+                                inner: Box::new(inner_err),
+                            },
+                        )
+                    },
                 )
+            } else {
+                AttributeType {
+                    kind: AttrTypeKind::Struct {
+                        name: name.clone(),
+                        fields: fields.clone(),
+                    },
+                }
+                .validate(value)
             }
-            // For non-recursive variants, delegate to the standalone
-            // validator. Any `Ref` they could reach has already been
-            // peeled off by the arms above.
-            _ => attr.validate(value),
         }
+        AttrTypeKind::Union(members) => {
+            let Some(concrete) = value.as_concrete() else {
+                return Ok(());
+            };
+            select_union_member_on_path(
+                members.as_raw_slice(),
+                value,
+                concrete,
+                attr.type_name(),
+                defs,
+                visited_refs,
+            )
+            .map(|_| ())
+        }
+        _ => attr.validate(value),
     }
 }
 
@@ -1729,12 +1831,21 @@ impl fmt::Display for FieldPath {
 /// expects. Enum map keys are lifted to `EnumIdentifier` so
 /// the strict carina#2986 validator accepts the bare-identifier form
 /// users write in source; every other key type lowers to `String`
-/// (carina#2996). Shared between `Schema::validate_attr`'s Map arm
+/// (carina#2996). Top-level key-type Refs are peeled through `defs`;
+/// an unresolved Ref stays on the ordinary validation-error path rather
+/// than panicking here. Shared between `Schema::validate_attr`'s Map arm
 /// and the standalone `validate_map` so the two walkers cannot
 /// drift again (carina#3347).
-pub(crate) fn lift_map_key(key_type: &AttributeType, key: &str) -> Value {
-    if matches!(&key_type.kind, AttrTypeKind::Enum { .. }) {
-        EnumValueResolver::new(key_type)
+pub(crate) fn lift_map_key(
+    key_type: &AttributeType,
+    key: &str,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Value {
+    let mut visited_refs = Vec::new();
+    let is_enum = resolve_refs_on_path(key_type, defs, &mut visited_refs)
+        .is_ok_and(|resolution| matches!(&resolution.attr.kind, AttrTypeKind::Enum { .. }));
+    if is_enum {
+        EnumValueResolver::with_defs(key_type, defs)
             .resolve_state_text(key)
             .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
             .unwrap_or_else(|_| Value::Concrete(ConcreteValue::enum_identifier(key.to_string())))
@@ -2451,25 +2562,27 @@ impl AttributeType {
     ///    decision lives.
     ///
     /// Recursive descent into `List`/`Map`/`Struct` element types uses
-    /// `inner.validate(&Value)` again, so each nested element is
+    /// the same definition map again, so each nested element is
     /// independently re-projected. Lists may legitimately mix concrete
     /// and deferred elements (e.g. `[vpc.id, "literal"]`).
     pub(crate) fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        self.validate_with_defs(value, empty_defs_for_schema_walks())
+    }
+
+    fn validate_with_defs(
+        &self,
+        value: &Value,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Result<(), TypeError> {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            return self.validate(inner).map_err(TypeError::masked_for_secret);
+            return self
+                .validate_with_defs(inner, defs)
+                .map_err(TypeError::masked_for_secret);
         }
-        // `Ref` cannot be resolved without a `Schema` context. Callers
-        // who hold a schema that contains `Ref` must go through
-        // `Schema::validate` / `Schema::validate_attr`; falling through
-        // here would silently accept any value, defeating type safety
-        // (carina#3340).
-        if let AttrTypeKind::Ref(name) = &self.kind {
-            return Err(TypeError::ValidationFailed {
-                message: format!(
-                    "internal: AttributeType::Ref(\"{name}\") reached the standalone \
-                     validator; this attribute must be validated through Schema::validate"
-                ),
-            });
+        if matches!(&self.kind, AttrTypeKind::Ref(_)) {
+            let resolution = resolve_refs_on_path(self, defs, &mut Vec::new())
+                .map_err(RefResolutionFailure::into_validation_error)?;
+            return resolution.attr.validate_with_defs(value, defs);
         }
         // Enum attributes assigned a bare `BindingRef` are the
         // shadowing collision case described in #2978: the user wrote a
@@ -2502,10 +2615,14 @@ impl AttributeType {
         let Some(concrete) = value.as_concrete() else {
             return Ok(());
         };
-        self.validate_concrete(concrete)
+        self.validate_concrete(concrete, defs)
     }
 
-    fn validate_concrete(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
+    fn validate_concrete(
+        &self,
+        value: ConcreteValueRef<'_>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Result<(), TypeError> {
         match &self.kind {
             AttrTypeKind::Enum {
                 identity,
@@ -2523,10 +2640,10 @@ impl AttributeType {
                 to_dsl.as_ref(),
                 value,
             ),
-            AttrTypeKind::List { .. } => self.validate_list(value),
-            AttrTypeKind::Map { .. } => self.validate_map(value),
-            AttrTypeKind::Struct { .. } => self.validate_struct(value),
-            AttrTypeKind::Union(_) => self.validate_union(value),
+            AttrTypeKind::List { .. } => self.validate_list(value, defs),
+            AttrTypeKind::Map { .. } => self.validate_map(value, defs),
+            AttrTypeKind::Struct { .. } => self.validate_struct(value, defs),
+            AttrTypeKind::Union(_) => self.validate_union(value, defs),
             AttrTypeKind::String { .. }
             | AttrTypeKind::ResourceHandle { .. }
             | AttrTypeKind::StringLiteralSet { .. }
@@ -2570,10 +2687,9 @@ impl AttributeType {
                 validate_string_refinement(identity.as_ref(), pattern.as_deref(), *length, s)?;
                 validate(&value.to_owned_value())
             }
-            (
-                AttrTypeKind::ResourceHandle { validate, .. },
-                ConcreteValueRef::String(_) | ConcreteValueRef::EnumIdentifier(_),
-            ) => validate(&value.to_owned_value()),
+            (AttrTypeKind::ResourceHandle { validate, .. }, ConcreteValueRef::String(_)) => {
+                validate(&value.to_owned_value())
+            }
             (
                 AttrTypeKind::StringLiteralSet { values, validate },
                 ConcreteValueRef::String(value),
@@ -2799,7 +2915,11 @@ impl AttributeType {
     /// projection returns `None` for them and the dispatcher returns
     /// `Ok(())` immediately. Type fitness for upstream list refs is
     /// the deferred-aware checker's job.
-    fn validate_list(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
+    fn validate_list(
+        &self,
+        value: ConcreteValueRef<'_>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Result<(), TypeError> {
         let AttrTypeKind::List {
             element_type: inner,
             length,
@@ -2817,7 +2937,7 @@ impl AttributeType {
             validate_list_length(*length, items.len())?;
             for (i, s) in items.iter().enumerate() {
                 inner
-                    .validate(&Value::Concrete(ConcreteValue::String(s.clone())))
+                    .validate_with_defs(&Value::Concrete(ConcreteValue::String(s.clone())), defs)
                     .map_err(|e| TypeError::ListItemError {
                         index: i,
                         inner: Box::new(e),
@@ -2833,10 +2953,12 @@ impl AttributeType {
         };
         validate_list_length(*length, items.len())?;
         for (i, item) in items.iter().enumerate() {
-            inner.validate(item).map_err(|e| TypeError::ListItemError {
-                index: i,
-                inner: Box::new(e),
-            })?;
+            inner
+                .validate_with_defs(item, defs)
+                .map_err(|e| TypeError::ListItemError {
+                    index: i,
+                    inner: Box::new(e),
+                })?;
         }
         validate(&value.to_owned_value())
     }
@@ -2846,7 +2968,11 @@ impl AttributeType {
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. Mirrors the
     /// `validate_list` migration — deferred values are filtered at the
     /// dispatcher and cannot reach here.
-    fn validate_map(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
+    fn validate_map(
+        &self,
+        value: ConcreteValueRef<'_>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Result<(), TypeError> {
         let AttrTypeKind::Map {
             key: key_type,
             value: inner,
@@ -2861,19 +2987,21 @@ impl AttributeType {
             });
         };
         for k in map.keys() {
-            let key_value = lift_map_key(key_type, k);
+            let key_value = lift_map_key(key_type, k, defs);
             key_type
-                .validate(&key_value)
+                .validate_with_defs(&key_value, defs)
                 .map_err(|e| TypeError::MapKeyError {
                     key: k.clone(),
                     inner: Box::new(e),
                 })?;
         }
         for (k, v) in map {
-            inner.validate(v).map_err(|e| TypeError::MapValueError {
-                key: k.clone(),
-                inner: Box::new(e),
-            })?;
+            inner
+                .validate_with_defs(v, defs)
+                .map_err(|e| TypeError::MapValueError {
+                    key: k.clone(),
+                    inner: Box::new(e),
+                })?;
         }
         Ok(())
     }
@@ -2887,7 +3015,11 @@ impl AttributeType {
     ///
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]; deferred values
     /// are filtered upstream by the dispatcher.
-    fn validate_struct(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
+    fn validate_struct(
+        &self,
+        value: ConcreteValueRef<'_>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Result<(), TypeError> {
         let AttrTypeKind::Struct { name, fields } = &self.kind else {
             unreachable!("validate_struct called on non-Struct");
         };
@@ -2916,12 +3048,13 @@ impl AttributeType {
                 }),
             },
             |input_name, field, field_value| {
-                field.field_type.validate(field_value).map_err(|inner_err| {
-                    TypeError::StructFieldError {
+                field
+                    .field_type
+                    .validate_with_defs(field_value, defs)
+                    .map_err(|inner_err| TypeError::StructFieldError {
                         field: input_name.to_string(),
                         inner: Box::new(inner_err),
-                    }
-                })
+                    })
             },
         )
     }
@@ -2937,19 +3070,25 @@ impl AttributeType {
     /// combined into a Union-level alternatives diagnostic. When no
     /// member shares any structural similarity, fall through to
     /// `TypeMismatch`. See #2219 and #3754.
-    fn validate_union(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
+    fn validate_union(
+        &self,
+        value: ConcreteValueRef<'_>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Result<(), TypeError> {
         let AttrTypeKind::Union(types) = &self.kind else {
             unreachable!("validate_union called on non-Union");
         };
+        let original = value.to_owned_value();
         let mut visited_refs = Vec::new();
-        validate_union_members(
+        select_union_member_on_path(
             types.as_raw_slice(),
+            &original,
             value,
             self.type_name(),
-            empty_defs_for_schema_walks(),
+            defs,
             &mut visited_refs,
-            |member, _| member.validate_concrete(value),
         )
+        .map(|_| ())
     }
 
     pub fn type_name(&self) -> String {
@@ -3609,16 +3748,426 @@ fn validate_float_range(
     Ok(())
 }
 
-/// Total ordering axis for choosing one Union member to canonicalize through.
+/// Ordered exactness accumulated across an entire value tree.
 ///
-/// This newtype is deliberately distinct from [`UnionDiagnosticIdentity`]:
-/// ranking two members and deciding whether their field matches are diagnostic
-/// alternatives are different operations, and interchanging them must not
-/// type-check (carina#3080, carina#3754).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct UnionCanonicalRank(u32);
+/// Fewer coercions always win. The secondary generic-map cost preserves the
+/// historical preference for a closed Struct that accepts every supplied key
+/// over an otherwise-equivalent homogeneous Map. Exact ties retain declaration
+/// order.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct FitExactness {
+    coercions: u32,
+    generic_maps: u32,
+}
 
-impl UnionCanonicalRank {
+impl FitExactness {
+    const EXACT: Self = Self {
+        coercions: 0,
+        generic_maps: 0,
+    };
+
+    const COERCIBLE: Self = Self {
+        coercions: 1,
+        generic_maps: 0,
+    };
+
+    const GENERIC_MAP: Self = Self {
+        coercions: 0,
+        generic_maps: 1,
+    };
+
+    fn combine(&mut self, child: Self) {
+        self.coercions = self.coercions.saturating_add(child.coercions);
+        self.generic_maps = self.generic_maps.saturating_add(child.generic_maps);
+    }
+
+    fn is_maximal(self) -> bool {
+        self == Self::EXACT
+    }
+}
+
+impl PartialOrd for FitExactness {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FitExactness {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .coercions
+            .cmp(&self.coercions)
+            .then_with(|| other.generic_maps.cmp(&self.generic_maps))
+    }
+}
+
+/// A successful purpose-aware fit plus the decisions needed to consume it.
+///
+/// The witness owns every nested Union choice and resolved enum value. A
+/// canonicalization caller can therefore walk the chosen tree without running
+/// validation or enum resolution a second time.
+pub(crate) struct Fit<'a> {
+    exactness: FitExactness,
+    pub(crate) attr: &'a AttributeType,
+    pub(crate) kind: FitKind<'a>,
+}
+
+pub(crate) enum FitKind<'a> {
+    PassThrough,
+    Deferred,
+    Secret(Box<Fit<'a>>),
+    Enum {
+        canonical: CanonicalEnumValue,
+        rewrite: bool,
+    },
+    List(Vec<Fit<'a>>),
+    StringList(Vec<Fit<'a>>),
+    Map(Vec<MapEntryFit<'a>>),
+    Struct(Vec<Fit<'a>>),
+    Union {
+        member: &'a AttributeType,
+        fit: Box<Fit<'a>>,
+    },
+}
+
+pub(crate) struct MapEntryFit<'a> {
+    pub(crate) canonical_key: Option<String>,
+    pub(crate) value: Fit<'a>,
+}
+
+fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
+    match &fit.kind {
+        FitKind::Enum { canonical, .. } => Some(canonical.api_value().to_string()),
+        FitKind::Union { fit, .. } => canonical_enum_key_from_fit(fit),
+        FitKind::PassThrough
+        | FitKind::Deferred
+        | FitKind::Secret(_)
+        | FitKind::List(_)
+        | FitKind::StringList(_)
+        | FitKind::Map(_)
+        | FitKind::Struct(_) => None,
+    }
+}
+
+impl Fit<'_> {
+    fn with_kind<'a>(
+        exactness: FitExactness,
+        attr: &'a AttributeType,
+        kind: FitKind<'a>,
+    ) -> Fit<'a> {
+        Fit {
+            exactness,
+            attr,
+            kind,
+        }
+    }
+}
+
+impl PartialEq for Fit<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.exactness == other.exactness
+    }
+}
+
+impl Eq for Fit<'_> {}
+
+impl PartialOrd for Fit<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Fit<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.exactness.cmp(&other.exactness)
+    }
+}
+
+struct UnionFit<'a> {
+    member: &'a AttributeType,
+    fit: Fit<'a>,
+}
+
+/// Compute the complete fit of `value` against `attr` for `purpose`.
+///
+/// Ref paths are retained only while examining the same value node. Container
+/// descent starts a fresh path because it consumes one value level, allowing a
+/// recursive schema to revisit the same definition for a child value.
+pub(crate) fn fit_value_to_type<'a>(
+    attr: &'a AttributeType,
+    value: &Value,
+    defs: &'a BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+) -> Option<Fit<'a>> {
+    fit_value_to_type_on_path(attr, value, defs, purpose, &mut Vec::new())
+}
+
+fn fit_value_to_type_on_path<'a>(
+    attr: &'a AttributeType,
+    value: &Value,
+    defs: &'a BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    let resolution = resolve_refs_on_path(attr, defs, visited_refs).ok()?;
+    let resolved = resolution.attr;
+    let fit = fit_value_to_resolved_type_on_path(resolved, value, defs, purpose, visited_refs);
+    visited_refs.truncate(resolution.restore_len);
+    fit
+}
+
+pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
+    attr: &'a AttributeType,
+    value: &Value,
+    defs: &'a BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    use AttrTypeKind as AT;
+
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        let inner = fit_value_to_resolved_type_on_path(attr, inner, defs, purpose, visited_refs)?;
+        let exactness = inner.exactness;
+        return Some(Fit::with_kind(
+            exactness,
+            attr,
+            FitKind::Secret(Box::new(inner)),
+        ));
+    }
+
+    if let AT::Enum {
+        values: Some(values),
+        dsl_aliases,
+        ..
+    } = &attr.kind
+        && let Some(binding) = bare_binding_name(value)
+        && enum_alias_collides_with(binding, values, dsl_aliases)
+    {
+        return None;
+    }
+
+    let Some(concrete) = value.as_concrete() else {
+        return Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred));
+    };
+
+    match (&attr.kind, concrete) {
+        (AT::Enum { identity, .. }, ConcreteValueRef::CanonicalEnum(canonical))
+            if canonical.identity().same_type(identity) =>
+        {
+            Some(Fit::with_kind(
+                FitExactness::EXACT,
+                attr,
+                FitKind::Enum {
+                    canonical: canonical.clone(),
+                    rewrite: false,
+                },
+            ))
+        }
+        (AT::Enum { identity, .. }, ConcreteValueRef::EnumIdentifier(raw)) => {
+            let resolver = EnumValueResolver::with_defs(attr, defs);
+            let canonical = if purpose.resolves_identifiers_as_state_text() {
+                resolver.resolve_state_text(raw.as_str())
+            } else if let Some(provider_name) = purpose.provider_config_name() {
+                crate::value::resolve_provider_config_enum_identifier(
+                    &resolver,
+                    raw,
+                    identity,
+                    provider_name,
+                )
+            } else {
+                resolver.resolve_raw(raw)
+            }
+            .ok()?;
+            Some(Fit::with_kind(
+                FitExactness::EXACT,
+                attr,
+                FitKind::Enum {
+                    canonical,
+                    rewrite: true,
+                },
+            ))
+        }
+        (AT::Enum { values, .. }, ConcreteValueRef::String(text))
+            if purpose.accepts_enum_string(values.is_some()) =>
+        {
+            let canonical = EnumValueResolver::with_defs(attr, defs)
+                .resolve_state_text(text.expose_plaintext())
+                .ok()?;
+            Some(Fit::with_kind(
+                FitExactness::COERCIBLE,
+                attr,
+                FitKind::Enum {
+                    canonical,
+                    rewrite: purpose.canonicalizes_full_shape(),
+                },
+            ))
+        }
+        (
+            AT::List {
+                element_type,
+                length,
+                validate,
+                ..
+            },
+            ConcreteValueRef::List(items),
+        ) => {
+            validate_list_length(*length, items.len()).ok()?;
+            let mut exactness = FitExactness::EXACT;
+            let mut item_fits = Vec::with_capacity(items.len());
+            for item in items {
+                let child = fit_value_to_type(element_type, item, defs, purpose)?;
+                exactness.combine(child.exactness);
+                item_fits.push(child);
+            }
+            validate(value).ok()?;
+            Some(Fit::with_kind(exactness, attr, FitKind::List(item_fits)))
+        }
+        (
+            AT::List {
+                element_type,
+                length,
+                validate,
+                ..
+            },
+            ConcreteValueRef::StringList(items),
+        ) => {
+            validate_list_length(*length, items.len()).ok()?;
+            let mut exactness = FitExactness::EXACT;
+            let mut item_fits = Vec::with_capacity(items.len());
+            for item in items {
+                let item = Value::Concrete(ConcreteValue::String(item.clone()));
+                let child = fit_value_to_type(element_type, &item, defs, purpose)?;
+                exactness.combine(child.exactness);
+                item_fits.push(child);
+            }
+            validate(value).ok()?;
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::StringList(item_fits),
+            ))
+        }
+        (
+            AT::Map {
+                key,
+                value: value_type,
+            },
+            ConcreteValueRef::Map(map),
+        ) => {
+            let mut exactness = FitExactness::GENERIC_MAP;
+            let mut entry_fits = Vec::with_capacity(map.len());
+            for (map_key, map_value) in map {
+                let lifted_key = lift_map_key(key, map_key, defs);
+                let key_fit = fit_value_to_type(key, &lifted_key, defs, purpose)?;
+                exactness.combine(key_fit.exactness);
+                let canonical_key = canonical_enum_key_from_fit(&key_fit);
+                let value_fit = fit_value_to_type(value_type, map_value, defs, purpose)?;
+                exactness.combine(value_fit.exactness);
+                entry_fits.push(MapEntryFit {
+                    canonical_key,
+                    value: value_fit,
+                });
+            }
+            Some(Fit::with_kind(exactness, attr, FitKind::Map(entry_fits)))
+        }
+        (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => {
+            for field in fields {
+                if field.is_required() && !struct_field_is_present(fields, map, field) {
+                    return None;
+                }
+            }
+
+            let mut exactness = FitExactness::EXACT;
+            let mut field_fits = Vec::with_capacity(map.len());
+            for (input_name, field_value) in map {
+                let field = struct_field_for_key(fields, input_name)?;
+                if purpose.validates_struct_assignments()
+                    && validate_struct_field_assignment(field, input_name).is_some()
+                {
+                    return None;
+                }
+                let child = fit_value_to_type(&field.field_type, field_value, defs, purpose)?;
+                exactness.combine(child.exactness);
+                field_fits.push(child);
+            }
+            Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
+        }
+        (AT::Union(members), _) => {
+            let selected = fit_union_members_on_path(
+                members.as_raw_slice(),
+                value,
+                defs,
+                purpose,
+                visited_refs,
+            )?;
+            let exactness = selected.fit.exactness;
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Union {
+                    member: selected.member,
+                    fit: Box::new(selected.fit),
+                },
+            ))
+        }
+        (AT::Ref(_), _) => unreachable!("fit dispatch received an unresolved Ref"),
+        (
+            AT::String { .. }
+            | AT::ResourceHandle { .. }
+            | AT::StringLiteralSet { .. }
+            | AT::Int { .. }
+            | AT::Float { .. }
+            | AT::Bool
+            | AT::Duration,
+            _,
+        ) => {
+            attr.validate_concrete(concrete, defs).ok()?;
+            let exactness = if matches!(
+                (&attr.kind, concrete),
+                (AT::Float { .. }, ConcreteValueRef::Int(_))
+            ) {
+                FitExactness::COERCIBLE
+            } else {
+                FitExactness::EXACT
+            };
+            Some(Fit::with_kind(exactness, attr, FitKind::PassThrough))
+        }
+        _ => None,
+    }
+}
+
+fn fit_union_members_on_path<'a>(
+    members: &'a [AttributeType],
+    value: &Value,
+    defs: &'a BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<UnionFit<'a>> {
+    let mut best: Option<UnionFit<'a>> = None;
+    for member in members {
+        let Some(fit) = fit_value_to_type_on_path(member, value, defs, purpose, visited_refs)
+        else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|current| fit > current.fit) {
+            best = Some(UnionFit { member, fit });
+        }
+        if best
+            .as_ref()
+            .is_some_and(|selected| selected.fit.exactness.is_maximal())
+        {
+            break;
+        }
+    }
+    best
+}
+
+/// Total ordering used only after every Union member rejects, to choose the
+/// member error that best explains the supplied shape.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UnionFailureRank(u32);
+
+impl UnionFailureRank {
     const NO_MATCH: Self = Self(0);
     const SAME_CONSTRUCTOR: Self = Self(80);
     const MAP_TO_STRUCT: Self = Self(100);
@@ -3636,16 +4185,15 @@ impl UnionCanonicalRank {
 ///
 /// The set is intentionally opaque: diagnostic selection reasons about field
 /// identity and emptiness, never cardinality. It therefore cannot be compared
-/// with [`UnionCanonicalRank`] or accidentally used as its numeric bonus.
+/// with [`UnionFailureRank`] or accidentally used as its numeric bonus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecognizedStructFields(IndexSet<String>);
 
 impl RecognizedStructFields {
     fn new(fields: &[StructField], map: &IndexMap<String, Value>) -> Self {
-        let accepted = build_accepted_field_map(fields);
         Self(
             map.keys()
-                .filter(|field| accepted.contains_key(field.as_str()))
+                .filter(|field| struct_field_for_key(fields, field).is_some())
                 .cloned()
                 .collect(),
         )
@@ -3670,7 +4218,7 @@ impl RecognizedStructFields {
 
 /// Diagnostic equivalence axis carried by the shared structural judgement.
 ///
-/// Unlike [`UnionCanonicalRank`], this type has no ordering. A Struct match
+/// Unlike [`UnionFailureRank`], this type has no ordering. A Struct match
 /// retains the actual recognized-field set so validation can distinguish one
 /// uniquely relevant arm from multiple co-equal alternatives without reducing
 /// those sets to counts.
@@ -3680,25 +4228,21 @@ enum UnionDiagnosticIdentity {
     OtherShape,
 }
 
-/// One shared judgement about a member and runtime value.
-///
-/// Canonicalization consumes only `canonical_rank`; failed validation consumes
-/// both the same structural rank and the separately typed diagnostic identity.
-/// Neither consumer re-derives shape or field recognition independently.
+/// Shape judgement used exclusively for failure attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnionMemberJudgement {
-    canonical_rank: UnionCanonicalRank,
+    failure_rank: UnionFailureRank,
     diagnostic_identity: UnionDiagnosticIdentity,
 }
 
 impl UnionMemberJudgement {
     fn no_match() -> Self {
-        Self::other_shape(UnionCanonicalRank::NO_MATCH)
+        Self::other_shape(UnionFailureRank::NO_MATCH)
     }
 
-    fn other_shape(canonical_rank: UnionCanonicalRank) -> Self {
+    fn other_shape(failure_rank: UnionFailureRank) -> Self {
         Self {
-            canonical_rank,
+            failure_rank,
             diagnostic_identity: UnionDiagnosticIdentity::OtherShape,
         }
     }
@@ -3708,7 +4252,7 @@ impl UnionMemberJudgement {
 /// its consumers need: the pre-#3754 structural rank and, for a closed Struct,
 /// the exact supplied keys that arm recognizes.
 ///
-/// The canonical rank keeps #2219's tiers unchanged: Map↔Struct is 100,
+/// The failure rank keeps #2219's tiers unchanged: Map↔Struct is 100,
 /// same-constructor matches are 80, List peeks at its first element, nested
 /// Union takes its best inner rank, and unrelated shapes are zero. Refined
 /// primitives retain their declared primitive constructor. Declaration order
@@ -3728,27 +4272,28 @@ fn union_member_judgement_on_path<'a>(
         // Map↔Struct: preserve the original flat rank. Field recognition is
         // diagnostic identity, not a numeric ordering bonus.
         (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => UnionMemberJudgement {
-            canonical_rank: UnionCanonicalRank::MAP_TO_STRUCT,
+            failure_rank: UnionFailureRank::MAP_TO_STRUCT,
             diagnostic_identity: UnionDiagnosticIdentity::ClosedStruct(
                 RecognizedStructFields::new(fields, map),
             ),
         },
         // Same-constructor match — second tier.
-        //
-        // `Enum` matches both `String` (quoted literal form) and
-        // `EnumIdentifier` (identifier form, carina#2986). The strict
-        // validator rejects the `String` shape inside `validate_enum`
-        // and surfaces `StringLiteralExpectedEnum`; the union picker
-        // still routes through this member so that error reaches the
-        // caller instead of a generic `TypeMismatch`.
         (AT::Map { .. }, ConcreteValueRef::Map(_))
         | (AT::String { .. }, ConcreteValueRef::String(_))
+        | (AT::ResourceHandle { .. }, ConcreteValueRef::String(_))
+        | (AT::StringLiteralSet { .. }, ConcreteValueRef::String(_))
         | (AT::Int { .. }, ConcreteValueRef::Int(_))
         | (AT::Float { .. }, ConcreteValueRef::Float(_))
-        | (AT::Bool, ConcreteValueRef::Bool(_))
-        | (AT::Enum { .. }, ConcreteValueRef::String(_))
-        | (AT::Enum { .. }, ConcreteValueRef::EnumIdentifier(_)) => {
-            UnionMemberJudgement::other_shape(UnionCanonicalRank::SAME_CONSTRUCTOR)
+        | (AT::Bool, ConcreteValueRef::Bool(_)) => {
+            UnionMemberJudgement::other_shape(UnionFailureRank::SAME_CONSTRUCTOR)
+        }
+        // Enum is string-shaped for diagnostics even when membership fails:
+        // this preserves InvalidEnumVariant / StringLiteralExpectedEnum and
+        // their valid-value suggestions when no Union arm accepts.
+        (AT::Enum { .. }, ConcreteValueRef::String(_))
+        | (AT::Enum { .. }, ConcreteValueRef::EnumIdentifier(_))
+        | (AT::Enum { .. }, ConcreteValueRef::CanonicalEnum(_)) => {
+            UnionMemberJudgement::other_shape(UnionFailureRank::SAME_CONSTRUCTOR)
         }
         // List↔List: peek at the first element's structural match
         // against the member's inner type so `List<Struct>` outranks
@@ -3778,10 +4323,10 @@ fn union_member_judgement_on_path<'a>(
                 .map(|first| {
                     let mut element_path = Vec::new();
                     union_member_judgement_on_path(inner, first, defs, &mut element_path)
-                        .canonical_rank
+                        .failure_rank
                 })
-                .unwrap_or(UnionCanonicalRank::NO_MATCH);
-            UnionMemberJudgement::other_shape(UnionCanonicalRank::list_with_inner(inner_rank))
+                .unwrap_or(UnionFailureRank::NO_MATCH);
+            UnionMemberJudgement::other_shape(UnionFailureRank::list_with_inner(inner_rank))
         }
         // Nested Union: recurse and retain the first best inner judgement.
         (AT::Union(inner), v) => inner
@@ -3789,7 +4334,7 @@ fn union_member_judgement_on_path<'a>(
             .iter()
             .map(|member| union_member_judgement_on_path(member, v, defs, visited_refs))
             .reduce(|best, candidate| {
-                if candidate.canonical_rank > best.canonical_rank {
+                if candidate.failure_rank > best.failure_rank {
                     candidate
                 } else {
                     best
@@ -3814,15 +4359,15 @@ struct UnionMemberFailure {
 /// accidentally recover the pre-#3754 behavior by taking only the first
 /// candidate.
 struct BestUnionMemberFailures {
-    canonical_rank: UnionCanonicalRank,
+    failure_rank: UnionFailureRank,
     first: UnionMemberFailure,
     tied: Vec<UnionMemberFailure>,
 }
 
 impl BestUnionMemberFailures {
-    fn new(canonical_rank: UnionCanonicalRank, first: UnionMemberFailure) -> Self {
+    fn new(failure_rank: UnionFailureRank, first: UnionMemberFailure) -> Self {
         Self {
-            canonical_rank,
+            failure_rank,
             first,
             tied: Vec::new(),
         }
@@ -3832,7 +4377,7 @@ impl BestUnionMemberFailures {
         let BestUnionMemberFailures {
             first,
             tied,
-            canonical_rank: _,
+            failure_rank: _,
         } = self;
         if tied.is_empty() {
             return first.error;
@@ -3949,60 +4494,102 @@ fn describe_struct_union_members(members: UnionMembers<'_>) -> Option<Vec<UnionS
         .collect()
 }
 
-/// Validate Union members and resolve their failures in one place for both
-/// the standalone and schema-aware validators.
+/// Pick the shape-closest Union member for strict failure canonicalization.
 ///
-/// A successful member short-circuits. Judgements with no structural match are
-/// ignored; every failure in the best canonical rank is retained. For closed
-/// Structs, exact recognized-field identities then select either one detailed
-/// member error or the structured alternatives diagnostic. This routine owns
-/// that policy for both validators so their real entry points cannot drift.
-fn validate_union_members<'a, F>(
+/// This is intentionally separate from fit: it is reachable only after every
+/// member returned `None`, and exists so provider-output enum failures retain
+/// the same leaf error as a non-Union enum. It uses the established diagnostic
+/// rank and declaration-order tie break without turning shape into acceptance.
+pub(crate) fn closest_union_member_for_value_on_path<'a>(
+    union: &'a AttributeType,
+    value: ConcreteValueRef<'_>,
+    defs: &'a BTreeMap<String, AttributeType>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<&'a AttributeType> {
+    let AttrTypeKind::Union(members) = &union.kind else {
+        return None;
+    };
+
+    let mut best: Option<(UnionFailureRank, &'a AttributeType)> = None;
+    for member in members.as_raw_slice() {
+        let rank = union_member_judgement_on_path(member, value, defs, visited_refs).failure_rank;
+        if rank.is_match() && best.is_none_or(|(current, _)| rank > current) {
+            best = Some((rank, member));
+        }
+    }
+
+    let (_, member) = best?;
+    resolve_refs_on_path(member, defs, visited_refs)
+        .ok()
+        .map(|resolution| resolution.attr)
+}
+
+/// Select one Union member from the set that accepts the complete value under
+/// the schema-aware validator.
+///
+/// Accepted candidates are ordered only by semantic exactness and then by
+/// declaration order. If every member rejects, the old structural failure
+/// rank is used solely to retain the most useful member diagnostic. Both
+/// Validation-only callers use this routine. Canonicalization consumes the
+/// richer [`Fit`] witness directly, so it never has to select the member again.
+pub(crate) fn select_union_member_on_path<'a>(
     members: &'a [AttributeType],
+    original: &Value,
     value: ConcreteValueRef<'_>,
     expected: String,
     defs: &'a BTreeMap<String, AttributeType>,
     visited_refs: &mut Vec<&'a str>,
-    mut validate_member: F,
-) -> Result<(), TypeError>
-where
-    F: FnMut(&'a AttributeType, &mut Vec<&'a str>) -> Result<(), TypeError>,
-{
+) -> Result<&'a AttributeType, TypeError> {
+    if let Some(selected) = fit_union_members_on_path(
+        members,
+        original,
+        defs,
+        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+        visited_refs,
+    ) {
+        return Ok(selected.member);
+    }
+
+    // Only the failure path snapshots the incoming Ref path. Successful
+    // selection already carries the winning fit witness and never clones it.
     let resolved_members =
         UnionMembers::new_after_union_on_path(members, defs, visited_refs.clone());
-    let mut best: Option<BestUnionMemberFailures> = None;
+    let mut best_failure: Option<BestUnionMemberFailures> = None;
+
     for member in members {
-        match validate_member(member, visited_refs) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let judgement = union_member_judgement_on_path(member, value, defs, visited_refs);
-                if !judgement.canonical_rank.is_match() {
-                    continue;
-                }
-                let failure = UnionMemberFailure {
-                    error,
-                    diagnostic_identity: judgement.diagnostic_identity,
-                };
-                match &mut best {
-                    Some(current) if judgement.canonical_rank > current.canonical_rank => {
-                        *current = BestUnionMemberFailures::new(judgement.canonical_rank, failure);
-                    }
-                    Some(current) if judgement.canonical_rank == current.canonical_rank => {
-                        current.tied.push(failure);
-                    }
-                    Some(_) => {}
-                    None => {
-                        best = Some(BestUnionMemberFailures::new(
-                            judgement.canonical_rank,
-                            failure,
-                        ));
-                    }
-                }
+        let Err(error) = validate_attr_with_defs_on_path(member, original, defs, visited_refs)
+        else {
+            // The authoritative whole-Union fit above proved that no member
+            // accepts. Reaching this branch would mean diagnostic validation
+            // had drifted from fit acceptance.
+            continue;
+        };
+        let judgement = union_member_judgement_on_path(member, value, defs, visited_refs);
+        if !judgement.failure_rank.is_match() {
+            continue;
+        }
+        let failure = UnionMemberFailure {
+            error,
+            diagnostic_identity: judgement.diagnostic_identity,
+        };
+        match &mut best_failure {
+            Some(current) if judgement.failure_rank > current.failure_rank => {
+                *current = BestUnionMemberFailures::new(judgement.failure_rank, failure);
+            }
+            Some(current) if judgement.failure_rank == current.failure_rank => {
+                current.tied.push(failure);
+            }
+            Some(_) => {}
+            None => {
+                best_failure = Some(BestUnionMemberFailures::new(
+                    judgement.failure_rank,
+                    failure,
+                ));
             }
         }
     }
 
-    Err(best
+    Err(best_failure
         .map(|best| best.into_error(value, resolved_members))
         .unwrap_or(TypeError::TypeMismatch {
             expected,
@@ -4010,23 +4597,33 @@ where
         }))
 }
 
-/// Map every accepted field name to its canonical [`StructField`].
-/// Both the canonical `name` and any `block_name` alias resolve to the
-/// same field, so users can write either form interchangeably.
+/// Resolve one host value-map key to its canonical [`StructField`].
 ///
-/// Used by both [`AttrTypeKind::validate`] (single-shot) and
-/// [`AttrTypeKind::validate_collect`] (path-tagged) so the two paths
-/// agree on which keys are accepted (#2214 — the LSP previously did
-/// this alias resolution itself, which let the two validators drift).
-pub(crate) fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, &StructField> {
-    let mut accepted: HashMap<&str, &StructField> = HashMap::new();
-    for f in fields {
-        accepted.insert(f.name.as_str(), f);
-        if let Some(block) = f.block_name.as_deref() {
-            accepted.insert(block, f);
-        }
-    }
-    accepted
+/// Host maps use the DSL/schema name or its `block_name` syntax alias.
+/// `provider_name` is transport metadata and is deliberately not a host-map
+/// key. The reverse walk preserves the former accepted-field map's last-entry
+/// behavior if a malformed schema declares colliding aliases.
+///
+/// Fit, validation, diagnostics, and canonicalization all call this helper so
+/// accepted-key semantics cannot drift (#2214, #3877).
+pub(crate) fn struct_field_for_key<'a>(
+    fields: &'a [StructField],
+    key: &str,
+) -> Option<&'a StructField> {
+    fields
+        .iter()
+        .rev()
+        .find(|field| field.name == key || field.block_name.as_deref() == Some(key))
+}
+
+fn struct_field_is_present(
+    fields: &[StructField],
+    map: &IndexMap<String, Value>,
+    expected: &StructField,
+) -> bool {
+    map.keys().any(|key| {
+        struct_field_for_key(fields, key).is_some_and(|found| std::ptr::eq(found, expected))
+    })
 }
 
 /// Reject an assignment that targets provider-populated struct data.
@@ -4058,15 +4655,14 @@ where
     V: FnMut(&str, &StructField, &Value) -> Result<(), TypeError>,
 {
     for field in fields {
-        if field.is_required() && !map.contains_key(&field.name) {
+        if field.is_required() && !struct_field_is_present(fields, map, field) {
             return Err(missing_required(field));
         }
     }
 
-    let accepted = build_accepted_field_map(fields);
     let canonical_names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
     for (input_name, value) in map {
-        let Some(field) = accepted.get(input_name.as_str()).copied() else {
+        let Some(field) = struct_field_for_key(fields, input_name) else {
             return Err(TypeError::UnknownStructField {
                 struct_name: struct_name.to_string(),
                 field: input_name.clone(),
@@ -4317,6 +4913,18 @@ fn format_invalid_enum(
     type_name: Option<&str>,
     expected: &[ExpectedEnumVariant],
 ) -> String {
+    let suggestion = value.as_plain().and_then(|value| {
+        let input = value.rsplit('.').next().unwrap_or(value);
+        let known = expected
+            .iter()
+            .map(|candidate| candidate.value.0.as_str())
+            .collect::<Vec<_>>();
+        let suggested = suggest_similar_name(input, &known)?;
+        expected
+            .iter()
+            .find(|candidate| candidate.value.0 == suggested)
+            .map(ToString::to_string)
+    });
     let value = value.render_enum_value(value_kind);
     let joined = join_expected(expected);
     let qualifier = match (attribute, type_name) {
@@ -4325,10 +4933,14 @@ fn format_invalid_enum(
         (None, Some(t)) => format!(" for {}", t),
         (None, None) => String::new(),
     };
-    if qualifier.is_empty() {
+    let message = if qualifier.is_empty() {
         format!("Invalid enum variant {value}, expected one of: {joined}")
     } else {
         format!("Invalid value {value}{qualifier}: expected one of {joined}")
+    };
+    match suggestion {
+        Some(suggestion) => format!("{message}; did you mean '{suggestion}'?"),
+        None => message,
     }
 }
 
@@ -5001,7 +5613,7 @@ impl TypeError {
     /// retained, while free-form validator messages are replaced wholesale
     /// because providers and custom validators may echo the plaintext.
     #[must_use]
-    fn masked_for_secret(self) -> Self {
+    pub(crate) fn masked_for_secret(self) -> Self {
         const MASKED_MESSAGE: &str = "(secret) failed validation";
 
         match self {
@@ -5180,7 +5792,7 @@ impl TypeError {
 }
 
 impl Value {
-    fn type_name(&self) -> String {
+    pub(crate) fn type_name(&self) -> String {
         match self {
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
             Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier".to_string(),

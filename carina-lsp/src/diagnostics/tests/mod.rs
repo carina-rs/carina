@@ -20,6 +20,79 @@ pub(super) fn test_engine() -> DiagnosticEngine {
     DiagnosticEngine::new(schemas, provider_names, Arc::new(vec![]))
 }
 
+struct RegionConfigFactory {
+    name: &'static str,
+}
+
+impl ProviderFactory for RegionConfigFactory {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn display_name(&self) -> &str {
+        self.name
+    }
+
+    fn provider_config_attribute_types(
+        &self,
+    ) -> std::collections::HashMap<String, carina_core::schema::AttributeType> {
+        std::collections::HashMap::from([(
+            "region".to_string(),
+            carina_core::schema::AttributeType::enum_(
+                carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                Some(vec!["ap-northeast-1".to_string()]),
+                vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                None,
+                None,
+            ),
+        )])
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = carina_core::provider::ProviderResult<
+                        Box<dyn carina_core::provider::Provider>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        unimplemented!("RegionConfigFactory::create_provider is not used in diagnostics tests")
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+        Vec::new()
+    }
+}
+
+pub(super) fn test_engine_with_region_config_provider(name: &'static str) -> DiagnosticEngine {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RegionConfigFactory { name })];
+    DiagnosticEngine::new(
+        Arc::new(provider_mod::collect_schemas(&factories)),
+        vec![name.to_string()],
+        Arc::new(factories),
+    )
+}
+
 pub(super) fn test_engine_reversed() -> DiagnosticEngine {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![];
     let schemas = Arc::new(provider_mod::collect_schemas(&factories));

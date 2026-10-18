@@ -69,13 +69,16 @@ impl ProviderFactory for AwsStub {
     fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
         HashMap::new()
     }
-    fn validate_config(&self, _a: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _a: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
     fn validate_custom_type(
         &self,
         _t: &carina_core::schema::TypeIdentity,
-        _v: &str,
+        _v: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> Result<(), String> {
         Ok(())
     }

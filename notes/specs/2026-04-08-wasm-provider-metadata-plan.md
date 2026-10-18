@@ -1,9 +1,12 @@
 # Implementation Plan: WASM Provider Metadata
 
+> Protocol v6 note: enum resolution is host-owned from schema metadata. The
+> former enum-alias WIT export and SDK hook have been removed.
+
 ## Task 1/5 — WIT + SDK: Add metadata functions
 
 **Files:**
-- `carina-plugin-wit/wit/provider.wit` — add `provider-config-completions`, `identity-attributes`, `get-enum-aliases`
+- `carina-plugin-wit/wit/provider.wit` — add `provider-config-completions` and `identity-attributes`
 - `carina-plugin-sdk/src/lib.rs` — add trait methods with defaults, wire up WIT dispatch
 
 **Acceptance Criteria:**
@@ -29,7 +32,7 @@
 ## Task 3/5 — Plugin Host: Call WIT functions and cache results
 
 **Files:**
-- `carina-plugin-host/src/wasm_factory.rs` — call new WIT functions at init, cache results, implement ProviderFactory trait methods (`config_completions`, `identity_attributes`, `get_enum_alias_reverse`)
+- `carina-plugin-host/src/wasm_factory.rs` — call new WIT functions at init, cache results, implement ProviderFactory trait methods (`config_completions`, `identity_attributes`)
 
 **Acceptance Criteria:**
 - [ ] `WasmProviderFactory` returns cached metadata from WASM
@@ -41,14 +44,13 @@
 **Repos:** `carina-provider-awscc`, `carina-provider-aws`
 
 **Files (each repo):**
-- Provider impl — implement `config_completions()`, `identity_attributes()`, `get_enum_aliases()` using `carina-aws-types`
+- Provider impl — implement `config_completions()` and `identity_attributes()` using `carina-aws-types`
 
 **Acceptance Criteria:**
 - [ ] Both providers compile with new SDK
 - [ ] WASM builds succeed
 - [ ] Config completions return region values under "region" key
 - [ ] Identity attributes return `["region"]`
-- [ ] Enum aliases return correct mappings
 
 ## Task 5/5 — Remove carina-aws-types usage from CLI wiring
 

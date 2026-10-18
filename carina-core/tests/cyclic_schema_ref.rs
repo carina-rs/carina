@@ -246,11 +246,11 @@ fn resource_schema_validate_routes_ref_through_defs() {
     );
 }
 
-/// Regression for carina#3345 Symptom B: `Schema::canonicalize_attr`
+/// Regression for carina#3345 Symptom B: `Schema::canonicalize_state_attr`
 /// must drive the `Ref` arm through the schema's `defs` map and
 /// canonicalize the resolved type's inner shape. This pins the
-/// public Schema-aware canonicalization entry point used by providers
-/// when normalising upstream state — the awscc
+/// public schema-aware entry point used by the host when reconciling
+/// provider and persisted state — the awscc
 /// `ec2_vpc_endpoint/{gateway,interface}` plan-verify failures hit
 /// this path with `Ref("DnsOptionsSpecification")` and a defs-less
 /// caller panicked at `schema/mod.rs:893`.
@@ -286,7 +286,7 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
     let attr_type = &schema.attributes["selectors"].attr_type;
 
     // Construct the value with a bare `String` under `tags`, which
-    // `canonicalize_with_type` must collapse to `StringList`
+    // host state canonicalization must collapse to `StringList`
     // *if* the Ref is followed and the resolved struct's field type
     // is consulted.
     let mut payload = indexmap::IndexMap::new();
@@ -298,7 +298,7 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
 
     let canon = schema
         .schema_view_for(attr_type.clone())
-        .canonicalize(value);
+        .canonicalize_state(value);
 
     let Value::Concrete(ConcreteValue::Map(canon_map)) = canon else {
         panic!("canonicalized value must remain a Map");

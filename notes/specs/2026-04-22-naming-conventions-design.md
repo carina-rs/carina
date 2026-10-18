@@ -66,11 +66,17 @@ After Y + 4C: **always** `provider.service.TypeName`. `aws.vpc` is rewritten to 
 
 This aligns resource references with the existing schema-type shape (`awscc.ec2.VpcId`) and matches AWS CloudFormation (`AWS::EC2::VPC`) at the structural level. Provider codegen gains the responsibility of producing the `service` segment correctly; this is mechanical.
 
-### D3. Enum values are snake_case; DSL ↔ AWS API mapping reuses existing alias machinery
+### D3. Enum values are snake_case; the host resolves DSL ↔ API mappings
 
-The codebase already has a DSL-alias mechanism for enum values (`known_enum_aliases` in `carina-provider-awscc/src/bin/codegen.rs`, normalizer/conversion pass in `carina-provider-awscc/src/provider/{normalizer,conversion}.rs`). That's how `"-1"` ↔ `"all"` is implemented today for security-group `ip_protocol`.
+Provider schema codegen records each enum's API members and `dsl_aliases`.
+`carina-core` resolves parser-authored identifiers and aliases to a typed
+`CanonicalEnum`; providers do not inspect, strip, or fold enum strings.
 
-Extend that exact machinery: provider codegen emits, for each `StringEnum`, a DSL-name (snake_case) ↔ API-name (whatever AWS returns — often PascalCase like `"Enabled"`, SHOUTY_SNAKE like `"GROUP"`, or already-snake like `"ap-northeast-1"`) mapping. The normalizer applies the mapping in both directions. **No new infrastructure** is needed; only one more automatic source of entries for the existing table.
+Provider codegen emits, for each `StringEnum`, a DSL-name (snake_case) ↔
+API-name (whatever AWS returns — often PascalCase like `"Enabled"`,
+SHOUTY_SNAKE like `"GROUP"`, or already-snake like `"ap-northeast-1"`)
+mapping in the schema. The host applies that mapping at schema-positioned
+canonicalization seams and sends only the API spelling over the provider wire.
 
 ### D4. No compatibility shims for values that are already snake_case
 
@@ -138,7 +144,7 @@ State JSON (`carina.state.json`) stores resource ids that include the resource k
 | Repo | Change |
 |---|---|
 | `carina-provider-aws` | Codegen emits new spellings for custom types and resource kinds; acceptance-test `.crn` rewritten |
-| `carina-provider-awscc` | Same as above; enum alias table in `known_enum_aliases` grows to cover every PascalCase / SHOUTY_SNAKE enum value |
+| `carina-provider-awscc` | Same as above; generated schemas carry API members and DSL aliases for every PascalCase / SHOUTY_SNAKE enum value so the host can resolve them |
 | `carina-rs/infra` | Every `.crn` rewritten (Phase B) |
 
 ### Out of scope (explicit non-goals)

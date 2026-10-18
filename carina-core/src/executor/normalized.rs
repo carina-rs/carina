@@ -66,7 +66,7 @@
 use std::collections::HashMap;
 
 use crate::parser::ProviderConfig;
-use crate::provider::{ProviderFactory, ProviderNormalizer, ProviderResult, merge_default_tags};
+use crate::provider::{ProviderNormalizer, ProviderResult, merge_default_tags};
 use crate::resource::{
     ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, value_contains_unknown,
 };
@@ -94,12 +94,10 @@ pub async fn apply_desired_normalization(
     resource: Resource,
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
 ) -> ProviderResult<NormalizedResource> {
     let mut one = [resource];
-    apply_desired_normalization_slice(&mut one, provider_configs, normalizer, factories, schemas)
-        .await?;
+    apply_desired_normalization_slice(&mut one, provider_configs, normalizer, schemas).await?;
     let [resource] = one;
     Ok(NormalizedResource(resource))
 }
@@ -110,23 +108,22 @@ pub async fn apply_desired_normalization(
 ///
 /// 1. Canonicalize resource values with their schemas.
 /// 2. Run [`ProviderNormalizer::normalize_desired`].
-/// 3. Run [`merge_default_tags`] for each provider instance.
-/// 4. Resolve enum aliases.
+/// 3. Re-canonicalize guest-returned enum strings using state-text semantics.
+/// 4. Run [`merge_default_tags`] for each provider instance.
 ///
 /// An error stops the pipeline before later stages run.
 pub async fn apply_desired_normalization_slice(
     resources: &mut [Resource],
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
 ) -> ProviderResult<()> {
-    crate::value::canonicalize_resources_with_schemas(resources, schemas);
+    crate::value::canonicalize_resources_with_schemas(resources, schemas)?;
     normalizer.normalize_desired(resources).await?;
+    crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas)?;
     for config in provider_configs {
         merge_default_tags(config, resources, schemas)?;
     }
-    crate::value::resolve_enum_aliases_for_resources(resources, factories);
     Ok(())
 }
 

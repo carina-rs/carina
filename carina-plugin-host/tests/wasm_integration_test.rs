@@ -9,9 +9,10 @@ use carina_core::provider::{
     ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, ResolvedResource, Resource, ResourceId, State,
-    UnknownReason, Value,
+    ConcreteValue, DataSource, DeferredValue, EnumValueResolver, RawEnumIdentifier,
+    ResolvedResource, Resource, ResourceId, State, UnknownReason, Value,
 };
+use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_plugin_host::WasmProviderFactory;
 
 fn lifted_saved_attrs(
@@ -451,6 +452,63 @@ async fn test_wasm_mock_provider_normalizer() {
             .get("__mock_normalized_state__"),
         Some(&Value::Concrete(ConcreteValue::String("second".into()))),
         "the second pending state must receive its own normalized WASM result"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_normalize_desired_echo_preserves_nested_enum_typing() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let hosted_zone_type = AttributeType::enum_(
+        TypeIdentity::new(
+            Some("aws"),
+            ["route53", "RecordSet", "AliasTarget"],
+            "HostedZoneId",
+        ),
+        Some(vec!["Z2FDTNDATAQYW2".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
+    let hosted_zone = EnumValueResolver::new(&hosted_zone_type)
+        .resolve_raw(&RawEnumIdentifier::parse("Z2FDTNDATAQYW2"))
+        .expect("the authored identifier must resolve through the Enum union member");
+    let mut resources = vec![
+        Resource::with_provider("mock", "test.resource", "enum-echo", None).with_attribute(
+            "alias_target",
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "hosted_zone_id".to_string(),
+                Value::Concrete(ConcreteValue::CanonicalEnum(hosted_zone)),
+            )]))),
+        ),
+    ];
+
+    normalizer
+        .normalize_desired(&mut resources)
+        .await
+        .expect("the echo normalizer must succeed");
+
+    let Some(Value::Concrete(ConcreteValue::Map(alias_target))) =
+        resources[0].get_attr("alias_target")
+    else {
+        panic!("alias_target must remain a map");
+    };
+    let hosted_zone = alias_target
+        .get("hosted_zone_id")
+        .expect("hosted_zone_id must remain present");
+    assert!(matches!(
+        hosted_zone,
+        Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            if value.api_value() == "Z2FDTNDATAQYW2"
+    ));
+    assert_eq!(
+        carina_core::value::format_value(hosted_zone),
+        "Z2FDTNDATAQYW2",
+        "the plan formatter must keep identifier syntax instead of quoting an echoed string"
     );
 }
 

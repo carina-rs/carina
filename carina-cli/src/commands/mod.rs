@@ -228,8 +228,12 @@ fn enrich_provider_context(
     ProviderContext {
         decryptor: None,
         validators: carina_core::provider::collect_custom_type_validators(schemas),
+        custom_type_attribute_types: carina_core::provider::collect_custom_type_attribute_types(
+            schemas,
+        ),
         custom_type_validator: Some(Box::new(
-            move |identity: &carina_core::schema::TypeIdentity, value: &str| {
+            move |identity: &carina_core::schema::TypeIdentity,
+                  value: &carina_core::provider::CanonicalCustomTypeValue| {
                 for factory in factories.iter() {
                     factory.validate_custom_type(identity, value)?;
                 }
@@ -674,10 +678,16 @@ pub(crate) fn validate_and_resolve_errors_with_context(
         }
     }
 
-    let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+    let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
         &mut parsed.resources,
         ctx.schemas(),
-    );
+    ) {
+        Ok(resources) => resources,
+        Err(error) => {
+            errors.push(error.into());
+            return errors;
+        }
+    };
 
     // Compute anonymous identifiers — downstream plan code assumes
     // every resource has a stable id, so a collision error must stop
@@ -1135,7 +1145,10 @@ exports {
             HashMap::new()
         }
 
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
             Ok(())
         }
 

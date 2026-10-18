@@ -32,11 +32,18 @@ impl ProviderFactory for AwsTestFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
-    fn validate_custom_type(&self, _type_name: &TypeIdentity, _value: &str) -> Result<(), String> {
+    fn validate_custom_type(
+        &self,
+        _type_name: &TypeIdentity,
+        _value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> Result<(), String> {
         Ok(())
     }
 

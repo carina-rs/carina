@@ -788,7 +788,7 @@ operating_regions = [{
 }
 
 #[test]
-fn union_static_value_validated() {
+fn union_static_non_member_preserves_enum_diagnostic() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
@@ -824,19 +824,15 @@ mode = "invalid_mode"
 
     let diagnostics = engine.analyze(&doc, None);
 
-    // After #2219 the Union error surfaces the closest member's
-    // structured error rather than a generic `Type mismatch`. For a
-    // string input that fails `Enum | Int`, the Enum
-    // member's "Invalid value 'invalid_mode' ... expected one of
-    // active, passive" is the right message.
-    let invalid_value_error = diagnostics.iter().find(|d| {
-        d.message.contains("invalid_mode")
-            && d.message.contains("active")
-            && d.message.contains("passive")
-    });
+    // No Union member accepts this value, so failure attribution retains the
+    // old shape-based route through the Enum arm and its useful variant list.
+    let invalid_value_error = diagnostics
+        .iter()
+        .find(|d| d.message.contains("expects an enum identifier"))
+        .filter(|d| d.message.contains("active, passive"));
     assert!(
         invalid_value_error.is_some(),
-        "Should warn about invalid Union value with the Enum member's variant list. Got diagnostics: {:?}",
+        "Should preserve the Enum member diagnostic. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

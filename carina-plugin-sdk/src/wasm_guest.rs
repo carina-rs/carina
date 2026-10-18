@@ -921,13 +921,6 @@ macro_rules! export_provider {
                     .map_err(validate_string_to_provider_error)
                 }
 
-                fn get_enum_aliases() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let aliases = $crate::CarinaProvider::enum_aliases(&*provider);
-                    serde_json::to_string(&aliases)
-                        .expect("provider enum alias serialization is infallible")
-                }
-
                 fn normalize_desired(
                     resources: Vec<wit_types::ResourceDef>,
                 ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
@@ -1643,13 +1636,6 @@ macro_rules! export_provider {
                         &value,
                     )
                     .map_err(validate_string_to_provider_error)
-                }
-
-                fn get_enum_aliases() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let aliases = $crate::CarinaProvider::enum_aliases(&*provider);
-                    serde_json::to_string(&aliases)
-                        .expect("provider enum alias serialization is infallible")
                 }
 
                 fn normalize_desired(

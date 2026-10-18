@@ -14,7 +14,7 @@ Do not redesign the provider protocol, state model, AWS assume-role configuratio
 
 ## Affected components inventory
 
-`carina-plugin-wit/wit/provider.wit` is the root schema change. `initialize`, `read`, `read-data-source`, `create`, `update`, and `delete` change from plain `func` to `async func`. `info`, `schemas`, `provider-config-attribute-types`, `validate-config`, `provider-config-completions`, `identity-attributes`, `validate-custom-type`, `get-enum-aliases`, `normalize-desired`, `normalize-state`, `hydrate-read-state`, and `merge-default-tags` stay sync unless the implementation experiment shows the generated binding shape forces whole-interface async. The long-running set is the set that can use external provider APIs or waiters.
+`carina-plugin-wit/wit/provider.wit` is the root schema change. `initialize`, `read`, `read-data-source`, `create`, `update`, and `delete` change from plain `func` to `async func`. `info`, `schemas`, `provider-config-attribute-types`, `validate-config`, `provider-config-completions`, `identity-attributes`, `validate-custom-type`, `normalize-desired`, `normalize-state`, `hydrate-read-state`, and `merge-default-tags` stay sync unless the implementation experiment shows the generated binding shape forces whole-interface async. The long-running set is the set that can use external provider APIs or waiters.
 
 `carina-plugin-wit/wit/world.wit` keeps both worlds, `carina-provider` and `carina-provider-with-http`, exporting the same `provider` interface. No new world is required for the recommended path. If the compatibility fallback is chosen after experiments, this file would instead export both `provider` and `provider-async`; that is not the recommended design.
 
@@ -44,7 +44,7 @@ Option A marks every long-running export as `async func`: `initialize`, `read`, 
 
 Option B adds a parallel `provider-async` interface and keeps `provider` sync as a legacy fallback. The upside is staged migration for old provider components. The downside is two protocol surfaces, two host dispatch paths, more tests, and a standing risk that carina accidentally loads the legacy sync path for an HTTP-capable provider. That leaves the broken state representable. It also complicates provider registry behavior because the host must classify a component's capability at instantiation time and report useful errors when only the old interface is present.
 
-Option C splits exports by I/O cost: long-running operations become async, metadata, schema, validation, completion, identity, enum alias, and pure normalization functions stay sync. This is the smallest WIT change that removes the root cause. It limits host and guest async plumbing to operations that can call provider APIs while preserving cheap sync calls for startup metadata and config validation. The risk is misclassification: a future provider could put network I/O in `validate-config` or a normalizer and recreate the same pattern. That risk should be handled by SDK contract and tests: sync trait methods must be documented and tested as no-I/O methods.
+Option C splits exports by I/O cost: long-running operations become async, while metadata, schema, validation, completion, identity, and pure normalization functions stay sync. This is the smallest WIT change that removes the root cause. It limits host and guest async plumbing to operations that can call provider APIs while preserving cheap sync calls for startup metadata and config validation. The risk is misclassification: a future provider could put network I/O in `validate-config` or a normalizer and recreate the same pattern. That risk should be handled by SDK contract and tests: sync trait methods must be documented and tested as no-I/O methods.
 
 Recommendation: choose Option C now, implemented as an in-place breaking change to the existing `provider` interface. It removes the observed invalid pattern without forcing pure metadata calls through component async, and it avoids a compatibility branch that keeps the bug alive. If the first code experiment shows that wit-bindgen generates a simpler and safer surface when the whole interface is async, switch to Option A before writing provider migrations; do not add Option B unless wasmtime or wit-bindgen cannot support mixed sync/async exports.
 
@@ -69,7 +69,7 @@ Default implementations for `initialize` can return `Box::pin(async { Ok(()) })`
 
 The `export_provider!` macro must bridge boxed-future trait methods to async WIT exports. For each async export, convert owned WIT input into protocol-owned values before calling the provider method, call the trait method, await it, then convert the result. For `initialize`, the provider state is mutated; for CRUD it is read-only. Do not hold `std::sync::MutexGuard` across `.await`. A simple safe shape is to keep provider state in a `OnceLock` containing an async mutex that is valid on wasm32, then await the mutex and the provider method inside the async export. That still serializes all operations on one guest instance, matching the host's current one-store-at-a-time behavior, but it does not block the component task with an OS-style mutex. If an async-aware mutex is unavailable for WASM without pulling a runtime, use `RefCell<T>` only after confirming wasmtime never polls two exports from the same instance concurrently; otherwise `RefCell` can panic on reentrant polls.
 
-The macro should keep sync methods sync. `info`, `schemas`, `provider_config_attribute_types`, `validate_config`, `provider_config_completions`, `identity_attributes`, `validate_custom_type`, `get_enum_aliases`, `normalize_desired`, `normalize_state`, `hydrate_read_state`, and `merge_default_tags` may continue to lock with `std::sync::Mutex` only if the async methods use a compatible shared state abstraction. Prefer one state wrapper for all methods so the provider cannot be borrowed by a sync method while an async operation is live.
+The macro should keep sync methods sync. `info`, `schemas`, `provider_config_attribute_types`, `validate_config`, `provider_config_completions`, `identity_attributes`, `validate_custom_type`, `normalize_desired`, `normalize_state`, `hydrate_read_state`, and `merge_default_tags` may continue to lock with `std::sync::Mutex` only if the async methods use a compatible shared state abstraction. Prefer one state wrapper for all methods so the provider cannot be borrowed by a sync method while an async operation is live.
 
 ## Guest provider impl change
 
@@ -209,7 +209,7 @@ take `&wasmtime::component::Accessor<_>` rather than `&mut Store<_>`.
 The host adapters therefore wrap the six async exports in
 `store.run_concurrent(async |accessor| { ... })` and pass cloned/owned
 WIT arguments into the generated `call_*` methods. The cheap metadata,
-validation, completion, identity, enum alias, and normalizer calls keep
+validation, completion, identity, and normalizer calls keep
 the existing sync generated shape.
 
 `build_engine_config` now enables `wasm_component_model_async(true)`.

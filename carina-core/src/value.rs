@@ -1,6 +1,7 @@
 //! Value conversion and formatting utilities
 
 use std::collections::{BTreeSet, HashMap};
+use std::convert::Infallible;
 
 use indexmap::IndexMap;
 use thiserror::Error;
@@ -100,6 +101,14 @@ pub enum SerializationError {
         name: String,
         context: SerializationContext,
     },
+    /// A parser-authored enum identifier reached a serialization boundary
+    /// without schema resolution. Provider transports accept only
+    /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
+    #[error("cannot serialize at {context}: unresolved enum identifier {value}")]
+    UnresolvedEnumIdentifier {
+        value: String,
+        context: SerializationContext,
+    },
     /// A secret reached a boundary where no safe representation exists.
     /// Resource state and provider transport have dedicated hash/unseal
     /// semantics; export state does not, because upstream consumers require
@@ -114,6 +123,31 @@ pub enum SerializationError {
     /// without first being rehydrated and verified.
     #[error("cannot serialize at {context}: saved-plan secret was not rehydrated")]
     RedactedSecretNotAllowed { context: SerializationContext },
+}
+
+impl SerializationError {
+    /// Mask user-derived payload text when an error originated below a
+    /// [`DeferredValue::Secret`] wrapper.
+    #[must_use]
+    pub fn masked_for_secret(self) -> Self {
+        const MASKED: &str = "(secret)";
+
+        match self {
+            Self::UnresolvedEnumIdentifier { context, .. } => Self::UnresolvedEnumIdentifier {
+                value: MASKED.to_string(),
+                context,
+            },
+            Self::UnresolvedResourceRef { context, .. } => Self::UnresolvedResourceRef {
+                path: MASKED.to_string(),
+                context,
+            },
+            Self::UnresolvedFunctionCall { context, .. } => Self::UnresolvedFunctionCall {
+                name: MASKED.to_string(),
+                context,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Why a saved-plan secret placeholder could not be restored.
@@ -3128,216 +3162,882 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
     t
 }
 
-/// Convert `value` to the canonical `Value::Concrete(ConcreteValue::StringList)` form when
-/// `attr_type` is the `string_or_list_of_strings` shape, recursing into
-/// containers (List, Map, Struct) so nested fields are also
-/// canonicalized.
-///
-/// Conversion rules for `string_or_list_of_strings`:
-/// - `Value::Concrete(ConcreteValue::String(s))` → `Value::Concrete(ConcreteValue::StringList(vec![s]))`
-/// - `Value::Concrete(ConcreteValue::List([Value::String(_), ...]))` (every element a String) →
-///   `Value::Concrete(ConcreteValue::StringList(vec![..]))`
-/// - `Value::Concrete(ConcreteValue::StringList(_))` is returned unchanged
-/// - any other shape (e.g. a list with non-string elements, a Map, a
-///   ResourceRef, an unresolved Interpolation/FunctionCall) is returned
-///   unchanged. Such shapes either fail validation downstream (wrong
-///   type for the schema) or carry an unresolved expression that must
-///   be canonicalized after resolution by a later pass.
-///
-/// `defs` carries the enclosing [`crate::schema::ResourceSchema::defs`]
-/// map so cyclic CFN definitions (`AttributeType::Ref`) are followed
-/// during the walk (carina#3340). A top-level Ref keeps the schema-invariant
-/// panic semantics of [`AttributeType::resolve_refs_with_defs`]; after Union
-/// selection, missing or cyclic member Refs are graceful no-match outcomes.
-/// Pass
-/// [`crate::schema::empty_defs_for_schema_walks()`] when the caller is confident no
-/// `Ref` is reachable.
-///
-/// This convenience wrapper interprets `EnumIdentifier` as authored DSL.
-/// State-side container adapters call the phase-aware worker through
-/// [`canonicalize_attribute_map_with_schema`] instead.
-///
-/// See #2481, #2510.
-pub(crate) fn canonicalize_with_type(
-    value: Value,
-    attr_type: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> Value {
-    canonicalize_with_type_for_enum_phase(value, attr_type, defs, EnumIdentifierPhase::RawDsl)
-}
-
-/// How an `EnumIdentifier` entered the canonicalization walk.
+/// Where a strict desired value came from. Both variants must be fully
+/// canonical before the value can cross a host-to-provider boundary, but
+/// parser-authored identifiers and provider-returned text have different
+/// alias precedence.
 #[derive(Clone, Copy)]
-pub(crate) enum EnumIdentifierPhase {
-    /// Parser-produced, authored enum syntax whose DSL aliases take precedence.
-    RawDsl,
-    /// Provider or persisted state text whose API spelling takes precedence.
-    StateText,
+pub(crate) enum DesiredValueSource {
+    AuthoredDsl,
+    ProviderOutput,
 }
 
-fn canonicalize_with_type_for_enum_phase(
+/// Internal recursion policy. Public and crate-visible callers enter through
+/// purpose-named functions below rather than selecting strictness flags.
+#[derive(Clone, Copy)]
+pub(crate) enum CanonicalizationPurpose<'a> {
+    Desired(DesiredValueSource),
+    ProviderConfig { provider_name: &'a str },
+    State,
+    WaitRhs,
+}
+
+impl<'a> CanonicalizationPurpose<'a> {
+    pub(crate) fn canonicalizes_full_shape(self) -> bool {
+        matches!(
+            self,
+            Self::Desired(_) | Self::ProviderConfig { .. } | Self::State
+        )
+    }
+
+    pub(crate) fn resolves_identifiers_as_state_text(self) -> bool {
+        matches!(
+            self,
+            Self::Desired(DesiredValueSource::ProviderOutput) | Self::State
+        )
+    }
+
+    pub(crate) fn provider_config_name(self) -> Option<&'a str> {
+        match self {
+            Self::ProviderConfig { provider_name } => Some(provider_name),
+            Self::Desired(_) | Self::State | Self::WaitRhs => None,
+        }
+    }
+
+    pub(crate) fn accepts_enum_string(self, enumerated: bool) -> bool {
+        match self {
+            Self::Desired(DesiredValueSource::AuthoredDsl) | Self::WaitRhs => !enumerated,
+            Self::Desired(DesiredValueSource::ProviderOutput)
+            | Self::ProviderConfig { .. }
+            | Self::State => true,
+        }
+    }
+
+    pub(crate) fn validates_struct_assignments(self) -> bool {
+        matches!(
+            self,
+            Self::Desired(DesiredValueSource::AuthoredDsl)
+                | Self::ProviderConfig { .. }
+                | Self::WaitRhs
+        )
+    }
+
+    fn rejects_unrecognized_enum_text(self) -> bool {
+        matches!(self, Self::Desired(DesiredValueSource::ProviderOutput))
+    }
+}
+
+trait CanonicalizationErrorPolicy: Copy {
+    type Error;
+
+    fn canonicalization_failed(
+        self,
+        original: Value,
+        source: crate::schema::TypeError,
+    ) -> Result<Value, Self::Error>;
+
+    fn mask_secret(self, error: Self::Error) -> Self::Error;
+
+    fn at_list_index(self, index: usize, error: Self::Error) -> Self::Error;
+
+    fn at_map_key(self, key: String, error: Self::Error) -> Self::Error;
+
+    fn at_map_value(self, key: String, error: Self::Error) -> Self::Error;
+
+    fn at_struct_field(self, field: String, error: Self::Error) -> Self::Error;
+
+    fn map_key_collision(self, key: String, canonical_key: String) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy)]
+struct RejectEnumResolutionErrors;
+
+impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
+    type Error = crate::schema::TypeError;
+
+    fn canonicalization_failed(
+        self,
+        _original: Value,
+        source: crate::schema::TypeError,
+    ) -> Result<Value, Self::Error> {
+        Err(source)
+    }
+
+    fn mask_secret(self, error: Self::Error) -> Self::Error {
+        error.masked_for_secret()
+    }
+
+    fn at_list_index(self, index: usize, error: Self::Error) -> Self::Error {
+        crate::schema::TypeError::ListItemError {
+            index,
+            inner: Box::new(error),
+        }
+    }
+
+    fn at_map_key(self, key: String, error: Self::Error) -> Self::Error {
+        crate::schema::TypeError::MapKeyError {
+            key,
+            inner: Box::new(error),
+        }
+    }
+
+    fn at_map_value(self, key: String, error: Self::Error) -> Self::Error {
+        crate::schema::TypeError::MapValueError {
+            key,
+            inner: Box::new(error),
+        }
+    }
+
+    fn at_struct_field(self, field: String, error: Self::Error) -> Self::Error {
+        crate::schema::TypeError::StructFieldError {
+            field,
+            inner: Box::new(error),
+        }
+    }
+
+    fn map_key_collision(self, key: String, canonical_key: String) -> Result<(), Self::Error> {
+        Err(self.at_map_key(
+            key,
+            crate::schema::TypeError::ValidationFailed {
+                message: format!(
+                    "canonical map key `{canonical_key}` conflicts with an earlier map key"
+                ),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreserveEnumResolutionErrors;
+
+impl CanonicalizationErrorPolicy for PreserveEnumResolutionErrors {
+    type Error = Infallible;
+
+    fn canonicalization_failed(
+        self,
+        original: Value,
+        _source: crate::schema::TypeError,
+    ) -> Result<Value, Self::Error> {
+        Ok(original)
+    }
+
+    fn mask_secret(self, error: Self::Error) -> Self::Error {
+        match error {}
+    }
+
+    fn at_list_index(self, _index: usize, error: Self::Error) -> Self::Error {
+        match error {}
+    }
+
+    fn at_map_key(self, _key: String, error: Self::Error) -> Self::Error {
+        match error {}
+    }
+
+    fn at_map_value(self, _key: String, error: Self::Error) -> Self::Error {
+        match error {}
+    }
+
+    fn at_struct_field(self, _field: String, error: Self::Error) -> Self::Error {
+        match error {}
+    }
+
+    fn map_key_collision(self, _key: String, _canonical_key: String) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => match error {},
+    }
+}
+
+/// Canonicalize a desired value completely. Success guarantees that no
+/// [`ConcreteValue::EnumIdentifier`] remains anywhere in the value tree.
+fn canonicalize_desired_with_type(
     value: Value,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
-    enum_identifier_phase: EnumIdentifierPhase,
-) -> Value {
-    canonicalize_with_type_mode(
+    source: DesiredValueSource,
+) -> Result<Value, crate::schema::TypeError> {
+    let canonical = canonicalize_with_type_for_purpose(
         value,
         attr_type,
         defs,
-        CanonicalizationMode::Full(enum_identifier_phase),
-    )
+        CanonicalizationPurpose::Desired(source),
+        RejectEnumResolutionErrors,
+    )?;
+    if let Some(error) = unresolved_enum_identifier_type_error_in(&canonical) {
+        return Err(error);
+    }
+    Ok(canonical)
 }
 
-#[derive(Clone, Copy)]
-enum CanonicalizationMode {
-    Full(EnumIdentifierPhase),
-    TypedEnumIdentifiersOnly,
-}
-
-fn canonicalize_typed_enum_identifiers_with_type(
+/// Canonicalize provider or persisted state. Unrecognized enum-positioned
+/// strings legitimately remain strings for validation and comparison.
+pub(crate) fn canonicalize_state_with_type(
     value: Value,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Value {
-    canonicalize_with_type_mode(
+    unwrap_infallible(canonicalize_with_type_for_purpose(
         value,
         attr_type,
         defs,
-        CanonicalizationMode::TypedEnumIdentifiersOnly,
-    )
+        CanonicalizationPurpose::State,
+        PreserveEnumResolutionErrors,
+    ))
 }
 
-fn canonicalize_with_type_mode(
+/// Resolve typed wait-RHS enum syntax without reclassifying quoted strings or
+/// applying unrelated structural rewrites.
+pub(crate) fn canonicalize_wait_rhs_with_type(
     value: Value,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
-    mode: CanonicalizationMode,
 ) -> Value {
+    unwrap_infallible(canonicalize_with_type_for_purpose(
+        value,
+        attr_type,
+        defs,
+        CanonicalizationPurpose::WaitRhs,
+        PreserveEnumResolutionErrors,
+    ))
+}
+
+fn canonicalize_with_type_for_purpose<P: CanonicalizationErrorPolicy>(
+    value: Value,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    error_policy: P,
+) -> Result<Value, P::Error> {
     let mut visited_refs = Vec::new();
-    let mut unwrapped = peel_custom(
+    let unwrapped = peel_custom(
         attr_type
             .resolve_refs_with_defs_on_path(defs, &mut visited_refs)
             .as_attr(),
     );
-    let value = match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            return Value::Deferred(DeferredValue::Secret(Box::new(
-                canonicalize_with_type_mode(*inner, attr_type, defs, mode),
-            )));
-        }
-        value => value,
-    };
+    if let Some(fit) = crate::schema::fit_value_to_resolved_type_on_path(
+        unwrapped,
+        &value,
+        defs,
+        purpose,
+        &mut visited_refs,
+    ) {
+        return canonicalize_with_fit(value, fit, defs, purpose, error_policy);
+    }
 
-    loop {
-        if matches!(mode, CanonicalizationMode::Full(_))
-            && is_string_or_list_of_strings(unwrapped, defs)
-        {
-            return canonicalize_to_string_list(value);
-        }
-        let shape = unwrapped
-            .shape_ref_free()
-            .expect("canonicalization dispatch must hold a Ref-peeled type");
+    canonicalize_without_fit(
+        value,
+        unwrapped,
+        defs,
+        purpose,
+        error_policy,
+        &mut visited_refs,
+    )
+}
 
-        // Union selection is a non-value-consuming walk. Keep the chosen
-        // Ref path across iterations so an alias that resolves back to an
-        // already visited Union is excluded, while sibling judgements retain
-        // their existing truncate-on-return discipline. Concrete container
-        // members below start a fresh path for every child value.
-        if matches!(shape, crate::schema::Shape::Union) {
-            let Some(members) = crate::schema::union_members_with_defs(unwrapped, defs) else {
-                return value;
-            };
-            let Some(member) = members.select_on_path(&value, &mut visited_refs) else {
-                return value;
-            };
-            unwrapped = peel_custom(member.as_attr());
-            continue;
-        }
+/// Consume a successful fit witness without re-validating any selected Union
+/// member or re-resolving any enum. The value and witness have identical tree
+/// shapes by construction.
+fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
+    value: Value,
+    fit: crate::schema::Fit<'_>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    error_policy: P,
+) -> Result<Value, P::Error> {
+    if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr, defs) {
+        return Ok(canonicalize_to_string_list(value));
+    }
 
-        return match (value, shape) {
-            (
-                Value::Concrete(ConcreteValue::List(items)),
-                crate::schema::Shape::List {
-                    element_type: inner,
-                    ..
-                },
-            ) => {
-                let canonicalized = items
-                    .into_iter()
-                    .map(|v| canonicalize_with_type_mode(v, inner, defs, mode))
-                    .collect();
-                Value::Concrete(ConcreteValue::List(canonicalized))
-            }
-            (
-                Value::Concrete(ConcreteValue::Map(map)),
-                crate::schema::Shape::Map { value: vt, .. },
-            ) => {
-                let canonicalized = map
-                    .into_iter()
-                    .map(|(k, v)| (k, canonicalize_with_type_mode(v, vt, defs, mode)))
-                    .collect();
-                Value::Concrete(ConcreteValue::Map(canonicalized))
-            }
-            (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { .. }) => {
-                let fields = crate::schema::struct_fields_with_defs(unwrapped, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                let canonicalized = map
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let field_type = fields
-                            .iter()
-                            .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
-                            .map(|f| &f.field_type);
-                        let canon = match field_type {
-                            Some(ft) => canonicalize_with_type_mode(v, ft, defs, mode),
-                            None => v,
-                        };
-                        (k, canon)
-                    })
-                    .collect();
-                Value::Concrete(ConcreteValue::Map(canonicalized))
-            }
-            // Enum must not fall through to the `(v, _) => v` wildcard.
-            // That is the same failure mode as carina#3080's Union gap:
-            // the ranker/canonicalizer path looked correct for other
-            // branches while this leaf silently skipped normalization.
-            (val, crate::schema::Shape::Enum { .. }) => {
-                let resolver = crate::resource::EnumValueResolver::with_defs(unwrapped, defs);
-                match val {
-                    Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                        let resolved = match mode {
-                            CanonicalizationMode::Full(EnumIdentifierPhase::StateText) => {
-                                resolver.resolve_state_text(raw.as_str())
-                            }
-                            CanonicalizationMode::Full(EnumIdentifierPhase::RawDsl)
-                            | CanonicalizationMode::TypedEnumIdentifiersOnly => {
-                                resolver.resolve_raw(&raw)
-                            }
-                        };
-                        resolved
-                            .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
-                            .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw)))
-                    }
-                    Value::Concrete(ConcreteValue::String(s)) => match mode {
-                        CanonicalizationMode::Full(_) => resolver
-                            .resolve_state_text(s.expose_plaintext())
-                            .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
-                            .unwrap_or_else(|_| Value::Concrete(ConcreteValue::String(s))),
-                        CanonicalizationMode::TypedEnumIdentifiersOnly => {
-                            Value::Concrete(ConcreteValue::String(s))
-                        }
-                    },
-                    Value::Concrete(ConcreteValue::CanonicalEnum(_)) => val,
-                    other => other,
-                }
-            }
-            (v, _) => v,
-        };
+    match (value, fit.kind) {
+        (Value::Deferred(DeferredValue::Secret(value)), crate::schema::FitKind::Secret(fit)) => {
+            canonicalize_with_fit(*value, *fit, defs, purpose, error_policy)
+                .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
+                .map_err(|error| error_policy.mask_secret(error))
+        }
+        (value, crate::schema::FitKind::Union { member, fit }) => {
+            // The witness retains the declaration member as well as its
+            // resolved child fit. Canonicalization needs only the child, but
+            // consuming both here makes the single selection decision
+            // explicit and prevents a second member lookup.
+            let _chosen_member = member;
+            canonicalize_with_fit(value, *fit, defs, purpose, error_policy)
+        }
+        (
+            _,
+            crate::schema::FitKind::Enum {
+                canonical,
+                rewrite: true,
+            },
+        ) => Ok(Value::Concrete(ConcreteValue::CanonicalEnum(canonical))),
+        (value, crate::schema::FitKind::Enum { rewrite: false, .. }) => Ok(value),
+        (Value::Concrete(ConcreteValue::List(items)), crate::schema::FitKind::List(fits)) => {
+            debug_assert_eq!(items.len(), fits.len());
+            let items = items
+                .into_iter()
+                .zip(fits)
+                .enumerate()
+                .map(|(index, (item, fit))| {
+                    canonicalize_with_fit(item, fit, defs, purpose, error_policy)
+                        .map_err(|error| error_policy.at_list_index(index, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Concrete(ConcreteValue::List(items)))
+        }
+        (
+            Value::Concrete(ConcreteValue::StringList(items)),
+            crate::schema::FitKind::StringList(fits),
+        ) => {
+            debug_assert_eq!(items.len(), fits.len());
+            let canonicalized = items
+                .into_iter()
+                .zip(fits)
+                .map(|(item, fit)| {
+                    canonicalize_with_fit(
+                        Value::Concrete(ConcreteValue::String(item)),
+                        fit,
+                        defs,
+                        purpose,
+                        error_policy,
+                    )
+                })
+                .enumerate()
+                .map(|(index, result)| {
+                    result.map_err(|error| error_policy.at_list_index(index, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let strings = canonicalized
+                .iter()
+                .map(|item| match item {
+                    Value::Concrete(ConcreteValue::String(value)) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            Ok(strings.map_or_else(
+                || Value::Concrete(ConcreteValue::List(canonicalized)),
+                |strings| Value::Concrete(ConcreteValue::StringList(strings)),
+            ))
+        }
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::FitKind::Map(fits)) => {
+            debug_assert_eq!(map.len(), fits.len());
+            let entries = map
+                .into_iter()
+                .zip(fits)
+                .map(|((key, value), fit)| {
+                    let canonical_key = fit.canonical_key.clone().unwrap_or_else(|| key.clone());
+                    let value =
+                        canonicalize_with_fit(value, fit.value, defs, purpose, error_policy)
+                            .map_err(|error| error_policy.at_map_value(key.clone(), error))?;
+                    Ok((key, canonical_key, value))
+                })
+                .collect::<Result<Vec<_>, P::Error>>()?;
+            Ok(Value::Concrete(ConcreteValue::Map(
+                collect_canonicalized_map(entries, error_policy)?,
+            )))
+        }
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::FitKind::Struct(fits)) => {
+            debug_assert_eq!(map.len(), fits.len());
+            let fields = map
+                .into_iter()
+                .zip(fits)
+                .map(|((key, value), fit)| {
+                    let value = canonicalize_with_fit(value, fit, defs, purpose, error_policy)
+                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))?;
+                    Ok((key, value))
+                })
+                .collect::<Result<IndexMap<_, _>, P::Error>>()?;
+            Ok(Value::Concrete(ConcreteValue::Map(fields)))
+        }
+        (value, crate::schema::FitKind::PassThrough | crate::schema::FitKind::Deferred) => {
+            Ok(value)
+        }
+        (value, _) => {
+            debug_assert!(false, "fit witness and value shape diverged");
+            Ok(value)
+        }
     }
 }
 
-/// Body of [`canonicalize_with_type`] for the
+fn collect_canonicalized_map<P: CanonicalizationErrorPolicy>(
+    entries: Vec<(String, String, Value)>,
+    error_policy: P,
+) -> Result<IndexMap<String, Value>, P::Error> {
+    let mut seen = BTreeSet::new();
+    let collision = entries.iter().find_map(|(original_key, canonical_key, _)| {
+        (!seen.insert(canonical_key.clone())).then(|| (original_key.clone(), canonical_key.clone()))
+    });
+
+    if let Some((original_key, canonical_key)) = collision {
+        error_policy.map_key_collision(original_key, canonical_key)?;
+        return Ok(entries
+            .into_iter()
+            .map(|(original_key, _, value)| (original_key, value))
+            .collect());
+    }
+
+    Ok(entries
+        .into_iter()
+        .map(|(_, canonical_key, value)| (canonical_key, value))
+        .collect())
+}
+
+fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeError> {
+    match value {
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+            Ok(canonical.api_value().to_string())
+        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Ok(raw.as_str().to_string()),
+        Value::Concrete(ConcreteValue::String(string)) => Ok(string.expose_plaintext().to_string()),
+        unexpected @ (Value::Concrete(
+            ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::List(_)
+            | ConcreteValue::StringList(_)
+            | ConcreteValue::Map(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        )) => Err(crate::schema::TypeError::TypeMismatch {
+            expected: "String or Enum map key".to_string(),
+            got: unexpected.type_name(),
+        }),
+    }
+}
+
+fn type_contains_enum(
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    fn walk<'a>(
+        attr_type: &'a AttributeType,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        visited: &mut std::collections::HashSet<*const AttributeType>,
+    ) -> bool {
+        let resolved = attr_type.resolve_refs_with_defs(defs).as_attr();
+        let identity = std::ptr::from_ref(resolved);
+        if !visited.insert(identity) {
+            return false;
+        }
+        let contains = match &resolved.kind {
+            AttrTypeKind::Enum { .. } => true,
+            AttrTypeKind::List { element_type, .. } => walk(element_type, defs, visited),
+            AttrTypeKind::Map { key, value } => {
+                walk(key, defs, visited) || walk(value, defs, visited)
+            }
+            AttrTypeKind::Struct { fields, .. } => fields
+                .iter()
+                .any(|field| walk(&field.field_type, defs, visited)),
+            AttrTypeKind::Union(_) => crate::schema::union_members_with_defs(resolved, defs)
+                .expect("resolved Union must expose its members")
+                .iter()
+                .flatten()
+                .any(|member| walk(member.as_attr(), defs, visited)),
+            AttrTypeKind::String { .. }
+            | AttrTypeKind::ResourceHandle { .. }
+            | AttrTypeKind::StringLiteralSet { .. }
+            | AttrTypeKind::Int { .. }
+            | AttrTypeKind::Float { .. }
+            | AttrTypeKind::Bool
+            | AttrTypeKind::Duration => false,
+            AttrTypeKind::Ref(_) => {
+                unreachable!("resolve_refs_with_defs must peel the top-level Ref")
+            }
+        };
+        visited.remove(&identity);
+        contains
+    }
+
+    walk(attr_type, defs, &mut std::collections::HashSet::new())
+}
+
+fn finish_no_fit<P: CanonicalizationErrorPolicy>(
+    value: Value,
+    expected: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    error_policy: P,
+) -> Result<Value, P::Error> {
+    if purpose.rejects_unrecognized_enum_text() && type_contains_enum(expected, defs) {
+        let source = crate::schema::TypeError::TypeMismatch {
+            expected: expected.type_name(),
+            got: value.type_name(),
+        };
+        error_policy.canonicalization_failed(value, source)
+    } else {
+        Ok(value)
+    }
+}
+
+/// Preserve legacy partial canonicalization and diagnostics for values that do
+/// not fit at all. Union acceptance never comes from this path. Provider output
+/// alone follows the closest failure shape so invalid enum text fails closed;
+/// persisted state retains its established forward-compatible lenience.
+fn canonicalize_without_fit<'a, P: CanonicalizationErrorPolicy>(
+    value: Value,
+    unwrapped: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    error_policy: P,
+    visited_refs: &mut Vec<&'a str>,
+) -> Result<Value, P::Error> {
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        return canonicalize_without_fit(
+            *inner,
+            unwrapped,
+            defs,
+            purpose,
+            error_policy,
+            visited_refs,
+        )
+        .map(|canonical| Value::Deferred(DeferredValue::Secret(Box::new(canonical))))
+        .map_err(|error| error_policy.mask_secret(error));
+    }
+
+    if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(unwrapped, defs) {
+        return Ok(canonicalize_to_string_list(value));
+    }
+
+    let shape = unwrapped
+        .shape_ref_free()
+        .expect("canonicalization dispatch must hold a Ref-peeled type");
+    if matches!(shape, crate::schema::Shape::Union) {
+        if purpose.rejects_unrecognized_enum_text()
+            && let Some(concrete) = value.as_concrete()
+            && let Some(member) = crate::schema::closest_union_member_for_value_on_path(
+                unwrapped,
+                concrete,
+                defs,
+                visited_refs,
+            )
+        {
+            let canonical = canonicalize_without_fit(
+                value,
+                peel_custom(member),
+                defs,
+                purpose,
+                error_policy,
+                visited_refs,
+            )?;
+            return finish_no_fit(canonical, unwrapped, defs, purpose, error_policy);
+        }
+        if let Some(occurrence) = first_enum_identifier(&value) {
+            let source = mask_enum_identifier_error_for_secret(
+                crate::schema::TypeError::ValidationFailed {
+                    message: format!(
+                        "unresolved enum identifier `{}` did not match any Union member",
+                        occurrence.raw
+                    ),
+                },
+                occurrence,
+            );
+            return error_policy.canonicalization_failed(value, source);
+        }
+        return finish_no_fit(value, unwrapped, defs, purpose, error_policy);
+    }
+
+    match (value, shape) {
+        (
+            Value::Concrete(ConcreteValue::List(items)),
+            crate::schema::Shape::List {
+                element_type: inner,
+                ..
+            },
+        ) => {
+            let canonicalized = items
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    canonicalize_with_type_for_purpose(value, inner, defs, purpose, error_policy)
+                        .map_err(|error| error_policy.at_list_index(index, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            finish_no_fit(
+                Value::Concrete(ConcreteValue::List(canonicalized)),
+                unwrapped,
+                defs,
+                purpose,
+                error_policy,
+            )
+        }
+        (
+            Value::Concrete(ConcreteValue::StringList(items)),
+            crate::schema::Shape::List {
+                element_type: inner,
+                ..
+            },
+        ) => {
+            let canonicalized = items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    canonicalize_with_type_for_purpose(
+                        Value::Concrete(ConcreteValue::String(item)),
+                        inner,
+                        defs,
+                        purpose,
+                        error_policy,
+                    )
+                    .map_err(|error| error_policy.at_list_index(index, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let strings = canonicalized
+                .iter()
+                .map(|item| match item {
+                    Value::Concrete(ConcreteValue::String(value)) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            let canonical = strings.map_or_else(
+                || Value::Concrete(ConcreteValue::List(canonicalized)),
+                |strings| Value::Concrete(ConcreteValue::StringList(strings)),
+            );
+            finish_no_fit(canonical, unwrapped, defs, purpose, error_policy)
+        }
+        (
+            Value::Concrete(ConcreteValue::Map(map)),
+            crate::schema::Shape::Map {
+                key: key_type,
+                value: value_type,
+            },
+        ) => {
+            let canonicalized = map
+                .into_iter()
+                .map(|(key, value)| {
+                    let lifted_key = crate::schema::lift_map_key(key_type, &key, defs);
+                    let canonical_key_value = canonicalize_with_type_for_purpose(
+                        lifted_key,
+                        key_type,
+                        defs,
+                        purpose,
+                        error_policy,
+                    )
+                    .map_err(|error| error_policy.at_map_key(key.clone(), error))?;
+                    let canonical_key = match canonical_map_key_text(canonical_key_value) {
+                        Ok(canonical_key) => canonical_key,
+                        Err(source) => error_policy
+                            .canonicalization_failed(
+                                Value::Concrete(ConcreteValue::String(key.clone().into())),
+                                source,
+                            )
+                            .map(|_| key.clone())
+                            .map_err(|error| error_policy.at_map_key(key.clone(), error))?,
+                    };
+                    let canonical_value = canonicalize_with_type_for_purpose(
+                        value,
+                        value_type,
+                        defs,
+                        purpose,
+                        error_policy,
+                    )
+                    .map_err(|error| error_policy.at_map_value(key.clone(), error))?;
+                    Ok((key, canonical_key, canonical_value))
+                })
+                .collect::<Result<Vec<_>, P::Error>>()?;
+            finish_no_fit(
+                Value::Concrete(ConcreteValue::Map(collect_canonicalized_map(
+                    canonicalized,
+                    error_policy,
+                )?)),
+                unwrapped,
+                defs,
+                purpose,
+                error_policy,
+            )
+        }
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { .. }) => {
+            let fields = crate::schema::struct_fields_with_defs(unwrapped, defs)
+                .expect("Shape::Struct must expose struct fields internally");
+            let canonicalized = map
+                .into_iter()
+                .map(|(key, value)| {
+                    let canonical = match crate::schema::struct_field_for_key(fields, &key) {
+                        Some(field) => canonicalize_with_type_for_purpose(
+                            value,
+                            &field.field_type,
+                            defs,
+                            purpose,
+                            error_policy,
+                        )
+                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))?,
+                        None => value,
+                    };
+                    Ok((key, canonical))
+                })
+                .collect::<Result<IndexMap<_, _>, P::Error>>()?;
+            finish_no_fit(
+                Value::Concrete(ConcreteValue::Map(canonicalized)),
+                unwrapped,
+                defs,
+                purpose,
+                error_policy,
+            )
+        }
+        (
+            value,
+            crate::schema::Shape::Enum {
+                identity: expected_identity,
+                values,
+                ..
+            },
+        ) => {
+            let resolver = crate::resource::EnumValueResolver::with_defs(unwrapped, defs);
+            match value {
+                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                    let resolved = if purpose.resolves_identifiers_as_state_text() {
+                        resolver.resolve_state_text(raw.as_str())
+                    } else if let Some(provider_name) = purpose.provider_config_name() {
+                        resolve_provider_config_enum_identifier(
+                            &resolver,
+                            &raw,
+                            expected_identity,
+                            provider_name,
+                        )
+                    } else {
+                        resolver.resolve_raw(&raw)
+                    };
+                    match resolved {
+                        Ok(canonical) => {
+                            Ok(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+                        }
+                        Err(source) => error_policy.canonicalization_failed(
+                            Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
+                            source,
+                        ),
+                    }
+                }
+                Value::Concrete(ConcreteValue::String(string))
+                    if purpose.canonicalizes_full_shape()
+                        && purpose.accepts_enum_string(values.is_some()) =>
+                {
+                    match resolver.resolve_state_text(string.expose_plaintext()) {
+                        Ok(canonical) => {
+                            Ok(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+                        }
+                        Err(source) => error_policy.canonicalization_failed(
+                            Value::Concrete(ConcreteValue::String(string)),
+                            source,
+                        ),
+                    }
+                }
+                Value::Concrete(ConcreteValue::CanonicalEnum(ref canonical))
+                    if canonical.identity().same_type(expected_identity) =>
+                {
+                    Ok(value)
+                }
+                Value::Concrete(ConcreteValue::CanonicalEnum(ref canonical)) => {
+                    let source = crate::schema::TypeError::TypeMismatch {
+                        expected: expected_identity.to_string(),
+                        got: canonical.identity().to_string(),
+                    };
+                    error_policy.canonicalization_failed(value, source)
+                }
+                other => finish_no_fit(other, unwrapped, defs, purpose, error_policy),
+            }
+        }
+        (value, _) => finish_no_fit(value, unwrapped, defs, purpose, error_policy),
+    }
+}
+
+pub(crate) fn resolve_provider_config_enum_identifier(
+    resolver: &crate::resource::EnumValueResolver<'_>,
+    raw: &crate::resource::RawEnumIdentifier,
+    expected_identity: &crate::schema::TypeIdentity,
+    provider_name: &str,
+) -> Result<crate::resource::CanonicalEnumValue, crate::schema::TypeError> {
+    // The schema identity remains authoritative. Only after its normal
+    // resolution fails may a provider block substitute its own name for the
+    // identity's provider axis; the rest of the identity must stay exact.
+    let first = resolver.resolve_raw(raw);
+    if first.is_ok() {
+        return first;
+    }
+
+    let member = match raw.parsed() {
+        crate::resource::RawEnumIdentifierParts::ProviderQualified {
+            provider,
+            type_name,
+            value,
+        } if provider == provider_name
+            && expected_identity.segments.is_empty()
+            && type_name == &expected_identity.kind =>
+        {
+            value
+        }
+        crate::resource::RawEnumIdentifierParts::FullyQualified {
+            provider,
+            segments,
+            type_name,
+            value,
+        } if provider == provider_name
+            && segments == &expected_identity.segments
+            && type_name == &expected_identity.kind =>
+        {
+            value
+        }
+        _ => return first,
+    };
+
+    resolver.resolve_raw(&crate::resource::RawEnumIdentifier::parse(member.clone()))
+}
+
+#[derive(Clone, Copy)]
+struct EnumIdentifierOccurrence<'a> {
+    raw: &'a crate::resource::RawEnumIdentifier,
+    inside_secret: bool,
+}
+
+fn first_enum_identifier(value: &Value) -> Option<EnumIdentifierOccurrence<'_>> {
+    first_enum_identifier_inner(value, false)
+}
+
+fn first_enum_identifier_inner(
+    value: &Value,
+    inside_secret: bool,
+) -> Option<EnumIdentifierOccurrence<'_>> {
+    match value {
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+            Some(EnumIdentifierOccurrence { raw, inside_secret })
+        }
+        Value::Concrete(ConcreteValue::List(items)) => items
+            .iter()
+            .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
+        Value::Concrete(ConcreteValue::Map(map)) => map
+            .values()
+            .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
+        Value::Deferred(DeferredValue::Secret(inner)) => first_enum_identifier_inner(inner, true),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::RedactedSecret { .. },
+        ) => None,
+    }
+}
+
+/// Body of state and desired canonicalization for the
 /// `string_or_list_of_strings` case.
 fn canonicalize_to_string_list(value: Value) -> Value {
     match value {
@@ -3371,6 +4071,7 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// the witness is alive, callers cannot mutate the underlying resources
 /// through another borrow, so identity code can require this type as
 /// evidence that the canonicalize pass already ran.
+#[derive(Debug)]
 pub struct CanonicalizedResources<'a> {
     resources: &'a mut [crate::resource::Resource],
 }
@@ -3381,18 +4082,127 @@ impl<'a> CanonicalizedResources<'a> {
     }
 }
 
-/// Canonicalize every schema-known value in one resource attribute map.
+/// A desired value could not be resolved to the enum value declared by its
+/// resource or data-source schema.
 ///
-/// carina#3740: desired resources, current states, and persisted saved
-/// attributes must share this exact per-attribute walk. Keeping the container
-/// adapters thin prevents one differ operand from receiving fewer structural
-/// rewrites than the others. `enum_identifier_phase` records the operand's
-/// provenance so the same recursive walk cannot accidentally reinterpret
-/// state text as raw DSL.
-pub(crate) fn canonicalize_attribute_map_with_schema<Attributes>(
+/// The structured [`crate::schema::TypeError`] remains the source so callers
+/// can inspect the resolver failure without parsing a rendered diagnostic.
+#[derive(Debug, Error)]
+#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {source}")]
+pub struct EnumCanonicalizationError {
+    resource: Box<crate::resource::ResourceId>,
+    attribute: String,
+    #[source]
+    source: Box<crate::schema::TypeError>,
+}
+
+impl EnumCanonicalizationError {
+    fn new(
+        resource: crate::resource::ResourceId,
+        attribute: impl Into<String>,
+        source: crate::schema::TypeError,
+    ) -> Self {
+        Self {
+            resource: Box::new(resource),
+            attribute: attribute.into(),
+            source: Box::new(source),
+        }
+    }
+
+    pub fn resource(&self) -> &crate::resource::ResourceId {
+        &self.resource
+    }
+
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+}
+
+fn unresolved_enum_identifier_type_error(
+    raw: &crate::resource::RawEnumIdentifier,
+) -> crate::schema::TypeError {
+    crate::schema::TypeError::ValidationFailed {
+        message: format!("unresolved enum identifier `{raw}` survived canonicalization"),
+    }
+}
+
+fn mask_enum_identifier_error_for_secret(
+    error: crate::schema::TypeError,
+    occurrence: EnumIdentifierOccurrence<'_>,
+) -> crate::schema::TypeError {
+    if occurrence.inside_secret {
+        error.masked_for_secret()
+    } else {
+        error
+    }
+}
+
+fn unresolved_enum_identifier_type_error_in(value: &Value) -> Option<crate::schema::TypeError> {
+    let occurrence = first_enum_identifier(value)?;
+    Some(mask_enum_identifier_error_for_secret(
+        unresolved_enum_identifier_type_error(occurrence.raw),
+        occurrence,
+    ))
+}
+
+fn canonicalize_desired_attribute_map_with_schema<Attributes>(
     attributes: &mut Attributes,
     schema: &crate::schema::ResourceSchema,
-    enum_identifier_phase: EnumIdentifierPhase,
+    resource: &crate::resource::ResourceId,
+    source: DesiredValueSource,
+) -> Result<(), EnumCanonicalizationError>
+where
+    Attributes:
+        Default + IntoIterator<Item = (String, Value)> + std::iter::FromIterator<(String, Value)>,
+{
+    let mut canonicalized = Vec::new();
+    for (key, value) in std::mem::take(attributes) {
+        let canonical = match schema.attributes.get(&key) {
+            Some(attr_schema) => {
+                canonicalize_desired_with_type(value, &attr_schema.attr_type, &schema.defs, source)
+                    .map_err(|source| {
+                        EnumCanonicalizationError::new(resource.clone(), key.clone(), source)
+                    })?
+            }
+            None => {
+                if let Some(source) = unresolved_enum_identifier_type_error_in(&value) {
+                    return Err(EnumCanonicalizationError::new(
+                        resource.clone(),
+                        key,
+                        source,
+                    ));
+                }
+                value
+            }
+        };
+        canonicalized.push((key, canonical));
+    }
+    *attributes = canonicalized.into_iter().collect();
+    Ok(())
+}
+
+fn reject_unresolved_enum_identifiers_in_attributes<'a>(
+    resource: &crate::resource::ResourceId,
+    attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+) -> Result<(), EnumCanonicalizationError> {
+    for (attribute, value) in attributes {
+        if let Some(source) = unresolved_enum_identifier_type_error_in(value) {
+            return Err(EnumCanonicalizationError::new(
+                resource.clone(),
+                attribute.clone(),
+                source,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize every schema-known value in one provider or persisted state
+/// attribute map. This lenient entry point intentionally preserves
+/// unrecognized enum-positioned strings as literal state text.
+pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
+    attributes: &mut Attributes,
+    schema: &crate::schema::ResourceSchema,
 ) where
     Attributes:
         Default + IntoIterator<Item = (String, Value)> + std::iter::FromIterator<(String, Value)>,
@@ -3401,12 +4211,9 @@ pub(crate) fn canonicalize_attribute_map_with_schema<Attributes>(
         .into_iter()
         .map(|(key, value)| {
             let canonical = match schema.attributes.get(&key) {
-                Some(attr_schema) => canonicalize_with_type_for_enum_phase(
-                    value,
-                    &attr_schema.attr_type,
-                    &schema.defs,
-                    enum_identifier_phase,
-                ),
+                Some(attr_schema) => {
+                    canonicalize_state_with_type(value, &attr_schema.attr_type, &schema.defs)
+                }
                 None => value,
             };
             (key, canonical)
@@ -3414,11 +4221,14 @@ pub(crate) fn canonicalize_attribute_map_with_schema<Attributes>(
         .collect();
 }
 
-/// Walk every resource's attributes, canonicalizing values whose
-/// declared schema type is `Union[String, list(String)]` into
-/// `Value::Concrete(ConcreteValue::StringList)`. Resources whose schema is not in the registry
-/// (provider not loaded, unknown resource type) are skipped — schema
-/// validation surfaces the mismatch elsewhere.
+/// Walk every desired resource attribute using its schema.
+///
+/// Structural rewrites such as `Union[String, list(String)]` remain, and every
+/// enum-typed leaf is resolved to [`ConcreteValue::CanonicalEnum`]. Enum
+/// resolution is total: an invalid member, an unselected Union containing a
+/// typed identifier, or any identifier outside the known schema returns a
+/// structured [`EnumCanonicalizationError`]. Unknown non-enum attributes and
+/// ordinary shape mismatches remain validation's responsibility.
 ///
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
@@ -3426,19 +4236,51 @@ pub(crate) fn canonicalize_attribute_map_with_schema<Attributes>(
 pub fn canonicalize_resources_with_schemas<'a>(
     resources: &'a mut [crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
-) -> CanonicalizedResources<'a> {
+) -> Result<CanonicalizedResources<'a>, EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
-        let Some(schema) = registry.get_for(resource) else {
-            continue;
-        };
-        canonicalize_attribute_map_with_schema(
-            &mut resource.attributes,
-            schema,
-            EnumIdentifierPhase::RawDsl,
-        );
+        if let Some(schema) = registry.get_for(resource) {
+            canonicalize_desired_attribute_map_with_schema(
+                &mut resource.attributes,
+                schema,
+                &resource.id,
+                DesiredValueSource::AuthoredDsl,
+            )?;
+        } else {
+            reject_unresolved_enum_identifiers_in_attributes(
+                &resource.id,
+                resource.attributes.iter(),
+            )?;
+        }
     }
 
-    CanonicalizedResources { resources }
+    Ok(CanonicalizedResources { resources })
+}
+
+/// Re-canonicalize values returned by `normalize_desired`.
+///
+/// Guest output is provider/state text, so strings resolve only by literal API
+/// membership or a declared alias. Dotted strings are never reinterpreted as
+/// namespaced DSL identifiers.
+pub fn canonicalize_normalized_resources_with_schemas(
+    resources: &mut [crate::resource::Resource],
+    registry: &crate::schema::SchemaRegistry,
+) -> Result<(), EnumCanonicalizationError> {
+    for resource in resources.iter_mut() {
+        if let Some(schema) = registry.get_for(resource) {
+            canonicalize_desired_attribute_map_with_schema(
+                &mut resource.attributes,
+                schema,
+                &resource.id,
+                DesiredValueSource::ProviderOutput,
+            )?;
+        } else {
+            reject_unresolved_enum_identifiers_in_attributes(
+                &resource.id,
+                resource.attributes.iter(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 type ProviderConfigAttributeTypeFn<'a> = dyn Fn(&str, &str) -> Option<AttributeType> + 'a;
@@ -3464,41 +4306,83 @@ impl CanonicalizedProviderConfigs {
     }
 }
 
-fn canonicalize_provider_config_with_type(value: Value, attr_type: &AttributeType) -> Value {
+pub(crate) fn canonicalize_provider_config_with_type(
+    provider_name: &str,
+    value: Value,
+    attr_type: &AttributeType,
+) -> Result<Value, crate::schema::TypeError> {
     let defs = crate::schema::empty_defs_for_schema_walks();
-    // Provider configs are authored DSL. Their parser-produced
-    // EnumIdentifier values therefore use DSL namespace/alias resolution,
-    // just like resource and data-source attributes.
-    let canonical =
-        canonicalize_with_type_for_enum_phase(value, attr_type, defs, EnumIdentifierPhase::RawDsl);
-    let Value::Concrete(ConcreteValue::EnumIdentifier(raw)) = &canonical else {
-        return canonical;
-    };
-    let Some((identity, ..)) = attr_type.enum_parts() else {
-        return canonical;
-    };
-    let member = match raw.parsed() {
-        crate::resource::RawEnumIdentifierParts::TypeQualified { type_name, value }
-        | crate::resource::RawEnumIdentifierParts::ProviderQualified {
-            type_name, value, ..
-        }
-        | crate::resource::RawEnumIdentifierParts::FullyQualified {
-            type_name, value, ..
-        } if type_name == &identity.kind => value,
-        _ => return canonical,
-    };
-
-    // Provider configs may intentionally source a compatible enum from a
-    // sibling provider namespace (for example `aws.Region.*` on an `awscc`
-    // config). The source is still a typed EnumIdentifier, so resolve its
-    // typed member against the receiving schema rather than inspecting a
-    // String's dotted shape.
-    canonicalize_with_type_for_enum_phase(
-        Value::Concrete(ConcreteValue::enum_identifier(member.clone())),
+    let canonical = canonicalize_with_type_for_purpose(
+        value,
         attr_type,
         defs,
-        EnumIdentifierPhase::RawDsl,
-    )
+        CanonicalizationPurpose::ProviderConfig { provider_name },
+        RejectEnumResolutionErrors,
+    )?;
+    if let Some(error) = unresolved_enum_identifier_type_error_in(&canonical) {
+        return Err(error);
+    }
+    Ok(canonical)
+}
+
+/// A provider configuration value could not be resolved through the
+/// provider-declared attribute type.
+#[derive(Debug, Error)]
+#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {source}")]
+pub struct ProviderConfigCanonicalizationError {
+    provider: String,
+    attribute: String,
+    #[source]
+    source: Box<crate::schema::TypeError>,
+}
+
+impl ProviderConfigCanonicalizationError {
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+
+    pub(crate) fn into_parts(self) -> (String, String, crate::schema::TypeError) {
+        (self.provider, self.attribute, *self.source)
+    }
+}
+
+/// Canonicalize one provider configuration attribute map using its
+/// host-declared types. Typed canonicalization is total; the only explicit
+/// identifier check is therefore for attributes without a declared type.
+pub(crate) fn canonicalize_provider_config_attributes_with_types(
+    provider_name: &str,
+    attributes: &IndexMap<String, Value>,
+    attr_types: &HashMap<String, AttributeType>,
+) -> Result<IndexMap<String, Value>, ProviderConfigCanonicalizationError> {
+    let mut canonical = IndexMap::with_capacity(attributes.len());
+    for (attribute, value) in attributes {
+        let value = match attr_types.get(attribute) {
+            Some(attr_type) => {
+                canonicalize_provider_config_with_type(provider_name, value.clone(), attr_type)
+                    .map_err(|source| ProviderConfigCanonicalizationError {
+                        provider: provider_name.to_string(),
+                        attribute: attribute.clone(),
+                        source: Box::new(source),
+                    })?
+            }
+            None => {
+                if let Some(source) = unresolved_enum_identifier_type_error_in(value) {
+                    return Err(ProviderConfigCanonicalizationError {
+                        provider: provider_name.to_string(),
+                        attribute: attribute.clone(),
+                        source: Box::new(source),
+                    });
+                }
+                value.clone()
+            }
+        };
+        canonical.insert(attribute.clone(), value);
+    }
+    Ok(canonical)
 }
 
 /// Walk every provider config's attributes, canonicalizing enum-typed leaves
@@ -3507,42 +4391,52 @@ fn canonicalize_provider_config_with_type(value: Value, attr_type: &AttributeTyp
 pub fn canonicalize_provider_configs_with_attribute_types(
     providers: &[crate::parser::ProviderConfig],
     provider_config_attribute_type_fn: &ProviderConfigAttributeTypeFn<'_>,
-) -> CanonicalizedProviderConfigs {
+) -> Result<CanonicalizedProviderConfigs, ProviderConfigCanonicalizationError> {
     let mut providers = providers.to_vec();
     for provider in providers.iter_mut() {
-        let mut new_attrs = indexmap::IndexMap::new();
-        for (key, value) in std::mem::take(&mut provider.attributes) {
-            let canon = match provider_config_attribute_type_fn(&provider.name, &key) {
-                Some(attr_type) => canonicalize_provider_config_with_type(value, &attr_type),
-                None => value,
-            };
-            new_attrs.insert(key, canon);
-        }
-        provider.attributes = new_attrs;
+        let attr_types = provider
+            .attributes
+            .keys()
+            .filter_map(|attribute| {
+                provider_config_attribute_type_fn(&provider.name, attribute)
+                    .map(|attr_type| (attribute.clone(), attr_type))
+            })
+            .collect();
+        provider.attributes = canonicalize_provider_config_attributes_with_types(
+            &provider.name,
+            &provider.attributes,
+            &attr_types,
+        )?;
     }
-    CanonicalizedProviderConfigs { providers }
+    Ok(CanonicalizedProviderConfigs { providers })
 }
 
 /// [`DataSource`](crate::resource::DataSource) counterpart of
-/// [`canonicalize_resources_with_schemas`]. Schema lookup routes through
-/// the data-source registry (`get_for_data_source`); data sources whose
-/// schema is not registered are skipped. A data source's attributes are
-/// authored `read` inputs, so `EnumIdentifier` uses RawDsl semantics
-/// (carina#3181, carina#3740).
+/// [`canonicalize_resources_with_schemas`]. Schema lookup routes through the
+/// data-source registry (`get_for_data_source`). A data source's attributes are
+/// authored `read` inputs, so `EnumIdentifier` uses authored-DSL semantics. Unknown
+/// non-enum values pass through, while an identifier without a resolvable
+/// schema is rejected (carina#3181, carina#3740).
 pub fn canonicalize_data_sources_with_schemas(
     data_sources: &mut [crate::resource::DataSource],
     registry: &crate::schema::SchemaRegistry,
-) {
+) -> Result<(), EnumCanonicalizationError> {
     for data_source in data_sources.iter_mut() {
-        let Some(schema) = registry.get_for_data_source(data_source) else {
-            continue;
-        };
-        canonicalize_attribute_map_with_schema(
-            &mut data_source.attributes,
-            schema,
-            EnumIdentifierPhase::RawDsl,
-        );
+        if let Some(schema) = registry.get_for_data_source(data_source) {
+            canonicalize_desired_attribute_map_with_schema(
+                &mut data_source.attributes,
+                schema,
+                &data_source.id,
+                DesiredValueSource::AuthoredDsl,
+            )?;
+        } else {
+            reject_unresolved_enum_identifiers_in_attributes(
+                &data_source.id,
+                data_source.attributes.iter(),
+            )?;
+        }
     }
+    Ok(())
 }
 
 /// Walk every entry in a `current_states` map and canonicalize attribute
@@ -3573,63 +4467,7 @@ pub fn canonicalize_states_with_schemas(
         let Some(schema) = kind else {
             continue;
         };
-        canonicalize_attribute_map_with_schema(
-            &mut state.attributes,
-            schema,
-            EnumIdentifierPhase::StateText,
-        );
-    }
-}
-
-/// Resolve typed enum identifiers within one attribute using the selected
-/// resource schema. The walk follows declared list, map, and struct types and
-/// converts only [`ConcreteValue::EnumIdentifier`] leaves to
-/// [`ConcreteValue::CanonicalEnum`]; plain [`ConcreteValue::String`] and
-/// already-canonical values stay unchanged. Plan, apply, and state-side alias
-/// passes share this implementation. Callers resolving multiple attributes
-/// should fetch one schema snapshot and reuse it.
-pub fn resolve_value_alias_with_schema(
-    value: &mut Value,
-    attr_name: &str,
-    schema: &crate::schema::ResourceSchema,
-) {
-    let Some(attr) = schema.attributes.get(attr_name) else {
-        return;
-    };
-    *value =
-        canonicalize_typed_enum_identifiers_with_type(value.clone(), &attr.attr_type, &schema.defs);
-}
-
-/// Re-apply enum-alias resolution to every resource, looking up the
-/// factory per resource by `id.provider` (the same `find_factory`
-/// dispatch the plan and apply paths use). Single source of truth for
-/// enum-alias resolution so the two cannot diverge on this stage again
-/// (carina#3063).
-pub fn resolve_enum_aliases_for_resources(
-    resources: &mut [crate::resource::Resource],
-    factories: &[Box<dyn crate::provider::ProviderFactory>],
-) {
-    for resource in resources.iter_mut() {
-        if resource.id.provider.is_empty() {
-            continue;
-        }
-        let Some(factory) = crate::provider::find_factory(factories, &resource.id.provider) else {
-            continue;
-        };
-        let resource_type = resource.id.resource_type.clone();
-        let schemas = factory.schemas();
-        let Some(schema) = schemas.iter().find(|schema| {
-            schema.resource_type == resource_type
-                && schema.kind == crate::schema::SchemaKind::Resource
-        }) else {
-            continue;
-        };
-        let keys: Vec<String> = resource.attributes.keys().cloned().collect();
-        for key in keys {
-            if let Some(value) = resource.attributes.get_mut(&key) {
-                resolve_value_alias_with_schema(value, &key, schema);
-            }
-        }
+        canonicalize_state_attribute_map_with_schema(&mut state.attributes, schema);
     }
 }
 
@@ -3641,370 +4479,6 @@ mod tests {
         Value::Deferred(DeferredValue::RedactedSecret {
             hash: RedactedSecretHash::generate(material.as_bytes()),
         })
-    }
-
-    fn status_enum(namespace: Option<&str>) -> AttributeType {
-        use crate::schema::enum_identity;
-
-        AttributeType::enum_(
-            namespace
-                .map(|ns| enum_identity("Status", Some(ns)))
-                .unwrap_or_else(|| crate::schema::TypeIdentity::bare("Status")),
-            Some(vec!["enabled".to_string(), "disabled".to_string()]),
-            Vec::new(),
-            None,
-            None,
-        )
-    }
-
-    fn schema_with_attr(
-        resource_type: &'static str,
-        attr_name: &'static str,
-        attr_type: AttributeType,
-    ) -> crate::schema::ResourceSchema {
-        use crate::schema::{AttributeSchema, ResourceSchema};
-
-        ResourceSchema::new(resource_type).attribute(AttributeSchema::new(attr_name, attr_type))
-    }
-
-    fn resolve_with_schema(
-        schema: crate::schema::ResourceSchema,
-        attr_name: &'static str,
-        input: &str,
-    ) -> Value {
-        let mut value = Value::Concrete(ConcreteValue::enum_identifier(input));
-        resolve_value_alias_with_schema(&mut value, attr_name, &schema);
-        value
-    }
-
-    #[test]
-    fn resolve_value_alias_does_not_reclassify_quoted_dotted_string() {
-        let schema = schema_with_attr(
-            "svc.Resource",
-            "status",
-            AttributeType::enum_(
-                crate::schema::TypeIdentity::bare("A"),
-                Some(vec!["json".to_string()]),
-                Vec::new(),
-                None,
-                None,
-            ),
-        );
-        let mut value = Value::Concrete(ConcreteValue::String("A.json".into()));
-
-        resolve_value_alias_with_schema(&mut value, "status", &schema);
-
-        assert!(matches!(
-            value,
-            Value::Concrete(ConcreteValue::String(text))
-                if text.expose_plaintext() == "A.json"
-        ));
-    }
-
-    #[test]
-    fn resolve_value_alias_uses_typed_schema_dsl_map() {
-        let schema = schema_with_attr(
-            "acm.Certificate",
-            "status",
-            AttributeType::enum_(
-                crate::schema::enum_identity("Status", Some("aws.acm.Certificate")),
-                Some(vec!["ISSUED".to_string()]),
-                vec![("ISSUED".to_string(), "issued".to_string())],
-                None,
-                None,
-            ),
-        );
-        let mut value = Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.acm.Certificate.Status.issued",
-        ));
-
-        resolve_value_alias_with_schema(&mut value, "status", &schema);
-
-        assert!(matches!(
-            value,
-            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
-                if canonical.api_value() == "ISSUED"
-                    && canonical.identity().to_string() == "aws.acm.Certificate.Status"
-        ));
-    }
-
-    #[test]
-    fn schema_resolved_enum_stays_canonical_when_legacy_alias_exists() {
-        let schema = schema_with_attr(
-            "acm.Certificate",
-            "status",
-            AttributeType::enum_(
-                crate::schema::enum_identity("Status", Some("aws.acm.Certificate")),
-                Some(vec!["ISSUED".to_string()]),
-                vec![("ISSUED".to_string(), "issued".to_string())],
-                None,
-                None,
-            ),
-        );
-        let mut value = Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.acm.Certificate.Status.issued",
-        ));
-
-        resolve_value_alias_with_schema(&mut value, "status", &schema);
-
-        assert!(matches!(
-            value,
-            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
-                if canonical.api_value() == "ISSUED"
-                    && canonical.identity().to_string() == "aws.acm.Certificate.Status"
-        ));
-    }
-
-    #[test]
-    fn resolve_value_alias_does_not_apply_list_schema_to_scalar_value() {
-        let schema = schema_with_attr(
-            "svc.Resource",
-            "statuses",
-            AttributeType::list(status_enum(Some("aws.svc.Resource"))),
-        );
-
-        assert!(matches!(
-            resolve_with_schema(
-                schema,
-                "statuses",
-                "aws.svc.Resource.Status.disabled",
-            ),
-            Value::Concrete(ConcreteValue::EnumIdentifier(raw))
-                if raw.as_str() == "aws.svc.Resource.Status.disabled"
-        ));
-    }
-
-    #[test]
-    fn resolve_value_alias_uses_the_nested_struct_field_type() {
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
-
-        let top_level_status = AttributeType::enum_(
-            TypeIdentity::new(Some("test"), ["widget", "Widget"], "TopLevelStatus"),
-            Some(vec!["TOP_LEVEL".to_string()]),
-            vec![("TOP_LEVEL".to_string(), "ready".to_string())],
-            None,
-            None,
-        );
-        let nested_status = AttributeType::enum_(
-            TypeIdentity::new(
-                Some("test"),
-                ["widget", "Widget", "Settings"],
-                "NestedStatus",
-            ),
-            Some(vec!["NESTED".to_string()]),
-            vec![("NESTED".to_string(), "ready".to_string())],
-            None,
-            None,
-        );
-        let schema = ResourceSchema::new("widget.Widget")
-            .attribute(AttributeSchema::new("status", top_level_status))
-            .attribute(AttributeSchema::new(
-                "settings",
-                AttributeType::struct_("Settings", vec![StructField::new("status", nested_status)]),
-            ));
-        let mut value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-            "status".to_string(),
-            Value::Concrete(ConcreteValue::enum_identifier(
-                "test.widget.Widget.Settings.NestedStatus.ready",
-            )),
-        )])));
-
-        resolve_value_alias_with_schema(&mut value, "settings", &schema);
-
-        assert!(matches!(
-            value,
-            Value::Concrete(ConcreteValue::Map(ref map))
-                if matches!(
-                    map.get("status"),
-                    Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
-                        if canonical.identity().to_string()
-                            == "test.widget.Widget.Settings.NestedStatus"
-                            && canonical.api_value() == "NESTED"
-                )
-        ));
-    }
-
-    #[test]
-    fn resolve_value_alias_uses_the_map_value_type() {
-        let status = AttributeType::enum_(
-            TypeIdentity::new(Some("test"), ["widget", "Widget"], "Status"),
-            Some(vec!["READY".to_string()]),
-            vec![("READY".to_string(), "ready".to_string())],
-            None,
-            None,
-        );
-        let schema = schema_with_attr("widget.Widget", "statuses", AttributeType::map(status));
-        let mut value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-            "primary".to_string(),
-            Value::Concrete(ConcreteValue::enum_identifier(
-                "test.widget.Widget.Status.ready",
-            )),
-        )])));
-
-        resolve_value_alias_with_schema(&mut value, "statuses", &schema);
-
-        assert!(matches!(
-            value,
-            Value::Concrete(ConcreteValue::Map(ref map))
-                if matches!(
-                    map.get("primary"),
-                    Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
-                        if canonical.identity().to_string() == "test.widget.Widget.Status"
-                            && canonical.api_value() == "READY"
-                )
-        ));
-    }
-
-    #[test]
-    fn resolve_value_alias_extracts_union_enum_member() {
-        let schema = schema_with_attr(
-            "svc.Resource",
-            "status",
-            AttributeType::union(vec![
-                AttributeType::string(),
-                status_enum(Some("aws.svc.Resource")),
-            ]),
-        );
-
-        assert!(matches!(
-            resolve_with_schema(
-                schema,
-                "status",
-                "aws.svc.Resource.Status.disabled",
-            ),
-            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
-                if canonical.identity().to_string() == "aws.svc.Resource.Status"
-                    && canonical.api_value() == "disabled"
-        ));
-    }
-
-    #[test]
-    fn resolve_value_alias_extracts_bare_enum_by_name() {
-        let schema = schema_with_attr("svc.Resource", "status", status_enum(None));
-
-        assert!(matches!(
-            resolve_with_schema(schema, "status", "Status.disabled"),
-            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
-                if canonical.identity().to_string() == "Status"
-                    && canonical.api_value() == "disabled"
-        ));
-    }
-
-    #[test]
-    fn enum_alias_resolution_does_not_explode_on_recursive_struct_schema() {
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField, enum_identity};
-
-        fn recursive_statement_def() -> AttributeType {
-            let mut union_arms = vec![
-                AttributeType::struct_(
-                    "ByteMatchStatement",
-                    vec![StructField::new("search_string", AttributeType::string())],
-                ),
-                AttributeType::struct_(
-                    "RegexMatchStatement",
-                    vec![StructField::new("regex_string", AttributeType::string())],
-                ),
-            ];
-            for idx in 0..10 {
-                union_arms.push(AttributeType::struct_(
-                    format!("RecursiveArm{idx}"),
-                    vec![StructField::new(
-                        "statement",
-                        AttributeType::ref_("Statement"),
-                    )],
-                ));
-            }
-
-            AttributeType::struct_(
-                "Statement",
-                vec![
-                    StructField::new("predicate", AttributeType::string()),
-                    StructField::new(
-                        "and_statement",
-                        AttributeType::struct_(
-                            "AndStatement",
-                            vec![StructField::new(
-                                "statements",
-                                AttributeType::list(AttributeType::ref_("Statement")),
-                            )],
-                        ),
-                    ),
-                    StructField::new(
-                        "or_statement",
-                        AttributeType::struct_(
-                            "OrStatement",
-                            vec![StructField::new(
-                                "statements",
-                                AttributeType::list(AttributeType::ref_("Statement")),
-                            )],
-                        ),
-                    ),
-                    StructField::new(
-                        "not_statement",
-                        AttributeType::struct_(
-                            "NotStatement",
-                            vec![StructField::new(
-                                "statement",
-                                AttributeType::ref_("Statement"),
-                            )],
-                        ),
-                    ),
-                    StructField::new("union_with_many_arms", AttributeType::union(union_arms)),
-                ],
-            )
-        }
-
-        let scope = AttributeType::enum_(
-            enum_identity("Scope", Some("aws.wafv2.WebAcl")),
-            Some(vec!["CLOUDFRONT".to_string(), "REGIONAL".to_string()]),
-            Vec::new(),
-            None,
-            None,
-        );
-        let schema = ResourceSchema::new("wafv2.WebAcl")
-            .attribute(AttributeSchema::new("scope", scope))
-            .attribute(AttributeSchema::new(
-                "statement",
-                AttributeType::ref_("Statement"),
-            ))
-            .with_def("Statement", recursive_statement_def());
-        let mut value = Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.wafv2.WebAcl.Scope.CLOUDFRONT",
-        ));
-
-        let started = std::time::Instant::now();
-        resolve_value_alias_with_schema(&mut value, "scope", &schema);
-
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
-            "recursive schema enum alias lookup should stay O(1), elapsed {:?}",
-            started.elapsed()
-        );
-        assert!(matches!(
-            value,
-            Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
-                if canonical.identity().to_string() == "aws.wafv2.WebAcl.Scope"
-                    && canonical.api_value() == "CLOUDFRONT"
-        ));
-    }
-
-    #[test]
-    fn resolve_value_alias_does_not_resolve_mismatched_identity() {
-        let schema = schema_with_attr(
-            "s3.BucketLifecycleConfiguration",
-            "status",
-            status_enum(Some("aws.s3.OtherStruct.Status")),
-        );
-        let original = "aws.s3.BucketLifecycleConfiguration.Rules.Status.disabled";
-
-        assert!(matches!(
-            resolve_with_schema(
-                schema,
-                "status",
-                original,
-            ),
-            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) if raw.as_str() == original
-        ));
     }
 
     #[test]
@@ -4034,7 +4508,7 @@ mod tests {
     }
 
     #[test]
-    fn value_duration_round_trips_serde() {
+    fn value_duration_survives_serde_encode_decode() {
         // Confirms the `#[serde(with = "duration_secs")]` adapter on
         // `Value::Concrete(ConcreteValue::Duration)` emits and reads back integer seconds, not
         // the default `{secs, nanos}` shape.
@@ -4424,10 +4898,10 @@ mod tests {
             .expect("state load must upgrade a raw legacy marker");
         let encoded = serde_json::to_value(&digest).expect("serialize typed digest");
 
-        let round_trip: RedactedSecretHash =
+        let decoded_hash: RedactedSecretHash =
             serde_json::from_value(encoded).expect("deserialize serialized digest");
         assert!(
-            round_trip
+            decoded_hash
                 .persisted_marker()
                 .starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
         );
@@ -4459,9 +4933,9 @@ mod tests {
         let v2 = RedactedSecretHash::generate(b"serde-v2");
         let v2_marker = v2.persisted_marker();
         let v2_encoded = serde_json::to_value(&v2).expect("serialize v2 digest");
-        let v2_round_trip: RedactedSecretHash =
+        let decoded_v2_hash: RedactedSecretHash =
             serde_json::from_value(v2_encoded).expect("deserialize serialized v2 digest");
-        assert_eq!(v2_round_trip.persisted_marker(), v2_marker);
+        assert_eq!(decoded_v2_hash.persisted_marker(), v2_marker);
         assert!(
             serde_json::from_value::<RedactedSecretHash>(serde_json::json!(v2_marker)).is_err(),
             "the full v2 state marker is not the typed digest's serde encoding",
@@ -4543,7 +5017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_value_json() {
+    fn test_value_json_encode_decode() {
         let original = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("hello".into())),
             Value::Concrete(ConcreteValue::Int(42)),
@@ -4640,7 +5114,7 @@ mod tests {
     }
 
     #[test]
-    fn json_to_dsl_value_round_trips_canonical_enum_typed_object() {
+    fn json_to_dsl_value_preserves_canonical_enum_typed_object() {
         let v = Value::Concrete(ConcreteValue::CanonicalEnum(
             crate::resource::CanonicalEnumValue::new_for_test(
                 crate::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
@@ -4698,7 +5172,7 @@ mod tests {
         );
         let mut resources = vec![resource];
 
-        canonicalize_resources_with_schemas(&mut resources, &registry);
+        canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
 
         let domain = resources[0].attributes.get("domain").unwrap();
         match domain {
@@ -4727,9 +5201,1061 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_route53_union_keeps_quoted_hosted_zone_id_on_string_arm() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+            TypeIdentity,
+        };
+
+        let hosted_zone = AttributeType::enum_(
+            TypeIdentity::new(
+                Some("aws"),
+                ["route53", "RecordSet", "AliasTarget"],
+                "HostedZoneId",
+            ),
+            Some(vec!["Z2FDTNDATAQYW2".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let alias_target = AttributeType::struct_(
+            "AliasTarget",
+            vec![StructField::new(
+                "hosted_zone_id",
+                AttributeType::union(vec![hosted_zone, AttributeType::string()]),
+            )],
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            ResourceSchema::new("route53.RecordSet")
+                .attribute(AttributeSchema::new("alias_target", alias_target)),
+        );
+
+        let canonicalize = |text: &str| {
+            let mut resource = crate::resource::Resource::with_provider(
+                "aws",
+                "route53.RecordSet",
+                "record",
+                None,
+            );
+            resource.set_attr(
+                "alias_target",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "hosted_zone_id".to_string(),
+                    Value::Concrete(ConcreteValue::String(text.to_string().into())),
+                )]))),
+            );
+            let mut resources = vec![resource];
+            canonicalize_resources_with_schemas(&mut resources, &registry)
+                .expect("the String arm must accept a non-enum literal");
+            let Value::Concrete(ConcreteValue::Map(alias_target)) =
+                &resources[0].attributes["alias_target"]
+            else {
+                panic!("expected alias_target map")
+            };
+            alias_target["hosted_zone_id"].clone()
+        };
+
+        assert_eq!(
+            canonicalize("Z05136711ZXUHBDOA8D5O"),
+            Value::Concrete(ConcreteValue::String("Z05136711ZXUHBDOA8D5O".into())),
+            "a non-member literal must remain on the String arm"
+        );
+        assert_eq!(
+            canonicalize("Z2FDTNDATAQYW2"),
+            Value::Concrete(ConcreteValue::String("Z2FDTNDATAQYW2".into())),
+            "a quoted literal must stay on the String arm even when it is an Enum member"
+        );
+    }
+
+    #[test]
+    fn desired_union_selects_the_struct_that_validation_accepts() {
+        use crate::schema::{AttributeType, StructField, TypeIdentity};
+
+        let mode = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget", "A"], "Mode"),
+            Some(vec!["X".to_string()]),
+            vec![("X".to_string(), "x_member".to_string())],
+            None,
+            None,
+        );
+        let kind = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget", "B"], "Kind"),
+            Some(vec!["Y".to_string()]),
+            vec![("Y".to_string(), "y_member".to_string())],
+            None,
+            None,
+        );
+        let union = AttributeType::union(vec![
+            AttributeType::struct_("A", vec![StructField::new("mode", mode)]),
+            AttributeType::struct_("B", vec![StructField::new("kind", kind)]),
+        ]);
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "kind".to_string(),
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "test.widget.B.Kind.y_member",
+            )),
+        )])));
+
+        assert!(
+            crate::schema::Schema::flat(union.clone())
+                .validate(&value)
+                .is_ok()
+        );
+        let canonical = canonicalize_desired_with_type(
+            value,
+            &union,
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::AuthoredDsl,
+        )
+        .expect("canonicalization must choose the same Struct arm as validation");
+
+        let Value::Concrete(ConcreteValue::Map(map)) = canonical else {
+            panic!("expected canonical Struct map")
+        };
+        assert!(matches!(
+            map.get("kind"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "Y"
+        ));
+    }
+
+    #[test]
+    fn desired_union_prefers_string_over_enum_for_quoted_literal_in_either_order() {
+        use crate::schema::{AttributeType, TypeIdentity};
+
+        let enum_type = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget"], "Effect"),
+            Some(vec!["Allow".to_string()]),
+            vec![("Allow".to_string(), "allow".to_string())],
+            None,
+            None,
+        );
+        let dynamic_enum = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget"], "DynamicEffect"),
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+        let literal = Value::Concrete(ConcreteValue::String("allow".into()));
+
+        for union in [
+            AttributeType::union(vec![enum_type.clone(), AttributeType::string()]),
+            AttributeType::union(vec![AttributeType::string(), enum_type.clone()]),
+            AttributeType::union(vec![
+                enum_type.clone(),
+                AttributeType::union(vec![AttributeType::string()]),
+            ]),
+            AttributeType::union(vec![
+                AttributeType::union(vec![AttributeType::string()]),
+                enum_type.clone(),
+            ]),
+            AttributeType::union(vec![
+                dynamic_enum.clone(),
+                AttributeType::union(vec![AttributeType::string()]),
+            ]),
+            AttributeType::union(vec![
+                AttributeType::union(vec![AttributeType::string()]),
+                dynamic_enum.clone(),
+            ]),
+        ] {
+            assert_eq!(
+                canonicalize_desired_with_type(
+                    literal.clone(),
+                    &union,
+                    crate::schema::empty_defs_for_schema_walks(),
+                    DesiredValueSource::AuthoredDsl,
+                )
+                .unwrap(),
+                literal,
+            );
+        }
+    }
+
+    fn status_enum() -> AttributeType {
+        AttributeType::enum_(
+            crate::schema::TypeIdentity::new(Some("test"), ["widget"], "Status"),
+            Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+            vec![
+                ("Enabled".to_string(), "enabled".to_string()),
+                ("Disabled".to_string(), "disabled".to_string()),
+            ],
+            None,
+            None,
+        )
+    }
+
+    fn status_union() -> AttributeType {
+        let status = status_enum();
+        AttributeType::union(vec![status.clone(), AttributeType::list(status)])
+    }
+
+    fn separator_folding_map_key_type() -> AttributeType {
+        AttributeType::map_with_key(
+            AttributeType::enum_(
+                crate::schema::TypeIdentity::bare("KeyAlgorithm"),
+                Some(vec!["RSA-2048".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+            AttributeType::string(),
+        )
+    }
+
+    fn colliding_map_key_value() -> Value {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "RSA-2048".to_string(),
+                Value::Concrete(ConcreteValue::String("first".into())),
+            ),
+            (
+                "RSA_2048".to_string(),
+                Value::Concrete(ConcreteValue::String("second".into())),
+            ),
+        ])))
+    }
+
+    #[test]
+    fn provider_output_union_canonicalizes_recognized_enum_string() {
+        let canonical = canonicalize_desired_with_type(
+            Value::Concrete(ConcreteValue::String("Enabled".into())),
+            &status_union(),
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect("recognized provider enum text must fit the scalar Enum member");
+
+        assert!(matches!(
+            canonical,
+            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                if value.api_value() == "Enabled"
+        ));
+    }
+
+    #[test]
+    fn provider_output_union_canonicalizes_recognized_secret_enum_string() {
+        let canonical = canonicalize_desired_with_type(
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("Enabled".into()),
+            )))),
+            &status_union(),
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect("the fit witness must preserve the Secret wrapper and enum choice");
+
+        let Value::Deferred(DeferredValue::Secret(inner)) = canonical else {
+            panic!("expected Secret wrapper");
+        };
+        assert!(matches!(
+            inner.as_ref(),
+            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                if value.api_value() == "Enabled"
+        ));
+    }
+
+    #[test]
+    fn state_union_canonicalizes_recognized_enum_string() {
+        let canonical = canonicalize_state_with_type(
+            Value::Concrete(ConcreteValue::String("Enabled".into())),
+            &status_union(),
+            crate::schema::empty_defs_for_schema_walks(),
+        );
+
+        assert!(matches!(
+            canonical,
+            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                if value.api_value() == "Enabled"
+        ));
+    }
+
+    #[test]
+    fn provider_output_union_rejects_unrecognized_enum_string() {
+        let error = canonicalize_desired_with_type(
+            Value::Concrete(ConcreteValue::String("Bogus".into())),
+            &status_union(),
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect_err("unrecognized provider enum text must fail closed inside a Union");
+
+        assert!(error.to_string().contains("Bogus"), "{error}");
+    }
+
+    #[test]
+    fn state_union_preserves_unrecognized_enum_string() {
+        let bogus = Value::Concrete(ConcreteValue::String("Bogus".into()));
+        assert_eq!(
+            canonicalize_state_with_type(
+                bogus.clone(),
+                &status_union(),
+                crate::schema::empty_defs_for_schema_walks(),
+            ),
+            bogus,
+            "persisted state keeps unknown enum text for forward compatibility"
+        );
+    }
+
+    #[test]
+    fn provider_output_treats_string_list_as_list_for_enum_validation() {
+        let attr_type = AttributeType::list(status_enum());
+        let error = canonicalize_desired_with_type(
+            Value::Concrete(ConcreteValue::StringList(vec!["Bogus".into()])),
+            &attr_type,
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect_err("an invalid enum inside StringList must not cross the provider boundary");
+
+        assert!(error.to_string().contains("Bogus"), "{error}");
+    }
+
+    #[test]
+    fn provider_output_rejects_shape_mismatch_for_enum_bearing_type() {
+        let attr_type = AttributeType::list(status_enum());
+        let value = Value::Concrete(ConcreteValue::Int(7));
+
+        canonicalize_desired_with_type(
+            value.clone(),
+            &attr_type,
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect_err("a provider-output shape mismatch at an enum-bearing type must fail closed");
+
+        assert_eq!(
+            canonicalize_state_with_type(
+                value.clone(),
+                &attr_type,
+                crate::schema::empty_defs_for_schema_walks(),
+            ),
+            value,
+            "persisted state must retain its forward-compatible lenience"
+        );
+    }
+
+    #[test]
+    fn provider_output_rejects_nested_enum_value_shape_mismatch() {
+        let attr_type = AttributeType::map_with_key(AttributeType::string(), status_enum());
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::Int(7)),
+        )])));
+
+        let error = canonicalize_desired_with_type(
+            value,
+            &attr_type,
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect_err("a nested enum-positioned shape mismatch must fail closed");
+
+        assert!(error.to_string().contains("status"), "{error}");
+    }
+
+    #[test]
+    fn enum_map_key_is_canonicalized_to_api_spelling() {
+        let attr_type = AttributeType::map_with_key(status_enum(), AttributeType::string());
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "enabled".to_string(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )])));
+
+        let canonical = canonicalize_desired_with_type(
+            value,
+            &attr_type,
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::AuthoredDsl,
+        )
+        .expect("a valid enum map key must canonicalize");
+        let Value::Concrete(ConcreteValue::Map(map)) = canonical else {
+            panic!("expected a canonicalized map");
+        };
+        assert_eq!(
+            map.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["Enabled"]
+        );
+    }
+
+    #[test]
+    fn ref_enum_map_key_is_canonicalized_with_schema_defs() {
+        let attr_type =
+            AttributeType::map_with_key(AttributeType::ref_("StatusKey"), AttributeType::string());
+        let defs = std::collections::BTreeMap::from([("StatusKey".to_string(), status_enum())]);
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "enabled".to_string(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )])));
+
+        let canonical = canonicalize_desired_with_type(
+            value,
+            &attr_type,
+            &defs,
+            DesiredValueSource::AuthoredDsl,
+        )
+        .expect("a Ref-backed enum map key must canonicalize");
+        let Value::Concrete(ConcreteValue::Map(map)) = canonical else {
+            panic!("expected a canonicalized map");
+        };
+        assert_eq!(
+            map.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["Enabled"]
+        );
+    }
+
+    #[test]
+    fn provider_output_rejects_invalid_enum_map_key_but_state_preserves_it() {
+        let attr_type = AttributeType::map_with_key(status_enum(), AttributeType::string());
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "Bogus".to_string(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )])));
+
+        let error = canonicalize_desired_with_type(
+            value.clone(),
+            &attr_type,
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect_err("an invalid provider-output enum map key must fail closed");
+        assert!(error.to_string().contains("Bogus"), "{error}");
+
+        assert_eq!(
+            canonicalize_state_with_type(
+                value.clone(),
+                &attr_type,
+                crate::schema::empty_defs_for_schema_walks(),
+            ),
+            value
+        );
+    }
+
+    #[test]
+    fn desired_map_key_canonicalization_rejects_colliding_api_keys() {
+        for source in [
+            DesiredValueSource::AuthoredDsl,
+            DesiredValueSource::ProviderOutput,
+        ] {
+            let error = canonicalize_desired_with_type(
+                colliding_map_key_value(),
+                &separator_folding_map_key_type(),
+                crate::schema::empty_defs_for_schema_walks(),
+                source,
+            )
+            .expect_err("distinct source keys must not silently merge after canonicalization");
+
+            match error {
+                crate::schema::TypeError::MapKeyError { key, .. } => {
+                    assert_eq!(key, "RSA_2048");
+                }
+                other => panic!("expected a MapKeyError for the colliding key, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn secret_map_key_collision_masks_the_colliding_key() {
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(colliding_map_key_value())));
+        let error = canonicalize_desired_with_type(
+            secret,
+            &separator_folding_map_key_type(),
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::ProviderOutput,
+        )
+        .expect_err("a secret map with colliding canonical keys must be rejected");
+
+        let crate::schema::TypeError::MapKeyError { key, .. } = &error else {
+            panic!("expected a masked MapKeyError, got {error:?}");
+        };
+        assert_eq!(key, "(secret)");
+        assert!(!error.to_string().contains("RSA"), "{error}");
+    }
+
+    #[test]
+    fn state_map_key_collision_preserves_every_original_key() {
+        let original = colliding_map_key_value();
+        let canonical = canonicalize_state_with_type(
+            original.clone(),
+            &separator_folding_map_key_type(),
+            crate::schema::empty_defs_for_schema_walks(),
+        );
+
+        assert_eq!(canonical, original);
+    }
+
+    #[test]
+    fn non_textual_canonical_map_key_is_an_error() {
+        assert!(matches!(
+            canonical_map_key_text(Value::Concrete(ConcreteValue::Int(7))),
+            Err(crate::schema::TypeError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn union_list_fit_accumulates_element_exactness() {
+        let open_enum = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("OpenValue"),
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+        let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("x".into()),
+        )]));
+
+        for union in [
+            AttributeType::union(vec![
+                AttributeType::list(open_enum.clone()),
+                AttributeType::list(AttributeType::string()),
+            ]),
+            AttributeType::union(vec![
+                AttributeType::list(AttributeType::string()),
+                AttributeType::list(open_enum.clone()),
+            ]),
+        ] {
+            assert_eq!(
+                canonicalize_state_with_type(
+                    value.clone(),
+                    &union,
+                    crate::schema::empty_defs_for_schema_walks(),
+                ),
+                value,
+                "List<String> must beat List<OpenEnum> for a string element"
+            );
+        }
+    }
+
+    #[test]
+    fn union_struct_fit_accumulates_field_exactness() {
+        let open_enum = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("OpenValue"),
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+        let enum_struct = AttributeType::struct_(
+            "EnumArm",
+            vec![crate::schema::StructField::new("a", open_enum)],
+        );
+        let string_struct = AttributeType::struct_(
+            "StringArm",
+            vec![crate::schema::StructField::new(
+                "a",
+                AttributeType::string(),
+            )],
+        );
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "a".to_string(),
+            Value::Concrete(ConcreteValue::String("x".into())),
+        )])));
+
+        for union in [
+            AttributeType::union(vec![enum_struct.clone(), string_struct.clone()]),
+            AttributeType::union(vec![string_struct.clone(), enum_struct.clone()]),
+        ] {
+            assert_eq!(
+                canonicalize_state_with_type(
+                    value.clone(),
+                    &union,
+                    crate::schema::empty_defs_for_schema_walks(),
+                ),
+                value,
+                "Struct{{a:String}} must beat Struct{{a:OpenEnum}} for a string field"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_union_fit_evaluates_each_member_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const DEPTH: usize = 12;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut nested = AttributeType::string();
+        for level in 0..DEPTH {
+            let calls = Arc::clone(&calls);
+            let open_enum = AttributeType::enum_(
+                crate::schema::TypeIdentity::bare(format!("OpenValue{level}")),
+                None,
+                Vec::new(),
+                Some(crate::schema::validator(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })),
+                None,
+            );
+            nested = AttributeType::union(vec![open_enum, nested]);
+        }
+
+        let value = Value::Concrete(ConcreteValue::String("x".into()));
+        assert_eq!(
+            canonicalize_state_with_type(
+                value.clone(),
+                &nested,
+                crate::schema::empty_defs_for_schema_walks(),
+            ),
+            value,
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DEPTH,
+            "bottom-up fit must visit each coercible Enum member exactly once"
+        );
+    }
+
+    #[test]
+    fn validation_only_union_stops_after_an_exact_member() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let calls = Arc::clone(&first_calls);
+            AttributeType::refined_string_with_validator(
+                Some(crate::schema::TypeIdentity::bare("First")),
+                None,
+                None,
+                crate::schema::validator(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                None,
+            )
+        };
+        let second = {
+            let calls = Arc::clone(&second_calls);
+            AttributeType::refined_string_with_validator(
+                Some(crate::schema::TypeIdentity::bare("Second")),
+                None,
+                None,
+                crate::schema::validator(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                None,
+            )
+        };
+
+        crate::schema::Schema::flat(AttributeType::union(vec![first, second]))
+            .validate(&Value::Concrete(ConcreteValue::String("x".into())))
+            .expect("the first exact String member accepts the value");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn desired_union_list_selection_validates_past_a_deferred_first_item() {
+        use crate::schema::{AttributeType, StructField, TypeIdentity};
+
+        let mode = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget", "A"], "Mode"),
+            Some(vec!["X".to_string()]),
+            vec![("X".to_string(), "x_member".to_string())],
+            None,
+            None,
+        );
+        let kind = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget", "B"], "Kind"),
+            Some(vec!["Y".to_string()]),
+            vec![("Y".to_string(), "y_member".to_string())],
+            None,
+            None,
+        );
+        let union = AttributeType::union(vec![
+            AttributeType::list(AttributeType::struct_(
+                "A",
+                vec![StructField::new("mode", mode)],
+            )),
+            AttributeType::list(AttributeType::struct_(
+                "B",
+                vec![StructField::new("kind", kind)],
+            )),
+        ]);
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: "later".to_string(),
+            }),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "kind".to_string(),
+                Value::Concrete(ConcreteValue::enum_identifier(
+                    "test.widget.B.Kind.y_member",
+                )),
+            )]))),
+        ]));
+
+        assert!(
+            crate::schema::Schema::flat(union.clone())
+                .validate(&value)
+                .is_ok()
+        );
+        let canonical = canonicalize_desired_with_type(
+            value,
+            &union,
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::AuthoredDsl,
+        )
+        .expect("the accepting List<Struct B> arm must be selected");
+
+        let Value::Concrete(ConcreteValue::List(items)) = canonical else {
+            panic!("expected canonical list")
+        };
+        let Value::Concrete(ConcreteValue::Map(second)) = &items[1] else {
+            panic!("expected second list item to be a map")
+        };
+        assert!(matches!(
+            second.get("kind"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "Y"
+        ));
+    }
+
+    #[test]
+    fn canonicalize_union_enum_identifier_resolves_against_second_matching_enum() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+        };
+
+        let first = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget"], "FirstMode"),
+            Some(vec!["FIRST".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let second = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget"], "SecondMode"),
+            Some(vec!["SECOND".to_string()]),
+            vec![("SECOND".to_string(), "second".to_string())],
+            None,
+            None,
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "test",
+            ResourceSchema::new("widget").attribute(AttributeSchema::new(
+                "mode",
+                AttributeType::union(vec![first, second]),
+            )),
+        );
+        let mut resource =
+            crate::resource::Resource::with_provider("test", "widget", "example", None);
+        resource.set_attr(
+            "mode",
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "test.widget.SecondMode.second",
+            )),
+        );
+        let mut resources = vec![resource];
+
+        canonicalize_resources_with_schemas(&mut resources, &registry)
+            .expect("the identifier is a member of the second Enum arm");
+
+        assert!(matches!(
+            &resources[0].attributes["mode"],
+            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                if value.identity().kind == "SecondMode" && value.api_value() == "SECOND"
+        ));
+    }
+
+    #[test]
+    fn canonicalize_secret_enum_error_masks_plaintext() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+        };
+
+        let plaintext = "plaintext-must-not-leak";
+        let mode = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget"], "Mode"),
+            Some(vec!["allowed".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "test",
+            ResourceSchema::new("widget").attribute(AttributeSchema::new("mode", mode)),
+        );
+        let mut resource =
+            crate::resource::Resource::with_provider("test", "widget", "secret", None);
+        resource.set_attr(
+            "mode",
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::enum_identifier(plaintext),
+            )))),
+        );
+        let mut resources = vec![resource];
+
+        let error = canonicalize_resources_with_schemas(&mut resources, &registry)
+            .expect_err("a non-member secret enum must fail canonicalization");
+        let display = error.to_string();
+
+        assert!(!display.contains(plaintext), "{display}");
+        assert!(display.contains("secret"), "{display}");
+    }
+
+    #[test]
+    fn desired_post_pass_masks_enum_identifier_inside_secret() {
+        let plaintext = "post-pass-plaintext-must-not-leak";
+        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::enum_identifier(plaintext),
+        ))));
+
+        let error = canonicalize_desired_with_type(
+            value,
+            &AttributeType::string(),
+            crate::schema::empty_defs_for_schema_walks(),
+            DesiredValueSource::AuthoredDsl,
+        )
+        .expect_err("a secret enum identifier under String must fail the desired post-pass");
+        let display = error.to_string();
+
+        assert!(!display.contains(plaintext), "{display}");
+        assert!(display.contains("secret"), "{display}");
+    }
+
+    #[test]
+    fn desired_none_schema_branches_mask_secret_enum_identifier() {
+        use crate::schema::{ResourceSchema, SchemaRegistry};
+
+        let plaintext = "none-schema-plaintext-must-not-leak";
+        let secret = || {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::enum_identifier(plaintext),
+            ))))
+        };
+        let registries = [SchemaRegistry::new(), {
+            let mut registry = SchemaRegistry::new();
+            registry.insert("test", ResourceSchema::new("widget"));
+            registry
+        }];
+
+        for registry in registries {
+            let mut resources = vec![
+                crate::resource::Resource::with_provider("test", "widget", "secret", None)
+                    .with_attribute("unknown", secret()),
+            ];
+            let error = canonicalize_resources_with_schemas(&mut resources, &registry)
+                .expect_err("an unresolved secret enum must fail without a declared attribute");
+            let display = error.to_string();
+            assert!(!display.contains(plaintext), "{display}");
+            assert!(display.contains("secret"), "{display}");
+        }
+    }
+
+    #[test]
+    fn resource_handle_validation_and_desired_canonicalization_agree_on_string_wire_value() {
+        let handle = AttributeType::resource_handle("test", "widget");
+        let string_id = Value::Concrete(ConcreteValue::String("widget-123".into()));
+        let identifier = Value::Concrete(ConcreteValue::enum_identifier("widget_binding"));
+
+        assert!(handle.validate(&string_id).is_ok());
+        assert!(matches!(
+            handle.validate(&identifier),
+            Err(crate::schema::TypeError::TypeMismatch { .. })
+        ));
+        assert_eq!(
+            canonicalize_desired_with_type(
+                string_id.clone(),
+                &handle,
+                crate::schema::empty_defs_for_schema_walks(),
+                DesiredValueSource::AuthoredDsl,
+            )
+            .unwrap(),
+            string_id,
+        );
+        assert!(
+            canonicalize_desired_with_type(
+                identifier,
+                &handle,
+                crate::schema::empty_defs_for_schema_walks(),
+                DesiredValueSource::AuthoredDsl,
+            )
+            .is_err(),
+            "plan-time canonicalization must reject the same identifier as validation"
+        );
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_rejects_unresolved_enum_at_every_typed_depth() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+            TypeIdentity,
+        };
+
+        let mode = AttributeType::enum_(
+            TypeIdentity::new(Some("test"), ["widget"], "Mode"),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![("Allow".to_string(), "allow".to_string())],
+            None,
+            None,
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "test",
+            ResourceSchema::new("widget")
+                .attribute(AttributeSchema::new("top", mode.clone()))
+                .attribute(AttributeSchema::new(
+                    "nested",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![StructField::new("mode", mode.clone())],
+                    ),
+                ))
+                .attribute(AttributeSchema::new(
+                    "items",
+                    AttributeType::list(mode.clone()),
+                ))
+                .attribute(AttributeSchema::new(
+                    "unselected_union",
+                    AttributeType::union(vec![
+                        AttributeType::list(mode),
+                        AttributeType::map(AttributeType::string()),
+                    ]),
+                )),
+        );
+
+        let invalid = || {
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "test.widget.Mode.not_a_member",
+            ))
+        };
+        let cases = [
+            ("top", invalid()),
+            (
+                "nested",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "mode".to_string(),
+                    invalid(),
+                )]))),
+            ),
+            (
+                "items",
+                Value::Concrete(ConcreteValue::List(vec![invalid()])),
+            ),
+            ("unselected_union", invalid()),
+        ];
+
+        for (attribute, value) in cases {
+            let mut resource =
+                crate::resource::Resource::with_provider("test", "widget", attribute, None);
+            resource.set_attr(attribute, value);
+            let mut resources = vec![resource];
+
+            let error = canonicalize_resources_with_schemas(&mut resources, &registry)
+                .expect_err("an unresolved enum must fail canonicalization");
+
+            assert!(error.to_string().contains(attribute), "{error}");
+            assert!(
+                std::error::Error::source(&error).is_some(),
+                "canonicalization errors must retain the resolver error source"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_rejects_enum_identifier_outside_schema() {
+        let registry = crate::schema::SchemaRegistry::new();
+        let mut resources = vec![make_resource(vec![(
+            "unknown",
+            Value::Concrete(ConcreteValue::enum_identifier("test.Mode.allow")),
+        )])];
+
+        canonicalize_resources_with_schemas(&mut resources, &registry)
+            .expect_err("no EnumIdentifier may survive desired canonicalization");
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_keeps_deferred_enum_expressions_in_static_parity() {
+        use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+        use crate::resource::InterpolationPart;
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+        let raw = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.allow"));
+        let runtime_ref = || Value::resource_ref("source", "suffix", Vec::new());
+        let runtime = [
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "join".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("".into())),
+                    Value::Concrete(ConcreteValue::List(vec![raw(), runtime_ref()])),
+                ],
+            }),
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(raw()),
+                InterpolationPart::Expr(runtime_ref()),
+            ])),
+        ];
+        let static_values = [
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "join".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("".into())),
+                    Value::Concrete(ConcreteValue::List(vec![
+                        raw(),
+                        Value::Concrete(ConcreteValue::String("-suffix".into())),
+                    ])),
+                ],
+            }),
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(raw()),
+                InterpolationPart::Expr(Value::Concrete(ConcreteValue::String("-suffix".into()))),
+            ])),
+        ];
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "test",
+            ResourceSchema::new("widget")
+                .attribute(AttributeSchema::new("value", AttributeType::string())),
+        );
+        let source = crate::resource::Resource::with_provider("test", "source", "source", None)
+            .with_binding("source")
+            .with_attribute(
+                "suffix",
+                Value::Concrete(ConcreteValue::String("-suffix".into())),
+            );
+        let managed = vec![source];
+        let current_states = std::collections::HashMap::new();
+        let remote_bindings = std::collections::HashMap::new();
+        let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &managed,
+            compositions: &[],
+            data_sources: &[],
+            current_states: &current_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &[],
+        });
+
+        for (runtime, static_value) in runtime.into_iter().zip(static_values) {
+            let mut resource =
+                crate::resource::Resource::with_provider("test", "widget", "example", None);
+            resource.set_attr("value", runtime);
+            let mut resources = vec![resource];
+
+            canonicalize_resources_with_schemas(&mut resources, &registry)
+                .expect("a deferred expression owns evaluation of its enum-shaped arguments");
+            let deferred_result =
+                crate::resolver::resolve_ref_value(&resources[0].attributes["value"], &bindings)
+                    .expect("runtime expression must resolve");
+            let static_result =
+                crate::resolver::resolve_ref_value(&static_value, &ResolvedBindings::default())
+                    .expect("static expression must evaluate");
+
+            assert_eq!(deferred_result, static_result);
+        }
+    }
+
+    #[test]
     fn canonicalize_provider_configs_replaces_region_enum_with_canonical_api_value() {
         use crate::parser::ProviderConfig;
-        use crate::schema::{AttributeType, DslTransform, TypeIdentity};
+        use crate::schema::{AttributeType, TypeIdentity};
 
         let providers = vec![
             ProviderConfig {
@@ -4763,17 +6289,18 @@ mod tests {
         ];
 
         let providers =
-            canonicalize_provider_configs_with_attribute_types(&providers, &|provider, attr| {
+            canonicalize_provider_configs_with_attribute_types(&providers, &|_provider, attr| {
                 (attr == "region").then(|| {
                     AttributeType::enum_(
-                        TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
+                        TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                        Some(vec!["ap-northeast-1".to_string()]),
+                        vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
                         None,
-                        Vec::new(),
                         None,
-                        Some(DslTransform::HyphenToUnderscore),
                     )
                 })
-            });
+            })
+            .unwrap();
 
         let api_values: Vec<_> = providers
             .as_slice()
@@ -4786,6 +6313,169 @@ mod tests {
             )
             .collect();
         assert_eq!(api_values, ["ap-northeast-1", "ap-northeast-1"]);
+    }
+
+    #[test]
+    fn provider_config_accepts_identity_or_configured_provider_namespace_only() {
+        use crate::schema::{AttributeType, TypeIdentity};
+
+        let attr_types = HashMap::from([(
+            "region".to_string(),
+            AttributeType::enum_(
+                TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                Some(vec!["ap-northeast-1".to_string()]),
+                vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                None,
+                None,
+            ),
+        )]);
+        let canonicalize = |provider_name: &str, raw: &str| {
+            canonicalize_provider_config_attributes_with_types(
+                provider_name,
+                &IndexMap::from([(
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::enum_identifier(raw)),
+                )]),
+                &attr_types,
+            )
+        };
+
+        for raw in ["awscc.Region.ap_northeast_1", "aws.Region.ap_northeast_1"] {
+            let accepted = canonicalize("awscc", raw)
+                .unwrap_or_else(|error| panic!("{raw} must resolve: {error}"));
+            assert!(matches!(
+                accepted.get("region"),
+                Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                    if value.identity().provider.as_deref() == Some("aws")
+                        && value.api_value() == "ap-northeast-1"
+            ));
+        }
+
+        for (provider_name, raw) in [
+            ("awscc", "gcp.Region.ap_northeast_1"),
+            ("aws", "awscc.Region.ap_northeast_1"),
+        ] {
+            let error = canonicalize(provider_name, raw)
+                .expect_err("an unrelated namespace must not be stripped");
+            assert!(error.to_string().contains(raw), "{error}");
+        }
+    }
+
+    #[test]
+    fn provider_config_alias_namespace_must_preserve_type_segments() {
+        use crate::schema::{AttributeType, TypeIdentity};
+
+        let attr_types = HashMap::from([(
+            "state".to_string(),
+            AttributeType::enum_(
+                TypeIdentity::new(Some("origin"), ["compute", "Instance"], "State"),
+                Some(vec!["running".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        )]);
+        let canonicalize = |raw: &str| {
+            canonicalize_provider_config_attributes_with_types(
+                "configured",
+                &IndexMap::from([(
+                    "state".to_string(),
+                    Value::Concrete(ConcreteValue::enum_identifier(raw)),
+                )]),
+                &attr_types,
+            )
+        };
+
+        let accepted = canonicalize("configured.compute.Instance.State.running")
+            .expect("the configured provider qualifier may replace only the provider axis");
+        assert!(matches!(
+            accepted.get("state"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.identity().provider.as_deref() == Some("origin")
+                    && value.identity().segments == ["compute", "Instance"]
+                    && value.api_value() == "running"
+        ));
+
+        for raw in [
+            "configured.compute.Other.State.running",
+            "configured.compute.Instance.Mode.running",
+        ] {
+            let error = canonicalize(raw).expect_err("segments and type name must match exactly");
+            assert!(error.to_string().contains(raw), "{error}");
+        }
+    }
+
+    #[test]
+    fn provider_config_never_retries_a_successful_first_resolution() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_from_validator = Arc::clone(&calls);
+        let region = AttributeType::enum_(
+            crate::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+            None,
+            Vec::new(),
+            Some(crate::schema::legacy_validator(move |_| {
+                let call = calls_from_validator.fetch_add(1, Ordering::SeqCst);
+                (call == 0)
+                    .then_some(())
+                    .ok_or_else(|| "validator was called twice".to_string())
+            })),
+            None,
+        );
+
+        canonicalize_provider_config_with_type(
+            "awscc",
+            Value::Concrete(ConcreteValue::enum_identifier("aws.Region.tokyo")),
+            &region,
+        )
+        .expect("a successful first result must be returned without a fallback retry");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn provider_config_canonicalization_masks_secret_enum_errors() {
+        use crate::schema::AttributeType;
+
+        let plaintext = "provider-config-plaintext-must-not-leak";
+        let secret = || {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::enum_identifier(plaintext),
+            ))))
+        };
+
+        let typed =
+            canonicalize_provider_config_with_type("test", secret(), &AttributeType::string())
+                .expect_err("a typed provider config must reject the unresolved enum");
+        assert!(!typed.to_string().contains(plaintext), "{typed}");
+
+        let attributes = IndexMap::from([("unknown".to_string(), secret())]);
+        let untyped = canonicalize_provider_config_attributes_with_types(
+            "test",
+            &attributes,
+            &HashMap::new(),
+        )
+        .expect_err("an untyped provider config must reject the unresolved enum");
+        let display = untyped.to_string();
+        assert!(!display.contains(plaintext), "{display}");
+        assert!(display.contains("secret"), "{display}");
+    }
+
+    #[test]
+    fn provider_config_typed_canonicalization_is_total() {
+        let error = canonicalize_provider_config_with_type(
+            "test",
+            Value::Concrete(ConcreteValue::enum_identifier("test.Mode.invalid")),
+            &AttributeType::string(),
+        )
+        .expect_err("a typed config value must not retain an enum identifier");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved enum identifier `test.Mode.invalid`")
+        );
     }
 
     #[test]
@@ -6352,7 +8042,8 @@ mod tests {
     fn canonicalize_scalar_to_string_list() {
         let t = string_or_list_of_strings();
         let v = Value::Concrete(ConcreteValue::String("repo:foo:*".into()));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".into()]))
@@ -6365,7 +8056,8 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::String("repo:foo:*".into()),
         )]));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".into()]))
@@ -6380,7 +8072,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String("b".into())),
             Value::Concrete(ConcreteValue::String("c".into())),
         ]));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec![
@@ -6395,15 +8088,18 @@ mod tests {
     fn canonicalize_idempotent_on_string_list() {
         let t = string_or_list_of_strings();
         let v = Value::Concrete(ConcreteValue::StringList(vec!["a".into()]));
-        let canon =
-            canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs_for_schema_walks());
+        let canon = canonicalize_state_with_type(
+            v.clone(),
+            &t,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
         assert_eq!(canon, v);
     }
 
     #[test]
     fn canonicalize_passes_through_non_applicable_type() {
         let v = Value::Concrete(ConcreteValue::String("foo".into()));
-        let canon = canonicalize_with_type(
+        let canon = canonicalize_state_with_type(
             v.clone(),
             &AttributeType::string(),
             crate::schema::empty_defs_for_schema_walks(),
@@ -6424,7 +8120,8 @@ mod tests {
             None,
         );
         let v = Value::Concrete(ConcreteValue::String("Allow".into()));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
                 assert_eq!(c.identity().to_string(), "aws.iam.PolicyDocument.Effect");
@@ -6442,8 +8139,11 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Int(1),
         )]));
-        let canon =
-            canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs_for_schema_walks());
+        let canon = canonicalize_state_with_type(
+            v.clone(),
+            &t,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
         assert_eq!(canon, v);
     }
 
@@ -6462,7 +8162,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String("s3:GetObject".into())),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -6507,7 +8208,7 @@ mod tests {
             )])),
         );
 
-        let canon = schema.canonicalize(Value::Concrete(ConcreteValue::Map(policy)));
+        let canon = schema.canonicalize_state(Value::Concrete(ConcreteValue::Map(policy)));
         let Value::Concrete(ConcreteValue::Map(policy)) = canon else {
             panic!("expected policy document map");
         };
@@ -6527,25 +8228,26 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_recurses_into_struct_via_provider_name() {
+    fn canonicalize_recurses_into_struct_via_block_name() {
         let t = AttributeType::struct_(
             "Statement".to_string(),
             vec![
-                crate::schema::StructField::new("action", string_or_list_of_strings())
-                    .with_provider_name("Action"),
+                crate::schema::StructField::new("actions", string_or_list_of_strings())
+                    .with_block_name("action"),
             ],
         );
         let mut map = IndexMap::new();
         map.insert(
-            "Action".to_string(),
+            "action".to_string(),
             Value::Concrete(ConcreteValue::String("s3:GetObject".into())),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
-                    m.get("Action"),
+                    m.get("action"),
                     Some(&Value::Concrete(ConcreteValue::StringList(vec![
                         "s3:GetObject".into()
                     ])))
@@ -6553,6 +8255,37 @@ mod tests {
             }
             _ => panic!("expected Map"),
         }
+    }
+
+    #[test]
+    fn canonicalize_does_not_treat_provider_name_as_a_struct_value_key() {
+        let t = AttributeType::struct_(
+            "Statement".to_string(),
+            vec![
+                crate::schema::StructField::new("action", string_or_list_of_strings())
+                    .with_provider_name("Action"),
+            ],
+        );
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "Action".to_string(),
+            Value::Concrete(ConcreteValue::String("s3:GetObject".into())),
+        )])));
+
+        assert!(
+            crate::schema::Schema::flat(t.clone())
+                .validate(&value)
+                .is_err(),
+            "provider-side metadata names are not host value-map keys"
+        );
+        assert_eq!(
+            canonicalize_state_with_type(
+                value.clone(),
+                &t,
+                crate::schema::empty_defs_for_schema_walks(),
+            ),
+            value,
+            "canonicalization must use the same accepted-key lookup as fit"
+        );
     }
 
     /// carina#3080: `principal` is `Union[Struct{ service:
@@ -6583,7 +8316,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".into())),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -6608,7 +8342,8 @@ mod tests {
             )])),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -6644,7 +8379,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".into())),
         );
 
-        let canon = canonicalize_with_type(Value::Concrete(ConcreteValue::Map(map)), &t, &defs);
+        let canon =
+            canonicalize_state_with_type(Value::Concrete(ConcreteValue::Map(map)), &t, &defs);
         let Value::Concrete(ConcreteValue::Map(map)) = canon else {
             panic!("expected Map");
         };
@@ -6680,7 +8416,7 @@ mod tests {
         let value = Value::Concrete(ConcreteValue::Map(map));
 
         assert!(schema.validate(&value).is_ok());
-        let canon = schema.canonicalize(value);
+        let canon = schema.canonicalize_state(value);
         let Value::Concrete(ConcreteValue::Map(map)) = canon else {
             panic!("expected Map");
         };
@@ -6704,7 +8440,7 @@ mod tests {
         let value = Value::Concrete(ConcreteValue::String("x".into()));
 
         assert!(schema.validate(&value).is_ok());
-        let canon = schema.canonicalize(value);
+        let canon = schema.canonicalize_state(value);
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["x".into()]))
@@ -6728,7 +8464,7 @@ mod tests {
         };
         let value = Value::Concrete(ConcreteValue::String("x".into()));
 
-        assert_eq!(schema.canonicalize(value.clone()), value);
+        assert_eq!(schema.canonicalize_state(value.clone()), value);
     }
 
     #[test]
@@ -6785,7 +8521,7 @@ mod tests {
 
         assert!(schema.validate(&value).is_ok());
         assert_eq!(
-            schema.canonicalize(value),
+            schema.canonicalize_state(value),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::List(vec![Value::Concrete(ConcreteValue::StringList(vec![
                     "x".into(),
@@ -6802,7 +8538,7 @@ mod tests {
             defs: std::collections::BTreeMap::new(),
         };
 
-        let _ = schema.canonicalize(Value::Concrete(ConcreteValue::String("x".into())));
+        let _ = schema.canonicalize_state(Value::Concrete(ConcreteValue::String("x".into())));
     }
 
     #[test]
@@ -6813,11 +8549,11 @@ mod tests {
             defs: std::collections::BTreeMap::from([("A".to_string(), AttributeType::ref_("A"))]),
         };
 
-        let _ = schema.canonicalize(Value::Concrete(ConcreteValue::String("x".into())));
+        let _ = schema.canonicalize_state(Value::Concrete(ConcreteValue::String("x".into())));
     }
 
     #[test]
-    fn canonicalize_ref_membered_string_or_list_union_in_both_enum_phases() {
+    fn canonicalize_ref_membered_string_or_list_union_in_desired_and_state_paths() {
         let attr_type =
             AttributeType::union(vec![AttributeType::ref_("S"), AttributeType::ref_("L")]);
         let defs = std::collections::BTreeMap::from([
@@ -6831,27 +8567,43 @@ mod tests {
             "cloudfront.amazonaws.com".into(),
         ]));
 
-        for phase in [EnumIdentifierPhase::RawDsl, EnumIdentifierPhase::StateText] {
-            let desired = Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".into()));
-            assert_eq!(
-                canonicalize_with_type_for_enum_phase(desired, &attr_type, &defs, phase),
-                expected
-            );
-
-            let provider_read = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        for value in [
+            Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".into())),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::String("cloudfront.amazonaws.com".into()),
-            )]));
+            )])),
+        ] {
             assert_eq!(
-                canonicalize_with_type_for_enum_phase(provider_read, &attr_type, &defs, phase),
+                canonicalize_state_with_type(value.clone(), &attr_type, &defs),
                 expected
             );
-
-            let sentinel = redacted_secret(&"deadbeef".repeat(8));
             assert_eq!(
-                canonicalize_with_type_for_enum_phase(sentinel.clone(), &attr_type, &defs, phase),
-                sentinel
+                canonicalize_desired_with_type(
+                    value.clone(),
+                    &attr_type,
+                    &defs,
+                    DesiredValueSource::AuthoredDsl,
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(
+                canonicalize_desired_with_type(
+                    value,
+                    &attr_type,
+                    &defs,
+                    DesiredValueSource::ProviderOutput,
+                )
+                .unwrap(),
+                expected
             );
         }
+
+        let sentinel = redacted_secret(&"deadbeef".repeat(8));
+        assert_eq!(
+            canonicalize_state_with_type(sentinel.clone(), &attr_type, &defs),
+            sentinel
+        );
     }
 
     /// The `String` member of the same Union, given a bare string,
@@ -6860,8 +8612,11 @@ mod tests {
     fn canonicalize_union_string_member_passthrough() {
         let t = principal_union();
         let v = Value::Concrete(ConcreteValue::String("*".into()));
-        let canon =
-            canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs_for_schema_walks());
+        let canon = canonicalize_state_with_type(
+            v.clone(),
+            &t,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
         assert_eq!(canon, v);
     }
 
@@ -6871,8 +8626,11 @@ mod tests {
     fn canonicalize_union_no_matching_member_is_identity() {
         let t = AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]);
         let v = Value::Concrete(ConcreteValue::String("not-an-int".into()));
-        let canon =
-            canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs_for_schema_walks());
+        let canon = canonicalize_state_with_type(
+            v.clone(),
+            &t,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
         assert_eq!(canon, v);
     }
 
@@ -6885,7 +8643,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -6903,7 +8662,8 @@ mod tests {
     fn canonicalize_string_or_list_union() {
         let t = string_or_list_of_strings();
         let v = Value::Concrete(ConcreteValue::String("x".into()));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["x".into()]))
@@ -6916,7 +8676,8 @@ mod tests {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("s".into()),
         ))));
-        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        let canon =
+            canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 assert_eq!(
@@ -7091,7 +8852,7 @@ mod tests {
             "subject",
             Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
         )])];
-        canonicalize_resources_with_schemas(&mut resources, &registry);
+        canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
         assert_eq!(
             resources[0].attributes.get("subject"),
             Some(&Value::Concrete(ConcreteValue::StringList(vec![
@@ -7109,7 +8870,7 @@ mod tests {
                 ConcreteValue::String("repo:foo:*".into()),
             )])),
         )])];
-        canonicalize_resources_with_schemas(&mut resources, &registry);
+        canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
         assert_eq!(
             resources[0].attributes.get("subject"),
             Some(&Value::Concrete(ConcreteValue::StringList(vec![
@@ -7126,7 +8887,7 @@ mod tests {
             "subject",
             Value::Concrete(ConcreteValue::String("x".into())),
         )])];
-        canonicalize_resources_with_schemas(&mut resources, &registry);
+        canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
         assert_eq!(
             resources[0].attributes.get("subject"),
             Some(&Value::Concrete(ConcreteValue::String("x".into())))
@@ -7145,7 +8906,7 @@ mod tests {
             ),
             ("name", Value::Concrete(ConcreteValue::String("p1".into()))),
         ])];
-        canonicalize_resources_with_schemas(&mut resources, &registry);
+        canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
         assert_eq!(
             resources[0].attributes.get("name"),
             Some(&Value::Concrete(ConcreteValue::String("p1".into())))
@@ -7168,8 +8929,8 @@ mod tests {
                 ConcreteValue::String("repo:foo:*".into()),
             )])),
         )])];
-        canonicalize_resources_with_schemas(&mut a, &registry);
-        canonicalize_resources_with_schemas(&mut b, &registry);
+        canonicalize_resources_with_schemas(&mut a, &registry).unwrap();
+        canonicalize_resources_with_schemas(&mut b, &registry).unwrap();
         assert_eq!(a[0].attributes, b[0].attributes);
     }
 
@@ -7208,7 +8969,7 @@ mod tests {
         );
         let mut data_sources = vec![data_source];
 
-        canonicalize_data_sources_with_schemas(&mut data_sources, &registry);
+        canonicalize_data_sources_with_schemas(&mut data_sources, &registry).unwrap();
 
         assert_eq!(
             data_sources[0].attributes["subject"],
@@ -7332,7 +9093,7 @@ mod tests {
                 ConcreteValue::String("repo:foo:*".into()),
             )])),
         )])];
-        canonicalize_resources_with_schemas(&mut resources, &registry);
+        canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
 
         let mut states = std::collections::HashMap::new();
         let s = make_state(vec![(
@@ -7377,7 +9138,7 @@ mod tests {
                 )),
             ),
         ];
-        canonicalize_resources_with_schemas(&mut desired, &registry);
+        canonicalize_resources_with_schemas(&mut desired, &registry).unwrap();
 
         let mut attrs = HashMap::new();
         attrs.insert(
@@ -7439,7 +9200,7 @@ mod tests {
             "principal",
             Value::Concrete(ConcreteValue::Map(desired_inner)),
         )])];
-        canonicalize_resources_with_schemas(&mut resources, &registry);
+        canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
 
         // State: aws-read singleton list inside the Struct member.
         let mut state_inner = IndexMap::new();
@@ -7559,7 +9320,7 @@ mod tests {
         );
     }
 
-    /// Carina#3329 (round-4): `plan --out` on the supported scenario
+    /// Carina#3329: `plan --out` on the supported scenario
     /// — `import { id = "${upstream.attr}|tail" }` where `upstream.attr`
     /// is still deferred at plan time — must succeed and persist the
     /// deferred `Unknown` placeholder through `redact_secrets_in_plan`.

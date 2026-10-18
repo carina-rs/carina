@@ -76,6 +76,119 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
     assert_eq!(tags.get("SecretTag"), Some(&secret));
 }
 
+#[tokio::test]
+async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position() {
+    struct EnumSchemaFactory;
+
+    impl ProviderFactory for EnumSchemaFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "test"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            String::new()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            unreachable!("plan canonicalization test does not create providers")
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            let mode = AttributeType::enum_(
+                carina_core::schema::enum_identity("Mode", Some("test.thing")),
+                Some(vec!["Allow".to_string()]),
+                vec![("Allow".to_string(), "allow".to_string())],
+                None,
+                None,
+            );
+            vec![
+                ResourceSchema::new("thing")
+                    .attribute(AttributeSchema::new("top", mode.clone()))
+                    .attribute(AttributeSchema::new(
+                        "nested",
+                        AttributeType::struct_(
+                            "Settings",
+                            vec![carina_core::schema::StructField::new("mode", mode.clone())],
+                        ),
+                    ))
+                    .attribute(AttributeSchema::new(
+                        "items",
+                        AttributeType::list(mode.clone()),
+                    ))
+                    .attribute(AttributeSchema::new(
+                        "unselected_union",
+                        AttributeType::union(vec![
+                            AttributeType::list(mode),
+                            AttributeType::map(AttributeType::string()),
+                        ]),
+                    )),
+            ]
+        }
+    }
+
+    let invalid = || {
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "test.thing.Mode.not_a_member",
+        ))
+    };
+    let cases = [
+        ("top", invalid()),
+        (
+            "nested",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "mode".to_string(),
+                invalid(),
+            )]))),
+        ),
+        (
+            "items",
+            Value::Concrete(ConcreteValue::List(vec![invalid()])),
+        ),
+        ("unselected_union", invalid()),
+    ];
+
+    for (attribute, value) in cases {
+        let provider_configs = Vec::new();
+        let ctx = WiringContext::new(vec![Box::new(EnumSchemaFactory)], &provider_configs);
+        let mut resources = vec![
+            Resource::with_provider("test", "thing", attribute, None)
+                .with_attribute(attribute, value),
+        ];
+
+        let error = prepare_desired_side_for_plan(
+            &mut resources,
+            &mut [],
+            &provider_configs,
+            &carina_core::provider::NoopNormalizer,
+            &ctx,
+        )
+        .await
+        .expect_err("an unresolved enum must abort plan desired preprocessing");
+
+        assert!(error.to_string().contains(attribute), "{error}");
+        assert!(std::error::Error::source(&error).is_some());
+    }
+}
+
 #[test]
 fn source_provider_kind_mismatch_is_rejected() {
     let source = "file:///tmp/provider.wasm";
@@ -489,7 +602,10 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             HashMap::new()
         }
 
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -568,7 +684,10 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         )])
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -702,7 +821,10 @@ impl ProviderFactory for CascadeAwsccFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -978,163 +1100,15 @@ async fn read_with_retry_does_not_retry_not_found() {
 
 use carina_core::parser::ParsedFile;
 
-#[test]
-#[ignore = "requires provider binary for enum alias resolution"]
-fn test_resolve_enum_aliases_ip_protocol_all() {
-    // Parser-authored enum syntax stays typed until alias resolution.
-    let mut resource =
-        Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
-    resource.set_attr(
-        "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "awscc.ec2.security_group_egress.IpProtocol.all",
-        )),
-    );
-
-    let mut resources = vec![resource];
-    resolve_enum_aliases(&mut resources);
-
-    assert_eq!(
-        resources[0].get_attr("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
-        "Alias 'all' should be resolved to canonical AWS value '-1'"
-    );
-}
-
-#[test]
-fn test_resolve_enum_aliases_no_alias() {
-    // A plain string is never reclassified as an enum from its text.
-    let mut resource =
-        Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
-    resource.set_attr(
-        "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.tcp"
-                .to_string()
-                .into(),
-        )),
-    );
-
-    let mut resources = vec![resource];
-    resolve_enum_aliases(&mut resources);
-
-    // It remains the exact string value.
-    assert_eq!(
-        resources[0].get_attr("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.tcp"
-                .to_string()
-                .into()
-        ))),
-    );
-}
-
-#[test]
-#[ignore = "requires provider binary for enum alias resolution"]
-fn test_resolve_enum_aliases_aws_provider() {
-    // Same alias resolution should work for the aws provider
-    let mut resource =
-        Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule", None);
-    resource.set_attr(
-        "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.ec2.security_group_ingress.IpProtocol.all",
-        )),
-    );
-
-    let mut resources = vec![resource];
-    resolve_enum_aliases(&mut resources);
-
-    assert_eq!(
-        resources[0].get_attr("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
-    );
-}
-
-#[test]
-#[ignore = "requires provider binary for enum alias resolution"]
-fn test_resolve_enum_aliases_in_states() {
-    // Current states should also have aliases resolved
-    let ctx = WiringContext::new(vec![], &[]);
-    let id =
-        ResourceId::with_provider_identity("awscc", "ec2.security_group_egress", "test-rule", None);
-    let mut attrs = HashMap::new();
-    attrs.insert(
-        "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "awscc.ec2.security_group_egress.IpProtocol.all",
-        )),
-    );
-    let state = State::existing(id.clone(), attrs);
-    let mut current_states = HashMap::new();
-    current_states.insert(id.clone(), state);
-
-    super::resolve_enum_aliases_in_states(&ctx, &mut current_states, &[]);
-
-    assert_eq!(
-        current_states[&id].attributes.get("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
-    );
-}
-
-#[test]
-#[ignore = "requires provider binary for enum alias resolution"]
-fn test_resolve_enum_aliases_in_struct_field() {
-    // Aliases within struct fields (maps inside lists) should also be resolved
-    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
-    let mut egress_map = IndexMap::new();
-    egress_map.insert(
-        "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "awscc.ec2.SecurityGroup.IpProtocol.all",
-        )),
-    );
-    egress_map.insert(
-        "cidr_ip".to_string(),
-        Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
-    );
-    resource.set_attr(
-        "security_group_egress".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Map(egress_map),
-        )])),
-    );
-
-    let mut resources = vec![resource];
-    resolve_enum_aliases(&mut resources);
-
-    if let Value::Concrete(ConcreteValue::List(items)) =
-        resources[0].get_attr("security_group_egress").unwrap()
-    {
-        if let Value::Concrete(ConcreteValue::Map(m)) = &items[0] {
-            assert_eq!(
-                m.get("ip_protocol"),
-                Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
-                "Alias in struct field should be resolved"
-            );
-            assert_eq!(
-                m.get("cidr_ip"),
-                Some(&Value::Concrete(ConcreteValue::String("0.0.0.0/0".into()))),
-                "Non-alias values should not be changed"
-            );
-        } else {
-            panic!("Expected Map in egress list");
-        }
-    } else {
-        panic!("Expected List for security_group_egress");
-    }
-}
-
-/// Verify that normalize_state prevents false diffs for enum values in state.
+/// Verify that provider state normalization plus host schema lifting prevents
+/// false diffs for enum values in state.
 ///
 /// When state contains raw AWS enum values (e.g., "default") and desired
-/// resources have been normalized to DSL enum format (e.g.,
-/// "awscc.ec2.Vpc.InstanceTenancy.default"), the differ would see a false
-/// diff unless normalize_state is also applied to current states.
+/// resources have been resolved by the host to canonical API values, the
+/// differ must compare the same typed representation on both sides.
 ///
-/// Both the plan path (wiring.rs) and the apply path (apply.rs) must call
-/// normalize_state to maintain parity. This test ensures the normalization
-/// produces matching values so no false diff occurs.
+/// Both the plan path (wiring.rs) and the apply path (apply.rs) run provider
+/// state normalization before the host's schema-positioned lift.
 #[test]
 #[ignore = "requires provider binary for state normalization"]
 fn test_normalize_state_prevents_false_enum_diff() {
@@ -1153,7 +1127,8 @@ fn test_normalize_state_prevents_false_enum_diff() {
     carina_core::value::canonicalize_resources_with_schemas(
         std::slice::from_mut(&mut resource),
         ctx.schemas(),
-    );
+    )
+    .unwrap();
 
     // State with raw AWS value (as returned by provider.read())
     let id = resource.id.clone();
@@ -1240,7 +1215,10 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
             HashMap::new()
         }
 
-        fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(
+            &self,
+            attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
             let _handle = tokio::task::block_in_place(|| tokio::runtime::Handle::current());
             self.validated.store(true, Ordering::SeqCst);
             *self.received_region.lock().unwrap() = attributes.get("region").cloned();
@@ -1318,7 +1296,10 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             HashMap::new()
         }
 
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -1514,34 +1495,6 @@ fn test_merge_default_tags_prevents_false_diff() {
     assert!(
         plan_with.effects().is_empty(),
         "after host default-tag merging, no false diff should occur"
-    );
-}
-
-#[test]
-fn test_resolve_enum_aliases_non_enum_values_unchanged() {
-    // Non-DSL-enum strings should not be affected
-    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
-    resource.set_attr(
-        "group_description".to_string(),
-        Value::Concrete(ConcreteValue::String("My security group".into())),
-    );
-    resource.set_attr(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-12345".into())),
-    );
-
-    let mut resources = vec![resource];
-    resolve_enum_aliases(&mut resources);
-
-    assert_eq!(
-        resources[0].get_attr("group_description"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "My security group".into()
-        ))),
-    );
-    assert_eq!(
-        resources[0].get_attr("vpc_id"),
-        Some(&Value::Concrete(ConcreteValue::String("vpc-12345".into()))),
     );
 }
 
@@ -2517,7 +2470,10 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -2938,7 +2894,8 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         ctx: &WiringContext,
         parsed: &mut carina_core::parser::ParsedFile,
     ) {
-        let canonical = canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas());
+        let canonical =
+            canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas()).unwrap();
         let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical, &parsed.providers);
         assert!(errors.is_empty(), "anonymous id setup failed: {errors:?}");
     }
@@ -2950,7 +2907,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
                 .with_attribute("cidr_block", string("10.220.1.0/24"))
                 .with_attribute("availability_zone", string("ap-northeast-1c")),
         ];
-        let canonical = canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+        let canonical = canonicalize_resources_with_schemas(&mut resources, ctx.schemas()).unwrap();
         let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
         assert!(errors.is_empty(), "state id setup failed: {errors:?}");
         resources[0]
@@ -3848,7 +3805,8 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
     let canonical_resources =
-        carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas())
+            .unwrap();
     let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, &providers);
     assert!(
         errors.is_empty(),
@@ -3873,20 +3831,19 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         HashMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::enum_(
-                carina_core::schema::TypeIdentity::new(
-                    Some("awscc"),
-                    Vec::<String>::new(),
-                    "Region",
-                ),
+                carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                Some(vec!["ap-northeast-1".to_string()]),
+                vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
                 None,
-                Vec::new(),
                 None,
-                Some(carina_core::schema::DslTransform::HyphenToUnderscore),
             ),
         )])
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -4027,11 +3984,13 @@ fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity
     let canonical_awscc = carina_core::value::canonicalize_resources_with_schemas(
         &mut resources_awscc,
         ctx.schemas(),
-    );
+    )
+    .unwrap();
     let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_awscc, &providers_awscc);
     assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
     let canonical_aws =
-        carina_core::value::canonicalize_resources_with_schemas(&mut resources_aws, ctx.schemas());
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources_aws, ctx.schemas())
+            .unwrap();
     let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_aws, &providers_aws);
     assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
@@ -4058,7 +4017,8 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 
     let mut anonymous = vec![anonymous_route_resource()];
     let canonical_anonymous =
-        carina_core::value::canonicalize_resources_with_schemas(&mut anonymous, ctx.schemas());
+        carina_core::value::canonicalize_resources_with_schemas(&mut anonymous, ctx.schemas())
+            .unwrap();
     let errors =
         compute_anonymous_identifiers_with_ctx(&ctx, canonical_anonymous, &providers_awscc);
     assert!(errors.is_empty(), "anonymous setup errors: {errors:?}");
@@ -4096,7 +4056,8 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         &mut saved_attrs,
         &Some(state_file),
         &carina_core::identifier::StateBlockClaims::empty(),
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         renames,
@@ -6211,12 +6172,19 @@ mod resolved_value_constraint_gate {
             HashMap::new()
         }
 
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn validate_custom_type(&self, identity: &TypeIdentity, value: &str) -> Result<(), String> {
-            if identity.kind == "ExternalId" && value == "bad" {
+        fn validate_custom_type(
+            &self,
+            identity: &TypeIdentity,
+            value: &carina_core::provider::CanonicalCustomTypeValue,
+        ) -> Result<(), String> {
+            if identity.kind == "ExternalId" && value.as_str() == "bad" {
                 Err("external id rejected".to_string())
             } else {
                 Ok(())
@@ -6292,7 +6260,10 @@ mod resolved_value_constraint_gate {
             HashMap::new()
         }
 
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
             Ok(())
         }
 

@@ -241,7 +241,8 @@ impl std::error::Error for WasmValueDecodeError {
 /// List and Map values are serialized to JSON strings because WIT does
 /// not support recursive types.
 ///
-/// Returns `Err(SerializationError)` for `Value::Deferred(DeferredValue::Unknown)`,
+/// Returns `Err(SerializationError)` for an unresolved `EnumIdentifier` and
+/// for `Value::Deferred(DeferredValue::Unknown)`,
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
 /// `Value::Deferred(DeferredValue::FunctionCall)`. The scoped transport wrapper in
 /// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
@@ -273,13 +274,13 @@ fn core_to_wit_value_from(
 ) -> Result<wit::Value, SerializationError> {
     match v {
         CoreValue::Concrete(ConcreteValue::String(s)) => {
-            // Enum identifiers lower to the WIT boundary as plain
-            // strings — the WASM plugin sees the same wire shape as
-            // any other string value. See carina#2986.
             Ok(wit::Value::StrVal(s.expose_plaintext().to_owned()))
         }
-        CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-            Ok(wit::Value::StrVal(s.to_string()))
+        CoreValue::Concrete(ConcreteValue::EnumIdentifier(value)) => {
+            Err(SerializationError::UnresolvedEnumIdentifier {
+                value: value.to_string(),
+                context: SerializationContext::WasmBoundary,
+            })
         }
         CoreValue::Concrete(ConcreteValue::CanonicalEnum(c)) => {
             Ok(wit::Value::StrVal(c.api_value().to_string()))
@@ -357,7 +358,8 @@ fn core_to_wit_value_from(
             })
         }
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            let json = core_value_to_json_from(inner, source)?;
+            let json = core_value_to_json_from(inner, source)
+                .map_err(SerializationError::masked_for_secret)?;
             let json_str =
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::SecretVal(json_str))
@@ -537,8 +539,11 @@ fn core_value_to_json_from(
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
         }
-        CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-            Ok(serde_json::Value::String(s.to_string()))
+        CoreValue::Concrete(ConcreteValue::EnumIdentifier(value)) => {
+            Err(SerializationError::UnresolvedEnumIdentifier {
+                value: value.to_string(),
+                context: SerializationContext::WasmBoundary,
+            })
         }
         CoreValue::Concrete(ConcreteValue::CanonicalEnum(c)) => {
             Ok(serde_json::Value::String(c.api_value().to_string()))
@@ -611,7 +616,9 @@ fn core_value_to_json_from(
         // that decode `list-val` / `map-val` see the inner JSON shape;
         // `secret-val` is the channel used to mark the *attribute* itself
         // as a secret.
-        CoreValue::Deferred(DeferredValue::Secret(inner)) => core_value_to_json_from(inner, source),
+        CoreValue::Deferred(DeferredValue::Secret(inner)) => {
+            core_value_to_json_from(inner, source).map_err(SerializationError::masked_for_secret)
+        }
         CoreValue::Deferred(DeferredValue::RedactedSecret { hash }) => match source {
             ValueWireSource::PersistedState => {
                 Ok(serde_json::Value::String(persisted_secret_marker(hash)))
@@ -2100,6 +2107,97 @@ mod tests {
     }
 
     #[test]
+    fn enum_identifier_is_rejected_by_scalar_wit_encoder() {
+        let value = CoreValue::Concrete(ConcreteValue::enum_identifier("aws.x.Mode.allow"));
+
+        assert!(matches!(
+            core_to_wit_value(&value),
+            Err(SerializationError::UnresolvedEnumIdentifier {
+                value,
+                context: SerializationContext::WasmBoundary,
+            }) if value == "aws.x.Mode.allow"
+        ));
+    }
+
+    #[test]
+    fn enum_identifier_is_rejected_by_nested_json_encoder() {
+        let value = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+            "items".to_string() => CoreValue::Concrete(ConcreteValue::List(vec![
+                CoreValue::Concrete(ConcreteValue::enum_identifier("aws.x.Mode.allow")),
+            ])),
+        }));
+
+        assert!(matches!(
+            core_value_to_json(&value),
+            Err(SerializationError::UnresolvedEnumIdentifier {
+                value,
+                context: SerializationContext::WasmBoundary,
+            }) if value == "aws.x.Mode.allow"
+        ));
+    }
+
+    #[test]
+    fn secret_enum_identifier_error_is_masked_by_scalar_wit_encoder() {
+        let plaintext = "scalar-secret-plaintext-must-not-leak";
+        let value = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::enum_identifier(plaintext),
+        ))));
+
+        let error = core_to_wit_value(&value).expect_err("the unresolved enum must be rejected");
+        let display = error.to_string();
+        assert!(!display.contains(plaintext), "{display}");
+        assert!(display.contains("secret"), "{display}");
+    }
+
+    #[test]
+    fn secret_enum_identifier_error_is_masked_by_nested_json_encoder() {
+        let plaintext = "nested-secret-plaintext-must-not-leak";
+        let value = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+            "items".to_string() => CoreValue::Deferred(DeferredValue::Secret(Box::new(
+                CoreValue::Concrete(ConcreteValue::enum_identifier(plaintext)),
+            ))),
+        }));
+
+        let error = core_value_to_json(&value).expect_err("the unresolved enum must be rejected");
+        let display = error.to_string();
+        assert!(!display.contains(plaintext), "{display}");
+        assert!(display.contains("secret"), "{display}");
+    }
+
+    #[test]
+    fn string_resembling_enum_syntax_is_encoded_literally() {
+        let value =
+            CoreValue::Concrete(ConcreteValue::String("aws.x.Mode.allow".to_string().into()));
+
+        assert!(matches!(
+            core_to_wit_value(&value),
+            Ok(wit::Value::StrVal(text)) if text == "aws.x.Mode.allow"
+        ));
+    }
+
+    #[test]
+    fn canonical_enum_is_encoded_with_its_api_spelling() {
+        let attr_type = carina_core::schema::AttributeType::enum_(
+            carina_core::schema::enum_identity("Mode", Some("aws.x")),
+            Some(vec!["ALLOW".to_string()]),
+            vec![("ALLOW".to_string(), "allow".to_string())],
+            None,
+            None,
+        );
+        let canonical = carina_core::resource::EnumValueResolver::new(&attr_type)
+            .resolve_raw(&carina_core::resource::RawEnumIdentifier::parse(
+                "aws.x.Mode.allow",
+            ))
+            .unwrap();
+        let value = CoreValue::Concrete(ConcreteValue::CanonicalEnum(canonical));
+
+        assert!(matches!(
+            core_to_wit_value(&value),
+            Ok(wit::Value::StrVal(text)) if text == "ALLOW"
+        ));
+    }
+
+    #[test]
     fn malformed_json_container_values_are_rejected() {
         let values = [
             (
@@ -2905,9 +3003,9 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v5_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 5);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 5);
+    fn test_protocol_version_range_is_v6_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 6);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 6);
     }
 
     #[test]

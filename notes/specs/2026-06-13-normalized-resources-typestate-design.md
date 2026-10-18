@@ -6,8 +6,8 @@ Make "the desired-side normalization pipeline has been applied" a
 compile-time invariant on every resource that enters a CloudControl /
 SDK patch builder. After this change, the `apply` executor can no
 longer construct an `UpdatePatch` (or any other provider request) from
-a `Resource` that has not gone through the same canonicalize →
-`normalize_desired` → `merge_default_tags` → `resolve_enum_aliases`
+a `Resource` that has not gone through the same host RawDsl canonicalize →
+`normalize_desired` → host StateText canonicalize → `merge_default_tags`
 sequence that the plan path runs in `PlanPreprocessor::prepare`. The
 broken state ("apply rebuilt the desired value but forgot one stage")
 becomes unrepresentable.
@@ -75,10 +75,10 @@ same conceptual pipeline:
 
 | Stage                                    | Plan (`PlanPreprocessor::prepare`)               | Apply (`executor::renormalize`) |
 | ---------------------------------------- | ------------------------------------------------ | ------------------------------- |
-| `canonicalize_resources_with_schemas`    | yes (called from `apply/mod.rs` before `prepare`) | yes                             |
+| Host RawDsl schema canonicalization      | yes                                              | yes                             |
 | `normalize_desired`                      | yes                                              | yes                             |
+| Host StateText schema canonicalization   | yes                                              | yes                             |
 | `merge_default_tags`                     | **yes**                                          | **no**                          |
-| `resolve_enum_aliases_for_resources`     | yes                                              | yes                             |
 
 `carina-core/src/executor/basic.rs::renormalize` already carries a
 doc-comment confessing the risk:
@@ -134,8 +134,8 @@ Introduce a wrapper in `carina-core::executor`:
 /// order:
 /// 1. `canonicalize_resources_with_schemas`
 /// 2. `ProviderNormalizer::normalize_desired`
-/// 3. `ProviderNormalizer::merge_default_tags` (per provider config)
-/// 4. `resolve_enum_aliases_for_resources`
+/// 3. `canonicalize_normalized_resources_with_schemas`
+/// 4. host `merge_default_tags` (per provider config)
 pub struct NormalizedResource(Resource);
 
 impl NormalizedResource {
@@ -150,22 +150,17 @@ pub async fn apply_desired_normalization(
     resource: Resource,
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
-) -> NormalizedResource {
+) -> ProviderResult<NormalizedResource> {
     let mut one = [resource];
-    canonicalize_resources_with_schemas(&mut one, schemas);
-    normalizer.normalize_desired(&mut one).await;
+    canonicalize_resources_with_schemas(&mut one, schemas)?;
+    normalizer.normalize_desired(&mut one).await?;
+    canonicalize_normalized_resources_with_schemas(&mut one, schemas)?;
     for config in provider_configs {
-        if !config.default_tags.is_empty() {
-            normalizer
-                .merge_default_tags(&mut one, &config.default_tags, schemas)
-                .await;
-        }
+        merge_default_tags(config, &mut one, schemas)?;
     }
-    resolve_enum_aliases_for_resources(&mut one, factories);
     let [resource] = one;
-    NormalizedResource(resource)
+    Ok(NormalizedResource(resource))
 }
 ```
 

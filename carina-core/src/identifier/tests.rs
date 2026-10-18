@@ -589,12 +589,14 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     )];
     let providers_awscc = crate::value::canonicalize_provider_configs_with_attribute_types(
         &providers_awscc,
-        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("awscc")),
-    );
+        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("aws")),
+    )
+    .unwrap();
     let providers_aws = crate::value::canonicalize_provider_configs_with_attribute_types(
         &providers_aws,
-        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("awscc")),
-    );
+        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("aws")),
+    )
+    .unwrap();
 
     let mut resources_awscc = vec![make_resource()];
     let mut resources_aws = vec![make_resource()];

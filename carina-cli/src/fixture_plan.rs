@@ -22,7 +22,7 @@ use carina_core::schema::{
 };
 use carina_state::{StateFile, check_and_migrate};
 
-use crate::commands::validate_and_resolve_with_config;
+use crate::commands::{collapse_errors, validate_and_resolve_errors_with_context};
 use crate::wiring::{
     LateAnonymousIdentityInputs, PlanPreparationError, PlanPreprocessor, WiringContext,
     add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
@@ -70,6 +70,10 @@ fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
         awscc(
             ResourceSchema::new("ec2.Vpc")
                 .attribute(create_only_string("cidr_block"))
+                .attribute(AttributeSchema::new(
+                    "instance_tenancy",
+                    fixture_instance_tenancy_type(),
+                ))
                 .attribute(AttributeSchema::new(
                     "enable_dns_support",
                     AttributeType::bool(),
@@ -151,14 +155,28 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let unresolved_resources = loaded.unresolved_parsed.resources;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&fixture_pathbuf);
-    validate_and_resolve_with_config(
+    // Fixture planning deliberately skips loading provider artifacts. Supply
+    // only the enum metadata validation needs here: the full fixture schema
+    // catalog would assign anonymous identities earlier than the real plan
+    // path and make the harness observe the wrong inputs.
+    let validation_wiring = WiringContext::new_with_additional_schemas(
+        fixture_provider_config_factories(),
+        &parsed.providers,
+        fixture_validation_enum_schemas(&fixture_pathbuf),
+    );
+    let validation_errors = validate_and_resolve_errors_with_context(
         &mut parsed,
         base_dir,
         true,
+        &validation_wiring,
+        HashMap::new(),
         &inference_errors,
         &duplicate_declarations,
-    )
-    .unwrap();
+    );
+    if !validation_errors.is_empty() {
+        let error = collapse_errors(validation_errors);
+        panic!("fixture validation failed: {error}");
+    }
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
         // Go through check_and_migrate so v5 fixtures (with the legacy
@@ -176,6 +194,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.providers,
         fixture_schemas(),
     );
+
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")
@@ -185,7 +204,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
             &mut parsed.resources,
             wiring.schemas(),
-        );
+        )
+        .unwrap();
         let errors =
             compute_anonymous_identifiers_with_ctx(&wiring, canonical_resources, &parsed.providers);
         assert!(errors.is_empty(), "{errors:?}");
@@ -600,25 +620,151 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 }
 
 fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactory>> {
+    let mut factories: Vec<Box<dyn ProviderFactory>> =
+        match fixture_path.file_name().and_then(|name| name.to_str()) {
+            Some("dynamic_enum_az_no_diff") => vec![Box::new(DynamicEnumFixtureFactory)],
+            Some("enum_display") => vec![Box::new(EnumDisplayFixtureFactory)],
+            Some("list_diff_best_first_mid_insert") => {
+                vec![Box::new(BestFirstPairingFixtureFactory)]
+            }
+            Some("moved_claims_precede_heuristics") => {
+                vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
+            }
+            Some("replace_create_only") | Some("replace_with_non_forcing_diffs") => {
+                vec![Box::new(ReplaceCreateOnlyFixtureFactory)]
+            }
+            Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
+                vec![Box::new(Route53HostedZoneFixtureFactory)]
+            }
+            Some("resolved_value_constraint_multifile") => {
+                vec![Box::new(ResolvedValueConstraintFixtureFactory)]
+            }
+            _ => vec![],
+        };
+
+    // Most display fixtures intentionally omit real provider artifacts. Their
+    // provider blocks still use typed Region enum syntax, so model that small
+    // piece of provider metadata instead of allowing an unresolved identifier
+    // through the harness. A fixture-specific factory wins when present.
+    for provider in ["aws", "awscc"] {
+        if !factories.iter().any(|factory| factory.name() == provider) {
+            factories.push(Box::new(FixtureProviderConfigFactory { provider }));
+        }
+    }
+    factories
+}
+
+fn fixture_provider_config_factories() -> Vec<Box<dyn ProviderFactory>> {
+    vec![
+        Box::new(FixtureProviderConfigFactory { provider: "aws" }),
+        Box::new(FixtureProviderConfigFactory { provider: "awscc" }),
+    ]
+}
+
+fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, ResourceSchema)> {
     match fixture_path.file_name().and_then(|name| name.to_str()) {
-        Some("dynamic_enum_az_no_diff") => vec![Box::new(DynamicEnumFixtureFactory)],
-        Some("enum_display") => vec![Box::new(EnumDisplayFixtureFactory)],
-        Some("list_diff_best_first_mid_insert") => {
-            vec![Box::new(BestFirstPairingFixtureFactory)]
-        }
-        Some("moved_claims_precede_heuristics") => {
-            vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
-        }
-        Some("replace_create_only") | Some("replace_with_non_forcing_diffs") => {
-            vec![Box::new(ReplaceCreateOnlyFixtureFactory)]
-        }
-        Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
-            vec![Box::new(Route53HostedZoneFixtureFactory)]
-        }
-        Some("resolved_value_constraint_multifile") => {
-            vec![Box::new(ResolvedValueConstraintFixtureFactory)]
-        }
-        _ => vec![],
+        Some("dynamic_enum_az_no_diff") => vec![(
+            "fixture".to_string(),
+            ResourceSchema::new("network.Subnet").attribute(
+                AttributeSchema::new("availability_zone", fixture_zone_name_type()).required(),
+            ),
+        )],
+        Some("enum_display" | "no_changes_enum") => vec![(
+            "awscc".to_string(),
+            ResourceSchema::new("ec2.Vpc")
+                .attribute(
+                    AttributeSchema::new("cidr_block", AttributeType::string())
+                        .required()
+                        .create_only(),
+                )
+                .attribute(
+                    AttributeSchema::new("instance_tenancy", fixture_instance_tenancy_type())
+                        .required(),
+                ),
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn fixture_region_attribute_types(provider: &str) -> HashMap<String, AttributeType> {
+    HashMap::from([(
+        "region".to_string(),
+        AttributeType::enum_(
+            TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
+            None,
+            vec![],
+            None,
+            Some(DslTransform::HyphenToUnderscore),
+        ),
+    )])
+}
+
+fn fixture_instance_tenancy_type() -> AttributeType {
+    AttributeType::enum_(
+        TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
+        Some(vec![
+            "default".to_string(),
+            "dedicated".to_string(),
+            "host".to_string(),
+        ]),
+        vec![],
+        None,
+        None,
+    )
+}
+
+fn fixture_zone_name_type() -> AttributeType {
+    AttributeType::enum_(
+        TypeIdentity::new(
+            Some("fixture"),
+            vec!["network".to_string(), "Subnet".to_string()],
+            "ZoneName",
+        ),
+        None,
+        vec![],
+        None,
+        Some(DslTransform::HyphenToUnderscore),
+    )
+}
+
+struct FixtureProviderConfigFactory {
+    provider: &'static str,
+}
+
+impl ProviderFactory for FixtureProviderConfigFactory {
+    fn name(&self) -> &str {
+        self.provider
+    }
+
+    fn display_name(&self) -> &str {
+        "Fixture provider config schema"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        fixture_region_attribute_types(self.provider)
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "test-region".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        Vec::new()
     }
 }
 
@@ -639,7 +785,7 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
 
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -680,12 +826,12 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
     }
 
     fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+        fixture_region_attribute_types(self.name())
     }
 
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -746,7 +892,7 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
 
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -793,12 +939,12 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
     }
 
     fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+        fixture_region_attribute_types(self.name())
     }
 
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -834,21 +980,12 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
     }
 
     fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::from([(
-            "region".to_string(),
-            AttributeType::enum_(
-                TypeIdentity::new(Some("awscc"), Vec::<String>::new(), "Region"),
-                None,
-                vec![],
-                None,
-                Some(DslTransform::HyphenToUnderscore),
-            ),
-        )])
+        fixture_region_attribute_types(self.name())
     }
 
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -866,17 +1003,6 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
-        let tenancy = AttributeType::enum_(
-            TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
-            Some(vec![
-                "default".to_string(),
-                "dedicated".to_string(),
-                "host".to_string(),
-            ]),
-            vec![],
-            None,
-            None,
-        );
         vec![
             ResourceSchema::new("ec2.Vpc")
                 .attribute(
@@ -884,7 +1010,10 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
                         .required()
                         .create_only(),
                 )
-                .attribute(AttributeSchema::new("instance_tenancy", tenancy).required()),
+                .attribute(
+                    AttributeSchema::new("instance_tenancy", fixture_instance_tenancy_type())
+                        .required(),
+                ),
         ]
     }
 }
@@ -906,7 +1035,7 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
 
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -924,21 +1053,9 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
-        let zone_name = AttributeType::enum_(
-            TypeIdentity::new(
-                Some("fixture"),
-                vec!["network".to_string(), "Subnet".to_string()],
-                "ZoneName",
-            ),
-            None,
-            vec![],
-            None,
-            Some(carina_core::schema::DslTransform::HyphenToUnderscore),
-        );
-        vec![
-            ResourceSchema::new("network.Subnet")
-                .attribute(AttributeSchema::new("availability_zone", zone_name).required()),
-        ]
+        vec![ResourceSchema::new("network.Subnet").attribute(
+            AttributeSchema::new("availability_zone", fixture_zone_name_type()).required(),
+        )]
     }
 }
 
@@ -959,7 +1076,7 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
 
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }

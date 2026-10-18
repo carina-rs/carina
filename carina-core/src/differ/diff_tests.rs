@@ -1383,12 +1383,10 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 /// (PascalCase compound) must compare equal under Enum even when
 /// `eq_ignore_ascii_case` alone is not enough.
 ///
-/// Scenario: BucketOwnershipControls.object_ownership — state stores
-/// `aws.s3.BucketOwnershipControls.ObjectOwnership.bucket_owner_enforced`
-/// (after normalize_state_enums applies the snake_case dsl_alias) and
-/// desired arrives as `BucketOwnerEnforced` (the API-canonical form
-/// after resolve_enum_identifiers' pass-2 api-canonicalize). The two
-/// name the same enum value, so the differ must see NoChange.
+/// Scenario: BucketOwnershipControls.object_ownership — one side carries the
+/// schema-declared DSL alias `bucket_owner_enforced` and the other carries the
+/// API spelling `BucketOwnerEnforced`. Host schema resolution proves that the
+/// two name the same enum value, so the differ must see NoChange.
 #[test]
 fn diff_no_change_for_compound_word_dsl_alias() {
     use crate::schema::{AttributeSchema, ResourceSchema};

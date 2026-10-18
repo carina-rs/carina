@@ -451,7 +451,10 @@ impl ProviderFactory for FailBCreateFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -878,7 +881,10 @@ impl ProviderFactory for ApplyTimeReadFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -972,7 +978,10 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -1209,7 +1218,8 @@ fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -
             .with_attribute("availability_zone", string_value("ap-northeast-1c")),
     ];
     let canonical =
-        carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas())
+            .unwrap();
     let errors = crate::wiring::compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
     assert!(errors.is_empty(), "state id setup failed: {errors:?}");
     resources[0]

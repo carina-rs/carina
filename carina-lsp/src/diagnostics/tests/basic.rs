@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn provider_config_enum_accepts_identity_or_configured_provider_namespace_only() {
+    for (provider_name, raw) in [
+        ("awscc", "awscc.Region.ap_northeast_1"),
+        ("awscc", "aws.Region.ap_northeast_1"),
+    ] {
+        let engine = test_engine_with_region_config_provider(provider_name);
+        let doc = create_document(&format!(
+            "provider {provider_name} {{\n  region = {raw}\n}}\n"
+        ));
+        let diagnostics = engine.analyze(&doc, None);
+        assert!(
+            diagnostics.is_empty(),
+            "{raw} must be accepted in provider {provider_name}; got: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    for (provider_name, raw) in [
+        ("awscc", "gcp.Region.ap_northeast_1"),
+        ("aws", "awscc.Region.ap_northeast_1"),
+    ] {
+        let engine = test_engine_with_region_config_provider(provider_name);
+        let doc = create_document(&format!(
+            "provider {provider_name} {{\n  region = {raw}\n}}\n"
+        ));
+        let diagnostics = engine.analyze(&doc, None);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains(&format!("provider {provider_name}: region:"))
+                    && diagnostic.message.contains(raw)
+            }),
+            "{raw} must be rejected in provider {provider_name}; got: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn reserved_resource_attribute_surfaces_parser_diagnostic() {
     let engine = test_engine();
     let doc = create_document("let bucket = aws.s3.Bucket {\n  \"_x\" = 1\n}\n");

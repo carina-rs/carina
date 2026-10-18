@@ -202,7 +202,8 @@ pub fn resolve_wait_predicate(
                     }
                 })?;
         if matches!(resolved, Value::Concrete(ConcreteValue::EnumIdentifier(_))) {
-            resolved = crate::value::canonicalize_with_type(resolved, attr_type, &schema.defs);
+            resolved =
+                crate::value::canonicalize_wait_rhs_with_type(resolved, attr_type, &schema.defs);
         }
     }
 

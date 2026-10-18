@@ -329,6 +329,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
             })
         })),
         validators: std::collections::HashMap::new(),
+        custom_type_attribute_types: std::collections::HashMap::new(),
         custom_type_validator: None,
         resource_types: Default::default(),
         // Schemas not yet loaded — early-parse runs before
