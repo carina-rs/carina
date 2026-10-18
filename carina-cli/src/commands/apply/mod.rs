@@ -92,35 +92,32 @@ fn saved_plan_secret_rehydration_error(
     error: carina_core::value::SecretRehydrationSiteError,
     apply_target: ApplyTarget<'_>,
 ) -> AppError {
-    let location = error.location.clone();
+    let carina_core::value::SecretRehydrationSiteError { location, source } = error;
     let replan = apply_target.replan_command().to_string();
-    let error = match &error.source {
+    let error = match source {
         carina_core::value::SecretRehydrationError::HashMismatch => {
-            SavedPlanSecretVerificationError::HashMismatch {
-                location,
-                replan,
-                source: error,
-            }
+            SavedPlanSecretVerificationError::HashMismatch { location, replan }
         }
         carina_core::value::SecretRehydrationError::EvaluationUnavailable => {
-            SavedPlanSecretVerificationError::SecretEvaluationUnavailable {
-                location,
-                replan,
-                source: error,
-            }
+            SavedPlanSecretVerificationError::SecretEvaluationUnavailable { location, replan }
         }
         carina_core::value::SecretRehydrationError::OrphanVanished => {
             SavedPlanSecretVerificationError::OrphanVanished {
                 resource: location,
                 replan,
-                source: error,
             }
         }
-        _ => SavedPlanSecretVerificationError::ConfigurationChanged {
-            location,
-            replan,
-            source: error,
-        },
+        carina_core::value::SecretRehydrationError::Serialization(error) => {
+            SavedPlanSecretVerificationError::Serialization {
+                location,
+                replan,
+                error,
+            }
+        }
+        carina_core::value::SecretRehydrationError::ExpectedSecret
+        | carina_core::value::SecretRehydrationError::ShapeMismatch => {
+            SavedPlanSecretVerificationError::ConfigurationChanged { location, replan }
+        }
     };
     AppError::SavedPlanSecretVerification(Box::new(error))
 }
@@ -142,7 +139,7 @@ fn saved_plan_secret_evaluation_error(source: AppError, apply_target: ApplyTarge
     AppError::SavedPlanSecretVerification(Box::new(
         SavedPlanSecretVerificationError::EvaluationUnavailable {
             replan: apply_target.replan_command().to_string(),
-            source: Box::new(source),
+            error: Box::new(source),
         },
     ))
 }
@@ -194,7 +191,7 @@ async fn create_checked_bootstrap_resource(
     provider
         .create(&id, request)
         .await
-        .map_err(|source| AppError::StateBucketCreate { source })?;
+        .map_err(|error| AppError::StateBucketCreate { error })?;
     Ok(())
 }
 
@@ -2568,21 +2565,21 @@ async fn run_apply_from_plan_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
-    let bytes = fs::read(plan_path).map_err(|source| AppError::PlanFileRead {
+    let bytes = fs::read(plan_path).map_err(|error| AppError::PlanFileRead {
         path: plan_path.to_path_buf(),
-        source,
+        error,
     })?;
     let header: PlanFileHeader =
-        serde_json::from_slice(&bytes).map_err(|source| match source.classify() {
+        serde_json::from_slice(&bytes).map_err(|error| match error.classify() {
             serde_json::error::Category::Data => AppError::InvalidPlanFile {
                 path: plan_path.to_path_buf(),
-                source,
+                error,
             },
             serde_json::error::Category::Syntax
             | serde_json::error::Category::Eof
             | serde_json::error::Category::Io => AppError::UnreadableJsonPlanFile {
                 path: plan_path.to_path_buf(),
-                source,
+                error,
             },
         })?;
     if bytes
@@ -2593,7 +2590,7 @@ async fn run_apply_from_plan_with_observer_factory(
     {
         return Err(AppError::InvalidPlanFile {
             path: plan_path.to_path_buf(),
-            source: <serde_json::Error as serde::de::Error>::custom(
+            error: <serde_json::Error as serde::de::Error>::custom(
                 "expected a top-level JSON object",
             ),
         });
@@ -2655,10 +2652,10 @@ async fn run_apply_from_plan_with_observer_factory(
     }
 
     let plan_file: PlanFile =
-        serde_json::from_slice(&bytes).map_err(|source| AppError::CorruptPlanFile {
+        serde_json::from_slice(&bytes).map_err(|error| AppError::CorruptPlanFile {
             path: plan_path.to_path_buf(),
             replan_command,
-            source,
+            error,
         })?;
     let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let apply_target = ApplyTarget::SavedPlan {

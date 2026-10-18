@@ -6,16 +6,15 @@ use std::fmt;
 use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
     CreateOutcome as CoreCreateOutcome, CreateRequest as CoreCreateRequest,
-    DeleteRequest as CoreDeleteRequest, ErrorDetail as CoreErrorDetail, PatchOp as CorePatchOp,
-    PatchOpKind as CorePatchOpKind, ProviderError as CoreProviderError,
-    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
-    UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
-    UpdateRequest as CoreUpdateRequest,
+    DeleteRequest as CoreDeleteRequest, PatchOp as CorePatchOp, PatchOpKind as CorePatchOpKind,
+    ProviderError as CoreProviderError, ReadRequest as CoreReadRequest,
+    SavedAttrs as CoreSavedAttrs, UpdateOutcome as CoreUpdateOutcome,
+    UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives, RedactedSecretHash,
-    Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentity,
-    ResourceIdentityError, ResourceIdentityState, State as CoreState, Value as CoreValue,
+    Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
+    State as CoreState, Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
@@ -121,23 +120,21 @@ impl fmt::Display for SchemaDecodeError {
                 self.detail
             )?;
         }
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
         Ok(())
     }
 }
 
-impl std::error::Error for SchemaDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
-    }
-}
+impl std::error::Error for SchemaDecodeError {}
 
 /// Failure to decode a JSON-backed recursive value at the WIT boundary.
 ///
 /// The payload itself is deliberately not retained: `secret-val` may contain
-/// plaintext credentials. JSON syntax failures keep the structured serde
-/// source so callers can preserve the error chain without exposing the input.
+/// plaintext credentials. JSON syntax failures retain the structured serde
+/// error as typed data and render its diagnostic once without exposing the
+/// input.
 #[derive(Debug)]
 pub struct WasmValueDecodeError {
     wit_variant: WitValueVariant,
@@ -201,7 +198,9 @@ impl fmt::Display for WasmValueDecodeError {
             write!(f, " attribute '{}'", self.attribute_path.join("."))?;
         }
         match &self.kind {
-            WasmValueDecodeErrorKind::InvalidJson(_) => f.write_str(": invalid JSON"),
+            WasmValueDecodeErrorKind::InvalidJson(error) => {
+                write!(f, ": invalid JSON: {error}")
+            }
             WasmValueDecodeErrorKind::ExpectedArray => f.write_str(": expected a JSON array"),
             WasmValueDecodeErrorKind::ExpectedObject => f.write_str(": expected a JSON object"),
             WasmValueDecodeErrorKind::ExpectedString { index } => {
@@ -220,19 +219,7 @@ impl fmt::Display for WasmValueDecodeError {
     }
 }
 
-impl std::error::Error for WasmValueDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.kind {
-            WasmValueDecodeErrorKind::InvalidJson(source) => Some(source),
-            WasmValueDecodeErrorKind::ExpectedArray
-            | WasmValueDecodeErrorKind::ExpectedObject
-            | WasmValueDecodeErrorKind::ExpectedString { .. }
-            | WasmValueDecodeErrorKind::Null
-            | WasmValueDecodeErrorKind::UnsupportedNumber
-            | WasmValueDecodeErrorKind::RawLegacySecretMarker => None,
-        }
-    }
-}
+impl std::error::Error for WasmValueDecodeError {}
 
 // -- Value --
 
@@ -788,35 +775,19 @@ pub(crate) fn resource_id_wire_key(id: &CoreResourceId) -> String {
 }
 
 pub(crate) fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
-    let identity = match id.identity_state() {
-        ResourceIdentityState::Pending(_) => String::new(),
-        ResourceIdentityState::Resolved(identity) => identity.as_str().to_string(),
-    };
+    let wire = id.to_wire();
     wit::ResourceId {
-        provider: id.provider.clone(),
-        resource_type: id.resource_type.clone(),
-        identity,
+        provider: wire.provider,
+        resource_type: wire.resource_type,
+        identity: wire.identity,
     }
 }
 
-pub(crate) fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
-    // The WIT `resource-id` record has no `provider-instance` field
-    // yet, so this boundary cannot round-trip a named instance.
-    // Tracked as a follow-up to extend the WIT contract; until then,
-    // callers that need routing must thread it through alongside the
-    // converted id.
-    match ResourceIdentity::try_from(id.identity.clone()) {
-        Ok(identity) => CoreResourceId::with_provider_identity(
-            id.provider.clone(),
-            id.resource_type.clone(),
-            identity,
-            None,
-        ),
-        Err(ResourceIdentityError::Empty) => CoreResourceId::pending_with_provider(
-            id.provider.clone(),
-            id.resource_type.clone(),
-            None,
-        ),
+fn wit_to_wire_resource_id(id: wit::ResourceId) -> proto::ResourceId {
+    proto::ResourceId {
+        provider: id.provider,
+        resource_type: id.resource_type,
+        identity: id.identity,
     }
 }
 
@@ -907,7 +878,7 @@ pub(crate) fn core_data_source_to_wit_resource(
 pub(crate) fn wit_to_core_resource(
     resource: &wit::ResourceDef,
 ) -> Result<CoreResource, WasmValueDecodeError> {
-    let id = wit_to_core_resource_id(&resource.id);
+    let id = CoreResourceId::from_wire(wit_to_wire_resource_id(resource.id.clone()));
     let mut core_resource = CoreResource::from_id(id);
     core_resource.attributes = wit_to_core_value_map(&resource.attributes)?
         .into_iter()
@@ -917,81 +888,76 @@ pub(crate) fn wit_to_core_resource(
 
 // -- ProviderError --
 
-/// Convert a host-side core [`CoreProviderError`] into the WIT
-/// `provider-error` variant. The boxed `cause` chain is flattened to a
-/// string because WIT cannot represent `dyn std::error::Error`.
+/// Encode the protocol record produced by [`CoreProviderError::to_wire`] as a
+/// WIT `provider-error` variant.
 #[cfg(test)]
-pub(crate) fn core_to_wit_provider_error(err: &CoreProviderError) -> wit::ProviderError {
-    let detail = err.detail();
+pub(crate) fn wire_to_wit_provider_error(err: proto::ProviderError) -> wit::ProviderError {
     let wit_detail = wit::ErrorDetail {
-        message: detail.message.clone(),
-        resource_id: detail
-            .resource_id
-            .as_ref()
-            .map(|id| core_to_wit_resource_id(id)),
-        cause: detail.cause.as_ref().map(|c| c.to_string()),
-        provider_name: detail.provider_name.clone(),
-        operation: detail.operation.clone(),
-        status: detail.status,
-        code: detail.code.clone(),
-        request_id: detail.request_id.clone(),
+        message: err.message,
+        resource_id: err.resource_id.map(|id| wit::ResourceId {
+            provider: id.provider,
+            resource_type: id.resource_type,
+            identity: id.identity,
+        }),
+        cause: err.cause,
+        provider_name: err.provider_name,
+        operation: err.operation,
+        status: err.status,
+        code: err.code,
+        request_id: err.request_id,
     };
-    match err {
-        CoreProviderError::InvalidInput(_) => wit::ProviderError::InvalidInput(wit_detail),
-        CoreProviderError::ApiError(_) => wit::ProviderError::ApiError(wit_detail),
-        CoreProviderError::NotFound(_) => wit::ProviderError::NotFound(wit_detail),
-        CoreProviderError::Timeout(_) => wit::ProviderError::Timeout(wit_detail),
-        CoreProviderError::Internal(_) => wit::ProviderError::Internal(wit_detail),
+    match err.kind {
+        proto::ProviderErrorKind::InvalidInput => wit::ProviderError::InvalidInput(wit_detail),
+        proto::ProviderErrorKind::ApiError => wit::ProviderError::ApiError(wit_detail),
+        proto::ProviderErrorKind::NotFound => wit::ProviderError::NotFound(wit_detail),
+        proto::ProviderErrorKind::Timeout => wit::ProviderError::Timeout(wit_detail),
+        proto::ProviderErrorKind::Internal => wit::ProviderError::Internal(wit_detail),
     }
 }
 
-/// Convert a WIT [`wit::ProviderError`] into the host-side core
-/// [`CoreProviderError`]. The variant is preserved exactly; the
-/// `cause` string is rehydrated as an `Option<String>` inside
-/// [`CoreErrorDetail`].
-pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
-    let (detail, ctor): (
-        wit::ErrorDetail,
-        fn(Box<CoreErrorDetail>) -> CoreProviderError,
-    ) = match err {
-        wit::ProviderError::InvalidInput(d) => (d, CoreProviderError::InvalidInput),
-        wit::ProviderError::ApiError(d) => (d, CoreProviderError::ApiError),
-        wit::ProviderError::NotFound(d) => (d, CoreProviderError::NotFound),
-        wit::ProviderError::Timeout(d) => (d, CoreProviderError::Timeout),
-        wit::ProviderError::Internal(d) => (d, CoreProviderError::Internal),
+pub(crate) fn wit_to_wire_provider_error(err: wit::ProviderError) -> proto::ProviderError {
+    let (detail, kind) = match err {
+        wit::ProviderError::InvalidInput(d) => (d, proto::ProviderErrorKind::InvalidInput),
+        wit::ProviderError::ApiError(d) => (d, proto::ProviderErrorKind::ApiError),
+        wit::ProviderError::NotFound(d) => (d, proto::ProviderErrorKind::NotFound),
+        wit::ProviderError::Timeout(d) => (d, proto::ProviderErrorKind::Timeout),
+        wit::ProviderError::Internal(d) => (d, proto::ProviderErrorKind::Internal),
     };
-    let core_detail = CoreErrorDetail {
+    proto::ProviderError {
+        kind,
         message: detail.message,
-        resource_id: detail
-            .resource_id
-            .map(|id| Box::new(wit_to_core_resource_id(&id))),
-        cause: detail
-            .cause
-            .map(|s| Box::new(FlattenedCause(s)) as Box<dyn std::error::Error + Send + Sync>),
+        resource_id: detail.resource_id.map(wit_to_wire_resource_id),
+        cause: detail.cause,
         provider_name: detail.provider_name,
         operation: detail.operation,
         status: detail.status,
         code: detail.code,
         request_id: detail.request_id,
-    };
-    ctor(Box::new(core_detail))
-}
-
-/// Synthetic `Error` wrapping a flattened-cause string from the WIT
-/// boundary. We can't rehydrate a real cause chain across WIT
-/// (`dyn Error` doesn't fit through a record), so we wrap the string
-/// in a minimal `Error` shape so callers reading
-/// `ProviderError::source()` still see a non-empty message.
-#[derive(Debug)]
-struct FlattenedCause(String);
-
-impl std::fmt::Display for FlattenedCause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for FlattenedCause {}
+/// Convert a WIT [`wit::ProviderError`] into the host-side core
+/// [`CoreProviderError`]. The variant is preserved exactly; the
+/// flattened `cause` string is rehydrated as a typed `FlattenedWireCause` inside
+/// [`CoreProviderError::from_wire`].
+pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
+    CoreProviderError::from_wire(wit_to_wire_provider_error(err))
+}
+
+/// Decode a guest initialization error and attach its boundary phase when the
+/// guest did not provide a more specific operation.
+///
+/// Provider identity is attached later by the wiring layer, which owns the
+/// configured name in both built-in and source-loaded paths. Keeping the
+/// decoded [`CoreProviderError`] intact preserves its kind, source text,
+/// resource id, and structured cloud fields.
+pub fn decode_provider_initialization_error(error: proto::ProviderError) -> CoreProviderError {
+    let mut error = CoreProviderError::from_wire(error);
+    if error.detail().operation.is_none() {
+        error.detail_mut().operation = Some("initialize".to_string());
+    }
+    error
+}
 
 // -- Update request and patch --
 
@@ -1599,6 +1565,20 @@ fn proto_input_mode_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct TestOperationError {
+        operation: &'static str,
+        source: std::io::Error,
+    }
+
+    impl std::fmt::Display for TestOperationError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "in operation {}: {}", self.operation, self.source)
+        }
+    }
+
+    impl std::error::Error for TestOperationError {}
 
     fn v2_redacted_secret(plaintext: &str) -> (CoreValue, String) {
         let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
@@ -2214,8 +2194,11 @@ mod tests {
         for (value, variant) in values {
             let error = wit_to_core_value(&value)
                 .expect_err("malformed JSON must not decode to a substitute value");
-            assert!(error.to_string().contains(variant));
-            assert!(std::error::Error::source(&error).is_some());
+            let rendered = error.to_string();
+            assert!(rendered.contains(variant), "{rendered}");
+            assert_eq!(rendered.matches("invalid JSON").count(), 1, "{rendered}");
+            assert!(rendered.contains("line 1 column"), "{rendered}");
+            assert!(std::error::Error::source(&error).is_none());
         }
 
         assert!(wit_to_core_value(&wit::Value::ListVal("{}".to_string())).is_err());
@@ -2246,7 +2229,10 @@ mod tests {
 
         assert!(!error.to_string().contains(plaintext));
         assert!(!format!("{error:?}").contains(plaintext));
-        assert!(std::error::Error::source(&error).is_some());
+        let rendered = error.to_string();
+        assert_eq!(rendered.matches("invalid JSON").count(), 1, "{rendered}");
+        assert!(rendered.contains("line 1 column"), "{rendered}");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -2273,12 +2259,11 @@ mod tests {
             .expect_err("invalid schema default must fail value decoding");
         let error = SchemaDecodeError::schema_default_value_decode(value_error);
 
-        assert!(
-            std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<WasmValueDecodeError>())
-                .is_some(),
-            "the schema wrapper must preserve WasmValueDecodeError as its source"
-        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("schema default value conversion error"));
+        assert_eq!(rendered.matches("list-val").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("invalid JSON").count(), 1, "{rendered}");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -2602,27 +2587,56 @@ mod tests {
 
     #[test]
     fn test_resource_id_roundtrip() {
-        let core = CoreResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
+        let core = CoreResourceId::with_provider_identity(
+            "aws",
+            "s3.Bucket",
+            "my-bucket",
+            Some("west".to_string()),
+        );
+        let wire = core.to_wire();
+        assert_eq!(wire.provider, "aws");
+        assert_eq!(wire.resource_type, "s3.Bucket");
+        assert_eq!(wire.identity, "my-bucket");
         let wit = core_to_wit_resource_id(&core);
         assert_eq!(wit.provider, "aws");
         assert_eq!(wit.resource_type, "s3.Bucket");
         assert_eq!(wit.identity, "my-bucket");
-        let back = wit_to_core_resource_id(&wit);
-        assert_eq!(core, back);
+        let back = CoreResourceId::from_wire(proto::ResourceId {
+            provider: wit.provider,
+            resource_type: wit.resource_type,
+            identity: wit.identity,
+        });
+        assert_eq!(back.provider_instance, None);
+        assert_eq!(back.provider, core.provider);
+        assert_eq!(back.resource_type, core.resource_type);
+        assert_eq!(back.identity_str(), core.identity_str());
     }
 
     #[test]
     fn pending_resource_id_wasm_conversion_never_reuses_identity() {
-        let pending = CoreResourceId::pending_with_provider("mock", "test.resource", None);
+        let pending = CoreResourceId::pending_with_provider(
+            "mock",
+            "test.resource",
+            Some("secondary".to_string()),
+        );
+        let encoded = pending.to_wire();
+        assert_eq!(encoded.identity, "");
         let wit = core_to_wit_resource_id(&pending);
         assert_eq!(wit.provider, "mock");
         assert_eq!(wit.resource_type, "test.resource");
         assert_eq!(wit.identity, "");
 
-        let first = wit_to_core_resource_id(&wit);
-        let second = wit_to_core_resource_id(&wit);
+        let wire = proto::ResourceId {
+            provider: wit.provider,
+            resource_type: wit.resource_type,
+            identity: wit.identity,
+        };
+        let first = CoreResourceId::from_wire(wire.clone());
+        let second = CoreResourceId::from_wire(wire);
         assert_eq!(first.identity_str(), None);
         assert_eq!(second.identity_str(), None);
+        assert_eq!(first.provider_instance, None);
+        assert_eq!(second.provider_instance, None);
         assert_ne!(first, second);
     }
 
@@ -2852,42 +2866,66 @@ mod tests {
         ];
 
         for (err, is_variant) in cases {
-            let wit_err = core_to_wit_provider_error(&err);
+            let wit_err = wire_to_wit_provider_error(err.to_wire());
             let back = wit_to_core_provider_error(wit_err);
             assert!(is_variant(&back), "variant lost for {}", err.variant_name());
-            assert_eq!(back.message(), err.message(), "message lost");
+            assert_eq!(
+                back.detail().context(),
+                err.detail().context(),
+                "context lost"
+            );
         }
     }
 
     #[test]
-    fn test_provider_error_detail_fields_round_trip() {
-        // Resource id, cause string, and provider name must all
-        // survive a host -> WIT -> host round trip. cause is
-        // flattened to a string at the boundary because WIT cannot
-        // carry `dyn std::error::Error`.
-        let cause = std::io::Error::other("inner io error");
+    fn test_provider_error_terminal_cause_and_detail_fields_round_trip() {
+        // Resource id, complete terminal cause, provider name, and structured
+        // fields must survive core -> wire -> WIT -> wire -> core. The
+        // operation wrapper renders its actionable typed detail itself.
+        let cause = TestOperationError {
+            operation: "read",
+            source: std::io::Error::other("inner io error"),
+        };
         let id = CoreResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
-        let err = CoreProviderError::api_error("Failed to read")
-            .with_cause(cause)
+        let err = CoreProviderError::api_error_caused_by("Failed to read", cause)
             .for_resource(id.clone())
-            .for_provider("aws");
+            .for_provider("aws")
+            .with_operation("s3.HeadBucket")
+            .with_status(503)
+            .with_code("ServiceUnavailable")
+            .with_request_id("request-123");
 
-        let wit_err = core_to_wit_provider_error(&err);
+        let wire: proto::ProviderError = err.to_wire();
+        assert_eq!(
+            wire.cause.as_deref(),
+            Some("in operation read: inner io error")
+        );
+        let wit_err = wire_to_wit_provider_error(wire);
         let back = wit_to_core_provider_error(wit_err);
         assert!(matches!(back, CoreProviderError::ApiError(_)));
         let detail = back.detail();
-        assert_eq!(detail.message, "Failed to read");
+        assert_eq!(detail.context(), "Failed to read");
         assert_eq!(detail.provider_name.as_deref(), Some("aws"));
+        assert_eq!(detail.operation.as_deref(), Some("s3.HeadBucket"));
+        assert_eq!(detail.status, Some(503));
+        assert_eq!(detail.code.as_deref(), Some("ServiceUnavailable"));
+        assert_eq!(detail.request_id.as_deref(), Some("request-123"));
         let rid = detail.resource_id.as_ref().expect("resource_id preserved");
         assert_eq!(rid.provider, "aws");
         assert_eq!(rid.resource_type, "s3.Bucket");
         assert_eq!(rid.identity_str().expect("resolved identity"), "my-bucket");
         let cause_str = detail
-            .cause
-            .as_ref()
-            .map(|c| c.to_string())
+            .cause()
+            .map(|cause| cause.to_string())
             .expect("cause preserved as string");
-        assert_eq!(cause_str, "inner io error");
+        assert_eq!(cause_str, "in operation read: inner io error");
+        let rendered = back.to_string();
+        assert_eq!(
+            rendered.matches("in operation read").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("inner io error").count(), 1, "{rendered}");
     }
 
     /// carina#3242: the new structured cloud-API metadata fields
@@ -2903,7 +2941,7 @@ mod tests {
             .with_code("AccessDenied")
             .with_request_id("997aa923-2aa4-4d2b-8d16-44fd21c81368");
 
-        let wit_err = core_to_wit_provider_error(&err);
+        let wit_err = wire_to_wit_provider_error(err.to_wire());
         let back = wit_to_core_provider_error(wit_err);
         let detail = back.detail();
         assert_eq!(detail.operation.as_deref(), Some("iam.ListRoles"));
@@ -2913,6 +2951,29 @@ mod tests {
             detail.request_id.as_deref(),
             Some("997aa923-2aa4-4d2b-8d16-44fd21c81368"),
         );
+    }
+
+    #[test]
+    fn pending_resource_id_round_trips_on_provider_error_without_routing_instance() {
+        let pending =
+            CoreResourceId::pending_with_provider("aws", "s3.Bucket", Some("audit".to_string()));
+        let err = CoreProviderError::not_found("Bucket identity is pending").for_resource(pending);
+
+        let wire = err.to_wire();
+        let wire_id = wire.resource_id.as_ref().expect("resource id encoded");
+        assert_eq!(wire_id.identity, "");
+        let wit_err = wire_to_wit_provider_error(wire);
+        let back = wit_to_core_provider_error(wit_err);
+        let id = back
+            .detail()
+            .resource_id
+            .as_deref()
+            .expect("resource id decoded");
+
+        assert_eq!(id.provider, "aws");
+        assert_eq!(id.resource_type, "s3.Bucket");
+        assert_eq!(id.identity_str(), None);
+        assert_eq!(id.provider_instance, None);
     }
 
     #[tokio::test]
@@ -3075,13 +3136,7 @@ mod tests {
             }]"#,
         )
         .unwrap_err();
-        let mut rendered = err.to_string();
-        let mut source = std::error::Error::source(&err);
-        while let Some(error) = source {
-            use std::fmt::Write as _;
-            write!(rendered, ": {error}").unwrap();
-            source = error.source();
-        }
+        let rendered = err.to_string();
 
         assert!(
             rendered.contains("schema JSON parse error"),
@@ -3324,7 +3379,10 @@ mod tests {
     #[test]
     fn json_to_attribute_types_rejects_malformed_json() {
         let error = json_to_attribute_types("not json").unwrap_err();
-        assert!(std::error::Error::source(&error).is_some());
+        let rendered = error.to_string();
+        assert_eq!(rendered.matches("schema JSON parse error").count(), 1);
+        assert!(rendered.contains("expected ident"), "{rendered}");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

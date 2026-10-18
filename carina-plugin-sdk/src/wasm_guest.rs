@@ -71,7 +71,9 @@ impl std::fmt::Display for WasmValueDecodeError {
             write!(f, " attribute '{}'", self.attribute_path.join("."))?;
         }
         match &self.kind {
-            WasmValueDecodeErrorKind::InvalidJson(_) => f.write_str(": invalid JSON"),
+            WasmValueDecodeErrorKind::InvalidJson(error) => {
+                write!(f, ": invalid JSON: {error}")
+            }
             WasmValueDecodeErrorKind::ExpectedArray => f.write_str(": expected a JSON array"),
             WasmValueDecodeErrorKind::ExpectedObject => f.write_str(": expected a JSON object"),
             WasmValueDecodeErrorKind::ExpectedString { index } => {
@@ -87,18 +89,7 @@ impl std::fmt::Display for WasmValueDecodeError {
     }
 }
 
-impl std::error::Error for WasmValueDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.kind {
-            WasmValueDecodeErrorKind::InvalidJson(source) => Some(source),
-            WasmValueDecodeErrorKind::ExpectedArray
-            | WasmValueDecodeErrorKind::ExpectedObject
-            | WasmValueDecodeErrorKind::ExpectedString { .. }
-            | WasmValueDecodeErrorKind::Null
-            | WasmValueDecodeErrorKind::UnsupportedNumber => None,
-        }
-    }
-}
+impl std::error::Error for WasmValueDecodeError {}
 
 fn json_to_proto_value_for_variant(
     v: serde_json::Value,
@@ -213,17 +204,9 @@ pub fn decode_secret_val(json: &str) -> Result<proto::Value, WasmValueDecodeErro
     json_to_proto_value_for_variant(inner, WitValueVariant::SecretVal)
 }
 
-/// Render a decode error for boundaries that cannot transport a typed source chain.
+/// Render a decode error for boundaries that cannot transport a typed error.
 pub fn format_wasm_value_decode_error(error: &WasmValueDecodeError) -> String {
-    use std::fmt::Write as _;
-
-    let mut rendered = error.to_string();
-    let mut source = std::error::Error::source(error);
-    while let Some(error) = source {
-        write!(rendered, ": {error}").expect("writing to String is infallible");
-        source = error.source();
-    }
-    rendered
+    error.to_string()
 }
 
 /// Failure to encode a proto value into a JSON-backed WIT value.
@@ -531,6 +514,13 @@ macro_rules! export_provider {
 
             // -- Guest trait implementation --
 
+            /// Trust-boundary encoder for a complete protocol error record.
+            ///
+            /// A core provider produces this exact record with
+            /// `ProviderError::to_wire`; guest implementations may also build
+            /// it directly. Its runtime message and flattened cause are
+            /// untrusted data and are passed through unchanged for the host's
+            /// sole sanctioned `ProviderError::from_wire` decode path.
             fn proto_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
                 let detail = wit_types::ErrorDetail {
                     message: err.message,
@@ -1248,6 +1238,13 @@ macro_rules! export_provider {
 
             // -- Guest trait implementation --
 
+            /// Trust-boundary encoder for a complete protocol error record.
+            ///
+            /// A core provider produces this exact record with
+            /// `ProviderError::to_wire`; guest implementations may also build
+            /// it directly. Its runtime message and flattened cause are
+            /// untrusted data and are passed through unchanged for the host's
+            /// sole sanctioned `ProviderError::from_wire` decode path.
             fn proto_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
                 let detail = wit_types::ErrorDetail {
                     message: err.message,
@@ -1777,8 +1774,11 @@ mod tests {
                 .into_iter()
                 .zip(["string-list-val", "list-val", "map-val", "secret-val"])
         {
-            assert!(error.to_string().contains(variant));
-            assert!(std::error::Error::source(&error).is_some());
+            let rendered = error.to_string();
+            assert!(rendered.contains(variant), "{rendered}");
+            assert_eq!(rendered.matches("invalid JSON").count(), 1, "{rendered}");
+            assert!(rendered.contains("line 1 column"), "{rendered}");
+            assert!(std::error::Error::source(&error).is_none());
         }
 
         assert!(decode_list_val("{}").is_err());
@@ -1801,7 +1801,10 @@ mod tests {
 
         assert!(!error.to_string().contains(plaintext));
         assert!(!format!("{error:?}").contains(plaintext));
-        assert!(std::error::Error::source(&error).is_some());
+        let rendered = error.to_string();
+        assert_eq!(rendered.matches("invalid JSON").count(), 1, "{rendered}");
+        assert!(rendered.contains("line 1 column"), "{rendered}");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

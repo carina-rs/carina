@@ -915,13 +915,12 @@ async fn run_state_bucket_delete(
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
     // a DSL concern that doesn't apply to the implicit state bucket.
-    let bucket_identity =
-        ResourceIdentity::try_from(bucket_name.to_string()).map_err(|source| {
-            AppError::InvalidStateBucketIdentity {
-                bucket_name: bucket_name.to_string(),
-                source,
-            }
-        })?;
+    let bucket_identity = ResourceIdentity::try_from(bucket_name.to_string()).map_err(|error| {
+        AppError::InvalidStateBucketIdentity {
+            bucket_name: bucket_name.to_string(),
+            error,
+        }
+    })?;
     let bucket_id = ResourceId::with_provider_identity(
         backend_provider_name,
         backend_resource_type,
@@ -2290,17 +2289,15 @@ mod tests {
             message.contains("required by provider 'test' attribute 'role_arn'"),
             "{message}"
         );
-        let AppError::ProviderReferencedUpstream { source, .. } = &error else {
+        let AppError::ProviderReferencedUpstream { error: source, .. } = &error else {
             panic!("provider-reference context must remain a typed AppError: {error:?}");
         };
         assert!(
             matches!(source.as_ref(), AppError::Config(_)),
             "the wrapped source must remain the original typed upstream error: {source:?}"
         );
-        assert!(
-            std::error::Error::source(&error).is_some(),
-            "provider-reference context must expose the upstream error via Error::source"
-        );
+        assert_eq!(message.matches("no state found").count(), 1, "{message}");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[tokio::test]

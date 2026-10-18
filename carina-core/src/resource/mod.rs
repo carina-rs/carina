@@ -388,6 +388,40 @@ pub struct ResourceId {
 }
 
 impl ResourceId {
+    /// Decode a resource id received from the provider protocol boundary.
+    ///
+    /// The wire format represents a pending identity as an empty string. Use
+    /// the exhaustive [`ResourceIdentityError`] match here so guest-controlled
+    /// input cannot reach an assertion or `expect` path. The protocol record
+    /// has no `provider_instance` field, so routing information does not round
+    /// trip and the decoded id always uses the default provider instance.
+    pub fn from_wire(id: carina_provider_protocol::types::ResourceId) -> Self {
+        let carina_provider_protocol::types::ResourceId {
+            provider,
+            resource_type,
+            identity,
+        } = id;
+        match ResourceIdentity::try_from(identity) {
+            Ok(identity) => Self::with_provider_identity(provider, resource_type, identity, None),
+            Err(ResourceIdentityError::Empty) => {
+                Self::pending_with_provider(provider, resource_type, None)
+            }
+        }
+    }
+
+    /// Encode this resource id for the provider protocol boundary.
+    ///
+    /// Pending identities are encoded as the protocol's empty-string sentinel.
+    /// The protocol record has no `provider_instance` field, so routing
+    /// information is intentionally omitted and cannot round trip.
+    pub fn to_wire(&self) -> carina_provider_protocol::types::ResourceId {
+        carina_provider_protocol::types::ResourceId {
+            provider: self.provider.clone(),
+            resource_type: self.resource_type.clone(),
+            identity: self.identity_str().unwrap_or_default().to_string(),
+        }
+    }
+
     pub fn pending(resource_type: impl Into<String>) -> Self {
         Self {
             provider: String::new(),

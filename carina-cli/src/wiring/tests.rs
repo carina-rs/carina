@@ -185,7 +185,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
         .expect_err("an unresolved enum must abort plan desired preprocessing");
 
         assert!(error.to_string().contains(attribute), "{error}");
-        assert!(std::error::Error::source(&error).is_some());
+        assert!(error.detail().cause().is_some());
     }
 }
 
@@ -368,13 +368,29 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
 
     match error {
         PlanPreparationError::Provider(error) => {
-            assert_eq!(error.message(), "plan normalization failed");
+            assert_eq!(error.to_string(), "plan normalization failed");
         }
         PlanPreparationError::Plan(errors) => panic!("unexpected plan errors: {errors:#?}"),
     }
     assert!(
         !state_called.load(Ordering::SeqCst),
         "state normalization must not run after desired normalization fails"
+    );
+}
+
+#[test]
+fn provider_plan_preparation_error_chain_renders_leaf_once() {
+    let error = PlanPreparationError::Provider(ProviderError::api_error_caused_by(
+        "x",
+        std::io::Error::other("provider leaf reason"),
+    ));
+
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("provider leaf reason").count(),
+        1,
+        "{rendered}"
     );
 }
 
@@ -655,8 +671,97 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     let AppError::Provider(error) = error else {
         panic!("expected provider error, got {error}");
     };
-    assert_eq!(error.message(), "normalizer initialization failed");
+    assert_eq!(error.to_string(), "normalizer initialization failed");
     assert_eq!(error.detail().provider_name.as_deref(), Some("failing"));
+}
+
+#[tokio::test]
+async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
+    struct FailingInitializeFactory;
+
+    impl ProviderFactory for FailingInitializeFactory {
+        fn name(&self) -> &str {
+            "aws"
+        }
+
+        fn display_name(&self) -> &str {
+            "Failing initialize factory"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test-region".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &carina_core::provider::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async {
+                Err(
+                    carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
+                        "initialization rejected",
+                    ),
+                )
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    let ctx = WiringContext::new(vec![Box::new(FailingInitializeFactory)], &[]);
+    let configs = validated_provider_configs(vec![ProviderConfig {
+        name: "aws".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }]);
+    let mut router = ProviderRouter::new();
+    let error = instantiate_provider_into_router(
+        &ctx,
+        &mut router,
+        configs.iter().next().unwrap(),
+        Path::new("."),
+        None,
+    )
+    .await
+    .expect_err("provider initialization must fail");
+
+    let AppError::Provider(error) = error else {
+        panic!("expected provider error")
+    };
+    assert_eq!(error.detail().provider_name.as_deref(), Some("aws"));
+    assert_eq!(error.detail().operation.as_deref(), Some("initialize"));
+}
+
+#[test]
+fn source_provider_initialization_error_keeps_provider_and_phase() {
+    let decoded = carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
+        "initialization rejected",
+    );
+    let AppError::Provider(error) = source_provider_initialization_error("awscc", decoded) else {
+        panic!("expected provider error")
+    };
+
+    assert_eq!(error.detail().provider_name.as_deref(), Some("awscc"));
+    assert_eq!(error.detail().operation.as_deref(), Some("initialize"));
 }
 
 struct ProviderConfigConstraintFactory {
@@ -1276,6 +1381,32 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
             "resolved-region".into()
         ))),
         "state normalization must prepare the declared provider config"
+    );
+}
+
+#[test]
+fn normalize_state_with_ctx_renders_provider_config_error_once() {
+    let (_parsed, provider_configs) = resolved_invalid_provider_config();
+    let ctx = WiringContext::new(
+        vec![Box::new(ProviderConfigConstraintFactory {
+            creates: Arc::new(AtomicUsize::new(0)),
+        })],
+        provider_configs.as_provider_configs(),
+    );
+
+    let error = normalize_state_with_ctx(&ctx, &provider_configs, &mut HashMap::new())
+        .expect_err("invalid provider configuration must fail state normalization setup");
+    let preparation_error = error
+        .detail()
+        .cause()
+        .expect("configuration preparation error must remain the typed source");
+    let leaf_reason = preparation_error.to_string();
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches(&leaf_reason).count(),
+        1,
+        "leaf TypeError must render once, got: {rendered}"
     );
 }
 
@@ -3711,7 +3842,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
 }
 
 #[tokio::test]
-async fn invalid_data_source_preparation_keeps_typed_error_chain() {
+async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
     use carina_core::resource::DataSource;
 
     let lookup = DataSource::with_provider("test", "Lookup", "roles", None).with_attribute(
@@ -3746,21 +3877,23 @@ async fn invalid_data_source_preparation_keeps_typed_error_chain() {
         error.to_string(),
         "[Lookup.roles] test.Lookup.roles: value constraint failed before provider dispatch: Invalid value 'bad' for 'filter': does not match required pattern /^good-/"
     );
-    let mut source = std::error::Error::source(&error);
-    let mut saw_preparation = false;
-    let mut saw_type_error = false;
-    while let Some(error) = source {
-        saw_preparation |= error
-            .downcast_ref::<carina_core::executor::ProviderPreparationError>()
-            .is_some();
-        saw_type_error |= error.downcast_ref::<TypeError>().is_some();
-        source = error.source();
-    }
-    assert!(
-        saw_preparation,
-        "typed preparation error was erased: {error:?}"
+    let AppError::ProviderPreparation(preparation) = &error else {
+        panic!("typed preparation error was erased: {error:?}");
+    };
+    let carina_core::executor::ProviderPreparationError::ValueConstraint { errors, .. } =
+        preparation.preparation_error()
+    else {
+        panic!("typed schema error was erased: {error:?}");
+    };
+    assert!(!errors.errors().is_empty());
+    assert_eq!(
+        error
+            .to_string()
+            .matches("does not match required pattern /^good-/")
+            .count(),
+        1
     );
-    assert!(saw_type_error, "typed schema error was erased: {error:?}");
+    assert!(std::error::Error::source(&error).is_none());
     assert_eq!(provider.data_source_read_calls(), 0);
 }
 
@@ -5930,7 +6063,9 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
         &installed,
         std::io::Error::other("runtime instantiation failed"),
     );
-    let cause = std::error::Error::source(&error)
+    let cause = error
+        .detail()
+        .cause()
         .expect("the ProviderError boundary must retain the artifact wrapper");
 
     assert!(
@@ -5985,7 +6120,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
 }
 
 #[test]
-fn unversioned_lock_error_reaches_cli_with_source_and_restore_remediation() {
+fn unversioned_lock_error_reaches_cli_typed_with_restore_remediation() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     std::fs::write(
@@ -6029,22 +6164,18 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         "{rendered}"
     );
 
-    let mut source = std::error::Error::source(&runtime_error);
-    let mut found_lock_file_error = false;
-    while let Some(error) = source {
-        if error
-            .downcast_ref::<carina_provider_resolver::LockFileError>()
-            .is_some()
-        {
-            found_lock_file_error = true;
-            break;
-        }
-        source = error.source();
-    }
     assert!(
-        found_lock_file_error,
-        "the CLI error chain must retain the typed lock-file error"
+        matches!(
+            &runtime_error,
+            AppError::LockConstraint(carina_provider_resolver::LockConstraintError::LockFile(_))
+        ),
+        "the CLI diagnostic must retain the typed lock-file error"
     );
+    assert_eq!(
+        rendered.matches("predates lock format versioning").count(),
+        1
+    );
+    assert!(std::error::Error::source(&runtime_error).is_none());
 
     let (factories, load_errors) = build_factories_from_providers_for_formatting(&[config], base);
     assert!(factories.is_empty());
@@ -6064,22 +6195,22 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         formatting_rendered.contains("preserve it for manual inspection"),
         "{formatting_rendered}"
     );
-    let mut source = std::error::Error::source(formatting_error);
-    let mut found_lock_file_error = false;
-    while let Some(error) = source {
-        if error
-            .downcast_ref::<carina_provider_resolver::LockFileError>()
-            .is_some()
-        {
-            found_lock_file_error = true;
-            break;
-        }
-        source = error.source();
-    }
     assert!(
-        found_lock_file_error,
+        matches!(
+            formatting_error,
+            ProviderFactoryDiagnostic::LockConstraint(
+                carina_provider_resolver::LockConstraintError::LockFile(_)
+            )
+        ),
         "the formatting diagnostic must retain the typed lock-file error"
     );
+    assert_eq!(
+        formatting_rendered
+            .matches("predates lock format versioning")
+            .count(),
+        1
+    );
+    assert!(std::error::Error::source(formatting_error).is_none());
 }
 
 #[test]

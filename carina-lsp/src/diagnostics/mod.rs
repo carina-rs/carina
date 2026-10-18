@@ -1819,12 +1819,12 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             "interpolation is not allowed in this string literal".to_string(),
         ),
-        ParseError::InvalidResourceIdentity { line, source } => carina_diagnostic(
+        ParseError::InvalidResourceIdentity { line, error } => carina_diagnostic(
             (*line as u32).saturating_sub(1),
             0,
             100,
             DiagnosticSeverity::ERROR,
-            source.to_string(),
+            error.to_string(),
         ),
         ParseError::UndefinedVariable(name) => carina_diagnostic_range(
             Range::default(),

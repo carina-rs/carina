@@ -43,6 +43,11 @@ impl InvalidResourceIdentityError {
         self.state_location = Some(location);
     }
 
+    /// Typed identity validation failure retained by this terminal diagnostic.
+    pub fn identity_error(&self) -> &ResourceIdentityError {
+        &self.source
+    }
+
     /// Render the recovery steps with a command appropriate to the caller's
     /// project context.
     pub fn render_with_plan_command(&self, plan_command: &str) -> String {
@@ -63,8 +68,8 @@ impl InvalidResourceIdentityError {
              resource. Back up the state file, then remove this row. Run `{plan_command}`; the \
              resource that owned it appears as a create with its newly assigned identity. Put the \
              row back with `identity` set to that value (keep its `identifier` and attributes), \
-             or leave it removed if the resource is no longer managed.",
-            self.resource_index, self.provider, self.resource_type,
+             or leave it removed if the resource is no longer managed.\nCause: {}",
+            self.resource_index, self.provider, self.resource_type, self.source,
         )
     }
 }
@@ -76,11 +81,7 @@ impl std::fmt::Display for InvalidResourceIdentityError {
     }
 }
 
-impl std::error::Error for InvalidResourceIdentityError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
+impl std::error::Error for InvalidResourceIdentityError {}
 
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
@@ -126,16 +127,15 @@ pub enum BackendError {
     InvalidState(String),
 
     /// An identity transformation produced a value that cannot be represented.
-    #[error("Invalid state file: {context}: {source}")]
+    #[error("Invalid state file: {context}: {error}")]
     InvalidStateIdentity {
         context: String,
-        #[source]
-        source: ResourceIdentityError,
+        error: ResourceIdentityError,
     },
 
     /// A legacy state row contains an identity that can no longer be matched.
     #[error("{0}")]
-    InvalidResourceIdentity(#[source] InvalidResourceIdentityError),
+    InvalidResourceIdentity(InvalidResourceIdentityError),
 
     /// The state file was written by a newer Carina than this binary supports
     #[error(
@@ -431,14 +431,14 @@ fn write_cause_line(out: &mut String, source: &(dyn std::error::Error + 'static)
     let _ = write!(out, "  cause: ");
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
     let mut first = true;
-    while let Some(e) = current {
+    while let Some(error) = current {
         if first {
-            let _ = write!(out, "{e}");
+            let _ = write!(out, "{error}");
             first = false;
         } else {
-            let _ = write!(out, ": {e}");
+            let _ = write!(out, ": {error}");
         }
-        current = e.source();
+        current = error.source();
     }
     out.push('\n');
 }
@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_config_error_conversion_preserves_display_and_per_attribute_sources() {
+    fn backend_config_error_conversion_preserves_each_terminal_attribute_diagnostic() {
         let raw = carina_core::parser::parse(
             r#"backend s3 {
                 bucket = "state"
@@ -645,13 +645,11 @@ mod tests {
         let BackendConfigError::Invalid(attribute_errors) = &config_error else {
             panic!("expected attribute errors, got {config_error:?}");
         };
-        assert!(
-            attribute_errors
-                .errors()
-                .iter()
-                .all(|error| std::error::Error::source(error).is_some()),
-            "each invalid attribute must retain its TypeError source"
-        );
+        for attribute_error in attribute_errors.errors() {
+            assert!(std::error::Error::source(attribute_error).is_none());
+            let detail = attribute_error.to_string();
+            assert_eq!(expected.matches(&detail).count(), 1, "{expected}");
+        }
         assert!(
             std::error::Error::source(attribute_errors).is_none(),
             "the aggregate must not repeat an arbitrary first attribute in error-chain renderers"
@@ -669,7 +667,7 @@ mod tests {
         );
         assert!(
             std::error::Error::source(&error).is_none(),
-            "the transparent BackendError must not repeat the aggregate display"
+            "the terminal BackendError must not repeat the aggregate display"
         );
     }
 

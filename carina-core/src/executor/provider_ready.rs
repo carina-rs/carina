@@ -362,15 +362,20 @@ pub enum ProviderPreparationError {
     #[error("{resource}: value constraint failed before provider dispatch: {errors}")]
     ValueConstraint {
         resource: ResourceId,
-        #[source]
         errors: ProviderValueConstraintErrors,
     },
     /// A pending module argument constraint became decidable and failed.
     #[error(transparent)]
     ModuleConstraint(#[from] ModuleConstraintGateError),
     /// Provider-specific normalization failed before dispatch.
-    #[error(transparent)]
-    Provider(#[from] crate::provider::ProviderError),
+    #[error("{0}")]
+    Provider(crate::provider::ProviderError),
+}
+
+impl From<crate::provider::ProviderError> for ProviderPreparationError {
+    fn from(error: crate::provider::ProviderError) -> Self {
+        Self::Provider(error)
+    }
 }
 
 impl From<crate::value::EnumCanonicalizationError> for ProviderPreparationError {
@@ -381,8 +386,8 @@ impl From<crate::value::EnumCanonicalizationError> for ProviderPreparationError 
 
 /// Provider-specific configuration validation failure.
 ///
-/// This wrapper lets [`ProviderConfigPreparationError`] retain a typed source
-/// for the provider-specific [`ProviderFactory::validate_config`] contract.
+/// This wrapper retains the provider-specific
+/// [`ProviderFactory::validate_config`] diagnostic as typed data.
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct ProviderConfigValidationError {
@@ -393,19 +398,17 @@ pub struct ProviderConfigValidationError {
 #[derive(Debug, Error)]
 pub enum ProviderConfigPreparationError {
     /// A concrete attribute violates its host-side type schema.
-    #[error("provider {provider}: {attribute}: {source}")]
+    #[error("provider {provider}: {attribute}: {error}")]
     InvalidAttribute {
         provider: String,
         attribute: String,
-        #[source]
-        source: Box<TypeError>,
+        error: Box<TypeError>,
     },
     /// The provider rejected cross-attribute or provider-specific semantics.
-    #[error("provider {provider}: {source}")]
+    #[error("provider {provider}: {error}")]
     ProviderValidation {
         provider: String,
-        #[source]
-        source: ProviderConfigValidationError,
+        error: ProviderConfigValidationError,
     },
 }
 
@@ -430,11 +433,11 @@ fn canonicalize_provider_config_attributes(
         attr_types,
     )
     .map_err(|error| {
-        let (provider, attribute, source) = error.into_parts();
+        let (provider, attribute, error) = error.into_parts();
         ProviderConfigPreparationError::InvalidAttribute {
             provider,
             attribute,
-            source: Box::new(source),
+            error: Box::new(error),
         }
     })?;
     Ok(CanonicalProviderConfigAttributes { attributes })
@@ -476,7 +479,7 @@ pub fn validate_and_canonicalize_provider_config(
         };
         ProviderConfigPreparationError::ProviderValidation {
             provider: provider_name.to_string(),
-            source: ProviderConfigValidationError { message },
+            error: ProviderConfigValidationError { message },
         }
     })?;
 
@@ -532,10 +535,10 @@ fn validate_provider_config_attributes(
         if let Some(attr_type) = attr_types.get(attribute) {
             schema_view
                 .validate_attr(attr_type, value)
-                .map_err(|source| ProviderConfigPreparationError::InvalidAttribute {
+                .map_err(|error| ProviderConfigPreparationError::InvalidAttribute {
                     provider: provider_name.to_string(),
                     attribute: attribute.clone(),
-                    source: Box::new(source),
+                    error: Box::new(error),
                 })?;
         }
     }
@@ -544,9 +547,10 @@ fn validate_provider_config_attributes(
 
 /// Typed collection of schema failures from one provider-boundary check.
 ///
-/// `Display` intentionally retains the historical `; `-joined text, while
-/// `Error::source` exposes the first structured [`TypeError`] to callers that
-/// inspect the chain. All errors remain available through [`Self::errors`].
+/// `Display` intentionally retains the historical `; `-joined text. This is a
+/// composite leaf: exposing the first item through `Error::source` would make
+/// a chain renderer repeat it while still omitting the remaining items. All
+/// structured errors remain available through [`Self::errors`].
 #[derive(Debug)]
 pub struct ProviderValueConstraintErrors(Vec<TypeError>);
 
@@ -574,13 +578,7 @@ impl fmt::Display for ProviderValueConstraintErrors {
     }
 }
 
-impl std::error::Error for ProviderValueConstraintErrors {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0
-            .first()
-            .map(|error| error as &(dyn std::error::Error + 'static))
-    }
-}
+impl std::error::Error for ProviderValueConstraintErrors {}
 
 /// Validate and prepare a resource for provider dispatch.
 ///
@@ -1037,7 +1035,8 @@ mod provider_config_tests {
         assert!(message.contains("provider test"), "{message}");
         assert!(message.contains("region"), "{message}");
         assert!(message.contains(r"^good-[a-z]+$"), "{message}");
-        assert!(std::error::Error::source(&error).is_some());
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(message.matches(r"^good-[a-z]+$").count(), 1, "{message}");
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1056,7 +1055,12 @@ mod provider_config_tests {
             message.contains("configured account is forbidden"),
             "{message}"
         );
-        assert!(std::error::Error::source(&error).is_some());
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(
+            message.matches("configured account is forbidden").count(),
+            1,
+            "{message}"
+        );
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
     }
 

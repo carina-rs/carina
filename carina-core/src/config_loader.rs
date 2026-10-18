@@ -991,6 +991,30 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn load_configuration_preserves_pest_syntax_diagnostic() {
+        let dir = create_temp_dir("syntax_diagnostic");
+        fs::write(dir.join("broken.crn"), "let =\n").unwrap();
+
+        let error = match load_configuration(&dir) {
+            Ok(_) => panic!("invalid syntax unexpectedly loaded"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("Syntax error"), "{error}");
+        assert!(error.contains("--> 1:"), "missing pest location: {error}");
+        assert_eq!(
+            error.matches("--> 1:").count(),
+            1,
+            "pest location must appear exactly once: {error}"
+        );
+        assert!(
+            error.contains("expected"),
+            "missing pest expectation: {error}"
+        );
+        cleanup(&dir);
+    }
+
     // ========== find_crn_files_in_dir tests ==========
 
     #[test]

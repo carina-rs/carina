@@ -923,6 +923,28 @@ test.r.mode_holder {
     );
 }
 
+#[test]
+fn validate_with_factories_preserves_enum_canonicalization_detail_once() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+let holder = missing.r.mode_holder {
+    mode = test.r.Mode.bogus
+}
+"#,
+    )]);
+
+    let diagnostics = cli_diagnostics(Vec::new(), &fixture);
+    let rendered = diagnostics.join("\n");
+    let leaf = "unresolved enum identifier `test.r.Mode.bogus` survived canonicalization";
+    assert!(rendered.contains(leaf), "missing enum detail: {rendered}");
+    assert_eq!(
+        rendered.matches(leaf).count(),
+        1,
+        "enum detail must appear exactly once: {rendered}"
+    );
+}
+
 // ============================================================================
 // Scenario 2: Custom type with `to_dsl` normalization (Region-like)
 // ============================================================================

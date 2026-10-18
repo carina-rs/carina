@@ -2001,15 +2001,9 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         parallelism: crate::executor::TEST_UNCAPPED,
     };
 
-    let result = completed_result(
-        execute_plan(
-            &provider,
-            input,
-            &MockObserver::new(),
-            uncancelled_shutdown(),
-        )
-        .await,
-    );
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 1);
@@ -2017,6 +2011,14 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), upstream_id.to_string())]
+    );
+    let events = observer.events().join("\n");
+    let leaf = "does not match required pattern /^good-/";
+    assert!(events.contains(leaf), "missing constraint detail: {events}");
+    assert_eq!(
+        events.matches(leaf).count(),
+        1,
+        "constraint detail must appear exactly once: {events}"
     );
 }
 

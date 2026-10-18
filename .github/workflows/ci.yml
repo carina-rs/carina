@@ -82,6 +82,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: bash scripts/check-provider-boundaries.sh
 
+  error-source-display:
+    name: Error Source Display Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-error-source-not-in-display.sh
+      - run: bash scripts/test-check-error-source-not-in-display.sh
+
   docs-spellings:
     name: Docs Spelling Check
     runs-on: ubuntu-latest

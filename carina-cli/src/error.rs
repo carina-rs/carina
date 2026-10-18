@@ -8,22 +8,32 @@ use carina_core::resource::ResourceId;
 use carina_state::BackendError;
 
 /// State encoding failure annotated with the resource row being written.
-#[derive(Debug, thiserror::Error)]
-#[error("Failed to encode state for resource {resource}: {source}")]
+#[derive(Debug)]
 pub struct LocatedResourceStateEncodingError {
     resource: ResourceId,
-    #[source]
     source: carina_state::ResourceStateEncodingError,
 }
 
+impl std::fmt::Display for LocatedResourceStateEncodingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to encode state for resource {}: {}",
+            self.resource, self.source
+        )
+    }
+}
+
+impl std::error::Error for LocatedResourceStateEncodingError {}
+
 impl LocatedResourceStateEncodingError {
-    #[cfg(test)]
-    pub(crate) fn resource(&self) -> &ResourceId {
+    /// Resource row whose value could not be encoded.
+    pub fn resource(&self) -> &ResourceId {
         &self.resource
     }
 
-    #[cfg(test)]
-    pub(crate) fn encoding_error(&self) -> &carina_state::ResourceStateEncodingError {
+    /// Typed terminal encoding failure.
+    pub fn encoding_error(&self) -> &carina_state::ResourceStateEncodingError {
         &self.source
     }
 }
@@ -45,6 +55,11 @@ impl ProjectBackendError {
             source,
         }
     }
+
+    /// Typed backend failure rendered with this project's recovery command.
+    pub fn backend_error(&self) -> &BackendError {
+        &self.source
+    }
 }
 
 impl std::fmt::Display for ProjectBackendError {
@@ -58,11 +73,10 @@ impl std::fmt::Display for ProjectBackendError {
     }
 }
 
-impl std::error::Error for ProjectBackendError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
+// This is a terminal project-aware rendering surface. In particular, the
+// legacy-state recovery message embeds a project-specific `carina plan`
+// command, so exposing the backend error again would repeat the diagnostic.
+impl std::error::Error for ProjectBackendError {}
 
 /// Provider preparation failure annotated with the same resource header that
 /// `ProviderError::for_resource` historically rendered.
@@ -72,6 +86,18 @@ pub struct ResourceProviderPreparationError {
     source: Box<carina_core::executor::ProviderPreparationError>,
 }
 
+impl ResourceProviderPreparationError {
+    /// Resource whose provider-boundary preparation failed.
+    pub fn resource(&self) -> &ResourceId {
+        &self.resource
+    }
+
+    /// Typed terminal preparation diagnostic.
+    pub fn preparation_error(&self) -> &carina_core::executor::ProviderPreparationError {
+        &self.source
+    }
+}
+
 impl std::fmt::Display for ResourceProviderPreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -79,21 +105,24 @@ impl std::fmt::Display for ResourceProviderPreparationError {
             "[{}.{}] {}",
             self.resource.resource_type,
             self.resource.identity_display(),
-            self.source
+            self.source,
         )
     }
 }
 
-impl std::error::Error for ResourceProviderPreparationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
+impl std::error::Error for ResourceProviderPreparationError {}
 
 /// Provider preparation failure while creating the managed state bucket.
 #[derive(Debug)]
 pub struct StateBucketPreparationError {
     source: Box<carina_core::executor::ProviderPreparationError>,
+}
+
+impl StateBucketPreparationError {
+    /// Typed terminal preparation diagnostic.
+    pub fn preparation_error(&self) -> &carina_core::executor::ProviderPreparationError {
+        &self.source
+    }
 }
 
 impl std::fmt::Display for StateBucketPreparationError {
@@ -106,11 +135,7 @@ impl std::fmt::Display for StateBucketPreparationError {
     }
 }
 
-impl std::error::Error for StateBucketPreparationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
+impl std::error::Error for StateBucketPreparationError {}
 
 fn apply_input_expectation() -> String {
     format!(
@@ -148,14 +173,7 @@ fn plan_file_recreation_guidance(replan_command: Option<&str>) -> String {
 /// Returns `None` when the message does not match the account-guard
 /// shape; the caller should fall back to the generic display.
 pub fn format_account_guard_error(msg: &str, provider_name: Option<&str>) -> Option<String> {
-    // Both providers wrap the eventual error string; the carina-provider-awscc
-    // path tags it with "Provider initialization failed:" before the
-    // shared "AWS account ID ..." sentence. Strip that prefix if present
-    // so the structured renderer doesn't have to special-case it.
-    let stripped = msg
-        .strip_prefix("Provider initialization failed: ")
-        .unwrap_or(msg)
-        .trim();
+    let stripped = msg.trim();
 
     let allowed = parse_account_guard_clause(stripped, "allowed_account_ids");
     let forbidden = parse_account_guard_clause(stripped, "forbidden_account_ids");
@@ -253,50 +271,38 @@ pub enum SavedPlanSecretVerificationError {
     #[error(
         "Saved-plan secret verification failed at {location}: the secret changed since the plan was created; re-run `{replan}`."
     )]
-    HashMismatch {
-        location: String,
-        replan: String,
-        #[source]
-        source: carina_core::value::SecretRehydrationSiteError,
-    },
+    HashMismatch { location: String, replan: String },
 
     #[error(
         "Saved-plan secret verification failed at {location}: the configuration changed and the recorded secret position no longer exists; re-run `{replan}`."
     )]
-    ConfigurationChanged {
-        location: String,
-        replan: String,
-        #[source]
-        source: carina_core::value::SecretRehydrationSiteError,
-    },
+    ConfigurationChanged { location: String, replan: String },
 
     #[error(
-        "Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs."
+        "Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs: {error}"
     )]
     EvaluationUnavailable {
         replan: String,
-        #[source]
-        source: Box<AppError>,
+        error: Box<AppError>,
     },
 
     #[error(
         "Saved-plan secret verification failed at {location}: the current secret could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs."
     )]
-    SecretEvaluationUnavailable {
-        location: String,
-        replan: String,
-        #[source]
-        source: carina_core::value::SecretRehydrationSiteError,
-    },
+    SecretEvaluationUnavailable { location: String, replan: String },
 
     #[error(
         "Saved-plan secret verification failed because orphan resource {resource} no longer exists; re-run `{replan}`."
     )]
-    OrphanVanished {
-        resource: String,
+    OrphanVanished { resource: String, replan: String },
+
+    #[error(
+        "Saved-plan secret verification failed at {location}: the current secret could not be encoded for verification: {error}; re-run `{replan}`."
+    )]
+    Serialization {
+        location: String,
         replan: String,
-        #[source]
-        source: carina_core::value::SecretRehydrationSiteError,
+        error: carina_core::value::SerializationError,
     },
 }
 
@@ -308,11 +314,10 @@ pub enum AppError {
     ResourceIdentity(#[from] carina_core::resource::ResourceIdentityError),
 
     /// A state-bucket argument was not a valid resource identity.
-    #[error("State bucket name '{bucket_name}' is not a valid resource identity: {source}")]
+    #[error("State bucket name '{bucket_name}' is not a valid resource identity: {error}")]
     InvalidStateBucketIdentity {
         bucket_name: String,
-        #[source]
-        source: carina_core::resource::ResourceIdentityError,
+        error: carina_core::resource::ResourceIdentityError,
     },
 
     /// Identity assignment was incomplete at a resolved-only pipeline boundary.
@@ -374,24 +379,23 @@ pub enum AppError {
 
     /// A parsed provider expression could not be evaluated.
     #[error("Provider attribute resolution error: {0}")]
-    ProviderAttributeResolution(#[source] Box<carina_core::parser::ParseError>),
+    ProviderAttributeResolution(Box<carina_core::parser::ParseError>),
 
     /// Provider resolution completed but left a value outside the resolved invariant.
     #[error("Provider configuration did not fully resolve: {0}")]
-    ProviderConfigInvariant(#[source] Box<carina_core::parser::ProviderConfigInvariantError>),
+    ProviderConfigInvariant(Box<carina_core::parser::ProviderConfigInvariantError>),
 
     /// An upstream needed by a provider construction attribute could not be loaded.
-    #[error("{source}; required by provider '{provider}' attribute '{attribute}'")]
+    #[error("{error}; required by provider '{provider}' attribute '{attribute}'")]
     ProviderReferencedUpstream {
         provider: String,
         attribute: String,
-        #[source]
-        source: Box<AppError>,
+        error: Box<AppError>,
     },
 
     /// A saved plan attempted to cross the provider boundary with unresolved config.
     #[error("Invalid provider config in saved plan: {0}")]
-    SavedProviderConfig(#[source] Box<carina_core::parser::ProviderConfigInvariantError>),
+    SavedProviderConfig(Box<carina_core::parser::ProviderConfigInvariantError>),
 
     /// A typed saved-plan secret verification failure with actionable cause.
     #[error(transparent)]
@@ -402,11 +406,8 @@ pub enum AppError {
     StateBucketPreparation(StateBucketPreparationError),
 
     /// The provider rejected state-backend bootstrap creation.
-    #[error("Failed to create state bucket: {source}")]
-    StateBucketCreate {
-        #[source]
-        source: ProviderError,
-    },
+    #[error("Failed to create state bucket: {error}")]
+    StateBucketCreate { error: ProviderError },
 
     /// Provider lock-file loading or constraint errors.
     #[error(transparent)]
@@ -422,69 +423,63 @@ pub enum AppError {
 
     /// The path passed to `apply` does not exist, so its input kind is unknown.
     #[error(
-        "Apply input '{}' does not exist.\n{}",
+        "Apply input '{}' does not exist.\n{}\nCause: {error}",
         path.display(),
         apply_input_expectation()
     )]
     ApplyInputNotFound {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 
     /// The path passed to `apply` is a symlink whose target does not exist.
     #[error(
-        "Apply input '{}' is a symbolic link whose target does not exist.\n{}",
+        "Apply input '{}' is a symbolic link whose target does not exist.\n{}\nCause: {error}",
         path.display(),
         apply_input_expectation()
     )]
     ApplyInputDanglingSymlink {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 
     /// The path passed to `apply` could not be inspected before dispatch.
-    #[error("Failed to inspect apply input '{}': {source}", path.display())]
+    #[error("Failed to inspect apply input '{}': {error}", path.display())]
     ApplyInputInspection {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 
     /// An existing file passed to `apply` was not a serialized Carina plan.
     #[error(
         "File '{}' is not a Carina plan file (or the plan file is corrupted).\n{}\n\
-         Detail: {source}",
+         Detail: {error}",
         path.display(),
         apply_input_expectation()
     )]
     InvalidPlanFile {
         path: PathBuf,
-        #[source]
-        source: serde_json::Error,
+        error: serde_json::Error,
     },
 
     /// A file passed to `apply` was not syntactically valid JSON.
     #[error(
         "File '{}' could not be parsed as JSON, so it is not a readable Carina plan file.\n{}\n{}\n\
-         JSON error: {source}",
+         JSON error: {error}",
         path.display(),
         unreadable_json_plan_guidance(),
         apply_input_expectation()
     )]
     UnreadableJsonPlanFile {
         path: PathBuf,
-        #[source]
-        source: serde_json::Error,
+        error: serde_json::Error,
     },
 
     /// A saved plan could not be read from the filesystem.
-    #[error("Failed to read plan file '{}': {source}", path.display())]
+    #[error("Failed to read plan file '{}': {error}", path.display())]
     PlanFileRead {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 
     /// A recognized saved plan uses a format version this binary cannot apply.
@@ -501,15 +496,14 @@ pub enum AppError {
 
     /// A recognized current-version plan had a malformed full body.
     #[error(
-        "Failed to parse plan file '{}': {source}\nThe plan file may be corrupted. {}",
+        "Failed to parse plan file '{}': {error}\nThe plan file may be corrupted. {}",
         path.display(),
         plan_file_recreation_guidance(replan_command.as_deref())
     )]
     CorruptPlanFile {
         path: PathBuf,
         replan_command: Option<String>,
-        #[source]
-        source: serde_json::Error,
+        error: serde_json::Error,
     },
 
     /// Apply completed with one or more partial create results.
@@ -659,84 +653,72 @@ mod tests {
     }
 
     #[test]
-    fn invalid_plan_file_preserves_serde_error_as_source() {
+    fn invalid_plan_file_renders_serde_error_once() {
         let source = serde_json::from_value::<Vec<serde_json::Value>>(serde_json::json!({}))
             .expect_err("fixture must not match the expected structure");
         let source_detail = source.to_string();
         let app_err = AppError::InvalidPlanFile {
             path: PathBuf::from("reviewed-plan"),
-            source,
+            error: source,
         };
 
-        assert!(
-            std::error::Error::source(&app_err)
-                .is_some_and(|source| source.downcast_ref::<serde_json::Error>().is_some()),
-            "serde error must remain available through the error source chain"
-        );
-        assert!(app_err.to_string().contains(&source_detail));
+        let rendered = app_err.to_string();
+        assert!(rendered.contains(&source_detail));
+        assert_eq!(rendered.matches(&source_detail).count(), 1);
+        assert!(std::error::Error::source(&app_err).is_none());
     }
 
     #[test]
-    fn unreadable_json_plan_file_preserves_serde_error_as_source() {
+    fn unreadable_json_plan_file_renders_serde_error_once() {
         let source = serde_json::from_str::<serde_json::Value>("not json")
             .expect_err("fixture must not be valid JSON");
         let source_detail = source.to_string();
         let app_err = AppError::UnreadableJsonPlanFile {
             path: PathBuf::from("truncated-plan"),
-            source,
+            error: source,
         };
 
-        assert!(
-            std::error::Error::source(&app_err)
-                .is_some_and(|source| source.downcast_ref::<serde_json::Error>().is_some()),
-            "serde error must remain available through the error source chain"
-        );
-        assert!(app_err.to_string().contains(&source_detail));
+        let rendered = app_err.to_string();
+        assert!(rendered.contains(&source_detail));
+        assert_eq!(rendered.matches(&source_detail).count(), 1);
+        assert!(std::error::Error::source(&app_err).is_none());
     }
 
     #[test]
-    fn dangling_apply_symlink_preserves_io_error_as_source() {
+    fn dangling_apply_symlink_renders_io_error_once() {
         let app_err = AppError::ApplyInputDanglingSymlink {
             path: PathBuf::from("dangling-plan"),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing target"),
+            error: std::io::Error::new(std::io::ErrorKind::NotFound, "missing target"),
         };
 
-        assert!(
-            std::error::Error::source(&app_err)
-                .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
-            "I/O error must remain available through the error source chain"
-        );
+        assert_eq!(app_err.to_string().matches("missing target").count(), 1);
+        assert!(std::error::Error::source(&app_err).is_none());
     }
 
     #[test]
-    fn plan_file_read_preserves_io_error_as_source() {
+    fn plan_file_read_renders_io_error_once() {
         let app_err = AppError::PlanFileRead {
             path: PathBuf::from("reviewed-plan"),
-            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
         };
 
-        assert!(
-            std::error::Error::source(&app_err)
-                .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
-            "I/O error must remain available through the error source chain"
-        );
+        assert_eq!(app_err.to_string().matches("denied").count(), 1);
+        assert!(std::error::Error::source(&app_err).is_none());
     }
 
     #[test]
-    fn corrupt_plan_file_preserves_serde_error_as_source() {
+    fn corrupt_plan_file_renders_serde_error_once() {
         let source = serde_json::from_value::<Vec<serde_json::Value>>(serde_json::json!({}))
             .expect_err("fixture must not match the expected structure");
         let app_err = AppError::CorruptPlanFile {
             path: PathBuf::from("reviewed-plan"),
             replan_command: Some("replan command".to_string()),
-            source,
+            error: source,
         };
 
-        assert!(
-            std::error::Error::source(&app_err)
-                .is_some_and(|source| source.downcast_ref::<serde_json::Error>().is_some()),
-            "serde error must remain available through the error source chain"
-        );
+        let rendered = app_err.to_string();
+        assert_eq!(rendered.matches("invalid type").count(), 1, "{rendered}");
+        assert!(std::error::Error::source(&app_err).is_none());
     }
 
     #[test]
@@ -747,11 +729,8 @@ mod tests {
 
     // -- account-guard formatter tests (#2407) --
 
-    /// The exact message shape produced by carina-provider-awscc's
-    /// `account_guard.rs::validate_account_against_lists` once it has
-    /// been wrapped by `CarinaProvider::initialize` with the
-    /// "Provider initialization failed: " prefix.
-    const AWSCC_ALLOWED_MISMATCH: &str = "Provider initialization failed: AWS account ID '019115212452' is not in the \
+    /// The exact account-guard shape produced by carina-provider-awscc.
+    const AWSCC_ALLOWED_MISMATCH: &str = "AWS account ID '019115212452' is not in the \
          provider's allowed_account_ids [\"151116838382\"]. Refusing to operate \
          against this account. Check the AWS credentials in your environment.";
 
@@ -803,7 +782,7 @@ mod tests {
 
     #[test]
     fn account_guard_formatter_recognizes_forbidden_mismatch() {
-        let msg = "Provider initialization failed: AWS account ID '019115212452' is listed \
+        let msg = "AWS account ID '019115212452' is listed \
                    in the provider's forbidden_account_ids [\"019115212452\"]. \
                    Refusing to operate against this account. \
                    Check the AWS credentials in your environment.";
@@ -821,8 +800,7 @@ mod tests {
         // Generic provider init failure (e.g. invalid region, missing
         // creds chain) MUST NOT be coerced into the structured shape —
         // callers fall back to the generic `Error: {msg}` rendering.
-        let msg = "Provider initialization failed: failed to load AWS credentials \
-                   from the environment";
+        let msg = "failed to load AWS credentials from the environment";
         assert!(format_account_guard_error(msg, Some("aws")).is_none());
     }
 

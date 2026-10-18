@@ -213,12 +213,11 @@ pub enum BackendAttributeError {
         backend_type: String,
         attribute: String,
     },
-    #[error("Invalid attribute '{attribute}' for backend type '{backend_type}': {source}")]
+    #[error("Invalid attribute '{attribute}' for backend type '{backend_type}': {error}")]
     InvalidAttribute {
         backend_type: String,
         attribute: String,
-        #[source]
-        source: Box<TypeError>,
+        error: Box<TypeError>,
     },
 }
 
@@ -297,20 +296,20 @@ fn canonicalize_attributes(
             attr_type,
         ) {
             Ok(canonical) => canonical,
-            Err(source) => {
+            Err(error) => {
                 errors.push(BackendAttributeError::InvalidAttribute {
                     backend_type: config.backend_type.clone(),
                     attribute: attribute.clone(),
-                    source: Box::new(source),
+                    error: Box::new(error),
                 });
                 continue;
             }
         };
-        if let Err(source) = schema_view.validate_attr(attr_type, &canonical) {
+        if let Err(error) = schema_view.validate_attr(attr_type, &canonical) {
             errors.push(BackendAttributeError::InvalidAttribute {
                 backend_type: config.backend_type.clone(),
                 attribute: attribute.clone(),
-                source: Box::new(source),
+                error: Box::new(error),
             });
             continue;
         }
@@ -329,7 +328,7 @@ fn invalid_resolved_shape(
     BackendAttributeError::InvalidAttribute {
         backend_type: backend_type.to_string(),
         attribute: attribute.to_string(),
-        source: Box::new(TypeError::TypeMismatch {
+        error: Box::new(TypeError::TypeMismatch {
             expected: expected.to_string(),
             got: value.type_name(),
         }),

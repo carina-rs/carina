@@ -276,21 +276,21 @@ fn classify_apply_input(path: &Path) -> Result<ApplyInput<'_>, error::AppError> 
     match path.metadata() {
         Ok(metadata) if metadata.is_dir() => Ok(ApplyInput::Project(path)),
         Ok(_) => Ok(ApplyInput::SavedPlan(path)),
-        Err(source) if source.kind() == ErrorKind::NotFound => match path.symlink_metadata() {
+        Err(error) if error.kind() == ErrorKind::NotFound => match path.symlink_metadata() {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Err(error::AppError::ApplyInputDanglingSymlink {
                     path: path.to_path_buf(),
-                    source,
+                    error,
                 })
             }
             _ => Err(error::AppError::ApplyInputNotFound {
                 path: path.to_path_buf(),
-                source,
+                error,
             }),
         },
-        Err(source) => Err(error::AppError::ApplyInputInspection {
+        Err(error) => Err(error::AppError::ApplyInputInspection {
             path: path.to_path_buf(),
-            source,
+            error,
         }),
     }
 }
@@ -587,9 +587,17 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
         },
         error::AppError::Provider(pe) => {
             let detail = pe.detail();
+            let rendered = pe.to_string();
             let body =
-                error::format_account_guard_error(&detail.message, detail.provider_name.as_deref())
-                    .unwrap_or_else(|| e.to_string());
+                error::format_account_guard_error(&rendered, detail.provider_name.as_deref())
+                    .unwrap_or_else(|| {
+                        match (detail.operation.as_deref(), detail.provider_name.as_deref()) {
+                            (Some("initialize"), Some(provider_name)) => {
+                                format!("Provider: {provider_name}\n{rendered}")
+                            }
+                            _ => rendered,
+                        }
+                    });
             AppErrorRendering {
                 stderr: format_error_lines(&body),
                 exit_code: 1,
@@ -656,7 +664,7 @@ mod error_format_tests {
     fn provider_account_guard_renders_structured_block() {
         colored::control::set_override(false);
         let pe = carina_core::provider::ProviderError::invalid_input(
-            "Provider initialization failed: AWS account ID '019115212452' \
+            "AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
              Refusing to operate against this account. \
              Check the AWS credentials in your environment.",
@@ -704,14 +712,48 @@ mod error_format_tests {
     }
 
     #[test]
+    fn decoded_provider_initialization_account_guard_renders_structured_block() {
+        colored::control::set_override(false);
+        const AWS_MESSAGE: &str = "AWS account ID 019115212452 is not in allowed_account_ids \
+            [\"151116838382\"]; refusing to operate against this account";
+        const AWSCC_MESSAGE: &str = "AWS account ID '019115212452' is not in the provider's \
+            allowed_account_ids [\"151116838382\"]. Refusing to operate against this account. \
+            Check the AWS credentials in your environment.";
+
+        for (provider_name, message) in [("aws", AWS_MESSAGE), ("awscc", AWSCC_MESSAGE)] {
+            let pe =
+                carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(message)
+                    // This is the wiring boundary used by both ordinary and
+                    // source-loaded provider construction.
+                    .for_provider(provider_name);
+            assert_eq!(pe.detail().operation.as_deref(), Some("initialize"));
+            let app_err: error::AppError = pe.into();
+            let rendered = render_app_error(&app_err);
+
+            assert!(
+                rendered.stderr.contains("AWS account mismatch"),
+                "decoded account-guard error was dropped for {provider_name}: {}",
+                rendered.stderr
+            );
+            assert!(
+                rendered
+                    .stderr
+                    .contains(&format!("Provider:    {provider_name}")),
+                "provider name was lost: {}",
+                rendered.stderr
+            );
+            assert!(rendered.stderr.contains("Actual:      019115212452"));
+        }
+    }
+
+    #[test]
     fn provider_non_account_guard_falls_back_to_plain_error() {
         // Generic provider init failures (invalid region, missing
         // credentials chain, etc.) must still be surfaced — just not
         // through the structured account-guard renderer.
         colored::control::set_override(false);
         let pe = carina_core::provider::ProviderError::invalid_input(
-            "Provider initialization failed: failed to load AWS credentials \
-             from the environment",
+            "failed to load AWS credentials from the environment",
         );
         let app_err: error::AppError = pe.into();
         let r = render_app_error(&app_err);
@@ -739,6 +781,40 @@ mod error_format_tests {
     }
 
     #[test]
+    fn decoded_provider_initialization_fallback_names_provider_and_phase() {
+        colored::control::set_override(false);
+        let pe = carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
+            "failed to load AWS credentials from the environment",
+        )
+        .for_provider("awscc");
+
+        let rendered = render_app_error(&error::AppError::Provider(pe));
+
+        assert_eq!(
+            rendered.stderr,
+            "Error: Provider: awscc\n\
+             Error: failed to load AWS credentials from the environment\n\
+             Error:   operation: initialize\n"
+        );
+    }
+
+    #[test]
+    fn non_initialization_provider_error_does_not_add_provider_header() {
+        colored::control::set_override(false);
+        let pe = carina_core::provider::ProviderError::invalid_input(
+            "failed to encode default tag for provider 'aws'",
+        )
+        .for_provider("aws");
+
+        let rendered = render_app_error(&error::AppError::Provider(pe));
+
+        assert_eq!(
+            rendered.stderr,
+            "Error: failed to encode default tag for provider 'aws'\n"
+        );
+    }
+
+    #[test]
     fn provider_account_guard_uses_attached_provider_name() {
         // When the wiring layer has attached a provider name via
         // ProviderError::for_provider, the structured renderer uses
@@ -746,7 +822,7 @@ mod error_format_tests {
         // mislabeling.
         colored::control::set_override(false);
         let pe = carina_core::provider::ProviderError::invalid_input(
-            "Provider initialization failed: AWS account ID '019115212452' \
+            "AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
              Refusing to operate against this account.",
         )

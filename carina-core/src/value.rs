@@ -176,11 +176,9 @@ pub enum SecretRehydrationError {
 }
 
 /// A rehydration failure annotated with its saved-plan location.
-#[derive(Debug, Error)]
-#[error("{location}: {source}")]
+#[derive(Debug)]
 pub struct SecretRehydrationSiteError {
     pub location: String,
-    #[source]
     pub source: SecretRehydrationError,
 }
 
@@ -192,6 +190,14 @@ impl SecretRehydrationSiteError {
         }
     }
 }
+
+impl std::fmt::Display for SecretRehydrationSiteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.location, self.source)
+    }
+}
+
+impl std::error::Error for SecretRehydrationSiteError {}
 
 impl std::fmt::Display for UnknownReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4082,27 +4088,26 @@ impl<'a> CanonicalizedResources<'a> {
 /// A desired value could not be resolved to the enum value declared by its
 /// resource or data-source schema.
 ///
-/// The structured [`crate::schema::TypeError`] remains the source so callers
-/// can inspect the resolver failure without parsing a rendered diagnostic.
+/// The structured [`crate::schema::TypeError`] is retained as typed data while
+/// this terminal diagnostic renders it exactly once.
 #[derive(Debug, Error)]
-#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {source}")]
+#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {error}")]
 pub struct EnumCanonicalizationError {
     resource: Box<crate::resource::ResourceId>,
     attribute: String,
-    #[source]
-    source: Box<crate::schema::TypeError>,
+    error: Box<crate::schema::TypeError>,
 }
 
 impl EnumCanonicalizationError {
     fn new(
         resource: crate::resource::ResourceId,
         attribute: impl Into<String>,
-        source: crate::schema::TypeError,
+        error: crate::schema::TypeError,
     ) -> Self {
         Self {
             resource: Box::new(resource),
             attribute: attribute.into(),
-            source: Box::new(source),
+            error: Box::new(error),
         }
     }
 
@@ -4112,6 +4117,11 @@ impl EnumCanonicalizationError {
 
     pub fn attribute(&self) -> &str {
         &self.attribute
+    }
+
+    /// Typed terminal reason for the canonicalization failure.
+    pub fn error(&self) -> &crate::schema::TypeError {
+        &self.error
     }
 }
 
@@ -4327,12 +4337,11 @@ pub fn canonicalize_provider_config_with_type(
 /// A provider configuration value could not be resolved through the
 /// provider-declared attribute type.
 #[derive(Debug, Error)]
-#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {source}")]
+#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {error}")]
 pub struct ProviderConfigCanonicalizationError {
     provider: String,
     attribute: String,
-    #[source]
-    source: Box<crate::schema::TypeError>,
+    error: Box<crate::schema::TypeError>,
 }
 
 impl ProviderConfigCanonicalizationError {
@@ -4344,8 +4353,13 @@ impl ProviderConfigCanonicalizationError {
         &self.attribute
     }
 
+    /// Typed terminal reason for the canonicalization failure.
+    pub fn error(&self) -> &crate::schema::TypeError {
+        &self.error
+    }
+
     pub(crate) fn into_parts(self) -> (String, String, crate::schema::TypeError) {
-        (self.provider, self.attribute, *self.source)
+        (self.provider, self.attribute, *self.error)
     }
 }
 
@@ -4362,18 +4376,18 @@ pub(crate) fn canonicalize_provider_config_attributes_with_types(
         let value = match attr_types.get(attribute) {
             Some(attr_type) => {
                 canonicalize_provider_config_with_type(provider_name, value.clone(), attr_type)
-                    .map_err(|source| ProviderConfigCanonicalizationError {
+                    .map_err(|error| ProviderConfigCanonicalizationError {
                         provider: provider_name.to_string(),
                         attribute: attribute.clone(),
-                        source: Box::new(source),
+                        error: Box::new(error),
                     })?
             }
             None => {
-                if let Some(source) = unresolved_enum_identifier_type_error_in(value) {
+                if let Some(error) = unresolved_enum_identifier_type_error_in(value) {
                     return Err(ProviderConfigCanonicalizationError {
                         provider: provider_name.to_string(),
                         attribute: attribute.clone(),
-                        source: Box::new(source),
+                        error: Box::new(error),
                     });
                 }
                 value.clone()
@@ -6150,12 +6164,12 @@ mod tests {
 
             let error = canonicalize_resources_with_schemas(&mut resources, &registry)
                 .expect_err("an unresolved enum must fail canonicalization");
+            let rendered = error.to_string();
 
-            assert!(error.to_string().contains(attribute), "{error}");
-            assert!(
-                std::error::Error::source(&error).is_some(),
-                "canonicalization errors must retain the resolver error source"
-            );
+            assert!(rendered.contains(attribute), "{rendered}");
+            let leaf = "test.widget.Mode.not_a_member";
+            assert_eq!(rendered.matches(leaf).count(), 1, "{rendered}");
+            assert!(std::error::Error::source(&error).is_none());
         }
     }
 

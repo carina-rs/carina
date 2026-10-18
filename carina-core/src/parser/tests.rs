@@ -4513,7 +4513,7 @@ fn state_block_address_rejects_interpolation() {
 }
 
 #[test]
-fn empty_removed_identity_reports_its_source_line_and_preserves_the_cause() {
+fn empty_removed_identity_reports_its_source_line_and_reason_once() {
     let input = r#"
 removed { from = mock.test.resource "" }
 "#;
@@ -4525,10 +4525,14 @@ removed { from = mock.test.resource "" }
         error.to_string(),
         "Invalid expression at line 2: resource identity cannot be empty"
     );
-    assert!(
-        std::error::Error::source(&error).is_some(),
-        "the typed ResourceIdentityError must remain in the source chain"
+    assert_eq!(
+        error
+            .to_string()
+            .matches("resource identity cannot be empty")
+            .count(),
+        1
     );
+    assert!(std::error::Error::source(&error).is_none());
 }
 
 #[test]

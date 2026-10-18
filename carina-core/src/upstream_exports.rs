@@ -1381,8 +1381,8 @@ mod tests {
 
     #[test]
     fn resolve_reports_parse_errors_for_broken_upstream() {
-        // A readable upstream whose .crn fails to parse must surface as a
-        // resolve error — otherwise downstream typos get silently masked.
+        // A readable upstream whose own main.crn fails to parse must surface as
+        // a resolve error — otherwise downstream typos get silently masked.
         let tmp = tempfile::tempdir().unwrap();
         let upstream_dir = tmp.path().join("organizations");
         fs::create_dir(&upstream_dir).unwrap();
@@ -1395,8 +1395,51 @@ mod tests {
         assert!(!got.contains_key("orgs"));
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].binding, "orgs");
-        assert!(errs[0].to_string().contains("orgs"));
-        assert!(errs[0].to_string().contains("organizations"));
+        let rendered = errs[0].to_string();
+        assert!(rendered.contains("orgs"), "{rendered}");
+        assert!(rendered.contains("organizations"), "{rendered}");
+        assert!(rendered.contains("Syntax error"), "{rendered}");
+        assert!(rendered.contains("--> 1:"), "{rendered}");
+        assert_eq!(
+            rendered.matches("--> 1:").count(),
+            1,
+            "pest location must appear exactly once: {rendered}"
+        );
+    }
+
+    #[test]
+    fn resolve_reports_parse_errors_for_broken_imported_module() {
+        // A readable upstream whose imported module fails to parse must
+        // preserve the ModuleError leaf through the String boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        let broken_module = upstream_dir.join("broken");
+        fs::create_dir(&broken_module).unwrap();
+        write_crn(
+            &upstream_dir,
+            "main.crn",
+            "let broken = use { source = './broken' }\nlet instance = broken {}\n",
+        );
+        write_crn(&broken_module, "main.crn", "let =\n");
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+
+        let (got, errs) =
+            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        assert!(!got.contains_key("orgs"));
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].binding, "orgs");
+        let rendered = errs[0].to_string();
+        assert!(rendered.contains("orgs"), "{rendered}");
+        assert!(rendered.contains("organizations"), "{rendered}");
+        assert!(rendered.contains("Syntax error"), "{rendered}");
+        assert!(rendered.contains("--> 1:"), "{rendered}");
+        assert_eq!(
+            rendered.matches("--> 1:").count(),
+            1,
+            "pest location must appear exactly once: {rendered}"
+        );
     }
 
     #[test]

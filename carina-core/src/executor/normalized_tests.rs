@@ -13,7 +13,6 @@ use crate::resource::{
     Value,
 };
 use crate::schema::SchemaRegistry;
-use crate::value::SerializationError;
 
 fn provider_config(default_tags: IndexMap<String, Value>) -> ProviderConfig {
     ProviderConfig {
@@ -89,7 +88,7 @@ async fn normalization_error_stops_later_stages() {
     .await
     .expect_err("normalizer error must propagate");
 
-    assert_eq!(error.message(), "normalization failed");
+    assert_eq!(error.to_string(), "normalization failed");
     assert!(
         resources[0].get_attr("tags").is_none(),
         "host default-tag merging must not run after a normalizer error"
@@ -126,17 +125,19 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
     .expect_err("a non-finite default tag must fail normalization");
 
     let rendered = error.to_string();
+    assert!(
+        rendered
+            .starts_with("failed to encode default tag: key 'InvalidNumber' of provider 'test': "),
+        "{rendered}"
+    );
     assert!(rendered.contains("provider 'test'"), "{rendered}");
     assert!(rendered.contains("InvalidNumber"), "{rendered}");
-    let source = std::error::Error::source(&error)
-        .expect("default-tag failure must retain its serialization source");
     assert!(
-        matches!(
-            source.downcast_ref::<SerializationError>(),
-            Some(SerializationError::NonFiniteFloat { value, .. }) if value.is_nan()
-        ),
-        "unexpected source: {source:?}"
+        error.detail().cause().is_some(),
+        "default-tag failure must retain its typed terminal cause"
     );
+    let leaf = "cannot serialize at WASM provider boundary: non-finite float NaN";
+    assert_eq!(rendered.matches(leaf).count(), 1, "{rendered}");
     assert_eq!(
         resources, original,
         "default-tag validation must finish before any resource is mutated"
@@ -161,12 +162,10 @@ async fn unresolved_enum_default_tag_fails_before_mutating_resources() {
     .await
     .expect_err("an unresolved enum default tag must not enter desired resources");
 
-    assert!(matches!(
-        std::error::Error::source(&error)
-            .and_then(|source| source.downcast_ref::<SerializationError>()),
-        Some(SerializationError::UnresolvedEnumIdentifier { value, .. })
-            if value == "test.Mode.allow"
-    ));
+    let rendered = error.to_string();
+    let leaf =
+        "cannot serialize at WASM provider boundary: unresolved enum identifier test.Mode.allow";
+    assert_eq!(rendered.matches(leaf).count(), 1, "{rendered}");
     assert_eq!(resources, original);
 }
 
@@ -425,7 +424,7 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
         .expect_err("guest strings must resolve by literal membership, never dotted shape");
 
     assert!(error.to_string().contains("test.thing.Mode.allow"));
-    assert!(std::error::Error::source(&error).is_some());
+    assert!(error.detail().cause().is_some());
 }
 
 #[tokio::test]

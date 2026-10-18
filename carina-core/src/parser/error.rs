@@ -9,8 +9,10 @@ pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted str
 /// Parse error
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    // A pest diagnostic is a terminal, already formatted leaf. Keep it in
+    // Display and do not expose it again through Error::source.
     #[error("Syntax error: {0}")]
-    Syntax(#[from] pest::error::Error<Rule>),
+    Syntax(pest::error::Error<Rule>),
 
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
@@ -42,11 +44,10 @@ pub enum ParseError {
     )]
     InterpolationNotAllowedInLiteralString { line: usize },
 
-    #[error("Invalid expression at line {line}: {source}")]
+    #[error("Invalid expression at line {line}: {error}")]
     InvalidResourceIdentity {
         line: usize,
-        #[source]
-        source: crate::resource::ResourceIdentityError,
+        error: crate::resource::ResourceIdentityError,
     },
 
     #[error("Undefined variable: {0}")]
@@ -89,6 +90,12 @@ pub enum ParseError {
 
     #[error("User-defined function error: {0}")]
     UserFunctionError(String),
+}
+
+impl From<pest::error::Error<Rule>> for ParseError {
+    fn from(error: pest::error::Error<Rule>) -> Self {
+        Self::Syntax(error)
+    }
 }
 
 fn format_cyclic_let_binding(chain: &[String]) -> String {

@@ -2346,7 +2346,7 @@ mod tests {
                     // Recreate the result since ProviderResult is not Clone
                     match &self.responses[idx] {
                         Ok(state) => Ok(state.clone()),
-                        Err(e) => Err(ProviderError::api_error(e.message().to_string())),
+                        Err(e) => Err(ProviderError::api_error(e.to_string())),
                     }
                 } else {
                     Ok(State::not_found(id))

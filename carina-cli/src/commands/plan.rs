@@ -1807,10 +1807,10 @@ async fn load_provider_referenced_upstream_states<E>(
             policy,
         )
         .await
-        .map_err(|source| AppError::ProviderReferencedUpstream {
+        .map_err(|error| AppError::ProviderReferencedUpstream {
             provider: required_by.provider,
             attribute: required_by.attribute,
-            source: Box::new(source),
+            error: Box::new(error),
         })?;
         remote_bindings.extend(loaded);
     }
@@ -2103,7 +2103,6 @@ async fn walk_upstream_cycles_only(
 #[cfg(test)]
 mod load_upstream_states_tests {
     use super::*;
-    use std::error::Error as _;
     use std::fs;
 
     fn write_state(dir: &Path, exports: &[(&str, serde_json::Value)]) {
@@ -2119,7 +2118,7 @@ mod load_upstream_states_tests {
     }
 
     #[tokio::test]
-    async fn provider_resolution_preserves_parse_error_source() {
+    async fn provider_resolution_preserves_complete_parse_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers.push(ProviderConfig {
@@ -2152,17 +2151,23 @@ mod load_upstream_states_tests {
             Err(error) => error,
         };
 
-        let source = error.source().expect("AppError must retain a source");
         assert!(
-            source
-                .downcast_ref::<Box<carina_core::parser::ParseError>>()
-                .is_some(),
-            "ParseError must remain in the AppError source chain: {error:?}"
+            matches!(&error, AppError::ProviderAttributeResolution(_)),
+            "ParseError must remain typed in AppError: {error:?}"
         );
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered
+                .matches("Unknown built-in function: no_such_provider_function")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[tokio::test]
-    async fn provider_resolution_preserves_invariant_error_source() {
+    async fn provider_resolution_preserves_complete_invariant_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers.push(ProviderConfig {
@@ -2193,13 +2198,9 @@ mod load_upstream_states_tests {
         };
 
         assert!(matches!(&error, AppError::ProviderConfigInvariant(_)));
-        let source = error.source().expect("AppError must retain a source");
-        assert!(
-            source
-                .downcast_ref::<Box<carina_core::parser::ProviderConfigInvariantError>>()
-                .is_some(),
-            "ProviderConfigInvariantError must remain in the AppError source chain: {error:?}"
-        );
+        let rendered = error.to_string();
+        assert_eq!(rendered.matches("missing.region").count(), 1, "{rendered}");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[tokio::test]

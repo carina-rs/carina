@@ -168,6 +168,27 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn load_module_from_directory_preserves_pest_syntax_diagnostic() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("broken.crn"), "let =\n").unwrap();
+
+        let error = load_module_from_directory(tmp.path())
+            .expect_err("invalid module syntax must fail to load");
+
+        assert!(error.contains("Syntax error"), "{error}");
+        assert!(error.contains("--> 1:"), "missing pest location: {error}");
+        assert_eq!(
+            error.matches("--> 1:").count(),
+            1,
+            "pest location must appear exactly once: {error}"
+        );
+        assert!(
+            error.contains("expected"),
+            "missing pest expectation: {error}"
+        );
+    }
+
     /// Loader is directory-scoped. Multi-file fixture asserts that sibling
     /// `.crn` files in the same module directory are merged into the
     /// returned `ParsedFile` — never read in isolation.
