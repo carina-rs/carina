@@ -143,7 +143,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     substitutions,
                     ArgumentSubstitutionPosition::Value,
                 )
-                .map_err(&contextualize_access_error)?;
+                .map_err(contextualize_access_error)?;
                 next.canonicalize_in_place();
                 let next_access = current
                     .access_base()
@@ -157,7 +157,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         Ok::<_, ArgumentSubstitutionError>(access_base)
                     })
                     .transpose()
-                    .map_err(&contextualize_access_error)?;
+                    .map_err(contextualize_access_error)?;
                 let next = ModuleArgument::from_parts(next, next_access);
                 if &next != current {
                     resolved_arguments.insert(arg.name.clone(), next);
@@ -301,7 +301,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     &intra_module_bindings,
                     argument_substitutions,
                 )
-                .map_err(&contextualize_access_error)?,
+                .map_err(contextualize_access_error)?,
             );
         }
 
@@ -317,7 +317,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     &intra_module_bindings,
                     argument_substitutions,
                 )
-                .map_err(&contextualize_access_error)?,
+                .map_err(contextualize_access_error)?,
             );
         }
 
@@ -351,7 +351,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     argument_substitutions,
                     &expanded_call,
                 )
-                .map_err(&contextualize_access_error)?,
+                .map_err(contextualize_access_error)?,
             );
         }
 
@@ -386,7 +386,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         argument_substitutions,
                         ArgumentSubstitutionPosition::Value,
                     )
-                    .map_err(&contextualize_access_error)?;
+                    .map_err(contextualize_access_error)?;
                     // Same post-substitution canonicalize as the
                     // resource-attribute path above (#2815 / #2817).
                     substituted.canonicalize_in_place();
@@ -472,7 +472,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 )
             })
             .collect::<Result<_, _>>()
-            .map_err(&contextualize_access_error)?;
+            .map_err(contextualize_access_error)?;
 
         // carina#3181: managed resources, data sources, and composition
         // resources are collected into separate typed `Vec`s above —
