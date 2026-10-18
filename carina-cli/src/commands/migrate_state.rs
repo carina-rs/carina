@@ -23,7 +23,10 @@ use colored::Colorize;
 
 #[cfg(test)]
 use carina_state::LocalBackend;
-use carina_state::{BackendLock, StateBackend, StateFile, anchored_local_path, create_backend};
+use carina_state::{
+    BackendConfig as StateBackendConfig, BackendLock, StateBackend, StateFile, anchored_local_path,
+    create_backend,
+};
 
 use crate::error::AppError;
 use carina_core::hint::ProjectCommand;
@@ -184,7 +187,8 @@ pub async fn run_init_migrate_state(
     );
     println!("{}", locked.describe_diff(&configured));
 
-    let locked_config = locked.to_state_config();
+    let locked_config = locked.to_state_config()?;
+    let configured_state_config = configured.to_state_config()?;
 
     // Both addresses are reconstructed from the *locked* / *configured*
     // snapshots, so a relative local `path` must be anchored at the
@@ -193,7 +197,7 @@ pub async fn run_init_migrate_state(
     let source = create_backend(Some(&locked_config), project_dir)
         .await
         .map_err(AppError::Backend)?;
-    let target = create_backend(Some(&configured.to_state_config()), project_dir)
+    let target = create_backend(Some(&configured_state_config), project_dir)
         .await
         .map_err(AppError::Backend)?;
 
@@ -226,8 +230,8 @@ pub async fn run_init_migrate_state(
     // (remote → remote in this scope). A failure to delete here is *not*
     // fatal: the migration already committed, so a leftover old file is
     // harmless and the next run is a no-op.
-    let source = if locked.is_local() {
-        let path = anchored_local_path(&locked_config, project_dir);
+    let source = if let StateBackendConfig::Local(local_settings) = &locked_config {
+        let path = anchored_local_path(local_settings, project_dir);
         if !path.exists() {
             SourceDisposition::Deleted
         } else {

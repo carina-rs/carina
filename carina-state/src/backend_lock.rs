@@ -13,9 +13,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use carina_core::hint::ProjectCommand;
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackendConfig, BackendError, BackendResult};
+use crate::backend::{BackendError, BackendResult, LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
+use crate::backend_config::BackendConfig;
 
 /// Name of the lock file at the project root.
 pub const LOCK_FILE: &str = "carina-backend.lock";
@@ -27,36 +29,68 @@ const LEGACY_LOCK_FILE: &str = "backend-lock.json";
 /// Snapshot of the backend configuration that was last used for a given
 /// configuration root. Persisted to disk as JSON.
 ///
-/// Attribute values are stored as `serde_json::Value` so that any DSL
-/// type can be serialized (strings, bools, numbers). Keys are sorted in
-/// a `BTreeMap` so the serialized form is deterministic regardless of
-/// `HashMap` iteration order.
+/// Attribute values are stored as strings and bools after typed backend
+/// resolution. Keys are sorted in a `BTreeMap` so the serialized form is
+/// deterministic regardless of parser-map iteration order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendLock {
     /// Backend type identifier (e.g., `"s3"`, `"local"`).
-    pub backend_type: String,
+    backend_type: String,
     /// Sorted snapshot of backend attributes for stable comparison.
-    pub attributes: BTreeMap<String, serde_json::Value>,
+    attributes: BTreeMap<String, serde_json::Value>,
 }
 
 impl BackendLock {
-    /// Build a lock snapshot from the current backend configuration.
-    ///
-    /// Returns `Err` if any backend attribute holds a `Value::Deferred(DeferredValue::Unknown)`
-    /// — backend configurations cannot reference unresolved upstream
-    /// values (RFC #2371 stage 4).
-    pub fn from_config(
-        config: &BackendConfig,
-    ) -> Result<Self, carina_core::value::SerializationError> {
-        let attributes = config
-            .attributes
-            .iter()
-            .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        Ok(Self {
-            backend_type: config.backend_type.clone(),
+    /// Build a lock snapshot directly from a typed backend configuration.
+    /// Enum values use canonical API spelling, and optional attributes are
+    /// included only when explicitly configured.
+    pub fn from_config(config: &BackendConfig) -> Self {
+        let (backend_type, attributes) = match config {
+            BackendConfig::S3(settings) => {
+                let mut attributes = BTreeMap::from([
+                    (
+                        "bucket".to_string(),
+                        serde_json::Value::String(settings.bucket().to_string()),
+                    ),
+                    (
+                        "key".to_string(),
+                        serde_json::Value::String(settings.key().to_string()),
+                    ),
+                ]);
+                if let Some(region) = settings.region() {
+                    attributes.insert(
+                        "region".to_string(),
+                        serde_json::Value::String(region.to_string()),
+                    );
+                }
+                if let Some(encrypt) = settings.authored_encrypt() {
+                    attributes.insert("encrypt".to_string(), serde_json::Value::Bool(encrypt));
+                }
+                if let Some(auto_create) = settings.authored_auto_create() {
+                    attributes.insert(
+                        "auto_create".to_string(),
+                        serde_json::Value::Bool(auto_create),
+                    );
+                }
+                (S3_BACKEND_TYPE, attributes)
+            }
+            BackendConfig::Local(settings) => {
+                let attributes = settings
+                    .path()
+                    .map(|path| {
+                        BTreeMap::from([(
+                            "path".to_string(),
+                            serde_json::Value::String(path.to_string()),
+                        )])
+                    })
+                    .unwrap_or_default();
+                (LOCAL_BACKEND_TYPE, attributes)
+            }
+        };
+        Self {
+            backend_type: backend_type.to_string(),
             attributes,
-        })
+        }
     }
 
     /// Build a lock snapshot representing the implicit local backend that
@@ -64,7 +98,7 @@ impl BackendLock {
     /// inspection to detect local → remote transitions.
     pub fn local_default() -> Self {
         Self {
-            backend_type: crate::backend::LOCAL_BACKEND_TYPE.to_string(),
+            backend_type: LOCAL_BACKEND_TYPE.to_string(),
             attributes: BTreeMap::new(),
         }
     }
@@ -78,16 +112,13 @@ impl BackendLock {
     /// cannot disagree.
     pub fn for_config(
         backend_config: Option<&carina_core::parser::BackendConfig>,
-    ) -> Result<Self, carina_core::value::SerializationError> {
+    ) -> BackendResult<Self> {
         match backend_config {
-            Some(cfg) => Self::from_config(&BackendConfig::from(cfg)),
+            Some(cfg) => BackendConfig::try_from(cfg)
+                .map(|config| Self::from_config(&config))
+                .map_err(BackendError::from),
             None => Ok(Self::local_default()),
         }
-    }
-
-    /// Whether this lock describes the local backend.
-    pub fn is_local(&self) -> bool {
-        self.backend_type == crate::backend::LOCAL_BACKEND_TYPE
     }
 
     /// Path to the lock file under `base_dir` (project root).
@@ -105,17 +136,17 @@ impl BackendLock {
     pub fn load(base_dir: &Path) -> BackendResult<Option<Self>> {
         let path = Self::lock_path(base_dir);
         if path.exists() {
-            return Self::load_from(&path);
+            return Self::load_from(&path, base_dir);
         }
         // Migration: try legacy path
         let legacy = Self::legacy_lock_path(base_dir);
         if legacy.exists() {
-            return Self::load_from(&legacy);
+            return Self::load_from(&legacy, base_dir);
         }
         Ok(None)
     }
 
-    fn load_from(path: &Path) -> BackendResult<Option<Self>> {
+    fn load_from(path: &Path, project_dir: &Path) -> BackendResult<Option<Self>> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| BackendError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
         let lock: Self = serde_json::from_str(&contents).map_err(|e| {
@@ -125,7 +156,13 @@ impl BackendLock {
                 e
             ))
         })?;
-        Ok(Some(lock))
+        // A syntactically valid JSON lock must still describe a configuration
+        // accepted by the current typed backend schema. Validate eagerly so a
+        // corrupt or obsolete address cannot participate in drift comparison.
+        let config = lock
+            .to_state_config()
+            .map_err(|error| unreadable_backend_address(path, project_dir, error))?;
+        Ok(Some(Self::from_config(&config)))
     }
 
     /// Persist this lock snapshot at the project root.
@@ -140,57 +177,39 @@ impl BackendLock {
 
     /// Reconstruct a runtime [`BackendConfig`] from this locked snapshot.
     ///
-    /// This is the inverse of [`from_config`]'s `value_to_json` step: it
-    /// is used by the `init --migrate-state` path to open the *old*
-    /// backend (the address recorded in `carina-backend.lock`) so its
-    /// state can be read and copied to the newly configured backend.
-    ///
-    /// Fidelity contract: every backend attribute that any backend
-    /// actually *reads* is a string or a bool (`bucket` / `key` /
-    /// `region` / `path` via `get_string`; `encrypt` / `auto_create` /
-    /// `use_lockfile` via `get_bool`). Those round-trip exactly, so the
-    /// reconstructed *source address* is always faithful. `from_config`
-    /// also accepts integers/durations (collapsed to a JSON number) and
-    /// writes `null` for anything else; numbers are reconstructed as
-    /// `Int` best-effort (an out-of-`i64` value falls back to its `f64`
-    /// truncation rather than being dropped — totality matters more than
-    /// precision for an attribute no backend consumes), and `null`
-    /// reconstructs as `Bool(false)` (an arbitrary non-dropping
-    /// placeholder; no backend reads a null-valued attribute). Crucially,
-    /// **no key is ever dropped**: a silently-missing attribute could
-    /// re-address the migration source, so the map is preserved
-    /// key-for-key.
+    /// It is used by `init --migrate-state` to open the *old* backend (the
+    /// address recorded in `carina-backend.lock`). JSON strings and bools are
+    /// fed back through the same resolver as authored DSL. Any other JSON
+    /// shape, unknown attribute, wrong type, or missing required attribute is
+    /// an error rather than a guessed placeholder.
     ///
     /// [`from_config`]: BackendLock::from_config
-    pub fn to_state_config(&self) -> BackendConfig {
+    pub fn to_state_config(&self) -> BackendResult<BackendConfig> {
         use carina_core::resource::{ConcreteValue, Value};
         let attributes = self
             .attributes
             .iter()
-            .map(|(k, v)| {
-                let value = match v {
+            .map(|(key, value)| {
+                let value = match value {
                     serde_json::Value::String(s) => {
                         Value::Concrete(ConcreteValue::String(s.clone().into()))
                     }
                     serde_json::Value::Bool(b) => Value::Concrete(ConcreteValue::Bool(*b)),
-                    serde_json::Value::Number(n) => Value::Concrete(ConcreteValue::Int(
-                        n.as_i64()
-                            .unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
-                    )),
-                    // `value_to_json` writes `null` only as its lossy
-                    // fallback for non-scalar attributes (which no
-                    // backend reads); keep the key so the address shape
-                    // is preserved rather than silently shrinking it.
-                    serde_json::Value::Null => Value::Concrete(ConcreteValue::Bool(false)),
-                    other => Value::Concrete(ConcreteValue::String(other.to_string().into())),
+                    other => {
+                        return Err(BackendError::Serialization(format!(
+                            "Invalid backend lock attribute '{key}': expected a string or bool, got {other}"
+                        )));
+                    }
                 };
-                (k.clone(), value)
+                Ok((key.clone(), value))
             })
-            .collect();
-        BackendConfig {
+            .collect::<BackendResult<_>>()?;
+        let raw = carina_core::parser::BackendConfig {
             backend_type: self.backend_type.clone(),
             attributes,
-        }
+            attribute_spans: Default::default(),
+        };
+        BackendConfig::try_from(&raw).map_err(BackendError::from)
     }
 
     /// Produce a human-readable diff description for error messages.
@@ -223,32 +242,23 @@ impl BackendLock {
     }
 }
 
-/// Convert a `carina_core::resource::Value` into a `serde_json::Value`
-/// for persistence in the lock file. Only scalar types are expected in
-/// backend configurations; complex types fall back to `null`. A
-/// `Value::Deferred(DeferredValue::Unknown)` produces `Err` because backend configurations
-/// cannot reference unresolved upstream values.
-fn value_to_json(
-    value: &carina_core::resource::Value,
-) -> Result<serde_json::Value, carina_core::value::SerializationError> {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-    use carina_core::value::{SerializationContext, SerializationError};
-    match value {
-        Value::Concrete(ConcreteValue::String(s)) => {
-            Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
-        }
-        Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
-        Value::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
-        Value::Concrete(ConcreteValue::Duration(d)) => {
-            Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
-        }
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
-                context: SerializationContext::BackendLock,
-            })
-        }
-        _ => Ok(serde_json::Value::Null),
+fn unreadable_backend_address(
+    path: &Path,
+    project_dir: &Path,
+    error: BackendError,
+) -> BackendError {
+    let detail = error.to_string();
+    let init_command = ProjectCommand::new("init", project_dir);
+    let message = format!(
+        "Backend lock at {} records a backend address this release cannot read: {detail}. \
+         To recover, verify the backend block, then delete `{}` and run `{init_command}` \
+         to record it again.",
+        path.display(),
+        path.display(),
+    );
+    BackendError::UnreadableBackendAddress {
+        message,
+        error: Box::new(error),
     }
 }
 
@@ -258,27 +268,40 @@ mod tests {
     use carina_core::resource::{ConcreteValue, Value};
     use std::collections::HashMap;
 
-    fn make_config(bucket: &str, region: &str) -> BackendConfig {
-        let mut attributes = HashMap::new();
-        attributes.insert(
-            "bucket".to_string(),
-            Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
-        );
-        attributes.insert(
-            "region".to_string(),
-            Value::Concrete(ConcreteValue::String(region.to_string().into())),
-        );
-        BackendConfig {
-            backend_type: "s3".to_string(),
+    fn resolve(backend_type: &str, attributes: HashMap<String, Value>) -> BackendConfig {
+        let raw = carina_core::parser::BackendConfig {
+            backend_type: backend_type.to_string(),
             attributes,
-        }
+            attribute_spans: HashMap::new(),
+        };
+        BackendConfig::try_from(&raw).unwrap()
+    }
+
+    fn make_config(bucket: &str, region: &str) -> BackendConfig {
+        resolve(
+            S3_BACKEND_TYPE,
+            HashMap::from([
+                (
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
+                ),
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("state.json".into())),
+                ),
+                (
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::String(region.to_string().into())),
+                ),
+            ]),
+        )
     }
 
     #[test]
     fn from_config_captures_type_and_attributes() {
         let config = make_config("my-bucket", "us-east-1");
-        let lock = BackendLock::from_config(&config).unwrap();
-        assert_eq!(lock.backend_type, "s3");
+        let lock = BackendLock::from_config(&config);
+        assert_eq!(lock.backend_type, S3_BACKEND_TYPE);
         assert_eq!(
             lock.attributes.get("bucket"),
             Some(&serde_json::Value::String("my-bucket".to_string()))
@@ -288,7 +311,7 @@ mod tests {
     #[test]
     fn lock_roundtrip_via_disk() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
         lock.save(tmp.path()).unwrap();
         let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
         assert_eq!(lock, loaded);
@@ -303,7 +326,7 @@ mod tests {
     #[test]
     fn lock_saves_to_project_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
         lock.save(tmp.path()).unwrap();
         // Should be at root, not in .carina/
         assert!(tmp.path().join("carina-backend.lock").exists());
@@ -315,7 +338,7 @@ mod tests {
     #[test]
     fn lock_file_ends_with_trailing_newline() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
         lock.save(tmp.path()).unwrap();
         let bytes = std::fs::read(tmp.path().join("carina-backend.lock")).unwrap();
         assert_eq!(
@@ -329,7 +352,7 @@ mod tests {
     #[test]
     fn load_migrates_from_legacy_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
         // Write to legacy path
         let legacy_dir = tmp.path().join(".carina");
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -343,8 +366,8 @@ mod tests {
     #[test]
     fn new_path_takes_precedence_over_legacy() {
         let tmp = tempfile::tempdir().unwrap();
-        let old_lock = BackendLock::from_config(&make_config("old-bucket", "us-east-1")).unwrap();
-        let new_lock = BackendLock::from_config(&make_config("new-bucket", "us-east-1")).unwrap();
+        let old_lock = BackendLock::from_config(&make_config("old-bucket", "us-east-1"));
+        let new_lock = BackendLock::from_config(&make_config("new-bucket", "us-east-1"));
         // Write old to legacy, new to root
         let legacy_dir = tmp.path().join(".carina");
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -361,8 +384,8 @@ mod tests {
 
     #[test]
     fn detects_bucket_change() {
-        let a = BackendLock::from_config(&make_config("old-bucket", "us-east-1")).unwrap();
-        let b = BackendLock::from_config(&make_config("new-bucket", "us-east-1")).unwrap();
+        let a = BackendLock::from_config(&make_config("old-bucket", "us-east-1"));
+        let b = BackendLock::from_config(&make_config("new-bucket", "us-east-1"));
         assert_ne!(a, b);
         let diff = a.describe_diff(&b);
         assert!(diff.contains("bucket"));
@@ -372,8 +395,8 @@ mod tests {
 
     #[test]
     fn equal_configs_do_not_differ() {
-        let a = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
-        let b = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        let a = BackendLock::from_config(&make_config("b", "us-east-1"));
+        let b = BackendLock::from_config(&make_config("b", "us-east-1"));
         assert_eq!(a, b);
     }
 
@@ -382,133 +405,239 @@ mod tests {
         // A locked remote backend must be reconstructible into a
         // `StateBackendConfig` so the migration path can read the OLD
         // state from the address recorded in the lock.
-        let lock = BackendLock::from_config(&make_config("old-bucket", "us-east-1")).unwrap();
-        let cfg = lock.to_state_config();
-        assert_eq!(cfg.backend_type, "s3");
-        assert_eq!(cfg.get_string("bucket"), Some("old-bucket"));
-        assert_eq!(cfg.get_string("region"), Some("us-east-1"));
+        let original = make_config("old-bucket", "us-east-1");
+        let lock = BackendLock::from_config(&original);
+        let cfg = lock.to_state_config().unwrap();
+        assert_eq!(cfg, original);
     }
 
     #[test]
-    fn to_state_config_preserves_bool_and_int() {
-        let mut attributes = HashMap::new();
-        attributes.insert(
-            "bucket".to_string(),
-            Value::Concrete(ConcreteValue::String("b".into())),
+    fn enum_region_is_locked_in_api_spelling_and_roundtrips() {
+        let config = resolve(
+            S3_BACKEND_TYPE,
+            HashMap::from([
+                (
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String("b".into())),
+                ),
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("state.json".into())),
+                ),
+                (
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::enum_identifier("aws.Region.us_west_2")),
+                ),
+            ]),
         );
-        attributes.insert(
-            "use_lockfile".to_string(),
-            Value::Concrete(ConcreteValue::Bool(true)),
+        let lock = BackendLock::from_config(&config);
+        assert_eq!(
+            lock.attributes.get("region"),
+            Some(&serde_json::Value::String("us-west-2".to_string()))
         );
-        attributes.insert(
-            "max_retries".to_string(),
-            Value::Concrete(ConcreteValue::Int(7)),
-        );
-        let config = BackendConfig {
-            backend_type: "s3".to_string(),
-            attributes,
-        };
-        let lock = BackendLock::from_config(&config).unwrap();
-        let cfg = lock.to_state_config();
-        assert_eq!(cfg.get_string("bucket"), Some("b"));
-        assert_eq!(cfg.get_bool("use_lockfile"), Some(true));
-        assert!(matches!(
-            cfg.attributes.get("max_retries"),
-            Some(Value::Concrete(ConcreteValue::Int(7)))
-        ));
+        assert_eq!(lock.to_state_config().unwrap(), config);
     }
 
     #[test]
     fn to_state_config_of_local_default_is_local() {
-        let cfg = BackendLock::local_default().to_state_config();
-        assert_eq!(cfg.backend_type, "local");
-        assert!(cfg.attributes.is_empty());
+        let cfg = BackendLock::local_default().to_state_config().unwrap();
+        assert!(matches!(cfg, BackendConfig::Local(_)));
     }
 
-    /// `from_config` collapses a `Duration` attribute to a JSON number;
-    /// the inverse cannot tell it apart from an `Int` (no backend reads
-    /// either, so this is acceptable) — but it must still preserve the
-    /// real string address attributes around it and never drop the key.
     #[test]
-    fn to_state_config_duration_does_not_corrupt_sibling_address() {
-        use std::time::Duration;
-        let mut attributes = HashMap::new();
-        attributes.insert(
-            "bucket".to_string(),
-            Value::Concrete(ConcreteValue::String("real-bucket".into())),
+    fn explicitly_configured_bools_keep_the_existing_lock_shape() {
+        let config = resolve(
+            S3_BACKEND_TYPE,
+            HashMap::from([
+                (
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String("b".into())),
+                ),
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("state.json".into())),
+                ),
+                (
+                    "encrypt".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(false)),
+                ),
+                (
+                    "auto_create".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                ),
+            ]),
         );
-        attributes.insert(
-            "ttl".to_string(),
-            Value::Concrete(ConcreteValue::Duration(Duration::from_secs(42))),
+        let lock = BackendLock::from_config(&config);
+        assert_eq!(
+            lock.attributes.get("encrypt"),
+            Some(&serde_json::Value::Bool(false))
         );
-        let config = BackendConfig {
-            backend_type: "s3".to_string(),
-            attributes,
-        };
-        let cfg = BackendLock::from_config(&config).unwrap().to_state_config();
-        // The address attribute the backend actually reads is intact.
-        assert_eq!(cfg.get_string("bucket"), Some("real-bucket"));
-        // The duration key survives (as an Int) — not silently dropped.
-        assert!(
-            cfg.attributes.contains_key("ttl"),
-            "no attribute key may be dropped on reconstruction"
+        assert_eq!(
+            lock.attributes.get("auto_create"),
+            Some(&serde_json::Value::Bool(true))
         );
+        assert_eq!(lock.to_state_config().unwrap(), config);
     }
 
-    /// A JSON number outside `i64` range must not drop the key (which
-    /// would re-address the migration source); totality over precision.
     #[test]
-    fn to_state_config_large_number_keeps_key() {
-        let mut lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
-        lock.attributes.insert(
-            "huge".to_string(),
-            serde_json::Value::Number(serde_json::Number::from_f64(1e30).unwrap()),
+    fn omitted_default_bools_remain_omitted_from_lock() {
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
+        assert!(!lock.attributes.contains_key("encrypt"));
+        assert!(!lock.attributes.contains_key("auto_create"));
+        let settings = lock.to_state_config().unwrap();
+        let settings = settings.as_s3().unwrap();
+        assert!(settings.encrypt());
+        assert!(settings.auto_create());
+    }
+
+    #[test]
+    fn load_normalizes_valid_plain_string_and_bool_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "backend_type": S3_BACKEND_TYPE,
+            "attributes": {
+                "bucket": "b",
+                "key": "state.json",
+                "region": "us_west_2",
+                "encrypt": false,
+                "auto_create": true
+            }
+        });
+        std::fs::write(
+            BackendLock::lock_path(tmp.path()),
+            serde_json::to_string(&raw).unwrap(),
+        )
+        .unwrap();
+        let expected_config = resolve(
+            S3_BACKEND_TYPE,
+            HashMap::from([
+                (
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String("b".into())),
+                ),
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("state.json".into())),
+                ),
+                (
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::String("us_west_2".into())),
+                ),
+                (
+                    "encrypt".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(false)),
+                ),
+                (
+                    "auto_create".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                ),
+            ]),
         );
-        lock.attributes
-            .insert("weird".to_string(), serde_json::Value::Null);
-        let cfg = lock.to_state_config();
-        assert_eq!(cfg.attributes.len(), lock.attributes.len());
-        assert!(cfg.attributes.contains_key("huge"));
-        assert!(cfg.attributes.contains_key("weird"));
-        // The genuine address attributes still round-trip exactly.
-        assert_eq!(cfg.get_string("bucket"), Some("b"));
-        assert_eq!(cfg.get_string("region"), Some("us-east-1"));
+
+        let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
+
+        assert_eq!(loaded, BackendLock::from_config(&expected_config));
     }
 
     #[test]
     fn local_default_differs_from_remote() {
         let local = BackendLock::local_default();
-        assert_eq!(local.backend_type, "local");
+        assert_eq!(local.backend_type, LOCAL_BACKEND_TYPE);
         assert!(local.attributes.is_empty());
-        let s3 = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        let s3 = BackendLock::from_config(&make_config("b", "us-east-1"));
         assert_ne!(local, s3);
         let diff = local.describe_diff(&s3);
         assert!(diff.contains("backend type"));
-        assert!(diff.contains("local"));
-        assert!(diff.contains("s3"));
+        assert!(diff.contains(LOCAL_BACKEND_TYPE));
+        assert!(diff.contains(S3_BACKEND_TYPE));
     }
 
-    /// RFC #2371 stage 4 contract pin: `value_to_json` returns
-    /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Deferred(DeferredValue::Unknown)`.
-    /// Backend lock files must never carry the variant (constraint b);
-    /// a silent fallback would re-introduce v1-style corruption.
     #[test]
-    fn unknown_returns_err_in_value_to_json() {
-        use carina_core::resource::{AccessPath, DeferredValue, UnknownReason, Value};
-        use carina_core::value::{SerializationContext, SerializationError};
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
-            path: path.clone(),
-        }));
-        let err = value_to_json(&v).unwrap_err();
-        match err {
-            SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamRef { path: p },
-                context: SerializationContext::BackendLock,
-            } => {
-                assert_eq!(p, path);
+    fn null_lock_value_is_not_coerced_to_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "backend_type": S3_BACKEND_TYPE,
+            "attributes": {
+                "bucket": "b",
+                "key": "state.json",
+                "encrypt": null
             }
-            other => panic!("expected UnknownNotAllowed/UpstreamRef/BackendLock, got: {other:?}"),
-        }
+        });
+        std::fs::write(
+            BackendLock::lock_path(tmp.path()),
+            serde_json::to_string(&raw).unwrap(),
+        )
+        .unwrap();
+        let error = BackendLock::load(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("encrypt"), "{error}");
+        assert!(error.to_string().contains("string or bool"), "{error}");
+    }
+
+    #[test]
+    fn obsolete_enum_region_lock_is_rejected_with_recovery_guidance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = BackendLock::lock_path(tmp.path());
+        let raw = serde_json::json!({
+            "backend_type": S3_BACKEND_TYPE,
+            "attributes": {
+                "bucket": "b",
+                "key": "state.json",
+                "region": null
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+        let error = BackendLock::load(tmp.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("region"), "{message}");
+        assert!(
+            message.contains("records a backend address this release cannot read"),
+            "{message}"
+        );
+        assert!(message.contains("verify the backend block"), "{message}");
+        assert!(
+            message.contains(&format!("delete `{}`", path.display())),
+            "{message}"
+        );
+        let init_command = ProjectCommand::new("init", tmp.path()).to_string();
+        assert!(
+            message.contains(&format!("run `{init_command}` to record it again")),
+            "{message}"
+        );
+        let BackendError::UnreadableBackendAddress {
+            error: inner_error, ..
+        } = &error
+        else {
+            panic!("invalid lock must retain its typed inner error, got {error:?}");
+        };
+        assert!(matches!(
+            inner_error.as_ref(),
+            BackendError::Serialization(_)
+        ));
+        assert_eq!(message.matches("Invalid backend lock attribute").count(), 1);
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn obsolete_legacy_lock_guidance_names_the_legacy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = BackendLock::legacy_lock_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!({
+            "backend_type": S3_BACKEND_TYPE,
+            "attributes": {
+                "bucket": "b",
+                "key": "state.json",
+                "region": null
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+        let error = BackendLock::load(tmp.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("delete `{}`", path.display())),
+            "guidance must name the lock that failed: {message}"
+        );
     }
 }

@@ -199,7 +199,7 @@ fn state_block_and_backend_in_one_module_are_both_reported() {
 }
 
 #[test]
-fn root_arguments_with_backend_report_only_the_arguments_rule() {
+fn directly_validated_module_with_backend_reports_only_the_backend_rule() {
     let temp = tempfile::tempdir().expect("tempdir");
     write(
         temp.path(),
@@ -217,17 +217,17 @@ fn root_arguments_with_backend_report_only_the_arguments_rule() {
     assert_eq!(
         diagnostics.len(),
         1,
-        "carina#2198 must remain a single root-arguments diagnostic: {diagnostics:#?}",
+        "the structural backend-in-module error must suppress secondary diagnostics: {diagnostics:#?}",
     );
     assert!(
-        diagnostics[0].contains("arguments blocks are only valid inside module definitions"),
-        "the existing root-arguments rule must win: {diagnostics:#?}",
+        diagnostics[0].contains(RULE),
+        "the backend-in-module rule must win: {diagnostics:#?}",
     );
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| !diagnostic.contains(RULE)),
-        "root validation must not apply the module-only backend rule: {diagnostics:#?}",
+            .all(|diagnostic| !diagnostic.contains("arguments blocks are only valid")),
+        "the root-arguments rule must not double-report: {diagnostics:#?}",
     );
 }
 

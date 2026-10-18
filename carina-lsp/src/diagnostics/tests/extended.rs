@@ -8,6 +8,254 @@ const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is d
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
+fn backend_directory_diagnostics(source: &str) -> Vec<Diagnostic> {
+    backend_directory_diagnostics_with_sibling("\n", source)
+}
+
+fn backend_directory_diagnostics_with_sibling(
+    sibling_source: &str,
+    backend_source: &str,
+) -> Vec<Diagnostic> {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("main.crn"), sibling_source).unwrap();
+    std::fs::write(fixture.path().join("backend.crn"), backend_source).unwrap();
+    test_engine().analyze_with_filename(
+        &create_document(backend_source),
+        Some("backend.crn"),
+        Some(fixture.path()),
+    )
+}
+
+fn assert_backend_typo_is_diagnosed(sibling_source: &str, backend_source: &str) {
+    let closing_brace = backend_source
+        .rfind('}')
+        .expect("backend fixture must have a closing brace");
+    let backend_with_typo = format!(
+        "{}  typo = true\n{}",
+        &backend_source[..closing_brace],
+        &backend_source[closing_brace..]
+    );
+    let diagnostics =
+        backend_directory_diagnostics_with_sibling(sibling_source, &backend_with_typo);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Unknown attribute 'typo'")),
+        "positive-control diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn backend_schema_diagnostics_are_directory_scoped_and_attribute_anchored() {
+    for (source, needle, line) in [
+        (
+            "backend s3 {\n  bucket = \"state\"\n  key = \"state.json\"\n  typo = true\n}\n",
+            "Unknown attribute 'typo'",
+            3,
+        ),
+        (
+            "backend s3 {\n  bucket = \"state\"\n  key = \"state.json\"\n  region = true\n}\n",
+            "Invalid attribute 'region'",
+            3,
+        ),
+    ] {
+        let diagnostics = backend_directory_diagnostics(source);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?}: {diagnostics:#?}"));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostic.range.start.line, line);
+        assert_eq!(diagnostic.range.start.character, 2);
+    }
+}
+
+#[test]
+fn backend_schema_is_not_reported_for_a_module_definition() {
+    let backend = "backend s3 {\n  bucket = \"state\"\n  key = \"state.json\"\n  typo = true\n}\n";
+    let module_diagnostics =
+        backend_directory_diagnostics_with_sibling("arguments {\n  name: String\n}\n", backend);
+    let module_messages: Vec<_> = module_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .filter(|message| {
+            message.contains("backend blocks are not allowed inside modules")
+                || message.contains("Unknown attribute 'typo'")
+        })
+        .collect();
+    assert_eq!(
+        module_messages,
+        vec![
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+        ],
+        "module diagnostics: {module_diagnostics:#?}"
+    );
+
+    let root_diagnostics = backend_directory_diagnostics(backend);
+    let root_messages: Vec<_> = root_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .filter(|message| {
+            message.contains("backend blocks are not allowed inside modules")
+                || message.contains("Unknown attribute 'typo'")
+        })
+        .collect();
+    assert_eq!(
+        root_messages,
+        vec!["Unknown attribute 'typo' for backend type 's3'"],
+        "root diagnostics: {root_diagnostics:#?}"
+    );
+}
+
+#[test]
+fn backend_enum_region_has_no_schema_diagnostic_in_directory() {
+    let source = "backend s3 {\n  bucket = \"state\"\n  key = \"state.json\"\n  region = aws.Region.us_west_2\n}\n";
+    let diagnostics = backend_directory_diagnostics(source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("backend type 's3'")
+                && !diagnostic.message.contains("attribute 'region'")
+        }),
+        "diagnostics: {diagnostics:#?}"
+    );
+    assert_backend_typo_is_diagnosed("\n", source);
+}
+
+#[test]
+fn backend_schema_uses_resolved_sibling_let_and_function_values() {
+    for (sibling_source, bucket_expression) in [
+        ("let state_bucket_name = \"state\"\n", "state_bucket_name"),
+        ("fn backend_bucket() { \"state\" }\n", "backend_bucket()"),
+    ] {
+        let backend_source =
+            format!("backend s3 {{\n  bucket = {bucket_expression}\n  key = \"state.json\"\n}}\n");
+        let diagnostics =
+            backend_directory_diagnostics_with_sibling(sibling_source, &backend_source);
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                !diagnostic.message.contains("backend type 's3'")
+                    && !diagnostic.message.contains("attribute 'bucket'")
+            }),
+            "{bucket_expression} diagnostics: {diagnostics:#?}"
+        );
+        assert_backend_typo_is_diagnosed(sibling_source, &backend_source);
+    }
+}
+
+#[test]
+fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
+    let sibling_source = "fn backend_bucket(): String { true }\n";
+    let backend_source = "backend s3 {\n  bucket = backend_bucket()\n  key = \"state.json\"\n}\n";
+
+    let diagnostics = backend_directory_diagnostics_with_sibling(sibling_source, backend_source);
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("Invalid attribute 'bucket'")
+                && !diagnostic.message.contains("expected String")
+        }),
+        "diagnostics: {diagnostics:#?}"
+    );
+    assert_backend_typo_is_diagnosed(sibling_source, backend_source);
+}
+
+#[test]
+fn retained_backend_function_does_not_hide_other_sorted_attribute_errors() {
+    let sibling_source = "fn backend_bucket(): String { true }\n";
+    let backend_source = "backend s3 {\n  bucket = backend_bucket()\n  key = \"state.json\"\n  region = true\n  encrypt = \"yes\"\n}\n";
+
+    let diagnostics = backend_directory_diagnostics_with_sibling(sibling_source, backend_source);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert_eq!(
+        messages,
+        vec![
+            "Invalid attribute 'encrypt' for backend type 's3': Type mismatch: expected Bool, got String",
+            "Invalid attribute 'region' for backend type 's3': Type mismatch: expected Region, got Bool",
+        ],
+        "diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn nested_retained_backend_function_does_not_emit_interpolation_mismatch() {
+    let sibling_source = "fn backend_prefix(): String { true }\n";
+    let backend_source =
+        "backend s3 {\n  bucket = \"${backend_prefix()}-state\"\n  key = \"state.json\"\n}\n";
+
+    let diagnostics = backend_directory_diagnostics_with_sibling(sibling_source, backend_source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("Invalid attribute 'bucket'")
+                && !diagnostic.message.contains("expected String")
+        }),
+        "diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn backend_resource_reference_reports_schema_type_mismatch() {
+    let diagnostics = backend_directory_diagnostics_with_sibling(
+        "let b = aws.s3.Bucket { bucket_name = \"state\" }\n",
+        "backend s3 {\n  bucket = b.bucket_name\n  key = \"k\"\n}\n",
+    );
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Invalid attribute 'bucket'")
+                && diagnostic.message.contains("expected String")
+                && diagnostic.message.contains("ResourceRef")
+        }),
+        "diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn backend_builtin_call_with_resource_ref_reports_schema_type_mismatch() {
+    let diagnostics = backend_directory_diagnostics_with_sibling(
+        "let vpc = aws.ec2.Vpc { cidr_block = \"10.0.0.0/16\" }\n",
+        "backend s3 {\n  bucket = upper(vpc.vpc_id)\n  key = \"k\"\n}\n",
+    );
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Invalid attribute 'bucket'")
+                && diagnostic.message.contains("expected String")
+                && diagnostic.message.contains("FunctionCall")
+        }),
+        "diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn backend_schema_check_skips_directories_with_multiple_backend_blocks() {
+    let valid = "backend s3 {\n  bucket = \"state\"\n  key = \"k\"\n}\n";
+    let invalid = "backend s3 {\n  bucket = \"state\"\n  key = \"k\"\n  typo = true\n}\n";
+
+    for (open_buffer, sibling) in [(valid, invalid), (invalid, valid)] {
+        let diagnostics = backend_directory_diagnostics_with_sibling(sibling, open_buffer);
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                !diagnostic.message.contains("backend type 's3'")
+                    && !diagnostic.message.contains("Unknown attribute 'typo'")
+            }),
+            "open buffer:\n{open_buffer}\nsibling:\n{sibling}\ndiagnostics: {diagnostics:#?}"
+        );
+    }
+
+    let diagnostics = backend_directory_diagnostics_with_sibling("\n", invalid);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Unknown attribute 'typo'")),
+        "single-backend positive-control diagnostics: {diagnostics:#?}"
+    );
+}
+
 fn render_value_type_error(
     engine: &DiagnosticEngine,
     type_expr: &TypeExpr,
@@ -9069,6 +9317,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
             (current_file, current_source.to_string()),
             (sibling_file, sibling_source.to_string()),
         ],
+        sole_backend_file: None,
     };
 
     let diagnostics =

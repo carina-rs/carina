@@ -5792,7 +5792,7 @@ impl TypeError {
 }
 
 impl Value {
-    pub(crate) fn type_name(&self) -> String {
+    pub fn type_name(&self) -> String {
         match self {
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
             Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier".to_string(),

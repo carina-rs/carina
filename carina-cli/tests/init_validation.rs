@@ -7,6 +7,7 @@
 use std::fs;
 use std::process::Command;
 
+use carina_core::hint::ProjectCommand;
 use tempfile::TempDir;
 
 fn carina_init(project_dir: &std::path::Path) -> std::process::Output {
@@ -60,6 +61,56 @@ awscc.s3.Bucket {
     assert!(
         !project.join("carina-providers.lock").exists(),
         "carina-providers.lock should not be created on failure",
+    );
+}
+
+#[test]
+fn init_rejects_obsolete_backend_lock_with_recovery_guidance() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+    fs::write(
+        project.join("main.crn"),
+        r#"backend s3 {
+  bucket = "state"
+  key = "state.json"
+  region = aws.Region.us_west_2
+}
+"#,
+    )
+    .unwrap();
+    let lock_path = project.join("carina-backend.lock");
+    fs::write(
+        &lock_path,
+        r#"{"backend_type":"s3","attributes":{"bucket":"state","key":"state.json","region":null}}"#,
+    )
+    .unwrap();
+
+    let output = carina_init(project);
+
+    assert!(
+        !output.status.success(),
+        "obsolete backend lock must block init\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&lock_path.display().to_string()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("region"), "{stderr}");
+    assert!(
+        stderr.contains("records a backend address this release cannot read"),
+        "{stderr}"
+    );
+    let init_command = ProjectCommand::new("init", project).to_string();
+    assert!(
+        stderr.contains(&format!("delete `{}`", lock_path.display())),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("run `{init_command}` to record it again")),
+        "{stderr}"
     );
 }
 

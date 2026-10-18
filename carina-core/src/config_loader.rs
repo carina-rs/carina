@@ -547,6 +547,9 @@ pub struct DirectoryParseResult {
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     /// Exact source inputs used for the parse, including in-memory overrides.
     pub source_files: Vec<(PathBuf, String)>,
+    /// Source file that owns the backend when the directory has exactly one.
+    /// `None` means the directory has either zero or multiple backend blocks.
+    pub sole_backend_file: Option<PathBuf>,
 }
 
 /// Diagnostic-preserving variant of [`parse_directory_with_overrides`].
@@ -605,8 +608,19 @@ fn parse_directory_with_overrides_impl(
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
 
     let mut merged = ParsedFile::default();
-    for (_, resolved) in parsed_files {
-        merge_parsed_file(&mut merged, resolved.into_inner());
+    let mut saw_backend = false;
+    let mut sole_backend_file = None;
+    for (file, resolved) in parsed_files {
+        let parsed = resolved.into_inner();
+        if parsed.backend.is_some() {
+            if saw_backend {
+                sole_backend_file = None;
+            } else {
+                saw_backend = true;
+                sole_backend_file = Some(file.clone());
+            }
+        }
+        merge_parsed_file(&mut merged, parsed);
     }
 
     // Resolve cross-file references on the merged result
@@ -634,6 +648,7 @@ fn parse_directory_with_overrides_impl(
         parsed: merged,
         duplicate_declarations,
         source_files: file_inputs,
+        sole_backend_file,
     })
 }
 
