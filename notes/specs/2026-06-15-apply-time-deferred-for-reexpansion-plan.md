@@ -50,7 +50,8 @@ user sees.
    `expand_same_config_deferred_for` produced — either pre-expanded
    children (when the iterable resolved at plan time, unchanged from
    today) or a single "deferred until apply" marker under the for-loop
-   header (new — replaces the silently-stamped `Unknown(ForValuePath)`
+   header (new — replaces the silently-stamped
+   `Access(Unknown(ForValue), …)`
    children). The latter case is a known-after-apply display, similar
    to how `wait` blocks render.
 
@@ -97,8 +98,8 @@ basic executor's `resolve_*` helpers can construct one.
 **Tests (red first)**:
 
 - `resolved_resource_constructor_rejects_value_unknown`: build a
-  `Resource` with one `Value::Deferred(DeferredValue::Unknown { …
-  ForValuePath … })` attribute; assert the constructor returns
+  `Resource` with one `Access` attribute rooted at
+  `Value::Deferred(DeferredValue::Unknown(ForValue))`; assert the constructor returns
   `Err(SerializationError::UnknownNotAllowed { … })`. Add this test
   to the resolve helper's existing test module
   (`carina-core/src/executor/tests.rs` already covers

@@ -860,6 +860,7 @@ fn test_find_state_bucket_resource_matching_type() {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: carina_core::resource::ExpansionTrace::new(),

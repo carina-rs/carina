@@ -92,6 +92,24 @@ fn snapshot_depends_on() {
 }
 
 #[test]
+fn snapshot_postfix_access() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("postfix_access");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_iam_preflight_warning_appears_after_plan_summary() {
     let (plan, schemas, _moved) = build_plan_from_fixture("depends_on");
     let mut output = strip_ansi(&format_plan(
@@ -1745,8 +1763,8 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
         "field access on a sibling string let must be rejected"
     );
     assert!(
-        message.contains("'X' is not a resource, cannot access attribute 'foo'"),
-        "expected scalar field-access diagnostic naming X.foo, got:\n{}",
+        message.contains("cannot apply access .foo to string"),
+        "expected scalar field-access diagnostic naming the failed step and shape, got:\n{}",
         message
     );
     assert!(

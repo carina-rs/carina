@@ -470,6 +470,13 @@ impl DiagnosticEngine {
                 upstream_exports,
                 &module_signatures,
             );
+            let inference_bindings =
+                carina_core::validation::inference::bindings_from_parsed(binding_input);
+            let semantic_file = current_file_path.as_deref().and_then(|path| {
+                merged_result
+                    .as_ref()
+                    .and_then(|result| result.directory.semantic_file(path))
+            });
             let export_value_bindings =
                 carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
@@ -479,6 +486,7 @@ impl DiagnosticEngine {
                     parsed,
                     &semantic_view,
                     &module_signatures,
+                    &inference_bindings,
                 ));
                 let constraint_diagnostics = base_path
                     .zip(current_file_name)
@@ -570,6 +578,19 @@ impl DiagnosticEngine {
                     .as_ref()
                     .and_then(|resources| resources.get(resource_index))
                     .map(carina_core::parser::ResourceRef::attributes);
+                // Directory-aware semantic ASTs can expand a sibling-backed
+                // `for` before the buffer-only AST does, so positional
+                // resource indexes are not a stable join key. Named bindings
+                // are parser-enforced identities; anonymous resources fall
+                // back to the buffer value because they have no such key.
+                let semantic_resource_attributes = rref.binding().and_then(|binding| {
+                    semantic_file.and_then(|parsed| {
+                        parsed
+                            .iter_all_resources()
+                            .find(|candidate| candidate.binding() == Some(binding))
+                            .map(|candidate| candidate.attributes())
+                    })
+                });
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || match rref {
                     carina_core::parser::ResourceRef::Resource(m)
@@ -720,6 +741,10 @@ impl DiagnosticEngine {
                         } else {
                             authored_attr_value
                         };
+                        let typecheck_value = semantic_resource_attributes
+                            .as_ref()
+                            .and_then(|attributes| attributes.get(attr_name))
+                            .unwrap_or(attr_value);
                         // Resolve block_name to canonical attribute name
                         let canonical_name = bn_map
                             .get(attr_name)
@@ -845,7 +870,7 @@ impl DiagnosticEngine {
                             // attribute (carina#3349 invariant lifted into
                             // the type system).
                             let attr_shape = schema.shape_of(&attr_schema.attr_type);
-                            let type_error = match (attr_shape, attr_value) {
+                            let type_error = match (attr_shape, typecheck_value) {
                                 // Bool type should not receive String
                                 (
                                     carina_core::schema::Shape::Bool,
@@ -870,16 +895,25 @@ impl DiagnosticEngine {
                                     "Type mismatch: expected Float, got {}.",
                                     carina_core::ValueDescription::of(attr_value)
                                 )),
-                                // Every statically typed deferred reference is
-                                // checked through the same BindingIndex source
-                                // resolver, including bare module arguments.
-                                (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
-                                    check_resource_ref_type_mismatch(
-                                        &binding_index,
-                                        schema.type_in_schema(&attr_schema.attr_type),
-                                        path.into(),
-                                    )
-                                }
+                                // The shared authority chooses BindingIndex
+                                // for canonical reference paths and inference
+                                // for computed Access values. Callers do not
+                                // classify binding kinds independently.
+                                (
+                                    _,
+                                    value @ Value::Deferred(
+                                        DeferredValue::ResourceRef { .. }
+                                        | DeferredValue::Access(_),
+                                    ),
+                                ) => carina_core::validation::check_deferred_access_type(
+                                    value,
+                                    schema.type_in_schema(&attr_schema.attr_type),
+                                    &inference_bindings,
+                                    &self.schemas,
+                                    &binding_index,
+                                )
+                                .err()
+                                .map(|error| error.to_string()),
                                 (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
                                     check_resource_ref_type_mismatch(
                                         &binding_index,
@@ -887,6 +921,18 @@ impl DiagnosticEngine {
                                         binding.as_str().into(),
                                     )
                                 }
+                                (
+                                    _,
+                                    Value::Deferred(DeferredValue::Unknown(
+                                        carina_core::resource::UnknownReason::ModuleArgument {
+                                            name,
+                                        },
+                                    )),
+                                ) => check_resource_ref_type_mismatch(
+                                    &binding_index,
+                                    schema.type_in_schema(&attr_schema.attr_type),
+                                    name.as_str().into(),
+                                ),
                                 // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
                                 // `StringLiteralExpectedEnum` and
@@ -958,7 +1004,8 @@ impl DiagnosticEngine {
                                             .map(|inner_err| inner_err.to_string())
                                     }
                                 }
-                                // String type - check for bare resource binding
+                                // String type - check for the legacy bare
+                                // structural-handle transport spelling.
                                 (
                                     carina_core::schema::Shape::String { .. },
                                     Value::Concrete(ConcreteValue::String(s)),
@@ -1213,6 +1260,7 @@ impl DiagnosticEngine {
                 &semantic_view,
                 &binding_index,
                 &known_bindings,
+                &inference_bindings,
             ));
 
             diagnostics.extend(self.check_exports_blocks(
@@ -1453,17 +1501,20 @@ impl DiagnosticEngine {
             if line_idx >= end {
                 break;
             }
-            let trimmed = line.trim_start();
-            // Must start with attr_name followed by whitespace or '='
-            if !trimmed.starts_with(attr_name) {
-                continue;
+            for (byte_column, _) in line.match_indices(attr_name) {
+                let before = line[..byte_column].chars().next_back();
+                if before.is_some_and(|ch| !ch.is_whitespace() && ch != '{' && ch != ',') {
+                    continue;
+                }
+                let after = &line[byte_column + attr_name.len()..];
+                if !after.trim_start().starts_with('=') {
+                    continue;
+                }
+                return Some((
+                    line_idx,
+                    position::byte_offset_to_char_offset(line, byte_column),
+                ));
             }
-            let after_attr = &trimmed[attr_name.len()..];
-            if !after_attr.starts_with(' ') && !after_attr.starts_with('=') {
-                continue;
-            }
-            // Calculate column position (account for leading whitespace)
-            return Some((line_idx, position::leading_whitespace_chars(line)));
         }
         None
     }

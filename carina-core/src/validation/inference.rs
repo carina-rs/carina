@@ -22,11 +22,11 @@
 //! - `Value::Deferred(DeferredValue::Interpolation(_))` → `TypeExpr::String` (interpolation
 //!   results are always strings; users who need a specific Custom
 //!   identity must annotate to narrow).
-//! - `Value::Deferred(DeferredValue::Secret(_))` → `TypeExpr::String` (the secret's plaintext
-//!   shape; same reasoning as Interpolation).
+//! - `Value::Deferred(DeferredValue::Secret(_))` → the wrapped value's type; sensitivity is
+//!   orthogonal to its list/map/scalar shape.
 //! - `Value::Deferred(DeferredValue::FunctionCall{ name, .. })` → consult `builtins`'s
 //!   `BuiltinReturnType`. `String/Int/List/Map/Secret` map to the
-//!   corresponding `TypeExpr` primitive; `Any` (`lookup`, `min`,
+//!   corresponding `TypeExpr` primitive, while `Secret` preserves its argument type; `Any` (`lookup`, `min`,
 //!   `max`, `map`) is "depends on arguments" — counts as inference
 //!   failure.
 
@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, PathSegment, Value};
 use crate::schema::{AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
 
 /// Why inference failed. Carries the rhs description so downstream
@@ -63,6 +63,12 @@ pub enum InferenceError {
     /// Could not look up the binding's resource schema (provider
     /// not loaded, etc.).
     SchemaUnavailable { binding: String },
+    /// The base type is statically known, but the authored postfix step
+    /// cannot be applied to that type.
+    InvalidAccess {
+        base_type: String,
+        step: PathSegment,
+    },
     /// Inference re-entered a `Virtual` binding it was already
     /// resolving — a cycle in the module-call attribute graph. Today
     /// the parser and module resolver reject module-of-module cycles,
@@ -108,6 +114,9 @@ impl std::fmt::Display for InferenceError {
             InferenceError::SchemaUnavailable { binding } => {
                 write!(f, "no schema available for binding `{}`", binding)
             }
+            InferenceError::InvalidAccess { base_type, step } => {
+                write!(f, "cannot apply access {step} to {base_type}")
+            }
             InferenceError::CyclicVirtualBinding { cycle } => {
                 write!(
                     f,
@@ -150,6 +159,13 @@ pub enum InferenceBinding {
     /// `bindings_from_parts` overwrites this entry with a `Virtual`
     /// that can actually project to a `TypeExpr`. #2493.
     ModuleCall,
+    /// A value parameter declared by an `arguments {}` block. Parser-side
+    /// expressions carry an `Unknown(ModuleArgument)` placeholder until the
+    /// caller value is substituted; retaining the declaration here lets
+    /// postfix access be checked before expansion.
+    Argument {
+        type_expr: TypeExpr,
+    },
 }
 
 pub type InferenceBindings = HashMap<String, InferenceBinding>;
@@ -181,6 +197,12 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
         {
             out.insert(name.clone(), InferenceBinding::ModuleCall);
         }
+    }
+    for argument in &parsed.arguments {
+        out.entry(argument.name.clone())
+            .or_insert_with(|| InferenceBinding::Argument {
+                type_expr: argument.type_expr.clone(),
+            });
     }
     out
 }
@@ -330,6 +352,103 @@ pub fn infer_type_from_value(
     infer_type_from_value_with_visiting(value, bindings, schemas, &mut visiting)
 }
 
+/// Infer only from the value's own shape and builtin metadata.
+///
+/// This explicitly has no binding/schema authority: references therefore
+/// remain unknown, while literals and computed values whose return shape is
+/// intrinsic (for example `split(...)[0]`) can still be checked. Callers use
+/// this instead of manufacturing empty binding/schema registries.
+pub(crate) fn infer_type_from_value_without_bindings(
+    value: &Value,
+) -> Result<TypeExpr, InferenceError> {
+    fn infer_collection_without_bindings<'a>(
+        values: impl IntoIterator<Item = &'a Value>,
+        wrap: impl FnOnce(Box<TypeExpr>) -> TypeExpr,
+    ) -> Result<TypeExpr, InferenceError> {
+        let mut values = values.into_iter();
+        let Some(first) = values.next() else {
+            return Err(InferenceError::UnknownType {
+                reason: "empty collection has no inferable element type".to_string(),
+            });
+        };
+        let element = infer_type_from_value_without_bindings(first)?;
+        for value in values {
+            let next = infer_type_from_value_without_bindings(value)?;
+            if next != element {
+                return Err(InferenceError::UnknownType {
+                    reason: "collection elements have different types".to_string(),
+                });
+            }
+        }
+        Ok(wrap(Box::new(element)))
+    }
+
+    match value {
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
+        Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
+        Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
+        Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
+        Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            infer_collection_without_bindings(items, TypeExpr::List)
+        }
+        Value::Concrete(ConcreteValue::StringList(_)) => {
+            Ok(TypeExpr::List(Box::new(TypeExpr::String)))
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            infer_collection_without_bindings(entries.values(), TypeExpr::Map)
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            infer_type_from_value_without_bindings(inner)
+        }
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            let return_type = builtin_functions()
+                .iter()
+                .find(|function| function.name == name)
+                .map(|function| function.return_type)
+                .ok_or_else(|| InferenceError::UnknownType {
+                    reason: format!("unknown built-in function `{name}`"),
+                })?;
+            match return_type {
+                BuiltinReturnType::String => Ok(TypeExpr::String),
+                BuiltinReturnType::Int => Ok(TypeExpr::Int),
+                BuiltinReturnType::StringList => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
+                BuiltinReturnType::Secret => args.first().map_or_else(
+                    || {
+                        Err(InferenceError::UnknownType {
+                            reason: format!("built-in `{name}` has no argument to wrap as secret"),
+                        })
+                    },
+                    infer_type_from_value_without_bindings,
+                ),
+                BuiltinReturnType::List | BuiltinReturnType::Map | BuiltinReturnType::Any => {
+                    Err(InferenceError::UnknownType {
+                        reason: format!("built-in `{name}` return type depends on arguments"),
+                    })
+                }
+            }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let base_type = infer_type_from_value_without_bindings(access.base())?;
+            super::narrow_type_expr(&base_type, std::slice::from_ref(access.step())).ok_or_else(
+                || InferenceError::InvalidAccess {
+                    base_type: base_type.to_string(),
+                    step: access.step().clone(),
+                },
+            )
+        }
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::RedactedSecret { .. })
+        | Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
+            reason: "value requires binding/schema authority".to_string(),
+        }),
+    }
+}
+
 /// Internal core of [`infer_type_from_value`] threading the
 /// currently-being-resolved `Virtual` binding chain through the
 /// recursive calls. Cycle detection lives on the `Virtual` arm of
@@ -356,7 +475,9 @@ fn infer_type_from_value_with_visiting(
         Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
-        Value::Deferred(DeferredValue::Secret(_)) => Ok(TypeExpr::String),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            infer_type_from_value_with_visiting(inner, bindings, schemas, visiting)
+        }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(InferenceError::UnknownType {
             reason: "saved-plan secret has not been rehydrated".to_string(),
         }),
@@ -383,7 +504,32 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::BindingRef { .. }) => Err(InferenceError::UnknownType {
             reason: "bare binding reference has no attribute to infer".to_string(),
         }),
-        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => infer_function_call(name),
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            infer_function_call(name, args, bindings, schemas, visiting)
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let base_type =
+                infer_type_from_value_with_visiting(access.base(), bindings, schemas, visiting)?;
+            if matches!(base_type, TypeExpr::Unknown) {
+                return Err(InferenceError::UnknownType {
+                    reason: "postfix access base type is not known".to_string(),
+                });
+            }
+            super::narrow_type_expr(&base_type, std::slice::from_ref(access.step())).ok_or_else(
+                || InferenceError::InvalidAccess {
+                    base_type: base_type.to_string(),
+                    step: access.step().clone(),
+                },
+            )
+        }
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ModuleArgument { name },
+        )) => match bindings.get(name) {
+            Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
+            _ => Err(InferenceError::UnknownType {
+                reason: format!("module argument `{name}` has no type authority"),
+            }),
+        },
         Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
             reason: "value not yet known at plan time (unresolved upstream)".to_string(),
         }),
@@ -445,7 +591,9 @@ fn infer_resource_ref_with_visiting(
             provider,
             resource_type,
         }) => (provider.as_str(), resource_type.as_str()),
-        Some(InferenceBinding::UpstreamState) | Some(InferenceBinding::ModuleCall) => {
+        Some(InferenceBinding::UpstreamState)
+        | Some(InferenceBinding::ModuleCall)
+        | Some(InferenceBinding::Argument { .. }) => {
             return Err(InferenceError::NonInferableBinding {
                 binding: binding.to_string(),
             });
@@ -522,7 +670,7 @@ fn infer_resource_ref_with_visiting(
         // also keeps the Subscript arms shape-matched.
         let resolved = current.resolve_refs_with_defs(&schema.defs).as_attr();
         current = match (seg, &resolved.kind) {
-            (PathSegment::Field { name }, _) => {
+            (PathSegment::Field { name }, AttrTypeKind::Struct { .. }) => {
                 match descend_struct_field(resolved, name, &schema.defs) {
                     Some(t) => t,
                     None => {
@@ -533,6 +681,7 @@ fn infer_resource_ref_with_visiting(
                     }
                 }
             }
+            (PathSegment::Field { .. }, AttrTypeKind::Map { value, .. }) => value,
             (
                 PathSegment::Subscript {
                     index: Subscript::Int { .. },
@@ -549,11 +698,9 @@ fn infer_resource_ref_with_visiting(
                 AttrTypeKind::Map { value, .. },
             ) => value,
             _ => {
-                return Err(InferenceError::UnknownType {
-                    reason: format!(
-                        "access path on `{}.{}` does not match the attribute's shape",
-                        binding, attribute
-                    ),
+                return Err(InferenceError::InvalidAccess {
+                    base_type: attribute_type_to_type_expr(resolved).to_string(),
+                    step: seg.clone(),
                 });
             }
         };
@@ -729,7 +876,13 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
     }
 }
 
-fn infer_function_call(name: &str) -> Result<TypeExpr, InferenceError> {
+fn infer_function_call(
+    name: &str,
+    args: &[Value],
+    bindings: &InferenceBindings,
+    schemas: &SchemaRegistry,
+    visiting: &mut indexmap::IndexSet<String>,
+) -> Result<TypeExpr, InferenceError> {
     let return_type = builtin_functions()
         .iter()
         .find(|f| f.name == name)
@@ -746,13 +899,21 @@ fn infer_function_call(name: &str) -> Result<TypeExpr, InferenceError> {
                 name
             ),
         }),
+        BuiltinReturnType::StringList => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
         BuiltinReturnType::Map => Err(InferenceError::UnknownType {
             reason: format!(
                 "built-in `{}` returns a map whose value type depends on arguments",
                 name
             ),
         }),
-        BuiltinReturnType::Secret => Ok(TypeExpr::String),
+        BuiltinReturnType::Secret => args.first().map_or_else(
+            || {
+                Err(InferenceError::UnknownType {
+                    reason: format!("built-in `{name}` has no argument to wrap as secret"),
+                })
+            },
+            |inner| infer_type_from_value_with_visiting(inner, bindings, schemas, visiting),
+        ),
         BuiltinReturnType::Any => Err(InferenceError::UnknownType {
             reason: format!("built-in `{}` return type depends on arguments", name),
         }),
@@ -1216,6 +1377,96 @@ mod tests {
             &SchemaRegistry::new(),
         );
         assert_eq!(r, Ok(TypeExpr::String));
+    }
+
+    #[test]
+    fn postfix_access_on_list_result_infers_element_type() {
+        use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
+
+        let list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("item".into()),
+        )]));
+        let value = apply_postfix_access(
+            list,
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("valid concrete list access");
+        let inferred =
+            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+
+        assert_eq!(inferred, Ok(TypeExpr::String));
+    }
+
+    #[test]
+    fn postfix_access_on_split_result_infers_string_element_type() {
+        use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
+
+        let value = apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())),
+                    Value::resource_ref("role", "arn", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 1 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("deferred split result remains accessible");
+
+        assert_eq!(
+            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new()),
+            Ok(TypeExpr::String)
+        );
+    }
+
+    #[test]
+    fn postfix_access_on_map_result_infers_value_type() {
+        use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
+
+        let mut map = indexmap::IndexMap::new();
+        map.insert("x".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+        let value = apply_postfix_access(
+            Value::Concrete(ConcreteValue::Map(map)),
+            PathSegment::Subscript {
+                index: Subscript::Str { key: "x".into() },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("valid concrete map access");
+        let inferred =
+            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+
+        assert_eq!(inferred, Ok(TypeExpr::Int));
+    }
+
+    #[test]
+    fn postfix_access_on_unknown_base_keeps_type_unknown() {
+        use crate::resource::{
+            AccessMissPolicy, PathSegment, Subscript, UnknownReason, apply_postfix_access,
+        };
+
+        let value = apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("unknown bases remain deferred");
+        let inferred =
+            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+
+        assert!(matches!(inferred, Err(InferenceError::UnknownType { .. })));
     }
 
     #[test]

@@ -569,6 +569,11 @@ fn deterministic_value_string(value: &Value) -> String {
             let arg_strs: Vec<String> = args.iter().map(deterministic_value_string).collect();
             format!("FunctionCall({}({}))", name, arg_strs.join(", "))
         }
+        Value::Deferred(DeferredValue::Access(access)) => format!(
+            "Access({}{})",
+            deterministic_value_string(access.base()),
+            access.step().to_plaintext_dot_string()
+        ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
@@ -591,11 +596,11 @@ fn deterministic_value_string(value: &Value) -> String {
                 UnknownReason::FnParam { name } => {
                     format!("Unknown(FnParam({name}))")
                 }
+                UnknownReason::ModuleArgument { name } => {
+                    format!("Unknown(ModuleArgument({name}))")
+                }
                 UnknownReason::FnLocal { name } => {
                     format!("Unknown(FnLocal({name}))")
-                }
-                UnknownReason::ForValuePath { path } => {
-                    format!("Unknown(ForValuePath({}))", path.to_plaintext_dot_string())
                 }
                 UnknownReason::EmptyInterpolation => "Unknown(EmptyInterpolation)".to_string(),
                 UnknownReason::PostCreateReadIncomplete { detail } => {

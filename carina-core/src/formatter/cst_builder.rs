@@ -211,10 +211,10 @@ impl<'a> CstBuilder<'a> {
                 Some(CstChild::Node(self.build_node(NodeKind::ForBinding, pair)))
             }
             Rule::for_iterable => {
-                let inner = pair.into_inner().next()?;
-                self.build_child(inner)
+                Some(CstChild::Node(self.build_node(NodeKind::PostfixExpr, pair)))
             }
-            Rule::for_body_content => None, // Silent rule
+            Rule::for_iterable_primary => None, // Silent rule
+            Rule::for_body_content => None,     // Silent rule
             Rule::for_local_binding => Some(CstChild::Node(
                 self.build_node(NodeKind::LocalBinding, pair),
             )),
@@ -238,13 +238,13 @@ impl<'a> CstBuilder<'a> {
             Rule::compose_expr => {
                 Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
             }
+            Rule::postfix_expr => {
+                Some(CstChild::Node(self.build_node(NodeKind::PostfixExpr, pair)))
+            }
             Rule::function_call => Some(CstChild::Node(
                 self.build_node(NodeKind::FunctionCall, pair),
             )),
-            Rule::primary => {
-                let inner = pair.into_inner().next()?;
-                self.build_child(inner)
-            }
+            Rule::primary => Some(CstChild::Node(self.build_node(NodeKind::Primary, pair))),
             Rule::list => Some(CstChild::Node(self.build_node(NodeKind::List, pair))),
             Rule::map => Some(CstChild::Node(self.build_node(NodeKind::Map, pair))),
             Rule::map_content => None, // Silent rule
@@ -295,6 +295,7 @@ impl<'a> CstBuilder<'a> {
             Rule::comma => Some(CstChild::Token(Token::new(",".to_string(), span))),
             Rule::pipe_op => Some(CstChild::Token(Token::new("|>".to_string(), span))),
             Rule::compose_op => Some(CstChild::Token(Token::new(">>".to_string(), span))),
+            Rule::dot => Some(CstChild::Token(Token::new(".".to_string(), span))),
 
             // Keywords
             Rule::kw_import => Some(CstChild::Token(Token::new("import".to_string(), span))),

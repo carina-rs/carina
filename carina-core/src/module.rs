@@ -194,6 +194,15 @@ fn format_value(value: &Value) -> String {
             let arg_strs: Vec<_> = args.iter().map(format_value).collect();
             format!("{}({})", name, arg_strs.join(", "))
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            if access.display_root().is_some() {
+                crate::value::format_value(value)
+            } else if let Some(reason) = crate::value::access_chain_unknown_root(access.base()) {
+                crate::value::render_unknown(reason)
+            } else {
+                format!("{}{}", format_value(access.base()), access.step())
+            }
+        }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
             "(secret)".to_string()
         }
@@ -500,6 +509,15 @@ impl RootConfigSignature {
                 for arg in args {
                     Self::collect_typed_dependencies(from, attr_key, arg, graph, binding_types);
                 }
+            }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    access.base(),
+                    graph,
+                    binding_types,
+                );
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -1019,6 +1037,16 @@ impl ModuleSignature {
                     );
                 }
             }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    access.base(),
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+            }
             Value::Concrete(
                 ConcreteValue::String(_)
                 | ConcreteValue::Int(_)
@@ -1042,8 +1070,28 @@ impl ModuleSignature {
                     argument_types,
                 );
             }
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::UnknownReason::ModuleArgument { name },
+            )) => {
+                let target_type = argument_types
+                    .get(name)
+                    .and_then(|arg_type| match arg_type {
+                        TypeExpr::Ref(path) => Some(path.clone()),
+                        _ => None,
+                    });
+                graph.add_edge(
+                    from.to_string(),
+                    TypedDependency {
+                        target: name.clone(),
+                        target_type,
+                        attribute: String::new(),
+                        used_in: attr_key.to_string(),
+                    },
+                );
+            }
             Value::Deferred(DeferredValue::Unknown(_)) => {
-                // Unknown is upstream-deferred and carries no resource-binding edge.
+                // Other unknowns are upstream-deferred and carry no
+                // resource-binding edge.
             }
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
                 // Saved-plan placeholders never carry dependency expressions.

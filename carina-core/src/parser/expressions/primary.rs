@@ -5,7 +5,8 @@
 //! partial-application handling), variable references with field/index
 //! access chains, and value-position `if` expressions.
 
-use crate::eval_value::EvalValue;
+use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::parser::context::ParseBindingRef;
 use crate::parser::expressions::if_expr::parse_if_value_expr;
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::{
@@ -13,61 +14,10 @@ use crate::parser::{
     is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, UnknownReason, Value,
-    ValueString,
+    AccessMissPolicy, AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, Value,
+    ValuePathSegmentResult, ValueString, apply_value_path_segment,
 };
 use indexmap::IndexMap;
-
-/// Resolve a field-access path rooted at a **bound variable** (a
-/// `for`-loop value var, a `let`-of-struct), shared by the two parser
-/// entry points that can reach one (carina#3136). Returns:
-///
-/// - `Some(resolved)` — the variable is a concrete tree and the path
-///   navigates: the real nested value (resolved-for-loop / struct let).
-/// - `Some(ForValuePath)` — the variable is the deferred-for `ForValue`
-///   placeholder (element not yet known): the path-carrying loop-var
-///   placeholder, re-navigated post-expansion by
-///   `substitute_placeholder`.
-/// - `None` — bound, concrete, but the path does not navigate (a
-///   scalar, or a genuine key/shape miss). The caller applies its own
-///   miss policy (scalar diagnostic vs. legacy `ResourceRef`); the two
-///   call sites genuinely differ there, everything above is identical
-///   and must not drift (the plan-path symmetry this fix exists for).
-///
-/// The deferred-for template binds the value var to exactly the bare
-/// `ForValue` placeholder (`for_expr.rs`), so the placeholder test is a
-/// direct match, not a tree walk.
-fn resolve_bound_var_field_access(bound: &Value, path: &AccessPath) -> Option<EvalValue> {
-    if let Some(v) = crate::resource::navigate_value_path(bound, path) {
-        return Some(EvalValue::from_value(v));
-    }
-    if matches!(
-        bound,
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
-    ) {
-        return Some(EvalValue::from_value(Value::Deferred(
-            DeferredValue::Unknown(UnknownReason::ForValuePath { path: path.clone() }),
-        )));
-    }
-    None
-}
-
-/// True when `bound` is a scalar value, where field access
-/// (`s.foo` on `let s = "x"`) is genuinely meaningless — the domain of
-/// the Site B "not a resource" diagnostic.
-fn is_scalar_value(bound: &Value) -> bool {
-    matches!(
-        bound,
-        Value::Concrete(
-            ConcreteValue::String(_)
-                | ConcreteValue::Int(_)
-                | ConcreteValue::Float(_)
-                | ConcreteValue::Bool(_)
-                | ConcreteValue::Duration(_)
-                | ConcreteValue::EnumIdentifier(_)
-        )
-    )
-}
 
 /// Decode a duration literal (`75min`, `1h`, `30s`) into integer
 /// seconds.
@@ -124,22 +74,172 @@ pub(crate) fn parse_duration_literal(src: &str, line: usize) -> Result<Value, Pa
 /// than at validate time because the DSL has no `[-1]` "from end"
 /// semantic — accepting them would let the validator pass and the
 /// resolver silently fall back to the unresolved ref.
-fn subscript_from_value(value: Value) -> Result<Subscript, ParseError> {
+fn subscript_from_value(value: Value, line: usize) -> Result<Subscript, ParseError> {
     match value {
         Value::Concrete(ConcreteValue::Int(n)) if n < 0 => Err(ParseError::InvalidExpression {
-            line: 0,
+            line,
             message: format!("index access key must be non-negative, got {}", n),
         }),
         Value::Concrete(ConcreteValue::Int(n)) => Ok(Subscript::Int { index: n }),
         Value::Concrete(ConcreteValue::String(s)) => Ok(Subscript::Str { key: s }),
         other => Err(ParseError::InvalidExpression {
-            line: 0,
+            line,
             message: format!(
-                "index access key must be an integer or string, got {:?}",
-                other
+                "index access key must be an integer or string, got {}",
+                crate::ValueDescription::of(&other)
             ),
         }),
     }
+}
+
+fn parse_postfix_path_segment(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<PathSegment, ParseError> {
+    match pair.as_rule() {
+        Rule::index_access => {
+            let line = pair.line_col().0;
+            let index_expr_pair = first_inner(pair, "index expression", "index access")?;
+            let index_value = parse_expression(index_expr_pair, ctx)?;
+            subscript_from_value(index_value, line).map(|index| PathSegment::Subscript { index })
+        }
+        Rule::field_access => {
+            let ident = first_inner(pair, "identifier", "field access")?;
+            Ok(PathSegment::Field {
+                name: ident.as_str().to_string(),
+            })
+        }
+        other => Err(ParseError::InternalError {
+            expected: "field or index access".to_string(),
+            context: format!("postfix expression contained {other:?}"),
+        }),
+    }
+}
+
+pub(crate) fn apply_postfix_path_segment(
+    value: EvalValue,
+    step: PathSegment,
+    line: usize,
+) -> Result<EvalValue, ParseError> {
+    let mut display_root = None;
+    let base = match value {
+        EvalValue::User(base) => base,
+        EvalValue::StructuralHandle(handle) => {
+            let Some(binding) = handle.addressable_binding() else {
+                let alias = handle.alias_name().unwrap_or("<structural alias>");
+                return Err(ParseError::InvalidExpression {
+                    line,
+                    message: match &step {
+                        PathSegment::Field { name } => {
+                            format!("'{alias}' is not a resource, cannot access attribute '{name}'")
+                        }
+                        PathSegment::Subscript { .. } => {
+                            format!("'{alias}' is not a resource, cannot index it")
+                        }
+                    },
+                });
+            };
+            if let PathSegment::Subscript { index } = &step {
+                let binding = match index {
+                    Subscript::Int { index } => format!("{binding}[{index}]"),
+                    Subscript::Str { key } => {
+                        crate::utils::map_key_address(binding, key.expose_plaintext())
+                    }
+                };
+                return Ok(EvalValue::from_value(Value::Deferred(
+                    DeferredValue::BindingRef { binding },
+                )));
+            }
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: binding.to_string(),
+            })
+        }
+        EvalValue::ComputedWithStructuralHandles {
+            value: base,
+            metadata,
+        } => {
+            if metadata.is_handle() {
+                return Err(ParseError::InvalidExpression {
+                    line,
+                    message: format!(
+                        "cannot apply access {step} to a resource handle inside a computed value"
+                    ),
+                });
+            }
+            let selected_metadata = metadata.select(&step);
+            return apply_value_path_segment(base, step, line, AccessMissPolicy::Error)
+                .and_then(ValuePathSegmentResult::into_value)
+                .map(|value| EvalValue::computed(value, selected_metadata))
+                .map_err(|error| ParseError::InvalidExpression {
+                    line,
+                    message: error.to_string(),
+                });
+        }
+        EvalValue::DeferredForValue { binding } => {
+            display_root = Some(binding);
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::UnknownReason::ForValue,
+            ))
+        }
+        EvalValue::Closure {
+            name,
+            remaining_arity,
+            ..
+        } => {
+            return Err(ParseError::InvalidExpression {
+                line,
+                message: format!(
+                    "cannot apply access {step} to partial application '{name}' \
+                     (still needs {remaining_arity} argument(s))"
+                ),
+            });
+        }
+    };
+    apply_value_path_segment(base, step, line, AccessMissPolicy::Error)
+        .and_then(ValuePathSegmentResult::into_value)
+        .map(|value| match display_root {
+            Some(root) => value.with_access_display_root(root),
+            None => value,
+        })
+        .map(EvalValue::from_value)
+        .map_err(|error| ParseError::InvalidExpression {
+            line,
+            message: error.to_string(),
+        })
+}
+
+pub(crate) fn apply_postfix_steps<'i>(
+    mut value: EvalValue,
+    steps: impl IntoIterator<Item = pest::iterators::Pair<'i, Rule>>,
+    ctx: &ParseContext,
+) -> Result<EvalValue, ParseError> {
+    for pair in steps {
+        let line = pair.line_col().0;
+        let step = parse_postfix_path_segment(pair, ctx)?;
+        value = apply_postfix_path_segment(value, step, line)?;
+    }
+    Ok(value)
+}
+
+/// Parse a postfix-expression wrapper (or the identically-shaped restricted
+/// `for_iterable` wrapper) and apply its suffixes from left to right.
+pub(crate) fn parse_postfix_eval(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<EvalValue, ParseError> {
+    if !matches!(pair.as_rule(), Rule::postfix_expr | Rule::for_iterable) {
+        return parse_primary_eval(pair, ctx);
+    }
+
+    let context = if pair.as_rule() == Rule::for_iterable {
+        "for iterable"
+    } else {
+        "postfix expression"
+    };
+    let mut inner = pair.into_inner();
+    let base = next_pair(&mut inner, "primary expression", context)?;
+    let value = parse_primary_eval(base, ctx)?;
+    apply_postfix_steps(value, inner, ctx)
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
@@ -152,6 +252,7 @@ fn parse_namespaced_id_value(
     ctx: &ParseContext,
     trailing_segments: Vec<PathSegment>,
 ) -> Result<EvalValue, ParseError> {
+    let line = pair.line_col().0;
     let full_str = pair.as_str();
     let parts: Vec<&str> = full_str.split('.').collect();
     // Pest's `namespaced_id = @{ identifier ~ ("." ~ ...)+ }` rule
@@ -175,8 +276,41 @@ fn parse_namespaced_id_value(
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
-    if ctx.is_resource_binding(parts[0]) {
-        return Ok(as_resource_ref(trailing_segments));
+    match ctx.lookup_binding(parts[0]) {
+        ParseBindingRef::Structural(handle) if handle.addressable_binding().is_some() => {
+            return Ok(as_resource_ref(trailing_segments));
+        }
+        ParseBindingRef::Structural(handle) => {
+            return Err(ParseError::InvalidExpression {
+                line,
+                message: format!(
+                    "'{}' is not a resource, cannot access attribute '{}'",
+                    handle.alias_name().unwrap_or(parts[0]),
+                    parts[1]
+                ),
+            });
+        }
+        ParseBindingRef::Value(bound) => {
+            // A dotted name whose head is an ordinary bound variable is value
+            // access, not a resource path. Apply every `.field` and trailing
+            // subscript through the same postfix primitive used by
+            // `postfix_expr`.
+            let mut value = bound.clone();
+            for field in &parts[1..] {
+                value = apply_postfix_path_segment(
+                    value,
+                    PathSegment::Field {
+                        name: (*field).to_string(),
+                    },
+                    line,
+                )?;
+            }
+            for segment in trailing_segments {
+                value = apply_postfix_path_segment(value, segment, line)?;
+            }
+            return Ok(value);
+        }
+        ParseBindingRef::Unbound => {}
     }
 
     // Trailing segments (`a.b['k']`, `a.b[0]`, `a.b.c[0].d`)
@@ -196,42 +330,6 @@ fn parse_namespaced_id_value(
     // fallback below and silently mistype as a string. Originally added
     // for #2435.
     if !trailing_segments.is_empty() {
-        return Ok(as_resource_ref(trailing_segments));
-    }
-
-    // carina#3136: `parts[0]` is a bound variable that is not a
-    // resource binding. Field access on a *scalar* variable
-    // (`let s = "x"; s.foo`) is genuinely meaningless → keep the
-    // error. But a struct/map-valued `for`-loop value variable
-    // (`for (_, o) in [{k=…}] { … o.k }`) is legitimate navigation:
-    // route it through the same navigator Site A uses.
-    if let Some(crate::eval_value::EvalValue::User(bound)) = ctx.get_variable(parts[0])
-        && !ctx.is_resource_binding(parts[0])
-    {
-        let mut segments: Vec<PathSegment> = parts[2..]
-            .iter()
-            .map(|s| PathSegment::Field {
-                name: (*s).to_string(),
-            })
-            .collect();
-        segments.extend(trailing_segments.clone());
-        let path = AccessPath::with_segments(parts[0].to_string(), parts[1].to_string(), segments);
-        if let Some(ev) = resolve_bound_var_field_access(bound, &path) {
-            return Ok(ev);
-        }
-        // Miss. A scalar can't have fields — the original user error.
-        if is_scalar_value(bound) {
-            return Err(ParseError::InvalidExpression {
-                line: 0,
-                message: format!(
-                    "'{}' is not a resource, cannot access attribute '{}'",
-                    parts[0], parts[1]
-                ),
-            });
-        }
-        // Non-scalar bound value whose path did not navigate (genuine
-        // key/shape miss): keep the legacy `ResourceRef` so existing
-        // scope/typo diagnostics still surface it.
         return Ok(as_resource_ref(trailing_segments));
     }
 
@@ -274,27 +372,57 @@ pub(crate) fn parse_primary_eval(
             })
         }
         Rule::list => {
-            let items: Result<Vec<Value>, ParseError> = inner
-                .into_inner()
-                .map(|item| parse_expression(item, ctx))
-                .collect();
-            Ok(EvalValue::from_value(Value::Concrete(ConcreteValue::List(
-                items?,
-            ))))
+            let mut items = Vec::new();
+            let mut item_metadata = Vec::new();
+            for item in inner.into_inner() {
+                let eval = parse_expression_eval(item, ctx)?;
+                let (value, metadata) = eval.into_collection_element().map_err(|leak| {
+                    ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "list element evaluates to a closure '{}' (still needs {} arg(s))",
+                            leak.name, leak.remaining_arity
+                        ),
+                    }
+                })?;
+                items.push(value);
+                item_metadata.push(metadata);
+            }
+            let metadata = item_metadata
+                .iter()
+                .any(Option::is_some)
+                .then_some(StructuralHandleMetadata::List(item_metadata));
+            Ok(EvalValue::computed(
+                Value::Concrete(ConcreteValue::List(items)),
+                metadata,
+            ))
         }
         Rule::map => {
             let mut map: IndexMap<String, Value> = IndexMap::new();
             let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
+            let mut structural_handles = IndexMap::new();
             for entry in inner.into_inner() {
                 match entry.as_rule() {
                     Rule::map_entry => {
                         let mut entry_inner = entry.into_inner();
                         let key_pair = next_pair(&mut entry_inner, "map key", "map entry")?;
                         let key = extract_key_string(key_pair)?;
-                        let value = parse_expression(
+                        let value = parse_expression_eval(
                             next_pair(&mut entry_inner, "map value", "map entry")?,
                             ctx,
                         )?;
+                        let (value, metadata) = value.into_collection_element().map_err(
+                            |leak| ParseError::InvalidExpression {
+                                line: 0,
+                                message: format!(
+                                    "map value evaluates to a closure '{}' (still needs {} arg(s))",
+                                    leak.name, leak.remaining_arity
+                                ),
+                            },
+                        )?;
+                        if let Some(metadata) = metadata {
+                            structural_handles.insert(key.clone(), metadata);
+                        }
                         map.insert(key, value);
                     }
                     Rule::nested_block => {
@@ -315,9 +443,12 @@ pub(crate) fn parse_primary_eval(
             for (name, blocks) in nested_blocks {
                 map.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
             }
-            Ok(EvalValue::from_value(Value::Concrete(ConcreteValue::Map(
-                map,
-            ))))
+            let metadata = (!structural_handles.is_empty())
+                .then_some(StructuralHandleMetadata::Map(structural_handles));
+            Ok(EvalValue::computed(
+                Value::Concrete(ConcreteValue::Map(map)),
+                metadata,
+            ))
         }
         Rule::namespaced_id => parse_namespaced_id_value(inner, ctx, Vec::new()),
         Rule::subscripted_id => {
@@ -334,11 +465,12 @@ pub(crate) fn parse_primary_eval(
             for pair in parts {
                 match pair.as_rule() {
                     Rule::index_access => {
+                        let line = pair.line_col().0;
                         let index_expr_pair =
                             first_inner(pair, "index expression", "index access")?;
                         let index_value = parse_expression(index_expr_pair, ctx)?;
                         segments.push(PathSegment::Subscript {
-                            index: subscript_from_value(index_value)?,
+                            index: subscript_from_value(index_value, line)?,
                         });
                     }
                     Rule::field_access => {
@@ -454,7 +586,9 @@ pub(crate) fn parse_primary_eval(
             // field_access = { "." ~ identifier }
             // index_access = { "[" ~ expression ~ "]" }
             let mut parts = inner.into_inner();
-            let first_ident = next_pair(&mut parts, "identifier", "variable reference")?.as_str();
+            let first_ident_pair = next_pair(&mut parts, "identifier", "variable reference")?;
+            let line = first_ident_pair.line_col().0;
+            let first_ident = first_ident_pair.as_str();
 
             // Collect all access steps (field or index)
             let access_steps: Vec<pest::iterators::Pair<Rule>> = parts.collect();
@@ -471,13 +605,44 @@ pub(crate) fn parse_primary_eval(
                 // precedence is already honored by the `get_variable` arm
                 // above — we only reach the `None` branch when the parser
                 // has no in-scope variable / let-binding for this name.
-                match ctx.get_variable(first_ident) {
-                    Some(val) => Ok(val.clone()),
-                    None => Ok(EvalValue::from_value(Value::Concrete(
+                match ctx.lookup_binding(first_ident) {
+                    ParseBindingRef::Value(value) => Ok(value.clone()),
+                    ParseBindingRef::Structural(handle) => {
+                        Ok(EvalValue::structural_handle(handle.clone()))
+                    }
+                    ParseBindingRef::Unbound => Ok(EvalValue::from_value(Value::Concrete(
                         ConcreteValue::enum_identifier(first_ident.to_string()),
                     ))),
                 }
             } else {
+                match ctx.lookup_binding(first_ident) {
+                    ParseBindingRef::Value(bound) => {
+                        return apply_postfix_steps(bound.clone(), access_steps, ctx);
+                    }
+                    ParseBindingRef::Structural(handle)
+                        if handle.addressable_binding().is_none() =>
+                    {
+                        let attribute = access_steps.iter().find_map(|step| {
+                            (step.as_rule() == Rule::field_access)
+                                .then(|| step.clone().into_inner().next())
+                                .flatten()
+                                .map(|identifier| identifier.as_str().to_string())
+                        });
+                        return Err(ParseError::InvalidExpression {
+                            line,
+                            message: attribute.map_or_else(
+                                || format!("'{first_ident}' is not a resource, cannot index it"),
+                                |attribute| {
+                                    format!(
+                                        "'{}' is not a resource, cannot access attribute '{attribute}'",
+                                        handle.alias_name().unwrap_or(first_ident)
+                                    )
+                                },
+                            ),
+                        });
+                    }
+                    ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => {}
+                }
                 // Build binding_name, attribute_name, field_path, and
                 // post-field subscripts from the access steps. There are
                 // two index phases:
@@ -506,10 +671,11 @@ pub(crate) fn parse_primary_eval(
                 for step in access_steps {
                     match step.as_rule() {
                         Rule::index_access => {
+                            let step_line = step.line_col().0;
                             let index_expr_pair =
                                 first_inner(step, "index expression", "index access")?;
                             let index_value = parse_expression(index_expr_pair, ctx)?;
-                            let subscript = subscript_from_value(index_value)?;
+                            let subscript = subscript_from_value(index_value, step_line)?;
                             if in_field_phase {
                                 subscripts.push(subscript);
                             } else {
@@ -535,7 +701,7 @@ pub(crate) fn parse_primary_eval(
                         Rule::field_access => {
                             if !subscripts.is_empty() {
                                 return Err(ParseError::InvalidExpression {
-                                    line: 0,
+                                    line,
                                     message: "field access after index access is not supported"
                                         .to_string(),
                                 });
@@ -560,20 +726,32 @@ pub(crate) fn parse_primary_eval(
                     // was the source of the empty-field diagnostic in
                     // #2847; the new variant makes that representation
                     // unrepresentable.
-                    match ctx.get_variable(binding_name.expose_plaintext()) {
-                        Some(val) => Ok(val.clone()),
-                        None if binding_name.is_diagnostic_sensitive() => {
+                    if matches!(
+                        ctx.lookup_binding(first_ident),
+                        ParseBindingRef::Structural(_)
+                    ) {
+                        return Ok(EvalValue::from_value(Value::Deferred(
+                            DeferredValue::BindingRef {
+                                binding: binding_name.into_plaintext(),
+                            },
+                        )));
+                    }
+                    match ctx.lookup_binding(binding_name.expose_plaintext()) {
+                        ParseBindingRef::Value(value) => Ok(value.clone()),
+                        ParseBindingRef::Structural(_) | ParseBindingRef::Unbound
+                            if binding_name.is_diagnostic_sensitive() =>
+                        {
                             Err(ParseError::InvalidExpression {
-                                line: 0,
+                                line,
                                 message: "unresolved binding containing a value from env()"
                                     .to_string(),
                             })
                         }
-                        None => Ok(EvalValue::from_value(Value::Deferred(
-                            DeferredValue::BindingRef {
+                        ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => Ok(
+                            EvalValue::from_value(Value::Deferred(DeferredValue::BindingRef {
                                 binding: binding_name.into_plaintext(),
-                            },
-                        ))),
+                            })),
+                        ),
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
@@ -583,29 +761,9 @@ pub(crate) fn parse_primary_eval(
                         field_names,
                         subscripts,
                     );
-                    // carina#3136: field access on a bound **variable**
-                    // (a `for`-loop value var, a `let`-of-struct) is
-                    // not a resource reference. The no-field arm above
-                    // already consults `get_variable`; this arm must
-                    // too, or `o.rr.name` escapes as a
-                    // `ResourceRef{binding:o}` no resolver can resolve
-                    // (a loop var is never a `ResolvedBindings` entry).
-                    // A non-variable head is a genuine resource binding
-                    // (`cert.domain_validation_options`) and a miss on a
-                    // bound var falls back to `ResourceRef` so existing
-                    // scope/typo diagnostics still surface — Site A has
-                    // no scalar-error arm (its no-field sibling already
-                    // guards scalars upstream).
-                    if let Some(crate::eval_value::EvalValue::User(bound)) =
-                        ctx.get_variable(binding_name.expose_plaintext())
-                        && let Some(ev) = resolve_bound_var_field_access(bound, &path)
-                    {
-                        Ok(ev)
-                    } else {
-                        Ok(EvalValue::from_value(Value::Deferred(
-                            DeferredValue::ResourceRef { path },
-                        )))
-                    }
+                    Ok(EvalValue::from_value(Value::Deferred(
+                        DeferredValue::ResourceRef { path },
+                    )))
                 }
             }
         }

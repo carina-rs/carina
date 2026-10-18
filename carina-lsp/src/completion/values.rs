@@ -2073,7 +2073,7 @@ fn return_type_fits(
         Shape::Int { .. } => matches!(ret, R::Int | R::Any),
         // No built-in currently returns a Bool; leave as unfit.
         Shape::Bool => false,
-        Shape::List { .. } => matches!(ret, R::List | R::Any),
+        Shape::List { .. } => matches!(ret, R::List | R::StringList | R::Any),
         Shape::Map { .. } => matches!(ret, R::Map | R::Any),
         // Enum expects a specific identifier form; no built-in
         // currently produces such values, and `Any` alone doesn't give us

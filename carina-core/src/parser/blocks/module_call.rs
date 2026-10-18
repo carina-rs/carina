@@ -3,10 +3,10 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::{ModuleCall, ModuleCallSource, ModuleCallSourceSpan};
+use crate::parser::ast::{ModuleArgument, ModuleCall, ModuleCallSource, ModuleCallSourceSpan};
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
-use crate::parser::parse_expression;
+use crate::parser::parse_expression_eval;
 use std::collections::HashMap;
 
 /// Parse module call
@@ -47,10 +47,20 @@ pub(crate) fn parse_module_call(
             let (start_line, start_column) = key_span.start_pos().line_col();
             let (end_line, end_column) = key_span.end_pos().line_col();
             let key = key_pair.as_str().to_string();
-            let value = parse_expression(
-                next_pair(&mut arg_inner, "argument value", "module call argument")?,
-                ctx,
-            )?;
+            let value_pair = next_pair(&mut arg_inner, "argument value", "module call argument")?;
+            let value_line = value_pair.line_col().0;
+            let eval = parse_expression_eval(value_pair, ctx)?;
+            let access_base = eval.module_argument_access_base();
+            let value = eval
+                .into_value()
+                .map_err(|leak| ParseError::InvalidExpression {
+                    line: value_line,
+                    message: format!(
+                        "expression evaluates to a closure '{}' (still needs {} arg(s)); finish the \
+                         partial application — closures are not valid as data",
+                        leak.name, leak.remaining_arity
+                    ),
+                })?;
             argument_spans.insert(
                 key.clone(),
                 ModuleCallSourceSpan {
@@ -62,12 +72,16 @@ pub(crate) fn parse_module_call(
                     end_column,
                 },
             );
-            arguments.insert(key, value);
+            let argument = match access_base {
+                Some(access_base) => ModuleArgument::with_access_base(value, access_base),
+                None => ModuleArgument::new(value),
+            };
+            arguments.insert(key, argument);
         }
     }
 
     Ok(
-        ModuleCall::synthetic(module_name, None, arguments).with_source(ModuleCallSource {
+        ModuleCall::from_arguments(module_name, None, arguments).with_source(ModuleCallSource {
             file: None,
             call_span: Some(call_span),
             argument_spans,

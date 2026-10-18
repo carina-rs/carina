@@ -265,6 +265,7 @@ fn render_value_type_error(
         type_expr,
         value,
         &engine.provider_context,
+        carina_core::validation::typecheck::TypecheckInference::Unavailable,
     )
     .err()
     .map(|error| error.to_string())
@@ -3772,6 +3773,117 @@ fn exports_referencing_module_call_attribute_does_not_require_annotation() {
 }
 
 #[test]
+fn postfix_index_on_sibling_computed_let_has_no_unknown_binding_diagnostic() {
+    let engine = test_engine();
+    let directory = tempfile::tempdir().unwrap();
+    let main = r#"
+let queue = mock.queue.Queue {
+  queue_name = "demo"
+}
+let parts = split(":", queue.arn)
+"#;
+    let exports = r#"
+exports {
+  account_id: String = parts[5]
+}
+"#;
+    std::fs::write(directory.path().join("main.crn"), main).unwrap();
+    std::fs::write(directory.path().join("exports.crn"), exports).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(exports),
+        Some("exports.crn"),
+        Some(directory.path()),
+    );
+    let false_unknown = diagnostics.iter().find(|diagnostic| {
+        diagnostic.message.contains("unknown binding 'parts[5]'")
+            || diagnostic.message.contains("Undefined resource 'parts[5]'")
+    });
+
+    assert!(
+        false_unknown.is_none(),
+        "postfix access must preserve the sibling `parts` binding; diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn postfix_access_type_errors_match_validate_across_sibling_files() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    let values = r#"
+let q = mock.test.resource { name = "q" }
+let parts = split("-", q.identifier)
+"#;
+    let main = r#"
+let a = mock.test.resource { name = parts.foo }
+let b = mock.test.resource { name = parts[1][0] }
+let r = mock.test.resource { name = split("-", q.identifier)[0][0] }
+"#;
+    std::fs::write(directory.path().join("values.crn"), values).unwrap();
+    std::fs::write(directory.path().join("main.crn"), main).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", main);
+    let access_errors = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("cannot apply access"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        access_errors.len(),
+        3,
+        "LSP must surface every Access error reported by validate: {diagnostics:#?}",
+    );
+    assert!(
+        access_errors
+            .iter()
+            .any(|message| message.contains(".foo") && message.contains("list(String)")),
+        "missing field-on-list diagnostic: {diagnostics:#?}",
+    );
+    assert_eq!(
+        access_errors
+            .iter()
+            .filter(|message| message.contains("[0]") && message.contains("String"))
+            .count(),
+        2,
+        "missing nested string-index diagnostics: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn secret_subscript_parse_diagnostic_is_redacted_in_lsp() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = r#"
+let parts = ["a", "b"]
+let selected = parts[secret("hunter2")]
+"#;
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), directory.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("index access key must be an integer or string")),
+        "missing invalid-subscript diagnostic: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("hunter2")),
+        "secret subscript plaintext leaked through the LSP: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn module_call_export_typo_is_reported_once_after_lsp_expansion() {
     let engine = DiagnosticEngine::new(
         Arc::new(SchemaRegistry::new()),
@@ -4091,6 +4203,40 @@ let sg = aws.ec2.SecurityGroup {
                 && diagnostic.message.contains("from vpc_id")
         }),
         "the open module's resource attribute must use its argument declaration as the source type: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn module_argument_postfix_access_uses_declared_type_in_open_module_document() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let source = r#"arguments {
+  items: list(String)
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name   = "module"
+  vpc_id = items[0]
+}
+"#;
+    std::fs::write(module.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &module, "main.crn", source);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got String")
+                && diagnostic.message.contains("module argument: items")
+        }),
+        "postfix access must use the module argument declaration as inference authority: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)
@@ -4525,6 +4671,104 @@ let instance = checked {
     let diagnostic = matching[0];
     assert_eq!(diagnostic.range.start.line, 2);
     assert_eq!(diagnostic.range.start.character, 15);
+}
+
+#[test]
+fn concrete_module_argument_postfix_miss_is_reported_by_lsp() {
+    let engine = test_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("modules/selector");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { items: list(String) }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("resource.crn"),
+        "\nlet selected = mock.test.Thing {\n  name = items[5]\n}\n",
+    )
+    .unwrap();
+    let source = r#"let selector = use { source = "../modules/selector" }
+
+let child = selector { items = ["x", "y"] }
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("index 5 out of range for list of length 2")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        matching[0].message.contains("selector")
+            && matching[0].message.contains("modules/selector")
+            && matching[0].message.contains("line 3"),
+        "diagnostic must retain module source context: {:#?}",
+        matching[0]
+    );
+}
+
+#[test]
+fn bare_structural_handle_keeps_the_string_attribute_lint() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("parent", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let source = r#"
+let vpc = mock.test.network {
+  name = "network"
+}
+
+mock.test.resource {
+  name = "child"
+  parent = vpc
+}
+"#;
+
+    let document = create_document(source);
+    let parsed = document.parsed().expect("document parse");
+    let child = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.is_none())
+        .expect("anonymous child resource");
+    assert_eq!(
+        child.get_attr("parent"),
+        Some(&Value::Concrete(ConcreteValue::String("${vpc}".into())))
+    );
+    let diagnostics = engine.analyze(&document, None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Expected string, got resource reference 'vpc'. Did you mean 'vpc.name'?")
+        }),
+        "bare-handle compatibility lint disappeared: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
 }
 
 fn multifile_sibling_let_module_constraint_diagnostics(
@@ -9318,6 +9562,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
             (sibling_file, sibling_source.to_string()),
         ],
         sole_backend_file: None,
+        semantic_files: Vec::new(),
     };
 
     let diagnostics =

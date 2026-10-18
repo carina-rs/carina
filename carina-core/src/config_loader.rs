@@ -550,6 +550,19 @@ pub struct DirectoryParseResult {
     /// Source file that owns the backend when the directory has exactly one.
     /// `None` means the directory has either zero or multiple backend blocks.
     pub sole_backend_file: Option<PathBuf>,
+    /// Per-file ASTs after directory seed resolution, retained for editor
+    /// diagnostics that need the correctly classified value while anchoring a
+    /// message in one authored file. Empty on non-diagnostic load paths.
+    #[doc(hidden)]
+    pub semantic_files: Vec<(PathBuf, ParsedFile)>,
+}
+
+impl DirectoryParseResult {
+    pub fn semantic_file(&self, path: &Path) -> Option<&ParsedFile> {
+        self.semantic_files
+            .iter()
+            .find_map(|(candidate, parsed)| (candidate == path).then_some(parsed))
+    }
 }
 
 /// Diagnostic-preserving variant of [`parse_directory_with_overrides`].
@@ -606,6 +619,14 @@ fn parse_directory_with_overrides_impl(
         Err(e) => return Err(format!("{}: {}", dir.display(), e)),
     };
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
+    let semantic_files = if preserve_failed_user_calls {
+        parsed_files
+            .iter()
+            .map(|(path, resolved)| (path.clone(), resolved.parsed.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut merged = ParsedFile::default();
     let mut saw_backend = false;
@@ -649,6 +670,7 @@ fn parse_directory_with_overrides_impl(
         duplicate_declarations,
         source_files: file_inputs,
         sole_backend_file,
+        semantic_files,
     })
 }
 
@@ -724,6 +746,7 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
         wait_bindings,
         requires,
         structural_bindings,
+        parser_binding_metadata,
         warnings,
         deferred_for_expressions,
         expansion_trace,
@@ -745,6 +768,9 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
     target.wait_bindings.extend(wait_bindings);
     target.requires.extend(requires);
     target.structural_bindings.extend(structural_bindings);
+    target
+        .parser_binding_metadata
+        .extend(parser_binding_metadata);
     target.warnings.extend(warnings);
     target
         .deferred_for_expressions
@@ -767,12 +793,12 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 /// Directory-scoped implementation that addresses the sibling-scope
 /// class (#2817, #3394):
 ///
-/// - **Pass 1.a** parses every input with an empty seed list. This is the
-///   legacy per-file parse — sibling-defined names are not in scope, so
-///   ResourceRef / String fallback paths fire as before. The merged
-///   result is used only to collect the directory-wide binding names;
-///   its variable values are discarded because unresolved sibling lets
-///   can have fallen back to `EnumIdentifier`.
+/// - **Scope pass** collects top-level `let` names from the grammar without
+///   evaluating their right-hand sides.
+/// - **Pass 1.a** parses every input with those names installed as provisional
+///   structural bindings. The result is used only to classify the real
+///   directory-wide declarations; its values are discarded because sibling
+///   lets have not reached their fixed point yet.
 /// - **Value fixed point** repeatedly parses every input with the current
 ///   directory seeds until the locally declared `let` values stop
 ///   changing. Each round accumulates only the per-file local variables,
@@ -794,38 +820,74 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 /// `parse_with_seeded_bindings` with an empty seed list is a no-op in
 /// `seed_bindings`, so single-file callers (parser tests, the
 /// `parse(input, config)` wrapper) pay zero overhead.
+#[derive(Clone, PartialEq)]
+struct DirectorySeedState {
+    variables: IndexMap<String, Value>,
+    metadata: crate::parser::ParserBindingMetadata,
+}
+
 pub fn parse_directory_files(
     files: &[(PathBuf, String)],
     config: &ProviderContext,
 ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, parser::ParseError> {
-    // Pass 1.a: collect the binding-name union from a regular per-file
-    // parse. Errors here propagate identically to Pass 2 (same input,
-    // same parser path), so don't try to be clever about saving them.
+    // Establish lexical scope without evaluating any RHS. Postfix access on a
+    // sibling name can otherwise fail on the identifier's enum fallback before
+    // the value fixed point gets a chance to type the name.
+    let mut provisional_names = Vec::new();
+    for (_, content) in files {
+        provisional_names.extend(parser::top_level_let_binding_names(content)?);
+    }
+    provisional_names.sort_unstable();
+    provisional_names.dedup();
+    let provisional_seeds: Vec<_> = provisional_names
+        .iter()
+        .map(|name| parser::BindingSeed::provisional(name))
+        .collect();
+
+    // Pass 1.a: classify declarations with the complete syntactic scope.
+    // Errors here propagate identically to Pass 2 (same input, same parser
+    // path), so don't try to be clever about saving them.
     let mut pass1_union = ParsedFile::default();
     let mut pass_1a_local_variables = Vec::with_capacity(files.len());
     for (_, content) in files {
-        let parsed =
-            parser::parse_with_seeded_bindings_without_literal_warnings(content, config, &[])?;
+        let parsed = parser::parse_with_seeded_bindings_without_literal_warnings(
+            content,
+            config,
+            &provisional_seeds,
+        )?;
         pass_1a_local_variables.push(local_variable_names(&parsed));
         merge_parsed_file(&mut pass1_union, parsed);
     }
     let structural = pass1_union.structural_binding_names();
+    let module_parameters: HashSet<&str> = pass1_union
+        .arguments
+        .iter()
+        .map(|argument| argument.name.as_str())
+        .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)?;
-    let mut variables_current = pass1_union.variables.clone();
+    let mut bindings_current = DirectorySeedState {
+        variables: pass1_union.variables.clone(),
+        metadata: pass1_union.parser_binding_metadata.clone(),
+    };
     let iteration_cap = pass1_union.variables.len() + 1;
     let mut converged = false;
 
     for _ in 0..iteration_cap {
-        let seeds = parser::collect_seed_bindings_from_parts(&structural, &variables_current);
-        let variables_next =
+        let seeds = parser::collect_seed_bindings_from_parts(
+            &structural,
+            &module_parameters,
+            &bindings_current.variables,
+            &bindings_current.metadata,
+        );
+        let bindings_next =
             parse_local_variable_union(files, config, &seeds, &pass_1a_local_variables)?;
-        parser::reject_cyclic_let_bindings_in_variables(&variables_next, &structural)?;
+        parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)?;
 
-        if variables_next == variables_current {
+        if bindings_next == bindings_current {
             converged = true;
             break;
         }
-        variables_current = variables_next;
+        bindings_current = bindings_next;
     }
 
     // Paranoid backstop only. The fixed-point sequence is monotone for
@@ -843,7 +905,12 @@ pub fn parse_directory_files(
         });
     }
 
-    let final_seeds = parser::collect_seed_bindings_from_parts(&structural, &variables_current);
+    let final_seeds = parser::collect_seed_bindings_from_parts(
+        &structural,
+        &module_parameters,
+        &bindings_current.variables,
+        &bindings_current.metadata,
+    );
 
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());
@@ -889,17 +956,25 @@ fn parse_local_variable_union(
     config: &ProviderContext,
     seeds: &[parser::BindingSeed<'_>],
     local_variables_by_file: &[HashSet<String>],
-) -> Result<IndexMap<String, Value>, parser::ParseError> {
+) -> Result<DirectorySeedState, parser::ParseError> {
     let mut variables = IndexMap::new();
+    let mut metadata = crate::parser::ParserBindingMetadata::default();
     for ((_, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
         let mut parsed =
             parser::parse_with_seeded_bindings_without_literal_warnings(content, config, seeds)?;
         parsed
             .variables
             .retain(|name, _| local_variables.contains(name));
+        parsed
+            .parser_binding_metadata
+            .retain(|name| local_variables.contains(name));
         variables.extend(parsed.variables);
+        metadata.extend(parsed.parser_binding_metadata);
     }
-    Ok(variables)
+    Ok(DirectorySeedState {
+        variables,
+        metadata,
+    })
 }
 
 /// Get base directory for module resolution.

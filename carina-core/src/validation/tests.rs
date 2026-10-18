@@ -1,5 +1,7 @@
 use super::*;
-use crate::parser::{BindingName, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding};
+use crate::parser::{
+    BindingName, ModuleArgument, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding,
+};
 use crate::resource::{
     Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
     Resource, Signature,
@@ -7,14 +9,28 @@ use crate::resource::{
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::HashMap;
 
+fn module_arguments(
+    values: impl IntoIterator<Item = (String, Value)>,
+) -> HashMap<String, ModuleArgument> {
+    values
+        .into_iter()
+        .map(|(name, value)| (name, ModuleArgument::new(value)))
+        .collect()
+}
+
 fn rendered_typecheck_result(
     type_expr: &TypeExpr,
     value: &Value,
     config: &ProviderContext,
 ) -> Option<String> {
-    typecheck::check_type_expr_value(type_expr, value, config)
-        .err()
-        .map(|error| error.to_string())
+    typecheck::check_type_expr_value(
+        type_expr,
+        value,
+        config,
+        typecheck::TypecheckInference::Unavailable,
+    )
+    .err()
+    .map(|error| error.to_string())
 }
 
 fn rendered_struct_typecheck_result(
@@ -49,6 +65,7 @@ fn empty_parsed() -> ParsedFile {
         wait_bindings: Vec::new(),
         requires: Vec::new(),
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: Vec::new(),
         deferred_for_expressions: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -575,7 +592,7 @@ fn binding_referenced_in_module_call() {
         module_name: "web_tier".to_string(),
         binding_name: None,
         source: Default::default(),
-        arguments: args,
+        arguments: module_arguments(args),
     });
 
     assert!(check_unused_bindings(&parsed).is_empty());
@@ -1032,6 +1049,265 @@ fn unknown_attribute_reference_reports_error() {
     assert_eq!(
         result.unwrap_err(),
         "awscc.ec2.Subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
+    );
+}
+
+fn postfix_access_validation_fixture(
+    value: Value,
+    sink: AttributeType,
+) -> (ParsedFile, SchemaRegistry) {
+    use crate::schema::{AttributeSchema, StructField};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Queue")
+            .attribute(AttributeSchema::new("identifier", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "rules",
+                AttributeType::list(AttributeType::struct_(
+                    "Rule".to_string(),
+                    vec![StructField::new("name", AttributeType::string())],
+                )),
+            )),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer").attribute(AttributeSchema::new("value", sink)),
+    );
+
+    let queue = Resource::with_provider("mock", "test.Queue", "queue", None)
+        .with_binding("q")
+        .with_attribute(
+            "identifier",
+            Value::Concrete(ConcreteValue::String("a/b".into())),
+        )
+        .with_attribute("rules", Value::Concrete(ConcreteValue::List(Vec::new())));
+    let consumer = Resource::with_provider("mock", "test.Consumer", "consumer", None)
+        .with_attribute("value", value);
+    let mut parsed = empty_parsed();
+    parsed.resources.extend([queue, consumer]); // allow: direct — fixture test inspection
+    (parsed, schemas)
+}
+
+#[test]
+fn postfix_and_path_access_report_the_same_unknown_struct_field() {
+    use crate::resource::{
+        AccessMissPolicy, AccessPath, PathSegment, Subscript, apply_postfix_access,
+    };
+
+    let segments = vec![
+        PathSegment::Subscript {
+            index: Subscript::Int { index: 0 },
+        },
+        PathSegment::Field {
+            name: "nope".to_string(),
+        },
+    ];
+    let path_value = Value::Deferred(DeferredValue::ResourceRef {
+        path: AccessPath::with_segments("q", "rules", segments.clone()),
+    });
+    let postfix_value =
+        segments
+            .into_iter()
+            .fold(Value::resource_ref("q", "rules", vec![]), |base, step| {
+                apply_postfix_access(base, step, 1, AccessMissPolicy::Error)
+                    .expect("reference access canonicalizes")
+            });
+
+    assert_eq!(postfix_value, path_value);
+
+    let (path_parsed, schemas) =
+        postfix_access_validation_fixture(path_value, AttributeType::string());
+    let path_error = validate_resource_ref_types_for_test(&path_parsed, &schemas, &HashSet::new())
+        .expect_err("path form must reject the unknown field");
+    let (postfix_parsed, schemas) =
+        postfix_access_validation_fixture(postfix_value, AttributeType::string());
+    let postfix_error =
+        validate_resource_ref_types_for_test(&postfix_parsed, &schemas, &HashSet::new())
+            .expect_err("postfix form must reject the same unknown field");
+
+    assert_eq!(postfix_error, path_error);
+    assert!(postfix_error.contains("unknown field 'nope'"));
+}
+
+#[test]
+fn parenthesized_for_address_reports_the_same_unknown_field_as_direct_path() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+            let roles = for n in [0] {
+                mock.test.Thing { name = "role" }
+            }
+            mock.test.Consumer {
+                direct  = roles[0].nope
+                grouped = (roles[0]).nope
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("both reference spellings parse");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer");
+    assert_eq!(consumer.get_attr("direct"), consumer.get_attr("grouped"));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("identifier", AttributeType::string())),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::new("direct", AttributeType::string()))
+            .attribute(AttributeSchema::new("grouped", AttributeType::string())),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+        .expect_err("unknown field must be rejected for both spellings");
+    assert_eq!(
+        error.matches("unknown attribute 'nope'").count(),
+        2,
+        "{error}"
+    );
+    assert!(error.contains("roles[0].nope"), "{error}");
+}
+
+#[test]
+fn postfix_access_rejects_steps_that_do_not_fit_known_base_types() {
+    use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
+
+    let cases = [
+        apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())),
+                    Value::resource_ref("q", "identifier", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Str { key: "bad".into() },
+            },
+            1,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred"),
+        apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "upper".to_string(),
+                args: vec![Value::resource_ref("q", "identifier", vec![])],
+            }),
+            PathSegment::Field {
+                name: "foo".to_string(),
+            },
+            1,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred"),
+    ];
+
+    for value in cases {
+        let (parsed, schemas) = postfix_access_validation_fixture(value, AttributeType::string());
+        let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+            .expect_err("a known base type must reject an incompatible access step");
+        assert!(
+            error.contains("cannot apply") || error.contains("does not fit"),
+            "unexpected access-type error: {error}"
+        );
+    }
+}
+
+#[test]
+fn postfix_function_result_type_is_checked_against_resource_attribute_type() {
+    use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
+
+    let split_element = || {
+        apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())),
+                    Value::resource_ref("q", "identifier", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            1,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred")
+    };
+
+    let (invalid, schemas) =
+        postfix_access_validation_fixture(split_element(), AttributeType::int());
+    let error = validate_resource_ref_types_for_test(&invalid, &schemas, &HashSet::new())
+        .expect_err("split()[0] is String, not Int");
+    assert!(
+        error.contains("expected Int") && error.contains("String"),
+        "{error}"
+    );
+
+    let (valid, schemas) =
+        postfix_access_validation_fixture(split_element(), AttributeType::string());
+    validate_resource_ref_types_for_test(&valid, &schemas, &HashSet::new())
+        .expect("split()[0] is assignable to String");
+}
+
+#[test]
+fn secret_preserves_its_argument_type_through_postfix_access() {
+    let parsed = crate::parser::parse(
+        r#"
+            let q = mock.test.Queue { identifier = "a-b" }
+            mock.test.Consumer {
+                value = secret(split("-", q.identifier))[0]
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("secret-wrapped computed collection must parse");
+    let (_, schemas) = postfix_access_validation_fixture(
+        Value::Concrete(ConcreteValue::String("unused".into())),
+        AttributeType::string(),
+    );
+
+    validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+        .expect("secret(list(String))[0] must infer as String");
+}
+
+#[test]
+fn resource_reference_segments_reject_wrong_shape_like_computed_access() {
+    let parsed = crate::parser::parse(
+        r#"
+            let q = mock.test.Queue { identifier = "a-b" }
+            mock.test.Consumer {
+                value = (q.identifier)[0]
+            }
+            mock.test.Consumer {
+                value = [q.identifier][0][0]
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("wrong-shape reference paths remain parseable for schema validation");
+    let (_, schemas) = postfix_access_validation_fixture(
+        Value::Concrete(ConcreteValue::String("unused".into())),
+        AttributeType::string(),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+        .expect_err("indexing a String resource attribute must fail validation");
+    assert_eq!(
+        error.matches("cannot apply access [0] to String").count(),
+        2,
+        "both reference-rooted spellings must use the Access typecheck: {error}",
     );
 }
 
@@ -2852,7 +3128,7 @@ fn validate_module_calls_rejects_custom_type() {
         module_name: "github".to_string(),
         binding_name: None,
         source: Default::default(),
-        arguments: args,
+        arguments: module_arguments(args),
     }];
 
     let mut imported_modules = HashMap::new();
@@ -2884,7 +3160,7 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
         module_name: "web_tier".to_string(),
         binding_name: None,
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "environment".to_string(),
             Value::Concrete(ConcreteValue::String("production".into())),
         )]),
@@ -2929,7 +3205,7 @@ fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
         module_name: "inner".to_string(),
         binding_name: None,
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "name".to_string(),
             Value::Deferred(DeferredValue::BindingRef {
                 binding: "count".to_string(),
@@ -3545,7 +3821,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         module_name: "consumer".to_string(),
         binding_name: Some("instance".to_string()),
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "subnet_ids".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
                 Value::resource_ref("a".to_string(), "subnet_id".to_string(), vec![]),
@@ -3614,7 +3890,7 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         module_name: "consumer".to_string(),
         binding_name: None,
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "number".to_string(),
             Value::resource_ref("source", "count", Vec::new()),
         )]),

@@ -96,6 +96,8 @@ pub enum NodeKind {
     Expression,
     PipeExpr,
     ComposeExpr,
+    PostfixExpr,
+    Primary,
     FunctionCall,
     VariableRef,
     NamespacedId,

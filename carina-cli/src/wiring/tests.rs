@@ -5168,7 +5168,7 @@ mod expand_same_config_deferred_for_tests {
         // carina#3136 (the flipped carina#3132 PR-1 limitation pin):
         // chained field access on the loop variable
         // (`opt.resource_record.name`) is parsed to
-        // `Unknown(ForValuePath { path })` and re-navigated against the
+        // `Access(Unknown(ForValue), .resource_record.name)` and reduced against the
         // real element by `substitute_placeholder` at for-expansion.
         // The loop materializes AND its attributes resolve to concrete
         // values — this is the carina#3132 PR-3 real-registry shape.

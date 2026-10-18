@@ -625,6 +625,9 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().any(value_contains_empty_interpolation)
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            value_contains_empty_interpolation(access.base())
+        }
         _ => false,
     }
 }
@@ -2113,7 +2116,9 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         });
     }
     expanded.deferred_for_expressions = pre_expandable_deferred_for;
-    expanded.expand_deferred_for_expressions(&iterable_bindings);
+    expanded
+        .expand_deferred_for_expressions(&iterable_bindings)
+        .map_err(|error| AppError::Validation(error.to_string()))?;
     let printed_warnings = expanded.print_warnings();
     let residual_deferred_for = expanded.deferred_for_expressions.clone();
 

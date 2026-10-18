@@ -216,7 +216,7 @@ fn prepare_user_function_call<'cfg>(
 
     // Evaluate local lets, substituting and resolving each one
     for (let_name, let_expr) in &func.local_lets {
-        let substituted = substitute_fn_params(let_expr, &substitutions);
+        let substituted = substitute_fn_params(let_expr, &substitutions)?;
         let evaluated = try_evaluate_fn_value(substituted, &child_ctx)?;
         child_ctx.set_variable(let_name.clone(), evaluated.clone());
         substitutions.insert(let_name.clone(), evaluated);
@@ -298,6 +298,7 @@ pub fn validate_custom_type(
         }
         (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::FunctionCall { .. })) => Ok(()), // will be resolved later
+        (_, Value::Deferred(DeferredValue::Access(_))) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Interpolation(_))) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Unknown(_))) => Ok(()), // resolved at upstream apply
         (_, value) if text(value).is_some() => {
@@ -411,9 +412,12 @@ fn check_fn_arg_type(
     let resolved_type_expr = crate::validation::resolve_type_expr(type_expr, ctx.config).ok();
     let type_expr = resolved_type_expr.as_ref().unwrap_or(type_expr);
 
-    if let Err(mismatch) =
-        crate::validation::typecheck::check_type_expr_value(type_expr, value, ctx.config)
-    {
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+        type_expr,
+        value,
+        ctx.config,
+        crate::validation::typecheck::TypecheckInference::Unavailable,
+    ) {
         return Err(function_argument_type_error(fn_name, param_name, mismatch));
     }
 
@@ -466,9 +470,12 @@ fn check_fn_return_type(
     value: &Value,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    if let Err(mismatch) =
-        crate::validation::typecheck::check_type_expr_value(type_expr, value, config)
-    {
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+        type_expr,
+        value,
+        config,
+        crate::validation::typecheck::TypecheckInference::Unavailable,
+    ) {
         return Err(function_return_type_error(fn_name, mismatch));
     }
     Ok(())
@@ -501,7 +508,7 @@ pub(crate) fn evaluate_user_function(
     };
 
     let UserFunctionBody(body) = &func.body;
-    let substituted_body = substitute_fn_params(body, &substitutions);
+    let substituted_body = substitute_fn_params(body, &substitutions)?;
     let result = try_evaluate_fn_value(substituted_body, &child_ctx)?.canonicalize();
     // Check return type if annotated
     if let Some(ref return_type) = func.return_type {
@@ -513,6 +520,9 @@ pub(crate) fn evaluate_user_function(
 pub fn contains_function_call(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::FunctionCall { .. }) => true,
+        Value::Deferred(DeferredValue::Access(access)) => {
+            contains_function_call(access.base())
+        }
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_function_call),
         Value::Concrete(ConcreteValue::Map(entries)) => {
             entries.values().any(contains_function_call)
@@ -526,8 +536,11 @@ pub fn contains_function_call(value: &Value) -> bool {
 }
 
 /// Recursively substitute function parameter placeholders with actual values
-fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -> Value {
-    match value {
+fn substitute_fn_params(
+    value: &Value,
+    substitutions: &HashMap<String, Value>,
+) -> Result<Value, ParseError> {
+    Ok(match value {
         Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam { name }))
         | Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal { name })) => substitutions
             .get(name)
@@ -537,12 +550,12 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
             items
                 .iter()
                 .map(|v| substitute_fn_params(v, substitutions))
-                .collect(),
+                .collect::<Result<_, _>>()?,
         )),
         Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
             map.iter()
-                .map(|(k, v)| (k.clone(), substitute_fn_params(v, substitutions)))
-                .collect(),
+                .map(|(k, v)| Ok((k.clone(), substitute_fn_params(v, substitutions)?)))
+                .collect::<Result<_, ParseError>>()?,
         )),
         Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             Value::Deferred(DeferredValue::FunctionCall {
@@ -550,31 +563,38 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
                 args: args
                     .iter()
                     .map(|a| substitute_fn_params(a, substitutions))
-                    .collect(),
+                    .collect::<Result<_, _>>()?,
             })
         }
+        Value::Deferred(DeferredValue::Access(access)) => access
+            .rebuild_with_base(
+                substitute_fn_params(access.base(), substitutions)?,
+                crate::resource::AccessMissPolicy::Error,
+            )
+            .map_err(|error| ParseError::InvalidExpression {
+                line: access.source_line(),
+                message: error.to_string(),
+            })?,
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             Value::Deferred(DeferredValue::Interpolation(
                 parts
                     .iter()
                     .map(|p| match p {
                         crate::resource::InterpolationPart::Expr(v) => {
-                            crate::resource::InterpolationPart::Expr(substitute_fn_params(
-                                v,
-                                substitutions,
-                            ))
+                            substitute_fn_params(v, substitutions)
+                                .map(crate::resource::InterpolationPart::Expr)
                         }
-                        other => other.clone(),
+                        other => Ok(other.clone()),
                     })
-                    .collect(),
+                    .collect::<Result<_, _>>()?,
             ))
         }
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(substitute_fn_params(inner, substitutions)),
+            Box::new(substitute_fn_params(inner, substitutions)?),
         )),
         Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
         other => other.clone(),
-    }
+    })
 }
 
 /// Try to evaluate a value (resolve function calls including user-defined ones).
@@ -665,6 +685,15 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                     }
                 }
             }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let base = try_evaluate_fn_value(access.base().clone(), ctx)?;
+            access
+                .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
+                .map_err(|error| ParseError::InvalidExpression {
+                    line: access.source_line(),
+                    message: error.to_string(),
+                })
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             let evaluated: Result<Vec<Value>, ParseError> = items

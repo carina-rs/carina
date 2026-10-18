@@ -7,7 +7,7 @@
 use super::ProviderContext;
 use super::error::ParseError;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+use crate::resource::{AccessMissPolicy, ConcreteValue, DeferredValue, InterpolationPart, Value};
 
 /// Check whether a Value is fully static (no runtime dependencies).
 pub(crate) fn is_static_value(value: &Value) -> bool {
@@ -25,6 +25,7 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().all(is_static_value)
         }
+        Value::Deferred(DeferredValue::Access(access)) => is_static_value(access.base()),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
                 InterpolationPart::Literal(_) => true,
@@ -46,6 +47,9 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
 pub(crate) fn is_static_eval(value: &EvalValue) -> bool {
     match value {
         EvalValue::User(v) => is_static_value(v),
+        EvalValue::StructuralHandle(_) => true,
+        EvalValue::ComputedWithStructuralHandles { value, .. } => is_static_value(value),
+        EvalValue::DeferredForValue { .. } => false,
         EvalValue::Closure { captured_args, .. } => captured_args.iter().all(is_static_eval),
     }
 }
@@ -121,6 +125,15 @@ pub(crate) fn evaluate_static_value(
                      (still needs {} arg(s)); finish the partial application",
                         leak.name, leak.remaining_arity
                     ),
+                })
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let base = evaluate_static_value(access.base().clone(), config)?;
+            access
+                .rebuild_with_base(base, AccessMissPolicy::Error)
+                .map_err(|error| ParseError::InvalidExpression {
+                    line: access.source_line(),
+                    message: error.to_string(),
                 })
         }
         other => Ok(other),

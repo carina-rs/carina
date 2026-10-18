@@ -20,8 +20,8 @@ Concrete/Deferred 軸は既に enum で分離されているので、Value 軸�
 | # | 形 | 階層 | 意味 | 解決時期 |
 | - | --- | ---- | ---- | -------- |
 | 1 | `Value::Deferred(DeferredValue::ResourceRef / BindingRef / Interpolation / FunctionCall)` | 値 (式) | 参照や式 — 評価すれば concrete | **reference resolution 時** |
-| 2 | `Value::Deferred(DeferredValue::Unknown(UpstreamRef / UpstreamBareRef))` | 値 (apply待ち) | upstream state 未解決、apply 後に判明 | **upstream apply 時** |
-| 3 | `Value::Deferred(DeferredValue::Unknown(ForKey / ForIndex / ForValue / ForValuePath))` | 値 (式) | for-expression のループ変数、iterable が解決すれば置換可 | **iterable 解決時** |
+| 2 | `Value::Deferred(DeferredValue::Unknown(UpstreamExport / UpstreamAllExports))` | 値 (apply待ち) | upstream state 未解決、apply 後に判明 | **upstream apply 時** |
+| 3 | `Value::Deferred(DeferredValue::Unknown(ForKey / ForIndex / ForValue))`（フィールド参照は `Access` を重ねる） | 値 (式) | for-expression のループ変数、iterable が解決すれば置換可 | **iterable 解決時** |
 | 4 | `Value::Deferred(DeferredValue::Unknown(EmptyInterpolation))` | 値 (パースエラー) | `${}` (空の interpolation) — 編集途中の sentinel | **(発生源で diagnostic) ** |
 | 5 | `Value::Deferred(DeferredValue::Secret(_))` | 値 (orthogonal) | 値が秘匿対象、中身は (1)(2)(3) どれもありうる | (中身に依存) |
 | 6 | `AttributeType::Custom { identity: None, .. }` | 型 (静的) | identity 軸で「区別しない」(3 つの意味が混在、§3 参照) | **(静的、不変)** |
@@ -75,7 +75,7 @@ Concrete/Deferred 軸は既に enum で分離されているので、Value 軸�
 ### 不変条件 1: 解決時期を型で区別する
 
 現状、`DeferredValue` は「reference resolution で解決」(BindingRef 等)と
-「apply 時に解決」(Unknown::UpstreamRef 等) を**同じ階層に並べている**。
+「apply 時に解決」(Unknown::UpstreamExport 等) を**同じ階層に並べている**。
 `resolve_ref_value` のような関数は「reference は解決できるが unknown は
 素通し」というロジックを runtime match で書かなければならない。
 
@@ -94,18 +94,18 @@ pub enum ReferenceExpr {
     BindingRef { binding: String },
     Interpolation(Vec<InterpolationPart>),
     FunctionCall { name: String, args: Vec<Value> },
+    Access { base: Box<Value>, step: PathSegment },
 }
 
 pub enum ApplyTimeUnknown {
-    UpstreamRef { path: AccessPath },
-    UpstreamBareRef { binding: String },
+    UpstreamExport { path: AccessPath },
+    UpstreamAllExports { binding: String },
     ForKey, ForIndex, ForValue,
-    ForValuePath { path: AccessPath },
     EmptyInterpolation,
 }
 ```
 
-`ForKey / ForIndex / ForValue / ForValuePath` を `ApplyTimeUnknown` に
+`ForKey / ForIndex / ForValue` を `ApplyTimeUnknown` に
 含めるかは**設計判断ポイント**。iterable 解決で置換される(=
 "reference 解決時") とも見えるし、上流 apply 待ちと同じ「将来置換され
 る placeholder」とも見える。Phase 1 で確定させる。
@@ -349,7 +349,7 @@ Rust の typestate は monomorphization が爆発する可能性。Phase 3 着�
 
 ### 6.4 For-loop variants の所属
 
-§3 不変条件 1 の「`ForKey / ForIndex / ForValue / ForValuePath` を
+§3 不変条件 1 の「`ForKey / ForIndex / ForValue` を
 `ApplyTimeUnknown` に入れるか `ReferenceExpr` に入れるか」は
 **Phase 2.c 着手前に決める必要がある**。判断基準は「いつ resolve され
 るか」: iterable が解決した瞬間 (= reference resolution と同タイミング)

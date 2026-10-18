@@ -563,10 +563,29 @@ impl Formatter {
         None
     }
 
-    /// Unwrap transparent expression wrappers (PipeExpr, ComposeExpr) to find the inner node
+    /// Unwrap transparent expression wrappers to find the inner value node.
+    /// A `PostfixExpr` is transparent only when it has no actual access
+    /// suffix; otherwise treating `{...}["key"]` as a map would trigger the
+    /// map/block formatting paths for the wrong result shape.
     pub(in crate::formatter) fn unwrap_expr_wrappers<'a>(&self, node: &'a CstNode) -> &'a CstNode {
         match node.kind {
-            NodeKind::PipeExpr | NodeKind::ComposeExpr => {
+            NodeKind::PipeExpr | NodeKind::ComposeExpr | NodeKind::Primary => {
+                for child in &node.children {
+                    if let CstChild::Node(n) = child {
+                        return self.unwrap_expr_wrappers(n);
+                    }
+                }
+                node
+            }
+            NodeKind::PostfixExpr
+                if !node.children.iter().any(|child| {
+                    matches!(
+                        child,
+                        CstChild::Node(node)
+                            if matches!(node.kind, NodeKind::FieldAccess | NodeKind::IndexAccess)
+                    )
+                }) =>
+            {
                 for child in &node.children {
                     if let CstChild::Node(n) = child {
                         return self.unwrap_expr_wrappers(n);

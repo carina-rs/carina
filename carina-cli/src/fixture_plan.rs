@@ -85,6 +85,11 @@ fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
         ),
         awscc(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
         awscc(
+            ResourceSchema::new("issue3885.Role")
+                .attribute(create_only_string("role_name"))
+                .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
+        ),
+        awscc(
             ResourceSchema::new("iam.RolePolicy")
                 .attribute(create_only_string("policy_name"))
                 .attribute(create_only_string("role_name"))

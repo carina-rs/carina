@@ -191,6 +191,17 @@ fn collect_unsynchronized_refs(
                 );
             }
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            collect_unsynchronized_refs(
+                access.base(),
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             collect_unsynchronized_refs(
                 inner,

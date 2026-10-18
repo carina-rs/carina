@@ -7,7 +7,8 @@ use super::error::{ParseWarning, WarningKind};
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
-use crate::binding_index::IterableBindings;
+use crate::binding_index::{BindingValueSource, IterableBindings};
+use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, Directives, GraphNode, LeafNode,
     Resource, ResourceId, ResourceIdentity, UnknownReason, Value,
@@ -35,7 +36,7 @@ pub struct DeferredForExpression {
     /// The provider-qualified resource type the loop body would produce (e.g., `awscc.sso.Assignment`).
     pub resource_type: String,
     /// Attribute template: key → value (concrete values are resolved;
-    /// loop-bound variables remain as `ResourceRef` or placeholder strings).
+    /// loop-bound values remain as deferred postfix access expressions).
     pub attributes: Vec<(String, Value)>,
     /// The binding address prefix for generated resources (e.g., `_for0`).
     pub binding_name: String,
@@ -50,10 +51,30 @@ pub struct DeferredForExpression {
     pub template_resource: Resource,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("expected {expected_kind} iterable, got {got_kind}")]
 pub struct ShapeMismatch {
     expected_kind: &'static str,
     got_kind: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DeferredForExpansionError {
+    #[error(transparent)]
+    ShapeMismatch(#[from] ShapeMismatch),
+    #[error("deferred-for binding `{binding}` at line {line}, attribute `{attribute}`: {message}")]
+    ValueAccess {
+        binding: String,
+        line: usize,
+        attribute: String,
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+struct PlaceholderAccessError {
+    line: usize,
+    message: String,
 }
 
 impl ShapeMismatch {
@@ -887,15 +908,78 @@ pub struct UserFunction {
 }
 
 /// Module call (instantiation)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleArgument {
+    value: Value,
+    access_base: Option<Value>,
+}
+
+impl ModuleArgument {
+    pub(crate) fn from_parts(value: Value, access_base: Option<Value>) -> Self {
+        Self { value, access_base }
+    }
+
+    pub fn new(value: Value) -> Self {
+        Self::from_parts(value, None)
+    }
+
+    pub(crate) fn with_access_base(value: Value, access_base: Value) -> Self {
+        Self::from_parts(value, Some(access_base))
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub(crate) fn access_base(&self) -> Option<&Value> {
+        self.access_base.as_ref()
+    }
+
+    pub(crate) fn value_for_access(&self) -> &Value {
+        self.access_base.as_ref().unwrap_or(&self.value)
+    }
+
+    pub(crate) fn try_rewrite<E>(
+        &mut self,
+        mut rewrite: impl FnMut(&Value) -> Result<Value, E>,
+    ) -> Result<(), E> {
+        let value = rewrite(&self.value)?;
+        let access_base = self.access_base.as_ref().map(&mut rewrite).transpose()?;
+        self.value = value;
+        self.access_base = access_base;
+        Ok(())
+    }
+}
+
+impl From<Value> for ModuleArgument {
+    fn from(value: Value) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Module call (instantiation)
 #[derive(Debug, Clone)]
 pub struct ModuleCall {
     pub module_name: String,
     pub binding_name: Option<String>,
-    pub arguments: HashMap<String, Value>,
+    pub arguments: HashMap<String, ModuleArgument>,
     pub(crate) source: Box<ModuleCallSource>,
 }
 
 impl ModuleCall {
+    pub(crate) fn from_arguments(
+        module_name: impl Into<String>,
+        binding_name: Option<String>,
+        arguments: HashMap<String, ModuleArgument>,
+    ) -> Self {
+        Self {
+            module_name: module_name.into(),
+            binding_name,
+            arguments,
+            source: Box::default(),
+        }
+    }
+
     /// Construct a synthetic module call that has no authored source site.
     ///
     /// Parser-created calls always carry source metadata. This constructor is
@@ -906,12 +990,14 @@ impl ModuleCall {
         binding_name: Option<String>,
         arguments: HashMap<String, Value>,
     ) -> Self {
-        Self {
-            module_name: module_name.into(),
+        Self::from_arguments(
+            module_name,
             binding_name,
-            arguments,
-            source: Box::default(),
-        }
+            arguments
+                .into_iter()
+                .map(|(name, value)| (name, ModuleArgument::new(value)))
+                .collect(),
+        )
     }
 
     pub(crate) fn with_source(mut self, source: ModuleCallSource) -> Self {
@@ -982,6 +1068,51 @@ pub struct ModuleCallDiagnosticSource {
     /// Distinguishes concrete calls expanded from the same authored `for`
     /// body. Direct calls have no expansion key.
     pub expansion_key: Option<String>,
+}
+
+/// Parser-only binding metadata that must survive directory fixed-point passes.
+///
+/// This type is public only because [`File`] is publicly constructible. Its
+/// contents stay crate-private so evaluator-only handles cannot escape into the
+/// runtime [`Value`] model.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParserBindingMetadata {
+    structural_aliases: IndexMap<String, StructuralHandle>,
+    value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
+}
+
+impl ParserBindingMetadata {
+    pub(crate) fn structural_aliases(&self) -> &IndexMap<String, StructuralHandle> {
+        &self.structural_aliases
+    }
+
+    pub(crate) fn insert_structural_alias(&mut self, name: String, handle: StructuralHandle) {
+        self.structural_aliases.insert(name, handle);
+    }
+
+    pub(crate) fn value_structural_handles(&self, name: &str) -> Option<&StructuralHandleMetadata> {
+        self.value_structural_handles.get(name)
+    }
+
+    pub(crate) fn insert_value_structural_handles(
+        &mut self,
+        name: String,
+        metadata: StructuralHandleMetadata,
+    ) {
+        self.value_structural_handles.insert(name, metadata);
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.structural_aliases.retain(|name, _| keep(name));
+        self.value_structural_handles.retain(|name, _| keep(name));
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.structural_aliases.extend(other.structural_aliases);
+        self.value_structural_handles
+            .extend(other.value_structural_handles);
+    }
 }
 
 /// Provider configuration
@@ -1293,6 +1424,9 @@ pub struct File<E> {
     /// Binding names that are structurally required (if/for/read expressions)
     /// and should not trigger unused-binding warnings.
     pub structural_bindings: HashSet<String>,
+    /// Evaluator-only classification carried between directory parse passes.
+    #[doc(hidden)]
+    pub parser_binding_metadata: ParserBindingMetadata,
     /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
     /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
@@ -1338,6 +1472,7 @@ impl<E> Default for File<E> {
             wait_bindings: Vec::new(),
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
+            parser_binding_metadata: ParserBindingMetadata::default(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -1378,6 +1513,7 @@ impl<E> File<E> {
             wait_bindings,
             requires,
             structural_bindings,
+            parser_binding_metadata,
             warnings,
             deferred_for_expressions,
             expansion_trace,
@@ -1401,6 +1537,7 @@ impl<E> File<E> {
             wait_bindings,
             requires,
             structural_bindings,
+            parser_binding_metadata,
             warnings,
             deferred_for_expressions,
             expansion_trace,
@@ -1584,7 +1721,10 @@ impl<E> File<E> {
     /// (`for _, opt in cert.domain_validation_options`) is in scope here
     /// only because the caller projects the post-refresh
     /// [`crate::binding_index::ResolvedBindings`] in.
-    pub fn expand_deferred_for_expressions(&mut self, bindings: &IterableBindings) {
+    pub fn expand_deferred_for_expressions(
+        &mut self,
+        bindings: &IterableBindings,
+    ) -> Result<(), DeferredForExpansionError> {
         let mut expanded_resources = Vec::new();
         let mut resolved_indices = Vec::new();
         // Indices where the iterable resolved but had the wrong shape. These
@@ -1603,30 +1743,42 @@ impl<E> File<E> {
             let Some(iterable_value) = iterable else {
                 continue;
             };
+            let Some(source) = bindings.source(&deferred.iterable_binding) else {
+                continue;
+            };
+            let miss_policy = match source {
+                BindingValueSource::Local | BindingValueSource::WaitAlias { .. } => {
+                    crate::resource::AccessMissPolicy::Defer
+                }
+                BindingValueSource::Upstream => crate::resource::AccessMissPolicy::Error,
+            };
 
             match (&deferred.binding, iterable_value) {
                 // Simple binding: only the value var is bound
                 (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(_))) => {
-                    expanded_resources.extend(
-                        expand_deferred_children(deferred, iterable_value)
-                            .expect("matched simple deferred-for list iterable"),
-                    );
+                    expanded_resources.extend(expand_deferred_children(
+                        deferred,
+                        iterable_value,
+                        miss_policy,
+                    )?);
                     resolved_indices.push(idx);
                 }
                 // Indexed binding: both index and value vars are bound
                 (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(_))) => {
-                    expanded_resources.extend(
-                        expand_deferred_children(deferred, iterable_value)
-                            .expect("matched indexed deferred-for list iterable"),
-                    );
+                    expanded_resources.extend(expand_deferred_children(
+                        deferred,
+                        iterable_value,
+                        miss_policy,
+                    )?);
                     resolved_indices.push(idx);
                 }
                 // Map binding expands over maps, substituting both key and value vars
                 (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
-                    expanded_resources.extend(
-                        expand_deferred_children(deferred, iterable_value)
-                            .expect("matched map deferred-for map iterable"),
-                    );
+                    expanded_resources.extend(expand_deferred_children(
+                        deferred,
+                        iterable_value,
+                        miss_policy,
+                    )?);
                     resolved_indices.push(idx);
                 }
                 // Shape mismatch: replace the original "not yet available" warning
@@ -1687,6 +1839,7 @@ impl<E> File<E> {
         // composition for-body never reaches the deferred path.)
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
+        Ok(())
     }
 }
 
@@ -1702,148 +1855,71 @@ fn retain_non_matching_deferred_for_warnings(
 pub fn expand_deferred_children(
     deferred: &DeferredForExpression,
     iterable_value: &Value,
-) -> Result<Vec<Resource>, ShapeMismatch> {
-    match &deferred.binding {
-        ForBinding::Simple(_) => match iterable_value {
-            Value::Concrete(ConcreteValue::List(items)) => Ok(items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    let address = format!("{}[{}]", deferred.binding_name, i);
-                    build_expanded_child(deferred, address, None, None, item)
+    miss_policy: crate::resource::AccessMissPolicy,
+) -> Result<Vec<Resource>, DeferredForExpansionError> {
+    match (&deferred.binding, iterable_value) {
+        (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let address = format!("{}[{index}]", deferred.binding_name);
+                build_expanded_child(deferred, address, None, None, item, miss_policy)
+            })
+            .collect(),
+        (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(items))) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let address = format!("{}[{index}]", deferred.binding_name);
+                build_expanded_child(
+                    deferred,
+                    address,
+                    Some(index as i64),
+                    None,
+                    item,
+                    miss_policy,
+                )
+            })
+            .collect(),
+        (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(map))) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            keys.into_iter()
+                .map(|key| {
+                    let address = crate::utils::map_key_address(&deferred.binding_name, key);
+                    build_expanded_child(deferred, address, None, Some(key), &map[key], miss_policy)
                 })
-                .collect()),
-            Value::Concrete(ConcreteValue::Map(_)) => Err(ShapeMismatch::new("list", "map")),
-            Value::Concrete(ConcreteValue::String(_)) => Err(ShapeMismatch::new("list", "string")),
-            Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
-                Err(ShapeMismatch::new("list", "enum identifier"))
-            }
-            Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
-                Err(ShapeMismatch::new("list", "enum"))
-            }
-            Value::Concrete(ConcreteValue::Int(_)) => Err(ShapeMismatch::new("list", "int")),
-            Value::Concrete(ConcreteValue::Float(_)) => Err(ShapeMismatch::new("list", "float")),
-            Value::Concrete(ConcreteValue::Bool(_)) => Err(ShapeMismatch::new("list", "bool")),
-            Value::Concrete(ConcreteValue::Duration(_)) => {
-                Err(ShapeMismatch::new("list", "duration"))
-            }
-            Value::Concrete(ConcreteValue::StringList(_)) => {
-                Err(ShapeMismatch::new("list", "string list"))
-            }
-            Value::Deferred(DeferredValue::ResourceRef { .. }) => {
-                Err(ShapeMismatch::new("list", "deferred resource reference"))
-            }
-            Value::Deferred(DeferredValue::BindingRef { .. }) => {
-                Err(ShapeMismatch::new("list", "deferred binding reference"))
-            }
-            Value::Deferred(DeferredValue::Interpolation(_)) => {
-                Err(ShapeMismatch::new("list", "deferred interpolation"))
-            }
-            Value::Deferred(DeferredValue::FunctionCall { .. }) => {
-                Err(ShapeMismatch::new("list", "deferred function call"))
-            }
-            Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("list", "secret")),
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-                Err(ShapeMismatch::new("list", "redacted secret"))
-            }
-            Value::Deferred(DeferredValue::Unknown(_)) => {
-                Err(ShapeMismatch::new("list", "unknown"))
-            }
-        },
-        ForBinding::Indexed(_, _) => match iterable_value {
-            Value::Concrete(ConcreteValue::List(items)) => Ok(items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    let address = format!("{}[{}]", deferred.binding_name, i);
-                    build_expanded_child(deferred, address, Some(i as i64), None, item)
-                })
-                .collect()),
-            Value::Concrete(ConcreteValue::Map(_)) => Err(ShapeMismatch::new("list", "map")),
-            Value::Concrete(ConcreteValue::String(_)) => Err(ShapeMismatch::new("list", "string")),
-            Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
-                Err(ShapeMismatch::new("list", "enum identifier"))
-            }
-            Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
-                Err(ShapeMismatch::new("list", "enum"))
-            }
-            Value::Concrete(ConcreteValue::Int(_)) => Err(ShapeMismatch::new("list", "int")),
-            Value::Concrete(ConcreteValue::Float(_)) => Err(ShapeMismatch::new("list", "float")),
-            Value::Concrete(ConcreteValue::Bool(_)) => Err(ShapeMismatch::new("list", "bool")),
-            Value::Concrete(ConcreteValue::Duration(_)) => {
-                Err(ShapeMismatch::new("list", "duration"))
-            }
-            Value::Concrete(ConcreteValue::StringList(_)) => {
-                Err(ShapeMismatch::new("list", "string list"))
-            }
-            Value::Deferred(DeferredValue::ResourceRef { .. }) => {
-                Err(ShapeMismatch::new("list", "deferred resource reference"))
-            }
-            Value::Deferred(DeferredValue::BindingRef { .. }) => {
-                Err(ShapeMismatch::new("list", "deferred binding reference"))
-            }
-            Value::Deferred(DeferredValue::Interpolation(_)) => {
-                Err(ShapeMismatch::new("list", "deferred interpolation"))
-            }
-            Value::Deferred(DeferredValue::FunctionCall { .. }) => {
-                Err(ShapeMismatch::new("list", "deferred function call"))
-            }
-            Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("list", "secret")),
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-                Err(ShapeMismatch::new("list", "redacted secret"))
-            }
-            Value::Deferred(DeferredValue::Unknown(_)) => {
-                Err(ShapeMismatch::new("list", "unknown"))
-            }
-        },
-        ForBinding::Map(_, _) => match iterable_value {
-            Value::Concrete(ConcreteValue::Map(map)) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                Ok(keys
-                    .into_iter()
-                    .map(|key| {
-                        let val = &map[key];
-                        let address = crate::utils::map_key_address(&deferred.binding_name, key);
-                        build_expanded_child(deferred, address, None, Some(key), val)
-                    })
-                    .collect())
-            }
-            Value::Concrete(ConcreteValue::List(_)) => Err(ShapeMismatch::new("map", "list")),
-            Value::Concrete(ConcreteValue::String(_)) => Err(ShapeMismatch::new("map", "string")),
-            Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
-                Err(ShapeMismatch::new("map", "enum identifier"))
-            }
-            Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
-                Err(ShapeMismatch::new("map", "enum"))
-            }
-            Value::Concrete(ConcreteValue::Int(_)) => Err(ShapeMismatch::new("map", "int")),
-            Value::Concrete(ConcreteValue::Float(_)) => Err(ShapeMismatch::new("map", "float")),
-            Value::Concrete(ConcreteValue::Bool(_)) => Err(ShapeMismatch::new("map", "bool")),
-            Value::Concrete(ConcreteValue::Duration(_)) => {
-                Err(ShapeMismatch::new("map", "duration"))
-            }
-            Value::Concrete(ConcreteValue::StringList(_)) => {
-                Err(ShapeMismatch::new("map", "string list"))
-            }
-            Value::Deferred(DeferredValue::ResourceRef { .. }) => {
-                Err(ShapeMismatch::new("map", "deferred resource reference"))
-            }
-            Value::Deferred(DeferredValue::BindingRef { .. }) => {
-                Err(ShapeMismatch::new("map", "deferred binding reference"))
-            }
-            Value::Deferred(DeferredValue::Interpolation(_)) => {
-                Err(ShapeMismatch::new("map", "deferred interpolation"))
-            }
-            Value::Deferred(DeferredValue::FunctionCall { .. }) => {
-                Err(ShapeMismatch::new("map", "deferred function call"))
-            }
-            Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("map", "secret")),
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-                Err(ShapeMismatch::new("map", "redacted secret"))
-            }
-            Value::Deferred(DeferredValue::Unknown(_)) => Err(ShapeMismatch::new("map", "unknown")),
-        },
+                .collect()
+        }
+        (ForBinding::Simple(_) | ForBinding::Indexed(_, _), other) => {
+            Err(ShapeMismatch::new("list", deferred_iterable_kind(other)).into())
+        }
+        (ForBinding::Map(_, _), other) => {
+            Err(ShapeMismatch::new("map", deferred_iterable_kind(other)).into())
+        }
+    }
+}
+
+fn deferred_iterable_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Concrete(ConcreteValue::String(_)) => "string",
+        Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "enum identifier",
+        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "enum",
+        Value::Concrete(ConcreteValue::Int(_)) => "int",
+        Value::Concrete(ConcreteValue::Float(_)) => "float",
+        Value::Concrete(ConcreteValue::Bool(_)) => "bool",
+        Value::Concrete(ConcreteValue::Duration(_)) => "duration",
+        Value::Concrete(ConcreteValue::List(_)) => "list",
+        Value::Concrete(ConcreteValue::StringList(_)) => "string list",
+        Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
+        Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
+        Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => "deferred function call",
+        Value::Deferred(DeferredValue::Access(_)) => "deferred access expression",
+        Value::Deferred(DeferredValue::Secret(_)) => "secret",
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
+        Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
     }
 }
 
@@ -1853,7 +1929,8 @@ fn build_expanded_child(
     index: Option<i64>,
     key: Option<&str>,
     item: &Value,
-) -> Resource {
+    miss_policy: crate::resource::AccessMissPolicy,
+) -> Result<Resource, DeferredForExpansionError> {
     let mut resource = deferred
         .template_resource
         .instantiate_with_identity(ResourceIdentity::new(address.clone()));
@@ -1861,8 +1938,16 @@ fn build_expanded_child(
     resource
         .dependency_bindings
         .insert(deferred.iterable_binding.clone());
-    substitute_attrs(&mut resource, index, key, item);
-    resource
+    if let Err((attribute, error)) = substitute_attrs(&mut resource, index, key, item, miss_policy)
+    {
+        return Err(DeferredForExpansionError::ValueAccess {
+            binding: deferred.binding_name.clone(),
+            line: error.line,
+            attribute,
+            message: error.message,
+        });
+    }
+    Ok(resource)
 }
 
 /// Run `substitute_placeholder` over every attribute of `resource`, then
@@ -1875,11 +1960,14 @@ fn substitute_attrs(
     index: Option<i64>,
     key: Option<&str>,
     value: &Value,
-) {
-    for (_, attr) in resource.attributes.iter_mut() {
-        substitute_placeholder(attr, index, key, value);
+    miss_policy: crate::resource::AccessMissPolicy,
+) -> Result<(), (String, PlaceholderAccessError)> {
+    for (name, attr) in resource.attributes.iter_mut() {
+        substitute_placeholder_with_policy(attr, index, key, value, miss_policy)
+            .map_err(|error| (name.clone(), error))?;
         attr.canonicalize_in_place();
     }
+    Ok(())
 }
 
 /// Substitute deferred-for-expression placeholders in a Value tree.
@@ -1894,29 +1982,33 @@ fn substitute_attrs(
 ///
 /// `UnknownReason::UpstreamExport` is the upstream-export marker, not a
 /// for-binding placeholder, so it is preserved unchanged.
-pub(super) fn substitute_placeholder(
+#[cfg(test)]
+fn substitute_placeholder(
     v: &mut Value,
     index: Option<i64>,
     key: Option<&str>,
     value: &Value,
-) {
+) -> Result<(), PlaceholderAccessError> {
+    substitute_placeholder_with_policy(
+        v,
+        index,
+        key,
+        value,
+        crate::resource::AccessMissPolicy::Error,
+    )
+}
+
+fn substitute_placeholder_with_policy(
+    v: &mut Value,
+    index: Option<i64>,
+    key: Option<&str>,
+    value: &Value,
+    miss_policy: crate::resource::AccessMissPolicy,
+) -> Result<(), PlaceholderAccessError> {
     match v {
         Value::Deferred(DeferredValue::Unknown(reason)) => match reason.clone() {
             UnknownReason::ForValue => {
                 *v = value.clone();
-            }
-            UnknownReason::ForValuePath { path } => {
-                // carina#3136: a field access on the loop variable
-                // (`opt.resource_record.name`). The element is now known
-                // (`value`); re-navigate it along the remembered path via
-                // the *same* navigator the parse-time resolved case uses
-                // (single source of truth). If it does not navigate (the
-                // element genuinely lacks that path), leave the placeholder
-                // so the existing "unresolved" surfacing applies rather
-                // than silently substituting a wrong value.
-                if let Some(resolved) = crate::resource::navigate_value_path(value, &path) {
-                    *v = resolved;
-                }
             }
             UnknownReason::ForKey => {
                 if let Some(k) = key {
@@ -1934,35 +2026,58 @@ pub(super) fn substitute_placeholder(
             | UnknownReason::EmptyInterpolation
             | UnknownReason::PostCreateReadIncomplete { .. } => {}
             // Function placeholders are substituted by user-function evaluation, not for expansion.
-            UnknownReason::FnParam { .. } | UnknownReason::FnLocal { .. } => {}
+            UnknownReason::FnParam { .. }
+            | UnknownReason::FnLocal { .. }
+            | UnknownReason::ModuleArgument { .. } => {}
         },
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items.iter_mut() {
-                substitute_placeholder(item, index, key, value);
+                substitute_placeholder_with_policy(item, index, key, value, miss_policy)?;
             }
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             for val in map.values_mut() {
-                substitute_placeholder(val, index, key, value);
+                substitute_placeholder_with_policy(val, index, key, value, miss_policy)?;
             }
         }
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             for arg in args.iter_mut() {
-                substitute_placeholder(arg, index, key, value);
+                substitute_placeholder_with_policy(arg, index, key, value, miss_policy)?;
+            }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let access = access.clone();
+            let original = Value::Deferred(DeferredValue::Access(access.clone()));
+            let mut base = access.base().clone();
+            substitute_placeholder_with_policy(&mut base, index, key, value, miss_policy)?;
+            // The placeholder may now be a concrete list/map. Re-run the
+            // shared access primitive so expanded `for` bodies do not retain
+            // a stale deferred wrapper after substitution.
+            match access.rebuild_result(base, access.step().clone(), miss_policy) {
+                Ok(crate::resource::ValuePathSegmentResult::Resolved(value))
+                | Ok(crate::resource::ValuePathSegmentResult::Deferred(value)) => *v = value,
+                Ok(crate::resource::ValuePathSegmentResult::DeferredMiss(_)) => *v = original,
+                Err(error) => {
+                    return Err(PlaceholderAccessError {
+                        line: access.source_line(),
+                        message: error.to_string(),
+                    });
+                }
             }
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts.iter_mut() {
                 if let crate::resource::InterpolationPart::Expr(inner) = part {
-                    substitute_placeholder(inner, index, key, value);
+                    substitute_placeholder_with_policy(inner, index, key, value, miss_policy)?;
                 }
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            substitute_placeholder(inner, index, key, value);
+            substitute_placeholder_with_policy(inner, index, key, value, miss_policy)?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1973,6 +2088,30 @@ mod substitute_placeholder_tests {
         UnknownReason, Value,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn module_argument_rewrite_cannot_leave_its_access_base_stale() {
+        let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+        let call = |value: &str| {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "upper".to_string(),
+                args: vec![string(value)],
+            })
+        };
+        let mut argument = ModuleArgument::with_access_base(call("value"), call("access"));
+
+        argument
+            .try_rewrite(|value| match value {
+                Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+                    Ok::<_, std::convert::Infallible>(args[0].clone())
+                }
+                other => Ok(other.clone()),
+            })
+            .unwrap();
+
+        assert_eq!(argument.value(), &string("value"));
+        assert_eq!(argument.access_base(), Some(&string("access")));
+    }
 
     #[test]
     fn structural_binding_names_covers_every_non_variable_kind() {
@@ -2112,6 +2251,7 @@ mod substitute_placeholder_tests {
             wait_bindings: _,
             requires: _,
             structural_bindings: _,
+            parser_binding_metadata: _,
             warnings: _,
             deferred_for_expressions: _,
             expansion_trace: _,
@@ -2142,8 +2282,13 @@ mod substitute_placeholder_tests {
         let err = expand_deferred_children(
             &deferred,
             &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            crate::resource::AccessMissPolicy::Error,
         )
         .expect_err("simple for-binding over a map must be a shape mismatch");
+
+        let DeferredForExpansionError::ShapeMismatch(err) = err else {
+            panic!("expected shape mismatch")
+        };
 
         assert_eq!(err.expected_kind(), "list");
         assert_eq!(err.got_kind(), "map");
@@ -2174,6 +2319,7 @@ mod substitute_placeholder_tests {
                 Value::Concrete(ConcreteValue::String("alpha".into())),
                 Value::Concrete(ConcreteValue::String("beta".into())),
             ])),
+            crate::resource::AccessMissPolicy::Error,
         )
         .unwrap();
         assert_eq!(list_deferred.template_resource.id.identity_str(), None);
@@ -2194,6 +2340,7 @@ mod substitute_placeholder_tests {
                     Value::Concrete(ConcreteValue::String("two".into())),
                 ),
             ]))),
+            crate::resource::AccessMissPolicy::Error,
         )
         .unwrap();
         assert_eq!(map_deferred.template_resource.id.identity_str(), None);
@@ -2237,7 +2384,8 @@ mod substitute_placeholder_tests {
             None,
             None,
             &Value::Concrete(ConcreteValue::String("acct-1".into())),
-        );
+        )
+        .unwrap();
         assert_eq!(v, Value::Concrete(ConcreteValue::String("acct-1".into())));
     }
 
@@ -2249,7 +2397,8 @@ mod substitute_placeholder_tests {
             None,
             Some("east"),
             &Value::Concrete(ConcreteValue::String("ignored".into())),
-        );
+        )
+        .unwrap();
         assert_eq!(v, Value::Concrete(ConcreteValue::String("east".into())));
     }
 
@@ -2261,7 +2410,8 @@ mod substitute_placeholder_tests {
             Some(7),
             None,
             &Value::Concrete(ConcreteValue::String("ignored".into())),
-        );
+        )
+        .unwrap();
         assert_eq!(v, Value::Concrete(ConcreteValue::Int(7)));
     }
 
@@ -2276,7 +2426,8 @@ mod substitute_placeholder_tests {
             Some(0),
             Some("k"),
             &Value::Concrete(ConcreteValue::String("anything".into())),
-        );
+        )
+        .unwrap();
         // `Value::Deferred(DeferredValue::Unknown)` never compares equal (see `impl PartialEq for Value`),
         // so destructure to verify the path survives.
         match v {
@@ -2311,7 +2462,8 @@ mod substitute_placeholder_tests {
             None,
             None,
             &Value::Concrete(ConcreteValue::String("X".into())),
-        );
+        )
+        .unwrap();
         match &v {
             Value::Concrete(ConcreteValue::List(items)) => {
                 assert_eq!(items[0], Value::Concrete(ConcreteValue::String("X".into())));
@@ -2345,7 +2497,8 @@ mod substitute_placeholder_tests {
             None,
             None,
             &Value::Concrete(ConcreteValue::String("X".into())),
-        );
+        )
+        .unwrap();
         assert_eq!(
             v,
             Value::Concrete(ConcreteValue::String("(known after upstream apply)".into()))

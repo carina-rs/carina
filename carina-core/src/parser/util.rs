@@ -63,6 +63,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
         Value::Deferred(DeferredValue::Interpolation(_)) => "string",
         Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
+        Value::Deferred(DeferredValue::Access(_)) => "access expression",
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
@@ -75,6 +76,9 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
 pub(crate) fn eval_type_name(value: &EvalValue) -> &'static str {
     match value {
         EvalValue::User(v) => value_type_name(v),
+        EvalValue::StructuralHandle(_) => "resource handle",
+        EvalValue::ComputedWithStructuralHandles { value, .. } => value_type_name(value),
+        EvalValue::DeferredForValue { .. } => "unknown",
         EvalValue::Closure { .. } => "closure",
     }
 }
@@ -160,7 +164,11 @@ pub(crate) fn unwrap_to_primary(
 ) -> Option<pest::iterators::Pair<Rule>> {
     match pair.as_rule() {
         Rule::primary => Some(pair),
-        Rule::expression | Rule::coalesce_expr | Rule::pipe_expr | Rule::compose_expr => {
+        Rule::expression
+        | Rule::coalesce_expr
+        | Rule::pipe_expr
+        | Rule::compose_expr
+        | Rule::postfix_expr => {
             let mut inner = pair.into_inner();
             let first = inner.next()?;
             if inner.next().is_some() {

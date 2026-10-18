@@ -286,11 +286,8 @@ impl Formatter {
     }
 
     fn format_field_access(&mut self, node: &CstNode) {
-        self.write(".");
         for child in &node.children {
-            if let CstChild::Token(token) = child
-                && self.is_identifier(&token.text)
-            {
+            if let CstChild::Token(token) = child {
                 self.write_token(&token.text);
             }
         }

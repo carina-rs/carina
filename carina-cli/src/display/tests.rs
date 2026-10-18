@@ -5,9 +5,26 @@ use colored::Colorize;
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    AccessPath, ConcreteValue, DeferredValue, Directives, ResolvedResource, Resource, ResourceId,
-    State, UnknownReason, Value,
+    AccessMissPolicy, ConcreteValue, DeferredValue, Directives, PathSegment, ResolvedResource,
+    Resource, ResourceId, State, UnknownReason, Value, apply_postfix_access,
 };
+
+fn for_value_access(fields: &[&str]) -> Value {
+    fields.iter().fold(
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        |base, field| {
+            apply_postfix_access(
+                base,
+                PathSegment::Field {
+                    name: (*field).to_string(),
+                },
+                0,
+                AccessMissPolicy::Error,
+            )
+            .expect("unknown access remains deferred")
+        },
+    )
+}
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
@@ -749,12 +766,7 @@ fn test_extract_compact_hint_considers_all_resource_attributes() {
 fn test_deferred_create_renders_deferred_until_apply_marker() {
     let mut template_resource = Resource::new("route53.Record", "validation_records");
     template_resource.binding = Some("validation_records".to_string());
-    template_resource.set_attr(
-        "name",
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
-            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
-        })),
-    );
+    template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
     let deferred = carina_core::parser::DeferredForExpression {
         file: None,
@@ -810,12 +822,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
 fn deferred_validation_records_effect() -> Effect {
     let mut template_resource = Resource::new("route53.Record", "validation_records");
     template_resource.binding = Some("validation_records".to_string());
-    template_resource.set_attr(
-        "name",
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
-            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
-        })),
-    );
+    template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
     let deferred = carina_core::parser::DeferredForExpression {
         file: None,

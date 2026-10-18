@@ -117,6 +117,79 @@ fn cli_diagnostics_at(
 }
 
 #[test]
+fn postfix_wrong_shape_access_has_cli_lsp_parity_for_local_and_wait_bindings() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "values.crn",
+            r#"let r0 = mock.test.resource { name = "z" }
+let q = mock.test.resource {
+  name = "q-z"
+  comment = "comment"
+}
+let forwarded = mock.test.resource { name = r0.identifier }
+let qw = wait q {
+  until = q.name == "q-z"
+  timeout = 1min
+}
+"#,
+        ),
+        (
+            "main.crn",
+            r#"let literal = mock.test.resource { name = q.name[0] }
+let provider_populated = mock.test.resource { name = q.identifier[0] }
+let waited = mock.test.resource { name = qw.name["key"] }
+let forwarded_value = mock.test.resource { name = forwarded.name[1] }
+let optional = mock.test.resource { name = q.comment[2] }
+let valid = mock.test.resource { name = q.comment }
+"#,
+        ),
+    ]);
+    let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
+        SchemaRegistry::new(),
+        |mut registry, schema| {
+            registry.insert("mock", schema);
+            registry
+        },
+    );
+
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let mut cli_access_errors = cli
+        .iter()
+        .filter_map(|message| {
+            message
+                .find("cannot apply access")
+                .map(|start| message[start..].to_string())
+        })
+        .collect::<Vec<_>>();
+    let mut lsp_access_errors = lsp
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("cannot apply access"))
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    cli_access_errors.sort();
+    lsp_access_errors.sort();
+
+    assert_eq!(
+        cli_access_errors, lsp_access_errors,
+        "CLI validate and LSP must report the same reference-path access errors; \
+         CLI={cli:#?}; LSP={lsp:#?}",
+    );
+    assert_eq!(
+        cli_access_errors,
+        [
+            "cannot apply access [\"key\"] to String",
+            "cannot apply access [0] to String",
+            "cannot apply access [0] to String",
+            "cannot apply access [1] to String",
+            "cannot apply access [2] to String",
+        ],
+        "every statically String-valued path must be rejected while the no-suffix control stays valid",
+    );
+}
+
+#[test]
 fn cli_module_call_uses_argument_type_declared_in_sibling_file() {
     let fixture = tempfile::tempdir().expect("tempdir");
     let inner = fixture.path().join("modules/inner");

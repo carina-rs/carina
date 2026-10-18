@@ -361,7 +361,7 @@ where
         let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
         for (arg_name, value) in call.arguments.iter() {
             f(
-                value,
+                value.value(),
                 &format!("module `{}` argument `{}`", caller, arg_name),
             );
         }
@@ -2870,6 +2870,38 @@ mod tests {
     }
 
     #[test]
+    fn list_field_access_keeps_the_dedicated_upstream_shape_diagnostic() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                let consumer = test.r.res {
+                    name = orgs.names.foo
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("names", TypeExpr::List(Box::new(TypeExpr::String)))],
+        )]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+
+        let generic_errors =
+            check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
+        assert!(
+            generic_errors.is_empty(),
+            "generic reference validation must leave this case to the dedicated upstream diagnostic: {generic_errors:?}"
+        );
+
+        let errors = check_upstream_state_attribute_access_shape_fallbacks(&parsed, &exports);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].to_string(),
+            "test.r.res.consumer attribute `name`: upstream_state `orgs.names` is declared as `list(String)` but `.foo` reads it as a struct; iterate the list with `for x in orgs.names` to access elements"
+        );
+    }
+
+    #[test]
     fn attribute_access_struct_with_unknown_field_flags_mismatch() {
         // `orgs.account.region` against a struct that doesn't declare
         // `region` is the canonical "downstream depends on upstream's
@@ -3356,6 +3388,36 @@ mod tests {
             msg.contains("list"),
             "message must mention list shape: {msg}"
         );
+    }
+
+    #[test]
+    fn postfix_access_on_upstream_ref_participates_in_subscript_shape_checks() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                let accounts = orgs.accounts
+                test.r.res {
+                    direct = (orgs.accounts)[0]
+                    alias  = accounts["alpha"]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("accounts", TypeExpr::List(Box::new(TypeExpr::String)))],
+        )]);
+
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the valid integer postfix access should pass and the string alias access should fail: {errs:?}"
+        );
+        assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
+        assert_eq!(errs[0].binding, "orgs");
+        assert_eq!(errs[0].field, "accounts");
     }
 
     #[test]

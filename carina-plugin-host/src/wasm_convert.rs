@@ -357,6 +357,12 @@ fn core_to_wit_value_from(
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::Access(_)) => {
+            Err(SerializationError::UnresolvedAccess {
+                expression: carina_core::value::format_value(v),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
             let json = core_value_to_json_from(inner, source)
                 .map_err(SerializationError::masked_for_secret)?;
@@ -605,6 +611,12 @@ fn core_value_to_json_from(
         CoreValue::Deferred(DeferredValue::FunctionCall { name, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: name.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::Access(_)) => {
+            Err(SerializationError::UnresolvedAccess {
+                expression: carina_core::value::format_value(v),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -2503,6 +2515,35 @@ mod tests {
             } => assert_eq!(name, "join"),
             other => panic!("expected UnresolvedFunctionCall/WasmBoundary, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn postfix_access_returns_err_in_core_to_wit_value() {
+        use carina_core::resource::{
+            AccessMissPolicy, PathSegment, Subscript, apply_postfix_access,
+        };
+
+        let value = apply_postfix_access(
+            CoreValue::Deferred(DeferredValue::FunctionCall {
+                name: "split".into(),
+                args: vec![],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 1 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred");
+        let error = core_to_wit_value(&value).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SerializationError::UnresolvedAccess {
+                expression,
+                context: SerializationContext::WasmBoundary,
+            } if expression == "split()[1]"
+        ));
     }
 
     #[test]

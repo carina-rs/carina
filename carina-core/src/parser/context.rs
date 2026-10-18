@@ -7,21 +7,41 @@
 use super::ast::{DeferredForExpression, ProviderConfig, UpstreamState, UserFunction, WaitBinding};
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
-use crate::eval_value::EvalValue;
+use crate::eval_value::{EvalValue, StructuralHandle};
 use crate::resource::Resource;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
+/// Parser-local lexical binding kind.
+///
+/// Structural bindings (resources, module calls, `for` results, waits,
+/// upstream state, and imports) are distinct from ordinary values. Their
+/// parser-only handle records both reference behavior and main-compatible bare
+/// value transport, preventing access parsing from mistaking a structural
+/// address such as `roles[0]` for value indexing.
+#[derive(Clone)]
+pub(super) enum ParseBinding {
+    Value(EvalValue),
+    Structural {
+        handle: StructuralHandle,
+        retain_value: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ParseBindingRef<'a> {
+    Value(&'a EvalValue),
+    Structural(&'a StructuralHandle),
+    Unbound,
+}
+
 /// Parse context (variable scope)
 #[derive(Clone)]
 pub(crate) struct ParseContext<'cfg> {
-    /// Variables bound by `let` statements during parsing. Carries
-    /// `EvalValue` rather than `Value` because partial applications
-    /// (e.g. `let f = join("-")`) produce a closure that lives until a
-    /// later pipe finishes the application. Lowered to `Value` at the
-    /// end of `parse(...)`; an unfinished closure surfaces as a
-    /// parse-time error.
-    pub(super) variables: IndexMap<String, EvalValue>,
+    /// All lexical bindings, with value and structural bindings represented
+    /// as disjoint variants. Value bindings carry `EvalValue` because partial
+    /// applications can live until a later pipe finishes the application.
+    pub(super) bindings: IndexMap<String, ParseBinding>,
     /// Resource bindings (binding_name -> Resource)
     pub(super) resource_bindings: HashMap<String, Resource>,
     /// Imported modules (alias -> path)
@@ -58,7 +78,7 @@ pub(crate) struct ParseContext<'cfg> {
 impl<'cfg> ParseContext<'cfg> {
     pub(super) fn new(config: &'cfg ProviderContext) -> Self {
         Self {
-            variables: IndexMap::new(),
+            bindings: IndexMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
             user_functions: HashMap::new(),
@@ -92,19 +112,66 @@ impl<'cfg> ParseContext<'cfg> {
     }
 
     pub(super) fn set_variable(&mut self, name: String, value: impl Into<EvalValue>) {
-        self.variables.insert(name, value.into());
+        self.bindings
+            .insert(name, ParseBinding::Value(value.into()));
+    }
+
+    pub(super) fn set_structural_binding(
+        &mut self,
+        name: String,
+        handle: StructuralHandle,
+        retain_value: bool,
+    ) {
+        self.bindings.insert(
+            name,
+            ParseBinding::Structural {
+                handle,
+                retain_value,
+            },
+        );
+    }
+
+    pub(super) fn set_structural_alias(&mut self, name: String, handle: StructuralHandle) {
+        self.bindings.insert(
+            name.clone(),
+            ParseBinding::Structural {
+                handle: handle.with_alias(name),
+                retain_value: true,
+            },
+        );
     }
 
     pub(super) fn get_variable(&self, name: &str) -> Option<&EvalValue> {
-        self.variables.get(name)
+        match self.bindings.get(name) {
+            Some(ParseBinding::Value(value)) => Some(value),
+            Some(ParseBinding::Structural { .. }) | None => None,
+        }
+    }
+
+    pub(super) fn lookup_binding(&self, name: &str) -> ParseBindingRef<'_> {
+        match self.bindings.get(name) {
+            Some(ParseBinding::Value(value)) => ParseBindingRef::Value(value),
+            Some(ParseBinding::Structural { handle, .. }) => ParseBindingRef::Structural(handle),
+            None => ParseBindingRef::Unbound,
+        }
+    }
+
+    pub(super) fn contains_binding(&self, name: &str) -> bool {
+        self.bindings.contains_key(name)
     }
 
     pub(super) fn set_resource_binding(&mut self, name: String, resource: Resource) {
+        if !matches!(
+            self.bindings.get(&name),
+            Some(ParseBinding::Structural { .. })
+        ) {
+            self.set_structural_binding(
+                name.clone(),
+                StructuralHandle::binding(name.clone()),
+                false,
+            );
+        }
         self.resource_bindings.insert(name, resource);
-    }
-
-    pub(super) fn is_resource_binding(&self, name: &str) -> bool {
-        self.resource_bindings.contains_key(name)
     }
 }
 

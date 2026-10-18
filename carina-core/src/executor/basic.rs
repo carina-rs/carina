@@ -204,6 +204,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Access(_)
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => true,
@@ -355,6 +356,17 @@ fn assert_fully_resolved(
                 bindings,
             ))
         }
+        Value::Deferred(DeferredValue::Access(_)) => {
+            let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
+            Err(unresolved_binding_message(
+                attribute_key,
+                UnresolvedSite::Access {
+                    expression: crate::value::format_value(value),
+                },
+                leaf.unwrap_or(""),
+                bindings,
+            ))
+        }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
                 reason: reason.clone(),
@@ -377,6 +389,7 @@ enum UnresolvedSite {
     Ref { path: String },
     Interpolation,
     FunctionCall { name: String },
+    Access { expression: String },
 }
 
 fn unresolved_binding_message(
@@ -394,6 +407,9 @@ fn unresolved_binding_message(
         ),
         UnresolvedSite::FunctionCall { name } => format!(
             "attribute `{attribute_key}` calls function `{name}()` whose arguments did not fully resolve at apply time."
+        ),
+        UnresolvedSite::Access { expression } => format!(
+            "attribute `{attribute_key}` contains access expression `{expression}` that did not fully resolve at apply time."
         ),
     };
 
@@ -427,6 +443,9 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
             for a in args {
                 collect_unresolved_bindings(a, out);
             }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            collect_unresolved_bindings(access.base(), out)
         }
         Value::Deferred(DeferredValue::Unknown(_)) => {}
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -1034,6 +1053,45 @@ mod assert_fully_resolved_tests {
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("FunctionCall that did not evaluate must be rejected");
         assert!(err.contains("concat"), "got: {err}");
+    }
+
+    #[test]
+    fn computed_list_out_of_range_surfaces_range_error_before_provider_boundary() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "identifier".to_string(),
+            Value::Concrete(ConcreteValue::String("a-b-c".into())),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("q", attrs, BindingValueSource::Local);
+        let value = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("-".into())),
+                    Value::resource_ref("q", "identifier", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 5 },
+            },
+            4,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        let error = resolve_ref_value(&value, &bindings)
+            .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
+            .expect_err("the apply path must reject the final computed list access");
+
+        assert!(
+            error.contains("index 5 out of range for list of length 3"),
+            "unexpected apply error: {error}"
+        );
+        assert!(
+            !error.contains("did not fully resolve") && !error.contains("wait"),
+            "a concrete range failure must not use unresolved/wait wording: {error}"
+        );
     }
 
     // -------------------------------------------------------------

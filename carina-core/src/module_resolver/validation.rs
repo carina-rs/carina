@@ -672,6 +672,7 @@ impl EvalValue {
             Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
             Self::Value(Value::Deferred(DeferredValue::Interpolation(_))) => "interpolation",
             Self::Value(Value::Deferred(DeferredValue::FunctionCall { .. })) => "function call",
+            Self::Value(Value::Deferred(DeferredValue::Access(_))) => "access expression",
             Self::Value(Value::Deferred(DeferredValue::Unknown(_))) => "unknown",
         }
     }

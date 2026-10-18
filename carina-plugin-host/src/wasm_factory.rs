@@ -3761,6 +3761,13 @@ mod tests {
                 }
             }
             (
+                Value::Deferred(DeferredValue::Access(actual_access)),
+                Value::Deferred(DeferredValue::Access(expected_access)),
+            ) => {
+                assert_eq!(actual_access.step(), expected_access.step());
+                assert_value_structure_eq(actual_access.base(), expected_access.base());
+            }
+            (
                 Value::Deferred(DeferredValue::Secret(actual)),
                 Value::Deferred(DeferredValue::Secret(expected)),
             ) => assert_value_structure_eq(actual, expected),

@@ -6,7 +6,7 @@
 use super::CarinaParser;
 use super::ProviderContext;
 use super::Rule;
-use super::ast::{ParsedFile, UpstreamState, WaitBinding};
+use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, WaitBinding};
 use super::blocks::attributes::{
     parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
@@ -15,7 +15,7 @@ use super::blocks::module_call::parse_module_call;
 use super::blocks::provider::{parse_provider_block, parse_require_statement};
 use super::blocks::resource::parse_anonymous_resource;
 use super::blocks::state::{parse_import_state_block, parse_moved_block, parse_removed_block};
-use super::context::{ParseContext, first_inner};
+use super::context::{ParseBinding, ParseContext, first_inner};
 use super::error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
@@ -24,12 +24,12 @@ use super::expressions::for_expr::{extract_for_iterable_name, parse_for_expr};
 use super::expressions::if_expr::parse_if_expr;
 use super::expressions::pipe::parse_coalesce_expr;
 use super::functions::parse_fn_def;
-use super::let_binding::parse_let_binding_extended;
+use super::let_binding::{LetBindingKind, parse_let_binding_extended};
 use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
-use crate::eval_value::EvalValue;
-use crate::resource::{DataSource, DeferredValue, Resource, Value};
+use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleMetadata};
+use crate::resource::{DataSource, Resource, Value};
 use indexmap::IndexMap;
 use pest::Parser;
 use pest::error::LineColLocation;
@@ -42,8 +42,14 @@ pub(crate) struct BindingSeed<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum SeedKind<'a> {
-    Value(&'a Value),
+    Value {
+        value: &'a Value,
+        structural_handles: Option<&'a StructuralHandleMetadata>,
+    },
+    ModuleParameter,
     Structural,
+    Provisional,
+    StructuralAlias(&'a StructuralHandle),
 }
 
 /// Source span of a top-level declaration keyword.
@@ -73,7 +79,24 @@ impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
             name,
-            kind: SeedKind::Value(value),
+            kind: SeedKind::Value {
+                value,
+                structural_handles: None,
+            },
+        }
+    }
+
+    pub(crate) fn value_with_structural_handles(
+        name: &'a str,
+        value: &'a Value,
+        structural_handles: &'a StructuralHandleMetadata,
+    ) -> Self {
+        Self {
+            name,
+            kind: SeedKind::Value {
+                value,
+                structural_handles: Some(structural_handles),
+            },
         }
     }
 
@@ -81,6 +104,27 @@ impl<'a> BindingSeed<'a> {
         Self {
             name,
             kind: SeedKind::Structural,
+        }
+    }
+
+    pub(crate) fn provisional(name: &'a str) -> Self {
+        Self {
+            name,
+            kind: SeedKind::Provisional,
+        }
+    }
+
+    pub(crate) fn module_parameter(name: &'a str) -> Self {
+        Self {
+            name,
+            kind: SeedKind::ModuleParameter,
+        }
+    }
+
+    pub(crate) fn structural_alias(name: &'a str, handle: &'a StructuralHandle) -> Self {
+        Self {
+            name,
+            kind: SeedKind::StructuralAlias(handle),
         }
     }
 
@@ -111,6 +155,49 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let parsed = parse_with_seeded_bindings(input, config, &[])?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
+}
+
+/// Collect top-level `let` names without evaluating their right-hand sides.
+///
+/// Directory parsing uses this syntax-only pass to establish lexical scope
+/// before its first semantic parse. A sibling reference may itself use
+/// postfix access, so evaluating files with an entirely empty scope can fail
+/// before the fixed-point pass has a chance to classify the referenced
+/// binding as a value or structural declaration.
+pub(crate) fn top_level_let_binding_names(input: &str) -> Result<Vec<String>, ParseError> {
+    let preprocess_result =
+        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
+            line: 0,
+            message: e.to_string(),
+        })?;
+    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let mut names = Vec::new();
+
+    for pair in pairs {
+        if pair.as_rule() != Rule::file {
+            continue;
+        }
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            let Some(binding) = statement.into_inner().next() else {
+                continue;
+            };
+            if binding.as_rule() != Rule::let_binding {
+                continue;
+            }
+            let Some(name) = binding.into_inner().next() else {
+                continue;
+            };
+            if name.as_str() != "_" {
+                names.push(name.as_str().to_string());
+            }
+        }
+    }
+
+    Ok(names)
 }
 
 /// Return keyword spans for state blocks parsed as top-level statements.
@@ -288,14 +375,12 @@ fn pair_contains_rule(pair: &pest::iterators::Pair<Rule>, expected: Rule) -> boo
 ///
 /// Each seed carries the directory-wide binding name and, for plain
 /// value-shaped `let` bindings, the pass-1 value from the merged file.
-/// Value seeds are installed directly in `ctx.variables`; all other
-/// binding kinds use the existing [`Value::Deferred(DeferredValue::BindingRef)`]
-/// placeholder and a placeholder `Resource` in `ctx.resource_bindings`.
-/// This keeps value lets value-shaped while structural sibling names
-/// still resolve through the normal `ctx.get_variable` /
-/// `ctx.is_resource_binding` paths instead of degrading to the
-/// literal-string fallback in `primary.rs::variable_ref` /
-/// `parse_namespaced_id_value`.
+/// Value seeds are installed as typed value bindings; all other binding
+/// kinds are installed as typed structural bindings plus a placeholder
+/// `Resource` in `ctx.resource_bindings`. This keeps sibling value access
+/// and structural reference paths distinct. A bare seeded structural name
+/// lowers to main's historical `BindingRef` shape, while same-file handles
+/// retain their historical sentinel-string transport.
 ///
 /// The seed list is the directory aggregate: every binding declared in
 /// any sibling `.crn` (resource bindings, argument names, attribute
@@ -447,6 +532,7 @@ fn parse_with_seeded_bindings_inner(
                                     expanded_data_sources,
                                     expanded_module_calls,
                                     _import,
+                                    _binding_kind,
                                 ) = parse_if_expr(stmt, &mut ctx, &binding_name)?;
                                 resources.extend(expanded_resources);
                                 data_sources.extend(expanded_data_sources);
@@ -487,6 +573,7 @@ fn parse_with_seeded_bindings_inner(
                                     expanded_data_sources,
                                     expanded_module_calls,
                                     maybe_import,
+                                    binding_kind,
                                     is_structural,
                                 ) = parse_let_binding_extended(stmt, &mut ctx)?;
                                 if is_structural {
@@ -498,7 +585,7 @@ fn parse_with_seeded_bindings_inner(
                                 let is_provider_instance = ctx
                                     .named_provider_instances
                                     .iter()
-                                    .any(|p| p.binding.as_deref() == Some(&name));
+                                    .any(|provider| provider.binding.as_deref() == Some(&name));
                                 if !is_discard {
                                     // A seeded placeholder (from a sibling-file
                                     // declaration during the directory-aware
@@ -509,7 +596,7 @@ fn parse_with_seeded_bindings_inner(
                                     // still trip the duplicate check.
                                     let shadows_seed = ctx.is_seeded_binding(&name);
                                     if !shadows_seed
-                                        && (ctx.variables.contains_key(&name)
+                                        && (ctx.contains_binding(&name)
                                             || ctx.resource_bindings.contains_key(&name))
                                     {
                                         return Err(ParseError::DuplicateBinding { name, line });
@@ -517,24 +604,40 @@ fn parse_with_seeded_bindings_inner(
                                     if shadows_seed {
                                         ctx.unmark_seeded(&name);
                                     }
-                                    if is_upstream_state || is_wait_binding || is_provider_instance
-                                    {
-                                        // upstream_state, wait, and named provider
-                                        // instance lets do not bind a user-facing
-                                        // value; the binding name is consumed by a
-                                        // dedicated side-channel (`upstream_states`,
-                                        // `wait_bindings`, `providers`) and would
-                                        // collide downstream if also stored as a
-                                        // regular variable. When a seed pre-installed
-                                        // a placeholder under this name, drop it so
-                                        // the ParsedFile we hand back doesn't leak the
-                                        // seeded `ResourceRef` into downstream walkers
-                                        // (#2817).
-                                        if shadows_seed {
-                                            ctx.variables.shift_remove(&name);
+                                    match binding_kind {
+                                        LetBindingKind::Value => {
+                                            ctx.set_variable(name.clone(), value);
                                         }
-                                    } else {
-                                        ctx.set_variable(name.clone(), value);
+                                        LetBindingKind::Structural => {
+                                            let handle = value
+                                                .into_structural_handle()
+                                                .ok_or_else(|| ParseError::InternalError {
+                                                    expected: "parser structural handle"
+                                                        .to_string(),
+                                                    context: format!(
+                                                        "structural let binding {name:?}"
+                                                    ),
+                                                })?;
+                                            ctx.set_structural_binding(
+                                                name.clone(),
+                                                handle,
+                                                !(is_upstream_state
+                                                    || is_wait_binding
+                                                    || is_provider_instance),
+                                            );
+                                        }
+                                        LetBindingKind::StructuralAlias => {
+                                            let handle = value
+                                                .into_structural_handle()
+                                                .ok_or_else(|| ParseError::InternalError {
+                                                    expected: "parser structural handle"
+                                                        .to_string(),
+                                                    context: format!(
+                                                        "structural alias binding {name:?}"
+                                                    ),
+                                                })?;
+                                            ctx.set_structural_alias(name.clone(), handle);
+                                        }
                                     }
                                 }
                                 if !expanded_resources.is_empty() {
@@ -589,8 +692,7 @@ fn parse_with_seeded_bindings_inner(
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     upstream_states.push(ctx.upstream_states[&name].clone());
                                 }
-                                let is_wait = ctx.wait_bindings.contains_key(&name);
-                                if is_wait && !is_discard {
+                                if is_wait_binding && !is_discard {
                                     // Register a placeholder resource binding so that
                                     // `<wait-binding>.<attr>` parses as `ResourceRef`.
                                     // Downstream resolution (Phase 4 of #2825) treats
@@ -638,15 +740,39 @@ fn parse_with_seeded_bindings_inner(
     // and consumed by a later pipe like `data |> f()`). After the parse
     // pass finishes, only fully-reduced `Value`s belong in
     // `ParsedFile.variables`; nothing downstream knows how to handle a
-    // closure. Pipe / call paths read from `ctx.variables` directly via
+    // closure. Pipe / call paths read from typed value bindings directly via
     // `get_variable`, so the closure was already available where it
     // mattered.
-    let variables: IndexMap<String, Value> = ctx
-        .variables
+    let mut parser_binding_metadata = ParserBindingMetadata::default();
+    for (name, binding) in &ctx.bindings {
+        match binding {
+            ParseBinding::Structural { handle, .. } if handle.alias_name().is_some() => {
+                parser_binding_metadata.insert_structural_alias(name.clone(), handle.clone());
+            }
+            ParseBinding::Value(value) => {
+                if let Some(metadata) = value.structural_handle_metadata() {
+                    parser_binding_metadata
+                        .insert_value_structural_handles(name.clone(), metadata.clone());
+                }
+            }
+            ParseBinding::Structural { .. } => {}
+        }
+    }
+    let variables: IndexMap<String, Value> = std::mem::take(&mut ctx.bindings)
         .into_iter()
-        .filter_map(|(name, eval)| match eval.into_value() {
-            Ok(v) => Some((name, v)),
-            Err(_leak) => None,
+        .filter_map(|(name, binding)| match binding {
+            ParseBinding::Value(eval) => match eval.into_value() {
+                Ok(value) => Some((name, value)),
+                Err(_leak) => None,
+            },
+            ParseBinding::Structural {
+                handle,
+                retain_value: true,
+            } => Some((name, handle.into_value())),
+            ParseBinding::Structural {
+                retain_value: false,
+                ..
+            } => None,
         })
         .collect();
 
@@ -676,6 +802,7 @@ fn parse_with_seeded_bindings_inner(
         wait_bindings,
         requires,
         structural_bindings: ctx.structural_bindings,
+        parser_binding_metadata,
         warnings: ctx.warnings,
         deferred_for_expressions: ctx.deferred_for_expressions,
         // The parser never synthesizes composition resources, so it
@@ -791,42 +918,62 @@ fn map_pest_error_lines(
 
 /// Pre-register `seeds` as lexical bindings in `ctx`.
 ///
-/// Plain value seeds mirror a local `let name = <value>`: only
-/// `ctx.variables` is populated. Structural seeds mirror the
-/// placeholder shape used for resource/module/data/upstream bindings:
-/// `ctx.variables` receives a [`Value::Deferred(DeferredValue::BindingRef)`]
-/// and `ctx.resource_bindings` receives a `_seeded` resource marker.
-/// Storing the structural seed as `ResourceRef` with an empty
-/// `attribute` field would be a type-level lie and previously surfaced
-/// as the empty-field diagnostic in #2847.
+/// Plain value seeds mirror a local `let name = <value>` and structural
+/// seeds use the distinct [`ParseBinding::Structural`] scope entry. A
+/// `_seeded` resource marker is also installed for compatibility with
+/// resource-path parsing. Seeded structural bindings retain their typed
+/// parser-only handle until a bare value crosses the `Value` boundary.
 ///
 /// Empty seed list is a no-op — single-file callers (the legacy
 /// `parse(input, config)` wrapper, parser tests) pay no cost.
 fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
     for seed in seeds {
         match seed.kind() {
-            SeedKind::Value(value) => {
-                ctx.set_variable(seed.name().to_string(), value.clone());
+            SeedKind::Value {
+                value,
+                structural_handles,
+            } => {
+                ctx.set_variable(
+                    seed.name().to_string(),
+                    EvalValue::computed(value.clone(), structural_handles.cloned()),
+                );
+            }
+            SeedKind::ModuleParameter => {
+                ctx.set_variable(
+                    seed.name().to_string(),
+                    Value::Deferred(crate::resource::DeferredValue::Unknown(
+                        crate::resource::UnknownReason::ModuleArgument {
+                            name: seed.name().to_string(),
+                        },
+                    )),
+                );
             }
             SeedKind::Structural => {
-                // Asymmetry: a local resource `let cluster = ...` registers
-                // `Concrete(String("${cluster}"))` in `ctx.variables`; a
-                // seeded structural binding registers `Deferred(BindingRef)`.
-                // Dotted refs (`cluster.attr`) go through `is_resource_binding`
-                // first and never observe the difference; bare refs read
-                // `ctx.variables`, but every current consumer (e.g.
-                // `value_as_binding_name`, the eval pipeline) handles both
-                // shapes identically. A new consumer that pattern-matches on
-                // only one shape would surface this: converge the two then.
-                let placeholder_ref = Value::Deferred(DeferredValue::BindingRef {
-                    binding: seed.name().to_string(),
-                });
-                ctx.set_variable(seed.name().to_string(), placeholder_ref);
+                ctx.set_structural_binding(
+                    seed.name().to_string(),
+                    StructuralHandle::from_seed(seed.name()),
+                    false,
+                );
                 let placeholder = Resource::new(
                     "_seeded",
                     crate::resource::ResourceIdentity::new(seed.name().to_string()),
                 );
                 ctx.set_resource_binding(seed.name().to_string(), placeholder);
+            }
+            SeedKind::Provisional => {
+                ctx.set_structural_binding(
+                    seed.name().to_string(),
+                    StructuralHandle::provisional(seed.name()),
+                    false,
+                );
+                let placeholder = Resource::new(
+                    "_seeded",
+                    crate::resource::ResourceIdentity::new(seed.name().to_string()),
+                );
+                ctx.set_resource_binding(seed.name().to_string(), placeholder);
+            }
+            SeedKind::StructuralAlias(handle) => {
+                ctx.set_structural_alias(seed.name().to_string(), handle.clone());
             }
         }
         ctx.seeded_bindings.insert(seed.name().to_string());

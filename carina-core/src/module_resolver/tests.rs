@@ -13,10 +13,12 @@ use indexmap::IndexMap;
 
 use super::resolver::ModuleResolver;
 use super::*;
-use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, TypeExpr};
+use crate::parser::{
+    ArgumentParameter, ModuleArgument, ModuleCall, ParsedFile, ProviderContext, TypeExpr,
+};
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
-    ResourceId, ResourceIdentity, Value,
+    ResourceId, ResourceIdentity, UnknownReason, Value,
 };
 use crate::schema::TypeIdentity;
 
@@ -31,6 +33,15 @@ fn reconcile_anonymous_module_instances(
         find_state_names_by_type,
         &crate::identifier::StateBlockClaims::empty(),
     );
+}
+
+fn module_arguments(
+    values: impl IntoIterator<Item = (String, Value)>,
+) -> HashMap<String, ModuleArgument> {
+    values
+        .into_iter()
+        .map(|(name, value)| (name, ModuleArgument::new(value)))
+        .collect()
 }
 
 fn create_test_module() -> ParsedFile {
@@ -90,6 +101,7 @@ fn create_test_module() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -108,7 +120,7 @@ fn test_substitute_arguments() {
     let value = Value::Deferred(DeferredValue::BindingRef {
         binding: "vpc_id".to_string(),
     });
-    let result = substitute_arguments(&value, &inputs);
+    let result = substitute_arguments(&value, &inputs).expect("substitution");
 
     assert_eq!(
         result,
@@ -130,7 +142,7 @@ fn test_substitute_arguments_nested() {
         }),
         Value::Concrete(ConcreteValue::Int(443)),
     ]));
-    let result = substitute_arguments(&value, &inputs);
+    let result = substitute_arguments(&value, &inputs).expect("substitution");
 
     match result {
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -184,6 +196,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -297,7 +310,7 @@ fn test_expand_module_call() {
                 "vpc_id".to_string(),
                 Value::Concrete(ConcreteValue::String("vpc-456".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -385,6 +398,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -559,6 +573,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -584,7 +599,7 @@ fn test_multiple_module_instances_no_collision() {
                 "cidr".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
-            args
+            module_arguments(args)
         },
     };
     let call_b = ModuleCall {
@@ -597,7 +612,7 @@ fn test_multiple_module_instances_no_collision() {
                 "cidr".to_string(),
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -710,6 +725,7 @@ fn create_module_with_attributes() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -1024,6 +1040,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -1049,7 +1066,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         module_name: "svc".to_string(),
         binding_name: Some("api".to_string()),
         source: Default::default(),
-        arguments: call_arguments,
+        arguments: module_arguments(call_arguments),
     };
 
     let expanded = resolver.expand_module_call(&call, "api").unwrap();
@@ -1186,7 +1203,7 @@ fn test_anonymous_module_calls_get_distinct_prefixes() {
                 "github_repo".to_string(),
                 Value::Concrete(ConcreteValue::String("carina-rs/infra".into())),
             );
-            args
+            module_arguments(args)
         },
     };
     let call_b = ModuleCall {
@@ -1199,7 +1216,7 @@ fn test_anonymous_module_calls_get_distinct_prefixes() {
                 "github_repo".to_string(),
                 Value::Concrete(ConcreteValue::String("carina-rs/other".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -1246,7 +1263,7 @@ fn test_anonymous_module_call_prefix_is_locality_sensitive() {
                     ),
                 )])),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -1842,7 +1859,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
                 "vpc_id".to_string(),
                 Value::Concrete(ConcreteValue::String("vpc-456".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -1879,7 +1896,7 @@ fn test_module_dot_path_bindings_and_refs() {
                 "cidr".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -1978,7 +1995,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 "cidr".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -2078,7 +2095,7 @@ fn test_substitute_arguments_interpolation() {
         })),
         InterpolationPart::Literal("-suffix".into()),
     ]));
-    let result = substitute_arguments(&value, &inputs);
+    let result = substitute_arguments(&value, &inputs).expect("substitution");
 
     // After substitution, the ResourceRef should be replaced with the argument value
     assert_eq!(
@@ -2115,7 +2132,7 @@ fn test_unknown_argument_rejected() {
                 "unknown_arg".to_string(),
                 Value::Concrete(ConcreteValue::String("should-fail".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -2146,7 +2163,7 @@ fn test_substitute_arguments_function_call() {
             Value::Concrete(ConcreteValue::Int(0)),
         ],
     });
-    let result = substitute_arguments(&value, &inputs);
+    let result = substitute_arguments(&value, &inputs).expect("substitution");
 
     assert_eq!(
         result,
@@ -2232,6 +2249,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -2261,7 +2279,7 @@ fn test_expand_module_call_with_interpolation() {
                 "env_name".to_string(),
                 Value::Concrete(ConcreteValue::String("dev".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -2473,7 +2491,7 @@ fn test_expand_module_call_with_function_call_argument() {
                 "env_name".to_string(),
                 Value::Concrete(ConcreteValue::String("dev".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -2786,6 +2804,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -2810,7 +2829,7 @@ fn test_argument_validation_passes_with_valid_value() {
         arguments: {
             let mut args = HashMap::new();
             args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
-            args
+            module_arguments(args)
         },
     };
 
@@ -2852,7 +2871,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
         module_name: "web_server".to_string(),
         binding_name: Some("web".to_string()),
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "port".to_string(),
             Value::resource_ref("producer", "port", Vec::new()),
         )]),
@@ -2950,6 +2969,7 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -2963,7 +2983,7 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         module_name: "outer".to_string(),
         binding_name: Some("root".to_string()),
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "outer_port".to_string(),
             Value::resource_ref("producer", "port", Vec::new()),
         )]),
@@ -3035,7 +3055,7 @@ fn test_argument_validation_fails_with_invalid_value() {
         arguments: {
             let mut args = HashMap::new();
             args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(0)));
-            args
+            module_arguments(args)
         },
     };
 
@@ -3080,7 +3100,7 @@ fn test_argument_validation_fails_with_negative_value() {
         arguments: {
             let mut args = HashMap::new();
             args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(-1)));
-            args
+            module_arguments(args)
         },
     };
 
@@ -3109,7 +3129,7 @@ fn test_argument_validation_fails_too_large() {
                 "port".to_string(),
                 Value::Concrete(ConcreteValue::Int(70000)),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -3151,6 +3171,7 @@ fn test_argument_validation_no_message_uses_default() {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3169,7 +3190,7 @@ fn test_argument_validation_no_message_uses_default() {
         arguments: {
             let mut args = HashMap::new();
             args.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(0)));
-            args
+            module_arguments(args)
         },
     };
 
@@ -3221,6 +3242,7 @@ fn test_argument_validation_len_with_list() {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3245,7 +3267,7 @@ fn test_argument_validation_len_with_list() {
                     ConcreteValue::String("env:prod".into()),
                 )])),
             );
-            args
+            module_arguments(args)
         },
     };
     assert!(resolver.expand_module_call(&call, "t").is_ok());
@@ -3261,7 +3283,7 @@ fn test_argument_validation_len_with_list() {
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![])),
             );
-            args
+            module_arguments(args)
         },
     };
     let result = resolver.expand_module_call(&call, "t");
@@ -3325,6 +3347,7 @@ fn test_require_block_passes() {
             error_message: "cert_arn is required when HTTPS is enabled".to_string(),
         }],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3353,7 +3376,7 @@ fn test_require_block_passes() {
                     "arn:aws:acm:us-east-1:123:cert/abc".into(),
                 )),
             );
-            args
+            module_arguments(args)
         },
     };
     assert!(resolver.expand_module_call(&call, "w").is_ok());
@@ -3404,6 +3427,7 @@ fn test_require_block_fails_with_not_expr() {
             error_message: "cert is required when HTTPS is enabled".to_string(),
         }],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3430,7 +3454,7 @@ fn test_require_block_fails_with_not_expr() {
                 "has_cert".to_string(),
                 Value::Concrete(ConcreteValue::Bool(false)),
             );
-            args
+            module_arguments(args)
         },
     };
     let result = resolver.expand_module_call(&call, "w");
@@ -3481,6 +3505,7 @@ fn test_require_block_len_function() {
             error_message: "ALB requires at least two subnets".to_string(),
         }],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3506,7 +3531,7 @@ fn test_require_block_len_function() {
                     Value::Concrete(ConcreteValue::String("subnet-b".into())),
                 ])),
             );
-            args
+            module_arguments(args)
         },
     };
     assert!(resolver.expand_module_call(&call, "lb").is_ok());
@@ -3524,7 +3549,7 @@ fn test_require_block_len_function() {
                     ConcreteValue::String("subnet-a".into()),
                 )])),
             );
-            args
+            module_arguments(args)
         },
     };
     let result = resolver.expand_module_call(&call, "lb");
@@ -3581,6 +3606,7 @@ fn test_require_block_multiple_constraints() {
             error_message: "min_size must be <= max_size".to_string(),
         }],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3607,7 +3633,7 @@ fn test_require_block_multiple_constraints() {
                 "max_size".to_string(),
                 Value::Concrete(ConcreteValue::Int(5)),
             );
-            args
+            module_arguments(args)
         },
     };
     assert!(resolver.expand_module_call(&call, "a").is_ok());
@@ -3627,7 +3653,7 @@ fn test_require_block_multiple_constraints() {
                 "max_size".to_string(),
                 Value::Concrete(ConcreteValue::Int(5)),
             );
-            args
+            module_arguments(args)
         },
     };
     let result = resolver.expand_module_call(&call, "a");
@@ -3672,7 +3698,7 @@ fn test_argument_type_mismatch_int_for_string() {
                 "vpc_id".to_string(),
                 Value::Concrete(ConcreteValue::Int(42)),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -3708,7 +3734,7 @@ fn test_argument_type_mismatch_string_for_bool() {
                 "enable_flag".to_string(),
                 Value::Concrete(ConcreteValue::String("not-a-bool".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -3775,7 +3801,7 @@ fn test_argument_type_custom_validator() {
                         .into(),
                 )),
             );
-            args
+            module_arguments(args)
         },
     };
     assert!(resolver.expand_module_call(&call, "a").is_ok());
@@ -3791,7 +3817,7 @@ fn test_argument_type_custom_validator() {
                 "policy_arn".to_string(),
                 Value::Concrete(ConcreteValue::String("not-an-arn".into())),
             );
-            args
+            module_arguments(args)
         },
     };
     let result = resolver.expand_module_call(&call_bad, "b");
@@ -3855,7 +3881,7 @@ fn test_argument_type_list_of_custom_type() {
                     Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/B".into())),
                 ])),
             );
-            args
+            module_arguments(args)
         },
     };
     assert!(resolver.expand_module_call(&call, "a").is_ok());
@@ -3874,7 +3900,7 @@ fn test_argument_type_list_of_custom_type() {
                     Value::Concrete(ConcreteValue::String("not-an-arn".into())),
                 ])),
             );
-            args
+            module_arguments(args)
         },
     };
     let result = resolver.expand_module_call(&call_bad, "b");
@@ -4066,6 +4092,151 @@ m {
         &Value::Concrete(ConcreteValue::String("p".into())),
         "bare-identifier default `secondary = primary` must resolve to caller's `primary`"
     );
+}
+
+#[test]
+fn module_argument_postfix_access_resolves_across_directory_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/selector");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("arguments.crn"),
+        r#"
+arguments {
+  items: list(String)
+  cfg: map(String)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("resource.crn"),
+        r#"
+let selected = mock.test.Thing {
+  name          = items[1]
+  bracket_value = cfg["k"]
+  field_value   = cfg.k
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let selector = use { source = "../modules/selector" }
+let child = selector {
+  items = ["a", "b"]
+  cfg   = { k = "value" }
+}
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir).expect("module postfix accesses must expand");
+
+    let selected = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("child.selected"))
+        .expect("expanded selected resource");
+    assert_eq!(
+        selected.get_attr("name"),
+        Some(&Value::Concrete(ConcreteValue::String("b".into())))
+    );
+    assert_eq!(
+        selected.get_attr("bracket_value"),
+        Some(&Value::Concrete(ConcreteValue::String("value".into())))
+    );
+    assert_eq!(
+        selected.get_attr("field_value"),
+        Some(&Value::Concrete(ConcreteValue::String("value".into())))
+    );
+}
+
+#[test]
+fn module_argument_postfix_access_reports_known_miss_during_expansion() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/selector");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("arguments.crn"),
+        "arguments { items: list(String) }\n",
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("resource.crn"),
+        r#"
+let selected = mock.test.Thing {
+  name = items[5]
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let selector = use { source = "../modules/selector" }
+let child = selector { items = ["x", "y"] }
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    let error = resolve_modules(&mut parsed, &root_dir)
+        .expect_err("known module-argument misses must fail during module expansion");
+    let message = error.to_string();
+    assert!(
+        message.contains("index 5 out of range for list of length 2"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("selector")
+            && message.contains("modules/selector")
+            && message.contains("line 3"),
+        "module access errors must identify the module source and authored line: {message}"
+    );
+}
+
+#[test]
+fn module_argument_postfix_access_preserves_deferred_caller_value() {
+    use crate::resource::{PathSegment, Subscript};
+
+    let value = crate::resource::apply_postfix_access(
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ModuleArgument {
+                name: "items".to_string(),
+            },
+        )),
+        PathSegment::Subscript {
+            index: Subscript::Int { index: 1 },
+        },
+        3,
+        crate::resource::AccessMissPolicy::Error,
+    )
+    .unwrap();
+    let caller_value = Value::Deferred(DeferredValue::FunctionCall {
+        name: "split".to_string(),
+        args: vec![
+            Value::Concrete(ConcreteValue::String(":".into())),
+            Value::resource_ref("source", "name", vec![]),
+        ],
+    });
+
+    let substituted = substitute_arguments(
+        &value,
+        &HashMap::from([("items".to_string(), caller_value)]),
+    )
+    .expect("substitution");
+
+    assert!(matches!(
+        substituted,
+        Value::Deferred(DeferredValue::Access(access))
+            if access.source_line() == 3
+            && matches!(access.step(), PathSegment::Subscript { index: Subscript::Int { index: 1 } })
+            && matches!(access.base(), Value::Deferred(DeferredValue::FunctionCall { name, args })
+            if name == "split" && matches!(&args[1], Value::Deferred(DeferredValue::ResourceRef { path }) if path.binding() == "source"))
+    ));
 }
 
 // #2393 — transitive default chain `a → b → c`. Each default is resolved
@@ -4263,19 +4434,18 @@ m {}
 
     let role_name = role_attr(&parsed, "role_name");
     match role_name {
-        // The cycle leaves both `a` and `b` as bare-binding refs; which
+        // The cycle leaves both `a` and `b` as typed argument placeholders; which
         // one surfaces as `role_name` depends on substitute_arguments's
         // walk order. Either is fine — the contract is that the loop
-        // terminates without panicking and produces a structured ref
-        // the scope check can flag. Since #2847 these bare refs are
-        // `BindingRef`, not `ResourceRef` with empty attribute.
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+        // terminates without panicking and preserves a structured,
+        // statically typed placeholder rather than inventing a value.
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name })) => {
             assert!(
-                binding == "a" || binding == "b",
-                "expected cyclic ref to point at `a` or `b`, got: {binding:?}"
+                name == "a" || name == "b",
+                "expected cyclic argument to point at `a` or `b`, got: {name:?}"
             );
         }
-        other => panic!("expected unresolved BindingRef from cycle; got {other:?}"),
+        other => panic!("expected unresolved module argument from cycle; got {other:?}"),
     }
 }
 
@@ -4957,6 +5127,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        parser_binding_metadata: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -4985,7 +5156,7 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
                 "environment".to_string(),
                 Value::Concrete(ConcreteValue::String("dpv".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -5019,7 +5190,7 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
                 "environment".to_string(),
                 Value::Concrete(ConcreteValue::String("prod".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -5060,7 +5231,7 @@ arguments {
         module_name: "env_module".to_string(),
         binding_name: Some("instance".to_string()),
         source: Default::default(),
-        arguments: HashMap::from([("environment".to_string(), value)]),
+        arguments: module_arguments([("environment".to_string(), value)]),
     };
 
     for literal in [r"'it\'s'", r#""it's""#] {
@@ -5288,7 +5459,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 "cidr".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -5470,7 +5641,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 "cidr".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -5868,7 +6039,7 @@ fn argument_type_list_accepts_resource_ref() {
                 "role_arns".to_string(),
                 Value::resource_ref("admin_access_roles", "arns", Vec::new()),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -5911,7 +6082,7 @@ fn argument_type_map_accepts_resource_ref() {
                 "tags".to_string(),
                 Value::resource_ref("some_resource", "tags", Vec::new()),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -5955,7 +6126,7 @@ fn argument_type_struct_accepts_resource_ref() {
                 "options".to_string(),
                 Value::resource_ref("some_resource", "options", Vec::new()),
             );
-            args
+            module_arguments(args)
         },
     };
 
@@ -5989,7 +6160,7 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
         module_name: "test_module".to_string(),
         binding_name: Some("a".to_string()),
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "count".to_string(),
             Value::resource_ref("source", "count", Vec::new()),
         )]),
@@ -6127,7 +6298,7 @@ fn module_argument_type_error_with_config(
         module_name: "web_tier".to_string(),
         binding_name: Some("web".to_string()),
         source: Default::default(),
-        arguments: HashMap::from([(arg_name.to_string(), value)]),
+        arguments: module_arguments([(arg_name.to_string(), value)]),
     };
 
     let result = resolver.expand_module_call(&call, "web");
@@ -6289,7 +6460,7 @@ fn binding_ref_argument_defers_to_binding_index() {
         module_name: "inner".to_string(),
         binding_name: Some("inner_instance".to_string()),
         source: Default::default(),
-        arguments: HashMap::from([(
+        arguments: module_arguments([(
             "environment".to_string(),
             Value::Deferred(DeferredValue::BindingRef {
                 binding: "outer_environment".to_string(),

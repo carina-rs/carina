@@ -256,6 +256,9 @@ pub(crate) fn visit_refs_with_sink<'a>(
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             f(ReferencePathRef::Binding(binding), sink)
         }
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ModuleArgument { name },
+        )) => f(ReferencePathRef::Binding(name), sink),
         Value::Concrete(ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
             for item in items {
@@ -283,6 +286,20 @@ pub(crate) fn visit_refs_with_sink<'a>(
                 visit_refs_with_sink(argument, None, f);
             }
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            if let Some(reference) = crate::resource::module_argument_reference_path(value) {
+                // Module parameters are typed value placeholders rather than
+                // structural references. Project their postfix chain through
+                // BindingIndex so `cfg.field` receives the same narrowing and
+                // diagnostic origin as an ordinary path.
+                f(reference.as_ref(), sink);
+            } else {
+                // Other Access values have computed operands. References
+                // nested inside the computation do not inherit its result
+                // sink.
+                visit_refs_with_sink(access.base(), None, f);
+            }
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => visit_refs_with_sink(inner, sink, f),
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -295,6 +312,178 @@ pub(crate) fn visit_refs_with_sink<'a>(
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => {}
     }
+}
+
+/// Visit values whose postfix path needs inference in addition to the normal
+/// reference walk. Computed Access values need their result checked; a
+/// canonical ResourceRef with path segments also needs inference so a known
+/// scalar cannot be indexed merely because BindingIndex reserves shape
+/// diagnostics for upstream references.
+fn visit_computed_accesses_with_sink<'a>(
+    value: &Value,
+    sink: Option<RefSink<'a>>,
+    f: &mut impl FnMut(&Value, Option<RefSink<'a>>),
+) {
+    match value {
+        Value::Deferred(DeferredValue::Access(access)) => {
+            if crate::resource::module_argument_reference_path(value).is_none() {
+                f(value, sink);
+                visit_computed_accesses_with_sink(access.base(), None, f);
+            }
+        }
+        Value::Deferred(DeferredValue::ResourceRef { path }) if !path.segments().is_empty() => {
+            f(value, sink);
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            let child_sink = sink.and_then(RefSink::list_element);
+            for item in items {
+                visit_computed_accesses_with_sink(item, child_sink, f);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            for (key, value) in entries {
+                visit_computed_accesses_with_sink(
+                    value,
+                    sink.and_then(|sink| sink.map_entry(key)),
+                    f,
+                );
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let crate::resource::InterpolationPart::Expr(value) = part {
+                    visit_computed_accesses_with_sink(value, Some(RefSink::String), f);
+                }
+            }
+        }
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            for argument in args {
+                visit_computed_accesses_with_sink(argument, None, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            visit_computed_accesses_with_sink(inner, sink, f)
+        }
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_))
+        | Value::Deferred(DeferredValue::RedactedSecret { .. })
+        | Value::Deferred(DeferredValue::Unknown(_)) => {}
+    }
+}
+
+/// A statically-known postfix access error shared by CLI validation and LSP
+/// diagnostics. Keeping the inference/error selection here prevents editor
+/// callers from silently treating a new inference error variant as success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferredAccessTypeError {
+    InvalidAccess {
+        error: inference::InferenceError,
+    },
+    TypeMismatch {
+        expected: String,
+        actual: String,
+        origin: String,
+    },
+}
+
+impl std::fmt::Display for DeferredAccessTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAccess { error } => error.fmt(f),
+            Self::TypeMismatch {
+                expected,
+                actual,
+                origin,
+            } => write!(
+                f,
+                "Type mismatch: expected {expected}, got {actual} ({origin})"
+            ),
+        }
+    }
+}
+
+/// Check a deferred postfix result against its sink with the canonical
+/// inference authority. Unknown bases remain unchecked; known-invalid access
+/// and known result mismatches are errors.
+pub fn check_deferred_access_type(
+    value: &Value,
+    expected: crate::schema::TypeInSchema<'_>,
+    bindings: &inference::InferenceBindings,
+    schemas: &SchemaRegistry,
+    binding_index: &BindingIndex<'_>,
+) -> Result<(), DeferredAccessTypeError> {
+    // Canonical reference-rooted postfix expressions are ResourceRefs. Route
+    // those through BindingIndex so managed resources and wait aliases share
+    // the same schema/value-source authority. This decision belongs here,
+    // rather than in every CLI/LSP caller, so a new binding kind cannot be
+    // silently skipped by a copied `InferenceBinding` predicate.
+    if let Value::Deferred(DeferredValue::ResourceRef { path }) = value {
+        return match binding_index.postfix_ref_type(path) {
+            RefType::Typed(source) => match source.is_assignable_to_sink(expected) {
+                Ok(()) => Ok(()),
+                Err(mismatch) => Err(DeferredAccessTypeError::TypeMismatch {
+                    expected: expected.resolved_type_name(),
+                    actual: mismatch.actual_type_name().to_string(),
+                    origin: mismatch.origin_description(path.into()),
+                }),
+            },
+            RefType::UnknownAttribute(RefTypeError::InvalidAccess { step, actual, .. }) => {
+                Err(DeferredAccessTypeError::InvalidAccess {
+                    error: inference::InferenceError::InvalidAccess {
+                        base_type: actual,
+                        step,
+                    },
+                })
+            }
+            // Existence/field errors retain their dedicated reference
+            // diagnostics; unknown type surfaces remain deliberately
+            // unchecked, as before.
+            RefType::Unchecked
+            | RefType::UnknownBinding { .. }
+            | RefType::UnknownAttribute(
+                RefTypeError::UnknownAttribute { .. }
+                | RefTypeError::UnknownStructField { .. }
+                | RefTypeError::UnknownUpstreamExport { .. },
+            ) => Ok(()),
+        };
+    }
+
+    let actual = match inference::infer_type_from_value(value, bindings, schemas) {
+        Ok(actual) => actual,
+        Err(error @ inference::InferenceError::InvalidAccess { .. })
+        | Err(error @ inference::InferenceError::UnknownAttribute { .. }) => {
+            return Err(DeferredAccessTypeError::InvalidAccess { error });
+        }
+        // Dynamic result types and unavailable authorities cannot be checked
+        // soundly at this phase. Spell every inference variant out so adding a
+        // new failure reason forces an explicit checked/unchecked decision.
+        Err(inference::InferenceError::UnknownType { .. })
+        | Err(inference::InferenceError::HeterogeneousCollection { .. })
+        | Err(inference::InferenceError::UnknownBinding { .. })
+        | Err(inference::InferenceError::NonInferableBinding { .. })
+        | Err(inference::InferenceError::SchemaUnavailable { .. })
+        | Err(inference::InferenceError::CyclicVirtualBinding { .. }) => return Ok(()),
+    };
+    let Some(actual) = lift_type_expr(&actual) else {
+        return Ok(());
+    };
+    let actual = crate::schema::TypeInSchema::schemaless(&actual);
+    if actual.is_assignable_to(expected) {
+        return Ok(());
+    }
+    Err(DeferredAccessTypeError::TypeMismatch {
+        expected: expected.resolved_type_name(),
+        actual: actual.resolved_type_name(),
+        origin: format!("from {}", crate::value::format_value(value)),
+    })
 }
 
 fn resolve_resource_reference(
@@ -438,7 +627,7 @@ fn validate_module_call_argument_ref_types_inner(
                 .map(|argument| &argument.type_expr);
 
             visit_refs_with_sink(
-                value,
+                value.value(),
                 declared_sink.map(RefSink::TypeExpr),
                 &mut |path, sink| {
                     let Some(kind) =
@@ -595,6 +784,10 @@ enum CompositionRefErrorKindKey {
         export: String,
         known_exports: Vec<String>,
     },
+    InvalidAccess {
+        step: crate::resource::PathSegment,
+        actual: String,
+    },
 }
 
 impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
@@ -636,6 +829,14 @@ impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
             }) => Self::UnknownUpstreamExport {
                 export: export.clone(),
                 known_exports: known_exports.clone(),
+            },
+            ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::InvalidAccess {
+                step,
+                actual,
+                ..
+            }) => Self::InvalidAccess {
+                step: step.clone(),
+                actual: actual.clone(),
             },
         }
     }
@@ -870,6 +1071,14 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
                 unknown_policy,
                 errors,
             ),
+            Value::Deferred(DeferredValue::Access(access)) => check_function_calls(
+                access.base(),
+                None,
+                context,
+                bindings,
+                unknown_policy,
+                errors,
+            ),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -897,7 +1106,14 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
     }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
-            check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+            check_function_calls(
+                value.value(),
+                None,
+                None,
+                bindings,
+                unknown_policy,
+                &mut errors,
+            );
         }
     }
     for parameter in &parsed.arguments {
@@ -1363,6 +1579,7 @@ fn validate_resource_ref_types_inner<E>(
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
+    let inference_bindings = inference::bindings_from_parsed(parsed);
 
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed.
@@ -1400,6 +1617,14 @@ fn validate_resource_ref_types_inner<E>(
                 else {
                     return;
                 };
+                if matches!(
+                    reference,
+                    ReferencePathRef::Access(path) if !path.segments().is_empty()
+                ) {
+                    // The shared postfix authority below owns both narrowing
+                    // and sink compatibility for a segmented ResourceRef.
+                    return;
+                }
                 let Some(sink_type) = (match sink {
                     Some(RefSink::AttributeType { attr_type, defs }) => {
                         Some(attr_type.in_schema(defs))
@@ -1425,6 +1650,35 @@ fn validate_resource_ref_types_inner<E>(
                     source_name,
                     origin,
                 ));
+            });
+            visit_computed_accesses_with_sink(attr_value, sink, &mut |access, sink| {
+                let sink_type = match sink {
+                    Some(RefSink::AttributeType { attr_type, defs }) => attr_type.in_schema(defs),
+                    Some(RefSink::String) => crate::schema::TypeInSchema::schemaless(&string_sink),
+                    Some(RefSink::TypeExpr(_)) | None => return,
+                };
+                match check_deferred_access_type(
+                    access,
+                    sink_type,
+                    &inference_bindings,
+                    registry,
+                    bindings,
+                ) {
+                    Ok(()) => {}
+                    Err(DeferredAccessTypeError::InvalidAccess { error }) => {
+                        all_errors.push(format!("{}: {}", resource_location, error));
+                    }
+                    Err(DeferredAccessTypeError::TypeMismatch {
+                        expected,
+                        actual,
+                        origin,
+                    }) => {
+                        all_errors.push(format!(
+                            "{}: cannot assign {} to '{}': expected {}, got {} ({})",
+                            resource_location, actual, attr_name, expected, actual, origin,
+                        ));
+                    }
+                }
             });
         }
     }
@@ -2090,7 +2344,7 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 
 /// Returns `true` if `value` contains any deferred sub-value that the
 /// WASM provider boundary would reject (ResourceRef, BindingRef,
-/// Interpolation, FunctionCall, Unknown). Used by
+/// Interpolation, FunctionCall, Access, Unknown). Used by
 /// [`validate_provider_config`] to skip the plugin-side `validate_config`
 /// call for attributes whose refs cannot be substituted at validate
 /// time. `Secret` is transparent — its inner value is unwrapped because
@@ -2102,6 +2356,7 @@ pub fn value_contains_unresolved_ref(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => true,
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unresolved_ref(inner),
@@ -2166,8 +2421,12 @@ pub fn validate_module_calls(
             let module_args = &signature.arguments;
             for (arg_name, arg_value) in &call.arguments {
                 if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name)
-                    && let Err(error) =
-                        typecheck::check_type_expr_value(&arg_param.type_expr, arg_value, config)
+                    && let Err(error) = typecheck::check_type_expr_value(
+                        &arg_param.type_expr,
+                        arg_value.value(),
+                        config,
+                        typecheck::TypecheckInference::Unavailable,
+                    )
                 {
                     errors.push(format!(
                         "module {} argument '{}': {}",
@@ -2260,8 +2519,12 @@ where
                     resolved_param.set_value(Some(resolved));
                     if let (Some(type_expr), Some(value)) =
                         (resolved_param.type_expr_opt(), resolved_param.value())
-                        && let Err(error) =
-                            typecheck::check_type_expr_value(type_expr, value, config)
+                        && let Err(error) = typecheck::check_type_expr_value(
+                            type_expr,
+                            value,
+                            config,
+                            typecheck::TypecheckInference::Unavailable,
+                        )
                     {
                         errors.push(format!("export '{}': {error}", param.name()));
                     }
@@ -2326,7 +2589,12 @@ pub fn validate_attribute_params(
 
     for param in attribute_params {
         if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
-            && let Err(error) = typecheck::check_type_expr_value(type_expr, value, config)
+            && let Err(error) = typecheck::check_type_expr_value(
+                type_expr,
+                value,
+                config,
+                typecheck::TypecheckInference::Unavailable,
+            )
         {
             errors.push(format!("attribute '{}': {}", param.name, error));
         }
@@ -2390,7 +2658,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
-            collect_dependencies(value, &mut referenced);
+            collect_dependencies(value.value(), &mut referenced);
         }
     }
     for attr_param in &parsed.attribute_params {

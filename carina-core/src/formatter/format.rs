@@ -212,6 +212,7 @@ impl Formatter {
             NodeKind::ExportsParam => self.format_attributes_param(node, 0), // same format as attributes
             NodeKind::PipeExpr => self.format_pipe_expr(node),
             NodeKind::ComposeExpr => self.format_compose_expr(node),
+            NodeKind::PostfixExpr | NodeKind::Primary => self.format_default(node),
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
             NodeKind::SubscriptedId => self.format_subscripted_id(node),
@@ -1125,6 +1126,75 @@ mod tests {
             "Expected function call in:\n{}",
             result
         );
+    }
+
+    #[test]
+    fn test_format_postfix_access_on_call_and_parenthesized_pipe_round_trips() {
+        let input = "let direct = split('/', role.arn)[1]\n\
+                     \n\
+                     let piped = (direct |> split(':'))[1]\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert_eq!(result, input);
+        assert_eq!(format(&result, &config).unwrap(), result);
+    }
+
+    #[test]
+    fn postfix_field_access_round_trips_for_every_base_shape() {
+        let input = "let call = lookup({ a = { b = 'z' } }, 'a').b\n\
+                     let map = { a = 'z' }.a\n\
+                     let list = [{ a = 'z' }].a\n\
+                     let indexed = [{ a = 'z' }][0].a\n\
+                     let paren = ({ a = 'z' }).a\n\
+                     let chain = { a = { b = 'z' } }.a.b\n\
+                     \n\
+                     let generated = for item in [{ a = 'z' }] {\n\
+                       mock.test.Thing { name = ({ a = item.a }).a }\n\
+                     }\n";
+        let config = FormatConfig::default();
+
+        let result = format(input, &config).expect("postfix field access must format");
+
+        let expected = "let call = lookup({\n\
+                        \x20 a = {\n\
+                        \x20   b = 'z'\n\
+                        \x20 }\n\
+                        }, 'a').b\n\
+                        \n\
+                        let map = {\n\
+                        \x20 a = 'z'\n\
+                        }.a\n\
+                        \n\
+                        let list = [{\n\
+                        \x20 a = 'z'\n\
+                        }].a\n\
+                        \n\
+                        let indexed = [{\n\
+                        \x20 a = 'z'\n\
+                        }][0].a\n\
+                        \n\
+                        let paren = ({\n\
+                        \x20 a = 'z'\n\
+                        }).a\n\
+                        \n\
+                        let chain = {\n\
+                        \x20 a = {\n\
+                        \x20   b = 'z'\n\
+                        \x20 }\n\
+                        }.a.b\n\
+                        \n\
+                        let generated = for item in [{\n\
+                        \x20 a = 'z'\n\
+                        }] {\n\
+                        \x20 mock.test.Thing {\n\
+                        \x20   name = ({\n\
+                        \x20     a = item.a\n\
+                        \x20   }).a\n\
+                        \x20 }\n\
+                        }\n";
+        assert_eq!(result, expected);
+        assert_eq!(format(&result, &config).unwrap(), result);
     }
 
     #[test]

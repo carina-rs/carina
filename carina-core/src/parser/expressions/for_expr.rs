@@ -7,7 +7,8 @@
 //! a later pass can finish the expansion once the upstream value
 //! resolves.
 
-use crate::parser::expressions::primary::parse_primary_eval;
+use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
     DeferredForExpression, ModuleCall, ParseContext, ParseError, ParseWarning, Rule, WarningKind,
     display_string_literal, evaluate_static_value, first_inner, next_pair, parse_expression,
@@ -60,20 +61,6 @@ fn identifier_appears_in(text: &str, name: &str) -> bool {
         i += 1;
     }
     false
-}
-
-/// Whether `s` is shaped like a bare Carina identifier — the first byte is
-/// `A-Za-z_` and the rest are `A-Za-z0-9_`. Used to recover from the
-/// parser's collapse of unresolved identifiers into `Value::Concrete(ConcreteValue::String(s))`
-/// when we need to decide whether to render an error as "identifier" vs
-/// "string literal". See #2101.
-fn is_bare_identifier(s: &str) -> bool {
-    let mut bytes = s.bytes();
-    match bytes.next() {
-        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
-        _ => return false,
-    }
-    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Result of parsing a for expression body: a managed resource, a data
@@ -138,7 +125,13 @@ pub(crate) fn parse_for_expr(
 
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
-    let iterable = parse_for_iterable(iterable_pair, ctx)?;
+    let ParsedForIterable {
+        value: iterable,
+        bare_unbound_identifier,
+        structural_for_binding,
+        provisional_binding,
+        structural_handle_metadata,
+    } = parse_for_iterable(iterable_pair, ctx)?;
 
     // Parse the body (we'll re-parse it for each iteration)
     let body_pair = next_pair(&mut inner, "body", "for expression")?;
@@ -189,6 +182,11 @@ pub(crate) fn parse_for_expr(
             c.set_variable(name.to_string(), v);
         }
     };
+    let bind_eval = |c: &mut ParseContext, name: &str, v: EvalValue| {
+        if name != "_" {
+            c.set_variable(name.to_string(), v);
+        }
+    };
 
     // Expand based on iterable type
     match (&binding, &iterable) {
@@ -196,7 +194,18 @@ pub(crate) fn parse_for_expr(
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
                 let mut iter_ctx = ctx.clone();
-                bind(&mut iter_ctx, var, item.clone());
+                let metadata = match structural_handle_metadata.as_ref() {
+                    Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
+                    Some(
+                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::Map(_),
+                    )
+                    | None => None,
+                };
+                bind_eval(
+                    &mut iter_ctx,
+                    var,
+                    EvalValue::computed(item.clone(), metadata),
+                );
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(
                     result,
@@ -216,7 +225,18 @@ pub(crate) fn parse_for_expr(
                     idx_var,
                     Value::Concrete(ConcreteValue::Int(i as i64)),
                 );
-                bind(&mut iter_ctx, val_var, item.clone());
+                let metadata = match structural_handle_metadata.as_ref() {
+                    Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
+                    Some(
+                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::Map(_),
+                    )
+                    | None => None,
+                };
+                bind_eval(
+                    &mut iter_ctx,
+                    val_var,
+                    EvalValue::computed(item.clone(), metadata),
+                );
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(
                     result,
@@ -240,7 +260,18 @@ pub(crate) fn parse_for_expr(
                     key_var,
                     Value::Concrete(ConcreteValue::String(key.clone().into())),
                 );
-                bind(&mut iter_ctx, val_var, val.clone());
+                let metadata = match structural_handle_metadata.as_ref() {
+                    Some(StructuralHandleMetadata::Map(entries)) => entries.get(key).cloned(),
+                    Some(
+                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::List(_),
+                    )
+                    | None => None,
+                };
+                bind_eval(
+                    &mut iter_ctx,
+                    val_var,
+                    EvalValue::computed(val.clone(), metadata),
+                );
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(
                     result,
@@ -273,15 +304,22 @@ pub(crate) fn parse_for_expr(
             // Try to parse the body once with placeholder values for the loop
             // variable(s) to extract the resource type and attribute template.
             let mut template_ctx = ctx.clone();
-            let placeholder = || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
             let bind = |c: &mut ParseContext, name: &str, v: Value| {
                 if name != "_" {
                     c.set_variable(name.to_string(), v);
                 }
             };
+            let bind_value = |c: &mut ParseContext, name: &str| {
+                if name != "_" {
+                    c.set_variable(
+                        name.to_string(),
+                        EvalValue::deferred_for_value(name.to_string()),
+                    );
+                }
+            };
             match &binding {
                 ForBinding::Simple(var) => {
-                    bind(&mut template_ctx, var, placeholder());
+                    bind_value(&mut template_ctx, var);
                 }
                 ForBinding::Indexed(idx, val) => {
                     bind(
@@ -289,7 +327,7 @@ pub(crate) fn parse_for_expr(
                         idx,
                         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
                     );
-                    bind(&mut template_ctx, val, placeholder());
+                    bind_value(&mut template_ctx, val);
                 }
                 ForBinding::Map(k, v) => {
                     bind(
@@ -297,7 +335,7 @@ pub(crate) fn parse_for_expr(
                         k,
                         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
                     );
-                    bind(&mut template_ctx, v, placeholder());
+                    bind_value(&mut template_ctx, v);
                 }
             }
 
@@ -330,45 +368,36 @@ pub(crate) fn parse_for_expr(
             // Return empty — the for body produces zero concrete resources
         }
         _ => {
-            // Special case: the parser lowers bare unresolved identifiers
-            // (e.g. `for _ in org { ... }`) into
-            // `Value::Concrete(ConcreteValue::EnumIdentifier("org"))`
-            // (carina#2986 Phase 3 routing). Pre-Phase-3 they landed as
-            // `ConcreteValue::String`; we still accept both shapes here
-            // because a quoted literal `for _ in "org" { ... }` should
-            // also drop into this branch — reporting either as
-            // `iterable is string "org"` is misleading. Record them as
-            // deferred for-expressions so `check_identifier_scope` (which
-            // runs on the merged directory-wide ParsedFile, so cross-file
-            // upstream_state / module bindings are visible) can emit a
-            // proper UndefinedIdentifier with the did-you-mean machinery
-            // from #2038 / #2100. See #2101 / #2138.
-            let bare_ident_text: Option<String> = match &iterable {
-                Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.to_string()),
-                Value::Concrete(ConcreteValue::String(s))
-                    if s.diagnostic_literal().is_some_and(is_bare_identifier) =>
-                {
-                    s.diagnostic_literal().map(str::to_owned)
-                }
-                _ => None,
-            };
-            if let Some(s) = bare_ident_text.as_ref() {
+            // Only an identifier token that was syntactically bare *and*
+            // unbound may enter the deferred identifier-diagnostic path.
+            // A String produced by indexing or a function result is data,
+            // even when its contents happen to be identifier-shaped.
+            if let Some(s) = bare_unbound_identifier
+                .as_ref()
+                .or(provisional_binding.as_ref())
+            {
                 let header = match &binding {
                     ForBinding::Simple(var) => format!("for {} in {}", var, s),
                     ForBinding::Indexed(idx, val) => format!("for ({}, {}) in {}", idx, val, s),
                     ForBinding::Map(k, v) => format!("for {}, {} in {}", k, v, s),
                 };
                 let mut template_ctx = ctx.clone();
-                let placeholder =
-                    || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
                 let bind = |c: &mut ParseContext, name: &str, v: Value| {
                     if name != "_" {
                         c.set_variable(name.to_string(), v);
                     }
                 };
+                let bind_value = |c: &mut ParseContext, name: &str| {
+                    if name != "_" {
+                        c.set_variable(
+                            name.to_string(),
+                            EvalValue::deferred_for_value(name.to_string()),
+                        );
+                    }
+                };
                 match &binding {
                     ForBinding::Simple(var) => {
-                        bind(&mut template_ctx, var, placeholder());
+                        bind_value(&mut template_ctx, var);
                     }
                     ForBinding::Indexed(idx, val) => {
                         bind(
@@ -376,7 +405,7 @@ pub(crate) fn parse_for_expr(
                             idx,
                             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
                         );
-                        bind(&mut template_ctx, val, placeholder());
+                        bind_value(&mut template_ctx, val);
                     }
                     ForBinding::Map(k, v) => {
                         bind(
@@ -384,7 +413,7 @@ pub(crate) fn parse_for_expr(
                             k,
                             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
                         );
-                        bind(&mut template_ctx, v, placeholder());
+                        bind_value(&mut template_ctx, v);
                     }
                 }
                 let address = format!("{}[?]", binding_name);
@@ -415,31 +444,41 @@ pub(crate) fn parse_for_expr(
                 }
                 return Ok((resources, data_sources, module_calls));
             }
-            let iterable_type = match &iterable {
-                Value::Concrete(ConcreteValue::String(s)) => match s.diagnostic_literal() {
-                    Some(s) => {
-                        let (truncated, marker) = crate::utils::truncate_chars_for_display(s, 50);
-                        format!("string {}{marker}", display_string_literal(&truncated))
+            let iterable_type = if structural_handle_metadata
+                .as_ref()
+                .is_some_and(StructuralHandleMetadata::is_handle)
+            {
+                "resource handle inside a computed value".to_string()
+            } else if let Some(binding) = structural_for_binding {
+                format!("for-binding '{binding}'")
+            } else {
+                match &iterable {
+                    Value::Concrete(ConcreteValue::String(s)) => match s.diagnostic_literal() {
+                        Some(s) => {
+                            let (truncated, marker) =
+                                crate::utils::truncate_chars_for_display(s, 50);
+                            format!("string {}{marker}", display_string_literal(&truncated))
+                        }
+                        None => "string".to_string(),
+                    },
+                    Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+                        let (truncated, marker) =
+                            crate::utils::truncate_chars_for_display(s.as_str(), 50);
+                        format!("identifier `{truncated}`{marker}")
                     }
-                    None => "string".to_string(),
-                },
-                Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-                    let (truncated, marker) =
-                        crate::utils::truncate_chars_for_display(s.as_str(), 50);
-                    format!("identifier `{truncated}`{marker}")
+                    Value::Concrete(ConcreteValue::Int(i)) => format!("int {}", i),
+                    Value::Concrete(ConcreteValue::Float(f)) => format!("float {}", f),
+                    Value::Concrete(ConcreteValue::Bool(b)) => format!("bool {}", b),
+                    Value::Concrete(ConcreteValue::Duration(d)) => {
+                        format!("duration {}", crate::value::render_duration(*d))
+                    }
+                    Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                        format!("unresolved reference {}", path.to_dot_string())
+                    }
+                    Value::Concrete(ConcreteValue::List(_)) => "list".to_string(),
+                    Value::Concrete(ConcreteValue::Map(_)) => "map".to_string(),
+                    other => crate::ValueDescription::of(other).to_string(),
                 }
-                Value::Concrete(ConcreteValue::Int(i)) => format!("int {}", i),
-                Value::Concrete(ConcreteValue::Float(f)) => format!("float {}", f),
-                Value::Concrete(ConcreteValue::Bool(b)) => format!("bool {}", b),
-                Value::Concrete(ConcreteValue::Duration(d)) => {
-                    format!("duration {}", crate::value::render_duration(*d))
-                }
-                Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                    format!("unresolved reference {}", path.to_dot_string())
-                }
-                Value::Concrete(ConcreteValue::List(_)) => "list".to_string(),
-                Value::Concrete(ConcreteValue::Map(_)) => "map".to_string(),
-                other => format!("{:?}", other),
             };
             let binding_type = match &binding {
                 ForBinding::Simple(var) => format!("`for {} in ...`", var),
@@ -513,13 +552,48 @@ pub(crate) fn parse_for_binding(
 /// When the iterable is a function call with all statically-known arguments,
 /// the function is eagerly evaluated at parse time. If any argument depends on
 /// a runtime value (e.g. ResourceRef), a clear error is returned.
-pub(crate) fn parse_for_iterable(
+struct ParsedForIterable {
+    value: Value,
+    bare_unbound_identifier: Option<String>,
+    structural_for_binding: Option<String>,
+    provisional_binding: Option<String>,
+    structural_handle_metadata: Option<StructuralHandleMetadata>,
+}
+
+fn syntactic_bare_unbound_identifier(
+    pair: &pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Option<String> {
+    let mut iterable_parts = pair.clone().into_inner();
+    let base = iterable_parts.next()?;
+    if iterable_parts.next().is_some() || base.as_rule() != Rule::variable_ref {
+        return None;
+    }
+    let mut variable_parts = base.into_inner();
+    let identifier = variable_parts.next()?;
+    if variable_parts.next().is_some() || ctx.contains_binding(identifier.as_str()) {
+        return None;
+    }
+    Some(identifier.as_str().to_string())
+}
+
+fn parse_for_iterable(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
-    // for_iterable contains function_call | list | variable_ref | "(" expression ")"
-    let inner = first_inner(pair, "iterable expression", "for iterable")?;
-    let eval = parse_primary_eval(inner, ctx)?;
+) -> Result<ParsedForIterable, ParseError> {
+    // `for_iterable` is a restricted postfix wrapper whose base is a
+    // function call, list, variable reference, or parenthesized expression.
+    let bare_unbound_identifier = syntactic_bare_unbound_identifier(&pair, ctx);
+    let eval = parse_postfix_eval(pair, ctx)?;
+    let structural_for_binding = eval
+        .structural_handle_ref()
+        .and_then(|handle| handle.for_binding_name())
+        .map(str::to_string);
+    let provisional_binding = eval
+        .structural_handle_ref()
+        .and_then(|handle| handle.provisional_binding_name())
+        .map(str::to_string);
+    let structural_handle_metadata = eval.structural_handle_metadata().cloned();
     let value = eval
         .into_value()
         .map_err(|leak| ParseError::InvalidExpression {
@@ -530,7 +604,13 @@ pub(crate) fn parse_for_iterable(
                 leak.name, leak.remaining_arity
             ),
         })?;
-    evaluate_static_value(value, ctx.config)
+    Ok(ParsedForIterable {
+        value: evaluate_static_value(value, ctx.config)?,
+        bare_unbound_identifier,
+        structural_for_binding,
+        provisional_binding,
+        structural_handle_metadata,
+    })
 }
 
 /// Parse the body of a for expression and produce a single resource or module call
