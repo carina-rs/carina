@@ -250,8 +250,9 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
         .await
         .expect_err("guest output containing nested NaN must be a provider error");
 
-    assert!(error.message().contains("WASM boundary encode error"));
-    assert!(error.message().contains("non-finite float NaN"));
+    let rendered = error.to_string();
+    assert!(rendered.contains("WASM boundary encode error"));
+    assert!(rendered.contains("non-finite float NaN"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -813,7 +814,7 @@ async fn test_wasm_create_normalizer_propagates_instance_initialization_failure(
     };
     assert!(
         error
-            .message()
+            .to_string()
             .contains("intentional mock initialization failure"),
         "unexpected normalizer initialization error: {error}"
     );
@@ -1067,7 +1068,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
         "the follow-up CRUD error must name the normalizer trap: {rendered}"
     );
     assert!(
-        !rendered.contains("WASM trap in create")
+        !rendered.contains("WASM guest trapped: create call failed")
             && !rendered.contains("cannot enter component instance"),
         "the follow-up CRUD error must not misattribute the poisoned instance: {rendered}"
     );
@@ -1091,7 +1092,9 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
         .await
         .expect_err("the mock create hook must trap");
     assert!(
-        initial_error.to_string().contains("WASM trap in create"),
+        initial_error
+            .to_string()
+            .contains("WASM guest trapped: create call failed"),
         "the initial error must name the trapping operation: {initial_error}"
     );
 
@@ -1109,7 +1112,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
         "the follow-up error must name the original operation and typed trap cause: {rendered}"
     );
     assert!(
-        !rendered.contains("WASM trap in read")
+        !rendered.contains("WASM guest trapped: read call failed")
             && !rendered.contains("cannot enter component instance")
             && !rendered.contains("wasm backtrace"),
         "the follow-up error must not be attributed to the later read: {rendered}"
@@ -1180,7 +1183,10 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         .await
         .expect_err("a guest normalize_desired error must cross the structured error channel");
     assert_eq!(error.variant_name(), "internal");
-    assert_eq!(error.message(), "intentional mock normalize_desired error");
+    assert_eq!(
+        error.detail().context(),
+        "intentional mock normalize_desired error"
+    );
     assert_eq!(
         error.detail().resource_id.as_deref(),
         Some(&desired_id),
@@ -1227,7 +1233,10 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         .expect_err("a guest normalize_state error must cross the structured error channel");
 
     assert_eq!(error.variant_name(), "internal");
-    assert_eq!(error.message(), "intentional mock normalize_state error");
+    assert_eq!(
+        error.detail().context(),
+        "intentional mock normalize_state error"
+    );
     assert_eq!(error.detail().resource_id.as_deref(), Some(&id));
     assert_eq!(states, before, "provider normalizer errors must be atomic");
 
@@ -1258,7 +1267,10 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         .await
         .expect_err("a guest hydrate_read_state error must cross the structured error channel");
     assert_eq!(error.variant_name(), "internal");
-    assert_eq!(error.message(), "intentional mock hydrate_read_state error");
+    assert_eq!(
+        error.detail().context(),
+        "intentional mock hydrate_read_state error"
+    );
     assert_eq!(error.detail().resource_id.as_deref(), Some(&hydrate_id));
     assert_eq!(
         hydrate_states, hydrate_before,
@@ -1308,7 +1320,7 @@ async fn test_wasm_normalizer_rejects_nested_non_finite_float_without_mutating_r
         .expect_err("nested non-finite floats must be provider errors, not panics");
 
     assert!(error.to_string().contains("non-finite float"));
-    assert!(std::error::Error::source(&error).is_some());
+    assert!(error.detail().cause().is_some());
     assert_eq!(resources, before, "failed encoding must be atomic");
 }
 

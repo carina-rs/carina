@@ -7,6 +7,9 @@ license = "MIT"
 [lib]
 doctest = false
 
+[features]
+test-utils = []
+
 [dependencies]
 carina-core = { path = "../carina-core" }
 carina-provider-protocol = { path = "../carina-provider-protocol" }

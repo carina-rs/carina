@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
+use carina_provider_protocol::types::{
+    ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
+};
+
 use crate::effect::PlanOp;
 use crate::parser::ProviderConfig;
 use crate::resource::{
@@ -30,18 +34,32 @@ pub use crate::executor::provider_ready::{
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
 ///
-/// Mirrors `error-detail` in `wit/types.wit`. The `cause` chain stays
+/// Mirrors `error-detail` in `wit/types.wit`. The typed terminal `cause` stays
 /// host-side (boxed `dyn Error`) and is flattened to a string when the
 /// error crosses the WIT boundary.
+///
+/// Message and cause cannot be supplied together through a struct literal.
+/// Cause-bearing errors must use one of the typed `*_caused_by` constructors
+/// on [`ProviderError`].
+///
+/// ```compile_fail,E0451
+/// use carina_core::provider::ErrorDetail;
+///
+/// let _ = ErrorDetail {
+///     message: String::from("x"),
+///     cause: Some(Box::new(std::io::Error::other("x"))),
+///     ..ErrorDetail::default()
+/// };
+/// ```
 #[derive(Debug, Default)]
 pub struct ErrorDetail {
     /// Human-readable message.
-    pub message: String,
+    message: String,
     /// Resource the error pertains to, if known.
     pub resource_id: Option<Box<ResourceId>>,
-    /// Underlying cause chain. Lost when the error crosses the WIT
-    /// boundary — flattened to a string there.
-    pub cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    /// Underlying terminal cause. Flattened to a string when the error crosses
+    /// the WIT boundary.
+    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
     /// Provider name (e.g. `"aws"`, `"awscc"`) attached when the error
     /// is raised at provider-init / `create_provider` boundary points
     /// where the name is known but no specific resource is in scope.
@@ -85,6 +103,17 @@ pub struct ErrorDetail {
 /// flags this at ≥128 bytes. Boxing now keeps the lint quiet and
 /// makes future field additions to `ErrorDetail` free at the variant
 /// layer.
+///
+/// A dynamically built message-only error cannot later acquire a cause:
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::ProviderError;
+///
+/// let _ = ProviderError::with_cause(
+///     ProviderError::internal(String::from("x")),
+///     std::io::Error::other("x"),
+/// );
+/// ```
 #[derive(Debug)]
 pub enum ProviderError {
     /// User-supplied input is invalid (bad attribute value, schema
@@ -112,43 +141,55 @@ impl std::fmt::Display for ProviderError {
 
         // Header line: always the `[type.name] message` form when a
         // resource id is attached, plain message otherwise. Shared
-        // between the structured multi-line render and the legacy
-        // chain-walk render so non-AWS errors keep the same shape.
+        // between the structured multi-line render and the single-line
+        // cause render so non-AWS errors keep the same shape.
         if let Some(ref id) = detail.resource_id {
             write!(
                 f,
                 "[{}.{}] {}",
                 id.resource_type,
                 id.identity_display(),
-                detail.message
+                detail.context()
             )?;
         } else {
-            write!(f, "{}", detail.message)?;
+            write!(f, "{}", detail.context())?;
         }
 
         // carina#3242: when any of the structured cloud-API fields are
         // populated, render the multi-line labeled shape and skip the
-        // legacy chain walk (the structured fields carry the same
+        // single-line cause form (the structured fields carry the same
         // information without the SDK-internal scaffolding). When all
-        // four are `None`, fall through to the legacy chain walk so
-        // unmigrated provider call sites and non-cloud errors render
+        // four are `None`, fall through to the single-line cause form so
+        // non-cloud errors render
         // exactly as they did before.
         if detail.has_structured_cloud_fields() {
             return render_structured_cloud_fields(f, detail);
         }
 
-        // carina#2603: walk the entire `source()` chain rather than
-        // printing only the first level. AWS SDK errors typically carry
-        // the actionable detail (error code, raw response message,
-        // request id) two or three levels deep; a single `: {cause}`
-        // would still hide e.g. "AccessDenied" behind a generic
-        // "service error" wrapper.
-        if let Some(ref cause) = detail.cause {
-            let mut current: Option<&(dyn std::error::Error + 'static)> = Some(cause.as_ref());
-            while let Some(c) = current {
-                write!(f, ": {}", c)?;
-                current = c.source();
-            }
+        // In-repo typed causes are terminal diagnostics. External errors may
+        // still carry actionable detail in their source chain, so expand that
+        // chain at this single ProviderError rendering seam.
+        if let Some(cause) = detail.cause() {
+            write!(f, ": {}", ProviderCauseChain(cause))?;
+        }
+        Ok(())
+    }
+}
+
+/// Complete rendering of one typed provider cause.
+///
+/// Errors defined in this workspace follow the terminal rule and therefore
+/// have no source. External errors such as SDK transport/service errors can
+/// keep detail in their source chain; render every such level exactly once.
+struct ProviderCauseChain<'a>(&'a (dyn std::error::Error + Send + Sync + 'static));
+
+impl std::fmt::Display for ProviderCauseChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(error) = source {
+            write!(f, ": {error}")?;
+            source = error.source();
         }
         Ok(())
     }
@@ -165,7 +206,7 @@ impl std::fmt::Display for ProviderError {
 ///
 /// `cause` is appended **even when the structured fields are present**
 /// because transport-level failures (DNS, TLS handshake, network
-/// timeout) carry their diagnostic only in the cause chain — there was
+/// timeout) carry their diagnostic only in the terminal cause — there was
 /// no HTTP response, so `status` / `code` / `request_id` aren't set,
 /// but `operation` may still be. Without appending `cause`, the
 /// operator would see `[s3.Bucket.foo] Failed / operation: s3.HeadBucket`
@@ -186,40 +227,21 @@ fn render_structured_cloud_fields(
     if let Some(ref id) = detail.request_id {
         write!(f, "\n  request_id: {id}")?;
     }
-    if let Some(ref cause) = detail.cause {
-        // Walk the source chain (same shape as the legacy fallback)
-        // and join with `: ` on the same `cause:` line. Keeps
-        // transport-level diagnostics visible without bringing back
-        // the SDK-scaffolding multi-line wall that motivated #3241.
-        write!(f, "\n  cause: ")?;
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(cause.as_ref());
-        let mut first = true;
-        while let Some(c) = current {
-            if first {
-                write!(f, "{c}")?;
-                first = false;
-            } else {
-                write!(f, ": {c}")?;
-            }
-            current = c.source();
-        }
+    if let Some(cause) = detail.cause() {
+        write!(f, "\n  cause: {}", ProviderCauseChain(cause))?;
     }
     Ok(())
 }
 
-impl std::error::Error for ProviderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.detail()
-            .cause
-            .as_ref()
-            .map(|e| e.as_ref() as &dyn std::error::Error)
-    }
-}
+// `ProviderError` is a terminal diagnostic: Display renders its complete
+// typed cause. Exposing that cause again through Error::source would
+// make every ordinary chain walker repeat it. The typed cause remains
+// available through `detail().cause()` and is flattened by `to_wire()`.
+impl std::error::Error for ProviderError {}
 
 impl From<crate::value::EnumCanonicalizationError> for ProviderError {
     fn from(error: crate::value::EnumCanonicalizationError) -> Self {
-        let message = error.to_string();
-        Self::invalid_input(message).with_cause(error)
+        Self::invalid_input_caused_by("Failed to canonicalize enum value", error)
     }
 }
 
@@ -257,11 +279,6 @@ impl ProviderError {
         }
     }
 
-    /// Convenience accessor for the human-readable message.
-    pub fn message(&self) -> &str {
-        &self.detail().message
-    }
-
     /// User-supplied input is invalid.
     pub fn invalid_input(message: impl Into<String>) -> Self {
         ProviderError::InvalidInput(Box::new(ErrorDetail::new(message)))
@@ -287,15 +304,121 @@ impl ProviderError {
         ProviderError::Internal(Box::new(ErrorDetail::new(message)))
     }
 
+    /// User-supplied input is invalid because of a typed source error.
+    ///
+    /// `context` is deliberately static: dynamic data belongs in a typed
+    /// cause, so its rendered text cannot also be copied into the message.
+    pub fn invalid_input_caused_by(
+        context: &'static str,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ProviderError::InvalidInput(Box::new(ErrorDetail::caused_by(context, cause)))
+    }
+
+    /// The cloud API rejected the request because of a typed source error.
+    pub fn api_error_caused_by(
+        context: &'static str,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ProviderError::ApiError(Box::new(ErrorDetail::caused_by(context, cause)))
+    }
+
+    /// A resource was not found because of a typed source error.
+    pub fn not_found_caused_by(
+        context: &'static str,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ProviderError::NotFound(Box::new(ErrorDetail::caused_by(context, cause)))
+    }
+
+    /// An operation timed out because of a typed source error.
+    pub fn timeout_caused_by(
+        context: &'static str,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ProviderError::Timeout(Box::new(ErrorDetail::caused_by(context, cause)))
+    }
+
+    /// A provider-internal operation failed because of a typed source error.
+    pub fn internal_caused_by(
+        context: &'static str,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ProviderError::Internal(Box::new(ErrorDetail::caused_by(context, cause)))
+    }
+
+    /// Encode this error for the provider protocol/WIT boundary.
+    ///
+    /// The complete typed cause chain is flattened into a string because the
+    /// wire format cannot carry `dyn Error`. The returned type is the exact
+    /// protocol record consumed by guest SDK encoders.
+    pub fn to_wire(&self) -> WireProviderError {
+        let detail = self.detail();
+        let kind = match self {
+            ProviderError::InvalidInput(_) => WireProviderErrorKind::InvalidInput,
+            ProviderError::ApiError(_) => WireProviderErrorKind::ApiError,
+            ProviderError::NotFound(_) => WireProviderErrorKind::NotFound,
+            ProviderError::Timeout(_) => WireProviderErrorKind::Timeout,
+            ProviderError::Internal(_) => WireProviderErrorKind::Internal,
+        };
+        WireProviderError {
+            kind,
+            message: detail.context().to_string(),
+            resource_id: detail.resource_id.as_deref().map(ResourceId::to_wire),
+            cause: detail
+                .cause()
+                .map(|cause| ProviderCauseChain(cause).to_string()),
+            provider_name: detail.provider_name.clone(),
+            operation: detail.operation.clone(),
+            status: detail.status,
+            code: detail.code.clone(),
+            request_id: detail.request_id.clone(),
+        }
+    }
+
+    /// Decode untrusted provider data received through the protocol/WIT boundary.
+    ///
+    /// This is the only sanctioned entry point for a wire record containing
+    /// both a runtime-built message and flattened cause string. It preserves
+    /// that untrusted data for diagnostics; it does not provide the static
+    /// context guarantees of the typed `*_caused_by` constructors.
+    pub fn from_wire(error: WireProviderError) -> Self {
+        let WireProviderError {
+            kind,
+            message,
+            resource_id,
+            cause,
+            provider_name,
+            operation,
+            status,
+            code,
+            request_id,
+        } = error;
+        let resource_id = resource_id.map(|id| Box::new(ResourceId::from_wire(id)));
+        let detail = Box::new(ErrorDetail {
+            message,
+            resource_id,
+            cause: cause.map(|cause| {
+                Box::new(FlattenedWireCause(cause)) as Box<dyn std::error::Error + Send + Sync>
+            }),
+            provider_name,
+            operation,
+            status,
+            code,
+            request_id,
+        });
+        match kind {
+            WireProviderErrorKind::InvalidInput => ProviderError::InvalidInput(detail),
+            WireProviderErrorKind::ApiError => ProviderError::ApiError(detail),
+            WireProviderErrorKind::NotFound => ProviderError::NotFound(detail),
+            WireProviderErrorKind::Timeout => ProviderError::Timeout(detail),
+            WireProviderErrorKind::Internal => ProviderError::Internal(detail),
+        }
+    }
+
     /// Attach a resource id to the inner detail.
     pub fn for_resource(mut self, id: ResourceId) -> Self {
         self.detail_mut().resource_id = Some(Box::new(id));
-        self
-    }
-
-    /// Attach a cause chain to the inner detail.
-    pub fn with_cause(mut self, cause: impl std::error::Error + Send + Sync + 'static) -> Self {
-        self.detail_mut().cause = Some(Box::new(cause));
         self
     }
 
@@ -347,14 +470,35 @@ impl ErrorDetail {
         }
     }
 
+    fn caused_by(
+        context: &'static str,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: context.to_string(),
+            cause: Some(Box::new(cause)),
+            ..Self::default()
+        }
+    }
+
+    /// Static context for a caused error, or the complete message for a
+    /// message-only error.
+    pub fn context(&self) -> &str {
+        &self.message
+    }
+
+    /// Typed source error, when this detail was built by a cause-bearing path.
+    pub fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        self.cause.as_deref()
+    }
+
     /// Returns `true` when at least one of the cloud-API metadata
     /// fields (`operation`, `status`, `code`, `request_id`) is set.
     ///
     /// `Display` uses this as the gate for the multi-line labeled
     /// render (carina#3242): any of the four flips the renderer into
     /// the structured shape. When none are set the error keeps the
-    /// existing chain-walking single-line render — that's the
-    /// fallback path for unmigrated provider call sites and for
+    /// existing single-line cause render — that's the fallback path for
     /// non-cloud errors.
     ///
     /// `pub(crate)` until a second use site materializes outside
@@ -367,6 +511,18 @@ impl ErrorDetail {
             || self.request_id.is_some()
     }
 }
+
+/// Synthetic typed source for a flattened cause received over WIT.
+#[derive(Debug)]
+struct FlattenedWireCause(String);
+
+impl std::fmt::Display for FlattenedWireCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FlattenedWireCause {}
 
 pub type ProviderResult<T> = Result<T, ProviderError>;
 
@@ -1941,6 +2097,25 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
     }
 }
 
+#[derive(Debug)]
+struct DefaultTagEncodingError {
+    key: String,
+    provider_name: String,
+    source: SerializationError,
+}
+
+impl std::fmt::Display for DefaultTagEncodingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "key '{}' of provider '{}': {}",
+            self.key, self.provider_name, self.source
+        )
+    }
+}
+
+impl std::error::Error for DefaultTagEncodingError {}
+
 /// Merge one provider instance's default tags into resources routed to it.
 ///
 /// For each resource matching the [`ProviderConfig`]'s `(name, binding)`
@@ -1982,11 +2157,14 @@ pub fn merge_default_tags(
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::RedactedSecretNotAllowed { .. }),
             ) => {
-                return Err(ProviderError::invalid_input(format!(
-                    "failed to encode default tag '{key}' for provider '{}'",
-                    config.name
-                ))
-                .with_cause(source)
+                return Err(ProviderError::invalid_input_caused_by(
+                    "failed to encode default tag",
+                    DefaultTagEncodingError {
+                        key: key.clone(),
+                        provider_name: config.name.clone(),
+                        source,
+                    },
+                )
                 .for_provider(config.name.clone()));
             }
         }
@@ -2753,7 +2931,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enum_canonicalization_error_becomes_invalid_provider_input_with_cause() {
+    fn enum_canonicalization_error_renders_its_reason_once() {
         let mut resources = vec![
             Resource::with_provider("test", "widget", "example", None).with_attribute(
                 "mode",
@@ -2765,13 +2943,23 @@ mod tests {
             &SchemaRegistry::new(),
         )
         .expect_err("an untyped enum identifier must be rejected");
-        let message = error.to_string();
+        let leaf_reason =
+            "unresolved enum identifier `test.widget.Mode.invalid` survived canonicalization";
 
         let provider_error = ProviderError::from(error);
 
         assert!(matches!(provider_error, ProviderError::InvalidInput(_)));
-        assert_eq!(provider_error.message(), message);
-        assert!(std::error::Error::source(&provider_error).is_some());
+        assert_eq!(
+            provider_error.detail().context(),
+            "Failed to canonicalize enum value"
+        );
+        assert!(std::error::Error::source(&provider_error).is_none());
+        assert!(provider_error.detail().cause().is_some());
+        assert_eq!(
+            provider_error.to_string().matches(&leaf_reason).count(),
+            1,
+            "the leaf TypeError must render exactly once"
+        );
     }
 
     #[test]
@@ -3871,18 +4059,22 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_source_returns_cause() {
+    fn provider_error_is_terminal_but_keeps_typed_cause() {
         use std::error::Error;
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::api_error("Failed to create resource").with_cause(cause);
-        let source = err.source().expect("source should be Some");
-        assert_eq!(source.to_string(), "connection refused");
+        let err = ProviderError::api_error_caused_by("Failed to create resource", cause);
+        assert!(err.source().is_none(), "ProviderError must be terminal");
+        let cause = err
+            .detail()
+            .cause()
+            .expect("typed cause must remain available");
+        assert_eq!(cause.to_string(), "connection refused");
     }
 
     #[test]
     fn provider_error_display_includes_cause() {
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::api_error("Failed to create resource").with_cause(cause);
+        let err = ProviderError::api_error_caused_by("Failed to create resource", cause);
         let display = format!("{}", err);
         assert!(
             display.contains("connection refused"),
@@ -3898,53 +4090,103 @@ mod tests {
         assert_eq!(display, "simple error");
     }
 
-    /// carina-rs/carina#2603: AWS SDK errors typically carry the
-    /// actionable detail (error code, message, request id) wrapped
-    /// two or three levels deep behind `source()`. A `Display` impl
-    /// that prints only the first level hides the part the user
-    /// actually needs. Walk the whole chain.
     #[test]
-    fn provider_error_display_walks_entire_source_chain() {
+    fn provider_error_display_and_wire_include_external_cause_chain_once() {
         #[derive(Debug)]
-        struct ChainErr {
-            msg: &'static str,
-            source: Option<Box<dyn std::error::Error + Send + Sync>>,
+        struct ServiceError {
+            source: std::io::Error,
         }
-        impl std::fmt::Display for ChainErr {
+
+        impl std::fmt::Display for ServiceError {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.msg)
+                f.write_str("service error")
             }
         }
-        impl std::error::Error for ChainErr {
+
+        impl std::error::Error for ServiceError {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                self.source
-                    .as_deref()
-                    .map(|e| e as &(dyn std::error::Error + 'static))
+                Some(&self.source)
             }
         }
 
-        let inner = ChainErr {
-            msg: "AccessDenied: User is not authorized to perform: s3:HeadBucket",
-            source: None,
-        };
-        let outer = ChainErr {
-            msg: "service error",
-            source: Some(Box::new(inner)),
-        };
-        let err = ProviderError::api_error("AWS error").with_cause(outer);
-
-        let rendered = format!("{}", err);
-        assert!(
-            rendered.contains("service error"),
-            "outer cause must surface, got: {}",
-            rendered
+        let error = ProviderError::api_error_caused_by(
+            "request failed",
+            ServiceError {
+                source: std::io::Error::other("throttled"),
+            },
         );
-        assert!(
-            rendered.contains("AccessDenied"),
-            "deeper source-chain text (the part the user actually needs) \
-             must surface — single-level Display is the carina#2603 bug. \
-             Got: {}",
-            rendered
+
+        let rendered = error.to_string();
+        assert_eq!(rendered, "request failed: service error: throttled");
+        assert_eq!(rendered.matches("throttled").count(), 1, "{rendered}");
+
+        let wire_cause = error.to_wire().cause.expect("wire cause");
+        assert_eq!(wire_cause, "service error: throttled");
+        assert_eq!(wire_cause.matches("throttled").count(), 1, "{wire_cause}");
+
+        let structured = ProviderError::api_error_caused_by(
+            "request failed",
+            ServiceError {
+                source: std::io::Error::other("throttled"),
+            },
+        )
+        .with_operation("s3.PutObject");
+        assert_eq!(
+            structured.to_string(),
+            "request failed\n  operation: s3.PutObject\n  cause: service error: throttled"
+        );
+    }
+
+    #[test]
+    fn provider_error_keeps_in_repo_terminal_cause_unchanged() {
+        let cause = crate::value::SecretRehydrationSiteError::new(
+            "config.token",
+            crate::value::SecretRehydrationError::HashMismatch,
+        );
+        let error = ProviderError::internal_caused_by("verification failed", cause);
+        let expected =
+            "verification failed: config.token: the secret changed since the plan was created";
+
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(
+            error.to_wire().cause.as_deref(),
+            Some("config.token: the secret changed since the plan was created")
+        );
+    }
+
+    #[test]
+    fn nested_provider_error_source_renders_leaf_once_in_display_and_wire() {
+        #[derive(Debug)]
+        struct ProviderBoundaryError(ProviderError);
+
+        impl std::fmt::Display for ProviderBoundaryError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "provider boundary failed: {}", self.0)
+            }
+        }
+        impl std::error::Error for ProviderBoundaryError {}
+
+        let inner = ProviderError::api_error_caused_by(
+            "provider request failed",
+            std::io::Error::other("leaf service reason"),
+        );
+        let outer = ProviderError::internal_caused_by(
+            "outer provider operation failed",
+            ProviderBoundaryError(inner),
+        );
+
+        let rendered = outer.to_string();
+        assert_eq!(
+            rendered.matches("leaf service reason").count(),
+            1,
+            "{rendered}"
+        );
+
+        let wire_cause = outer.to_wire().cause.expect("wire cause");
+        assert_eq!(
+            wire_cause.matches("leaf service reason").count(),
+            1,
+            "{wire_cause}"
         );
     }
 
@@ -3952,9 +4194,7 @@ mod tests {
     fn provider_error_display_with_resource_id_and_cause() {
         let cause = std::io::Error::other("timeout");
         let id = ResourceId::with_identity("s3.Bucket", "my-bucket");
-        let err = ProviderError::api_error("Failed to read")
-            .with_cause(cause)
-            .for_resource(id);
+        let err = ProviderError::api_error_caused_by("Failed to read", cause).for_resource(id);
         let display = format!("{}", err);
         assert!(
             display.contains("timeout"),
@@ -4106,7 +4346,7 @@ mod tests {
     /// populated, the renderer emits `cause:` as its OWN labeled line
     /// at the bottom (not joined to the header). Transport failures
     /// (DNS, TLS handshake, network timeouts) only carry their
-    /// diagnostic in the cause chain — there was no HTTP response, so
+    /// diagnostic in the terminal cause — there was no HTTP response, so
     /// `status`/`code`/`request_id` are `None` but `operation` may
     /// still be set. Without preserving cause, the operator loses
     /// visibility into the underlying error. The labeled-line shape
@@ -4115,8 +4355,7 @@ mod tests {
     #[test]
     fn provider_error_display_multi_line_appends_cause_as_labeled_line() {
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::api_error("Failed to list IAM roles")
-            .with_cause(cause)
+        let err = ProviderError::api_error_caused_by("Failed to list IAM roles", cause)
             .with_operation("iam.ListRoles");
         let rendered = format!("{}", err);
         let lines: Vec<&str> = rendered.lines().collect();
@@ -4125,7 +4364,7 @@ mod tests {
         assert_eq!(
             lines.first().copied(),
             Some("Failed to list IAM roles"),
-            "header line must not be extended by the chain-walk, got: {}",
+            "header line must not be extended by the cause, got: {}",
             rendered
         );
 
@@ -4154,8 +4393,7 @@ mod tests {
     fn provider_error_display_multi_line_all_fields_including_cause() {
         let cause = std::io::Error::other("tls handshake failed");
         let id = ResourceId::with_identity("iam.Roles", "admin_access_roles");
-        let err = ProviderError::api_error("Failed to list IAM roles")
-            .with_cause(cause)
+        let err = ProviderError::api_error_caused_by("Failed to list IAM roles", cause)
             .for_resource(id)
             .with_operation("iam.ListRoles")
             .with_status(403)
@@ -4179,58 +4417,50 @@ mod tests {
         );
     }
 
-    /// carina#3242: when the cause itself carries a source chain, the
-    /// `cause:` line joins the levels with `: ` exactly like the
-    /// legacy fallback (carina#2603) — same shape, same content,
-    /// just on a labeled line instead of appended to the header.
+    /// carina#3242: a terminal cause carries all of its detail in Display,
+    /// including detail held by a typed inner error.
     #[test]
-    fn provider_error_display_multi_line_cause_walks_source_chain() {
+    fn provider_error_display_multi_line_preserves_complete_terminal_cause() {
         #[derive(Debug)]
         struct ChainErr {
             msg: &'static str,
-            source: Option<Box<dyn std::error::Error + Send + Sync>>,
+            detail: Option<Box<ChainErr>>,
         }
         impl std::fmt::Display for ChainErr {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.msg)
+                f.write_str(self.msg)?;
+                if let Some(detail) = &self.detail {
+                    write!(f, ": {detail}")?;
+                }
+                Ok(())
             }
         }
-        impl std::error::Error for ChainErr {
-            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                self.source
-                    .as_deref()
-                    .map(|e| e as &(dyn std::error::Error + 'static))
-            }
-        }
+        impl std::error::Error for ChainErr {}
 
         let inner = ChainErr {
             msg: "dns lookup failed",
-            source: None,
+            detail: None,
         };
         let outer = ChainErr {
             msg: "transport error",
-            source: Some(Box::new(inner)),
+            detail: Some(Box::new(inner)),
         };
-        let err = ProviderError::api_error("Failed")
-            .with_cause(outer)
-            .with_operation("iam.ListRoles");
+        let err =
+            ProviderError::api_error_caused_by("Failed", outer).with_operation("iam.ListRoles");
         let rendered = format!("{}", err);
         assert!(
             rendered.contains("\n  cause: transport error: dns lookup failed"),
-            "cause line must walk the full source chain, got: {}",
+            "cause line must preserve the complete terminal cause, got: {}",
             rendered
         );
     }
 
     /// carina#3242: when **none** of the structured fields are
-    /// populated, `Display` must fall back to the existing
-    /// chain-walking single-line form. This is the path that
-    /// unmigrated provider call sites still hit during the
-    /// migration period.
+    /// populated, `Display` uses the existing single-line cause form.
     #[test]
-    fn provider_error_display_falls_back_to_chain_walk_when_unstructured() {
+    fn provider_error_display_uses_single_line_cause_when_unstructured() {
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::api_error("Failed to create resource").with_cause(cause);
+        let err = ProviderError::api_error_caused_by("Failed to create resource", cause);
         let rendered = format!("{}", err);
         // The existing render is a single line with `: <cause>` appended.
         assert_eq!(
@@ -4244,7 +4474,7 @@ mod tests {
     fn provider_error_variant_constructors() {
         let inv = ProviderError::invalid_input("bad");
         assert!(matches!(inv, ProviderError::InvalidInput(_)));
-        assert_eq!(inv.message(), "bad");
+        assert_eq!(inv.to_string(), "bad");
 
         let api = ProviderError::api_error("rejected");
         assert!(matches!(api, ProviderError::ApiError(_)));
@@ -4343,7 +4573,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ProviderError::Internal(_)));
-        assert!(err.message().contains("Unknown provider: nonexistent"));
+        assert!(err.to_string().contains("Unknown provider: nonexistent"));
     }
 
     /// A provider that records its identity in the returned state
@@ -4453,7 +4683,7 @@ mod tests {
         let id =
             ResourceId::with_provider_identity("mock", "test", "x", Some("missing".to_string()));
         let err = router.read(&id, None, ReadRequest).await.unwrap_err();
-        let msg = err.message();
+        let msg = err.to_string();
         assert!(
             msg.contains("missing") && msg.contains("mock"),
             "error must name both the binding and the kind, got: {msg}"
@@ -4522,7 +4752,7 @@ mod tests {
             Err(e) => e,
         };
         // Inner message must be preserved verbatim; no implementation-detail wrapper.
-        let msg = err.message().to_string();
+        let msg = err.to_string();
         assert!(
             msg.contains("019115212452"),
             "actual account missing: {msg}"

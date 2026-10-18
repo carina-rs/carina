@@ -286,17 +286,7 @@ impl fmt::Display for RegistryDiscoveryPinError {
     }
 }
 
-impl std::error::Error for RegistryDiscoveryPinError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidApiBaseUrl {
-                source: Some(source),
-                ..
-            } => Some(source),
-            Self::MissingProvidersV1 | Self::InvalidApiBaseUrl { source: None, .. } => None,
-        }
-    }
-}
+impl std::error::Error for RegistryDiscoveryPinError {}
 
 impl RegistryDiscoveryPin {
     fn from_values(values: BTreeMap<String, String>) -> Result<Self, RegistryDiscoveryPinError> {
@@ -426,21 +416,13 @@ impl fmt::Display for RegistryHostLockError {
                 f,
                 "registry host lock is inconsistent: providers.v1 must be present in discovery_values exactly when discovery_pin_present is true; migration_pending_discovery_pin is valid only as the sole discovery material while discovery_pin_present is false; other discovery values may remain in an ordinary unpinned state"
             ),
-            Self::InvalidDiscoveryPin(source) => source.fmt(f),
-            Self::InvalidUnconsumedDiscoveryValues(source) => source.fmt(f),
+            Self::InvalidDiscoveryPin(error) => error.fmt(f),
+            Self::InvalidUnconsumedDiscoveryValues(error) => error.fmt(f),
         }
     }
 }
 
-impl std::error::Error for RegistryHostLockError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidDiscoveryPin(source) => Some(source),
-            Self::InvalidUnconsumedDiscoveryValues(source) => Some(source),
-            Self::Inconsistent => None,
-        }
-    }
-}
+impl std::error::Error for RegistryHostLockError {}
 
 impl RegistryHostLock {
     fn pinned(pin: RegistryDiscoveryPin) -> Self {
@@ -894,25 +876,12 @@ impl fmt::Display for RegistryLockRecoveryError {
                 f,
                 "Registry provider {provider:?} already requires a signature and is awaiting a new identity pin"
             ),
-            Self::IdentityPinConflict(source) => source.fmt(f),
+            Self::IdentityPinConflict(error) => error.fmt(f),
         }
     }
 }
 
-impl std::error::Error for RegistryLockRecoveryError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::IdentityPinConflict(source) => Some(source),
-            Self::InvalidProvider { .. }
-            | Self::NotRegistryProvider { .. }
-            | Self::ProviderStateNotFound { .. }
-            | Self::RegistryHostStateNotFound { .. }
-            | Self::DiscoveryAlreadyUnpinned { .. }
-            | Self::SignatureNotRequired { .. }
-            | Self::IdentityAlreadyUnpinned { .. } => None,
-        }
-    }
-}
+impl std::error::Error for RegistryLockRecoveryError {}
 
 /// Durable security observations for one registry source. This is the shared
 /// representation used both by pinned provider entries and by observations
@@ -1891,20 +1860,7 @@ impl fmt::Display for LockFileError {
     }
 }
 
-impl std::error::Error for LockFileError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Read { source, .. } => Some(source),
-            Self::Parse { source, .. } => Some(source),
-            Self::RegistryIdentityPinConflict { source, .. } => Some(source),
-            Self::MissingVersion { .. }
-            | Self::VersionTooNew { .. }
-            | Self::VersionTooOld { .. }
-            | Self::MissingRegistryHostRecord { .. }
-            | Self::RegistryHostKeyConflict { .. } => None,
-        }
-    }
-}
+impl std::error::Error for LockFileError {}
 
 #[derive(Debug)]
 pub enum LockConstraintError {
@@ -1935,14 +1891,7 @@ impl fmt::Display for LockConstraintError {
     }
 }
 
-impl std::error::Error for LockConstraintError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::LockFile(error) => Some(error),
-            Self::ConstraintMismatch { .. } => None,
-        }
-    }
-}
+impl std::error::Error for LockConstraintError {}
 
 impl From<LockFileError> for LockConstraintError {
     fn from(error: LockFileError) -> Self {
@@ -7396,17 +7345,25 @@ discovery_pin_present = true
     }
 
     #[test]
-    fn registry_host_lock_error_preserves_invalid_discovery_pin_source() {
+    fn registry_host_lock_error_preserves_invalid_discovery_pin_once() {
         let error = RegistryHostLockError::InvalidDiscoveryPin(
             RegistryDiscoveryPinError::MissingProvidersV1,
         );
-        let source = std::error::Error::source(&error)
-            .expect("the invalid discovery pin must remain in the error chain");
-
+        assert!(matches!(
+            &error,
+            RegistryHostLockError::InvalidDiscoveryPin(
+                RegistryDiscoveryPinError::MissingProvidersV1
+            )
+        ));
+        let rendered = error.to_string();
         assert_eq!(
-            source.to_string(),
-            "registry discovery values are missing required providers.v1"
+            rendered
+                .matches("registry discovery values are missing required providers.v1")
+                .count(),
+            1,
+            "{rendered}"
         );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -7674,6 +7631,21 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         assert!(
             rendered.contains("preserving every other provider and registry protection record"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn resolve_all_string_boundary_preserves_lock_parse_source() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("carina-providers.lock"), "version = [\n").unwrap();
+
+        let rendered = resolve_all(dir.path(), &[], LockMode::Normal)
+            .expect_err("a malformed lock must fail before provider resolution");
+
+        assert!(rendered.contains("Failed to parse"), "{rendered}");
+        assert!(
+            rendered.contains("line 1") && rendered.contains("column"),
+            "the string boundary dropped the typed TOML parse source: {rendered}"
         );
     }
 

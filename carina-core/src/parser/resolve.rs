@@ -397,11 +397,11 @@ fn validate_resolved_provider_configs(
 ) -> Result<(), ProviderConfigInvariantError> {
     for config in configs {
         for (attribute, value) in &config.attributes {
-            crate::resource::assert_value_fully_resolved(value).map_err(|source| {
+            crate::resource::assert_value_fully_resolved(value).map_err(|error| {
                 ProviderConfigInvariantError::UnresolvedAttribute {
                     provider: config.name.clone(),
                     attribute: attribute.clone(),
-                    source: Box::new(source),
+                    error: Box::new(error),
                 }
             })?;
         }
@@ -411,12 +411,11 @@ fn validate_resolved_provider_configs(
 
 #[derive(Debug, Error)]
 pub enum ProviderConfigInvariantError {
-    #[error("provider {provider}: {attribute}: {source}")]
+    #[error("provider {provider}: {attribute}: {error}")]
     UnresolvedAttribute {
         provider: String,
         attribute: String,
-        #[source]
-        source: Box<crate::value::SerializationError>,
+        error: Box<crate::value::SerializationError>,
     },
 }
 

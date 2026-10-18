@@ -27,11 +27,13 @@ pub enum ModuleError {
     #[error("Reference type validation failed: {0}")]
     ReferenceType(String),
 
+    // An I/O error is a terminal leaf here. Keep its diagnostic in Display
+    // and do not expose it a second time through Error::source.
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 
     #[error("Parse error: {0}")]
-    Parse(#[from] ParseError),
+    Parse(ParseError),
 
     #[error("Unknown argument '{argument}' for module '{module}'")]
     UnknownArgument { module: String, argument: String },
@@ -71,4 +73,16 @@ pub enum ModuleError {
         "Module path '{path}' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory."
     )]
     NotADirectory { path: String },
+}
+
+impl From<std::io::Error> for ModuleError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ParseError> for ModuleError {
+    fn from(error: ParseError) -> Self {
+        Self::Parse(error)
+    }
 }

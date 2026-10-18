@@ -183,6 +183,40 @@ fn unreadable_state_at_t1_warns_it_could_not_be_rechecked() {
 }
 
 #[test]
+fn invalid_resource_identity_at_t1_preserves_leaf_detail_once() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let state_path = init_project_with_state(dir, 7, "lineage-A");
+
+    let writer_path = state_path.clone();
+    let stderr = plan_with_concurrent_writer(dir, move || {
+        let state = serde_json::json!({
+            "version": 6,
+            "serial": 8,
+            "lineage": "lineage-A",
+            "carina_version": "0.0.0-test",
+            "resources": [{
+                "resource_type": "test.Resource",
+                "identity": "",
+                "provider": "mock",
+                "identifier": "legacy-resource-123",
+                "attributes": {}
+            }],
+            "exports": { "region": "ap-northeast-1" }
+        });
+        fs::write(&writer_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    });
+
+    let leaf = "resource identity cannot be empty";
+    assert!(stderr.contains(leaf), "missing identity detail: {stderr}");
+    assert_eq!(
+        stderr.matches(leaf).count(),
+        1,
+        "identity detail must appear exactly once: {stderr}"
+    );
+}
+
+#[test]
 fn no_state_at_t0_skips_drift_check_entirely() {
     // First-ever plan: no state file exists. There is no T0 baseline,
     // so the whole re-read/warn block must be skipped — neither the

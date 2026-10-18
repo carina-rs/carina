@@ -167,7 +167,7 @@ fn rename_resource_identities_returns_error_for_duplicate_destination() {
 }
 
 #[test]
-fn rename_resource_identities_preserves_invalid_identity_source() {
+fn rename_resource_identities_preserves_invalid_identity_detail_once() {
     let mut state = StateFile::new();
     state
         .upsert_resource(ResourceState::new("ec2.Vpc", "old", "aws"))
@@ -178,8 +178,15 @@ fn rename_resource_identities_preserves_invalid_identity_source() {
         .expect_err("rename must reject an empty destination identity");
 
     assert!(matches!(error, BackendError::InvalidStateIdentity { .. }));
-    let source = std::error::Error::source(&error).expect("identity error must remain the source");
-    assert_eq!(source.to_string(), "resource identity cannot be empty");
+    let rendered = error.to_string();
+    assert_eq!(
+        rendered
+            .matches("resource identity cannot be empty")
+            .count(),
+        1,
+        "{rendered}"
+    );
+    assert!(std::error::Error::source(&error).is_none());
     assert!(state.find_resource("aws", "ec2.Vpc", "old").is_some());
 }
 
@@ -2339,14 +2346,15 @@ fn check_and_migrate_rejects_empty_identity_with_actionable_row_context() {
          state file, then remove this row. Run `carina plan`; the resource that owned it appears \
          as a create with its newly assigned identity. Put the row back with `identity` set to \
          that value (keep its `identifier` and attributes), or leave it removed if the resource \
-         is no longer managed."
+         is no longer managed.\nCause: resource identity cannot be empty"
     );
-    let row_error = std::error::Error::source(&error)
-        .expect("BackendError must preserve the contextual row error");
-    assert!(
-        row_error.source().is_some(),
-        "the row error must preserve ResourceIdentityError as its source"
+    assert_eq!(
+        message.matches("resource identity cannot be empty").count(),
+        1,
+        "{message}"
     );
+    assert!(error.invalid_resource_identity().is_some());
+    assert!(std::error::Error::source(&error).is_none());
 }
 
 #[test]

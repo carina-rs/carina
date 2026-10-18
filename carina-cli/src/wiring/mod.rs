@@ -150,14 +150,7 @@ impl fmt::Display for ProviderFactoryDiagnostic {
     }
 }
 
-impl std::error::Error for ProviderFactoryDiagnostic {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::LockConstraint(error) => Some(error),
-            Self::Message(_) => None,
-        }
-    }
-}
+impl std::error::Error for ProviderFactoryDiagnostic {}
 
 impl From<String> for ProviderFactoryDiagnostic {
     fn from(message: String) -> Self {
@@ -426,8 +419,10 @@ fn runtime_instantiation_error_with_provenance<E>(
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    ProviderError::internal("Failed to instantiate WASM provider runtime instance")
-        .with_cause(installed.with_load_error(error))
+    ProviderError::internal_caused_by(
+        "Failed to instantiate WASM provider runtime instance",
+        installed.with_load_error(error),
+    )
 }
 
 /// Lift a core-validation `Result<(), String>` into per-finding
@@ -1260,7 +1255,9 @@ pub fn normalize_state_with_ctx(
             .block_on(async {
                 prepare_provider_ready_config(factory.as_ref(), resolved_config.as_ref())
             })
-            .map_err(|error| ProviderError::internal(error.to_string()).with_cause(error))?;
+            .map_err(|error| {
+                ProviderError::internal_caused_by("Failed to prepare provider configuration", error)
+            })?;
         router.add_normalizer(
             factory.name(),
             rt.block_on(factory.create_normalizer(None, &config))?,
@@ -1695,9 +1692,7 @@ async fn try_add_source_provider(
             // wrappers like "Failed to load provider '...': ...".
             // Attach provider name so the renderer can label the
             // structured block with the right provider.
-            Err(AppError::Provider(
-                e.for_provider(config.name().to_string()),
-            ))
+            Err(source_provider_initialization_error(config.name(), e))
         }
         Err(LoadSourceError::Config(error)) => Err(AppError::from(error)),
         Err(LoadSourceError::Wasm(error)) => {
@@ -1715,6 +1710,10 @@ async fn try_add_source_provider(
             Ok(())
         }
     }
+}
+
+fn source_provider_initialization_error(provider_name: &str, error: ProviderError) -> AppError {
+    AppError::Provider(error.for_provider(provider_name.to_string()))
 }
 
 fn ensure_source_provider_kind_matches(

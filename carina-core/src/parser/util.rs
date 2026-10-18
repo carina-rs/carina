@@ -113,7 +113,7 @@ pub(crate) fn parse_state_block_address(
     // path. A future programmatic caller can't bypass it.
     let (provider, resource_type) = split_namespaced_id(&namespaced);
     let name = crate::resource::ResourceIdentity::try_from(raw_name)
-        .map_err(|source| ParseError::InvalidResourceIdentity { line, source })?;
+        .map_err(|error| ParseError::InvalidResourceIdentity { line, error })?;
     Ok(crate::parser::ast::StateBlockAddress::new(
         provider,
         resource_type,

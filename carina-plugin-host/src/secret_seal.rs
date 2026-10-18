@@ -64,18 +64,14 @@ pub(crate) enum SealError {
 impl fmt::Display for SealError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ResourceValue(_) => f.write_str("failed to encode sealed resource value"),
+            Self::ResourceValue(error) => {
+                write!(f, "failed to encode sealed resource value: {error}")
+            }
         }
     }
 }
 
-impl std::error::Error for SealError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ResourceValue(source) => Some(source),
-        }
-    }
-}
+impl std::error::Error for SealError {}
 
 impl From<SerializationError> for SealError {
     fn from(source: SerializationError) -> Self {
@@ -96,19 +92,14 @@ impl fmt::Display for RestoreError {
                 f,
                 "WASM guest returned {actual} normalized resources; expected {expected}"
             ),
-            Self::ValueDecode(_) => f.write_str("failed to decode normalized resource values"),
+            Self::ValueDecode(error) => {
+                write!(f, "failed to decode normalized resource values: {error}")
+            }
         }
     }
 }
 
-impl std::error::Error for RestoreError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ValueDecode(source) => Some(source),
-            Self::ResourceCountMismatch { .. } => None,
-        }
-    }
-}
+impl std::error::Error for RestoreError {}
 
 impl From<wasm_convert::WasmValueDecodeError> for RestoreError {
     fn from(error: wasm_convert::WasmValueDecodeError) -> Self {

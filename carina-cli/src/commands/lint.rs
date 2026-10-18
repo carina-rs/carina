@@ -258,6 +258,39 @@ mod tests {
     use carina_core::lint::collect_tag_keys_for_file;
     use carina_core::parser::{ModuleCall, ParsedFile, UseStatement};
 
+    #[test]
+    fn lint_preserves_imported_module_pest_syntax_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let module_dir = temp.path().join("broken");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            temp.path().join("main.crn"),
+            "let broken = use { source = './broken' }\nlet instance = broken {}\n",
+        )
+        .unwrap();
+        std::fs::write(module_dir.join("main.crn"), "let =\n").unwrap();
+
+        let error = run_lint(temp.path(), &ProviderContext::default())
+            .expect_err("invalid imported module syntax must fail lint");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("Module resolution error"), "{rendered}");
+        assert!(rendered.contains("Syntax error"), "{rendered}");
+        assert!(
+            rendered.contains("--> 1:"),
+            "missing pest location: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("--> 1:").count(),
+            1,
+            "pest location must appear exactly once: {rendered}"
+        );
+        assert!(
+            rendered.contains("expected"),
+            "missing pest expectation: {rendered}"
+        );
+    }
+
     fn parsed_with_uses(uses: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
         ParsedFile {
             uses: uses

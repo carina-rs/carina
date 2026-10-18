@@ -27,8 +27,6 @@ use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 
 #[test]
 fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
-    use std::error::Error as _;
-
     let target = ApplyTarget::SavedPlan {
         plan_file: Path::new("reviewed-plan.json"),
         source_dir: Path::new("infra"),
@@ -42,7 +40,10 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
     );
     assert!(matches!(hash, AppError::SavedPlanSecretVerification(_)));
     assert!(hash.to_string().contains("secret changed"));
-    assert!(hash.source().is_some(), "typed source chain must survive");
+    assert!(
+        std::error::Error::source(&hash).is_none(),
+        "classified saved-plan diagnostic must be terminal"
+    );
 
     let shape = saved_plan_secret_rehydration_error(
         carina_core::value::SecretRehydrationSiteError::new(
@@ -59,13 +60,51 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
         AppError::Config("environment variable TOKEN is not set".to_string()),
         target,
     );
-    assert!(unavailable.to_string().contains("could not be evaluated"));
-    assert!(unavailable.source().is_some());
+    let unavailable_rendered = unavailable.to_string();
+    assert!(unavailable_rendered.contains("could not be evaluated"));
+    assert_eq!(
+        unavailable_rendered
+            .matches("environment variable TOKEN is not set")
+            .count(),
+        1,
+        "{unavailable_rendered}"
+    );
+    assert!(std::error::Error::source(&unavailable).is_none());
+
+    let serialization = saved_plan_secret_rehydration_error(
+        carina_core::value::SecretRehydrationSiteError::new(
+            "mock.test.resource.example.token",
+            carina_core::value::SecretRehydrationError::Serialization(
+                carina_core::value::SerializationError::UnresolvedResourceRef {
+                    path: "mock.test.resource.other.token".to_string(),
+                    context: carina_core::value::SerializationContext::SecretRedaction,
+                },
+            ),
+        ),
+        target,
+    );
+    assert!(matches!(
+        &serialization,
+        AppError::SavedPlanSecretVerification(error)
+            if matches!(error.as_ref(), SavedPlanSecretVerificationError::Serialization { .. })
+    ));
+    let serialization_rendered = serialization.to_string();
+    let encoding_failure =
+        "cannot serialize at secret redaction: unresolved reference mock.test.resource.other.token";
+    assert_eq!(
+        serialization_rendered.matches(encoding_failure).count(),
+        1,
+        "{serialization_rendered}"
+    );
+    assert!(std::error::Error::source(&serialization).is_none());
 
     let orphan = saved_plan_secret_orphan_vanished_error("mock.test.resource.orphan", target);
     assert!(orphan.to_string().contains("orphan"));
     assert!(orphan.to_string().contains("no longer exists"));
-    assert!(orphan.source().is_some(), "orphan cause chain must survive");
+    assert!(
+        std::error::Error::source(&orphan).is_none(),
+        "classified orphan diagnostic must be terminal"
+    );
 }
 
 #[tokio::test]
@@ -2190,9 +2229,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 }
 
 #[tokio::test]
-async fn saved_plan_provider_validation_preserves_typed_error_source() {
-    use std::error::Error as _;
-
+async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let plan_file = PlanFile {
@@ -2258,13 +2295,13 @@ async fn saved_plan_provider_validation_preserves_typed_error_source() {
     .await
     .expect_err("saved plan with unresolved provider config must be rejected");
 
-    let source = error.source().expect("AppError must retain a source");
     assert!(
-        source
-            .downcast_ref::<Box<carina_core::parser::ProviderConfigInvariantError>>()
-            .is_some(),
-        "ProviderConfigInvariantError must remain in the AppError source chain: {error:?}"
+        matches!(&error, AppError::SavedProviderConfig(_)),
+        "ProviderConfigInvariantError must remain typed in AppError: {error:?}"
     );
+    let rendered = error.to_string();
+    assert_eq!(rendered.matches("mgmt.region").count(), 1, "{rendered}");
+    assert!(std::error::Error::source(&error).is_none());
 }
 
 #[tokio::test]
@@ -3622,28 +3659,28 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
         message.contains("does not match required pattern /^state-/"),
         "error must retain the value-constraint reason: {message}"
     );
-    let mut source = std::error::Error::source(&error);
-    let mut saw_preparation = false;
-    let mut saw_type_error = false;
-    while let Some(error) = source {
-        saw_preparation |= error
-            .downcast_ref::<carina_core::executor::ProviderPreparationError>()
-            .is_some();
-        saw_type_error |= error
-            .downcast_ref::<carina_core::schema::TypeError>()
-            .is_some();
-        source = error.source();
-    }
-    assert!(
-        saw_preparation,
-        "typed preparation error was erased: {error:?}"
+    let AppError::StateBucketPreparation(preparation) = &error else {
+        panic!("typed preparation error was erased: {error:?}");
+    };
+    let carina_core::executor::ProviderPreparationError::ValueConstraint { errors, .. } =
+        preparation.preparation_error()
+    else {
+        panic!("typed schema error was erased: {error:?}");
+    };
+    assert!(!errors.errors().is_empty());
+    assert_eq!(
+        message
+            .matches("does not match required pattern /^state-/")
+            .count(),
+        1,
+        "{message}"
     );
-    assert!(saw_type_error, "typed schema error was erased: {error:?}");
+    assert!(std::error::Error::source(&error).is_none());
     assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn state_bucket_provider_error_keeps_typed_source() {
+async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         fail_create: true,
@@ -3677,11 +3714,13 @@ async fn state_bucket_provider_error_keeps_typed_source() {
         error.to_string(),
         "Failed to create state bucket: bootstrap create failed"
     );
-    let source = std::error::Error::source(&error).expect("provider source must be retained");
-    assert!(
-        source.downcast_ref::<ProviderError>().is_some(),
-        "{error:?}"
+    assert!(matches!(&error, AppError::StateBucketCreate { error }
+        if error.detail().context() == "bootstrap create failed"));
+    assert_eq!(
+        error.to_string().matches("bootstrap create failed").count(),
+        1
     );
+    assert!(std::error::Error::source(&error).is_none());
 }
 
 #[tokio::test]
@@ -6158,9 +6197,8 @@ mod saved_plan_version_tests {
         )
         .await;
 
-        let message = result
-            .expect_err("malformed current-version plan must be rejected")
-            .to_string();
+        let error = result.expect_err("malformed current-version plan must be rejected");
+        let message = error.to_string();
         assert!(
             message.contains("The plan file may be corrupted. Re-run"),
             "current-version structural errors must be reported as corruption: {message}",

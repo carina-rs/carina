@@ -297,7 +297,7 @@ impl MockProvider {
         if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
             let key = Self::resolved_resource_key(id)?;
             Self::append_op_log(path, op, &key).map_err(|e| {
-                ProviderError::internal("Failed to append operation log").with_cause(e)
+                ProviderError::internal_caused_by("Failed to append operation log", e)
             })?;
         }
         Ok(())
@@ -414,11 +414,11 @@ impl MockProvider {
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
-                ProviderError::internal("Failed to create mock readiness directory").with_cause(err)
+                ProviderError::internal_caused_by("Failed to create mock readiness directory", err)
             })?;
         }
         fs::write(path, "ready\n").map_err(|err| {
-            ProviderError::internal("Failed to write mock readiness file").with_cause(err)
+            ProviderError::internal_caused_by("Failed to write mock readiness file", err)
         })
     }
 
@@ -456,7 +456,7 @@ impl MockProvider {
 
         states.insert(key, attrs);
         self.save_states(&states)
-            .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
+            .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
 
         let mut state_attrs = resource.resolved_attributes();
         Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
@@ -683,7 +683,7 @@ impl Provider for MockProvider {
 
             states.insert(key, attrs);
             self.save_states(&states)
-                .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
+                .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
 
             let mut state = State::existing(id, attributes).with_identifier("mock-id");
             if let Some(config) = partial_update {
@@ -724,7 +724,7 @@ impl Provider for MockProvider {
 
             if let Some(path) = env::var_os("CARINA_MOCK_DELETE_LOG").map(PathBuf::from) {
                 Self::append_delete_log(path, &key).map_err(|e| {
-                    ProviderError::internal("Failed to append delete log").with_cause(e)
+                    ProviderError::internal_caused_by("Failed to append delete log", e)
                 })?;
             }
 
@@ -732,7 +732,7 @@ impl Provider for MockProvider {
 
             states.remove(&key);
             self.save_states(&states)
-                .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
+                .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
 
             Self::append_op_log_if_configured("delete", &id)?;
             Ok(())

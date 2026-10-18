@@ -147,6 +147,11 @@ fn assert_secret_verification_rejected_without_mutation(
         rendered.contains(expected_message) && rendered.contains("carina plan"),
         "saved-plan secret verification reported the wrong cause:\n{rendered}",
     );
+    assert_eq!(
+        rendered.matches(expected_message).count(),
+        1,
+        "saved-plan secret reason was rendered more than once:\n{rendered}",
+    );
     assert_output_has_no_plaintext("rejected saved-plan apply", output, plaintexts);
     assert_eq!(
         fs::read(scenario.project.join("carina.state.json")).ok(),
@@ -722,6 +727,11 @@ let item = mock.test.resource {
         rendered.contains("could not be evaluated") && rendered.contains("carina plan"),
         "unavailable-secret diagnostic must explain how to recover:\n{rendered}",
     );
+    assert_eq!(
+        rendered.matches("could not be evaluated").count(),
+        1,
+        "unavailable-secret reason was rendered more than once:\n{rendered}",
+    );
     assert!(
         !scenario.mock_state.exists(),
         "provider must not be called when secret evaluation fails: {}",
@@ -731,6 +741,96 @@ let item = mock.test.resource {
         fs::read(scenario.project.join("carina.state.json")).ok(),
         state_before,
         "state must be unchanged when secret evaluation fails",
+    );
+}
+
+#[test]
+fn saved_plan_configuration_change_reason_and_location_render_once() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let shape_once = mock.test.resource {
+  name    = "shape-once"
+  comment = secret("SHAPE_ONCE_PLAINTEXT_3890")
+}
+"#,
+    );
+    assert_success("shape-change saved plan", &scenario.plan());
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let shape_once = mock.test.resource {
+  name = "shape-once"
+}
+"#,
+    );
+
+    let apply = scenario.apply_plan();
+    let rendered = output_text(&apply);
+
+    assert!(
+        !apply.status.success(),
+        "shape-changed plan applied:\n{rendered}"
+    );
+    assert_eq!(
+        rendered
+            .matches("recorded secret position no longer exists")
+            .count(),
+        1,
+        "configuration-change reason was not rendered exactly once:\n{rendered}",
+    );
+    assert_eq!(
+        rendered.matches("shape_once").count(),
+        1,
+        "configuration-change location was rendered more than once:\n{rendered}",
+    );
+}
+
+#[test]
+fn saved_plan_vanished_orphan_reason_and_resource_render_once() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let orphan_once = mock.test.resource {
+  name    = "orphan-once"
+  comment = secret("ORPHAN_ONCE_PLAINTEXT_3890")
+}
+"#,
+    );
+    assert_success(
+        "initial orphan fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    assert_success(
+        "refresh-disabled orphan saved plan",
+        &scenario.carina(&["plan", "--refresh=false", "--out", "plan.json", "."]),
+    );
+    fs::write(&scenario.mock_state, b"{}\n").expect("remove orphan from provider state");
+
+    let apply = scenario.apply_plan();
+    let rendered = output_text(&apply);
+
+    assert!(
+        !apply.status.success(),
+        "vanished orphan plan applied:\n{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("orphan resource").count(),
+        1,
+        "orphan-vanished reason was rendered more than once:\n{rendered}",
+    );
+    assert_eq!(
+        rendered.matches("orphan_once").count(),
+        1,
+        "orphan resource was rendered more than once:\n{rendered}",
     );
 }
 

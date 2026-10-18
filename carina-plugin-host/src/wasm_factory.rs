@@ -49,42 +49,90 @@ fn early_provider_err<T: 'static>(
     Box::pin(async move { Err(wasm_value_encode_provider_error(operation, error)) })
 }
 
+#[derive(Debug)]
+struct WasmOperationError<E> {
+    operation: &'static str,
+    source: E,
+}
+
+impl<E: fmt::Display> fmt::Display for WasmOperationError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "in operation {}: {}", self.operation, self.source)
+    }
+}
+
+impl<E> std::error::Error for WasmOperationError<E> where E: std::error::Error + 'static {}
+
 fn wasm_value_decode_provider_error<E>(operation: &'static str, error: E) -> ProviderError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    ProviderError::internal(format!(
-        "WASM provider returned an invalid boundary value during {operation}"
-    ))
-    .with_cause(error)
+    ProviderError::internal_caused_by(
+        "WASM provider returned an invalid boundary value",
+        WasmOperationError {
+            operation,
+            source: error,
+        },
+    )
 }
 
 fn wasm_value_encode_provider_error<E>(operation: &'static str, error: E) -> ProviderError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    ProviderError::internal(format!(
-        "failed to encode a WASM provider boundary value during {operation}"
-    ))
-    .with_cause(error)
+    ProviderError::internal_caused_by(
+        "failed to encode a WASM provider boundary value",
+        WasmOperationError {
+            operation,
+            source: error,
+        },
+    )
 }
 
 #[derive(Debug)]
 struct WasmGuestCallError {
+    context: Option<WasmGuestCallContext>,
     source: wasmtime::Error,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WasmGuestCallContext {
+    Trap {
+        operation: &'static str,
+    },
+    Timeout {
+        operation: &'static str,
+        credential_hint: bool,
+    },
 }
 
 impl fmt::Display for WasmGuestCallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("WASM guest call failed")
+        match self.context {
+            None => f.write_str("WASM guest call failed"),
+            Some(WasmGuestCallContext::Trap { operation }) => {
+                write!(f, "{operation} call failed")
+            }
+            Some(WasmGuestCallContext::Timeout {
+                operation,
+                credential_hint,
+            }) => {
+                write!(
+                    f,
+                    "{operation} did not complete within {WASM_OPERATION_TIMEOUT_SECS}s"
+                )?;
+                if credential_hint {
+                    f.write_str(" (check AWS credentials)")?;
+                }
+                Ok(())
+            }
+        }?;
+        f.write_str(": ")?;
+        write_error_chain_inline(f, &self.source)
     }
 }
 
-impl std::error::Error for WasmGuestCallError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
+impl std::error::Error for WasmGuestCallError {}
 
 #[derive(Clone, Copy)]
 enum WasmTrapContext {
@@ -98,19 +146,25 @@ fn wasm_trap_provider_error(
     context: WasmTrapContext,
 ) -> ProviderError {
     let timed_out = error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt);
-    let cause = WasmGuestCallError { source: error };
     if timed_out {
-        let credential_hint = match context {
-            WasmTrapContext::ProviderOperation => " (check AWS credentials)",
-            WasmTrapContext::Normalizer => "",
-        };
-        ProviderError::timeout(format!(
-            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in {operation}{credential_hint}"
-        ))
-        .with_cause(cause)
+        ProviderError::timeout_caused_by(
+            "WASM plugin timed out",
+            WasmGuestCallError {
+                context: Some(WasmGuestCallContext::Timeout {
+                    operation,
+                    credential_hint: matches!(context, WasmTrapContext::ProviderOperation),
+                }),
+                source: error,
+            },
+        )
     } else {
-        let message = format!("WASM trap in {operation}");
-        ProviderError::internal(message).with_cause(cause)
+        ProviderError::internal_caused_by(
+            "WASM guest trapped",
+            WasmGuestCallError {
+                context: Some(WasmGuestCallContext::Trap { operation }),
+                source: error,
+            },
+        )
     }
 }
 
@@ -512,32 +566,14 @@ impl fmt::Display for WasmProviderLoadError {
             WasmProviderLoadError::PrecompiledDeserialization(error) => error.fmt(f),
             WasmProviderLoadError::Instantiation(error) => error.fmt(f),
             WasmProviderLoadError::Metadata { context, source } => {
-                // ProviderArtifactLoadError is the terminal rendering surface
-                // and does not walk `source()`, so render this typed chain once
-                // here while still exposing it through Error::source.
-                write!(f, "{context}")?;
-                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
-                while let Some(error) = current {
-                    write!(f, ": {error}")?;
-                    current = error.source();
-                }
-                Ok(())
+                write!(f, "{context}: {source}")
             }
             WasmProviderLoadError::Other(message) => f.write_str(message),
         }
     }
 }
 
-impl std::error::Error for WasmProviderLoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            WasmProviderLoadError::Metadata { source, .. } => Some(source.as_ref()),
-            WasmProviderLoadError::PrecompiledDeserialization(_)
-            | WasmProviderLoadError::Instantiation(_)
-            | WasmProviderLoadError::Other(_) => None,
-        }
-    }
-}
+impl std::error::Error for WasmProviderLoadError {}
 
 impl WasmProviderLoadError {
     fn metadata(
@@ -588,23 +624,26 @@ impl fmt::Display for PrecompiledComponentDeserializationError {
 impl std::error::Error for PrecompiledComponentDeserializationError {}
 
 /// Failure while creating a credentialed per-binding runtime instance.
-/// Instantiation and `info` guest-call failures remain typed until the
-/// `ProviderFactory` trait boundary; protocol and provider initialization
-/// rejections retain their existing verbatim messages.
+/// Instantiation, `info` guest-call, and decoded initialization failures remain
+/// typed until the `ProviderFactory` trait boundary.
 #[derive(Debug)]
 enum WasmProviderInstanceError {
     Instantiation(ProviderInstantiationError),
     InfoCall(wasmtime::Error),
+    InitializeValueEncode(SerializationError),
+    InitializeCall(wasmtime::Error),
+    Initialize(ProviderError),
     ProtocolVersion(String),
-    Other(String),
 }
 
 type ProviderInstantiationErrorMapper =
     Arc<dyn Fn(ProviderInstantiationError) -> ProviderError + Send + Sync>;
 
 fn default_provider_instantiation_error_mapper(error: ProviderInstantiationError) -> ProviderError {
-    ProviderError::internal("Failed to instantiate WASM provider runtime instance")
-        .with_cause(error)
+    ProviderError::internal_caused_by(
+        "Failed to instantiate WASM provider runtime instance",
+        error,
+    )
 }
 
 impl WasmProviderInstanceError {
@@ -614,41 +653,44 @@ impl WasmProviderInstanceError {
             WasmProviderInstanceError::InfoCall(error) => {
                 wasm_trap_provider_error("info", error, WasmTrapContext::ProviderOperation)
             }
-            WasmProviderInstanceError::ProtocolVersion(message) => ProviderError::internal(message),
-            WasmProviderInstanceError::Other(message) => ProviderError::invalid_input(message),
-        }
-    }
-}
-
-impl fmt::Display for WasmProviderInstanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WasmProviderInstanceError::Instantiation(error) => error.fmt(f),
-            WasmProviderInstanceError::InfoCall(error) => {
-                write!(f, "Failed to call info(): ")?;
-                write_error_chain(f, error)
+            WasmProviderInstanceError::InitializeValueEncode(error) => {
+                wasm_value_encode_provider_error("initialize", error)
             }
-            WasmProviderInstanceError::ProtocolVersion(message)
-            | WasmProviderInstanceError::Other(message) => f.write_str(message),
+            WasmProviderInstanceError::InitializeCall(error) => {
+                wasm_trap_provider_error("initialize", error, WasmTrapContext::ProviderOperation)
+            }
+            WasmProviderInstanceError::Initialize(error) => error,
+            WasmProviderInstanceError::ProtocolVersion(message) => ProviderError::internal(message),
         }
     }
 }
 
-impl std::error::Error for WasmProviderInstanceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            WasmProviderInstanceError::InfoCall(error) => Some(error.as_ref()),
-            WasmProviderInstanceError::Instantiation(_)
-            | WasmProviderInstanceError::ProtocolVersion(_)
-            | WasmProviderInstanceError::Other(_) => None,
-        }
-    }
-}
-
-impl From<String> for WasmProviderInstanceError {
-    fn from(message: String) -> Self {
-        WasmProviderInstanceError::Other(message)
-    }
+/// Exercise the exact guest-string initialization boundary for downstream
+/// rendering tests.
+///
+/// The constructed WIT value matches the SDK's
+/// `validate_string_to_provider_error`, then follows the live host path:
+/// WIT → protocol → core → `WasmProviderInstanceError::Initialize` → public
+/// `ProviderError`. Provider identity is intentionally left for the wiring
+/// layer to attach.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn decode_initialize_string_error_for_test(message: impl Into<String>) -> ProviderError {
+    let wit_error = wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
+        message: message.into(),
+        resource_id: None,
+        cause: None,
+        provider_name: None,
+        operation: None,
+        status: None,
+        code: None,
+        request_id: None,
+    });
+    let decoded = wasm_convert::decode_provider_initialization_error(
+        wasm_convert::wit_to_wire_provider_error(wit_error),
+    );
+    let mapper: ProviderInstantiationErrorMapper =
+        Arc::new(default_provider_instantiation_error_mapper);
+    WasmProviderInstanceError::Initialize(decoded).into_provider_error_with(&mapper)
 }
 
 fn wasi_http_compatibility(
@@ -701,6 +743,16 @@ fn write_error_chain(f: &mut fmt::Formatter<'_>, error: &wasmtime::Error) -> fmt
         } else {
             write!(f, "\n  caused by: {cause}")?;
         }
+    }
+    Ok(())
+}
+
+fn write_error_chain_inline(f: &mut fmt::Formatter<'_>, error: &wasmtime::Error) -> fmt::Result {
+    for (index, cause) in error.chain().enumerate() {
+        if index > 0 {
+            f.write_str(": ")?;
+        }
+        write!(f, "{cause}")?;
     }
     Ok(())
 }
@@ -2145,7 +2197,10 @@ fn create_instance_auto<'a>(
             Ok((store, bindings)) => Ok((store, bindings, true)),
             Err(WasmBindingCreationError::InfoCall(error)) => Err(WasmProviderLoadError::metadata(
                 "Failed to call info()",
-                WasmGuestCallError { source: error },
+                WasmGuestCallError {
+                    context: None,
+                    source: error,
+                },
             )),
             Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
             Err(WasmBindingCreationError::Instantiation(http_err)) => {
@@ -2154,7 +2209,10 @@ fn create_instance_auto<'a>(
                     Err(WasmBindingCreationError::InfoCall(error)) => {
                         Err(WasmProviderLoadError::metadata(
                             "Failed to call info()",
-                            WasmGuestCallError { source: error },
+                            WasmGuestCallError {
+                                context: None,
+                                source: error,
+                            },
                         ))
                     }
                     Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
@@ -2251,16 +2309,11 @@ struct WasmMetadataCallError {
 
 impl fmt::Display for WasmMetadataCallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(f)
+        write_error_chain(f, &self.source)
     }
 }
 
-impl std::error::Error for WasmMetadataCallError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        let source: &(dyn std::error::Error + 'static) = self.source.as_ref();
-        source.source()
-    }
-}
+impl std::error::Error for WasmMetadataCallError {}
 
 fn metadata_call_error(
     provider_name: &str,
@@ -2672,15 +2725,18 @@ impl WasmProviderFactory {
         };
         let (mut store, bindings) =
             create_runtime_instance(&self.engine, &self.component, kind, world).await?;
-        let wit_attrs =
-            wasm_convert::core_to_wit_value_map(attributes).map_err(|e| e.to_string())?;
+        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
+            .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
         bindings
             .call_initialize(&mut store, &wit_attrs)
             .await
-            .map_err(|e| format!("Failed to call initialize(): {e}"))?
+            .map_err(WasmProviderInstanceError::InitializeCall)?
             .map_err(|e| {
-                let core_err = wasm_convert::wit_to_core_provider_error(e);
-                format!("Provider initialization failed: {}", core_err.message())
+                WasmProviderInstanceError::Initialize(
+                    wasm_convert::decode_provider_initialization_error(
+                        wasm_convert::wit_to_wire_provider_error(e),
+                    ),
+                )
             })?;
 
         Ok((store, bindings))
@@ -2784,11 +2840,7 @@ impl ProviderFactory for WasmProviderFactory {
                     .call_validate_config(store, &wit_attrs)
                     .await
                     .map_err(|e| format!("Failed to call validate_config(): {e}"))?
-                    .map_err(|e| {
-                        wasm_convert::wit_to_core_provider_error(e)
-                            .message()
-                            .to_string()
-                    })
+                    .map_err(|e| wasm_convert::wit_to_core_provider_error(e).to_string())
             })
         })
     }
@@ -2808,11 +2860,7 @@ impl ProviderFactory for WasmProviderFactory {
                     .call_validate_custom_type(store, &wit_identity, value.as_str())
                     .await
                     .map_err(|e| format!("Failed to call validate_custom_type(): {e}"))?
-                    .map_err(|e| {
-                        wasm_convert::wit_to_core_provider_error(e)
-                            .message()
-                            .to_string()
-                    })
+                    .map_err(|e| wasm_convert::wit_to_core_provider_error(e).to_string())
             })
         })
     }
@@ -3241,10 +3289,13 @@ fn validate_wit_state_result_keys(
         duplicates,
     };
     if !error.missing.is_empty() || !error.unexpected.is_empty() || !error.duplicates.is_empty() {
-        return Err(ProviderError::internal(format!(
-            "WASM provider returned invalid state keys during {operation}"
-        ))
-        .with_cause(error));
+        return Err(ProviderError::internal_caused_by(
+            "WASM provider returned invalid state keys",
+            WasmOperationError {
+                operation,
+                source: error,
+            },
+        ));
     }
 
     Ok(expected_ids_by_key
@@ -3264,12 +3315,15 @@ fn take_single_wit_state_result(
     results: Vec<(String, wit_types::State)>,
 ) -> ProviderResult<WitStateAttributeUpdate> {
     if results.len() != 1 {
-        return Err(ProviderError::internal(format!(
-            "WASM provider returned an invalid state count during {operation}"
-        ))
-        .with_cause(WasmNormalizerResultCountError {
-            actual: results.len(),
-        })
+        return Err(ProviderError::internal_caused_by(
+            "WASM provider returned an invalid state count",
+            WasmOperationError {
+                operation,
+                source: WasmNormalizerResultCountError {
+                    actual: results.len(),
+                },
+            },
+        )
         .for_resource(id));
     }
 
@@ -3979,7 +4033,7 @@ mod tests {
         .await
         .expect_err("the boundary error must propagate");
 
-        assert_eq!(error.message(), "boundary failed");
+        assert_eq!(error.detail().context(), "boundary failed");
         assert_eq!(
             resources[0].attributes.keys().collect::<Vec<_>>(),
             before.keys().collect::<Vec<_>>(),
@@ -4000,20 +4054,31 @@ mod tests {
         let error = decode_config_completions_json("not json", "mock", "1.0.0")
             .expect_err("malformed config completions must fail provider loading");
 
-        assert!(error.to_string().contains("provider config completions"));
-        assert!(std::error::Error::source(&error).is_some());
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("provider config completions"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("expected ident"), "{rendered}");
+        assert!(rendered.contains("line 1 column 2"), "{rendered}");
+        assert_eq!(rendered.matches("expected ident").count(), 1, "{rendered}");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
     fn shared_trap_mapper_preserves_provider_operation_messages() {
         let trap = wasm_trap_provider_error(
             "read",
-            wasmtime::Error::msg("guest trap"),
+            wasmtime::Error::msg("low-level trap"),
             WasmTrapContext::ProviderOperation,
         );
-        assert_eq!(trap.message(), "WASM trap in read");
-        assert_eq!(trap.to_string().matches("guest trap").count(), 1);
-        assert!(std::error::Error::source(&trap).is_some());
+        assert_eq!(trap.detail().context(), "WASM guest trapped");
+        assert_eq!(
+            trap.to_string(),
+            "WASM guest trapped: read call failed: low-level trap"
+        );
+        assert!(trap.detail().cause().is_some());
+        assert!(std::error::Error::source(&trap).is_none());
 
         let timeout = wasm_trap_provider_error(
             "read",
@@ -4021,12 +4086,10 @@ mod tests {
                 .context("error while executing at wasm backtrace:\n    0: test-frame"),
             WasmTrapContext::ProviderOperation,
         );
-        assert_eq!(
-            timeout.message(),
-            format!(
-                "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in read (check AWS credentials)"
-            )
-        );
+        assert_eq!(timeout.detail().context(), "WASM plugin timed out");
+        assert!(timeout.to_string().contains(&format!(
+            "read did not complete within {WASM_OPERATION_TIMEOUT_SECS}s (check AWS credentials)"
+        )));
 
         let normalizer_timeout = wasm_trap_provider_error(
             "normalize_state",
@@ -4035,11 +4098,12 @@ mod tests {
             WasmTrapContext::Normalizer,
         );
         assert_eq!(
-            normalizer_timeout.message(),
-            format!(
-                "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in normalize_state"
-            )
+            normalizer_timeout.detail().context(),
+            "WASM plugin timed out"
         );
+        assert!(normalizer_timeout.to_string().contains(&format!(
+            "normalize_state did not complete within {WASM_OPERATION_TIMEOUT_SECS}s"
+        )));
     }
 
     #[test]
@@ -4150,16 +4214,17 @@ mod tests {
             Some("normalize_desired"),
             "the guest boundary error must retain its export operation"
         );
+        let rendered = error.to_string();
         assert!(
-            error.message().contains("normalize_desired"),
+            rendered.contains("normalize_desired"),
             "the guest boundary error message must name its export: {error}"
         );
         assert!(
-            error.message().contains("WASM boundary decode error"),
+            rendered.contains("WASM boundary decode error"),
             "the guest boundary error message must be preserved: {error}"
         );
         assert!(
-            error.message().contains("invalid JSON"),
+            rendered.contains("invalid JSON"),
             "the guest decode detail must be preserved: {error}"
         );
         assert!(
@@ -4194,7 +4259,7 @@ mod tests {
         );
         assert!(
             error
-                .message()
+                .to_string()
                 .contains("hydrate_read_state saved attributes"),
             "the boundary error message must retain its failing sub-part: {error}"
         );
@@ -4218,17 +4283,13 @@ mod tests {
 
     #[test]
     fn rendered_decode_provider_error_contains_serde_detail_once() {
-        use std::error::Error as _;
-
         let decode_error =
             wasm_convert::wit_to_core_value(&wit_types::Value::ListVal("[".to_string()))
                 .expect_err("malformed JSON must fail");
-        let serde_detail = decode_error
-            .source()
-            .expect("syntax errors retain serde source")
-            .to_string();
+        let serde_detail = "EOF while parsing a list at line 1 column 1";
         let rendered = wasm_value_decode_provider_error("read", decode_error).to_string();
 
+        assert!(rendered.contains("in operation read"), "{rendered}");
         assert_eq!(rendered.matches(&serde_detail).count(), 1, "{rendered}");
     }
 
@@ -4276,7 +4337,7 @@ mod tests {
             .expect_err("malformed guest output must fail normalization");
 
         assert!(error.to_string().contains("map-val"));
-        assert!(std::error::Error::source(&error).is_some());
+        assert!(error.detail().cause().is_some());
         assert_eq!(
             error.detail().resource_id.as_deref(),
             Some(&second_id),
@@ -4465,7 +4526,8 @@ mod tests {
             }]"#,
         )
         .unwrap_err();
-        let err = provider_schema_decode_error("bad-provider", "9.9.9", detail).to_string();
+        let error = provider_schema_decode_error("bad-provider", "9.9.9", detail);
+        let err = error.to_string();
 
         assert!(err.contains("provider 'bad-provider' 9.9.9"), "{err}");
         assert!(err.contains("schema JSON parse error"), "{err}");
@@ -5018,7 +5080,10 @@ mod tests {
             Ok(_) => panic!("the unresolved bogus import must reject instantiation"),
             Err(error) => error,
         };
-        let rendered = error.to_string();
+        let WasmProviderInstanceError::Instantiation(instantiation) = error else {
+            panic!("expected instantiation error")
+        };
+        let rendered = instantiation.to_string();
 
         assert!(rendered.contains("bogus:runtime/iface@1.0.0"));
         assert!(rendered.contains("Component wasi:http imports: none detected"));
@@ -5050,7 +5115,10 @@ mod tests {
                 Ok(_) => panic!("the basic linker must reject the wasi:http import"),
                 Err(error) => error,
             };
-        let rendered = error.to_string();
+        let WasmProviderInstanceError::Instantiation(instantiation) = error else {
+            panic!("expected instantiation error")
+        };
+        let rendered = instantiation.to_string();
 
         assert!(rendered.contains("wasi:http/types@0.2.9"));
         assert!(rendered.contains("Host wasi:http version: 0.2.6"));
@@ -5161,7 +5229,9 @@ mod tests {
             Arc::new(default_provider_instantiation_error_mapper);
         let provider_error = WasmProviderInstanceError::Instantiation(instantiation)
             .into_provider_error_with(&mapper);
-        let cause = std::error::Error::source(&provider_error)
+        let cause = provider_error
+            .detail()
+            .cause()
             .expect("provider boundary must retain the typed instantiation cause");
 
         assert!(cause.downcast_ref::<ProviderInstantiationError>().is_some());
@@ -5184,20 +5254,99 @@ mod tests {
         .into_provider_error_with(&mapper);
 
         assert_eq!(provider_error.variant_name(), "timeout");
-        assert_eq!(
-            provider_error.message(),
-            format!(
-                "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in info (check AWS credentials)"
-            )
-        );
-        let cause = std::error::Error::source(&provider_error)
+        assert_eq!(provider_error.detail().context(), "WASM plugin timed out");
+        assert!(provider_error.to_string().contains(&format!(
+            "info did not complete within {WASM_OPERATION_TIMEOUT_SECS}s (check AWS credentials)"
+        )));
+        let cause = provider_error
+            .detail()
+            .cause()
             .expect("info timeout must retain the typed guest-call cause");
         assert!(cause.downcast_ref::<WasmGuestCallError>().is_some());
+        let rendered = cause.to_string();
         assert!(
-            cause.source().is_some_and(|source| source
-                .to_string()
-                .contains("error while calling provider info")),
-            "the typed guest-call wrapper must retain the Wasmtime cause chain"
+            rendered.contains("error while calling provider info"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("error while calling provider info")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(cause.source().is_none());
+    }
+
+    #[test]
+    fn initialization_value_encode_failure_keeps_typed_internal_error() {
+        let mapper: ProviderInstantiationErrorMapper =
+            Arc::new(default_provider_instantiation_error_mapper);
+        let provider_error =
+            WasmProviderInstanceError::InitializeValueEncode(SerializationError::NonFiniteFloat {
+                value: f64::NAN,
+                context: carina_core::value::SerializationContext::WasmBoundary,
+            })
+            .into_provider_error_with(&mapper);
+
+        assert_eq!(provider_error.variant_name(), "internal");
+        assert_eq!(
+            provider_error.detail().context(),
+            "failed to encode a WASM provider boundary value"
+        );
+        assert_eq!(
+            provider_error.to_string(),
+            "failed to encode a WASM provider boundary value: in operation initialize: cannot serialize at WASM provider boundary: non-finite float NaN"
+        );
+    }
+
+    #[test]
+    fn initialization_call_interrupt_uses_guest_timeout_classification() {
+        let mapper: ProviderInstantiationErrorMapper =
+            Arc::new(default_provider_instantiation_error_mapper);
+        let provider_error = WasmProviderInstanceError::InitializeCall(
+            wasmtime::Error::new(wasmtime::Trap::Interrupt)
+                .context("error while calling provider initialize"),
+        )
+        .into_provider_error_with(&mapper);
+
+        assert_eq!(provider_error.variant_name(), "timeout");
+        assert_eq!(provider_error.detail().context(), "WASM plugin timed out");
+        assert_eq!(
+            provider_error.to_string(),
+            format!(
+                "WASM plugin timed out: initialize did not complete within {WASM_OPERATION_TIMEOUT_SECS}s (check AWS credentials): error while calling provider initialize: wasm trap: interrupt"
+            )
+        );
+    }
+
+    #[test]
+    fn initialization_error_preserves_decoded_provider_error_details() {
+        let original = ProviderError::api_error_caused_by(
+            "Initialization request failed",
+            std::io::Error::other("credential service rejected the request"),
+        )
+        .with_operation("sts.GetCallerIdentity")
+        .with_status(403)
+        .with_code("AccessDenied")
+        .with_request_id("request-123");
+        let decoded = wasm_convert::decode_provider_initialization_error(original.to_wire());
+        let mapper: ProviderInstantiationErrorMapper =
+            Arc::new(default_provider_instantiation_error_mapper);
+        let mapped = WasmProviderInstanceError::Initialize(decoded)
+            .into_provider_error_with(&mapper)
+            .for_provider("awscc");
+
+        assert!(matches!(mapped, ProviderError::ApiError(_)));
+        let detail = mapped.detail();
+        assert_eq!(detail.provider_name.as_deref(), Some("awscc"));
+        assert_eq!(detail.operation.as_deref(), Some("sts.GetCallerIdentity"));
+        assert_eq!(detail.status, Some(403));
+        assert_eq!(detail.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(detail.request_id.as_deref(), Some("request-123"));
+        assert_eq!(
+            mapped.to_string(),
+            "Initialization request failed\n  operation: sts.GetCallerIdentity\n  status: 403 AccessDenied\n  request_id: request-123\n  cause: credential service rejected the request"
         );
     }
 
@@ -5213,7 +5362,7 @@ mod tests {
             wasmtime::Error::msg("runtime instantiation failed"),
         );
         let mapper: ProviderInstantiationErrorMapper = Arc::new(|error| {
-            ProviderError::internal("artifact provenance attached").with_cause(error)
+            ProviderError::internal_caused_by("artifact provenance attached", error)
         });
 
         let provider_error = WasmProviderInstanceError::Instantiation(instantiation)
