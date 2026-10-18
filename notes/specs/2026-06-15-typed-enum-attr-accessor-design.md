@@ -5,12 +5,50 @@
 
 ## Status
 
-Design proposal for carina-rs/carina#3555.
+Design record for carina-rs/carina#3555, updated for carina-rs/carina#3882.
 
-This document does not implement the change. It records the carina-core API
-shape needed to make provider enum reads typed enough that service code cannot
-silently drop `EnumIdentifier` or `CanonicalEnum` values by matching only
-`ConcreteValue::String`.
+The implemented carina-core API distinguishes absence from an invalid present
+value:
+
+```rust
+pub fn get_enum_attr<'a>(
+    &'a self,
+    schema: &'a ResourceSchema,
+    name: &str,
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
+
+pub fn get_enum_struct_field<'a>(
+    &'a self,
+    schema: &'a ResourceSchema,
+    struct_attr: &str,
+    field_name: &str,
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
+
+pub fn enum_attr_at_schema_path<'a>(
+    schema: &'a ResourceSchema,
+    root_attr: &str,
+    path: &[&str],
+    value: Option<&'a Value>,
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
+```
+
+`Ok(None)` means the value is absent. A matching `CanonicalEnum` and a literal
+`String` containing an exact closed-enum API value return `Ok(Some(_))`; open
+enums accept the string verbatim. Schema mismatches, identity mismatches,
+closed-enum membership failures, and all other value shapes return a typed
+`EnumAttrError` whose value diagnostics preserve secret redaction.
+
+The path-based accessor resolves the root attribute and every struct field from
+the supplied schema. It peels ordered and unordered list element types only at
+intermediate positions before a named segment, and resolves `Ref` through
+`ResourceSchema::defs`. It does not traverse `Map` or `Union`, and it does not
+peel the leaf: a `List<Enum>` leaf is `NotEnum`. Callers supply only the leaf
+value they have already reached, not an independently selected `AttributeType`.
+
+After carina#3881, provider-bound enum positions contain only API spellings.
+`EnumIdentifier` is therefore rejected by these accessors, and strings are not
+resolved through `EnumValueResolver`: there is no case folding, `_`/`-`
+equivalence, or DSL-alias lookup.
 
 ## Problem statement
 
@@ -86,9 +124,9 @@ impl<'a> EnumAttr<'a> {
 }
 ```
 
-The caller should not need to know whether the stored value is a quoted string,
-a raw enum identifier, or a canonical enum. The accessor should check the
-resource schema first, then project only the enum value.
+The caller should not need to match raw value variants. The accessor should
+check the resource schema first, distinguish absence from invalidity, then
+project only a matching canonical enum or literal API string.
 
 Non-goals:
 
@@ -111,7 +149,7 @@ impl Resource {
         &'a self,
         schema: &'a ResourceSchema,
         name: &str,
-    ) -> Option<EnumAttr<'a>>;
+    ) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
 }
 ```
 
@@ -124,36 +162,35 @@ impl<'a> EnumAttr<'a> {
 }
 ```
 
-Sketch:
+The same strict projection is available to provider helpers that already walk
+runtime lists or structs and reach an enum leaf themselves:
 
 ```rust
-pub fn get_enum_attr<'a>(
-    &'a self,
+pub fn enum_attr_at_schema_path<'a>(
     schema: &'a ResourceSchema,
-    name: &str,
-) -> Option<EnumAttr<'a>> {
-    let attr_schema = schema.attributes.get(name)?;
-    let parts = attr_schema.attr_type.enum_parts_with_defs(&schema.defs)?;
-    let value = self.get_attr(name)?;
-    EnumAttr::from_value_and_parts(value, parts)
-}
+    root_attr: &str,
+    path: &[&str],
+    value: Option<&'a Value>,
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
 ```
 
-The exact schema API may be `ResourceSchema::shape_of`,
-`AttributeType::shape_with_defs`, or a small `enum_parts_with_defs` helper. The
-important part is that the accessor receives the resource schema and resolves
-`Ref` through `ResourceSchema::defs` before accepting the attribute as enum.
+Core starts at `schema.attributes[root_attr]`, peels ordered and unordered list
+element types only at intermediate positions before each named struct-field
+segment, and resolves `Ref` through `ResourceSchema::defs`. `Map`, `Union`, and
+the leaf are not peeled or traversed. A missing root or field is an error rather
+than an absent value, and callers cannot pair a value with an unrelated
+attribute type.
 
-`EnumAttr::from_value_and_parts` should accept:
+The projection accepts:
 
-- `ConcreteValue::CanonicalEnum(c)` only when `c.identity() == parts.identity`;
-- `ConcreteValue::EnumIdentifier(raw)` by resolving through
-  `EnumValueResolver`;
-- `ConcreteValue::String(s)` by resolving as provider/state text for the enum
-  schema position.
+- `ConcreteValue::CanonicalEnum(c)` only when its identity matches and its API
+  value belongs to a closed enum's `values`;
+- `ConcreteValue::String(s)` verbatim for an open enum, or only when it exactly
+  equals a closed enum's API value.
 
-It should reject non-enum schema positions even when the stored value happens to
-be a string.
+It rejects `EnumIdentifier`, deferred values, and every other value shape. It
+also rejects non-enum schema positions even when the stored value is absent or
+happens to be a string.
 
 ### Option A evaluation
 
@@ -181,7 +218,7 @@ pub fn optional_enum_attr<'a>(
     resource: &'a Resource,
     schema: &'a ResourceSchema,
     attr_name: &str,
-) -> Option<EnumAttr<'a>>;
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
 ```
 
 or, if keeping provider return types stable for the sweep:
@@ -191,8 +228,10 @@ pub fn optional_enum_attr<'a>(
     resource: &'a Resource,
     schema: &'a ResourceSchema,
     attr_name: &str,
-) -> Option<&'a str> {
-    resource.get_enum_attr(schema, attr_name).map(|v| v.api_value())
+) -> Result<Option<&'a str>, EnumAttrError> {
+    resource
+        .get_enum_attr(schema, attr_name)
+        .map(|value| value.map(|value| value.api_value()))
 }
 ```
 
@@ -355,8 +394,9 @@ Option A should be paired with an enforcement signal during provider migration:
 - add a crate-local clippy lint or custom lint for provider crates that flags
   `resource.get_attr("<known enum attr>")` followed by a direct
   `ConcreteValue::String` match;
-- add tests proving `String`, `EnumIdentifier`, and `CanonicalEnum` all project
-  through `Resource::get_enum_attr`.
+- add tests proving exact API `String` and matching `CanonicalEnum` values
+  project through `Resource::get_enum_attr`, while `EnumIdentifier` and invalid
+  present values return errors.
 
 The lint is not the primary defense. The primary defense is that migrated code
 does not receive `&Value` for enum reads. The lint catches remaining direct raw
@@ -380,19 +420,29 @@ impl Resource {
         &'a self,
         schema: &'a ResourceSchema,
         name: &str,
-    ) -> Option<EnumAttr<'a>>;
+    ) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
 }
+
+pub fn enum_attr_at_schema_path<'a>(
+    schema: &'a ResourceSchema,
+    root_attr: &str,
+    path: &[&str],
+    value: Option<&'a Value>,
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError>;
 ```
 
 Core tests:
 
-- returns `None` when the attribute is absent;
-- returns `None` when the schema attribute is not enum-typed;
-- returns API value and identity for `ConcreteValue::CanonicalEnum`;
-- resolves `ConcreteValue::EnumIdentifier` through enum schema parts;
-- resolves provider/state `ConcreteValue::String` through enum schema parts;
-- rejects a canonical enum whose identity does not match the schema position;
-- handles `Ref` through `ResourceSchema::defs`.
+- returns `Ok(None)` only when the attribute is absent;
+- returns `Err` when the schema attribute is not enum-typed;
+- returns API value and identity for a matching, valid
+  `ConcreteValue::CanonicalEnum`;
+- accepts a literal `ConcreteValue::String` only verbatim for open enums or as
+  an exact member of closed enums;
+- rejects `ConcreteValue::EnumIdentifier`, folded strings, DSL aliases, stale
+  canonical members, and canonical identity mismatches;
+- handles intermediate ordered/unordered lists, structs, and `Ref` schema paths
+  in core without traversing maps, unions, or list-typed leaves.
 
 No provider code changes in this PR.
 
@@ -427,15 +477,15 @@ pub(crate) fn enum_struct_field_str<'a>(
 ) -> Option<&'a str>;
 ```
 
-For nested struct fields, either add a core accessor:
+For nested struct fields, use the core accessor:
 
 ```rust
 resource.get_enum_struct_field(schema, "options", "dns_support")
 ```
 
-or make the AWS helper use a core lower-level projection function that accepts
-an `AttributeType` plus `ResourceSchema::defs`. Do not keep nested enum variant
-matching solely in AWS.
+For enum leaves reached while iterating lists, pass the schema root and field
+path to `enum_attr_at_schema_path`. Do not keep schema-path resolution or nested
+enum variant matching solely in AWS.
 
 ### PR 3: AWS service sweep
 
@@ -555,12 +605,17 @@ Hard constraints:
 
 Acceptance criteria for Option A:
 
-- `Resource::get_enum_attr(schema, name)` returns an opaque `EnumAttr<'_>`.
+- `Resource::get_enum_attr(schema, name)` returns
+  `Result<Option<EnumAttr<'_>>, EnumAttrError>`.
+- `enum_attr_at_schema_path(schema, root_attr, path, value)` resolves the leaf
+  type from the same schema and returns `Ok(None)` only for an absent leaf value.
+- The path accessor peels ordered/unordered lists only before intermediate named
+  segments; maps, unions, and the leaf type are not peeled or traversed.
 - `EnumAttr` exposes `.api_value() -> &str` and `.identity() -> &TypeIdentity`.
 - The accessor first proves `name` is enum-typed in `schema`.
-- The accessor handles `String`, `EnumIdentifier`, and `CanonicalEnum` enum
-  storage shapes.
-- Identity mismatches are rejected.
+- The accessor accepts exact/open `String` and matching `CanonicalEnum` storage
+  shapes, and rejects `EnumIdentifier` and all other shapes.
+- Identity and closed-membership mismatches are rejected.
 - `Ref`-typed schema attributes are resolved through `ResourceSchema::defs`.
 - Provider helper signatures require schema.
 - The following direct pattern is no longer accepted in migrated provider code:
@@ -603,12 +658,11 @@ Acceptance criteria for PR sequencing:
    `Resource` construction (e.g. a state-side typestate refactor),
    reopening B at that seam is sensible — otherwise A stands.
 
-2. Should `EnumAttr` resolve `ConcreteValue::String` as provider/state text, or
-   only accept `CanonicalEnum` and `EnumIdentifier`?
+2. How are strings and identifiers handled?
 
-   Accepting `String` preserves current provider behavior for quoted enum input
-   and provider-read echoes. Rejecting it is stricter but may require a prior
-   canonicalization guarantee at every provider boundary.
+   Resolved by carina#3881 and carina#3882: a `String` is a literal API spelling
+   and is never folded or alias-resolved. `EnumIdentifier` cannot reach a
+   provider through the supported path and is rejected by the accessor.
 
 3. Should nested enum struct fields get a first-class core accessor in the same
    PR?
