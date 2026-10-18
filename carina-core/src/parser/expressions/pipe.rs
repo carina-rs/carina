@@ -7,7 +7,7 @@
 //! final `EvalValue` to a `Value` at the type boundary.
 
 use crate::eval_value::EvalValue;
-use crate::parser::expressions::primary::parse_primary_eval;
+use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
     ParseContext, ParseError, Rule, eval_type_name, evaluate_user_function, is_static_eval,
     is_static_value, next_pair, parse_expression,
@@ -39,12 +39,12 @@ pub(crate) fn parse_compose_expr(
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
-    let first = next_pair(&mut inner, "primary expression", "compose expression")?;
-    let mut value = parse_primary_eval(first, ctx)?;
+    let first = next_pair(&mut inner, "postfix expression", "compose expression")?;
+    let mut value = parse_postfix_eval(first, ctx)?;
 
     // Collect remaining primaries for >> composition
     for rhs_pair in inner {
-        let rhs = parse_primary_eval(rhs_pair, ctx)?;
+        let rhs = parse_postfix_eval(rhs_pair, ctx)?;
 
         // Both sides must be Closures
         if !value.is_closure() {
@@ -144,6 +144,11 @@ pub(crate) fn parse_pipe_expr(
         // non-closure-aware call, which we surface as a parse error.
         let pipe_value = match value {
             EvalValue::User(v) => v,
+            EvalValue::StructuralHandle(handle) => handle.into_value(),
+            EvalValue::ComputedWithStructuralHandles { value, .. } => value,
+            EvalValue::DeferredForValue { .. } => Value::Deferred(DeferredValue::Unknown(
+                crate::resource::UnknownReason::ForValue,
+            )),
             EvalValue::Closure {
                 ref name,
                 remaining_arity,

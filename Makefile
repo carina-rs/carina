@@ -76,6 +76,8 @@ plan-default-tags-update-replace:
 	$(PLAN_FIXTURE) default_tags_update_replace
 plan-depends-on:
 	$(PLAN_FIXTURE) depends_on
+plan-postfix-access:
+	$(PLAN_FIXTURE) postfix_access
 plan-resolved-value-constraint-multifile:
 	$(PLAN_FIXTURE) resolved_value_constraint_multifile
 plan-wait-cert:
@@ -329,7 +331,7 @@ plan-multi-instance-module:
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \
         plan-enum-display plan-string-dot-suffix plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
-        plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace \
+        plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace plan-postfix-access \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \

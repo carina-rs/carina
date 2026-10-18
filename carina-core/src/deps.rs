@@ -332,6 +332,32 @@ mod tests {
         assert_eq!(deps, HashSet::from(["role".to_string()]));
     }
 
+    #[test]
+    fn collect_dependencies_recurses_into_postfix_access_base() {
+        use crate::resource::{PathSegment, Subscript};
+
+        let value = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())),
+                    Value::resource_ref("role", "arn", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 1 },
+            },
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+        let mut deps = HashSet::new();
+
+        collect_dependencies(&value, &mut deps);
+
+        assert_eq!(deps, HashSet::from(["role".to_string()]));
+    }
+
     // Closure-in-attribute regression test deleted: `Value::Closure` no
     // longer exists, so a closure can never reach `Resource.attributes`.
     // The original concern (refs inside captured args getting silently

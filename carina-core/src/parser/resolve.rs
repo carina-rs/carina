@@ -9,7 +9,7 @@ use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, Value,
+    AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, Value,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -718,7 +718,7 @@ fn resolve_resource_refs_with_policy(
     // `Value::Deferred(DeferredValue::FunctionCall)` placeholders deferred by the per-file
     // parse — typically `fn X(...)` lives in a sibling `.crn` (#2444).
     // The variant below only mutates `FunctionCall` arms, leaving
-    // other shapes (`Value::Concrete(ConcreteValue::String("${vpc}"))` placeholder,
+    // other shapes (`Value::Deferred(DeferredValue::BindingRef)` references,
     // `Value::Deferred(DeferredValue::ResourceRef)`, etc.) untouched so earlier passes
     // (`upstream_exports`, `BindingNameSet`) keep seeing the raw
     // unresolved forms they expect.
@@ -742,13 +742,15 @@ fn resolve_resource_refs_with_policy(
     // would treat that deferred call as unknown and silently accept it.
     for call in &mut parsed.module_calls {
         for argument in call.arguments.values_mut() {
-            *argument = resolve_function_calls_only(
-                argument,
-                &binding_map,
-                &fn_ctx,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
-            )?;
+            argument.try_rewrite(|value| {
+                resolve_function_calls_only(
+                    value,
+                    &binding_map,
+                    &fn_ctx,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                )
+            })?;
         }
     }
     for argument in &mut parsed.arguments {
@@ -829,20 +831,30 @@ pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::H
 ///
 /// Plain value-shaped `let` bindings carry their pass-1 value so bare
 /// sibling identifiers parse to that value instead of a deferred
-/// placeholder. Structural bindings may also have parser placeholder
-/// entries in `parsed.variables` (`"${binding}"`); those must not become
-/// value seeds, so structural names continue to use the placeholder
-/// installed by `seed_bindings`.
+/// placeholder. Structural names always become typed structural seeds, even
+/// when `parsed.variables` retains a legacy bare resource-handle value.
 #[cfg(test)]
 pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSeed<'_>> {
     let structural = parsed.structural_binding_names();
+    let module_parameters: HashSet<&str> = parsed
+        .arguments
+        .iter()
+        .map(|argument| argument.name.as_str())
+        .collect();
 
-    collect_seed_bindings_from_parts(&structural, &parsed.variables)
+    collect_seed_bindings_from_parts(
+        &structural,
+        &module_parameters,
+        &parsed.variables,
+        &parsed.parser_binding_metadata,
+    )
 }
 
 pub(crate) fn collect_seed_bindings_from_parts<'a>(
     structural: &HashSet<&'a str>,
+    module_parameters: &HashSet<&'a str>,
     variables: &'a IndexMap<String, Value>,
+    metadata: &'a super::ast::ParserBindingMetadata,
 ) -> Vec<BindingSeed<'a>> {
     let mut names: Vec<&'a str> = structural.iter().copied().collect();
     names.extend(variables.keys().map(String::as_str));
@@ -852,10 +864,19 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
     names
         .into_iter()
         .map(|name| {
-            if structural.contains(name) {
+            if module_parameters.contains(name) {
+                BindingSeed::module_parameter(name)
+            } else if let Some(handle) = metadata.structural_aliases().get(name) {
+                BindingSeed::structural_alias(name, handle)
+            } else if structural.contains(name) {
                 BindingSeed::structural(name)
             } else if let Some(value) = variables.get(name) {
-                BindingSeed::value(name, value)
+                match metadata.value_structural_handles(name) {
+                    Some(structural_handles) => {
+                        BindingSeed::value_with_structural_handles(name, value, structural_handles)
+                    }
+                    None => BindingSeed::value(name, value),
+                }
             } else {
                 unreachable!(
                     "collect_seed_bindings_from_parts names are either structural or in variables"
@@ -979,6 +1000,9 @@ fn collect_reference_roots(
             for arg in args {
                 collect_reference_roots(arg, variables, structural, roots);
             }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            collect_reference_roots(access.base(), variables, structural, roots);
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
@@ -1173,7 +1197,7 @@ fn accumulate_undefined_reference_errors(
     }
     for call in &parsed.module_calls {
         for v in call.arguments.values() {
-            check(v);
+            check(v.value());
         }
     }
     for export in &parsed.export_params {
@@ -1216,6 +1240,16 @@ fn resolve_value_with_config(
 ) -> Result<Value, ParseError> {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            // A suffix is part of the authored reference, not decoration on
+            // its base attribute. Resolving only `binding.attribute` would
+            // erase the suffix (`q.name[0]` became the whole `q.name`
+            // string), preventing static validation and changing runtime
+            // semantics. Segmented references stay canonical ResourceRefs;
+            // BindingIndex checks their shape and the apply resolver performs
+            // the value navigation with the binding-source miss policy.
+            if !path.segments().is_empty() {
+                return Ok(value.clone());
+            }
             match binding_map.get(path.binding()) {
                 Some(attributes) => match attributes.get(path.attribute()) {
                     Some(attr_value) => {
@@ -1362,6 +1396,21 @@ fn resolve_value_with_config(
                 }
             }
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let resolved_base = resolve_value_with_config(
+                access.base(),
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            access
+                .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
+                .map_err(|error| ParseError::InvalidExpression {
+                    line: access.source_line(),
+                    message: error.to_string(),
+                })
+        }
         _ => Ok(value.clone()),
     }
 }
@@ -1382,13 +1431,15 @@ fn resolve_function_calls_only(
 ) -> Result<Value, ParseError> {
     use crate::resource::InterpolationPart;
     match value {
-        Value::Deferred(DeferredValue::FunctionCall { .. }) => resolve_value_with_config(
-            value,
-            binding_map,
-            fn_ctx,
-            defer_unknown_functions,
-            preserve_failed_user_calls,
-        ),
+        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Access(_)) => {
+            resolve_value_with_config(
+                value,
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
@@ -1601,24 +1652,56 @@ pub fn finalize_provider_configs<E>(parsed: &mut super::File<E>) -> Result<(), P
 }
 
 #[cfg(test)]
+mod resolve_access_tests {
+    use super::*;
+
+    #[test]
+    fn resource_ref_resolution_never_discards_authored_path_segments() {
+        let mut parsed = crate::parser::parse(
+            r#"
+let q = mock.test.resource { name = "q-z" }
+let consumer = mock.test.resource { name = q.name[0] }
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("parse resource path fixture");
+        let authored = parsed.resources[1]
+            .get_attr("name")
+            .expect("consumer name")
+            .clone();
+        assert!(matches!(
+            &authored,
+            Value::Deferred(DeferredValue::ResourceRef { path })
+                if path.segments().len() == 1
+        ));
+
+        resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
+            .expect("resolution keeps validation-owned paths deferred");
+
+        assert_eq!(
+            parsed.resources[1].get_attr("name"),
+            Some(&authored),
+            "resolving the known base attribute must not erase its postfix path",
+        );
+    }
+}
+
+#[cfg(test)]
 mod seed_precedence_tests {
     use super::*;
     use crate::parser::entry::SeedKind;
 
     #[test]
-    fn structural_let_with_placeholder_in_variables_seeds_as_structural() {
-        // A `let cluster = mock.compute.Instance {}` shape: `cluster` appears
-        // in `parsed.resources` and in `parsed.variables`, where let_binding.rs
-        // stores the parser placeholder string "${cluster}".
-        let mut parsed = ParsedFile::default();
-
-        let mut resource = Resource::new("mock.compute.Instance", "instance");
-        resource.binding = Some("cluster".to_string());
-        parsed.resources.push(resource); // allow: direct — fixture test inspection
-
-        parsed.variables.insert(
-            "cluster".to_string(),
-            Value::Concrete(ConcreteValue::String("${cluster}".into())),
+    fn structural_let_retains_legacy_value_and_still_seeds_as_structural() {
+        let parsed = crate::parser::parse(
+            "let cluster = mock.compute.Instance { name = \"example\" }",
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("parse structural let");
+        assert_eq!(
+            parsed.variables.get("cluster"),
+            Some(&Value::Concrete(ConcreteValue::String("${cluster}".into()))),
+            "structural handles must keep the main-compatible transport value"
         );
 
         let seeds = collect_seed_bindings_merged(&parsed);
@@ -1628,16 +1711,13 @@ mod seed_precedence_tests {
             .expect("cluster seed missing");
 
         match cluster_seed.kind() {
-            SeedKind::Structural => {}
-            SeedKind::Value(value) => panic!(
-                "structural binding `cluster` with placeholder in variables \
-                 must seed as Structural, not Value({value:?}). The structural-first \
-                 precedence in collect_seed_bindings_merged is load-bearing for \
-                 carina#3391's fix: if Value wins, the parser placeholder \
-                 \"${{cluster}}\" leaks as the seed value and sibling-file `cluster.attr` \
-                 references can resolve to the placeholder string instead of \
-                 going through the resource-binding path."
-            ),
+            SeedKind::Structural
+            | SeedKind::Provisional
+            | SeedKind::StructuralAlias(_)
+            | SeedKind::ModuleParameter => {}
+            SeedKind::Value { value, .. } => {
+                panic!("structural binding `cluster` must seed as Structural, not Value({value:?})")
+            }
         }
     }
 
@@ -1658,14 +1738,19 @@ mod seed_precedence_tests {
             .expect("bad_name seed missing");
 
         match bad_seed.kind() {
-            SeedKind::Value(value) => {
+            SeedKind::Value { value, .. } => {
                 assert_eq!(
                     value,
                     &Value::Concrete(ConcreteValue::String("literal".into())),
                     "Value seed must carry the actual literal"
                 );
             }
-            SeedKind::Structural => panic!("plain value let must seed as Value, not Structural"),
+            SeedKind::Structural
+            | SeedKind::Provisional
+            | SeedKind::StructuralAlias(_)
+            | SeedKind::ModuleParameter => {
+                panic!("plain value let must seed as Value, not a non-value seed")
+            }
         }
     }
 

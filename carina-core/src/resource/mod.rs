@@ -977,6 +977,48 @@ pub enum PathSegment {
     },
 }
 
+impl PathSegment {
+    /// Append this segment in DSL source form (`.field`, `[0]`, or
+    /// `["key"]`). Diagnostic-sensitive string keys stay redacted through
+    /// [`Subscript::append_to_dot_string`].
+    pub fn append_to_dot_string(&self, out: &mut String) {
+        match self {
+            Self::Field { name } => {
+                out.push('.');
+                out.push_str(name);
+            }
+            Self::Subscript { index } => index.append_to_dot_string(out),
+        }
+    }
+
+    /// Return this segment in DSL source form.
+    pub fn to_dot_string(&self) -> String {
+        let mut out = String::new();
+        self.append_to_dot_string(&mut out);
+        out
+    }
+
+    /// Return this segment in runtime source form, exposing a string
+    /// subscript only for internal identity and hashing paths.
+    pub(crate) fn to_plaintext_dot_string(&self) -> String {
+        let mut out = String::new();
+        match self {
+            Self::Field { name } => {
+                out.push('.');
+                out.push_str(name);
+            }
+            Self::Subscript { index } => index.append_to_plaintext_dot_string(&mut out),
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for PathSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_dot_string())
+    }
+}
+
 /// A typed access path representing a `ResourceRef` target.
 ///
 /// The path always carries a binding name and an attribute name; the
@@ -1074,6 +1116,16 @@ impl AccessPath {
             attribute,
             segments,
         }
+    }
+
+    /// Return this reference path with one more postfix access step.
+    ///
+    /// Reference-rooted postfix syntax is normalized through this method so
+    /// `(resource.attr)[0].field` has exactly the same representation as the
+    /// direct `resource.attr[0].field` spelling.
+    pub(crate) fn with_appended_segment(mut self, segment: PathSegment) -> Self {
+        self.segments.push(segment);
+        self
     }
 
     /// Returns the binding name.
@@ -1212,14 +1264,18 @@ impl std::fmt::Display for AccessPath {
 }
 
 /// A reference-shaped value, including both attribute access and a bare
-/// binding. [`AccessPath`] deliberately requires an attribute, while module
-/// arguments are commonly forwarded as bare [`DeferredValue::BindingRef`]
-/// values. This enum lets static type resolution cover both without weakening
-/// `AccessPath`'s non-empty-attribute invariant.
+/// binding. [`AccessPath`] deliberately requires an attribute, while typed
+/// value parameters can be projected as `BindingAccess` during static
+/// validation. This enum lets static type resolution cover both without
+/// weakening `AccessPath`'s non-empty-attribute invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReferencePath {
     Access(AccessPath),
     Binding(String),
+    BindingAccess {
+        binding: String,
+        segments: Vec<PathSegment>,
+    },
 }
 
 impl ReferencePath {
@@ -1227,6 +1283,9 @@ impl ReferencePath {
         match self {
             Self::Access(path) => ReferencePathRef::Access(path),
             Self::Binding(binding) => ReferencePathRef::Binding(binding),
+            Self::BindingAccess { binding, segments } => {
+                ReferencePathRef::BindingAccess { binding, segments }
+            }
         }
     }
 
@@ -1234,6 +1293,13 @@ impl ReferencePath {
         match self {
             Self::Access(path) => path.to_dot_string(),
             Self::Binding(binding) => binding.clone(),
+            Self::BindingAccess { binding, segments } => {
+                let mut rendered = binding.clone();
+                for segment in segments {
+                    segment.append_to_dot_string(&mut rendered);
+                }
+                rendered
+            }
         }
     }
 
@@ -1241,6 +1307,13 @@ impl ReferencePath {
         match self {
             Self::Access(path) => path.to_plaintext_dot_string(),
             Self::Binding(binding) => binding.clone(),
+            Self::BindingAccess { binding, segments } => {
+                let mut rendered = binding.clone();
+                for segment in segments {
+                    rendered.push_str(&segment.to_plaintext_dot_string());
+                }
+                rendered
+            }
         }
     }
 }
@@ -1250,7 +1323,39 @@ impl std::fmt::Display for ReferencePath {
         match self {
             Self::Access(path) => path.fmt(f),
             Self::Binding(binding) => binding.fmt(f),
+            Self::BindingAccess { .. } => f.write_str(&self.to_dot_string()),
         }
+    }
+}
+
+/// Project a parser-only module-argument placeholder and its postfix chain
+/// into the static reference path understood by [`crate::binding_index`].
+///
+/// Module arguments are values, not structural resource references, so their
+/// runtime representation deliberately remains `Unknown(ModuleArgument)` plus
+/// `Access`. This projection is validation metadata only: it does not weaken
+/// the construction invariant that a structural reference-rooted access is
+/// canonicalized to `ResourceRef` / `BindingRef`.
+pub(crate) fn module_argument_reference_path(value: &Value) -> Option<ReferencePath> {
+    fn collect(value: &Value) -> Option<(String, Vec<PathSegment>)> {
+        match value {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name })) => {
+                Some((name.clone(), Vec::new()))
+            }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                let (binding, mut segments) = collect(access.base())?;
+                segments.push(access.step().clone());
+                Some((binding, segments))
+            }
+            _ => None,
+        }
+    }
+
+    let (binding, segments) = collect(value)?;
+    if segments.is_empty() {
+        Some(ReferencePath::Binding(binding))
+    } else {
+        Some(ReferencePath::BindingAccess { binding, segments })
     }
 }
 
@@ -1259,6 +1364,10 @@ impl std::fmt::Display for ReferencePath {
 pub enum ReferencePathRef<'a> {
     Access(&'a AccessPath),
     Binding(&'a str),
+    BindingAccess {
+        binding: &'a str,
+        segments: &'a [PathSegment],
+    },
 }
 
 impl<'a> ReferencePathRef<'a> {
@@ -1266,6 +1375,7 @@ impl<'a> ReferencePathRef<'a> {
         match self {
             Self::Access(path) => path.binding(),
             Self::Binding(binding) => binding,
+            Self::BindingAccess { binding, .. } => binding,
         }
     }
 
@@ -1273,6 +1383,13 @@ impl<'a> ReferencePathRef<'a> {
         match self {
             Self::Access(path) => path.to_dot_string(),
             Self::Binding(binding) => binding.to_string(),
+            Self::BindingAccess { binding, segments } => {
+                let mut rendered = binding.to_string();
+                for segment in segments {
+                    segment.append_to_dot_string(&mut rendered);
+                }
+                rendered
+            }
         }
     }
 
@@ -1280,6 +1397,13 @@ impl<'a> ReferencePathRef<'a> {
         match self {
             Self::Access(path) => path.to_plaintext_dot_string(),
             Self::Binding(binding) => binding.to_string(),
+            Self::BindingAccess { binding, segments } => {
+                let mut rendered = binding.to_string();
+                for segment in segments {
+                    rendered.push_str(&segment.to_plaintext_dot_string());
+                }
+                rendered
+            }
         }
     }
 
@@ -1287,6 +1411,10 @@ impl<'a> ReferencePathRef<'a> {
         match self {
             Self::Access(path) => ReferencePath::Access(path.clone()),
             Self::Binding(binding) => ReferencePath::Binding(binding.to_string()),
+            Self::BindingAccess { binding, segments } => ReferencePath::BindingAccess {
+                binding: binding.to_string(),
+                segments: segments.to_vec(),
+            },
         }
     }
 }
@@ -1332,6 +1460,384 @@ pub(crate) fn rewrap_secrets(value: Value, depth: usize) -> Value {
     })
 }
 
+/// Failure to apply one [`PathSegment`] to a value whose shape is already
+/// known. Deferred bases are not errors: [`apply_value_path_segment`] retains
+/// them as [`DeferredValue::Access`] until resolution makes their shape
+/// concrete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueAccessError {
+    IndexOutOfRange {
+        index: i64,
+        len: usize,
+    },
+    MissingField {
+        name: String,
+        available: Option<Vec<String>>,
+        len: usize,
+    },
+    MissingKey {
+        key: ValueString,
+        available: Option<Vec<String>>,
+        len: usize,
+    },
+    WrongShape {
+        step: PathSegment,
+        actual: &'static str,
+    },
+}
+
+impl ValueAccessError {
+    fn available_suffix(available: &Option<Vec<String>>, len: usize) -> String {
+        match available {
+            None => format!("; available keys redacted ({len} entries)"),
+            Some(keys) if keys.is_empty() => "; available keys: <no keys>".to_string(),
+            Some(keys) => format!(
+                "; available keys: {}",
+                keys.iter()
+                    .map(|key| format!("{key:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// Render the historical path-oriented resolver diagnostic from
+    /// #2435/#2447. Dot and subscript map misses intentionally share this
+    /// format, and secret maps expose only their entry count.
+    pub(crate) fn format_for_path(&self, path: &str) -> String {
+        match self {
+            Self::MissingField { available, len, .. } | Self::MissingKey { available, len, .. } => {
+                let known = match available {
+                    None => format!("<redacted, {len} entries>"),
+                    Some(keys) if keys.is_empty() => "<no keys>".to_string(),
+                    Some(keys) => keys
+                        .iter()
+                        .map(|key| format!("{key:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+                format!("{path}: key not found; available keys: {known}")
+            }
+            _ => format!("{path}: {self}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ValueAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfRange { index, len } => {
+                write!(f, "index {index} out of range for list of length {len}")
+            }
+            Self::MissingField {
+                name,
+                available,
+                len,
+            } => write!(
+                f,
+                "field {name:?} not found in map{}",
+                Self::available_suffix(available, *len)
+            ),
+            Self::MissingKey {
+                key,
+                available,
+                len,
+            } => {
+                let key = key
+                    .diagnostic_literal()
+                    .map_or_else(|| "value from env()".to_string(), |key| format!("{key:?}"));
+                write!(
+                    f,
+                    "key {key} not found in map{}",
+                    Self::available_suffix(available, *len)
+                )
+            }
+            Self::WrongShape { step, actual } => {
+                write!(f, "cannot apply access {step} to {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ValueAccessError {}
+
+fn concrete_value_shape(value: &ConcreteValue) -> &'static str {
+    match value {
+        ConcreteValue::String(_) => "string",
+        ConcreteValue::EnumIdentifier(_) | ConcreteValue::CanonicalEnum(_) => "enum",
+        ConcreteValue::Int(_) => "integer",
+        ConcreteValue::Float(_) => "float",
+        ConcreteValue::Bool(_) => "boolean",
+        ConcreteValue::Duration(_) => "duration",
+        ConcreteValue::List(_) | ConcreteValue::StringList(_) => "list",
+        ConcreteValue::Map(_) => "map",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValueAccessMiss {
+    IndexOutOfRange {
+        index: i64,
+        len: usize,
+    },
+    MissingField {
+        name: String,
+        available: Option<Vec<String>>,
+        len: usize,
+    },
+    MissingKey {
+        key: ValueString,
+        available: Option<Vec<String>>,
+        len: usize,
+    },
+}
+
+impl From<ValueAccessMiss> for ValueAccessError {
+    fn from(miss: ValueAccessMiss) -> Self {
+        match miss {
+            ValueAccessMiss::IndexOutOfRange { index, len } => Self::IndexOutOfRange { index, len },
+            ValueAccessMiss::MissingField {
+                name,
+                available,
+                len,
+            } => Self::MissingField {
+                name,
+                available,
+                len,
+            },
+            ValueAccessMiss::MissingKey {
+                key,
+                available,
+                len,
+            } => Self::MissingKey {
+                key,
+                available,
+                len,
+            },
+        }
+    }
+}
+
+fn checked_list_position(index: i64, len: usize) -> Result<usize, ValueAccessMiss> {
+    usize::try_from(index)
+        .ok()
+        .filter(|position| *position < len)
+        .ok_or(ValueAccessMiss::IndexOutOfRange { index, len })
+}
+
+/// What a known-shape access should do when its selected field/index is not
+/// present. Local binding views can be incomplete until apply, whereas
+/// literals and loaded upstream values are final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMissPolicy {
+    Error,
+    Defer,
+}
+
+/// Result of applying one path segment. The distinction lets reference
+/// resolution preserve the original `ResourceRef` when navigation itself is
+/// undecidable, without guessing from the returned `Value` shape.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ValuePathSegmentResult {
+    Resolved(Value),
+    Deferred(Value),
+    /// The selected element is absent from a concrete container, but the
+    /// caller's source policy says that view may be incomplete.  The caller
+    /// must retain its original unresolved expression; constructing an
+    /// `Access` around this concrete `base` would violate the Access invariant.
+    DeferredMiss(ValueAccessError),
+}
+
+impl ValuePathSegmentResult {
+    pub(crate) fn into_value(self) -> Result<Value, ValueAccessError> {
+        match self {
+            Self::Resolved(value) | Self::Deferred(value) => Ok(value),
+            Self::DeferredMiss(error) => Err(error),
+        }
+    }
+}
+
+fn deferred_access(base: Value, step: PathSegment, source_line: usize) -> Value {
+    let display_root = match &base {
+        Value::Deferred(DeferredValue::Access(access)) => access.display_root.clone(),
+        _ => None,
+    };
+    Value::Deferred(DeferredValue::Access(AccessExpr {
+        base: Box::new(base),
+        step,
+        source_line,
+        display_root,
+    }))
+}
+
+fn handle_access_miss(
+    miss_policy: AccessMissPolicy,
+    miss: ValueAccessMiss,
+) -> Result<ValuePathSegmentResult, ValueAccessError> {
+    let error = ValueAccessError::from(miss);
+    match miss_policy {
+        AccessMissPolicy::Error => Err(error),
+        AccessMissPolicy::Defer => Ok(ValuePathSegmentResult::DeferredMiss(error)),
+    }
+}
+
+/// Apply one field/index step to a value.
+///
+/// This is the single semantic primitive used by parsing, runtime resolution,
+/// and [`navigate_value_path`]. Concrete containers are navigated immediately;
+/// a deferred base is retained as [`DeferredValue::Access`]. Secret wrappers
+/// are peeled before navigation and restored around the selected value.
+pub(crate) fn apply_value_path_segment(
+    base: Value,
+    step: PathSegment,
+    source_line: usize,
+    miss_policy: AccessMissPolicy,
+) -> Result<ValuePathSegmentResult, ValueAccessError> {
+    let (peeled, secret_depth) = peel_secrets(base);
+    let selected = match peeled {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            let reference = Value::Deferred(DeferredValue::ResourceRef {
+                path: path.with_appended_segment(step),
+            });
+            return Ok(ValuePathSegmentResult::Deferred(rewrap_secrets(
+                reference,
+                secret_depth,
+            )));
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            let reference = match step {
+                PathSegment::Field { name } => Value::Deferred(DeferredValue::ResourceRef {
+                    path: AccessPath::new(binding, name),
+                }),
+                PathSegment::Subscript {
+                    index: Subscript::Int { index },
+                } => Value::Deferred(DeferredValue::BindingRef {
+                    binding: format!("{binding}[{index}]"),
+                }),
+                PathSegment::Subscript {
+                    index: Subscript::Str { key },
+                } => Value::Deferred(DeferredValue::BindingRef {
+                    binding: crate::utils::map_key_address(&binding, key.expose_plaintext()),
+                }),
+            };
+            return Ok(ValuePathSegmentResult::Deferred(rewrap_secrets(
+                reference,
+                secret_depth,
+            )));
+        }
+        Value::Deferred(deferred) => {
+            let base = rewrap_secrets(Value::Deferred(deferred), secret_depth);
+            return Ok(ValuePathSegmentResult::Deferred(deferred_access(
+                base,
+                step,
+                source_line,
+            )));
+        }
+        Value::Concrete(ConcreteValue::List(items)) => match &step {
+            PathSegment::Subscript {
+                index: Subscript::Int { index },
+            } => {
+                let position = match checked_list_position(*index, items.len()) {
+                    Ok(position) => position,
+                    Err(error) => {
+                        return handle_access_miss(miss_policy, error);
+                    }
+                };
+                items[position].clone()
+            }
+            _ => {
+                return Err(ValueAccessError::WrongShape {
+                    step: step.clone(),
+                    actual: "list",
+                });
+            }
+        },
+        Value::Concrete(ConcreteValue::StringList(items)) => match &step {
+            PathSegment::Subscript {
+                index: Subscript::Int { index },
+            } => {
+                let position = match checked_list_position(*index, items.len()) {
+                    Ok(position) => position,
+                    Err(error) => {
+                        return handle_access_miss(miss_policy, error);
+                    }
+                };
+                Value::Concrete(ConcreteValue::String(items[position].clone()))
+            }
+            _ => {
+                return Err(ValueAccessError::WrongShape {
+                    step: step.clone(),
+                    actual: "list",
+                });
+            }
+        },
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            let available = (secret_depth == 0).then(|| map.keys().cloned().collect());
+            let len = map.len();
+            match &step {
+                PathSegment::Field { name } => match map.get(name).cloned() {
+                    Some(value) => value,
+                    None => {
+                        let error = ValueAccessMiss::MissingField {
+                            name: name.clone(),
+                            available,
+                            len,
+                        };
+                        return handle_access_miss(miss_policy, error);
+                    }
+                },
+                PathSegment::Subscript {
+                    index: Subscript::Str { key },
+                } => match map.get(key.expose_plaintext()).cloned() {
+                    Some(value) => value,
+                    None => {
+                        let error = ValueAccessMiss::MissingKey {
+                            key: key.clone(),
+                            available,
+                            len,
+                        };
+                        return handle_access_miss(miss_policy, error);
+                    }
+                },
+                _ => {
+                    return Err(ValueAccessError::WrongShape {
+                        step: step.clone(),
+                        actual: "map",
+                    });
+                }
+            }
+        }
+        Value::Concrete(concrete) => {
+            let actual = concrete_value_shape(&concrete);
+            return Err(ValueAccessError::WrongShape {
+                step: step.clone(),
+                actual,
+            });
+        }
+    };
+
+    Ok(ValuePathSegmentResult::Resolved(rewrap_secrets(
+        selected,
+        secret_depth,
+    )))
+}
+
+/// Construct one postfix access through the canonical access seam.
+///
+/// This convenience wrapper is used by value-tree transformations and tests;
+/// it can return a concrete selection or canonical reference just as the
+/// parser and resolver do. The raw [`DeferredValue::Access`] constructor is
+/// intentionally unavailable outside this module.
+pub fn apply_postfix_access(
+    base: Value,
+    step: PathSegment,
+    source_line: usize,
+    miss_policy: AccessMissPolicy,
+) -> Result<Value, ValueAccessError> {
+    apply_value_path_segment(base, step, source_line, miss_policy)
+        .and_then(ValuePathSegmentResult::into_value)
+}
+
 /// Navigate a value tree along an [`AccessPath`]'s `attribute` then
 /// ordered `segments`, returning the value at the leaf.
 ///
@@ -1348,9 +1854,11 @@ pub(crate) fn rewrap_secrets(value: Value, depth: usize) -> Value {
 /// `List`+`Subscript::Int`, `Map`+`Subscript::Str` — including
 /// `Secret` peel/rewrap so a secret leaf keeps its tag. Any missing
 /// hop, shape mismatch (a field expected where the value is a scalar),
-/// or out-of-range index yields `None`: a loop-variable path that does
-/// not navigate is "not resolvable here", never a panic or a wrong
-/// value.
+/// or out-of-range index yields `None`. A hop whose base is still deferred
+/// also yields `None`; callers must not mistake a retained
+/// [`DeferredValue::Access`] for a concrete navigation result. A
+/// loop-variable path that does not navigate is "not resolvable here", never
+/// a panic or a wrong value.
 pub fn navigate_value_path(root: &Value, path: &AccessPath) -> Option<Value> {
     // The `attribute` head is the first hop: `root` is the loop
     // element, `root[attribute]` is the first navigated value.
@@ -1361,32 +1869,19 @@ pub fn navigate_value_path(root: &Value, path: &AccessPath) -> Option<Value> {
     let mut current = rewrap_secrets(root_map.get(path.attribute())?.clone(), root_secret);
 
     for segment in path.segments() {
-        let (peeled, secret_depth) = peel_secrets(current);
-        let next = match (&peeled, segment) {
-            (Value::Concrete(ConcreteValue::Map(map)), PathSegment::Field { name }) => {
-                map.get(name)?.clone()
-            }
-            (
-                Value::Concrete(ConcreteValue::List(items)),
-                PathSegment::Subscript {
-                    index: Subscript::Int { index },
-                },
-            ) => {
-                let i = usize::try_from(*index).ok().filter(|i| *i < items.len())?;
-                items[i].clone()
-            }
-            (
-                Value::Concrete(ConcreteValue::Map(map)),
-                PathSegment::Subscript {
-                    index: Subscript::Str { key },
-                },
-            ) => map.get(key.expose_plaintext())?.clone(),
-            _ => return None,
-        };
-        current = rewrap_secrets(next, secret_depth);
+        current =
+            match apply_value_path_segment(current, segment.clone(), 0, AccessMissPolicy::Error)
+                .ok()?
+            {
+                ValuePathSegmentResult::Resolved(value) => value,
+                ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_) => {
+                    return None;
+                }
+            };
     }
 
-    Some(current)
+    let (peeled, _) = peel_secrets(current.clone());
+    matches!(peeled, Value::Concrete(_)).then_some(current)
 }
 
 /// Serde adapter that maps `std::time::Duration` ↔ integer seconds.
@@ -1622,7 +2117,7 @@ pub enum ConcreteValue {
 
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
-#[derive(Clone, Deserialize)]
+#[derive(Clone)]
 pub enum DeferredValue {
     /// Reference to another resource's attribute via an access path.
     ResourceRef { path: AccessPath },
@@ -1633,6 +2128,10 @@ pub enum DeferredValue {
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
     /// `["a", "b"] |> join("-")`. Evaluated during reference resolution.
     FunctionCall { name: String, args: Vec<Value> },
+    /// Field/index access whose base is not concrete yet. Once `base`
+    /// resolves, the resolver applies `step` through
+    /// [`apply_value_path_segment`].
+    Access(AccessExpr),
     /// A secret value. The inner value is sent to the provider but
     /// stored as an Argon2id hash in state.
     Secret(Box<Value>),
@@ -1649,15 +2148,118 @@ pub enum DeferredValue {
     Unknown(UnknownReason),
 }
 
+/// A sealed postfix-access node.  Its fields are read-only outside this
+/// module, so every rebuild must pass through [`apply_value_path_segment`]
+/// and cannot leave an Access wrapped around a concrete or reference root.
+#[derive(Clone)]
+pub struct AccessExpr {
+    base: Box<Value>,
+    step: PathSegment,
+    source_line: usize,
+    /// Parser-only authored root for deferred-for diagnostics (`item` in
+    /// `item.missing`). It is display metadata, like `source_line`, and is
+    /// intentionally omitted from the serialized Value representation.
+    display_root: Option<String>,
+}
+
+impl AccessExpr {
+    pub fn base(&self) -> &Value {
+        &self.base
+    }
+
+    pub fn step(&self) -> &PathSegment {
+        &self.step
+    }
+
+    pub fn source_line(&self) -> usize {
+        self.source_line
+    }
+
+    pub fn display_root(&self) -> Option<&str> {
+        self.display_root.as_deref()
+    }
+
+    /// Rebuild this access after a value-tree transform. The operands still
+    /// pass through the single access primitive, while source/display metadata
+    /// is retained when the result remains deferred.
+    pub(crate) fn rebuild_result(
+        &self,
+        base: Value,
+        step: PathSegment,
+        miss_policy: AccessMissPolicy,
+    ) -> Result<ValuePathSegmentResult, ValueAccessError> {
+        apply_value_path_segment(base, step, self.source_line, miss_policy).map(|result| {
+            let restore_display_root = |value: Value| match &self.display_root {
+                Some(root) => value.with_access_display_root(root.clone()),
+                None => value,
+            };
+            match result {
+                ValuePathSegmentResult::Resolved(value) => {
+                    ValuePathSegmentResult::Resolved(restore_display_root(value))
+                }
+                ValuePathSegmentResult::Deferred(value) => {
+                    ValuePathSegmentResult::Deferred(restore_display_root(value))
+                }
+                ValuePathSegmentResult::DeferredMiss(error) => {
+                    ValuePathSegmentResult::DeferredMiss(error)
+                }
+            }
+        })
+    }
+
+    pub(crate) fn rebuild(
+        &self,
+        base: Value,
+        step: PathSegment,
+        miss_policy: AccessMissPolicy,
+    ) -> Result<Value, ValueAccessError> {
+        self.rebuild_result(base, step, miss_policy)
+            .and_then(ValuePathSegmentResult::into_value)
+    }
+
+    pub(crate) fn rebuild_with_base(
+        &self,
+        base: Value,
+        miss_policy: AccessMissPolicy,
+    ) -> Result<Value, ValueAccessError> {
+        self.rebuild(base, self.step.clone(), miss_policy)
+    }
+}
+
+impl Value {
+    /// Attach authored display context to a valid deferred access. This does
+    /// not expose or mutate the access operands; construction and rebuilding
+    /// still go through [`apply_value_path_segment`].
+    pub(crate) fn with_access_display_root(mut self, root: impl Into<String>) -> Self {
+        if let Value::Deferred(DeferredValue::Access(access)) = &mut self {
+            access.display_root = Some(root.into());
+        }
+        self
+    }
+}
+
 impl Serialize for DeferredValue {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         enum SerializableDeferredValue<'a> {
-            ResourceRef { path: &'a AccessPath },
-            BindingRef { binding: &'a str },
+            ResourceRef {
+                path: &'a AccessPath,
+            },
+            BindingRef {
+                binding: &'a str,
+            },
             Interpolation(&'a [InterpolationPart]),
-            FunctionCall { name: &'a str, args: &'a [Value] },
-            RedactedSecret { hash: &'a RedactedSecretHash },
+            FunctionCall {
+                name: &'a str,
+                args: &'a [Value],
+            },
+            Access {
+                base: &'a Value,
+                step: &'a PathSegment,
+            },
+            RedactedSecret {
+                hash: &'a RedactedSecretHash,
+            },
             Unknown(&'a UnknownReason),
         }
 
@@ -1677,6 +2279,11 @@ impl Serialize for DeferredValue {
                 args,
             }
             .serialize(serializer),
+            Self::Access(access) => SerializableDeferredValue::Access {
+                base: access.base(),
+                step: access.step(),
+            }
+            .serialize(serializer),
             Self::Secret(_) => Err(serde::ser::Error::custom(
                 "raw secret values cannot be serialized; redact or materialize them at the typed boundary",
             )),
@@ -1686,6 +2293,46 @@ impl Serialize for DeferredValue {
             Self::Unknown(reason) => {
                 SerializableDeferredValue::Unknown(reason).serialize(serializer)
             }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DeferredValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum DeserializableDeferredValue {
+            ResourceRef { path: AccessPath },
+            BindingRef { binding: String },
+            Interpolation(Vec<InterpolationPart>),
+            FunctionCall { name: String, args: Vec<Value> },
+            Access { base: Box<Value>, step: PathSegment },
+            Secret(Box<Value>),
+            RedactedSecret { hash: RedactedSecretHash },
+            Unknown(UnknownReason),
+        }
+
+        match DeserializableDeferredValue::deserialize(deserializer)? {
+            DeserializableDeferredValue::ResourceRef { path } => Ok(Self::ResourceRef { path }),
+            DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
+            DeserializableDeferredValue::Interpolation(parts) => Ok(Self::Interpolation(parts)),
+            DeserializableDeferredValue::FunctionCall { name, args } => {
+                Ok(Self::FunctionCall { name, args })
+            }
+            DeserializableDeferredValue::Access { base, step } => {
+                let canonical = apply_postfix_access(*base, step, 0, AccessMissPolicy::Error)
+                    .map_err(serde::de::Error::custom)?;
+                match canonical {
+                    Value::Deferred(value) => Ok(value),
+                    Value::Concrete(_) => Err(serde::de::Error::custom(
+                        "serialized deferred access resolved to a concrete value",
+                    )),
+                }
+            }
+            DeserializableDeferredValue::Secret(inner) => Ok(Self::Secret(inner)),
+            DeserializableDeferredValue::RedactedSecret { hash } => {
+                Ok(Self::RedactedSecret { hash })
+            }
+            DeserializableDeferredValue::Unknown(reason) => Ok(Self::Unknown(reason)),
         }
     }
 }
@@ -1705,6 +2352,13 @@ impl fmt::Debug for DeferredValue {
                 .debug_struct("FunctionCall")
                 .field("name", name)
                 .field("args", args)
+                .finish(),
+            Self::Access(access) => f
+                .debug_struct("Access")
+                .field("base", access.base())
+                .field("step", access.step())
+                .field("source_line", &access.source_line())
+                .field("display_root", &access.display_root())
                 .finish(),
             Self::Secret(_) => f.write_str("Secret((secret))"),
             Self::RedactedSecret { .. } => f.write_str("RedactedSecret((secret hash))"),
@@ -2080,10 +2734,22 @@ impl ConcreteValue {
 /// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
 #[derive(Debug, Clone, Copy)]
 pub enum DeferredValueRef<'a> {
-    ResourceRef { path: &'a AccessPath },
-    BindingRef { binding: &'a str },
+    ResourceRef {
+        path: &'a AccessPath,
+    },
+    BindingRef {
+        binding: &'a str,
+    },
     Interpolation(&'a [InterpolationPart]),
-    FunctionCall { name: &'a str, args: &'a [Value] },
+    FunctionCall {
+        name: &'a str,
+        args: &'a [Value],
+    },
+    Access {
+        base: &'a Value,
+        step: &'a PathSegment,
+        source_line: usize,
+    },
     Secret(&'a Value),
     RedactedSecret(&'a RedactedSecretHash),
     Unknown(&'a UnknownReason),
@@ -2113,6 +2779,15 @@ impl Value {
             Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                 args.iter().any(Value::contains_diagnostic_sensitive_string)
             }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().contains_diagnostic_sensitive_string()
+                    || matches!(
+                        access.step(),
+                        PathSegment::Subscript {
+                            index: Subscript::Str { key },
+                        } if key.is_diagnostic_sensitive()
+                    )
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.contains_diagnostic_sensitive_string()
             }
@@ -2137,8 +2812,8 @@ impl Value {
     /// projection. Returns `None` for deferred-resolution variants
     /// ([`Value::ResourceRef`], [`Value::BindingRef`],
     /// [`Value::Interpolation`], [`Value::FunctionCall`],
-    /// [`Value::Secret`], saved-plan secret placeholders, and
-    /// [`Value::Unknown`]).
+    /// [`Value::Access`], [`Value::Secret`], saved-plan secret
+    /// placeholders, and [`Value::Unknown`]).
     ///
     /// Concrete-only sub-systems should consume `Value` exclusively
     /// through this accessor — the returned [`ConcreteValueRef`]
@@ -2175,6 +2850,11 @@ impl Value {
                 DeferredValue::FunctionCall { name, args } => {
                     DeferredValueRef::FunctionCall { name, args }
                 }
+                DeferredValue::Access(access) => DeferredValueRef::Access {
+                    base: access.base(),
+                    step: access.step(),
+                    source_line: access.source_line(),
+                },
                 DeferredValue::Secret(inner) => DeferredValueRef::Secret(inner),
                 DeferredValue::RedactedSecret { hash } => DeferredValueRef::RedactedSecret(hash),
                 DeferredValue::Unknown(reason) => DeferredValueRef::Unknown(reason),
@@ -2222,24 +2902,14 @@ pub enum UnknownReason {
     /// function body. Substituted with the call argument when the
     /// function is evaluated.
     FnParam { name: String },
+    /// Module argument placeholder while parsing a module definition.
+    /// This is a value slot, not a structural resource address; module
+    /// expansion substitutes it before provider-facing validation.
+    ModuleArgument { name: String },
     /// Function-local let placeholder while parsing a user-defined
     /// function body. Substituted after local lets are evaluated for a
     /// call.
     FnLocal { name: String },
-    /// Field access on a deferred for-expression's loop variable
-    /// (`for (_, opt) in iterable { … opt.resource_record.name … }`).
-    /// Carries the navigation path past the loop variable. The
-    /// `ForValue` sibling that additionally remembers *which* nested
-    /// value of the element is wanted: at template-parse time the
-    /// element is not yet known, so the parser emits this; once the
-    /// iterable resolves, `substitute_placeholder` re-navigates the
-    /// real element along `path` (carina#3136). Distinct from a
-    /// resource `ResourceRef` so `resolve_ref_value` — which only
-    /// resolves against resource bindings — never sees a loop variable
-    /// it cannot resolve. It inherits the never-equal `PartialEq`
-    /// invariant; saved plans serialize it so deferred templates retain
-    /// the information required for apply-time substitution.
-    ForValuePath { path: AccessPath },
     /// Mid-edit empty `${}` interpolation. Carries no payload — the
     /// presence of the marker is enough for the LSP to surface a
     /// diagnostic at the `${}` span and for downstream resolvers to
@@ -2259,15 +2929,22 @@ pub enum InterpolationPart {
 }
 
 /// `PartialEq` for `Value` is hand-rolled (not derived) to enforce one
-/// invariant the differ depends on: **`Value::Unknown` is never equal
+/// invariant the differ depends on: runtime **`Value::Unknown` is never equal
 /// to anything**, including another `Value::Unknown` with the same
 /// reason. An unresolved value is, by definition, unknown — two
 /// independently-unresolved attributes are not the "same value", so a
 /// derived `PartialEq` would silently suppress real diffs in
-/// `merge_lists_hashed` and `semantically_equal`. See RFC #2371.
+/// `merge_lists_hashed` and `semantically_equal`. The parser-only module
+/// argument token is the sole exception: fixed-point directory parsing must
+/// be able to recognize the same lexical placeholder across passes, and it is
+/// always substituted before values reach the differ. See RFC #2371.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (
+                Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name: a })),
+                Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name: b })),
+            ) => a == b,
             // Constraint: Unknown is never equal to anything.
             (Value::Deferred(DeferredValue::Unknown(_)), _)
             | (_, Value::Deferred(DeferredValue::Unknown(_))) => false,
@@ -2337,6 +3014,10 @@ impl PartialEq for Value {
                 Value::Deferred(DeferredValue::FunctionCall { name: an, args: aa }),
                 Value::Deferred(DeferredValue::FunctionCall { name: bn, args: ba }),
             ) => an == bn && aa == ba,
+            (
+                Value::Deferred(DeferredValue::Access(a)),
+                Value::Deferred(DeferredValue::Access(b)),
+            ) => a.base() == b.base() && a.step() == b.step(),
             (
                 Value::Deferred(DeferredValue::Secret(a)),
                 Value::Deferred(DeferredValue::Secret(b)),
@@ -2437,7 +3118,7 @@ impl Value {
     /// - An `Interpolation` whose parts collapse to a single `Literal` is
     ///   replaced with `Value::String(s)`.
     ///
-    /// `List`, `Map`, `Secret`, and `FunctionCall` recurse into their
+    /// `List`, `Map`, `Secret`, `FunctionCall`, and `Access` recurse into their
     /// children at the `Value` level. Other variants are returned
     /// unchanged. The transformation is idempotent.
     ///
@@ -2465,6 +3146,14 @@ impl Value {
             Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                 for arg in args {
                     arg.canonicalize_in_place();
+                }
+            }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                let access = access.clone();
+                let mut base = access.base().clone();
+                base.canonicalize_in_place();
+                if let Ok(rebuilt) = access.rebuild_with_base(base, AccessMissPolicy::Error) {
+                    *self = rebuilt;
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(_)) => {
@@ -2553,6 +3242,9 @@ impl Value {
                     arg.visit_resource_refs(f);
                 }
             }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().visit_resource_refs(f);
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_resource_refs(f),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -2603,6 +3295,9 @@ impl Value {
                     arg.visit_binding_refs(f);
                 }
             }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().visit_binding_refs(f);
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_binding_refs(f),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -2631,7 +3326,8 @@ impl Value {
 ///
 /// Despite the historical name (the helper used to operate on the now-removed
 /// `Expr` newtype), this function does **not** resolve `Value::ResourceRef` /
-/// `Value::Interpolation` / `Value::FunctionCall` / `Value::Secret` — it just
+/// `Value::Interpolation` / `Value::FunctionCall` / `Value::Access` /
+/// `Value::Secret` — it just
 /// projects ordered attribute storage to a hashmap. Callers that need concrete
 /// values must run `carina_core::resolver::resolve_refs_with_state_and_remote`
 /// (or an equivalent) first. See #1683 for a regression caused by assuming
@@ -2663,6 +3359,7 @@ pub fn value_contains_unknown(value: &Value) -> bool {
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().any(value_contains_unknown)
         }
+        Value::Deferred(DeferredValue::Access(access)) => value_contains_unknown(access.base()),
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
         _ => false,
     }
@@ -2778,6 +3475,10 @@ impl Value {
                     arg.hash_into(hasher);
                 }
             }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().hash_into(hasher);
+                access.step().hash(hasher);
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.hash_into(hasher);
             }
@@ -2802,13 +3503,11 @@ impl Value {
                     // allocation.
                     UnknownReason::UpstreamExport { path } => path.hash(hasher),
                     UnknownReason::UpstreamAllExports { binding } => binding.hash(hasher),
-                    UnknownReason::FnParam { name } | UnknownReason::FnLocal { name } => {
+                    UnknownReason::FnParam { name }
+                    | UnknownReason::FnLocal { name }
+                    | UnknownReason::ModuleArgument { name } => {
                         name.hash(hasher);
                     }
-                    // Carries an `AccessPath` payload — hash it like
-                    // `UpstreamExport` so two distinct loop-var paths get
-                    // distinct hashes.
-                    UnknownReason::ForValuePath { path } => path.hash(hasher),
                     UnknownReason::PostCreateReadIncomplete { detail } => detail.hash(hasher),
                     // `For{Key,Index,Value}` and `EmptyInterpolation`
                     // carry no payload; the discriminant alone already
@@ -4910,6 +5609,12 @@ pub(crate) fn assert_value_fully_resolved(
         Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
             Err(crate::value::SerializationError::UnresolvedFunctionCall {
                 name: name.clone(),
+                context,
+            })
+        }
+        Value::Deferred(DeferredValue::Access(_)) => {
+            Err(crate::value::SerializationError::UnresolvedAccess {
+                expression: crate::value::format_value(value),
                 context,
             })
         }

@@ -7,12 +7,13 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::ResolvedBindings;
+use crate::binding_index::{BindingValueSource, ResolvedBindings};
 #[cfg(test)]
 use crate::resource::State;
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart, PlanInputState,
-    Resource, ResourceId, Value, contains_resource_ref, peel_secrets, rewrap_secrets,
+    AccessMissPolicy, Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart,
+    PlanInputState, Resource, ResourceId, Value, ValuePathSegmentResult, apply_value_path_segment,
+    contains_resource_ref,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -293,6 +294,15 @@ fn stamp_unresolved_upstream(
                     .collect(),
             })
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let original = Value::Deferred(DeferredValue::Access(access.clone()));
+            access
+                .rebuild_with_base(
+                    stamp_unresolved_upstream(access.base().clone(), upstream_binding_names),
+                    AccessMissPolicy::Error,
+                )
+                .unwrap_or(original)
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(stamp_unresolved_upstream(*inner, upstream_binding_names)),
         )),
@@ -354,6 +364,19 @@ pub fn resolve_ref_value_with_config(
     resolve_ref_value_inner(value, bindings, Some(config))
 }
 
+/// Select the miss policy for a path-shaped reference. A missing source is not
+/// evidence of a partially-known local value, so it uses the strict policy.
+fn binding_access_miss_policy(binding: &str, bindings: &ResolvedBindings) -> AccessMissPolicy {
+    let Some(source) = bindings.source(binding) else {
+        return AccessMissPolicy::Error;
+    };
+    match source {
+        BindingValueSource::Local => AccessMissPolicy::Defer,
+        BindingValueSource::Upstream => AccessMissPolicy::Error,
+        BindingValueSource::WaitAlias { .. } => AccessMissPolicy::Defer,
+    }
+}
+
 fn resolve_ref_value_inner(
     value: &Value,
     bindings: &ResolvedBindings,
@@ -368,67 +391,19 @@ fn resolve_ref_value_inner(
             {
                 // Resolve the initial attribute value
                 let mut resolved = resolve_ref_value_inner(attr_value, bindings, config)?;
+                let miss_policy = binding_access_miss_policy(binding_name, bindings);
 
-                // For upstream bindings the loaded `Value::Map` is
-                // concrete, so a missing field/key is a user typo and
-                // gets a "key not found" error. For local bindings the
-                // value may simply not be known yet (referenced
-                // resource not created) and we keep the ref unchanged.
-                let is_upstream = matches!(
-                    bindings.source(binding_name),
-                    Some(crate::binding_index::BindingValueSource::Upstream)
-                );
-                use crate::resource::{PathSegment, Subscript};
                 for segment in path.segments() {
-                    // Peel `Secret` wrappers so dot-form / subscript
-                    // access descends into the inner container, then
-                    // re-wraps the leaf so the secret tag survives
-                    // end-to-end. #2439.
-                    let (peeled, secret_depth) = peel_secrets(resolved);
-                    let next = match (peeled, segment) {
-                        (
-                            Value::Concrete(ConcreteValue::Map(ref map)),
-                            PathSegment::Field { name: field },
-                        ) => match map.get(field) {
-                            Some(nested) => resolve_ref_value_inner(nested, bindings, config)?,
-                            None if is_upstream && secret_depth > 0 => {
-                                return Err(missing_map_key_error_redacted(path, map.len()));
-                            }
-                            None if is_upstream => {
-                                return Err(missing_map_key_error(path, map));
-                            }
-                            None => return Ok(value.clone()),
-                        },
-                        (
-                            Value::Concrete(ConcreteValue::List(items)),
-                            PathSegment::Subscript {
-                                index: Subscript::Int { index },
-                            },
-                        ) => {
-                            let idx = usize::try_from(*index).ok().filter(|i| *i < items.len());
-                            match idx {
-                                Some(i) => resolve_ref_value_inner(&items[i], bindings, config)?,
-                                None => return Ok(value.clone()),
-                            }
+                    match apply_value_path_segment(resolved, segment.clone(), 0, miss_policy) {
+                        Ok(ValuePathSegmentResult::Resolved(next)) => {
+                            resolved = resolve_ref_value_inner(&next, bindings, config)?;
                         }
-                        (
-                            Value::Concrete(ConcreteValue::Map(map)),
-                            PathSegment::Subscript {
-                                index: Subscript::Str { key },
-                            },
-                        ) => match map.get(key.expose_plaintext()) {
-                            Some(nested) => resolve_ref_value_inner(nested, bindings, config)?,
-                            None if is_upstream && secret_depth > 0 => {
-                                return Err(missing_map_key_error_redacted(path, map.len()));
-                            }
-                            None if is_upstream => {
-                                return Err(missing_map_key_error(path, &map));
-                            }
-                            None => return Ok(value.clone()),
-                        },
-                        _ => return Ok(value.clone()),
-                    };
-                    resolved = rewrap_secrets(next, secret_depth);
+                        Ok(
+                            ValuePathSegmentResult::Deferred(_)
+                            | ValuePathSegmentResult::DeferredMiss(_),
+                        ) => return Ok(value.clone()),
+                        Err(error) => return Err(error.format_for_path(&path.to_string())),
+                    }
                 }
 
                 return Ok(resolved);
@@ -436,6 +411,7 @@ fn resolve_ref_value_inner(
             // Keep as-is if not found
             Ok(value.clone())
         }
+        Value::Deferred(DeferredValue::BindingRef { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, String> = items
                 .iter()
@@ -511,6 +487,23 @@ fn resolve_ref_value_inner(
                 }))
             }
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let access_expression = crate::value::format_value(value);
+            let resolved_base = resolve_ref_value_inner(access.base(), bindings, config)?;
+            // Construction canonicalizes reference-rooted access into a
+            // ResourceRef/BindingRef. Every surviving Access therefore has a
+            // computed container, whose missing element is a final error.
+            access
+                .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
+                .map_err(|error| {
+                    let message = error.format_for_path(&access_expression);
+                    if access.source_line() == 0 {
+                        message
+                    } else {
+                        format!("at line {}: {message}", access.source_line())
+                    }
+                })
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             let resolved_inner = resolve_ref_value_inner(inner, bindings, config)?;
             Ok(Value::Deferred(DeferredValue::Secret(Box::new(
@@ -522,39 +515,6 @@ fn resolve_ref_value_inner(
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(value.clone()),
         _ => Ok(value.clone()),
     }
-}
-
-// `peel_secrets` / `rewrap_secrets` live in `crate::resource` (next to
-// the `Secret` definition and `navigate_value_path`) so the
-// secret-tunnel discipline (#2439) has one home shared with
-// carina#3136's loop-var navigator.
-
-/// Format the "key not found; available keys: ..." error for a missing
-/// map entry. Shared by the `field_path` (dot-notation, #2447) and
-/// `subscripts` (#2435) walks so the message format cannot drift.
-fn missing_map_key_error(
-    path: &crate::resource::AccessPath,
-    map: &indexmap::IndexMap<String, Value>,
-) -> String {
-    let known_list = if map.is_empty() {
-        "<no keys>".to_string()
-    } else {
-        map.keys()
-            .map(|k| format!("{k:?}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    format!("{path}: key not found; available keys: {known_list}")
-}
-
-/// Redacted variant of [`missing_map_key_error`] for `Secret`-wrapped
-/// upstream maps (#2501). The signature deliberately takes only the
-/// entry count, not the map itself, so the formatter cannot accidentally
-/// include the keys: a `Secret(Map)`'s key names (`db_pwd`, `api_key`,
-/// …) leak the shape of the credential set even when the values are
-/// already redacted by the plan-display path.
-fn missing_map_key_error_redacted(path: &crate::resource::AccessPath, key_count: usize) -> String {
-    format!("{path}: key not found; available keys: <redacted, {key_count} entries>")
 }
 
 #[cfg(test)]
@@ -591,6 +551,16 @@ mod tests {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         })
+    }
+
+    #[test]
+    fn local_bare_binding_ref_stays_typed_during_general_resolution() {
+        let bindings = bindings_from(vec![("vpc", vec![])]);
+        let reference = Value::Deferred(DeferredValue::BindingRef {
+            binding: "vpc".to_string(),
+        });
+
+        assert_eq!(resolve_ref_value(&reference, &bindings), Ok(reference));
     }
 
     /// Test-only adapter that preserves the pre-#3248 four-arg
@@ -1020,13 +990,9 @@ mod tests {
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let result = resolve_ref_value(&ref_value, &bindings);
         let err = result.expect_err("missing key in concrete upstream Secret(Map) must error");
-        assert!(
-            err.contains("key not found"),
-            "expected missing-key error, got: {err}"
-        );
-        assert!(
-            err.contains("<redacted, 3 entries>"),
-            "Secret(Map) keys must be redacted, got: {err}"
+        assert_eq!(
+            err,
+            "h.creds[\"missing\"]: key not found; available keys: <redacted, 3 entries>"
         );
         for k in ["db_pwd", "api_key", "slack_token"] {
             assert!(
@@ -1078,9 +1044,9 @@ mod tests {
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let err = resolve_ref_value(&ref_value, &bindings)
             .expect_err("missing dot-form field in concrete upstream Secret(Map) must error");
-        assert!(
-            err.contains("<redacted, 2 entries>"),
-            "Secret(Map) field_path keys must be redacted, got: {err}"
+        assert_eq!(
+            err,
+            "h.creds.missing: key not found; available keys: <redacted, 2 entries>"
         );
         for k in ["db_pwd", "api_key"] {
             assert!(
@@ -1118,21 +1084,21 @@ mod tests {
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let err = resolve_ref_value(&ref_value, &bindings)
             .expect_err("missing key in empty upstream Secret(Map) must error");
-        assert!(
-            err.contains("<redacted, 0 entries>"),
-            "empty Secret(Map) must still use redacted form, got: {err}"
+        assert_eq!(
+            err,
+            "h.creds[\"missing\"]: key not found; available keys: <redacted, 0 entries>"
         );
     }
 
     #[test]
-    fn test_resolve_subscript_secret_wrapped_unresolved_inner_ref_keeps_outer() {
+    fn test_resolve_subscript_secret_wrapped_unresolved_inner_ref_stays_deferred() {
         // Defensive: after the initial `resolve_ref_value(attr_value)`
         // call, the `resolved` value can be a `Secret(ResourceRef)` if
         // the inner ref points to an as-yet-unresolved binding. The
         // peel/rewrap loops then expose the inner ResourceRef and the
-        // wildcard arm should keep the *outer* ref unchanged — never
-        // silently strip the Secret tag and surface the bare inner
-        // ref. Pin the contract.
+        // shared access primitive must preserve the Secret wrapper and
+        // retain the pending projection as Access — never strip the
+        // Secret tag or pretend the projection is concrete.
         let mut h_attrs: HashMap<String, Value> = HashMap::new();
         h_attrs.insert(
             "creds".to_string(),
@@ -1164,8 +1130,8 @@ mod tests {
 
     #[test]
     fn test_resolve_subscript_out_of_range_keeps_ref() {
-        // `orgs.accounts[5]` against a 2-element list — out of range,
-        // keep as-is so the planner can surface the unresolved ref.
+        // `orgs.accounts[5]` against a one-element local list keeps the
+        // reference: a local desired-side view may still be incomplete.
         let bindings = bindings_from(vec![(
             "orgs",
             vec![(
@@ -1181,7 +1147,7 @@ mod tests {
             Vec::new(),
             vec![crate::resource::Subscript::Int { index: 5 }],
         );
-        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path: path.clone() });
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, ref_value);
     }
@@ -1446,6 +1412,262 @@ mod tests {
     }
 
     #[test]
+    fn access_over_deferred_function_base_reduces_after_reference_resolution() {
+        use crate::resource::{PathSegment, Subscript};
+
+        let bindings = bindings_from(vec![(
+            "queue",
+            vec![(
+                "arn",
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:sqs:region:account:name".into(),
+                )),
+            )],
+        )]);
+        let value = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String(":".into())),
+                    Value::resource_ref("queue", "arn", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 5 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_ref_value(&value, &bindings).unwrap(),
+            Value::Concrete(ConcreteValue::String("name".into()))
+        );
+    }
+
+    #[test]
+    fn access_over_deferred_function_base_reports_out_of_range_after_resolution() {
+        use crate::binding_index::BindingValueSource;
+        use crate::resource::{PathSegment, Subscript};
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "arn".to_string(),
+            Value::Concrete(ConcreteValue::String("a:b:c".into())),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("queue", attrs, BindingValueSource::Upstream);
+        let value = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String(":".into())),
+                    Value::resource_ref("queue", "arn", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 5 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        let error = resolve_ref_value(&value, &bindings)
+            .expect_err("apply-time out-of-range access must be an error");
+        assert!(
+            error.contains("index 5 out of range for list of length 3"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn computed_access_over_local_reference_reports_out_of_range_immediately() {
+        use crate::binding_index::BindingValueSource;
+        use crate::resource::{PathSegment, Subscript};
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "identifier".to_string(),
+            Value::Concrete(ConcreteValue::String("a-b-c".into())),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("q", attrs, BindingValueSource::Local);
+        let value = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("-".into())),
+                    Value::resource_ref("q", "identifier", vec![]),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 5 },
+            },
+            7,
+            AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        let error = resolve_ref_value(&value, &bindings)
+            .expect_err("a computed list is final even when an input ref is local");
+        assert!(
+            error.contains("index 5 out of range for list of length 3"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains("wait"),
+            "range errors must not suggest wait: {error}"
+        );
+    }
+
+    #[test]
+    fn local_resource_path_and_postfix_access_both_defer_missing_map_key() {
+        use crate::resource::{AccessPath, PathSegment, Subscript};
+
+        let mut tags = IndexMap::new();
+        tags.insert(
+            "present".to_string(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        );
+        let tags_value = Value::Concrete(ConcreteValue::Map(tags));
+        let bindings = bindings_from(vec![("res", vec![("tags", tags_value.clone())])]);
+        let step = PathSegment::Subscript {
+            index: Subscript::Str {
+                key: "missing".into(),
+            },
+        };
+        let resource_path = Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments("res", "tags", vec![step.clone()]),
+        });
+        let postfix_access = crate::resource::apply_postfix_access(
+            Value::resource_ref("res".to_string(), "tags".to_string(), vec![]),
+            step,
+            0,
+            AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        assert_eq!(postfix_access, resource_path);
+
+        assert_eq!(
+            resolve_ref_value(&resource_path, &bindings),
+            Ok(resource_path.clone())
+        );
+        assert_eq!(
+            resolve_ref_value(&postfix_access, &bindings),
+            Ok(resource_path.clone())
+        );
+    }
+
+    #[test]
+    fn upstream_resource_path_and_postfix_access_both_error_on_missing_map_key() {
+        use crate::binding_index::BindingValueSource;
+        use crate::resource::{AccessPath, PathSegment, Subscript};
+
+        let mut tags = IndexMap::new();
+        tags.insert(
+            "present".to_string(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(tags)),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("res", attrs, BindingValueSource::Upstream);
+        let step = PathSegment::Subscript {
+            index: Subscript::Str {
+                key: "missing".into(),
+            },
+        };
+        let resource_path = Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments("res", "tags", vec![step.clone()]),
+        });
+        let postfix_access = crate::resource::apply_postfix_access(
+            Value::resource_ref("res".to_string(), "tags".to_string(), vec![]),
+            step,
+            0,
+            AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        assert_eq!(postfix_access, resource_path);
+
+        let expected =
+            Err("res.tags[\"missing\"]: key not found; available keys: \"present\"".to_string());
+        assert_eq!(resolve_ref_value(&resource_path, &bindings), expected);
+        assert_eq!(resolve_ref_value(&postfix_access, &bindings), expected);
+    }
+
+    #[test]
+    fn resource_path_and_postfix_access_both_index_string_lists() {
+        use crate::resource::{AccessPath, PathSegment, Subscript};
+
+        let bindings = bindings_from(vec![(
+            "res",
+            vec![(
+                "names",
+                Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()])),
+            )],
+        )]);
+        let step = PathSegment::Subscript {
+            index: Subscript::Int { index: 1 },
+        };
+        let resource_path = Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments("res", "names", vec![step.clone()]),
+        });
+        let postfix_access = crate::resource::apply_postfix_access(
+            Value::resource_ref("res".to_string(), "names".to_string(), vec![]),
+            step,
+            0,
+            AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        assert_eq!(postfix_access, resource_path);
+
+        let expected = Ok(Value::Concrete(ConcreteValue::String("b".into())));
+        assert_eq!(resolve_ref_value(&resource_path, &bindings), expected);
+        assert_eq!(resolve_ref_value(&postfix_access, &bindings), expected);
+    }
+
+    #[test]
+    fn local_reference_wrong_shape_is_never_deferred_as_a_missing_value() {
+        use crate::resource::{AccessPath, PathSegment, Subscript};
+
+        let bindings = bindings_from(vec![(
+            "q",
+            vec![(
+                "identifier",
+                Value::Concrete(ConcreteValue::String("q-123".into())),
+            )],
+        )]);
+        let value = Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments(
+                "q",
+                "identifier",
+                vec![PathSegment::Subscript {
+                    index: Subscript::Int { index: 0 },
+                }],
+            ),
+        });
+
+        let error = resolve_ref_value(&value, &bindings)
+            .expect_err("a String cannot become indexable after apply");
+        assert!(
+            error.contains("cannot apply access [0] to string"),
+            "unexpected apply-time error: {error}",
+        );
+        assert!(
+            !error.contains("wait"),
+            "wrong-shape access must never be reported as a deferred miss: {error}",
+        );
+    }
+
+    #[test]
     fn test_resolve_function_call_unresolved_ref_kept() {
         let bindings = ResolvedBindings::default();
 
@@ -1539,7 +1761,7 @@ mod tests {
             vec![("network", Value::Concrete(ConcreteValue::Map(network_map)))],
         )]);
 
-        // web.network.nonexistent should keep original ref
+        // A local desired-side view may not contain provider-populated fields yet.
         let ref_value = Value::resource_ref(
             "web".to_string(),
             "network".to_string(),
@@ -1796,8 +2018,8 @@ mod tests {
         )
         .expect_err("missing key in concrete upstream map must error");
         assert!(
-            err.contains("orgs.accounts") && err.contains("registry_qa"),
-            "error must name the upstream path and the missing key, got: {err}"
+            err.contains("registry_qa"),
+            "error must name the missing key, got: {err}"
         );
         // Should also list available keys so the user can fix the typo.
         assert!(

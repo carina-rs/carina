@@ -115,6 +115,12 @@ fn value_depends_on_module_output(
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => args.iter().any(|value| {
             value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
         }),
+        Value::Deferred(DeferredValue::Access(access)) => value_depends_on_module_output(
+            access.base(),
+            module_bindings,
+            variables,
+            visiting_variables,
+        ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             value_depends_on_module_output(inner, module_bindings, variables, visiting_variables)
         }
@@ -254,6 +260,7 @@ impl<'a> ContextFreeValue<'a> {
                 | Value::Deferred(DeferredValue::ResourceRef { .. })
                 | Value::Deferred(DeferredValue::BindingRef { .. })
                 | Value::Deferred(DeferredValue::FunctionCall { .. })
+                | Value::Deferred(DeferredValue::Access(_))
                 | Value::Deferred(DeferredValue::Unknown(_))
                 | Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
                 Value::Concrete(ConcreteValue::List(items)) => {
@@ -308,7 +315,9 @@ impl SemanticLookup for ModuleCall {
         let TypecheckValueSlot::ModuleArgument(argument) = slot else {
             return None;
         };
-        self.arguments.get(argument)
+        self.arguments
+            .get(argument)
+            .map(|argument| argument.value())
     }
 }
 
@@ -1252,10 +1261,13 @@ impl DiagnosticEngine {
         error: &carina_core::module_resolver::ModuleError,
         owner: Option<&str>,
     ) -> Option<Diagnostic> {
-        let (constraint_instance, message) = match error {
-            carina_core::module_resolver::ModuleError::Constraint(diagnostic) => {
-                (Some(diagnostic.instance.as_str()), error.to_string())
-            }
+        let (constraint_instance, direct_module, severity, message) = match error {
+            carina_core::module_resolver::ModuleError::Constraint(diagnostic) => (
+                Some(diagnostic.instance.as_str()),
+                None,
+                DiagnosticSeverity::ERROR,
+                error.to_string(),
+            ),
             carina_core::module_resolver::ModuleError::ReferenceType(joined) => {
                 // Output/resource/function declaration failures belong to the
                 // imported module document. Only a nested call boundary has a
@@ -1269,12 +1281,20 @@ impl DiagnosticEngine {
                 }
                 (
                     None,
+                    None,
+                    DiagnosticSeverity::WARNING,
                     format!(
                         "Reference type validation failed: {}",
                         nested_calls.join("\n")
                     ),
                 )
             }
+            carina_core::module_resolver::ModuleError::ArgumentValueAccess { module, .. } => (
+                None,
+                Some(module.as_str()),
+                DiagnosticSeverity::ERROR,
+                error.to_string(),
+            ),
             _ => return None,
         };
 
@@ -1289,7 +1309,9 @@ impl DiagnosticEngine {
                         || instance
                             .strip_prefix(&root_instance)
                             .is_some_and(|suffix| suffix.starts_with('.'))
-                }) || owner.is_some_and(|alias| call.module_name == alias);
+                }) || direct_module
+                    .is_some_and(|module| call.module_name == module)
+                    || owner.is_some_and(|alias| call.module_name == alias);
                 if !owns_failure {
                     return None;
                 }
@@ -1304,11 +1326,7 @@ impl DiagnosticEngine {
                     line,
                     col,
                     col + width,
-                    if constraint_instance.is_some() {
-                        DiagnosticSeverity::ERROR
-                    } else {
-                        DiagnosticSeverity::WARNING
-                    },
+                    severity,
                     message.clone(),
                 ))
             })
@@ -1799,6 +1817,7 @@ impl DiagnosticEngine {
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
+        inference_bindings: &carina_core::validation::inference::InferenceBindings,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -1848,6 +1867,10 @@ impl DiagnosticEngine {
                                 &arg.type_expr,
                                 semantic_value,
                                 &self.provider_context,
+                                carina_core::validation::typecheck::TypecheckInference::Available {
+                                    bindings: inference_bindings,
+                                    schemas: &self.schemas,
+                                },
                             )
                         && let Some((line, col)) =
                             self.find_module_call_arg_position(doc, call, call_occurrence, arg_name)
@@ -2286,6 +2309,7 @@ impl DiagnosticEngine {
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
+        inference_bindings: &carina_core::validation::inference::InferenceBindings,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let semantic_params = parsed
@@ -2347,6 +2371,10 @@ impl DiagnosticEngine {
                             type_expr,
                             semantic_value,
                             &self.provider_context,
+                            carina_core::validation::typecheck::TypecheckInference::Available {
+                                bindings: inference_bindings,
+                                schemas: &self.schemas,
+                            },
                         )
                     && let Some((line, col)) =
                         self.find_attributes_param_position(doc, &attr_param.name)
@@ -2888,6 +2916,14 @@ impl DiagnosticEngine {
                         self.collect_unknown_function_diagnostics(doc, expr, user_fns, diagnostics);
                     }
                 }
+            }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                self.collect_unknown_function_diagnostics(
+                    doc,
+                    access.base(),
+                    user_fns,
+                    diagnostics,
+                );
             }
             _ => {}
         }

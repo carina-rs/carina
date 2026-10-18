@@ -1,7 +1,9 @@
 use super::*;
 use crate::binding_index::{IterableBindings, PreApplyInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Resource, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, InterpolationPart, Resource, UnknownReason, Value,
+};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -848,9 +850,11 @@ fn parse_directory_module() {
     let sg = &result.resources[0];
     assert_eq!(
         sg.get_attr("vpc_id"),
-        Some(&Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc_id".to_string(),
-        }))
+        Some(&Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::ModuleArgument {
+                name: "vpc_id".to_string(),
+            },
+        )))
     );
 }
 
@@ -3279,7 +3283,7 @@ fn parse_let_binding_module_call() {
     assert_eq!(call.module_name, "web_tier");
     assert_eq!(call.binding_name, Some("web".to_string()));
     assert_eq!(
-        call.arguments.get("vpc"),
+        call.arguments.get("vpc").map(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
     );
 }
@@ -3966,7 +3970,10 @@ fn parse_for_expression_with_module_call() {
         .find(|c| c.binding_name.as_deref() == Some("webs.prod"))
         .unwrap();
     assert_eq!(
-        prod_call.arguments.get("vpc_cidr"),
+        prod_call
+            .arguments
+            .get("vpc_cidr")
+            .map(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
         )))
@@ -3978,7 +3985,10 @@ fn parse_for_expression_with_module_call() {
         .find(|c| c.binding_name.as_deref() == Some("webs.staging"))
         .unwrap();
     assert_eq!(
-        staging_call.arguments.get("vpc_cidr"),
+        staging_call
+            .arguments
+            .get("vpc_cidr")
+            .map(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
         )))
@@ -4011,13 +4021,19 @@ fn parse_for_expression_with_module_call_over_list() {
     );
 
     assert_eq!(
-        result.module_calls[0].arguments.get("vpc_cidr"),
+        result.module_calls[0]
+            .arguments
+            .get("vpc_cidr")
+            .map(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
         )))
     );
     assert_eq!(
-        result.module_calls[1].arguments.get("vpc_cidr"),
+        result.module_calls[1]
+            .arguments
+            .get("vpc_cidr")
+            .map(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
         )))
@@ -8694,7 +8710,9 @@ fn expand_deferred_for_with_remote_bindings() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     // Expand deferred for-expressions
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
 
     // Deferred should be resolved
     assert_eq!(
@@ -8756,7 +8774,9 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
 
     // Empty remote_bindings — upstream hasn't been applied yet
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
 
     // Should remain deferred
     assert_eq!(
@@ -8804,7 +8824,9 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
 
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
@@ -8864,7 +8886,9 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
 
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
     assert_eq!(
@@ -8940,7 +8964,9 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
 
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
@@ -8991,9 +9017,11 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     );
     remote_bindings.insert("anchor".to_string(), anchor_attrs);
 
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-        remote_bindings.clone(),
-    ));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            remote_bindings.clone(),
+        ))
+        .unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
@@ -9047,7 +9075,9 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     // label must have the placeholder substituted in the interpolation.
@@ -9139,7 +9169,9 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
 
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
@@ -9186,7 +9218,9 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+    parsed
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .unwrap();
 
     // Mismatch: should NOT expand silently with numeric indices
     assert_eq!(
@@ -9481,6 +9515,45 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     assert!(
         msg.contains("Did you mean `orgs`") || msg.contains("Did you mean 'orgs'"),
         "error should suggest the close match 'orgs' via #2038 plumbing, got: {msg}"
+    );
+}
+
+#[test]
+fn for_iterable_string_selected_from_value_is_not_reinterpreted_as_identifier() {
+    let error = parse(
+        r#"
+            let keys = ["src"]
+            let resources = for key in keys[0] {
+                mock.test.Thing { name = key }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a string value is not an iterable binding name");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("iterable is string") && message.contains("expected list"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn for_iterable_string_selected_from_function_result_is_a_type_error() {
+    let error = parse(
+        r#"
+            let resources = for part in split("-", "a-b")[0] {
+                mock.test.Thing { name = part }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a selected string result cannot be iterated");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("iterable is string") && message.contains("expected list"),
+        "unexpected error: {message}"
     );
 }
 
@@ -12531,6 +12604,792 @@ fn access_path_serde_round_trips_mixed_segments() {
     assert_eq!(original, reloaded);
 }
 
+// =====================================================================
+// carina#3885: postfix access applies to values, not only references.
+// =====================================================================
+
+#[test]
+fn postfix_index_on_deferred_function_call_parses_as_access() {
+    let parsed = parse(
+        r#"
+            let role = aws.iam.Role {
+                role_name = "demo"
+            }
+            let selected = split("/", role.arn)[1]
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a function result must accept postfix indexing");
+
+    match parsed.variables.get("selected") {
+        Some(Value::Deferred(DeferredValue::Access(access))) => {
+            assert_eq!(
+                access.step(),
+                &crate::resource::PathSegment::Subscript {
+                    index: crate::resource::Subscript::Int { index: 1 },
+                }
+            );
+            match access.base() {
+                Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+                    assert_eq!(name, "split");
+                    assert_eq!(args.len(), 2);
+                    assert!(matches!(
+                        &args[1],
+                        Value::Deferred(DeferredValue::ResourceRef { path })
+                            if path.binding() == "role" && path.attribute() == "arn"
+                    ));
+                }
+                other => panic!("expected split FunctionCall base, got {other:?}"),
+            }
+        }
+        other => panic!("expected postfix Access, got {other:?}"),
+    }
+}
+
+#[test]
+fn postfix_index_on_static_function_result_evaluates_during_parse_resolution() {
+    let parsed = parse_and_resolve(r#"let selected = split(":", "a:b:c")[1]"#)
+        .expect("static split result must be indexed eagerly");
+
+    assert_eq!(
+        parsed.variables.get("selected"),
+        Some(&Value::Concrete(ConcreteValue::String("b".into())))
+    );
+}
+
+#[test]
+fn postfix_index_on_known_list_reports_out_of_range_during_parse() {
+    let error = parse(
+        r#"let selected = ["a", "b"][5]"#,
+        &ProviderContext::default(),
+    )
+    .expect_err("known out-of-range list access must fail during parsing");
+
+    assert!(
+        error
+            .to_string()
+            .contains("index 5 out of range for list of length 2"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn postfix_index_parses_on_parenthesized_pipe_results() {
+    let parsed = parse(
+        r#"
+            let queue = aws.sqs.Queue {
+                queue_name = "demo"
+            }
+            let x = queue.arn
+            let from_pipe = (x |> split(":"))[1]
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("postfix access must parse after parenthesized pipes");
+    assert!(matches!(
+        parsed.variables.get("from_pipe"),
+        Some(Value::Deferred(DeferredValue::Access(access)))
+            if matches!(access.step(), crate::resource::PathSegment::Subscript {
+                index: crate::resource::Subscript::Int { index: 1 },
+            }) && matches!(access.base(), Value::Deferred(DeferredValue::FunctionCall { name, .. }) if name == "split")
+    ));
+}
+
+#[test]
+fn postfix_index_on_let_bound_deferred_value_does_not_become_binding_name() {
+    let parsed = parse(
+        r#"
+            let queue = aws.sqs.Queue {
+                queue_name = "demo"
+            }
+            let parts = split(":", queue.arn)
+            let selected = parts[5]
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("let-bound computed values must accept postfix indexing");
+
+    assert!(matches!(
+        parsed.variables.get("selected"),
+        Some(Value::Deferred(DeferredValue::Access(access)))
+            if matches!(access.step(), crate::resource::PathSegment::Subscript {
+                index: crate::resource::Subscript::Int { index: 5 },
+            }) && matches!(access.base(), Value::Deferred(DeferredValue::FunctionCall { name, .. }) if name == "split")
+    ));
+    assert!(
+        check_identifier_scope(&parsed).is_empty(),
+        "parts[5] must not be diagnosed as an unknown binding"
+    );
+}
+
+#[test]
+fn postfix_index_on_let_bound_known_list_evaluates_immediately() {
+    let parsed = parse(
+        r#"
+            let values = ["a", "b"]
+            let selected = values[1]
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("known let-bound lists must be indexed eagerly");
+
+    assert_eq!(
+        parsed.variables.get("selected"),
+        Some(&Value::Concrete(ConcreteValue::String("b".into())))
+    );
+}
+
+#[test]
+fn postfix_index_on_sibling_let_bound_computed_value_is_directory_scoped() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        r#"
+            let queue = aws.sqs.Queue {
+                queue_name = "demo"
+            }
+            let parts = split(":", queue.arn)
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("exports.crn"),
+        r#"
+            exports {
+                account_id: String = parts[5]
+            }
+        "#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("sibling let-bound computed value must be visible to postfix access");
+    let value = parsed
+        .export_params
+        .iter()
+        .find(|export| export.name == "account_id")
+        .and_then(|export| export.value.as_ref())
+        .expect("account_id export value");
+
+    assert!(matches!(
+        value,
+        Value::Deferred(DeferredValue::Access(access))
+            if matches!(access.step(), crate::resource::PathSegment::Subscript {
+                index: crate::resource::Subscript::Int { index: 5 },
+            }) && matches!(access.base(), Value::Deferred(DeferredValue::FunctionCall { name, .. }) if name == "split")
+    ));
+    assert!(
+        check_identifier_scope(&parsed).is_empty(),
+        "sibling parts[5] must not be diagnosed as an unknown binding"
+    );
+}
+
+#[test]
+fn postfix_grammar_keeps_for_expanded_resource_address_shape() {
+    let parsed = parse(
+        r#"
+            let subnets = for az in ["ap-northeast-1a"] {
+                awscc.ec2.Subnet {
+                    availability_zone = az
+                }
+            }
+            awscc.ec2.RouteTable {
+                subnet_id = subnets[0].id
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("for-expanded resource addresses must retain legacy parsing");
+    let value = parsed
+        .resources
+        .last()
+        .and_then(|resource| resource.get_attr("subnet_id"))
+        .expect("route table subnet_id");
+
+    assert!(matches!(
+        value,
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if path.binding() == "subnets[0]" && path.attribute() == "id"
+    ));
+}
+
+fn assert_resource_reference_shape(value: &Value, binding: &str, attribute: &str) {
+    assert!(
+        matches!(
+            value,
+            Value::Deferred(DeferredValue::ResourceRef { path })
+                if path.binding() == binding && path.attribute() == attribute
+        ),
+        "expected ResourceRef({binding}.{attribute}), got {value:?}"
+    );
+}
+
+fn resource_attribute(parsed: &ParsedFile, resource_type: &str, name: &str) -> Value {
+    parsed
+        .iter_all_resources()
+        .find(|resource| resource.id().resource_type == resource_type)
+        .unwrap_or_else(|| panic!("fixture must contain resource type {resource_type:?}"))
+        .attributes()
+        .get(name)
+        .unwrap_or_else(|| panic!("resource {resource_type:?} must contain attribute {name:?}"))
+        .clone()
+}
+
+#[test]
+fn postfix_access_preserves_deferred_for_binding_as_resource_address() {
+    let parsed = parse(
+        r#"
+            let orgs = upstream_state { source = "../organizations" }
+            let roles = for account in orgs.accounts {
+                mock.test.Thing { name = account.name }
+            }
+            mock.test.Consumer { name = roles[0].name }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a deferred structural for binding must remain a reference path");
+
+    let value = resource_attribute(&parsed, "test.Consumer", "name");
+    assert_resource_reference_shape(&value, "roles[0]", "name");
+}
+
+#[test]
+fn postfix_access_preserves_statically_empty_for_binding_as_resource_address() {
+    let parsed = parse(
+        r#"
+            let roles = for account in [] {
+                mock.test.Thing { name = "unused" }
+            }
+            mock.test.Consumer { name = roles[0].name }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("an empty structural for binding must remain a reference path");
+
+    let value = resource_attribute(&parsed, "test.Consumer", "name");
+    assert_resource_reference_shape(&value, "roles[0]", "name");
+}
+
+#[test]
+fn postfix_access_preserves_deferred_map_for_binding_as_resource_address() {
+    let parsed = parse(
+        r#"
+            let orgs = upstream_state { source = "../organizations" }
+            let roles = for key, account in orgs.accounts {
+                mock.test.Thing { name = account.name }
+            }
+            mock.test.Consumer {
+                direct  = roles["k"].name
+                grouped = (roles)["k"].name
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a deferred map-for binding must remain a reference path");
+
+    let direct = resource_attribute(&parsed, "test.Consumer", "direct");
+    let grouped = resource_attribute(&parsed, "test.Consumer", "grouped");
+    assert_eq!(grouped, direct);
+    assert_resource_reference_shape(&direct, "roles.k", "name");
+}
+
+#[test]
+fn postfix_access_preserves_module_call_binding_field_access() {
+    let parsed = parse(
+        r#"
+            let child_module = use { source = "./child" }
+            let child = child_module {}
+            mock.test.Consumer {
+                direct  = child.output
+                grouped = (child).output
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("module-call output access must remain a reference path");
+
+    let direct = resource_attribute(&parsed, "test.Consumer", "direct");
+    let grouped = resource_attribute(&parsed, "test.Consumer", "grouped");
+    assert_eq!(grouped, direct);
+    assert_resource_reference_shape(&direct, "child", "output");
+}
+
+#[test]
+fn postfix_access_preserves_indexed_resource_binding_address() {
+    let parsed = parse(
+        r#"
+            let res = mock.test.Thing { name = "source" }
+            mock.test.Consumer {
+                direct  = res[0].name
+                grouped = (res)[0].name
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("indexed resource addresses must remain reference paths");
+
+    let direct = resource_attribute(&parsed, "test.Consumer", "direct");
+    let grouped = resource_attribute(&parsed, "test.Consumer", "grouped");
+    assert_eq!(grouped, direct);
+    assert_resource_reference_shape(&direct, "res[0]", "name");
+}
+
+#[test]
+fn postfix_access_typed_structural_binding_preserves_bare_resource_handle() {
+    let parsed = parse(
+        r#"
+            let vpc = mock.test.Thing { name = "source" }
+            mock.test.Consumer { parent = vpc }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("bare structural resource handles must retain their provider-facing value");
+
+    assert_eq!(
+        resource_attribute(&parsed, "test.Consumer", "parent"),
+        Value::Concrete(ConcreteValue::String("${vpc}".into()))
+    );
+}
+
+#[test]
+fn structural_handles_lower_once_to_legacy_runtime_values() {
+    let parsed = parse(
+        r#"
+            let vpc = mock.test.Thing { name = "source" }
+            let alias = vpc
+            let roles = for name in ["one"] {
+                mock.test.Thing { name = name }
+            }
+            let child_module = use { source = "./child" }
+            let child = child_module {}
+            let conditional_child = if true { child_module {} }
+
+            mock.test.Consumer {
+                direct = vpc
+                alias = alias
+                handles = [vpc, alias]
+                handles_by_name = { direct = vpc, alias = alias }
+                for_handle = roles
+                module_handle = child
+                conditional_module_handle = conditional_child
+            }
+
+            exports {
+                handle: String = vpc
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("structural handles must lower to their legacy transport values");
+
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer");
+    assert_eq!(consumer.get_attr("direct"), Some(&string("${vpc}")));
+    assert_eq!(consumer.get_attr("alias"), Some(&string("${vpc}")));
+    assert_eq!(
+        consumer.get_attr("handles"),
+        Some(&Value::Concrete(ConcreteValue::List(vec![
+            string("${vpc}"),
+            string("${vpc}"),
+        ])))
+    );
+    assert_eq!(
+        consumer.get_attr("handles_by_name"),
+        Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("direct".to_string(), string("${vpc}")),
+            ("alias".to_string(), string("${vpc}")),
+        ]))))
+    );
+    assert_eq!(
+        consumer.get_attr("for_handle"),
+        Some(&string("${for:roles}"))
+    );
+    assert_eq!(
+        consumer.get_attr("module_handle"),
+        Some(&string("${module:child_module}"))
+    );
+    assert_eq!(
+        consumer.get_attr("conditional_module_handle"),
+        Some(&string("${module:child_module}"))
+    );
+    assert_eq!(parsed.variables.get("vpc"), Some(&string("${vpc}")));
+    assert_eq!(parsed.variables.get("alias"), Some(&string("${vpc}")));
+    assert_eq!(parsed.variables.get("roles"), Some(&string("${for:roles}")));
+    assert_eq!(
+        parsed.variables.get("child_module"),
+        Some(&string("${use:./child}"))
+    );
+    assert_eq!(
+        parsed.variables.get("child"),
+        Some(&string("${module:child_module}"))
+    );
+    assert_eq!(
+        parsed.variables.get("conditional_child"),
+        Some(&string("${module:child_module}"))
+    );
+    assert_eq!(
+        parsed
+            .export_params
+            .iter()
+            .find(|export| export.name == "handle")
+            .and_then(|export| export.value.as_ref()),
+        Some(&string("${vpc}"))
+    );
+}
+
+#[test]
+fn side_channel_structural_handles_keep_main_bare_identifier_values() {
+    let parsed = parse(
+        r#"
+            let q = mock.test.Thing { name = "source" }
+            let orgs = upstream_state { source = "../organizations" }
+            let ready = wait q { until = q.ready == true }
+            let secondary = provider mock {}
+
+            mock.test.Consumer {
+                upstream_handle = orgs
+                wait_handle = ready
+                provider_handle = secondary
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("side-channel structural names remain available as operands");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer");
+    let bare_identifier =
+        |name: &str| Value::Concrete(ConcreteValue::enum_identifier(name.to_string()));
+    assert_eq!(
+        consumer.get_attr("upstream_handle"),
+        Some(&bare_identifier("orgs"))
+    );
+    assert_eq!(
+        consumer.get_attr("wait_handle"),
+        Some(&bare_identifier("ready"))
+    );
+    assert_eq!(
+        consumer.get_attr("provider_handle"),
+        Some(&bare_identifier("secondary"))
+    );
+    assert!(!parsed.variables.contains_key("orgs"));
+    assert!(!parsed.variables.contains_key("ready"));
+    assert!(!parsed.variables.contains_key("secondary"));
+}
+
+#[test]
+fn accessing_a_handle_nested_in_a_computed_list_is_not_a_string_shape_error() {
+    let error = parse(
+        r#"
+            let q = mock.test.Thing { name = "q" }
+            let r = mock.test.Thing { name = "r" }
+            let consumer = mock.test.Consumer { name = [q, r][1].identifier }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("computed containers cannot expose structural handles for postfix access");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("resource handle inside a computed value"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("to string"),
+        "a parser-internal transport spelling leaked into the diagnostic: {message}"
+    );
+}
+
+#[test]
+fn postfix_access_reference_roots_are_canonical_reference_paths() {
+    let parsed = parse(
+        r#"
+            let q = mock.test.Thing { name = "queue" }
+            let roles = for n in [0] {
+                mock.test.Thing { name = "role" }
+            }
+            let r0 = roles[0]
+            let orgs = upstream_state { source = "../organizations" }
+            let w = wait q { until = q.ready == true }
+
+            mock.test.Consumer {
+                role_direct      = roles[0].identifier
+                role_alias       = r0.identifier
+                role_grouped     = (roles[0]).identifier
+                roles_grouped    = (roles)[0].identifier
+                resource_direct  = q.identifier
+                resource_grouped = (q).identifier
+                upstream_direct  = orgs.ident
+                upstream_grouped = (orgs).ident
+                wait_direct      = w.ready
+                wait_grouped     = (w).ready
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("parenthesized and aliased reference roots must parse canonically");
+
+    assert_eq!(
+        parsed.variables.get("r0"),
+        Some(&Value::Deferred(DeferredValue::BindingRef {
+            binding: "roles[0]".to_string(),
+        })),
+        "an indexed address is a typed reference, not a lowered handle string",
+    );
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer");
+    let attr = |name: &str| consumer.get_attr(name).expect(name);
+
+    assert_eq!(attr("role_alias"), attr("role_direct"));
+    assert_eq!(attr("role_grouped"), attr("role_direct"));
+    assert_eq!(attr("roles_grouped"), attr("role_direct"));
+    assert_eq!(attr("resource_grouped"), attr("resource_direct"));
+    assert_eq!(attr("upstream_grouped"), attr("upstream_direct"));
+    assert_eq!(attr("wait_grouped"), attr("wait_direct"));
+
+    for name in [
+        "role_alias",
+        "role_grouped",
+        "roles_grouped",
+        "resource_grouped",
+        "upstream_grouped",
+        "wait_grouped",
+    ] {
+        assert!(
+            matches!(
+                attr(name),
+                Value::Deferred(DeferredValue::ResourceRef { .. })
+            ),
+            "{name} must be a canonical ResourceRef, got {:?}",
+            attr(name)
+        );
+    }
+}
+
+#[test]
+fn postfix_access_preserves_sibling_deferred_for_binding_as_resource_address() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        r#"
+            let orgs = upstream_state { source = "../organizations" }
+            let roles = for account in orgs.accounts {
+                mock.test.Thing { name = account.name }
+            }
+            let r0 = roles[0]
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("exports.crn"),
+        r#"
+            exports {
+                role_name: String = roles[0].name
+                role_grouped: String = (roles[0]).name
+                role_alias: String = r0.name
+            }
+        "#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("sibling structural bindings must be typed as references");
+    let value = |name: &str| {
+        parsed
+            .export_params
+            .iter()
+            .find(|export| export.name == name)
+            .and_then(|export| export.value.as_ref())
+            .unwrap()
+    };
+    assert_eq!(value("role_grouped"), value("role_name"));
+    assert_eq!(value("role_alias"), value("role_name"));
+    assert_resource_reference_shape(value("role_name"), "roles[0]", "name");
+}
+
+#[test]
+fn postfix_access_error_after_resolution_reports_authored_line() {
+    let error = parse_and_resolve(
+        "let source = mock.test.Thing { name = \"a\" }\n\
+         let parts = split(\":\", source.name)\n\
+         let selected = parts[1]",
+    )
+    .expect_err("resolved out-of-range access must report its source line");
+
+    assert!(
+        error.to_string().contains("at line 3"),
+        "expected authored line 3, got {error}"
+    );
+}
+
+#[test]
+fn postfix_access_on_partial_application_is_a_parse_error() {
+    let error = parse(
+        r#"
+            let values = { k = { x = "value" } }
+            let selected = lookup(values, "k")["x"]
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a partial application is not indexable data");
+
+    assert!(
+        error.to_string().contains("partial application"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn structural_binding_alias_field_access_keeps_not_a_resource_diagnostic() {
+    let error = parse(
+        r#"
+            let x = mock.test.Thing { name = "source" }
+            let y = x
+            let consumer = mock.test.Consumer { name = y.identifier }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a bare resource-handle alias is not itself a resource binding");
+
+    assert!(
+        error
+            .to_string()
+            .contains("'y' is not a resource, cannot access attribute 'identifier'"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn sibling_structural_alias_keeps_not_a_resource_diagnostic() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("resource.crn"),
+        "let q = mock.test.Thing { name = \"source\" }\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("alias.crn"), "let qa = q\n").unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "let consumer = mock.test.Consumer { name = qa.name }\n",
+    )
+    .unwrap();
+
+    let error = parse_directory(directory.path(), &ProviderContext::default())
+        .expect_err("a sibling bare resource-handle alias is not a resource binding");
+    assert!(
+        error
+            .to_string()
+            .contains("'qa' is not a resource, cannot access attribute 'name'"),
+        "unexpected error: {error}",
+    );
+    assert!(
+        !error.to_string().contains("to enum"),
+        "the directory seed lost structural-alias metadata: {error}",
+    );
+}
+
+#[test]
+fn for_iterable_computed_structural_handles_have_a_domain_error() {
+    let error = parse(
+        r#"
+            let q = mock.test.Thing { name = "q" }
+            let ss = for name in ["s"] {
+                mock.test.Thing { name = name }
+            }
+            let copies = for o in [q, ss[0]] {
+                mock.test.Consumer { name = o.identifier }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("computed collections of resource handles are not iterable values");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("resource handle inside a computed value"),
+        "unexpected error: {message}",
+    );
+    assert!(
+        !message.contains("to string"),
+        "the lowered handle transport leaked into the diagnostic: {message}",
+    );
+}
+
+#[test]
+fn sibling_for_iterable_computed_handles_keep_typed_diagnostic() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("values.crn"),
+        r#"
+            let q = mock.test.Thing { name = "q" }
+            let handles = [q]
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        r#"
+            let copies = for handle in handles {
+                mock.test.Consumer { name = handle.identifier }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let error = parse_directory(directory.path(), &ProviderContext::default())
+        .expect_err("directory seeds must retain computed handle metadata");
+    let message = error.to_string();
+    assert!(
+        message.contains("resource handle inside a computed value"),
+        "unexpected error: {message}",
+    );
+    assert!(
+        !message.contains("to string"),
+        "the directory fixed point discarded typed handle metadata: {message}",
+    );
+}
+
+#[test]
+fn invalid_secret_subscript_diagnostic_never_exposes_plaintext() {
+    let error = parse(
+        r#"
+            let parts = ["a", "b"]
+            let selected = parts[secret("hunter2")]
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a secret value is not a valid list subscript");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("index access key must be an integer or string"),
+        "unexpected error: {message}",
+    );
+    assert!(
+        !message.contains("hunter2"),
+        "secret subscript plaintext leaked: {message}",
+    );
+}
+
 // carina#3136: field access on a struct/map-valued for-loop variable.
 // The full behavior matrix that was ERR / unresolved before the fix
 // must now resolve; the scalar guard and the bare-var path must not
@@ -12606,11 +13465,11 @@ mod loop_var_field_access_matrix {
     }
 
     #[test]
-    fn deferred_template_emits_for_value_path_then_substitutes() {
+    fn deferred_template_emits_postfix_access_then_substitutes() {
         // The deferred path: iterable is an unresolved upstream ref, so
         // the loop is deferred and the body's `o.k` is parsed to
-        // `Unknown(ForValuePath)`. Then expand with a concrete iterable
-        // and assert substitute_placeholder re-navigates it.
+        // `Access(Unknown(ForValue), .k)`. Then expand with a concrete
+        // iterable and assert substitute_placeholder applies the step.
         let src = r#"
             let up = upstream_state { source = "../x" }
             for (_, o) in up.items {
@@ -12619,18 +13478,25 @@ mod loop_var_field_access_matrix {
         "#;
         let mut p = parse(src, &ProviderContext::default()).expect("parse");
         assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
-        // The template body must carry the path-aware placeholder, not
-        // a resource ResourceRef (which would never resolve for a loop
-        // var) and not a bare ForValue (which would lose the `.k`).
+        // The template body must carry the deferred postfix operation, not a
+        // resource ResourceRef (which would never resolve for a loop var) and
+        // not a bare ForValue (which would lose the `.k`).
         let tmpl = &p.deferred_for_expressions[0].template_resource;
         assert!(
             matches!(
                 tmpl.get_attr("name"),
-                Some(Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValuePath { .. }
-                )))
+                Some(Value::Deferred(DeferredValue::Access(access)))
+                    if matches!(
+                        access.base(),
+                        Value::Deferred(DeferredValue::Unknown(
+                            crate::resource::UnknownReason::ForValue
+                        ))
+                    ) && matches!(
+                        access.step(),
+                        crate::resource::PathSegment::Field { name } if name == "k"
+                    )
             ),
-            "deferred template must carry ForValuePath; got {:?}",
+            "deferred template must carry postfix Access; got {:?}",
             tmpl.get_attr("name")
         );
 
@@ -12648,13 +13514,121 @@ mod loop_var_field_access_matrix {
         );
         let mut remote = HashMap::new();
         remote.insert("up".to_string(), up_attrs);
-        p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote));
+        p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
+            .unwrap();
 
         assert_eq!(p.deferred_for_expressions.len(), 0, "loop expanded");
         assert_eq!(
             p.resources.first().expect("one resource").get_attr("name"),
             Some(&Value::Concrete(ConcreteValue::String("resolved".into()))),
-            "ForValuePath must re-navigate the resolved element"
+            "postfix Access must select from the resolved element"
         );
     }
+
+    #[test]
+    fn deferred_template_reports_missing_key_when_placeholder_becomes_concrete() {
+        let src = r#"
+            let up = upstream_state { source = "../x" }
+            let children = for item in up.items {
+                mock.test.Thing { name = item["missing"] }
+            }
+        "#;
+        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "present".to_string(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )])));
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![item])),
+        );
+        let mut remote = HashMap::new();
+        remote.insert("up".to_string(), attrs);
+
+        let error = parsed
+            .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
+            .expect_err("known missing keys must fail during deferred-for expansion");
+        assert!(
+            error.to_string().contains("key \"missing\" not found"),
+            "unexpected expansion error: {error}"
+        );
+    }
+
+    #[test]
+    fn deferred_template_keeps_missing_local_iterable_element_access_deferred() {
+        let src = r#"
+            let q = mock.test.Source { name = "source" }
+            let children = for r in q.rules {
+                mock.test.Thing { name = r.missing }
+            }
+        "#;
+        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "present".to_string(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )])));
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![item.clone()])),
+        );
+        let mut resolved = ResolvedBindings::default();
+        resolved.set("q", attrs, crate::binding_index::BindingValueSource::Local);
+
+        parsed
+            .expand_deferred_for_expressions(&resolved.project_iterable_bindings())
+            .expect("a miss in a local desired-side view remains deferred");
+
+        let name = parsed
+            .resources
+            .iter()
+            .find(|resource| resource.binding.as_deref() == Some("children[0]"))
+            .and_then(|resource| resource.get_attr("name"))
+            .expect("expanded child name");
+        assert!(matches!(
+            name,
+            Value::Deferred(DeferredValue::Access(access)) if matches!(
+                access.base(),
+                Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::ForValue
+                ))
+            ) && matches!(
+                access.step(),
+                crate::resource::PathSegment::Field { name } if name == "missing"
+            )
+        ));
+        assert_eq!(
+            crate::value::format_value(name),
+            "(known after upstream apply: r.missing)",
+            "a deferred local miss must retain the original loop-variable path in the plan",
+        );
+    }
+}
+
+#[test]
+fn for_iterable_structural_binding_has_a_user_facing_description() {
+    let error = parse(
+        r#"
+            let source = mock.test.resource { name = "source" }
+            let subs = for item in source.rules {
+                mock.test.Thing { name = item.action }
+            }
+            let copies = for sub in subs {
+                mock.test.Thing { name = sub }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a for-result handle is not itself an iterable value");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("iterable is for-binding 'subs'"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("BindingRef") && !message.contains("Deferred("),
+        "Rust Debug output leaked into the diagnostic: {message}"
+    );
 }

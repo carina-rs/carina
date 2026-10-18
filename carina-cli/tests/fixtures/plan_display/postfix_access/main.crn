@@ -1,0 +1,12 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let role = awscc.issue3885.Role {
+  role_name = 'demo-role'
+}
+
+awscc.ec2.SecurityGroup {
+  group_name = split('/', role.arn)[1]
+  vpc_id     = 'vpc-123'
+}

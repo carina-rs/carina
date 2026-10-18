@@ -590,14 +590,69 @@ mod tests {
     use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
-        ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, State,
-        Value,
+        ConcreteValue, DeferredValue, Directives, PathSegment, ResolvedResource, Resource,
+        ResourceId, ResourceIdentity, State, Subscript, UnknownReason, Value,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    #[test]
+    fn deferred_for_display_hides_direct_placeholder_access_but_keeps_expressions() {
+        let placeholder = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+        let direct_access = crate::resource::apply_postfix_access(
+            crate::resource::apply_postfix_access(
+                placeholder.clone(),
+                PathSegment::Field {
+                    name: "resource_record".to_string(),
+                },
+                0,
+                crate::resource::AccessMissPolicy::Error,
+            )
+            .unwrap(),
+            PathSegment::Field {
+                name: "name".to_string(),
+            },
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+        assert_eq!(
+            format_deferred_for_template_value(&direct_access, "name", "cert", "applies"),
+            "(known after cert applies)"
+        );
+        assert_eq!(
+            format_deferred_for_template_value(
+                &Value::Concrete(ConcreteValue::List(vec![direct_access])),
+                "resource_records",
+                "cert",
+                "applies",
+            ),
+            "(known after cert applies)"
+        );
+
+        let expression = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())),
+                    placeholder,
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 1 },
+            },
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+        assert_eq!(
+            format_deferred_for_template_value(&expression, "name", "cert", "applies"),
+            "split(\"/\", (known after cert applies))[1]"
+        );
     }
 
     #[test]

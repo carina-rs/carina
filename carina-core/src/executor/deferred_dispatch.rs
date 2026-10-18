@@ -2,10 +2,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
-use crate::binding_index::ResolvedBindings;
+use crate::binding_index::{BindingValueSource, ResolvedBindings};
 use crate::effect::Effect;
-use crate::parser::{DeferredForExpression, ShapeMismatch, expand_deferred_children};
-use crate::resource::ResolvedResource;
+use crate::parser::{
+    DeferredForExpansionError, DeferredForExpression, ShapeMismatch, expand_deferred_children,
+};
+use crate::resource::{AccessMissPolicy, ResolvedResource};
 
 /// Failure while expanding a deferred-for create half against apply-time
 /// upstream state.
@@ -13,7 +15,9 @@ use crate::resource::ResolvedResource;
 pub(super) enum DeferredCreateFailure {
     /// The upstream binding that should have published iterable attributes is
     /// absent from the runtime binding table.
-    UpstreamBindingMissing { upstream_binding: String },
+    UpstreamBindingMissing {
+        upstream_binding: String,
+    },
     /// The upstream binding exists but does not contain the iterable
     /// attribute named by the deferred-for template.
     IterableAttrMissing {
@@ -26,6 +30,9 @@ pub(super) enum DeferredCreateFailure {
         upstream_binding: String,
         attr: String,
         mismatch: ShapeMismatch,
+    },
+    ValueAccess {
+        error: DeferredForExpansionError,
     },
 }
 
@@ -56,6 +63,7 @@ impl DeferredCreateFailure {
                     mismatch.got_kind()
                 )
             }
+            DeferredCreateFailure::ValueAccess { error } => error.to_string(),
         }
     }
 }
@@ -78,12 +86,27 @@ pub(super) fn materialize_deferred_create(
             attr: template.iterable_attr.clone(),
         }
     })?;
-
-    Ok(expand_deferred_children(template, iterable)
-        .map_err(|mismatch| DeferredCreateFailure::ShapeMismatch {
+    let miss_policy = match bindings.source(upstream_binding).ok_or_else(|| {
+        DeferredCreateFailure::UpstreamBindingMissing {
             upstream_binding: upstream_binding.to_string(),
-            attr: template.iterable_attr.clone(),
-            mismatch,
+        }
+    })? {
+        BindingValueSource::Local | BindingValueSource::WaitAlias { .. } => AccessMissPolicy::Defer,
+        BindingValueSource::Upstream => AccessMissPolicy::Error,
+    };
+
+    Ok(expand_deferred_children(template, iterable, miss_policy)
+        .map_err(|error| match error {
+            DeferredForExpansionError::ShapeMismatch(mismatch) => {
+                DeferredCreateFailure::ShapeMismatch {
+                    upstream_binding: upstream_binding.to_string(),
+                    attr: template.iterable_attr.clone(),
+                    mismatch,
+                }
+            }
+            error @ DeferredForExpansionError::ValueAccess { .. } => {
+                DeferredCreateFailure::ValueAccess { error }
+            }
         })?
         .into_iter()
         .map(|resource| {

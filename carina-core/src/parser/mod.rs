@@ -17,13 +17,13 @@ mod types;
 mod util;
 
 pub use ast::{
-    ArgumentParameter, AttributeParameter, BackendConfig, BindingName, DeferredForExpression,
-    ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleCall,
-    ModuleCallDiagnosticSource, ModuleCallSourceSpan, MovedAddresses, ParsedExportParam,
-    ParsedFile, ProviderConfig, RequireBlock, ResourceContext, ResourceRef, ResourceTypePath,
-    ShapeMismatch, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState,
-    UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
-    expand_deferred_children,
+    ArgumentParameter, AttributeParameter, BackendConfig, BindingName, DeferredForExpansionError,
+    DeferredForExpression, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
+    InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallSourceSpan,
+    MovedAddresses, ParsedExportParam, ParsedFile, ParserBindingMetadata, ProviderConfig,
+    RequireBlock, ResourceContext, ResourceRef, ResourceTypePath, ShapeMismatch, StateBlock,
+    StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
+    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub use entry::{
@@ -33,6 +33,7 @@ pub use entry::{
 };
 pub(crate) use entry::{
     BindingSeed, parse_with_seeded_bindings, parse_with_seeded_bindings_without_literal_warnings,
+    top_level_let_binding_names,
 };
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{
@@ -70,7 +71,10 @@ pub(crate) use blocks::resource::{
 pub(crate) use context::{ParseContext, extract_key_string, first_inner, next_pair};
 pub use expressions::for_expr::ForBinding;
 pub use expressions::validate_expr::CompareOp;
-pub(crate) use let_binding::LetBindingRhs;
+pub(crate) use let_binding::{
+    LetBindingKind, LetBindingRhs, if_structural_handle, module_structural_handle,
+    structural_handle,
+};
 pub(crate) use static_eval::{evaluate_static_value, is_static_eval, is_static_value};
 
 use pest_derive::Parser;

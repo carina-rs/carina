@@ -2,6 +2,50 @@ use super::*;
 use crate::explicit::ExplicitFields;
 
 #[test]
+fn deferred_access_serde_round_trips() {
+    let original = apply_postfix_access(
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: "lookup".to_string(),
+            args: vec![Value::resource_ref("source", "values", vec![])],
+        }),
+        PathSegment::Subscript {
+            index: Subscript::Str { key: "name".into() },
+        },
+        0,
+        AccessMissPolicy::Error,
+    )
+    .unwrap();
+
+    let json = serde_json::to_string(&original).expect("serialize deferred access");
+    let decoded: Value = serde_json::from_str(&json).expect("deserialize deferred access");
+
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn canonicalizing_an_access_rebuilds_after_interpolation_collapses() {
+    let value = apply_postfix_access(
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("selected".into()),
+        ])),
+        PathSegment::Field {
+            name: "identifier".to_string(),
+        },
+        0,
+        AccessMissPolicy::Error,
+    )
+    .expect("the interpolation is deferred until canonicalization");
+    let original = value.clone();
+
+    assert_eq!(
+        value.canonicalize(),
+        original,
+        "a base that canonicalizes to an invalid concrete shape must retain the sealed original, \
+         not leave Access wrapped around the concrete string",
+    );
+}
+
+#[test]
 fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_hashes() {
     let plaintext = br#""legacy-constant-time""#;
     let salt = b"carina:mock.test.resource:legacy:comment";
@@ -2733,6 +2777,23 @@ fn unknown_round_trips_through_saved_plan_serde() {
 }
 
 #[test]
+fn deserializing_reference_rooted_access_canonicalizes_the_reference() {
+    let encoded = serde_json::json!({
+        "Access": {
+            "base": { "BindingRef": { "binding": "roles[0]" } },
+            "step": { "kind": "field", "name": "identifier" }
+        }
+    });
+
+    let decoded: Value = serde_json::from_value(encoded).expect("valid deferred access encoding");
+    assert_eq!(
+        decoded,
+        Value::resource_ref("roles[0]", "identifier", vec![]),
+        "deserialization must enter through the same canonical constructor"
+    );
+}
+
+#[test]
 fn upstream_unknown_wire_tags_remain_stable() {
     let path = AccessPath::new("network", "vpc_id");
     let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
@@ -3044,6 +3105,17 @@ mod navigate_value_path_tests {
             vec![],
             vec![Subscript::Int { index: 5 }],
         );
+        assert_eq!(navigate_value_path(&root, &path), None);
+    }
+
+    #[test]
+    fn deferred_hop_is_not_reported_as_a_concrete_navigation_result() {
+        let root = map(&[(
+            "nested",
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        )]);
+        let path = AccessPath::with_fields("o", "nested", vec!["name".into()]);
+
         assert_eq!(navigate_value_path(&root, &path), None);
     }
 

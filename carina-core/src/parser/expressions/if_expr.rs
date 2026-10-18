@@ -12,9 +12,10 @@
 use crate::ValueDescription;
 use crate::eval_value::EvalValue;
 use crate::parser::{
-    LetBindingRhs, ModuleCall, ParseContext, ParseError, Rule, evaluate_static_value, first_inner,
-    is_static_value, next_pair, parse_expression, parse_module_call, parse_read_resource_expr,
-    parse_resource_expr,
+    LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, Rule,
+    evaluate_static_value, first_inner, if_structural_handle, is_static_value,
+    module_structural_handle, next_pair, parse_expression, parse_module_call,
+    parse_read_resource_expr, parse_resource_expr, structural_handle,
 };
 use crate::resource::{ConcreteValue, DataSource, Resource, Value};
 
@@ -85,15 +86,13 @@ pub(crate) fn parse_if_expr(
         parse_if_body_to_rhs(else_body, ctx, binding_name)
     } else {
         // No else clause and condition is false: produce nothing
-        let ref_value = Value::Concrete(ConcreteValue::String(
-            format!("${{if:{}}}", binding_name).into(),
-        ));
         Ok((
-            EvalValue::from_value(ref_value),
+            if_structural_handle(binding_name),
             vec![],
             vec![],
             vec![],
             None,
+            LetBindingKind::Structural,
         ))
     }
 }
@@ -106,37 +105,41 @@ pub(crate) fn parse_if_body_to_rhs(
 ) -> Result<LetBindingRhs, ParseError> {
     let result = parse_if_body(pair, ctx, binding_name)?;
     match result {
-        IfBodyResult::Resource(r) => {
-            let ref_value = Value::Concrete(ConcreteValue::String(
-                format!("${{{}}}", binding_name).into(),
-            ));
-            Ok((
-                EvalValue::from_value(ref_value),
-                vec![*r],
-                vec![],
-                vec![],
-                None,
-            ))
-        }
-        IfBodyResult::DataSource(d) => {
-            let ref_value = Value::Concrete(ConcreteValue::String(
-                format!("${{{}}}", binding_name).into(),
-            ));
-            Ok((
-                EvalValue::from_value(ref_value),
-                vec![],
-                vec![*d],
-                vec![],
-                None,
-            ))
-        }
+        IfBodyResult::Resource(r) => Ok((
+            structural_handle(binding_name),
+            vec![*r],
+            vec![],
+            vec![],
+            None,
+            LetBindingKind::Structural,
+        )),
+        IfBodyResult::DataSource(d) => Ok((
+            structural_handle(binding_name),
+            vec![],
+            vec![*d],
+            vec![],
+            None,
+            LetBindingKind::Structural,
+        )),
         IfBodyResult::ModuleCall(c) => {
-            let value = Value::Concrete(ConcreteValue::String(
-                format!("${{module:{}}}", c.module_name).into(),
-            ));
-            Ok((EvalValue::from_value(value), vec![], vec![], vec![c], None))
+            let handle = module_structural_handle(binding_name, &c.module_name);
+            Ok((
+                handle,
+                vec![],
+                vec![],
+                vec![c],
+                None,
+                LetBindingKind::Structural,
+            ))
         }
-        IfBodyResult::Value(v) => Ok((EvalValue::from_value(v), vec![], vec![], vec![], None)),
+        IfBodyResult::Value(v) => Ok((
+            EvalValue::from_value(v),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            LetBindingKind::Value,
+        )),
     }
 }
 

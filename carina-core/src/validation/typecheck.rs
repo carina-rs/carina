@@ -6,6 +6,18 @@ use crate::ValueDescription;
 use crate::parser::{ProviderContext, TypeExpr, validate_custom_type};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 
+/// Static authority available while checking deferred computed values.
+/// Callers without a binding/schema view must say so explicitly rather than
+/// passing empty registries that look authoritative.
+#[derive(Clone, Copy)]
+pub enum TypecheckInference<'a> {
+    Available {
+        bindings: &'a super::inference::InferenceBindings,
+        schemas: &'a crate::schema::SchemaRegistry,
+    },
+    Unavailable,
+}
+
 /// One step from the checked value's root to the mismatched leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeExprValuePathSegment {
@@ -34,6 +46,9 @@ pub enum TypeExprValueError {
         actual: Box<ValueDescription>,
         field: String,
     },
+    InvalidAccess {
+        message: String,
+    },
 }
 
 impl TypeExprValueError {
@@ -42,6 +57,7 @@ impl TypeExprValueError {
             Self::Mismatch { path, .. }
             | Self::MissingStructField { path, .. }
             | Self::UnknownStructField { path, .. } => path.insert(0, segment),
+            Self::InvalidAccess { .. } => {}
         }
         self
     }
@@ -93,6 +109,7 @@ impl fmt::Display for TypeExprValueError {
                 write_path(f, path)?;
                 write!(f, "expected struct, unknown field '{field}'.")
             }
+            Self::InvalidAccess { message } => f.write_str(message),
         }
     }
 }
@@ -105,6 +122,7 @@ pub fn check_type_expr_value(
     expected: &TypeExpr,
     value: &Value,
     config: &ProviderContext,
+    inference: TypecheckInference<'_>,
 ) -> Result<(), TypeExprValueError> {
     if matches!(expected, TypeExpr::Unknown) {
         return Ok(());
@@ -119,6 +137,27 @@ pub fn check_type_expr_value(
         Value::Deferred(DeferredValue::FunctionCall { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => return Ok(()),
+        Value::Deferred(DeferredValue::Access(_)) => {
+            let inferred = match inference {
+                TypecheckInference::Available { bindings, schemas } => {
+                    super::inference::infer_type_from_value(value, bindings, schemas)
+                }
+                TypecheckInference::Unavailable => {
+                    super::inference::infer_type_from_value_without_bindings(value)
+                }
+            };
+            return match inferred {
+                Ok(actual) if inferred_type_fits(expected, &actual) => Ok(()),
+                Ok(_) => Err(mismatch(expected, value)),
+                Err(error @ super::inference::InferenceError::InvalidAccess { .. })
+                | Err(error @ super::inference::InferenceError::UnknownAttribute { .. }) => {
+                    Err(TypeExprValueError::InvalidAccess {
+                        message: error.to_string(),
+                    })
+                }
+                Err(_) => Ok(()),
+            };
+        }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             return if accepts_interpolation(expected) {
@@ -128,7 +167,7 @@ pub fn check_type_expr_value(
             };
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            return check_type_expr_value(expected, inner, config)
+            return check_type_expr_value(expected, inner, config, inference)
                 .map_err(|_| mismatch(expected, value));
         }
         Value::Concrete(_) => {}
@@ -172,7 +211,7 @@ pub fn check_type_expr_value(
         TypeExpr::List(inner) => match value {
             Value::Concrete(ConcreteValue::List(items)) => {
                 for (index, item) in items.iter().enumerate() {
-                    check_type_expr_value(inner, item, config).map_err(|error| {
+                    check_type_expr_value(inner, item, config, inference).map_err(|error| {
                         error.prepend(TypeExprValuePathSegment::ListIndex(index))
                     })?;
                 }
@@ -181,7 +220,7 @@ pub fn check_type_expr_value(
             Value::Concrete(ConcreteValue::StringList(items)) => {
                 for (index, item) in items.iter().enumerate() {
                     let item = Value::Concrete(ConcreteValue::String(item.clone()));
-                    check_type_expr_value(inner, &item, config).map_err(|error| {
+                    check_type_expr_value(inner, &item, config, inference).map_err(|error| {
                         error.prepend(TypeExprValuePathSegment::ListIndex(index))
                     })?;
                 }
@@ -192,7 +231,7 @@ pub fn check_type_expr_value(
         TypeExpr::Map(inner) => match value {
             Value::Concrete(ConcreteValue::Map(entries)) => {
                 for (key, item) in entries {
-                    check_type_expr_value(inner, item, config).map_err(|error| {
+                    check_type_expr_value(inner, item, config, inference).map_err(|error| {
                         error.prepend(TypeExprValuePathSegment::MapKey(key.clone()))
                     })?;
                 }
@@ -251,9 +290,9 @@ pub fn check_type_expr_value(
                             field: field.clone(),
                         });
                     };
-                    check_type_expr_value(field_type, field_value, config).map_err(|error| {
-                        error.prepend(TypeExprValuePathSegment::StructField(field.clone()))
-                    })?;
+                    check_type_expr_value(field_type, field_value, config, inference).map_err(
+                        |error| error.prepend(TypeExprValuePathSegment::StructField(field.clone())),
+                    )?;
                 }
                 Ok(())
             }
@@ -266,7 +305,7 @@ pub fn check_type_expr_value(
         TypeExpr::Union(members) => {
             if members
                 .iter()
-                .any(|member| check_type_expr_value(member, value, config).is_ok())
+                .any(|member| check_type_expr_value(member, value, config, inference).is_ok())
             {
                 Ok(())
             } else {
@@ -323,6 +362,21 @@ fn is_qualified_enum_identifier(identifier: &str) -> bool {
     identifier.contains('.')
 }
 
+fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
+    if expected == actual || matches!(expected, TypeExpr::Unknown) {
+        return true;
+    }
+    match (expected, actual) {
+        (TypeExpr::Float, TypeExpr::Int) => true,
+        (TypeExpr::Union(members), actual) => members
+            .iter()
+            .any(|member| inferred_type_fits(member, actual)),
+        (TypeExpr::List(expected), TypeExpr::List(actual))
+        | (TypeExpr::Map(expected), TypeExpr::Map(actual)) => inferred_type_fits(expected, actual),
+        _ => false,
+    }
+}
+
 /// Directional compatibility for a declared source flowing into a declared sink.
 #[cfg(test)]
 mod tests {
@@ -334,11 +388,83 @@ mod tests {
     use crate::schema::TypeIdentity;
 
     fn check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
-        check_type_expr_value(expected, value, &ProviderContext::default())
+        check_type_expr_value(
+            expected,
+            value,
+            &ProviderContext::default(),
+            TypecheckInference::Unavailable,
+        )
+    }
+
+    fn check_with_config(
+        expected: &TypeExpr,
+        value: &Value,
+        config: &ProviderContext,
+    ) -> Result<(), TypeExprValueError> {
+        check_type_expr_value(expected, value, config, TypecheckInference::Unavailable)
     }
 
     fn string(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
+    }
+
+    fn split_result_element_access() -> Value {
+        use crate::resource::{PathSegment, Subscript};
+
+        crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![string("/"), Value::resource_ref("role", "arn", vec![])],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 1 },
+            },
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn postfix_access_uses_inferred_element_type_for_typecheck() {
+        let value = split_result_element_access();
+
+        check(&TypeExpr::String, &value).expect("an element of split() is assignable to String");
+        check(&TypeExpr::Int, &value).expect_err("an element of split() is not assignable to Int");
+    }
+
+    #[test]
+    fn postfix_access_on_known_type_rejects_incompatible_step() {
+        use crate::resource::{PathSegment, Subscript};
+
+        let list_with_string_key = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![string("/"), Value::resource_ref("q", "identifier", vec![])],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Str { key: "key".into() },
+            },
+            1,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+        let field_on_string = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "upper".to_string(),
+                args: vec![Value::resource_ref("q", "identifier", vec![])],
+            }),
+            PathSegment::Field {
+                name: "field".to_string(),
+            },
+            1,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+
+        check(&TypeExpr::String, &list_with_string_key)
+            .expect_err("a string key cannot select from list(String)");
+        check(&TypeExpr::String, &field_on_string).expect_err("a String does not expose fields");
     }
 
     fn all_type_shapes() -> Vec<TypeExpr> {
@@ -589,7 +715,7 @@ mod tests {
         };
 
         let invalid = string("wrong");
-        let error = check_type_expr_value(&schema_type, &invalid, &config)
+        let error = check_with_config(&schema_type, &invalid, &config)
             .expect_err("SchemaType must run its provider validator");
         assert!(matches!(
             error,
@@ -600,7 +726,7 @@ mod tests {
         ));
         let invalid_shorthand = Value::Concrete(ConcreteValue::enum_identifier("wrong"));
         assert!(matches!(
-            check_type_expr_value(&schema_type, &invalid_shorthand, &config),
+            check_with_config(&schema_type, &invalid_shorthand, &config),
             Err(TypeExprValueError::Mismatch {
                 validator_message: Some(message),
                 ..
@@ -613,11 +739,11 @@ mod tests {
             CanonicalEnumValue::new_for_test(identity, "net-canonical"),
         ));
         assert!(
-            check_type_expr_value(&schema_type, &raw, &config).is_ok(),
+            check_with_config(&schema_type, &raw, &config).is_ok(),
             "raw enum shorthand should be validated by {schema_type}"
         );
         assert!(
-            check_type_expr_value(&schema_type, &canonical, &config).is_ok(),
+            check_with_config(&schema_type, &canonical, &config).is_ok(),
             "canonical enum should satisfy {schema_type}"
         );
         for expected in [
@@ -625,15 +751,15 @@ mod tests {
             TypeExpr::DottedUnresolved(ResourceTypePath::new("test", "network.Id")),
         ] {
             assert!(
-                check_type_expr_value(&expected, &raw, &config).is_err(),
+                check_with_config(&expected, &raw, &config).is_err(),
                 "bare enum identifier must not satisfy {expected}"
             );
             assert!(
-                check_type_expr_value(&expected, &qualified, &config).is_ok(),
+                check_with_config(&expected, &qualified, &config).is_ok(),
                 "qualified enum identifier should satisfy {expected}"
             );
             assert!(
-                check_type_expr_value(&expected, &canonical, &config).is_ok(),
+                check_with_config(&expected, &canonical, &config).is_ok(),
                 "canonical enum should satisfy {expected}"
             );
         }
@@ -671,7 +797,7 @@ mod tests {
         };
         let value = Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
 
-        check_type_expr_value(&schema_type, &value, &config)
+        check_with_config(&schema_type, &value, &config)
             .expect("the declared enum member must validate");
 
         assert_eq!(*seen.lock().unwrap(), ["API_VALUE"]);
@@ -718,7 +844,7 @@ mod tests {
                 type_name: "Mode".to_string(),
             },
         ] {
-            check_type_expr_value(&expected, &value, &config)
+            check_with_config(&expected, &value, &config)
                 .expect("enum-typed string must resolve through state-text spelling");
         }
 

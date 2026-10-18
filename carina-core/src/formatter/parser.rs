@@ -291,6 +291,18 @@ mod tests {
     }
 
     #[test]
+    fn issue_3885_postfix_access_on_call_and_parenthesized_pipe() {
+        let input = "let direct = split('/', role.arn)[1]\n\
+                     let piped = (direct |> split(':'))[1]\n";
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "postfix access expressions should parse in the formatter, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
     fn issue_1175_chained_field_access() {
         // Multiple chained field accesses: a.b.c
         let input = r#"let x = vpc.details.id

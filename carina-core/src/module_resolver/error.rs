@@ -24,6 +24,14 @@ pub enum ModuleError {
         mismatch: TypeExprValueError,
     },
 
+    #[error("module '{module}' ({source_path}) at line {line}: {message}")]
+    ArgumentValueAccess {
+        module: String,
+        source_path: String,
+        line: usize,
+        message: String,
+    },
+
     #[error("Reference type validation failed: {0}")]
     ReferenceType(String),
 

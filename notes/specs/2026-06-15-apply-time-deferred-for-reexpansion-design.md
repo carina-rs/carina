@@ -6,10 +6,14 @@
 
 Design proposal for carina-rs/carina#3561.
 
+Implementation note: carina#3885 later replaced the path-specific loop-value
+unknown with a `DeferredValue::Access` chain rooted at `Unknown(ForValue)`.
+This document uses that current representation below.
+
 This document does not implement the change. It records the seam — both
 the type shape and the scheduling shape — needed so that a
 `for opt in <upstream>.<computed-collection> { ... }` block no longer
-admits an `Unknown(ForValuePath)` placeholder into the apply path, and
+admits an `Access(Unknown(ForValue), …)` placeholder into the apply path, and
 so the deferred children are scheduled against the upstream's
 create-step completion rather than against an arbitrary later lifecycle
 event (terminal status, downstream `wait` satisfaction, etc.).
@@ -53,8 +57,8 @@ reaches apply with three intertwined gaps:
    Replace (or a first-time Create), the upstream's
    `domain_validation_options` collection does not yet hold the values
    the children's `opt.resource_record.name` / `opt.resource_record.value`
-   references resolve to. The expansion stamps each placeholder as
-   `Value::Deferred(DeferredValue::Unknown { reason: UnknownReason::ForValuePath { path } })`
+   references resolve to. The expansion stamps each placeholder as an
+   `Access` chain whose base is `Unknown(ForValue)`
    and the apply path inherits the stamped child verbatim. The Route 53
    `Create` then calls `resolve_resource` → `assert_fully_resolved`
    and reaches the WASM serialization boundary with a still-`Unknown`
@@ -144,7 +148,7 @@ to block its `Create` until `DescribeCertificate` returns populated
 DVOs, that is a provider-side correctness decision; if it returns
 sooner and the deferred-for re-expansion still gets an empty
 collection, the failure mode is a clear empty-collection result, not
-a stale `Unknown(ForValuePath)` placeholder.
+a stale `Access(Unknown(ForValue), …)` placeholder.
 
 ## Goals and non-goals
 
@@ -152,7 +156,7 @@ a stale `Unknown(ForValuePath)` placeholder.
 
 Goals:
 
-- Make `Value::Deferred(DeferredValue::Unknown { reason: ForValuePath { … } })`
+- Make `Value::Deferred(DeferredValue::Access { base: Unknown(ForValue), … })`
   **unrepresentable on resources that reach the apply path**. The
   `resolve_resource` / `assert_fully_resolved` seam is the last line
   of defence today; the design should move it from "the last defense
@@ -177,10 +181,10 @@ Non-goals:
   "the `Create` future resolved with a `State`".
 - Generalizing to `for_each` over arbitrary maps, datasource-deferred
   attributes, or upstream-stack-deferred attributes. Those produce
-  `Unknown` values from different sources (`UpstreamRef`,
-  `UpstreamBareRef`) and have their own resolution model already
+  `Unknown` values from different sources (`UpstreamExport`,
+  `UpstreamAllExports`) and have their own resolution model already
   (`wait` blocks, `upstream_state` reads). The design here addresses
-  only `ForValuePath` placeholders produced by the deferred-for
+  only `Access` placeholders rooted at `Unknown(ForValue)` produced by the deferred-for
   expansion against a *local managed resource*'s collection.
 
 ## Design
@@ -188,7 +192,7 @@ Non-goals:
 <!-- derived-from #goals-and-non-goals -->
 
 The fix has two components that must land together: a typed seam that
-keeps `Unknown(ForValuePath)` out of resources the apply executor sees,
+keeps `Access(Unknown(ForValue), …)` out of resources the apply executor sees,
 and an explicit re-expansion effect that produces the resolved
 children once the upstream's `Create` step completes.
 
@@ -207,7 +211,7 @@ and after `resolve_resource`. The scheduler holds
 intermediate types still degrade to bare `Resource` once resolution
 ran. The deferred-for expansion runs on a `Resource` and produces a
 `Resource`; nothing in the type system records "this child's
-attributes still contain `Unknown(ForValuePath)` placeholders" vs
+attributes still contain `Access(Unknown(ForValue), …)` placeholders" vs
 "this child's attributes are fully concrete".
 
 Proposal: introduce a `ResolvedResource` witness type that wraps a
@@ -346,7 +350,7 @@ Refine PR #3558's edge so the deferred child waits for the upstream's
 `upstream_create_completion` lookup that crosses phase boundaries
 without re-expansion.
 
-Rejected. The `Unknown(ForValuePath)` placeholder still reaches the
+Rejected. The `Access(Unknown(ForValue), …)` placeholder still reaches the
 apply path; `resolve_resource` still has to catch it; a future
 caller adding another deferred-pattern (datasource-deferred attribute,
 nested for-binding) re-introduces the same class of bug because the
@@ -374,8 +378,8 @@ them.
 
 <!-- derived-from #design -->
 
-- Unit: a `Resource` containing
-  `Value::Deferred(DeferredValue::Unknown { reason: ForValuePath { … } })`
+- Unit: a `Resource` containing an `Access` chain rooted at
+  `Value::Deferred(DeferredValue::Unknown(ForValue))`
   cannot be wrapped in `ResolvedResource` — the constructor is
   `pub(crate)` in `executor::basic`; a `compile_fail` doctest pins
   it.

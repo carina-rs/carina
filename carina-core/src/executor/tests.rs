@@ -12,8 +12,8 @@ use crate::provider::{
     ProviderReadyDataSource, ProviderResult, ReadRequest, UpdateRequest,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceIdentity, UnknownReason, Value,
+    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, PathSegment,
+    ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity, UnknownReason, Value,
 };
 use crate::value::SerializationError;
 use parallel::build_dependency_levels;
@@ -51,24 +51,31 @@ fn create_effect(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
 }
 
+fn for_value_access(fields: &[&str]) -> Value {
+    fields.iter().fold(
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        |base, field| {
+            crate::resource::apply_postfix_access(
+                base,
+                PathSegment::Field {
+                    name: (*field).to_string(),
+                },
+                0,
+                crate::resource::AccessMissPolicy::Error,
+            )
+            .unwrap()
+        },
+    )
+}
+
 fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
     let mut template_resource = Resource::new("test", "validation_records");
     template_resource.binding = Some("validation_records".to_string());
     template_resource
         .dependency_bindings
         .insert("cert".to_string());
-    template_resource.set_attr(
-        "name",
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
-            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
-        })),
-    );
-    template_resource.set_attr(
-        "value",
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
-            path: AccessPath::with_fields("opt", "resource_record", vec!["value".to_string()]),
-        })),
-    );
+    template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
+    template_resource.set_attr("value", for_value_access(&["resource_record", "value"]));
 
     crate::parser::DeferredForExpression {
         file: None,
@@ -368,9 +375,7 @@ fn resource_with_attr(value: Value) -> Resource {
 }
 
 fn for_value_path_unknown() -> Value {
-    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
-        path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
-    }))
+    for_value_access(&["resource_record", "name"])
 }
 
 #[test]
@@ -379,8 +384,8 @@ fn resolved_resource_constructor_rejects_value_unknown() {
         .expect_err("deferred unknown must not construct a ResolvedResource");
 
     assert!(
-        matches!(err, SerializationError::UnknownNotAllowed { .. }),
-        "expected UnknownNotAllowed, got {err:?}"
+        matches!(err, SerializationError::UnresolvedAccess { .. }),
+        "expected UnresolvedAccess, got {err:?}"
     );
 }
 
@@ -414,8 +419,8 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
         .expect_err("nested deferred values must not construct a ResolvedResource");
 
     assert!(
-        matches!(err, SerializationError::UnknownNotAllowed { .. }),
-        "expected UnknownNotAllowed, got {err:?}"
+        matches!(err, SerializationError::UnresolvedAccess { .. }),
+        "expected UnresolvedAccess, got {err:?}"
     );
 }
 
@@ -4580,6 +4585,94 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     );
 }
 
+/// #3885: a value alias of a for-expanded address must already be a canonical
+/// ResourceRef before execution. This drives authored source through parsing,
+/// pre-apply resolution, and the real apply scheduler.
+#[tokio::test]
+async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
+    let provider = MockProvider::new();
+    let mut parsed = crate::parser::parse(
+        r#"
+            let roles = for n in [0] {
+                mock.test.Thing { name = "role" }
+            }
+            let r0 = roles[0]
+            let consumer = mock.test.Thing { name = r0.identifier }
+        "#,
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("reference alias source parses");
+    crate::parser::resolve_resource_refs(&mut parsed)
+        .expect("pre-apply reference resolution succeeds");
+
+    let role = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("roles[0]"))
+        .expect("for-expanded role")
+        .clone();
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("consumer"))
+        .expect("consumer")
+        .clone();
+    assert_eq!(
+        consumer.get_attr("name"),
+        Some(&Value::resource_ref("roles[0]", "identifier", vec![])),
+        "alias access must be canonical before apply"
+    );
+    assert!(consumer.dependency_bindings.contains("roles[0]"));
+
+    let mut role_attrs = HashMap::new();
+    role_attrs.insert(
+        "identifier".to_string(),
+        Value::Concrete(ConcreteValue::String("role-0-id".into())),
+    );
+    provider.push_create(Ok(
+        State::existing(role.id.clone(), role_attrs).with_identifier("role-0-id")
+    ));
+    provider.push_create(Ok(ok_state(&consumer.id)));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(role));
+    plan.add(create_effect(consumer.clone()));
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+    assert_eq!(result.success_count, 2);
+    assert_eq!(result.failure_count, 0);
+    let created = provider.captured_create_resources();
+    let applied_consumer = created
+        .iter()
+        .find(|resource| resource.id == consumer.id)
+        .expect("consumer reached provider");
+    assert_eq!(
+        applied_consumer.get_attr("name"),
+        Some(&Value::Concrete(ConcreteValue::String("role-0-id".into())))
+    );
+}
+
 /// carina#3112 regression: the apply-path `renormalize` (carina#3060)
 /// invokes `ProviderNormalizer::normalize_desired` from inside the
 /// async apply execution loop, multiple times in sequence (once per
@@ -6934,6 +7027,85 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         failed_event.contains("wait"),
         "error must suggest `wait` as the synchronization mechanism; \
          got: {failed_event}",
+    );
+}
+
+#[tokio::test]
+async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
+    use crate::resource::{AccessPath, ConcreteValue, PathSegment, Subscript};
+
+    let provider = MockProvider::new();
+    let mut consumer = Resource::new("test", "consumer");
+    consumer.binding = Some("consumer".to_string());
+    consumer.dependency_bindings.insert("q".to_string());
+    consumer.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments(
+                "q",
+                "identifier",
+                vec![PathSegment::Subscript {
+                    index: Subscript::Int { index: 0 },
+                }],
+            ),
+        }),
+    );
+    let consumer_id = consumer.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(consumer));
+    // Keep a slot available so a regression that forwards the unresolved
+    // value reaches the assertion below instead of panicking in the mock.
+    provider.push_create(Ok(State::existing(consumer_id.clone(), HashMap::new())));
+
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "q",
+        HashMap::from([(
+            "identifier".to_string(),
+            Value::Concrete(ConcreteValue::String("q-123".into())),
+        )]),
+        crate::binding_index::BindingValueSource::Local,
+    );
+
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(result.success_count, 0, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+    assert!(
+        provider
+            .captured_create_resources()
+            .iter()
+            .all(|resource| resource.id != consumer_id),
+        "wrong-shape value must fail before the provider boundary"
+    );
+    let events = observer.events();
+    let failure = events
+        .iter()
+        .find(|event| event.starts_with("failed:") && event.contains("consumer"))
+        .expect("consumer failure event");
+    assert!(
+        failure.contains("cannot apply access [0] to string"),
+        "unexpected apply error: {failure}"
+    );
+    assert!(
+        !failure.contains("wait"),
+        "wrong shape is permanent and must not suggest waiting: {failure}"
     );
 }
 

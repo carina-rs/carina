@@ -98,6 +98,13 @@ pub enum SerializationError {
         name: String,
         context: SerializationContext,
     },
+    /// A deferred postfix field/index access reached a concrete-only
+    /// serialization boundary before its base resolved.
+    #[error("cannot serialize at {context}: unresolved access {expression}")]
+    UnresolvedAccess {
+        expression: String,
+        context: SerializationContext,
+    },
     /// A parser-authored enum identifier reached a serialization boundary
     /// without schema resolution. Provider transports accept only
     /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
@@ -140,6 +147,10 @@ impl SerializationError {
             },
             Self::UnresolvedFunctionCall { context, .. } => Self::UnresolvedFunctionCall {
                 name: MASKED.to_string(),
+                context,
+            },
+            Self::UnresolvedAccess { context, .. } => Self::UnresolvedAccess {
+                expression: MASKED.to_string(),
                 context,
             },
             other => other,
@@ -212,10 +223,8 @@ impl std::fmt::Display for UnknownReason {
             UnknownReason::ForIndex => write!(f, "deferred for-binding index"),
             UnknownReason::ForValue => write!(f, "deferred for-binding value"),
             UnknownReason::FnParam { name } => write!(f, "function parameter {name}"),
+            UnknownReason::ModuleArgument { name } => write!(f, "module argument {name}"),
             UnknownReason::FnLocal { name } => write!(f, "function local {name}"),
-            UnknownReason::ForValuePath { path } => {
-                write!(f, "deferred for-binding value {}", path.to_dot_string())
-            }
             UnknownReason::EmptyInterpolation => write!(f, "empty interpolation"),
             UnknownReason::PostCreateReadIncomplete { detail } => {
                 write!(f, "post-create read failed: {detail}")
@@ -237,10 +246,10 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
         UnknownReason::ForIndex => "(known after upstream apply: index)".to_string(),
         UnknownReason::ForValue => "(known after upstream apply)".to_string(),
         UnknownReason::FnParam { name } => format!("(unresolved function parameter: {name})"),
-        UnknownReason::FnLocal { name } => format!("(unresolved function local: {name})"),
-        UnknownReason::ForValuePath { path } => {
-            format!("(known after upstream apply: {})", path.to_dot_string())
+        UnknownReason::ModuleArgument { name } => {
+            format!("(unresolved module argument: {name})")
         }
+        UnknownReason::FnLocal { name } => format!("(unresolved function local: {name})"),
         UnknownReason::EmptyInterpolation => "(empty interpolation)".to_string(),
         UnknownReason::PostCreateReadIncomplete { detail } => {
             format!("(known after next apply: post-create read failed — {detail})")
@@ -366,6 +375,10 @@ fn value_to_json_inner(
                 context: ctx,
             })
         }
+        Value::Deferred(DeferredValue::Access(_)) => Err(SerializationError::UnresolvedAccess {
+            expression: format_value(value),
+            context: ctx,
+        }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             if persist_secrets {
                 let material = canonical_secret_hash_material(inner)?;
@@ -425,6 +438,7 @@ pub(crate) fn canonical_secret_hash_material(value: &Value) -> Result<Vec<u8>, S
             | SerializationError::UnresolvedResourceRef { .. }
             | SerializationError::UnresolvedInterpolation { .. }
             | SerializationError::UnresolvedFunctionCall { .. }
+            | SerializationError::UnresolvedAccess { .. }
             | SerializationError::SecretNotAllowed { .. },
         ) => canonical_secret_template(value)?,
         Err(error) => return Err(error),
@@ -769,10 +783,55 @@ pub(crate) fn format_value_into<S: FormatSink>(
             }
             sink.write_str(")")
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            if let Some(path) = deferred_for_access_display_path(access) {
+                sink.write_str("(known after upstream apply: ")?;
+                sink.write_str(&path)?;
+                sink.write_str(")")
+            } else if let Some(reason) = access_chain_unknown_root(access.base()) {
+                sink.write_str(&render_unknown(reason))
+            } else {
+                format_value_into(access.base(), sink)?;
+                sink.write_str(&access.step().to_dot_string())
+            }
+        }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
             sink.write_str("(secret)")
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => sink.write_str(&render_unknown(reason)),
+    }
+}
+
+/// Reconstruct an authored deferred-for value path from sealed access nodes.
+/// The semantic placeholder remains `Unknown(ForValue)`; the binding name is
+/// display-only parser metadata on `AccessExpr`, so no obsolete unknown reason
+/// or independently navigable path representation is reintroduced.
+fn deferred_for_access_display_path(access: &crate::resource::AccessExpr) -> Option<String> {
+    fn append_steps(access: &crate::resource::AccessExpr, output: &mut String) -> bool {
+        let rooted_at_for_value = match access.base() {
+            Value::Deferred(DeferredValue::Access(inner)) => append_steps(inner, output),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)) => true,
+            _ => false,
+        };
+        if rooted_at_for_value {
+            output.push_str(&access.step().to_dot_string());
+        }
+        rooted_at_for_value
+    }
+
+    let mut path = access.display_root()?.to_string();
+    append_steps(access, &mut path).then_some(path)
+}
+
+/// Return the root `Unknown` reason of a direct postfix-access chain.
+/// Function calls and all other expression nodes intentionally stop the
+/// search: `unknown.field` is still unknown, while `split(unknown)[0]`
+/// remains a useful expression in diagnostics and plans.
+pub(crate) fn access_chain_unknown_root(value: &Value) -> Option<&UnknownReason> {
+    match value {
+        Value::Deferred(DeferredValue::Access(access)) => access_chain_unknown_root(access.base()),
+        Value::Deferred(DeferredValue::Unknown(reason)) => Some(reason),
+        _ => None,
     }
 }
 
@@ -788,6 +847,7 @@ pub fn contains_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().any(contains_secret)
         }
+        Value::Deferred(DeferredValue::Access(access)) => contains_secret(access.base()),
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -828,6 +888,9 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         }),
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().any(contains_unredacted_secret)
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            contains_unredacted_secret(access.base())
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -872,6 +935,7 @@ pub fn merge_secrets_into_provider_json(
                     SerializationError::UnresolvedResourceRef { .. }
                     | SerializationError::UnresolvedInterpolation { .. }
                     | SerializationError::UnresolvedFunctionCall { .. }
+                    | SerializationError::UnresolvedAccess { .. }
                     | SerializationError::UnknownNotAllowed { .. },
                 ) => {
                     if matches!(provider_json, serde_json::Value::String(value) if is_persisted_secret(value))
@@ -988,6 +1052,15 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
                 args: redacted?,
             }))
         }
+        Value::Deferred(DeferredValue::Access(access)) => access
+            .rebuild_with_base(
+                redact_secrets_only(access.base())?,
+                crate::resource::AccessMissPolicy::Error,
+            )
+            .map_err(|_| SerializationError::UnresolvedAccess {
+                expression: format_value(value),
+                context: SerializationContext::SecretRedaction,
+            }),
         // `Unknown` and every other deferred / concrete shape pass through.
         other => Ok(other.clone()),
     }
@@ -1125,6 +1198,18 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
             );
             tagged("function_call", JsonValue::Object(call))
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let mut encoded = Map::new();
+            encoded.insert(
+                "base".to_string(),
+                canonical_secret_template(access.base())?,
+            );
+            encoded.insert(
+                "step".to_string(),
+                serde_json::to_value(access.step()).expect("PathSegment is serializable"),
+            );
+            tagged("access", JsonValue::Object(encoded))
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => canonical_secret_template(inner)?,
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
             return Err(SerializationError::RedactedSecretNotAllowed {
@@ -1153,6 +1238,9 @@ pub fn contains_redacted_secret(value: &Value) -> bool {
         }),
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().any(contains_redacted_secret)
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            contains_redacted_secret(access.base())
         }
         _ => false,
     }
@@ -1729,13 +1817,33 @@ fn rehydrate_redacted_secrets_impl(
                 args,
             }))
         }
+        Value::Deferred(DeferredValue::Access(saved_access)) => {
+            let Value::Deferred(DeferredValue::Access(candidate_access)) = candidate else {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            };
+            if saved_access.step() != candidate_access.step() {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            }
+            let base = rehydrate_redacted_secrets_impl(
+                saved_access.base(),
+                candidate_access.base(),
+                candidate_is_secret,
+            )?;
+            saved_access
+                .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
+                .map_err(|_| SecretRehydrationError::ShapeMismatch)
+        }
         _ => Err(SecretRehydrationError::ShapeMismatch),
     }
 }
 
 fn secret_candidate_evaluation_is_unavailable(value: &Value) -> bool {
     match value {
-        Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::FunctionCall { .. }) => true,
+        Value::Deferred(
+            DeferredValue::Unknown(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Access(_),
+        ) => true,
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(
                 part,
@@ -1858,6 +1966,15 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
                 args: redacted?,
             }))
         }
+        Value::Deferred(DeferredValue::Access(access)) => access
+            .rebuild_with_base(
+                redact_secrets_only(access.base())?,
+                crate::resource::AccessMissPolicy::Error,
+            )
+            .map_err(|_| SerializationError::UnresolvedAccess {
+                expression: format_value(value),
+                context: SerializationContext::SecretRedaction,
+            }),
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
                 reason: reason.clone(),
@@ -3609,6 +3726,7 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
@@ -4020,6 +4138,9 @@ fn first_enum_identifier_inner(
             .values()
             .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
         Value::Deferred(DeferredValue::Secret(inner)) => first_enum_identifier_inner(inner, true),
+        Value::Deferred(DeferredValue::Access(access)) => {
+            first_enum_identifier_inner(access.base(), inside_secret)
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::CanonicalEnum(_)
@@ -4606,22 +4727,6 @@ mod tests {
     }
 
     #[test]
-    fn render_unknown_for_value_path() {
-        // carina#3136: the path-carrying loop-var placeholder renders
-        // the path like every other payload-carrying arm (not the bare
-        // `ForValue` string), so an unresolved chained loop-var access
-        // stays distinguishable in plan output.
-        use crate::resource::AccessPath;
-        let r = UnknownReason::ForValuePath {
-            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
-        };
-        assert_eq!(
-            render_unknown(&r),
-            "(known after upstream apply: opt.resource_record.name)"
-        );
-    }
-
-    #[test]
     fn render_unknown_post_create_read_incomplete() {
         let r = UnknownReason::PostCreateReadIncomplete {
             detail: "AccessDenied".to_string(),
@@ -4822,6 +4927,36 @@ mod tests {
                 } if name == "join"
             ),
             "expected UnresolvedFunctionCall/join/ValueToJson, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_postfix_access_returns_err() {
+        use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
+
+        let value = apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".into(),
+                args: vec![],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 1 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred");
+        let error = value_to_json(&value).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                SerializationError::UnresolvedAccess {
+                    expression,
+                    context: SerializationContext::ValueToJson,
+                } if expression == "split()[1]"
+            ),
+            "expected UnresolvedAccess/ValueToJson, got: {error:?}"
         );
     }
 
@@ -6522,6 +6657,58 @@ mod tests {
     fn test_format_value_resource_ref() {
         let v = Value::resource_ref("vpc", "id", vec![]);
         assert_eq!(format_value(&v), "vpc.id");
+    }
+
+    #[test]
+    fn format_value_collapses_access_chain_rooted_at_unknown() {
+        use crate::resource::{AccessMissPolicy, PathSegment, apply_postfix_access};
+
+        let inner = apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            PathSegment::Field {
+                name: "resource_record".to_string(),
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("unknown access remains deferred");
+        let value = apply_postfix_access(
+            inner,
+            PathSegment::Field {
+                name: "name".to_string(),
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("unknown access remains deferred");
+
+        assert_eq!(format_value(&value), "(known after upstream apply)");
+    }
+
+    #[test]
+    fn format_value_keeps_access_chain_on_expression_base() {
+        use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
+
+        let value = apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())),
+                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                ],
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 1 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred");
+
+        assert_eq!(
+            format_value(&value),
+            "split(\"/\", (known after upstream apply))[1]"
+        );
     }
 
     /// `Value::Deferred(DeferredValue::Unknown(UpstreamExport))` renders unquoted as
@@ -9444,12 +9631,27 @@ mod tests {
         use crate::parser::{DeferredForExpression, ForBinding};
         use crate::plan::Plan;
         use crate::resource::{
-            AccessPath, DeferredValue, Resource, ResourceId, UnknownReason, Value,
+            DeferredValue, PathSegment, Resource, ResourceId, UnknownReason, Value,
         };
 
-        let placeholder = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
-            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
-        }));
+        let placeholder_inner = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            PathSegment::Field {
+                name: "resource_record".to_string(),
+            },
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect("unknown access remains deferred");
+        let placeholder = crate::resource::apply_postfix_access(
+            placeholder_inner,
+            PathSegment::Field {
+                name: "name".to_string(),
+            },
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect("unknown access remains deferred");
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("DEFERRED_TEMPLATE_PLAINTEXT".into()),
         ))));

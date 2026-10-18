@@ -244,6 +244,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
                 visit_unknowns(arg, f);
             }
         }
+        Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),
         Value::Deferred(DeferredValue::Secret(inner)) => visit_unknowns(inner, f),
         Value::Concrete(_)
         | Value::Deferred(DeferredValue::ResourceRef { .. })

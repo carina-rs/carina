@@ -272,6 +272,7 @@ fn unresolved_enum_identifier(value: &Value) -> Option<&str> {
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().find_map(unresolved_enum_identifier)
         }
+        Value::Deferred(DeferredValue::Access(access)) => unresolved_enum_identifier(access.base()),
         Value::Deferred(DeferredValue::Secret(inner)) => unresolved_enum_identifier(inner),
         Value::Concrete(
             ConcreteValue::String(_)

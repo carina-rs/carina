@@ -14,9 +14,7 @@ use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource, ResourceIdentity, Value,
-};
+use crate::resource::{ConcreteValue, DeferredValue, Directives, Value};
 use indexmap::IndexMap;
 
 /// Parse arguments block. See `register_argument_binding` for the
@@ -138,23 +136,23 @@ pub(in crate::parser) fn parse_arguments_block(
 
 /// Register an argument name as a lexical binding so subsequent expressions
 /// (later argument defaults, resource bodies, etc.) resolve it as a
-/// `BindingRef` placeholder rather than a literal string. Without this
+/// typed module-argument placeholder rather than a literal string. Without this
 /// incremental registration, `${other_arg}` inside a default would have no
 /// in-scope binding and degrade to the literal string `"other_arg"` (#2393).
 ///
-/// `BindingRef` (not `ResourceRef`) is correct here: an `arguments {}`
-/// declaration introduces a name without an attribute. When a later
-/// expression writes `other_arg.attr`, the parser composes a fresh
-/// `ResourceRef`. Storing the placeholder as `ResourceRef` with an
-/// empty `attribute` would be a type-level lie — the same shape that
-/// produced the empty-field diagnostic in #2847.
+/// An argument is a value binding whose placeholder is an explicitly typed
+/// unknown. It must not be a `BindingRef`: that variant denotes a structural
+/// resource address and postfix access canonicalizes it into a reference path.
+/// Module expansion substitutes this placeholder before applying any access.
 fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
-    let placeholder_ref = Value::Deferred(DeferredValue::BindingRef {
-        binding: name.to_string(),
-    });
-    ctx.set_variable(name.to_string(), placeholder_ref);
-    let placeholder = Resource::new("_argument", ResourceIdentity::new(name.to_string()));
-    ctx.set_resource_binding(name.to_string(), placeholder);
+    ctx.set_variable(
+        name.to_string(),
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ModuleArgument {
+                name: name.to_string(),
+            },
+        )),
+    );
     // The local declaration is the real one for this file; drop the
     // seed mark (if any) so a later real duplicate (`let <name> = ...`
     // in the same file) is still flagged. #2817.
@@ -334,7 +332,7 @@ fn value_as_binding_name(value: &Value, context: &str) -> Result<String, ParseEr
             let bare = name
                 .expose_plaintext()
                 .strip_prefix("${")
-                .and_then(|s| s.strip_suffix('}'))
+                .and_then(|value| value.strip_suffix('}'))
                 .unwrap_or(name.expose_plaintext());
             Ok(bare.to_string())
         }

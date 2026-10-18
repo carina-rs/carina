@@ -70,6 +70,41 @@ pub struct BindingEntry<'a> {
     pub target: BindingTarget<'a>,
 }
 
+/// Whether a path-shape mismatch is owned by this lookup or by a dedicated
+/// diagnostic pass. Ordinary reference compatibility preserves the historic
+/// upstream shape diagnostics; postfix validation requests a strict result
+/// for schema/value-backed bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceTypeCheck {
+    Compatibility,
+    PostfixAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidAccessPolicy {
+    Unchecked,
+    Error,
+}
+
+impl ReferenceTypeCheck {
+    fn invalid_access_policy(self, target: BindingTarget<'_>) -> InvalidAccessPolicy {
+        match (self, target) {
+            // Upstream shape errors carry purpose-built guidance such as
+            // "iterate the list" and must remain authoritative.
+            (Self::PostfixAccess, BindingTarget::UpstreamState(_)) | (Self::Compatibility, _) => {
+                InvalidAccessPolicy::Unchecked
+            }
+            (
+                Self::PostfixAccess,
+                BindingTarget::Schema(_)
+                | BindingTarget::Composition(_)
+                | BindingTarget::ModuleCall(_)
+                | BindingTarget::Argument(_),
+            ) => InvalidAccessPolicy::Error,
+        }
+    }
+}
+
 /// One type constraint on a reference path, paired with the definition
 /// context required to interpret any nested schema `Ref`s.
 #[derive(Debug, Clone)]
@@ -91,8 +126,17 @@ impl ResolvedTypeConstraint {
         self,
         segments: &[PathSegment],
         path: &AccessPath,
+        invalid_access: InvalidAccessPolicy,
     ) -> Result<Option<Self>, RefTypeError> {
-        let narrowed = narrow_type(&self.attr_type, segments, &self.defs, path)?.cloned();
+        let rendered_path = path.to_dot_string();
+        let narrowed = narrow_type(
+            &self.attr_type,
+            segments,
+            &self.defs,
+            &rendered_path,
+            invalid_access,
+        )?
+        .cloned();
         Ok(narrowed.map(|attr_type| Self::new(attr_type, self.defs)))
     }
 }
@@ -125,13 +169,14 @@ impl AuthoritativeTypeConstraint {
         self,
         segments: &[PathSegment],
         path: &AccessPath,
+        invalid_access: InvalidAccessPolicy,
     ) -> Result<Option<Self>, RefTypeError> {
         match self {
             Self::Direct(constraint) => Ok(constraint
-                .narrow(segments, path)?
+                .narrow(segments, path, invalid_access)?
                 .map(AuthoritativeTypeConstraint::Direct)),
             Self::DeclaredCompositionAttribute(constraint) => Ok(constraint
-                .narrow(segments, path)?
+                .narrow(segments, path, invalid_access)?
                 .map(AuthoritativeTypeConstraint::DeclaredCompositionAttribute)),
         }
     }
@@ -208,14 +253,15 @@ impl ResolvedRefType {
         self,
         segments: &[PathSegment],
         path: &AccessPath,
+        invalid_access: InvalidAccessPolicy,
     ) -> Result<Option<Self>, RefTypeError> {
-        let Some(authoritative) = self.authoritative.narrow(segments, path)? else {
+        let Some(authoritative) = self.authoritative.narrow(segments, path, invalid_access)? else {
             return Ok(None);
         };
         let evidence = self
             .evidence
             .into_iter()
-            .map(|constraint| constraint.narrow(segments, path))
+            .map(|constraint| constraint.narrow(segments, path, invalid_access))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
@@ -287,6 +333,11 @@ pub enum RefTypeError {
         export: String,
         known_exports: Vec<String>,
     },
+    InvalidAccess {
+        path: String,
+        step: PathSegment,
+        actual: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -345,6 +396,12 @@ impl std::fmt::Display for RefTypeError {
                     f,
                     "upstream_state `{}` does not export `{}`.{}",
                     binding, export, suggestion
+                )
+            }
+            Self::InvalidAccess { path, step, actual } => {
+                write!(
+                    f,
+                    "cannot apply access {step} to {actual} in reference {path}"
                 )
             }
         }
@@ -585,13 +642,29 @@ impl<'a> BindingIndex<'a> {
     /// `TypeExpr::Unknown` remains unchecked. The active path set
     /// bounds malformed/cyclic forwarded chains.
     pub fn ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
-        self.ref_type_inner(path.into(), &mut HashSet::new())
+        self.ref_type_inner(
+            path.into(),
+            &mut HashSet::new(),
+            ReferenceTypeCheck::Compatibility,
+        )
+    }
+
+    /// Resolve a reference for postfix type checking. Schema-backed bindings
+    /// (including wait aliases) report wrong-shape suffixes, while upstream
+    /// bindings retain their dedicated shape-diagnostic authority.
+    pub(crate) fn postfix_ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
+        self.ref_type_inner(
+            path.into(),
+            &mut HashSet::new(),
+            ReferenceTypeCheck::PostfixAccess,
+        )
     }
 
     fn ref_type_inner(
         &self,
         reference: ReferencePathRef<'_>,
         visiting: &mut HashSet<String>,
+        check: ReferenceTypeCheck,
     ) -> RefType {
         let key = reference.to_plaintext_dot_string();
         if !visiting.insert(key.clone()) {
@@ -614,11 +687,14 @@ impl<'a> BindingIndex<'a> {
                 binding: reference.binding().to_string(),
                 attribute: match reference {
                     ReferencePathRef::Access(path) => path.attribute().to_string(),
-                    ReferencePathRef::Binding(_) => String::new(),
+                    ReferencePathRef::Binding(_) | ReferencePathRef::BindingAccess { .. } => {
+                        String::new()
+                    }
                 },
             },
             Some(entry) => match entry.target {
                 BindingTarget::Schema(schema) => {
+                    let invalid_access = check.invalid_access_policy(entry.target);
                     let ReferencePathRef::Access(path) = reference else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
@@ -633,7 +709,14 @@ impl<'a> BindingIndex<'a> {
                             },
                         ));
                     };
-                    match narrow_type(&attribute.attr_type, path.segments(), &schema.defs, path) {
+                    let rendered_path = path.to_dot_string();
+                    match narrow_type(
+                        &attribute.attr_type,
+                        path.segments(),
+                        &schema.defs,
+                        &rendered_path,
+                        invalid_access,
+                    ) {
                         Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
                             attr_type.clone(),
                             schema.defs.clone(),
@@ -643,6 +726,7 @@ impl<'a> BindingIndex<'a> {
                     }
                 }
                 BindingTarget::Composition(composition) => {
+                    let invalid_access = check.invalid_access_policy(entry.target);
                     let ReferencePathRef::Access(path) = reference else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
@@ -662,16 +746,25 @@ impl<'a> BindingIndex<'a> {
                         .and_then(crate::validation::lift_type_expr)
                     {
                         let defs = crate::schema::empty_defs_for_schema_walks();
-                        match narrow_type(&declared, path.segments(), defs, path) {
+                        let rendered_path = path.to_dot_string();
+                        match narrow_type(
+                            &declared,
+                            path.segments(),
+                            defs,
+                            &rendered_path,
+                            invalid_access,
+                        ) {
                             Ok(Some(attr_type)) => {
                                 let inferred = attribute.forwarded_path().and_then(|forwarded| {
                                     match self.ref_type_inner(
                                         ReferencePathRef::Access(forwarded),
                                         visiting,
+                                        check,
                                     ) {
-                                        RefType::Typed(resolved) => {
-                                            resolved.narrow(path.segments(), path).ok().flatten()
-                                        }
+                                        RefType::Typed(resolved) => resolved
+                                            .narrow(path.segments(), path, invalid_access)
+                                            .ok()
+                                            .flatten(),
                                         RefType::Unchecked
                                         | RefType::UnknownBinding { .. }
                                         | RefType::UnknownAttribute(_) => None,
@@ -694,9 +787,13 @@ impl<'a> BindingIndex<'a> {
                         // substituted value type.
                         RefType::Unchecked
                     } else if let Some(forwarded) = attribute.forwarded_path() {
-                        match self.ref_type_inner(ReferencePathRef::Access(forwarded), visiting) {
+                        match self.ref_type_inner(
+                            ReferencePathRef::Access(forwarded),
+                            visiting,
+                            check,
+                        ) {
                             RefType::Typed(resolved) => {
-                                match resolved.narrow(path.segments(), path) {
+                                match resolved.narrow(path.segments(), path, invalid_access) {
                                     Ok(Some(resolved)) => RefType::Typed(resolved),
                                     Ok(None) => RefType::Unchecked,
                                     Err(error) => RefType::UnknownAttribute(error),
@@ -709,6 +806,7 @@ impl<'a> BindingIndex<'a> {
                     }
                 }
                 BindingTarget::ModuleCall(signature) => {
+                    let invalid_access = check.invalid_access_policy(entry.target);
                     let ReferencePathRef::Access(path) = reference else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
@@ -729,7 +827,14 @@ impl<'a> BindingIndex<'a> {
                         return RefType::Unchecked;
                     };
                     let defs = crate::schema::empty_defs_for_schema_walks();
-                    match narrow_type(&declared, path.segments(), defs, path) {
+                    let rendered_path = path.to_dot_string();
+                    match narrow_type(
+                        &declared,
+                        path.segments(),
+                        defs,
+                        &rendered_path,
+                        invalid_access,
+                    ) {
                         Ok(Some(attr_type)) => {
                             RefType::Typed(ResolvedRefType::new(attr_type.clone(), defs.clone()))
                         }
@@ -738,6 +843,23 @@ impl<'a> BindingIndex<'a> {
                     }
                 }
                 BindingTarget::Argument(type_expr) => {
+                    let invalid_access = check.invalid_access_policy(entry.target);
+                    // A resource-handle argument is substituted with the
+                    // caller's concrete resource binding during module
+                    // expansion. Its `.attribute` suffix therefore belongs
+                    // to that resource schema, not to the string-backed
+                    // transport type used for the module boundary. Keep the
+                    // pre-expansion source-local check neutral; the expanded
+                    // ResourceRef is checked against the caller schema.
+                    if matches!(
+                        type_expr,
+                        crate::parser::TypeExpr::Ref(_)
+                            | crate::parser::TypeExpr::DottedUnresolved(_)
+                    ) && !matches!(reference, ReferencePathRef::Binding(_))
+                    {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    }
                     let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
@@ -753,7 +875,31 @@ impl<'a> BindingIndex<'a> {
                                 name: path.attribute().to_string(),
                             });
                             segments.extend_from_slice(path.segments());
-                            match narrow_type(&declared, &segments, defs, path) {
+                            let rendered_path = path.to_dot_string();
+                            match narrow_type(
+                                &declared,
+                                &segments,
+                                defs,
+                                &rendered_path,
+                                invalid_access,
+                            ) {
+                                Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
+                                    attr_type.clone(),
+                                    defs.clone(),
+                                )),
+                                Ok(None) => RefType::Unchecked,
+                                Err(error) => RefType::UnknownAttribute(error),
+                            }
+                        }
+                        ReferencePathRef::BindingAccess { segments, .. } => {
+                            let rendered_path = reference.to_dot_string();
+                            match narrow_type(
+                                &declared,
+                                segments,
+                                defs,
+                                &rendered_path,
+                                invalid_access,
+                            ) {
                                 Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
                                     attr_type.clone(),
                                     defs.clone(),
@@ -765,6 +911,7 @@ impl<'a> BindingIndex<'a> {
                     }
                 }
                 BindingTarget::UpstreamState(exports) => {
+                    let invalid_access = check.invalid_access_policy(entry.target);
                     let ReferencePathRef::Access(path) = reference else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
@@ -792,7 +939,14 @@ impl<'a> BindingIndex<'a> {
                         return RefType::Unchecked;
                     };
                     let defs = crate::schema::empty_defs_for_schema_walks();
-                    match narrow_type(&declared, path.segments(), defs, path) {
+                    let rendered_path = path.to_dot_string();
+                    match narrow_type(
+                        &declared,
+                        path.segments(),
+                        defs,
+                        &rendered_path,
+                        invalid_access,
+                    ) {
                         Ok(Some(attr_type)) => {
                             RefType::Typed(ResolvedRefType::new(attr_type.clone(), defs.clone()))
                         }
@@ -859,7 +1013,8 @@ fn narrow_type<'a>(
     start: &'a AttributeType,
     segments: &[PathSegment],
     defs: &'a BTreeMap<String, AttributeType>,
-    full_path: &AccessPath,
+    full_path: &str,
+    invalid_access: InvalidAccessPolicy,
 ) -> Result<Option<&'a AttributeType>, RefTypeError> {
     let mut current = start;
     for segment in segments {
@@ -869,7 +1024,7 @@ fn narrow_type<'a>(
                     .expect("Shape::Struct must expose struct fields internally");
                 let Some(field) = fields.iter().find(|field| field.name == *name) else {
                     return Err(RefTypeError::UnknownStructField {
-                        path: full_path.to_dot_string(),
+                        path: full_path.to_string(),
                         field: name.clone(),
                         struct_name: struct_name.to_string(),
                         known_fields: fields.iter().map(|field| field.name.clone()).collect(),
@@ -890,7 +1045,20 @@ fn narrow_type<'a>(
                 },
                 Shape::Map { value, .. },
             ) => value,
-            _ => return Ok(None),
+            (_, Shape::Union) => return Ok(None),
+            _ => match invalid_access {
+                // Existing upstream reference paths have dedicated shape
+                // diagnostics. Preserve that richer message by leaving the
+                // compatibility lookup unchecked.
+                InvalidAccessPolicy::Unchecked => return Ok(None),
+                InvalidAccessPolicy::Error => {
+                    return Err(RefTypeError::InvalidAccess {
+                        path: full_path.to_string(),
+                        step: segment.clone(),
+                        actual: current.in_schema(defs).resolved_type_name(),
+                    });
+                }
+            },
         };
     }
     Ok(Some(current))
@@ -1543,7 +1711,7 @@ impl ResolvedBindings {
             by_binding: self
                 .by_name
                 .iter()
-                .map(|(name, rb)| (name.clone(), rb.attributes.clone()))
+                .map(|(name, rb)| (name.clone(), rb.clone()))
                 .collect(),
         }
     }
@@ -1566,7 +1734,7 @@ impl ResolvedBindings {
 /// map" unrepresentable.
 #[derive(Debug, Default, Clone)]
 pub struct IterableBindings {
-    by_binding: HashMap<String, HashMap<String, Value>>,
+    by_binding: HashMap<String, ResolvedBinding>,
 }
 
 impl IterableBindings {
@@ -1580,13 +1748,31 @@ impl IterableBindings {
     /// iterable path with hand-built bindings.
     pub fn from_upstream_only(remote_bindings: HashMap<String, HashMap<String, Value>>) -> Self {
         Self {
-            by_binding: remote_bindings,
+            by_binding: remote_bindings
+                .into_iter()
+                .map(|(name, attributes)| {
+                    (
+                        name,
+                        ResolvedBinding {
+                            attributes,
+                            source: BindingValueSource::Upstream,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
     /// Resolve a binding's attribute map (the iterable's source).
     pub fn get(&self, binding: &str) -> Option<&HashMap<String, Value>> {
-        self.by_binding.get(binding)
+        self.by_binding.get(binding).map(|entry| &entry.attributes)
+    }
+
+    /// Provenance of the iterable container. Expansion uses this to retain
+    /// missing local desired-side fields while treating loaded upstream data
+    /// as final.
+    pub fn source(&self, binding: &str) -> Option<&BindingValueSource> {
+        self.by_binding.get(binding).map(|entry| &entry.source)
     }
 }
 

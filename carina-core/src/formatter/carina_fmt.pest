@@ -258,7 +258,11 @@ expression = { pipe_expr }
 pipe_expr = { compose_expr ~ (trivia* ~ pipe_op ~ trivia* ~ function_call)* }
 
 // Compose operator: f >> g (function composition)
-compose_expr = { primary ~ (trivia* ~ compose_op ~ trivia* ~ primary)* }
+compose_expr = { postfix_expr ~ (trivia* ~ compose_op ~ trivia* ~ postfix_expr)* }
+
+// Field/index access is a postfix operator on any primary value. Reference
+// primaries retain their existing suffix parsing for address fidelity.
+postfix_expr = { primary ~ (trivia* ~ (index_access | field_access))* }
 
 // Function call: func(args)
 function_call = {
@@ -361,8 +365,10 @@ for_map_binding = {
     (discard_pattern | identifier) ~ trivia* ~ comma ~ trivia+ ~ (discard_pattern | identifier)
 }
 
-// For iterable: restricted to simple expressions
-for_iterable = { function_call | list | variable_ref | open_paren ~ trivia* ~ expression ~ trivia* ~ close_paren }
+// For iterable: restricted to simple expressions, with the same postfix
+// suffix layer as ordinary expressions.
+for_iterable = { for_iterable_primary ~ (trivia* ~ (index_access | field_access))* }
+for_iterable_primary = _{ function_call | list | variable_ref | open_paren ~ trivia* ~ expression ~ trivia* ~ close_paren }
 
 // For body content
 for_body_content = _{ trivia | for_local_binding | read_resource_expr | resource_expr | module_call }
@@ -395,7 +401,8 @@ read_resource_expr = {
 // Variable reference (with optional chained member access and index access)
 // Supports: bucket.name, a.b.c, a[0].b, a["key"].b.c
 variable_ref = { identifier ~ (field_access | index_access)* }
-field_access = { "." ~ identifier }
+dot = { "." }
+field_access = { dot ~ identifier }
 index_access = { open_bracket ~ trivia* ~ expression ~ trivia* ~ close_bracket }
 
 // Literals

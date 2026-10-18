@@ -75,6 +75,26 @@ fn mark_secret_input_strings(value: Value) -> Value {
                 args: args.into_iter().map(mark_secret_input_strings).collect(),
             })
         }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let original = Value::Deferred(DeferredValue::Access(access.clone()));
+            let step = match access.step().clone() {
+                crate::resource::PathSegment::Subscript {
+                    index: crate::resource::Subscript::Str { key },
+                } => crate::resource::PathSegment::Subscript {
+                    index: crate::resource::Subscript::Str {
+                        key: ValueString::diagnostic_sensitive(key.into_plaintext()),
+                    },
+                },
+                other => other,
+            };
+            access
+                .rebuild(
+                    mark_secret_input_strings(access.base().clone()),
+                    step,
+                    crate::resource::AccessMissPolicy::Error,
+                )
+                .unwrap_or(original)
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(mark_secret_input_strings(*inner)),
         )),
@@ -132,6 +152,8 @@ pub enum BuiltinReturnType {
     Int,
     /// Returns a `Value::Concrete(ConcreteValue::List)` of some element type.
     List,
+    /// Returns a list whose elements are statically known to be strings.
+    StringList,
     /// Returns a `Value::Concrete(ConcreteValue::Map)`.
     Map,
     /// Return shape depends on the arguments (e.g. `lookup`, `min`, `max`,
@@ -296,7 +318,7 @@ register_builtins! {
     keys(keys_values::builtin_keys, arity: 1) {
         signature: "keys(map: map) -> list",
         description: "Returns the keys of a map as a sorted list.",
-        return_type: BuiltinReturnType::List,
+        return_type: BuiltinReturnType::StringList,
     },
     length(length::builtin_length, arity: 1) {
         signature: "length(value: list | map | String) -> Int",
@@ -341,7 +363,7 @@ register_builtins! {
     split(split::builtin_split, arity: 2) {
         signature: "split(separator: String, string: String) -> list",
         description: "Splits a string into a list using the separator.",
-        return_type: BuiltinReturnType::List,
+        return_type: BuiltinReturnType::StringList,
     },
     trim(trim::builtin_trim, arity: 1) {
         signature: "trim(string: String) -> String",
@@ -516,6 +538,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::BindingRef { .. }) => "BindingRef",
         Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
         Value::Deferred(DeferredValue::FunctionCall { .. }) => "FunctionCall",
+        Value::Deferred(DeferredValue::Access(_)) => "Access",
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret",
         Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",

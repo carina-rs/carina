@@ -254,7 +254,13 @@ coalesce_expr = { pipe_expr ~ ("??" ~ pipe_expr)? }
 pipe_expr = { compose_expr ~ ("|>" ~ function_call)* }
 
 // Compose operator: f >> g (function composition, binds tighter than |>)
-compose_expr = { primary ~ (">>" ~ primary)* }
+compose_expr = { postfix_expr ~ (">>" ~ postfix_expr)* }
+
+// Field/index access is a postfix operator on any primary value. Reference
+// primaries keep consuming their own suffixes so resource references retain
+// their AccessPath shape and for-expanded addresses such as `subnets[0]`
+// remain binding names.
+postfix_expr = { primary ~ (index_access | field_access)* }
 
 // Function call: func(args)
 function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
@@ -302,8 +308,11 @@ for_simple_binding = { discard_pattern | identifier }
 for_indexed_binding = { "(" ~ (discard_pattern | identifier) ~ "," ~ (discard_pattern | identifier) ~ ")" }
 for_map_binding = { (discard_pattern | identifier) ~ "," ~ (discard_pattern | identifier) }
 
-// For iterable: restricted to simple expressions to avoid ambiguity with body block
-for_iterable = { function_call | list | variable_ref | "(" ~ expression ~ ")" }
+// For iterable: restricted to simple expressions to avoid ambiguity with body block.
+// The restricted base still accepts postfix access without admitting resource/module
+// expressions that could consume the loop body.
+for_iterable = { for_iterable_primary ~ (index_access | field_access)* }
+for_iterable_primary = _{ function_call | list | variable_ref | "(" ~ expression ~ ")" }
 
 // For body: local let bindings followed by a resource expression or module call
 for_body = { for_local_binding* ~ (read_resource_expr | resource_expr | module_call) }

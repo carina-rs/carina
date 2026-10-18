@@ -150,6 +150,20 @@ Upstream state is bound with `let <binding> = upstream_state { source = "..." }`
 
 Use `let _ =` (the discard pattern) when you need to evaluate an expression but do not need to reference the result. See [Syntax: Discard Pattern](/reference/dsl/syntax/#discard-pattern) for details.
 
+### Field and Index Access
+
+Field access (`.field`) and indexing (`[0]` or `["key"]`) can follow any value expression, including a function result, a parenthesized pipe expression, or a computed `let` binding:
+
+```crn
+let parts = split(':', queue.arn)
+let account_id = parts[4]
+
+let resource_name = split('/', role.arn)[1]
+let queue_name = (queue.arn |> split(':'))[5]
+```
+
+Access on a value that is already known is evaluated immediately. Access whose base depends on a resource or upstream value is deferred until that value is available.
+
 ## Pipe Operator (`|>`)
 
 The pipe operator passes the result of the left expression as the last argument to the function on the right. This enables readable left-to-right data transformations.

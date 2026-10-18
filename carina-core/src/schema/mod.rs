@@ -213,6 +213,7 @@ fn walk_custom_lookup_on_path<'a>(
     if matches!(
         value,
         Value::Deferred(DeferredValue::FunctionCall { .. })
+            | Value::Deferred(DeferredValue::Access(_))
             | Value::Deferred(DeferredValue::ResourceRef { .. })
             | Value::Deferred(DeferredValue::Interpolation(_))
             | Value::Deferred(DeferredValue::Unknown(_))
@@ -5814,6 +5815,7 @@ impl Value {
             Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
                 format!("FunctionCall({})", name)
             }
+            Value::Deferred(DeferredValue::Access(_)) => "Access".to_string(),
             Value::Deferred(DeferredValue::Secret(_)) => "Secret".to_string(),
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret".to_string(),
             Value::Deferred(DeferredValue::Unknown(_)) => "Unknown".to_string(),

@@ -619,6 +619,10 @@ pub(crate) fn dsl_value_to_json(
                 context: ctx,
             })
         }
+        Value::Deferred(DeferredValue::Access(_)) => Err(SerializationError::UnresolvedAccess {
+            expression: carina_core::value::format_value(value),
+            context: ctx,
+        }),
         Value::Deferred(DeferredValue::Secret(_)) => {
             Err(SerializationError::SecretNotAllowed { context: ctx })
         }
