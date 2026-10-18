@@ -807,7 +807,7 @@ impl ShapeWalkBudget {
         }
     }
 
-    fn take(&mut self) -> bool {
+    pub(crate) fn take(&mut self) -> bool {
         let Some(next) = self.remaining.checked_sub(1) else {
             return false;
         };

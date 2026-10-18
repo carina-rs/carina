@@ -15,11 +15,10 @@ use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
 use crate::explicit::ExplicitFields;
-use crate::schema::{
-    AttributeType, DslMap, ResourceSchema, Shape, TypeIdentity, struct_fields_with_defs,
-};
+use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
@@ -40,6 +39,161 @@ impl<'a> EnumAttr<'a> {
     pub fn identity(&self) -> &'a TypeIdentity {
         self.identity
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EnumAttrError {
+    #[error("resource schema has no attribute `{path}`")]
+    SchemaAttributeNotFound { path: String },
+    #[error("resource schema has no struct field `{path}`")]
+    SchemaFieldNotFound { path: String },
+    #[error("resource schema traversal is too deep at `{path}`")]
+    SchemaTooDeep { path: String },
+    #[error("attribute `{path}` is not enum-typed")]
+    NotEnum { path: String },
+    #[error("attribute `{path}` is not struct-typed")]
+    NotStruct { path: String },
+    #[error("struct attribute `{path}` must contain a map value")]
+    StructValueNotMap { path: String },
+    #[error("enum attribute `{path}` has identity `{actual}`, but the schema expects `{expected}`")]
+    EnumIdentityMismatch {
+        path: String,
+        expected: Box<TypeIdentity>,
+        actual: Box<TypeIdentity>,
+    },
+    #[error("invalid enum attribute `{path}`: {value} does not exactly match a declared API value")]
+    NotAMember {
+        path: String,
+        value: ValueDescription,
+    },
+    #[error("invalid enum attribute `{path}`: expected a canonical enum or string, got {value}")]
+    UnexpectedShape {
+        path: String,
+        value: ValueDescription,
+    },
+}
+
+fn validate_enum_api_value<'a>(
+    identity: &'a TypeIdentity,
+    values: Option<&[String]>,
+    value: &Value,
+    api_value: &'a str,
+    path: &str,
+) -> Result<EnumAttr<'a>, EnumAttrError> {
+    if values.is_none_or(|values| values.iter().any(|value| value == api_value)) {
+        Ok(EnumAttr {
+            api_value,
+            identity,
+        })
+    } else {
+        Err(EnumAttrError::NotAMember {
+            path: path.to_string(),
+            value: ValueDescription::of(value),
+        })
+    }
+}
+
+fn enum_attr_for_value<'a>(
+    schema: &'a ResourceSchema,
+    attr_type: &'a AttributeType,
+    value: Option<&'a Value>,
+    path: &str,
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError> {
+    let Shape::Enum {
+        identity, values, ..
+    } = schema.shape_of(attr_type)
+    else {
+        return Err(EnumAttrError::NotEnum {
+            path: path.to_string(),
+        });
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.identity() == identity => {
+            validate_enum_api_value(identity, values, value, c.api_value(), path).map(Some)
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            Err(EnumAttrError::EnumIdentityMismatch {
+                path: path.to_string(),
+                expected: Box::new(identity.clone()),
+                actual: Box::new(c.identity().clone()),
+            })
+        }
+        Value::Concrete(ConcreteValue::String(s)) => {
+            validate_enum_api_value(identity, values, value, s.expose_plaintext(), path).map(Some)
+        }
+        _ => Err(EnumAttrError::UnexpectedShape {
+            path: path.to_string(),
+            value: ValueDescription::of(value),
+        }),
+    }
+}
+
+fn enum_attr_type_at_schema_path<'a>(
+    schema: &'a ResourceSchema,
+    root_attr: &str,
+    path: &[&str],
+) -> Result<(&'a AttributeType, String), EnumAttrError> {
+    let mut attr_type = &schema
+        .attributes
+        .get(root_attr)
+        .ok_or_else(|| EnumAttrError::SchemaAttributeNotFound {
+            path: root_attr.to_string(),
+        })?
+        .attr_type;
+    let mut attr_path = root_attr.to_string();
+    let mut budget = ShapeWalkBudget::new(64);
+
+    for segment in path {
+        while let Shape::List { element_type, .. } = schema.shape_of(attr_type) {
+            if !budget.take() {
+                return Err(EnumAttrError::SchemaTooDeep { path: attr_path });
+            }
+            attr_type = element_type;
+        }
+
+        if !matches!(schema.shape_of(attr_type), Shape::Struct { .. }) {
+            return Err(EnumAttrError::NotStruct { path: attr_path });
+        }
+        let fields = schema
+            .struct_fields_with_budget(attr_type, &mut budget)
+            .ok_or_else(|| EnumAttrError::SchemaTooDeep {
+                path: attr_path.clone(),
+            })?;
+        attr_path.push('.');
+        attr_path.push_str(segment);
+        attr_type = &fields
+            .iter()
+            .find(|field| field.name == *segment)
+            .ok_or_else(|| EnumAttrError::SchemaFieldNotFound {
+                path: attr_path.clone(),
+            })?
+            .field_type;
+    }
+
+    Ok((attr_type, attr_path))
+}
+
+/// Project a leaf value at an enum-typed resource schema path into its provider
+/// API spelling.
+///
+/// The path starts at `root_attr` and descends through named struct fields.
+/// Ordered and unordered list element types are peeled only at intermediate
+/// positions before a named segment. Map and union positions are not traversed,
+/// and the leaf is validated without peeling, so a list-of-enum leaf is
+/// [`EnumAttrError::NotEnum`]. `value` is the leaf value already reached by the
+/// caller. `Ok(None)` is returned only when that value is absent.
+pub fn enum_attr_at_schema_path<'a>(
+    schema: &'a ResourceSchema,
+    root_attr: &str,
+    path: &[&str],
+    value: Option<&'a Value>,
+) -> Result<Option<EnumAttr<'a>>, EnumAttrError> {
+    let (attr_type, attr_path) = enum_attr_type_at_schema_path(schema, root_attr, path)?;
+    enum_attr_for_value(schema, attr_type, value, &attr_path)
 }
 
 /// Opaque resource identity.
@@ -3826,68 +3980,57 @@ impl Resource {
         self.attributes.get(key)
     }
 
+    /// Get an enum attribute using its provider API spelling.
+    ///
+    /// `Ok(None)` is returned only when the resource attribute is absent.
+    /// Schema and present-value errors are returned as [`EnumAttrError`].
     pub fn get_enum_attr<'a>(
         &'a self,
         schema: &'a ResourceSchema,
         name: &str,
-    ) -> Option<EnumAttr<'a>> {
-        let attr_schema = schema.attributes.get(name)?;
-        let value = self.get_attr(name)?;
-        self.enum_attr_for_type(value, &attr_schema.attr_type, schema)
+    ) -> Result<Option<EnumAttr<'a>>, EnumAttrError> {
+        enum_attr_at_schema_path(schema, name, &[], self.get_attr(name))
     }
 
+    /// Get an enum field from a struct-valued resource attribute.
+    ///
+    /// The root schema attribute must resolve directly to a struct; a list of
+    /// structs is not accepted by this accessor.
+    ///
+    /// `Ok(None)` is returned only when the struct attribute or requested field
+    /// value is absent. Schema and present-value errors are returned as
+    /// [`EnumAttrError`].
     pub fn get_enum_struct_field<'a>(
         &'a self,
         schema: &'a ResourceSchema,
         struct_attr: &str,
         field_name: &str,
-    ) -> Option<EnumAttr<'a>> {
-        let attr_schema = schema.attributes.get(struct_attr)?;
-        let Shape::Struct { .. } = schema.shape_of(&attr_schema.attr_type) else {
-            return None;
-        };
-        let field = struct_fields_with_defs(&attr_schema.attr_type, &schema.defs)?
-            .iter()
-            .find(|field| field.name == field_name)?;
-        let value = self.get_attr(struct_attr)?;
-        let Value::Concrete(ConcreteValue::Map(map)) = value else {
-            return None;
-        };
-        let value = map.get(field_name)?;
-        self.enum_attr_for_type(value, &field.field_type, schema)
-    }
-
-    fn enum_attr_for_type<'a>(
-        &'a self,
-        value: &'a Value,
-        attr_type: &'a AttributeType,
-        schema: &'a ResourceSchema,
-    ) -> Option<EnumAttr<'a>> {
-        let Shape::Enum {
-            identity, values, ..
-        } = schema.shape_of(attr_type)
-        else {
-            return None;
-        };
-        let resolver = EnumValueResolver::with_defs(attr_type, &schema.defs);
-
-        match value {
-            Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.identity() == identity => {
-                Some(EnumAttr {
-                    api_value: c.api_value(),
-                    identity,
-                })
-            }
-            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                let canonical = resolver.resolve_raw(raw).ok()?;
-                enum_attr_from_resolved_text(identity, values, raw.as_str(), &canonical)
-            }
-            Value::Concrete(ConcreteValue::String(s)) => {
-                let canonical = resolver.resolve_state_text(s.expose_plaintext()).ok()?;
-                enum_attr_from_resolved_text(identity, values, s.expose_plaintext(), &canonical)
-            }
-            _ => None,
+    ) -> Result<Option<EnumAttr<'a>>, EnumAttrError> {
+        let attr_type = &schema
+            .attributes
+            .get(struct_attr)
+            .ok_or_else(|| EnumAttrError::SchemaAttributeNotFound {
+                path: struct_attr.to_string(),
+            })?
+            .attr_type;
+        if !matches!(schema.shape_of(attr_type), Shape::Struct { .. }) {
+            return Err(EnumAttrError::NotStruct {
+                path: struct_attr.to_string(),
+            });
         }
+
+        let (field_type, path) = enum_attr_type_at_schema_path(schema, struct_attr, &[field_name])?;
+
+        let value = match self.get_attr(struct_attr) {
+            None => None,
+            Some(Value::Concrete(ConcreteValue::Map(map))) => map.get(field_name),
+            Some(_) => {
+                return Err(EnumAttrError::StructValueNotMap {
+                    path: struct_attr.to_string(),
+                });
+            }
+        };
+        enum_attr_for_value(schema, field_type, value, &path)
     }
 
     /// Get a mutable attribute value by key, returning `Option<&mut Value>`.
@@ -3927,29 +4070,6 @@ impl Resource {
     }
 }
 
-fn enum_attr_from_resolved_text<'a>(
-    identity: &'a TypeIdentity,
-    values: Option<&'a [String]>,
-    input: &'a str,
-    canonical: &CanonicalEnumValue,
-) -> Option<EnumAttr<'a>> {
-    if canonical.identity() != identity {
-        return None;
-    }
-    let api_value = values
-        .into_iter()
-        .flatten()
-        .find(|value| value.as_str() == canonical.api_value())
-        .map_or_else(
-            || (input == canonical.api_value()).then_some(input),
-            |value| Some(value.as_str()),
-        )?;
-    Some(EnumAttr {
-        api_value,
-        identity,
-    })
-}
-
 #[cfg(test)]
 mod enum_attr_tests {
     use super::*;
@@ -3969,6 +4089,25 @@ mod enum_attr_tests {
         enum_identity("Status", Some("aws.s3.BucketVersioning"))
     }
 
+    fn open_status_enum_type() -> AttributeType {
+        AttributeType::enum_(status_identity(), None, vec![], None, None)
+    }
+
+    fn ip_protocol_enum_type() -> AttributeType {
+        AttributeType::enum_(
+            enum_identity("IpProtocol", Some("aws.ec2.SecurityGroupRule")),
+            Some(
+                ["tcp", "udp", "icmp", "icmpv6", "-1"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            vec![("-1".to_string(), "all".to_string())],
+            None,
+            None,
+        )
+    }
+
     fn mfa_delete_status_identity() -> TypeIdentity {
         enum_identity("Status", Some("aws.s3.MfaDelete"))
     }
@@ -3985,6 +4124,38 @@ mod enum_attr_tests {
     fn schema_with_options(fields: Vec<StructField>) -> ResourceSchema {
         ResourceSchema::new("aws.s3.BucketVersioning")
             .attribute(AttributeSchema::new("options", options_struct_type(fields)))
+    }
+
+    fn schema_with_rule_statements(
+        statements_type: AttributeType,
+        protocol_type: AttributeType,
+    ) -> ResourceSchema {
+        ResourceSchema::new("aws.ec2.SecurityGroup")
+            .with_def(
+                "Rule",
+                AttributeType::struct_(
+                    "Rule",
+                    vec![StructField::new("statements", statements_type)],
+                ),
+            )
+            .with_def(
+                "Statement",
+                AttributeType::struct_(
+                    "Statement",
+                    vec![StructField::new("protocol", protocol_type)],
+                ),
+            )
+            .attribute(AttributeSchema::new(
+                "rules",
+                AttributeType::list(AttributeType::ref_("Rule")),
+            ))
+    }
+
+    fn schema_with_nested_rule_protocol(protocol_type: AttributeType) -> ResourceSchema {
+        schema_with_rule_statements(
+            AttributeType::unordered_list(AttributeType::ref_("Statement")),
+            protocol_type,
+        )
     }
 
     fn resource_with_attr(name: &str, value: ConcreteValue) -> Resource {
@@ -4010,67 +4181,327 @@ mod enum_attr_tests {
     fn assert_struct_field_enabled(resource: &Resource, schema: &ResourceSchema) {
         let attr = resource
             .get_enum_struct_field(schema, "options", "dns_support")
-            .unwrap();
+            .expect("valid enum field")
+            .expect("present enum field");
 
         assert_eq!(attr.api_value(), "Enabled");
         assert_eq!(attr.identity(), &status_identity());
     }
 
     #[test]
-    fn returns_none_when_attribute_absent() {
+    fn attribute_absent_is_ok_none() {
         let schema = schema_with_status();
         let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
-        assert!(resource.get_enum_attr(&schema, "status").is_none());
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "status"),
+            Ok(None)
+        ));
     }
 
     #[test]
-    fn returns_none_when_schema_attribute_is_not_enum() {
+    fn missing_schema_attribute_is_an_error() {
+        let schema = schema_with_status();
+        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "missing"),
+            Err(EnumAttrError::SchemaAttributeNotFound { path }) if path == "missing"
+        ));
+    }
+
+    #[test]
+    fn non_enum_attribute_is_an_error() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
             .attribute(AttributeSchema::new("name", AttributeType::string()));
         let resource = resource_with_attr("name", ConcreteValue::String("x".into()));
 
-        assert!(resource.get_enum_attr(&schema, "name").is_none());
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "name"),
+            Err(EnumAttrError::NotEnum { path }) if path == "name"
+        ));
     }
 
     #[test]
-    fn resolves_canonical_enum_for_matching_identity() {
+    fn matching_canonical_enum_is_returned() {
         let schema = schema_with_status();
         let resource = resource_with_attr("status", canonical_status("Enabled"));
 
-        let attr = resource.get_enum_attr(&schema, "status").unwrap();
+        let attr = resource
+            .get_enum_attr(&schema, "status")
+            .expect("valid enum")
+            .expect("present enum");
 
         assert_eq!(attr.api_value(), "Enabled");
         assert_eq!(attr.identity(), &status_identity());
     }
 
     #[test]
-    fn resolves_enum_identifier_through_resolver() {
+    fn matching_canonical_enum_with_non_member_api_value_is_an_error() {
+        let schema = schema_with_status();
+        let resource = resource_with_attr("status", canonical_status("Retired"));
+
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "status"),
+            Err(EnumAttrError::NotAMember { path, .. }) if path == "status"
+        ));
+    }
+
+    #[test]
+    fn enum_identifier_is_an_error() {
         let schema = schema_with_status();
         let resource = resource_with_attr(
             "status",
             ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
         );
 
-        let attr = resource.get_enum_attr(&schema, "status").unwrap();
-
-        assert_eq!(attr.api_value(), "Enabled");
-        assert_eq!(attr.identity(), &status_identity());
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "status"),
+            Err(EnumAttrError::UnexpectedShape { path, .. }) if path == "status"
+        ));
     }
 
     #[test]
-    fn resolves_string_through_resolver() {
+    fn exact_closed_enum_string_is_returned_as_is() {
         let schema = schema_with_status();
         let resource = resource_with_attr("status", ConcreteValue::String("Enabled".into()));
 
-        let attr = resource.get_enum_attr(&schema, "status").unwrap();
+        let attr = resource
+            .get_enum_attr(&schema, "status")
+            .expect("valid enum")
+            .expect("present enum");
 
         assert_eq!(attr.api_value(), "Enabled");
         assert_eq!(attr.identity(), &status_identity());
     }
 
     #[test]
-    fn rejects_canonical_enum_with_mismatched_identity() {
+    fn folded_closed_enum_string_is_an_error() {
+        let schema = schema_with_status();
+        let resource = resource_with_attr("status", ConcreteValue::String("enabled".into()));
+
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "status"),
+            Err(EnumAttrError::NotAMember { path, .. }) if path == "status"
+        ));
+    }
+
+    #[test]
+    fn dsl_alias_is_not_accepted_as_a_string_api_value() {
+        let schema = ResourceSchema::new("aws.ec2.SecurityGroupRule")
+            .attribute(AttributeSchema::new("protocol", ip_protocol_enum_type()));
+        let alias = Value::Concrete(ConcreteValue::String("all".into()));
+        let api_value = Value::Concrete(ConcreteValue::String("-1".into()));
+
+        assert!(matches!(
+            enum_attr_at_schema_path(&schema, "protocol", &[], Some(&alias)),
+            Err(EnumAttrError::NotAMember { path, .. }) if path == "protocol"
+        ));
+
+        let attr = enum_attr_at_schema_path(&schema, "protocol", &[], Some(&api_value))
+            .expect("API spelling is valid")
+            .expect("protocol is present");
+        assert_eq!(attr.api_value(), "-1");
+    }
+
+    #[test]
+    fn nested_list_struct_schema_path_returns_valid_member() {
+        let schema = schema_with_nested_rule_protocol(ip_protocol_enum_type());
+        let value = Value::Concrete(ConcreteValue::String("tcp".into()));
+
+        let attr =
+            enum_attr_at_schema_path(&schema, "rules", &["statements", "protocol"], Some(&value))
+                .expect("valid nested enum")
+                .expect("nested enum is present");
+
+        assert_eq!(attr.api_value(), "tcp");
+    }
+
+    #[test]
+    fn nested_list_struct_schema_path_returns_matching_canonical_enum() {
+        let schema = schema_with_nested_rule_protocol(ip_protocol_enum_type());
+        let value = Value::Concrete(ConcreteValue::CanonicalEnum(
+            CanonicalEnumValue::new_for_test(
+                enum_identity("IpProtocol", Some("aws.ec2.SecurityGroupRule")),
+                "tcp",
+            ),
+        ));
+
+        let attr =
+            enum_attr_at_schema_path(&schema, "rules", &["statements", "protocol"], Some(&value))
+                .expect("valid nested enum")
+                .expect("nested enum is present");
+
+        assert_eq!(attr.api_value(), "tcp");
+        assert_eq!(
+            attr.identity(),
+            &enum_identity("IpProtocol", Some("aws.ec2.SecurityGroupRule"))
+        );
+    }
+
+    #[test]
+    fn nested_list_struct_schema_path_rejects_non_member() {
+        let schema = schema_with_nested_rule_protocol(ip_protocol_enum_type());
+        let value = Value::Concrete(ConcreteValue::String("gre".into()));
+
+        assert!(matches!(
+            enum_attr_at_schema_path(
+                &schema,
+                "rules",
+                &["statements", "protocol"],
+                Some(&value),
+            ),
+            Err(EnumAttrError::NotAMember { path, .. })
+                if path == "rules.statements.protocol"
+        ));
+    }
+
+    #[test]
+    fn nested_list_struct_schema_path_reports_missing_segment() {
+        let schema = schema_with_nested_rule_protocol(ip_protocol_enum_type());
+        let value = Value::Concrete(ConcreteValue::String("tcp".into()));
+
+        assert!(matches!(
+            enum_attr_at_schema_path(
+                &schema,
+                "rules",
+                &["statements", "missing"],
+                Some(&value),
+            ),
+            Err(EnumAttrError::SchemaFieldNotFound { path })
+                if path == "rules.statements.missing"
+        ));
+    }
+
+    #[test]
+    fn nested_list_struct_schema_path_reports_non_struct_segment() {
+        let schema = schema_with_nested_rule_protocol(ip_protocol_enum_type());
+
+        assert!(matches!(
+            enum_attr_at_schema_path(
+                &schema,
+                "rules",
+                &["statements", "protocol", "member"],
+                None,
+            ),
+            Err(EnumAttrError::NotStruct { path })
+                if path == "rules.statements.protocol"
+        ));
+    }
+
+    #[test]
+    fn nested_map_struct_schema_path_is_not_peeled() {
+        let schema = schema_with_rule_statements(
+            AttributeType::map(AttributeType::ref_("Statement")),
+            ip_protocol_enum_type(),
+        );
+
+        assert!(matches!(
+            enum_attr_at_schema_path(
+                &schema,
+                "rules",
+                &["statements", "protocol"],
+                None,
+            ),
+            Err(EnumAttrError::NotStruct { path }) if path == "rules.statements"
+        ));
+    }
+
+    #[test]
+    fn nested_union_struct_schema_path_is_not_peeled() {
+        let schema = schema_with_rule_statements(
+            AttributeType::union(vec![
+                AttributeType::ref_("Statement"),
+                AttributeType::string(),
+            ]),
+            ip_protocol_enum_type(),
+        );
+
+        assert!(matches!(
+            enum_attr_at_schema_path(
+                &schema,
+                "rules",
+                &["statements", "protocol"],
+                None,
+            ),
+            Err(EnumAttrError::NotStruct { path }) if path == "rules.statements"
+        ));
+    }
+
+    #[test]
+    fn self_referential_list_schema_path_exhausts_the_walk_budget() {
+        let schema = ResourceSchema::new("aws.ec2.SecurityGroup")
+            .with_def(
+                "Recursive",
+                AttributeType::list(AttributeType::ref_("Recursive")),
+            )
+            .attribute(AttributeSchema::new(
+                "rules",
+                AttributeType::ref_("Recursive"),
+            ));
+
+        assert!(matches!(
+            enum_attr_at_schema_path(&schema, "rules", &["protocol"], None),
+            Err(EnumAttrError::SchemaTooDeep { path }) if path == "rules"
+        ));
+    }
+
+    #[test]
+    fn nested_list_struct_schema_path_rejects_non_enum_leaf() {
+        let schema = schema_with_nested_rule_protocol(AttributeType::string());
+        let value = Value::Concrete(ConcreteValue::String("tcp".into()));
+
+        assert!(matches!(
+            enum_attr_at_schema_path(
+                &schema,
+                "rules",
+                &["statements", "protocol"],
+                Some(&value),
+            ),
+            Err(EnumAttrError::NotEnum { path }) if path == "rules.statements.protocol"
+        ));
+    }
+
+    #[test]
+    fn nested_list_enum_leaf_is_not_peeled() {
+        let schema = schema_with_nested_rule_protocol(AttributeType::list(ip_protocol_enum_type()));
+
+        assert!(matches!(
+            enum_attr_at_schema_path(&schema, "rules", &["statements", "protocol"], None,),
+            Err(EnumAttrError::NotEnum { path }) if path == "rules.statements.protocol"
+        ));
+    }
+
+    #[test]
+    fn nested_list_struct_schema_path_absent_value_is_ok_none() {
+        let schema = schema_with_nested_rule_protocol(ip_protocol_enum_type());
+
+        assert!(matches!(
+            enum_attr_at_schema_path(&schema, "rules", &["statements", "protocol"], None,),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn open_enum_string_is_returned_verbatim() {
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning")
+            .attribute(AttributeSchema::new("status", open_status_enum_type()));
+        let resource = resource_with_attr(
+            "status",
+            ConcreteValue::String("vendor_VALUE-with-MixedCase".into()),
+        );
+
+        let attr = resource
+            .get_enum_attr(&schema, "status")
+            .expect("valid enum")
+            .expect("present enum");
+
+        assert_eq!(attr.api_value(), "vendor_VALUE-with-MixedCase");
+        assert_eq!(attr.identity(), &status_identity());
+    }
+
+    #[test]
+    fn mismatched_canonical_enum_identity_is_an_error() {
         let schema = schema_with_status();
         let resource = resource_with_attr(
             "status",
@@ -4080,19 +4511,58 @@ mod enum_attr_tests {
             )),
         );
 
-        assert!(resource.get_enum_attr(&schema, "status").is_none());
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "status"),
+            Err(EnumAttrError::EnumIdentityMismatch { path, .. }) if path == "status"
+        ));
     }
 
     #[test]
-    fn returns_none_for_int_value_in_enum_schema() {
+    fn non_enum_value_shape_is_an_error() {
         let schema = schema_with_status();
         let resource = resource_with_attr("status", ConcreteValue::Int(1));
 
-        assert!(resource.get_enum_attr(&schema, "status").is_none());
+        assert!(matches!(
+            resource.get_enum_attr(&schema, "status"),
+            Err(EnumAttrError::UnexpectedShape { path, .. }) if path == "status"
+        ));
     }
 
     #[test]
-    fn resolves_ref_typed_attribute_through_defs() {
+    fn invalid_sensitive_string_is_redacted_in_error_display() {
+        let schema = schema_with_status();
+        let secret = "enum-secret-that-must-not-leak";
+        let resource = resource_with_attr(
+            "status",
+            ConcreteValue::String(ValueString::diagnostic_sensitive(secret)),
+        );
+
+        let error = match resource.get_enum_attr(&schema, "status") {
+            Err(error) => error,
+            Ok(_) => panic!("invalid closed enum member must fail"),
+        };
+
+        assert!(matches!(&error, EnumAttrError::NotAMember { .. }));
+        assert!(!error.to_string().contains(secret));
+    }
+
+    #[test]
+    fn invalid_public_string_is_in_error_display() {
+        let schema = schema_with_status();
+        let invalid = "Retired";
+        let resource = resource_with_attr("status", ConcreteValue::String(invalid.into()));
+
+        let error = match resource.get_enum_attr(&schema, "status") {
+            Err(error) => error,
+            Ok(_) => panic!("invalid closed enum member must fail"),
+        };
+
+        assert!(matches!(&error, EnumAttrError::NotAMember { .. }));
+        assert!(error.to_string().contains(invalid));
+    }
+
+    #[test]
+    fn ref_typed_attribute_is_resolved_through_defs() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
             .with_def("VersioningStatus", status_enum_type())
             .attribute(AttributeSchema::new(
@@ -4101,14 +4571,16 @@ mod enum_attr_tests {
             ));
         let cases = [
             canonical_status("Enabled"),
-            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
             ConcreteValue::String("Enabled".into()),
         ];
 
         for value in cases {
             let resource = resource_with_attr("status", value);
 
-            let attr = resource.get_enum_attr(&schema, "status").unwrap();
+            let attr = resource
+                .get_enum_attr(&schema, "status")
+                .expect("valid enum")
+                .expect("present enum");
 
             assert_eq!(attr.api_value(), "Enabled");
             assert_eq!(attr.identity(), &status_identity());
@@ -4116,44 +4588,91 @@ mod enum_attr_tests {
     }
 
     #[test]
-    fn struct_field_returns_none_when_struct_attribute_absent() {
+    fn struct_attribute_absent_is_ok_none() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
-        assert!(
-            resource
-                .get_enum_struct_field(&schema, "options", "dns_support")
-                .is_none()
-        );
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Ok(None)
+        ));
     }
 
     #[test]
-    fn struct_field_returns_none_when_struct_attribute_is_not_map() {
+    fn struct_value_that_is_not_a_map_is_an_error() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = resource_with_attr("options", ConcreteValue::String("Enabled".into()));
 
-        assert!(
+        assert!(matches!(
             resource
-                .get_enum_struct_field(&schema, "options", "dns_support")
-                .is_none()
-        );
+                .get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::StructValueNotMap { path }) if path == "options"
+        ));
     }
 
     #[test]
-    fn struct_field_returns_none_when_struct_schema_does_not_declare_field() {
+    fn missing_struct_schema_field_is_an_error() {
         let schema =
             schema_with_options(vec![StructField::new("dns_hostnames", status_enum_type())]);
         let resource = resource_with_options(vec![("dns_support", canonical_status("Enabled"))]);
 
-        assert!(
+        assert!(matches!(
             resource
-                .get_enum_struct_field(&schema, "options", "dns_support")
-                .is_none()
-        );
+                .get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::SchemaFieldNotFound { path }) if path == "options.dns_support"
+        ));
     }
 
     #[test]
-    fn struct_field_returns_none_when_field_is_not_enum_in_schema() {
+    fn non_struct_schema_attribute_is_an_error() {
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning")
+            .attribute(AttributeSchema::new("options", AttributeType::string()));
+        let resource = resource_with_attr("options", ConcreteValue::String("Enabled".into()));
+
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::NotStruct { path }) if path == "options"
+        ));
+    }
+
+    #[test]
+    fn list_struct_schema_is_not_a_struct_field_accessor_when_value_is_absent() {
+        let schema =
+            ResourceSchema::new("aws.s3.BucketVersioning").attribute(AttributeSchema::new(
+                "options",
+                AttributeType::list(options_struct_type(vec![StructField::new(
+                    "dns_support",
+                    status_enum_type(),
+                )])),
+            ));
+        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::NotStruct { path }) if path == "options"
+        ));
+    }
+
+    #[test]
+    fn list_struct_schema_is_not_a_struct_field_accessor_when_value_is_present() {
+        let schema =
+            ResourceSchema::new("aws.s3.BucketVersioning").attribute(AttributeSchema::new(
+                "options",
+                AttributeType::list(options_struct_type(vec![StructField::new(
+                    "dns_support",
+                    status_enum_type(),
+                )])),
+            ));
+        let resource = resource_with_attr("options", ConcreteValue::List(Vec::new()));
+
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::NotStruct { path }) if path == "options"
+        ));
+    }
+
+    #[test]
+    fn non_enum_struct_field_is_an_error() {
         let schema = schema_with_options(vec![StructField::new(
             "dns_support",
             AttributeType::string(),
@@ -4163,27 +4682,40 @@ mod enum_attr_tests {
             ConcreteValue::String("Enabled".into()),
         )]);
 
-        assert!(
+        assert!(matches!(
             resource
-                .get_enum_struct_field(&schema, "options", "dns_support")
-                .is_none()
-        );
+                .get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::NotEnum { path }) if path == "options.dns_support"
+        ));
     }
 
     #[test]
-    fn struct_field_returns_none_when_field_absent_in_map() {
+    fn absent_struct_attribute_does_not_hide_non_enum_field() {
+        let schema = schema_with_options(vec![StructField::new(
+            "dns_support",
+            AttributeType::string(),
+        )]);
+        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::NotEnum { path }) if path == "options.dns_support"
+        ));
+    }
+
+    #[test]
+    fn struct_field_absent_from_map_is_ok_none() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = resource_with_options(vec![("dns_hostnames", canonical_status("Enabled"))]);
 
-        assert!(
-            resource
-                .get_enum_struct_field(&schema, "options", "dns_support")
-                .is_none()
-        );
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Ok(None)
+        ));
     }
 
     #[test]
-    fn struct_field_resolves_canonical_enum_for_matching_identity() {
+    fn struct_field_accepts_matching_canonical_enum() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = resource_with_options(vec![("dns_support", canonical_status("Enabled"))]);
 
@@ -4191,18 +4723,21 @@ mod enum_attr_tests {
     }
 
     #[test]
-    fn struct_field_resolves_enum_identifier_through_resolver() {
+    fn struct_field_rejects_enum_identifier() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = resource_with_options(vec![(
             "dns_support",
             ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
         )]);
 
-        assert_struct_field_enabled(&resource, &schema);
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::UnexpectedShape { path, .. }) if path == "options.dns_support"
+        ));
     }
 
     #[test]
-    fn struct_field_resolves_string_through_resolver() {
+    fn struct_field_accepts_exact_closed_enum_string() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = resource_with_options(vec![(
             "dns_support",
@@ -4213,7 +4748,21 @@ mod enum_attr_tests {
     }
 
     #[test]
-    fn struct_field_rejects_canonical_enum_with_mismatched_identity() {
+    fn struct_field_rejects_folded_closed_enum_string() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = resource_with_options(vec![(
+            "dns_support",
+            ConcreteValue::String("enabled".into()),
+        )]);
+
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::NotAMember { path, .. }) if path == "options.dns_support"
+        ));
+    }
+
+    #[test]
+    fn struct_field_rejects_mismatched_canonical_enum_identity() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = resource_with_options(vec![(
             "dns_support",
@@ -4223,11 +4772,11 @@ mod enum_attr_tests {
             )),
         )]);
 
-        assert!(
-            resource
-                .get_enum_struct_field(&schema, "options", "dns_support")
-                .is_none()
-        );
+        assert!(matches!(
+            resource.get_enum_struct_field(&schema, "options", "dns_support"),
+            Err(EnumAttrError::EnumIdentityMismatch { path, .. })
+                if path == "options.dns_support"
+        ));
     }
 
     #[test]
@@ -4243,7 +4792,6 @@ mod enum_attr_tests {
             ));
         let cases = [
             canonical_status("Enabled"),
-            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
             ConcreteValue::String("Enabled".into()),
         ];
 
@@ -4267,7 +4815,6 @@ mod enum_attr_tests {
             ));
         let cases = [
             canonical_status("Enabled"),
-            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
             ConcreteValue::String("Enabled".into()),
         ];
 
