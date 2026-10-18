@@ -241,7 +241,7 @@ mod tests {
         let id = ResourceId::with_identity("aws.route53.RecordSet", "r");
         let deferred = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamBareRef {
+                UnknownReason::UpstreamAllExports {
                     binding: "management_route53".into(),
                 },
             ))),

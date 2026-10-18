@@ -3354,7 +3354,7 @@ pub fn add_state_block_effects(
     desired_resources: &[Resource],
     // carina#3329: resolved bindings + the set of upstream-state
     // binding names whose surviving refs are stamped as
-    // `Value::Deferred(DeferredValue::Unknown(UpstreamRef { … }))`.
+    // `Value::Deferred(DeferredValue::Unknown(UpstreamExport { … }))`.
     // The `id = "${X.attr}|…"` interpolation inside an `import` block
     // is resolved here against the same view that the differ uses for
     // resource attributes (`resolve_refs_for_plan`), so a deferred
@@ -3399,7 +3399,7 @@ pub fn add_state_block_effects(
                     // to a `Value::Concrete(ConcreteValue::String)`; if
                     // it is an `upstream_state` binding whose state has
                     // not been published yet, it is stamped as
-                    // `Value::Deferred(DeferredValue::Unknown(UpstreamRef))`
+                    // `Value::Deferred(DeferredValue::Unknown(UpstreamExport))`
                     // for display. The pre-#3329 path stored a partially-
                     // substituted `String` and dropped the deferred-ref
                     // signal entirely.

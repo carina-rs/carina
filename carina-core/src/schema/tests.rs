@@ -8851,7 +8851,7 @@ fn validate_skips_value_unknown_for_primitive_types() {
     assert!(AttributeType::int().validate(&unknown).is_ok());
     assert!(AttributeType::bool().validate(&unknown).is_ok());
 
-    let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+    let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
     assert!(AttributeType::string().validate(&upstream).is_ok());

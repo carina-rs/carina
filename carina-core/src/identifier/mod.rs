@@ -577,11 +577,12 @@ fn deterministic_value_string(value: &Value) -> String {
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::UnknownReason;
+            // Variant labels feed identity hashes; keep them stable across Rust renames.
             match reason {
-                UnknownReason::UpstreamRef { path } => {
+                UnknownReason::UpstreamExport { path } => {
                     format!("Unknown(UpstreamRef({}))", path.to_plaintext_dot_string())
                 }
-                UnknownReason::UpstreamBareRef { binding } => {
+                UnknownReason::UpstreamAllExports { binding } => {
                     format!("Unknown(UpstreamBareRef({}))", binding)
                 }
                 UnknownReason::ForKey => "Unknown(ForKey)".to_string(),

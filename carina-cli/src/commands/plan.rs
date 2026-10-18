@@ -3355,7 +3355,9 @@ mod plan_serialization_error_tests {
 
     fn upstream_unknown() -> Value {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }))
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+            path,
+        }))
     }
 
     #[test]
@@ -3363,12 +3365,12 @@ mod plan_serialization_error_tests {
         let err = value_to_json(&upstream_unknown()).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamRef { path },
+                reason: UnknownReason::UpstreamExport { path },
                 ..
             } => {
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
             }
-            other => panic!("expected UnknownNotAllowed/UpstreamRef, got: {other:?}"),
+            other => panic!("expected UnknownNotAllowed/UpstreamExport, got: {other:?}"),
         }
     }
 

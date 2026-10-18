@@ -2001,22 +2001,25 @@ impl Value {
 /// drift across reasons. See RFC #2371.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnknownReason {
-    /// Plan-time reference into an `upstream_state` binding that did not
-    /// resolve (state file missing, or the referenced export was absent).
+    /// One export reached through an attribute path on an `upstream_state`
+    /// binding that did not resolve (state file missing, or the export was absent).
     /// Renders as `(known after upstream apply: <path.to_dot_string()>)`.
-    /// Holds the original `AccessPath` so display retains subscripts and
+    /// Retains the original `AccessPath` so display preserves subscripts and
     /// chained field access (`network.accounts[0]`, `vpc.tags["Name"]`).
-    UpstreamRef { path: AccessPath },
-    /// Plan-time reference into an `upstream_state` binding written
-    /// without an attribute selector — `let v = bootstrap` (since the
-    /// type-split in #2856 lowers a bare identifier to
-    /// `Value::BindingRef`). Renders as
+    // Keep the wire tag independent of the Rust variant name.
+    #[serde(rename = "UpstreamRef")]
+    UpstreamExport { path: AccessPath },
+    /// The complete set of exports from an `upstream_state` binding referenced
+    /// without an attribute selector — `let v = bootstrap` (since the type-split
+    /// in #2856 lowers a bare identifier to `Value::BindingRef`). Renders as
     /// `(known after upstream apply: <binding>)`. Parallel to
-    /// `UpstreamRef`; kept as a distinct variant so the type system
+    /// `UpstreamExport`; kept as a distinct variant so the type system
     /// carries the "no attribute" condition rather than a runtime
-    /// `path.attribute().is_empty()` check inside `UpstreamRef`. See
+    /// `path.attribute().is_empty()` check inside `UpstreamExport`. See
     /// #2876.
-    UpstreamBareRef { binding: String },
+    // Keep the wire tag independent of the Rust variant name.
+    #[serde(rename = "UpstreamBareRef")]
+    UpstreamAllExports { binding: String },
     /// Map-binding key in a deferred for-expression
     /// (`for (k, _) in iterable`). Substituted with the actual key when
     /// the iterable is later resolved.
@@ -2609,13 +2612,13 @@ impl Value {
                     // Reuse `AccessPath`'s native `Hash` impl (matches
                     // the `ResourceRef` arm above) — no per-call String
                     // allocation.
-                    UnknownReason::UpstreamRef { path } => path.hash(hasher),
-                    UnknownReason::UpstreamBareRef { binding } => binding.hash(hasher),
+                    UnknownReason::UpstreamExport { path } => path.hash(hasher),
+                    UnknownReason::UpstreamAllExports { binding } => binding.hash(hasher),
                     UnknownReason::FnParam { name } | UnknownReason::FnLocal { name } => {
                         name.hash(hasher);
                     }
                     // Carries an `AccessPath` payload — hash it like
-                    // `UpstreamRef` so two distinct loop-var paths get
+                    // `UpstreamExport` so two distinct loop-var paths get
                     // distinct hashes.
                     UnknownReason::ForValuePath { path } => path.hash(hasher),
                     UnknownReason::PostCreateReadIncomplete { detail } => detail.hash(hasher),

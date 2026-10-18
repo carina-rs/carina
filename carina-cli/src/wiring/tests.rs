@@ -6607,7 +6607,7 @@ mod resolved_value_constraint_gate {
     #[tokio::test]
     async fn still_unknown_reference_is_not_rejected() {
         let normalizer = RewritingNormalizer::default();
-        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: AccessPath::new("producer", "value"),
         }));
 
@@ -6961,7 +6961,7 @@ exports { team_prefix: String = "x" }"#,
             message: "value must not be bad".to_string(),
         };
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
-        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: AccessPath::new("producer", "value"),
         }));
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::parser::StateBlockAddress;
-use crate::resource::{AccessPath, Resource, Subscript, ValueString};
+use crate::resource::{AccessPath, Resource, Subscript, UnknownReason, ValueString};
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, enum_identity,
 };
@@ -2573,6 +2573,25 @@ fn test_canonical_create_only_string_covers_concrete_scalars() {
             "beta".into(),
         ]))),
         Some("List([alpha, beta])".to_string())
+    );
+}
+
+#[test]
+fn upstream_unknown_identity_hash_strings_remain_stable() {
+    let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        path: AccessPath::new("network", "vpc_id"),
+    }));
+    assert_eq!(
+        deterministic_value_string(&export),
+        "Unknown(UpstreamRef(network.vpc_id))"
+    );
+
+    let all_exports = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
+        binding: "network".into(),
+    }));
+    assert_eq!(
+        deterministic_value_string(&all_exports),
+        "Unknown(UpstreamBareRef(network))"
     );
 }
 

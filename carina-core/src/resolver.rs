@@ -54,7 +54,7 @@ pub fn resolve_refs_with_state(
 /// plan path — it additionally stamps any surviving
 /// `ResourceRef` whose root binding is named in
 /// `bindings_upstream_keys` as
-/// `Value::Unknown(UnknownReason::UpstreamRef { path })` so plan
+/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))` so plan
 /// display can render it as `(known after upstream apply: <ref>)`
 /// instead of the raw dot-form.
 pub fn resolve_refs_with_state_and_remote(
@@ -68,7 +68,7 @@ pub fn resolve_refs_with_state_and_remote(
 /// Same input/output shape (pre-built `ResolvedBindings`), with the
 /// addition of `unresolved_upstream_bindings`: the set of upstream-
 /// state binding names whose surviving refs should be stamped as
-/// `Value::Unknown(UnknownReason::UpstreamRef { path })` for display.
+/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))` for display.
 /// `apply` continues to call the strict variant. See #2366 / RFC #2371.
 pub fn resolve_refs_for_plan(
     resources: &mut [Resource],
@@ -159,7 +159,7 @@ pub fn resolve_data_source_refs(
 /// Plan-only counterpart of [`resolve_data_source_refs`]. Mirrors
 /// [`resolve_refs_for_plan`]: takes the set of upstream-binding
 /// names whose surviving refs should be stamped as
-/// `Value::Unknown(UnknownReason::UpstreamRef { path })`.
+/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))`.
 pub fn resolve_data_source_refs_for_plan(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
@@ -248,14 +248,14 @@ fn stamp_unresolved_upstream(
             if upstream_binding_names.contains(path.binding()) =>
         {
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamRef { path },
+                crate::resource::UnknownReason::UpstreamExport { path },
             ))
         }
         Value::Deferred(DeferredValue::BindingRef { binding })
             if upstream_binding_names.contains(binding.as_str()) =>
         {
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamBareRef { binding },
+                crate::resource::UnknownReason::UpstreamAllExports { binding },
             ))
         }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
@@ -308,7 +308,7 @@ fn stamp_unresolved_upstream(
 /// Resolves `ResourceRef` segments against `bindings` and then stamps
 /// any surviving ref whose root binding is in
 /// `unresolved_upstream_bindings` as
-/// `Value::Deferred(DeferredValue::Unknown(UpstreamRef { path }))` so
+/// `Value::Deferred(DeferredValue::Unknown(UpstreamExport { path }))` so
 /// plan display renders it as `(known after upstream apply: …)`.
 ///
 /// Used by `carina_cli::wiring::add_state_block_effects` for the `id`
@@ -1855,7 +1855,7 @@ mod tests {
         // binding itself isn't loaded yet (e.g. plan-time before the
         // upstream apply has run). The resolver should keep the ref so
         // `resolve_refs_for_plan` can stamp it as
-        // `Unknown(UpstreamRef)`. Guards against a future refactor that
+        // `Unknown(UpstreamExport)`. Guards against a future refactor that
         // hoists the subscript walk above the binding-presence check.
         let mut resources = vec![make_resource(
             "policy",
@@ -2029,7 +2029,7 @@ mod tests {
 
     /// `resolve_refs_for_plan` stamps any surviving `ResourceRef` whose
     /// root binding is in `remote_bindings.keys()` as
-    /// `Value::Unknown(UnknownReason::UpstreamRef { path })`.
+    /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))`.
     #[test]
     fn test_resolve_refs_for_plan_stamps_top_level_unresolved_upstream() {
         use crate::resource::UnknownReason;
@@ -2052,10 +2052,12 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("vpc_id") {
-            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }))) => {
+            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+                path,
+            }))) => {
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
             }
-            other => panic!("expected Value::Unknown(UpstreamRef), got {:?}", other),
+            other => panic!("expected Value::Unknown(UpstreamExport), got {:?}", other),
         }
     }
 
@@ -2102,7 +2104,7 @@ mod tests {
     /// display as a plain identifier instead of the
     /// `(known after upstream apply: bootstrap)` form. #2876.
     #[test]
-    fn test_resolve_refs_for_plan_stamps_bare_upstream_binding_ref() {
+    fn test_resolve_refs_for_plan_stamps_upstream_all_exports_ref() {
         use crate::resource::UnknownReason;
         let mut resources = vec![make_resource(
             "consumer",
@@ -2121,21 +2123,24 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("raw") {
-            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamBareRef {
+            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
                 binding,
             }))) => {
                 assert_eq!(binding, "bootstrap");
             }
-            other => panic!("expected Value::Unknown(UpstreamBareRef), got {:?}", other),
+            other => panic!(
+                "expected Value::Unknown(UpstreamAllExports), got {:?}",
+                other
+            ),
         }
     }
 
-    /// Bare upstream refs nested inside a `List` must reach the
+    /// `UpstreamAllExports` unknowns nested inside a `List` must reach the
     /// stamping arm via the existing recursion. Locks in the recursive
-    /// contract symmetrically with the `UpstreamRef`-inside-list test
+    /// contract symmetrically with the `UpstreamExport`-inside-list test
     /// above. #2876.
     #[test]
-    fn test_resolve_refs_for_plan_stamps_bare_upstream_inside_list() {
+    fn test_resolve_refs_for_plan_stamps_upstream_all_exports_inside_list() {
         use crate::resource::UnknownReason;
         let mut resources = vec![make_resource(
             "consumer",
@@ -2166,9 +2171,9 @@ mod tests {
                     .iter()
                     .map(|v| match v {
                         Value::Deferred(DeferredValue::Unknown(
-                            UnknownReason::UpstreamBareRef { binding },
+                            UnknownReason::UpstreamAllExports { binding },
                         )) => binding.as_str(),
-                        other => panic!("expected UpstreamBareRef, got {:?}", other),
+                        other => panic!("expected UpstreamAllExports, got {:?}", other),
                     })
                     .collect();
                 assert_eq!(bindings, vec!["bootstrap", "secondary"]);
