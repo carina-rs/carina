@@ -2219,6 +2219,78 @@ fn prevent_destroy_does_not_block_create() {
 }
 
 #[test]
+fn route53_union_non_enum_literal_reaches_plan_as_string() {
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    };
+
+    let hosted_zone = AttributeType::enum_(
+        TypeIdentity::new(
+            Some("aws"),
+            ["route53", "RecordSet", "AliasTarget"],
+            "HostedZoneId",
+        ),
+        Some(vec!["Z2FDTNDATAQYW2".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("route53.RecordSet").attribute(AttributeSchema::new(
+            "alias_target",
+            AttributeType::struct_(
+                "AliasTarget",
+                vec![StructField::new(
+                    "hosted_zone_id",
+                    AttributeType::union(vec![hosted_zone, AttributeType::string()]),
+                )],
+            ),
+        )),
+    );
+    let literal = Value::Concrete(ConcreteValue::String("Z05136711ZXUHBDOA8D5O".into()));
+    let mut resources = vec![
+        Resource::with_provider("aws", "route53.RecordSet", "record", None).with_attribute(
+            "alias_target",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "hosted_zone_id".to_string(),
+                literal.clone(),
+            )]))),
+        ),
+    ];
+
+    crate::value::canonicalize_resources_with_schemas(&mut resources, &schemas)
+        .expect("the literal String arm must be selected before planning");
+    let plan = create_plan(
+        &resources,
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        !plan.has_errors(),
+        "unexpected plan errors: {:?}",
+        plan.errors()
+    );
+    let Effect::Create(resource) = &plan.effects()[0] else {
+        panic!("expected a Create effect, got {:?}", plan.effects()[0]);
+    };
+    let Some(Value::Concrete(ConcreteValue::Map(alias_target))) = resource.get_attr("alias_target")
+    else {
+        panic!("expected alias_target map in planned resource");
+    };
+    assert_eq!(alias_target.get("hosted_zone_id"), Some(&literal));
+}
+
+#[test]
 fn without_prevent_destroy_delete_works_normally() {
     // Orphaned resource without prevent_destroy should still be deleted normally
     let orphan_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");

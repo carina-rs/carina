@@ -240,6 +240,7 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
     ProviderContext {
         decryptor: None,
         validators,
+        custom_type_attribute_types: HashMap::new(),
         custom_type_validator: None,
         resource_types: Default::default(),
         customs_loaded: false,
@@ -2959,6 +2960,107 @@ fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
 }
 
 #[test]
+fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary() {
+    use crate::binding_index::ResolvedBindings;
+    use crate::parser::{ArgumentParameter, AttributeParameter, InferredExportParam};
+    use std::sync::{Arc, Mutex};
+
+    let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+    let schema_type = TypeExpr::SchemaType {
+        provider: "test".to_string(),
+        path: "widget".to_string(),
+        type_name: "Mode".to_string(),
+    };
+    let enum_type = AttributeType::enum_(
+        identity.clone(),
+        Some(vec!["API_VALUE".to_string()]),
+        vec![("API_VALUE".to_string(), "dsl_value".to_string())],
+        None,
+        None,
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_by_validator = Arc::clone(&seen);
+    let config = ProviderContext {
+        custom_type_attribute_types: HashMap::from([(identity, enum_type)]),
+        custom_type_validator: Some(Box::new(move |_identity, value| {
+            seen_by_validator
+                .lock()
+                .expect("validator observation lock")
+                .push(value.to_string());
+            Ok(())
+        })),
+        resource_types: HashSet::from([("test".to_string(), "widget".to_string())]),
+        ..ProviderContext::default()
+    };
+    let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
+
+    let module_calls = [ModuleCall::synthetic(
+        "child",
+        None,
+        HashMap::from([("mode".to_string(), authored())]),
+    )];
+    let imported_modules = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "mode".to_string(),
+                type_expr: schema_type.clone(),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    validate_module_calls(&module_calls, &imported_modules, &config)
+        .expect("module argument must validate");
+
+    validate_attribute_params(
+        &[AttributeParameter::new(
+            "mode".to_string(),
+            Some(schema_type.clone()),
+            Some(authored()),
+        )],
+        &config,
+    )
+    .expect("attribute parameter must validate");
+
+    let exports = [InferredExportParam {
+        name: "mode".to_string(),
+        type_expr: schema_type,
+        value: Some(authored()),
+    }];
+    check_export_values_pre_apply(&exports, &ResolvedBindings::default(), &config)
+        .expect("export must validate");
+
+    let parsed = crate::parser::parse(
+        r#"
+            fn consume(mode: test.widget.Mode) { "ok" }
+            let result = mock.test.resource {
+                name = consume(test.widget.Mode.dsl_value)
+            }
+        "#,
+        &config,
+    )
+    .expect("function argument must validate");
+    assert!(
+        matches!(
+            parsed.resources[0].get_attr("name"),
+            Some(Value::Concrete(ConcreteValue::String(value))) if value == "ok"
+        ),
+        "the static function call must be evaluated: {:?}",
+        parsed.resources[0].get_attr("name"),
+    );
+
+    assert_eq!(
+        *seen.lock().expect("validator observation lock"),
+        ["API_VALUE", "API_VALUE", "API_VALUE", "API_VALUE"],
+        "every TypeExpr consumer must resolve DSL spelling before calling the provider",
+    );
+}
+
+#[test]
 fn attribute_param_ref_type_mismatch_detected() {
     use crate::parser::AttributeParameter;
     use crate::schema::{AttributeSchema, ResourceSchema};
@@ -5626,8 +5728,14 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String> {
-        self.seen.lock().unwrap().push(attributes.clone());
+    fn validate_config(
+        &self,
+        attributes: &crate::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(attributes.attributes().clone());
         Ok(())
     }
 
@@ -5714,6 +5822,99 @@ fn validate_provider_config_skips_attributes_with_deferred_refs() {
         !seen.contains_key("assume_role"),
         "attribute containing a deferred ref must be filtered out; got: {seen:?}",
     );
+}
+
+#[test]
+fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
+    use crate::parser::ProviderConfig;
+
+    struct EnumRecordingFactory {
+        seen: ValidateConfigCallLog,
+    }
+
+    impl crate::provider::ProviderFactory for EnumRecordingFactory {
+        fn name(&self) -> &str {
+            "awscc"
+        }
+
+        fn display_name(&self) -> &str {
+            "awscc"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::from([(
+                "region".to_string(),
+                AttributeType::enum_(
+                    crate::schema::enum_identity("Region", Some("aws")),
+                    Some(vec!["ap-northeast-1".to_string()]),
+                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                    None,
+                    None,
+                ),
+            )])
+        }
+
+        fn validate_config(
+            &self,
+            attributes: &crate::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(attributes.attributes().clone());
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            String::new()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &crate::provider::ProviderReadyConfig,
+        ) -> futures::future::BoxFuture<
+            '_,
+            crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+        > {
+            unimplemented!("EnumRecordingFactory::create_provider is not used in this test")
+        }
+
+        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    let mut parsed = empty_parsed();
+    parsed.providers.push(ProviderConfig {
+        name: "awscc".to_string(),
+        attributes: IndexMap::from([(
+            "region".to_string(),
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "awscc.Region.ap_northeast_1",
+            )),
+        )]),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    });
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factories: Vec<Box<dyn crate::provider::ProviderFactory>> =
+        vec![Box::new(EnumRecordingFactory {
+            seen: std::sync::Arc::clone(&seen),
+        })];
+
+    validate_provider_config(&parsed, &factories).expect("enum config must validate");
+
+    let calls = seen.lock().unwrap();
+    assert!(matches!(
+        calls.last().and_then(|attrs| attrs.get("region")),
+        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+            if value.api_value() == "ap-northeast-1"
+    ));
 }
 
 #[test]

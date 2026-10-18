@@ -139,6 +139,7 @@ async fn main() {
         let provider_context = ProviderContext {
             decryptor: None,
             validators: HashMap::new(),
+            custom_type_attribute_types: HashMap::new(),
             custom_type_validator: None,
             resource_types: Default::default(),
             // Schemas load asynchronously after LSP initialize; the

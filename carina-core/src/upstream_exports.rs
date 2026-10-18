@@ -2223,7 +2223,7 @@ mod tests {
     #[test]
     fn type_check_walker_resolves_struct_block_name_alias() {
         // The walker's `Struct` arm resolves field keys via
-        // `build_accepted_field_map`, which honours `block_name`
+        // `struct_field_for_key`, which honours `block_name`
         // aliases. Without that resolution a ref written under the
         // alias would silently skip the type check (the alias key
         // wouldn't match any `field.name`). Pin the path: a field

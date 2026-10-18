@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use super::{
-    AttributeType, RefPathResolution, ResolvedAttrType, UnionCanonicalRank,
-    union_member_judgement_on_path,
-};
+use super::{AttributeType, ResolvedAttrType};
+#[cfg(test)]
+use super::{RefPathResolution, select_union_member_on_path};
+#[cfg(test)]
 use crate::resource::Value;
 
 /// Opaque storage for raw Union declarations.
@@ -176,11 +176,11 @@ impl<'a> UnionMembers<'a> {
         Some(ResolvedUnionMember::new(resolution.attr))
     }
 
-    /// Select the structurally best member through the same judgement used for
-    /// validation failure attribution. The strict maximum rank wins, leaving
-    /// declaration order as the tie-break; no structural match returns `None`.
-    /// Only the chosen member's Ref names remain on the caller's current
-    /// non-consuming path.
+    /// Select the best member from those that accept the complete value under
+    /// validation. Exact wire kind wins, then declaration order. Only the
+    /// chosen member's Ref names remain on the caller's current non-consuming
+    /// path; no accepting member returns `None`.
+    #[cfg(test)]
     pub(crate) fn select_on_path(
         &self,
         value: &Value,
@@ -193,20 +193,20 @@ impl<'a> UnionMembers<'a> {
                 visited_refs.push(name);
             }
         }
-        let mut best: Option<(UnionCanonicalRank, &AttributeType)> = None;
-        for member in self.members {
-            let judgement =
-                union_member_judgement_on_path(member, projected, self.defs, visited_refs);
-            if judgement.canonical_rank.is_match()
-                && best
-                    .as_ref()
-                    .is_none_or(|(previous, _)| judgement.canonical_rank > *previous)
-            {
-                best = Some((judgement.canonical_rank, member));
-            }
-        }
-
-        let Some((_, selected)) = best else {
+        let expected = self
+            .members
+            .iter()
+            .map(AttributeType::type_name)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let Ok(selected) = select_union_member_on_path(
+            self.members,
+            value,
+            projected,
+            expected,
+            self.defs,
+            visited_refs,
+        ) else {
             visited_refs.truncate(restore_len);
             return None;
         };

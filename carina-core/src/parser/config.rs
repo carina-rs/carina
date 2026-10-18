@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{SchemaRegistry, TypeIdentity};
+use crate::provider::CanonicalCustomTypeValue;
+use crate::schema::{AttributeType, SchemaRegistry, TypeIdentity};
 
 /// Signature for a custom type validator function.
 ///
@@ -19,7 +20,7 @@ pub type ValidatorFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// factory (e.g. a WASM provider) resolves the exact provider-scoped
 /// type instead of splitting a flat name string.
 pub type CustomTypeValidatorFn =
-    Box<dyn Fn(&TypeIdentity, &str) -> Result<(), String> + Send + Sync>;
+    Box<dyn Fn(&TypeIdentity, &CanonicalCustomTypeValue) -> Result<(), String> + Send + Sync>;
 
 /// Signature for a decryptor function.
 ///
@@ -39,6 +40,11 @@ pub struct ProviderContext {
     /// two providers' same-named custom types resolve to distinct
     /// validators instead of colliding first-wins.
     pub validators: HashMap<TypeIdentity, ValidatorFn>,
+    /// Host-declared schema types keyed by their structured identity.
+    /// Type-expression validation uses this map to resolve authored
+    /// [`crate::resource::RawEnumIdentifier`] values before any provider
+    /// validator is called.
+    pub custom_type_attribute_types: HashMap<TypeIdentity, AttributeType>,
     /// Factory-based custom type validator that calls through to provider factories
     /// (e.g., WASM plugins) for types not covered by `validators`.
     pub custom_type_validator: Option<CustomTypeValidatorFn>,
@@ -89,6 +95,10 @@ impl std::fmt::Debug for ProviderContext {
         f.debug_struct("ProviderContext")
             .field("decryptor", &self.decryptor.as_ref().map(|_| "..."))
             .field("validators", &self.validators.keys().collect::<Vec<_>>())
+            .field(
+                "custom_type_attribute_types",
+                &self.custom_type_attribute_types.keys().collect::<Vec<_>>(),
+            )
             .field(
                 "custom_type_validator",
                 &self.custom_type_validator.as_ref().map(|_| "..."),

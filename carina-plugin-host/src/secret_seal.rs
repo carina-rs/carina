@@ -51,6 +51,8 @@ impl GuestDesired {
 pub(crate) struct Unsealer {
     nonce_prefix: String,
     secrets: Vec<Value>,
+    host_attributes: Vec<indexmap::IndexMap<String, Value>>,
+    sent_attributes: Vec<HashMap<String, wit::Value>>,
     expected_resource_count: usize,
 }
 
@@ -141,6 +143,10 @@ impl RestoredDesired {
 
 pub(crate) fn seal(resources: &[Resource]) -> Result<(SealedDesired, Unsealer), SealError> {
     let nonce_prefix = format!("{TOKEN_NAMESPACE}:{}:", uuid::Uuid::new_v4().simple());
+    let host_attributes = resources
+        .iter()
+        .map(|resource| resource.attributes.clone())
+        .collect();
     let mut sealer = Sealer {
         nonce_prefix: nonce_prefix.clone(),
         secrets: Vec::new(),
@@ -156,12 +162,18 @@ pub(crate) fn seal(resources: &[Resource]) -> Result<(SealedDesired, Unsealer), 
         })
         .collect::<Result<Vec<_>, _>>()?;
     let expected_resource_count = resources.len();
+    let sent_attributes = resources
+        .iter()
+        .map(|resource| resource.attributes.iter().cloned().collect())
+        .collect();
 
     Ok((
         SealedDesired { resources },
         Unsealer {
             nonce_prefix,
             secrets: sealer.secrets,
+            host_attributes,
+            sent_attributes,
             expected_resource_count,
         },
     ))
@@ -212,11 +224,30 @@ impl Unsealer {
         }
         let mut resources = Vec::with_capacity(guest.resources.len());
 
-        for resource in guest.resources {
+        for (resource_index, resource) in guest.resources.into_iter().enumerate() {
+            let host_attributes = &self.host_attributes[resource_index];
+            let sent_attributes = &self.sent_attributes[resource_index];
+            let guest_wire_by_key: HashMap<&str, &wit::Value> = resource
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.as_str(), value))
+                .collect();
             let guest_attributes = wasm_convert::wit_to_core_value_map(&resource.attributes)?;
             let mut attributes = HashMap::with_capacity(guest_attributes.len());
             let mut skipped_attributes = Vec::new();
             for (key, mut value) in guest_attributes {
+                if let (Some(host_value), Some(sent_value), Some(guest_value)) = (
+                    host_attributes.get(&key),
+                    sent_attributes.get(&key),
+                    guest_wire_by_key.get(key.as_str()),
+                ) {
+                    preserve_wire_equal_host_values(
+                        host_value,
+                        sent_value,
+                        guest_value,
+                        &mut value,
+                    );
+                }
                 // A token cannot be restored into a string key, so any token
                 // material in a key is structurally mangled.
                 if key.contains(&self.nonce_prefix) || !self.restore_value(&mut value) {
@@ -330,9 +361,158 @@ impl Unsealer {
     }
 }
 
+fn preserve_wire_equal_host_values(
+    host: &Value,
+    sent: &wit::Value,
+    returned: &wit::Value,
+    guest: &mut Value,
+) {
+    if same_wire_value(sent, returned) {
+        *guest = host.clone();
+        return;
+    }
+
+    let (sent_json, returned_json) = match (sent, returned) {
+        (wit::Value::StringListVal(sent), wit::Value::StringListVal(returned))
+        | (wit::Value::ListVal(sent), wit::Value::ListVal(returned))
+        | (wit::Value::MapVal(sent), wit::Value::MapVal(returned))
+        | (wit::Value::SecretVal(sent), wit::Value::SecretVal(returned)) => (
+            serde_json::from_str::<serde_json::Value>(sent),
+            serde_json::from_str::<serde_json::Value>(returned),
+        ),
+        (
+            wit::Value::StrVal(_)
+            | wit::Value::IntVal(_)
+            | wit::Value::FloatVal(_)
+            | wit::Value::BoolVal(_),
+            _,
+        )
+        | (
+            _,
+            wit::Value::StrVal(_)
+            | wit::Value::IntVal(_)
+            | wit::Value::FloatVal(_)
+            | wit::Value::BoolVal(_),
+        ) => return,
+        _ => return,
+    };
+    if let (Ok(sent_json), Ok(returned_json)) = (sent_json, returned_json) {
+        preserve_equal_json_subtrees(host, &sent_json, &returned_json, guest);
+    }
+}
+
+fn preserve_equal_json_subtrees(
+    host: &Value,
+    sent: &serde_json::Value,
+    returned: &serde_json::Value,
+    guest: &mut Value,
+) {
+    if sent == returned {
+        *guest = host.clone();
+        return;
+    }
+
+    match (host, sent, returned, guest) {
+        (
+            Value::Concrete(ConcreteValue::Map(host_entries)),
+            serde_json::Value::Object(sent_entries),
+            serde_json::Value::Object(returned_entries),
+            Value::Concrete(ConcreteValue::Map(guest_entries)),
+        ) => {
+            for (key, guest_value) in guest_entries {
+                let (Some(host_value), Some(sent_value), Some(returned_value)) = (
+                    host_entries.get(key),
+                    sent_entries.get(key),
+                    returned_entries.get(key),
+                ) else {
+                    continue;
+                };
+                preserve_equal_json_subtrees(host_value, sent_value, returned_value, guest_value);
+            }
+        }
+        (
+            Value::Concrete(ConcreteValue::List(host_items)),
+            serde_json::Value::Array(sent_items),
+            serde_json::Value::Array(returned_items),
+            Value::Concrete(ConcreteValue::List(guest_items)),
+        ) if sent_items.len() == returned_items.len()
+            && host_items.len() == sent_items.len()
+            && guest_items.len() == returned_items.len() =>
+        {
+            for (((host_item, sent_item), returned_item), guest_item) in host_items
+                .iter()
+                .zip(sent_items)
+                .zip(returned_items)
+                .zip(guest_items)
+            {
+                preserve_equal_json_subtrees(host_item, sent_item, returned_item, guest_item);
+            }
+        }
+        (
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall { .. }
+                | DeferredValue::Secret(_)
+                | DeferredValue::RedactedSecret { .. }
+                | DeferredValue::Unknown(_),
+            ),
+            _,
+            _,
+            _,
+        )
+        | (Value::Concrete(ConcreteValue::Map(_) | ConcreteValue::List(_)), _, _, _) => {}
+    }
+}
+
+/// Compare the exact provider wire forms so an echoed enum string can retain
+/// the richer host-side type that was intentionally erased for transport.
+fn same_wire_value(left: &wit::Value, right: &wit::Value) -> bool {
+    match (left, right) {
+        (wit::Value::StrVal(left), wit::Value::StrVal(right)) => left == right,
+        (wit::Value::StringListVal(left), wit::Value::StringListVal(right))
+        | (wit::Value::ListVal(left), wit::Value::ListVal(right))
+        | (wit::Value::MapVal(left), wit::Value::MapVal(right))
+        | (wit::Value::SecretVal(left), wit::Value::SecretVal(right)) => {
+            same_json_wire_value(left, right)
+        }
+        (wit::Value::IntVal(left), wit::Value::IntVal(right)) => left == right,
+        (wit::Value::FloatVal(left), wit::Value::FloatVal(right)) => {
+            left.to_bits() == right.to_bits()
+        }
+        (wit::Value::BoolVal(left), wit::Value::BoolVal(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// JSON-backed wire variants use semantic JSON equality because guests may
+/// reserialize an unchanged subtree with different insignificant formatting.
+fn same_json_wire_value(left: &str, right: &str) -> bool {
+    left == right
+        || matches!(
+            (
+                serde_json::from_str::<serde_json::Value>(left),
+                serde_json::from_str::<serde_json::Value>(right),
+            ),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use carina_core::resource::{ConcreteValue, DeferredValue};
+    use carina_core::schema::{AttributeType, TypeIdentity};
     use indexmap::IndexMap;
 
     use super::*;
@@ -349,6 +529,41 @@ mod tests {
         let mut resource = Resource::with_provider("mock", "test.resource", "test", None);
         resource.attributes.insert(name.to_string(), value);
         resource
+    }
+
+    fn mode_enum_type() -> AttributeType {
+        AttributeType::enum_(
+            TypeIdentity::new(Some("mock"), ["test", "resource"], "Mode"),
+            Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
+    fn canonical_mode(mode: &str) -> Value {
+        let canonical = carina_core::resource::EnumValueResolver::new(&mode_enum_type())
+            .resolve_state_text(mode)
+            .expect("the test mode must resolve");
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical))
+    }
+
+    fn rewrite_json_attribute(
+        payload: &mut SealedDesired,
+        attribute: &str,
+        rewrite: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let value = guest_attribute_mut(payload, attribute);
+        let json = match value {
+            wit::Value::StringListVal(json)
+            | wit::Value::ListVal(json)
+            | wit::Value::MapVal(json)
+            | wit::Value::SecretVal(json) => json,
+            other => panic!("{attribute} must use a JSON-backed wire value, got {other:?}"),
+        };
+        let mut decoded = serde_json::from_str(json).expect("test wire JSON must decode");
+        rewrite(&mut decoded);
+        *json = serde_json::to_string(&decoded).expect("test wire JSON must encode");
     }
 
     fn payload_strings(payload: &SealedDesired) -> Vec<&str> {
@@ -448,6 +663,134 @@ mod tests {
                 "a guest resource count mismatch must be a boundary error"
             );
         }
+    }
+
+    #[test]
+    fn echoed_enum_wire_value_keeps_host_typing_and_plan_display() {
+        let enum_type = AttributeType::enum_(
+            TypeIdentity::new(
+                Some("aws"),
+                ["route53", "RecordSet", "AliasTarget"],
+                "HostedZoneId",
+            ),
+            Some(vec!["Z2FDTNDATAQYW2".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let canonical = carina_core::resource::EnumValueResolver::new(&enum_type)
+            .resolve_raw(&carina_core::resource::RawEnumIdentifier::parse(
+                "Z2FDTNDATAQYW2",
+            ))
+            .expect("the identifier must resolve through the Enum arm of the union");
+        let original = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
+        let alias_target = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "hosted_zone_id".to_string(),
+            original.clone(),
+        )])));
+        let mut resources = vec![resource_with_attribute("alias_target", alias_target)];
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
+
+        // The guest echoes the exact StrVal wire representation it received.
+        let restored = unsealer.restore(take_guest_resources(&mut payload));
+        restored.apply_to(&mut resources);
+
+        let Value::Concrete(ConcreteValue::Map(normalized_alias_target)) = resources[0]
+            .get_attr("alias_target")
+            .expect("the normalized attribute must remain present")
+        else {
+            panic!("alias_target must remain a typed map");
+        };
+        let normalized = normalized_alias_target
+            .get("hosted_zone_id")
+            .expect("the nested enum must remain present");
+        assert_eq!(normalized, &original);
+        assert_eq!(
+            carina_core::value::format_value(normalized),
+            "Z2FDTNDATAQYW2",
+            "plan-value display must retain identifier rendering rather than adding quotes"
+        );
+    }
+
+    #[test]
+    fn partial_nested_change_preserves_unchanged_enum_typing_and_relifts_changed_leaf() {
+        let unchanged = canonical_mode("Enabled");
+        let changed = canonical_mode("Enabled");
+        let settings = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("unchanged".to_string(), unchanged.clone()),
+            ("changed".to_string(), changed),
+        ])));
+        let mut resources = vec![resource_with_attribute("settings", settings)];
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
+        rewrite_json_attribute(&mut payload, "settings", |json| {
+            json["changed"] = serde_json::Value::String("Disabled".to_string());
+        });
+
+        let restored = unsealer.restore(take_guest_resources(&mut payload));
+        restored.apply_to(&mut resources);
+
+        let Some(Value::Concrete(ConcreteValue::Map(settings))) = resources[0].get_attr("settings")
+        else {
+            panic!("settings must remain a map");
+        };
+        assert_eq!(settings.get("unchanged"), Some(&unchanged));
+        assert_eq!(
+            carina_core::value::format_value(settings.get("unchanged").unwrap()),
+            "Enabled",
+            "an unchanged enum leaf must keep unquoted plan rendering"
+        );
+        assert_eq!(settings.get("changed"), Some(&string("Disabled")));
+
+        let mut registry = carina_core::schema::SchemaRegistry::new();
+        registry.insert(
+            "mock",
+            carina_core::schema::ResourceSchema::new("test.resource").attribute(
+                carina_core::schema::AttributeSchema::new(
+                    "settings",
+                    AttributeType::map(mode_enum_type()),
+                ),
+            ),
+        );
+        carina_core::value::canonicalize_normalized_resources_with_schemas(
+            &mut resources,
+            &registry,
+        )
+        .expect("the changed guest string must be re-lifted by the normalizer pipeline");
+        let Some(Value::Concrete(ConcreteValue::Map(settings))) = resources[0].get_attr("settings")
+        else {
+            panic!("settings must remain a map after re-lifting");
+        };
+        assert!(matches!(
+            settings.get("changed"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "Disabled"
+        ));
+    }
+
+    #[test]
+    fn length_changed_list_uses_the_complete_guest_list() {
+        let mut resources = vec![resource_with_attribute(
+            "modes",
+            Value::Concrete(ConcreteValue::List(vec![canonical_mode("Enabled")])),
+        )];
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
+        rewrite_json_attribute(&mut payload, "modes", |json| {
+            json.as_array_mut()
+                .expect("modes must encode as an array")
+                .push(serde_json::Value::String("Disabled".to_string()));
+        });
+
+        let restored = unsealer.restore(take_guest_resources(&mut payload));
+        restored.apply_to(&mut resources);
+
+        assert_eq!(
+            resources[0].get_attr("modes"),
+            Some(&Value::Concrete(ConcreteValue::List(vec![
+                string("Enabled"),
+                string("Disabled"),
+            ]))),
+            "a changed list length makes the whole list guest-owned"
+        );
     }
 
     #[test]

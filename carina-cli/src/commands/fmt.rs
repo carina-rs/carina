@@ -467,7 +467,7 @@ mod tests {
 
         fn validate_config(
             &self,
-            _attributes: &IndexMap<String, Value>,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> std::result::Result<(), String> {
             Ok(())
         }

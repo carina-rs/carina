@@ -109,8 +109,12 @@ impl DiagnosticEngine {
         let provider_context = carina_core::parser::ProviderContext {
             decryptor: None,
             validators: carina_core::provider::collect_custom_type_validators(&schemas),
+            custom_type_attribute_types: carina_core::provider::collect_custom_type_attribute_types(
+                &schemas,
+            ),
             custom_type_validator: Some(Box::new(
-                move |identity: &carina_core::schema::TypeIdentity, value: &str| {
+                move |identity: &carina_core::schema::TypeIdentity,
+                      value: &carina_core::provider::CanonicalCustomTypeValue| {
                     for factory in factories_clone.iter() {
                         factory.validate_custom_type(identity, value)?;
                     }

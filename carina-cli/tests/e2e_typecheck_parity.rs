@@ -751,7 +751,10 @@ impl ProviderFactory for TestProviderFactory {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -1493,17 +1496,20 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
         HashMap::new()
     }
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
     fn validate_custom_type(
         &self,
         identity: &carina_core::schema::TypeIdentity,
-        value: &str,
+        value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> Result<(), String> {
         // Mirror awscc's `prefixed` validator family: VpcId must start
         // with "vpc-".
-        if identity.kind == "VpcId" && !value.starts_with("vpc-") {
+        if identity.kind == "VpcId" && !value.as_str().starts_with("vpc-") {
             return Err(format!(
                 "Invalid vpc_id '{}': must start with 'vpc-'",
                 value

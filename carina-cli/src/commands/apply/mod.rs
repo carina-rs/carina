@@ -1715,7 +1715,7 @@ async fn run_apply_locked(
             &mut saved_attrs,
             &state_file,
             &state_block_claims,
-        ));
+        )?);
         pairs
     };
     // Wait bindings become passthrough aliases to their targets

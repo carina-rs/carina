@@ -13,8 +13,8 @@ use std::pin::Pin;
 use crate::effect::PlanOp;
 use crate::parser::ProviderConfig;
 use crate::resource::{
-    ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
-    ResourceId, ResourceIdentity, State, Value,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker,
+    ResolvedResource, Resource, ResourceId, ResourceIdentity, State, Value, ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
@@ -24,7 +24,8 @@ use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
 pub use crate::executor::provider_ready::{
-    ProviderReady, ProviderReadyConfig, ProviderReadyDataSource, ProviderReadyResource,
+    CanonicalProviderConfigAttributes, ProviderReady, ProviderReadyConfig, ProviderReadyDataSource,
+    ProviderReadyResource,
 };
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
@@ -212,6 +213,13 @@ impl std::error::Error for ProviderError {
             .cause
             .as_ref()
             .map(|e| e.as_ref() as &dyn std::error::Error)
+    }
+}
+
+impl From<crate::value::EnumCanonicalizationError> for ProviderError {
+    fn from(error: crate::value::EnumCanonicalizationError) -> Self {
+        let message = error.to_string();
+        Self::invalid_input(message).with_cause(error)
     }
 }
 
@@ -1909,8 +1917,13 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
                 context: crate::value::SerializationContext::WasmBoundary,
             })
         }
+        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => {
+            Err(SerializationError::UnresolvedEnumIdentifier {
+                value: value.to_string(),
+                context: crate::value::SerializationContext::WasmBoundary,
+            })
+        }
         Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
         | Value::Concrete(ConcreteValue::Int(_))
         | Value::Concrete(ConcreteValue::Float(_))
@@ -1966,6 +1979,7 @@ pub fn merge_default_tags(
             }
             Err(
                 source @ (SerializationError::NonFiniteFloat { .. }
+                | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::RedactedSecretNotAllowed { .. }),
             ) => {
                 return Err(ProviderError::invalid_input(format!(
@@ -2228,6 +2242,52 @@ impl ProviderNormalizer for ProviderRouter {
     }
 }
 
+/// Provider-facing text whose DSL spelling has already been resolved by the
+/// host.
+///
+/// The inner string is private and there is no public constructor, so an
+/// implementation of [`ProviderFactory`] can inspect API spelling but a caller
+/// outside `carina-core` cannot manufacture this capability from raw DSL text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalCustomTypeValue(String);
+
+impl CanonicalCustomTypeValue {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Produce provider-facing text from a literal at a non-enum custom-type
+    /// position. Enum positions must resolve through [`Self::from_canonical_enum`].
+    pub(crate) fn from_literal_string(value: &ValueString) -> Self {
+        Self(value.expose_plaintext().to_string())
+    }
+
+    /// Produce provider-facing API spelling from a schema-resolved enum.
+    pub(crate) fn from_canonical_enum(value: &CanonicalEnumValue) -> Self {
+        Self(value.api_value().to_string())
+    }
+}
+
+impl std::ops::Deref for CanonicalCustomTypeValue {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for CanonicalCustomTypeValue {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for CanonicalCustomTypeValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Factory for creating and configuring a Provider.
 ///
 /// Each provider crate implements this trait to encapsulate provider-specific
@@ -2254,7 +2314,20 @@ pub trait ProviderFactory: Send + Sync {
     /// expressed in the attribute type schema (e.g., cross-attribute
     /// consistency checks). Type-level validation is handled by the host
     /// using [`provider_config_attribute_types`] before this is called.
-    fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String>;
+    ///
+    /// A raw attribute map cannot be passed to this boundary:
+    ///
+    /// ```compile_fail
+    /// use carina_core::provider::ProviderFactory;
+    /// use carina_core::resource::Value;
+    /// use indexmap::IndexMap;
+    ///
+    /// fn bypass(factory: &dyn ProviderFactory, raw: &IndexMap<String, Value>) {
+    ///     factory.validate_config(raw).unwrap();
+    /// }
+    /// ```
+    fn validate_config(&self, attributes: &CanonicalProviderConfigAttributes)
+    -> Result<(), String>;
 
     /// Validate a value against a provider-defined custom type.
     /// Returns `Ok(())` if the value is valid or the type is unknown to this provider.
@@ -2262,8 +2335,24 @@ pub trait ProviderFactory: Send + Sync {
     ///
     /// `identity` is the structured [`TypeIdentity`] of the type, so a
     /// provider resolves the exact provider-scoped type instead of
-    /// splitting a flat name string.
-    fn validate_custom_type(&self, _identity: &TypeIdentity, _value: &str) -> Result<(), String> {
+    /// splitting a flat name string. Raw DSL text cannot be passed to this
+    /// boundary:
+    ///
+    /// ```compile_fail
+    /// use carina_core::provider::ProviderFactory;
+    /// use carina_core::schema::TypeIdentity;
+    ///
+    /// fn bypass(factory: &dyn ProviderFactory) {
+    ///     factory
+    ///         .validate_custom_type(&TypeIdentity::bare("Mode"), "raw.dsl.text")
+    ///         .unwrap();
+    /// }
+    /// ```
+    fn validate_custom_type(
+        &self,
+        _identity: &TypeIdentity,
+        _value: &CanonicalCustomTypeValue,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -2326,21 +2415,6 @@ pub trait ProviderFactory: Send + Sync {
     ) -> std::collections::HashMap<String, Vec<crate::schema::CompletionValue>> {
         std::collections::HashMap::new()
     }
-
-    /// Maps a DSL alias value back to the canonical AWS value.
-    ///
-    /// For example, `("ec2.security_group_ingress", "ip_protocol", "all")` returns
-    /// `Some("-1")` because `"all"` is a DSL alias for the AWS value `"-1"`.
-    ///
-    /// Returns `None` if no alias mapping exists (the value is already canonical).
-    fn get_enum_alias_reverse(
-        &self,
-        _resource_type: &str,
-        _attr_name: &str,
-        _value: &str,
-    ) -> Option<String> {
-        None
-    }
 }
 
 /// Find a factory by provider name.
@@ -2396,6 +2470,78 @@ pub fn collect_custom_type_validators(
     }
 
     validators
+}
+
+/// Collect every identity-bearing schema type used by type-expression
+/// validation.
+///
+/// The retained [`AttributeType`] is the authority needed to turn an authored
+/// enum identifier into provider API spelling. Walking each definition once
+/// mirrors [`collect_custom_type_validators`] and avoids recursively following
+/// cyclic [`crate::schema::AttrTypeKind::Ref`] graphs.
+pub fn collect_custom_type_attribute_types(
+    registry: &SchemaRegistry,
+) -> HashMap<TypeIdentity, crate::schema::AttributeType> {
+    let mut types = HashMap::new();
+    for (_provider, _resource_type, _kind, schema) in registry.iter() {
+        for attr_schema in schema.attributes.values() {
+            collect_identified_attribute_types_from_type(&attr_schema.attr_type, &mut types);
+        }
+        for def in schema.defs.values() {
+            collect_identified_attribute_types_from_type(def, &mut types);
+        }
+    }
+    types
+}
+
+fn collect_identified_attribute_types_from_type(
+    attr_type: &crate::schema::AttributeType,
+    types: &mut HashMap<TypeIdentity, crate::schema::AttributeType>,
+) {
+    use crate::schema::RawShape;
+
+    match attr_type.raw_shape() {
+        RawShape::String {
+            identity: Some(identity),
+            ..
+        }
+        | RawShape::Int {
+            identity: Some(identity),
+            ..
+        }
+        | RawShape::Float {
+            identity: Some(identity),
+            ..
+        }
+        | RawShape::Enum { identity, .. } => {
+            types
+                .entry(identity.clone())
+                .or_insert_with(|| attr_type.clone());
+        }
+        RawShape::List { element_type, .. } => {
+            collect_identified_attribute_types_from_type(element_type, types);
+        }
+        RawShape::Map { key, value } => {
+            collect_identified_attribute_types_from_type(key, types);
+            collect_identified_attribute_types_from_type(value, types);
+        }
+        RawShape::Struct { fields, .. } => {
+            for field in fields {
+                collect_identified_attribute_types_from_type(&field.field_type, types);
+            }
+        }
+        RawShape::Union(members) => {
+            for member in members {
+                collect_identified_attribute_types_from_type(member, types);
+            }
+        }
+        RawShape::Ref(_)
+        | RawShape::String { identity: None, .. }
+        | RawShape::Int { identity: None, .. }
+        | RawShape::Float { identity: None, .. }
+        | RawShape::Bool
+        | RawShape::Duration => {}
+    }
 }
 
 /// Collect custom type identities from a registry without allocating
@@ -2605,6 +2751,28 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enum_canonicalization_error_becomes_invalid_provider_input_with_cause() {
+        let mut resources = vec![
+            Resource::with_provider("test", "widget", "example", None).with_attribute(
+                "mode",
+                Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.invalid")),
+            ),
+        ];
+        let error = crate::value::canonicalize_resources_with_schemas(
+            &mut resources,
+            &SchemaRegistry::new(),
+        )
+        .expect_err("an untyped enum identifier must be rejected");
+        let message = error.to_string();
+
+        let provider_error = ProviderError::from(error);
+
+        assert!(matches!(provider_error, ProviderError::InvalidInput(_)));
+        assert_eq!(provider_error.message(), message);
+        assert!(std::error::Error::source(&provider_error).is_some());
+    }
 
     #[test]
     fn raw_legacy_persisted_attributes_require_a_state_row_constructor() {
@@ -4314,7 +4482,10 @@ mod tests {
             ) -> HashMap<String, crate::schema::AttributeType> {
                 HashMap::new()
             }
-            fn validate_config(&self, _attrs: &IndexMap<String, Value>) -> Result<(), String> {
+            fn validate_config(
+                &self,
+                _attrs: &CanonicalProviderConfigAttributes,
+            ) -> Result<(), String> {
                 Ok(())
             }
             fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
@@ -4400,7 +4571,10 @@ mod tests {
             ) -> HashMap<String, crate::schema::AttributeType> {
                 HashMap::new()
             }
-            fn validate_config(&self, _attrs: &IndexMap<String, Value>) -> Result<(), String> {
+            fn validate_config(
+                &self,
+                _attrs: &CanonicalProviderConfigAttributes,
+            ) -> Result<(), String> {
                 Ok(())
             }
             fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {

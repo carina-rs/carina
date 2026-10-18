@@ -1,7 +1,7 @@
 //! Shared utility functions for value normalization and conversion
 
-use crate::resource::{ConcreteValue, Value, ValueString};
-use crate::schema::{AttributeType, EnumParts};
+use crate::resource::{ConcreteValue, Value};
+use crate::schema::AttributeType;
 
 pub(crate) fn truncate_chars_for_display(value: &str, max_chars: usize) -> (String, &'static str) {
     let mut chars = value.chars();
@@ -396,40 +396,6 @@ pub(crate) fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&st
     extract_enum_value(s)
 }
 
-/// Canonicalize one `Enum` value to its API spelling: strip any
-/// namespace prefix with `extract_enum_value_with_values` then map the
-/// DSL alias to the API form via [`crate::schema::DslMap::api_for`].
-///
-/// This exact-match helper is part of the provider-facing API and is used by
-/// provider `api_canonicalize` normalizers. Core comparison, pairing, and plan
-/// rendering operate on typed [`crate::resource::RawEnumIdentifier`] values
-/// and share that type's API → DSL → API comparison fold instead.
-///
-/// ```
-/// use carina_core::schema::DslMap;
-/// use carina_core::utils::canonicalize_enum_to_api;
-///
-/// let aliases = [("Allow".to_string(), "allow".to_string())];
-/// let dsl_map = DslMap::new(&aliases, None);
-/// let valid = &["Allow", "Deny"];
-/// // DSL alias → API spelling
-/// assert_eq!(canonicalize_enum_to_api("allow", valid, &dsl_map), "Allow");
-/// // Already-canonical round-trips to itself
-/// assert_eq!(canonicalize_enum_to_api("Allow", valid, &dsl_map), "Allow");
-/// // Namespaced form is stripped, then canonicalized
-/// assert_eq!(
-///     canonicalize_enum_to_api("aws.x.Mode.allow", valid, &dsl_map),
-///     "Allow"
-/// );
-/// ```
-pub fn canonicalize_enum_to_api(
-    s: &str,
-    valid_values: &[&str],
-    dsl_map: &crate::schema::DslMap<'_>,
-) -> String {
-    dsl_map.api_for(extract_enum_value_with_values(s, valid_values))
-}
-
 /// Validate namespace format for an enum identifier.
 ///
 /// Handles the following formats:
@@ -612,11 +578,7 @@ pub(crate) fn lift_saved_state_enum_leaves(
             crate::schema::SchemaKind::Resource,
         ) {
             lift_state_enum_leaves(attrs, schema);
-            crate::value::canonicalize_attribute_map_with_schema(
-                attrs,
-                schema,
-                crate::value::EnumIdentifierPhase::StateText,
-            );
+            crate::value::canonicalize_state_attribute_map_with_schema(attrs, schema);
         }
     }
 }
@@ -874,37 +836,6 @@ fn is_dynamic_dsl_member_segment(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
 }
 
-/// Normalize a single state enum value to its fully-qualified namespaced DSL format.
-///
-/// This handles values that contain dots but are raw enum values (for example,
-/// `"ipsec.1"`) rather than already-namespaced identifiers. It uses
-/// `enum_parts` from the attribute type to distinguish between the two cases.
-///
-/// Returns `None` if the value doesn't need normalization.
-pub fn normalize_state_enum_value(
-    value: &Value,
-    parts: &EnumParts<'_>,
-    enum_check: Option<&dyn Fn(&str) -> bool>,
-) -> Option<Value> {
-    let (identity, _, _, _, dsl_map) = parts;
-    let type_name = identity.kind.as_str();
-    let ns = identity.dotted_prefix()?;
-    if let Value::Concrete(ConcreteValue::String(s)) = value {
-        // Skip values already in namespaced DSL format.
-        // A value that contains '.' but is not already namespaced is a raw enum value
-        // like "ipsec.1" -- check if it matches a known valid enum value.
-        let already_namespaced = s.expose_plaintext().contains('.')
-            && !enum_check.is_some_and(|check| check(s.expose_plaintext()));
-        if !already_namespaced {
-            let dsl_val = dsl_map.dsl_for(s.expose_plaintext());
-            return Some(Value::Concrete(ConcreteValue::String(
-                ValueString::derived_from(format!("{}.{}.{}", ns, type_name, dsl_val), [s]),
-            )));
-        }
-    }
-    None
-}
-
 /// Convert a region value from DSL format to AWS SDK format.
 ///
 /// Handles the following patterns:
@@ -933,18 +864,13 @@ pub fn convert_region_value(value: &str) -> String {
     value.to_string()
 }
 
-/// Resolve a provider config's `region` attribute to an AWS-SDK region
-/// string, falling back to `default_region` when the attribute is
-/// absent or carried in a shape that is not a region.
+/// Read a provider-ready config's `region` attribute, falling back to
+/// `default_region` when it is absent or unresolved.
 ///
-/// Accepts both quoted-string (`region = "us-east-1"`,
-/// `ConcreteValue::String`) and namespaced-identifier (`region =
-/// aws.Region.us_east_1`, `ConcreteValue::EnumIdentifier`) shapes —
-/// both are how the parser stores the `region` value depending on
-/// how the user wrote it. carina#3021 was an instance of this site
-/// matching only the `String` arm; namespaced identifiers silently
-/// fell through to the caller's hardcoded default region, which
-/// silently broke multi-region named provider instances.
+/// Enum-typed configs reach this helper as [`ConcreteValue::CanonicalEnum`]
+/// after host schema resolution. A [`ConcreteValue::String`] is always a
+/// literal and is returned unchanged; this helper never strips or folds text
+/// that merely resembles DSL enum syntax.
 ///
 /// This is the single source of truth for "given a provider config's
 /// attribute map, what region string should the SDK use" — every
@@ -958,13 +884,6 @@ pub fn convert_region_value(value: &str) -> String {
 /// use carina_core::utils::extract_region_from_attrs;
 /// use indexmap::IndexMap;
 ///
-/// let mut attrs = IndexMap::new();
-/// attrs.insert(
-///     "region".to_string(),
-///     Value::Concrete(ConcreteValue::enum_identifier("aws.Region.us_east_1")),
-/// );
-/// assert_eq!(extract_region_from_attrs(&attrs, "ap-northeast-1"), "us-east-1");
-///
 /// let empty: IndexMap<String, Value> = IndexMap::new();
 /// assert_eq!(extract_region_from_attrs(&empty, "ap-northeast-1"), "ap-northeast-1");
 /// ```
@@ -974,10 +893,8 @@ pub fn extract_region_from_attrs(
 ) -> String {
     use crate::resource::{ConcreteValue, Value};
     match attributes.get("region") {
-        Some(Value::Concrete(ConcreteValue::String(s))) => {
-            convert_region_value(s.expose_plaintext())
-        }
-        Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => convert_region_value(s.as_str()),
+        Some(Value::Concrete(ConcreteValue::String(s))) => s.expose_plaintext().to_string(),
+        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value))) => value.api_value().to_string(),
         _ => default_region.to_string(),
     }
 }
@@ -1823,9 +1740,23 @@ mod tests {
         }
 
         #[test]
-        fn enum_identifier_namespaced_form() {
+        fn unresolved_enum_identifier_uses_default() {
             let attrs = attrs_with_region(Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.Region.us_east_1".to_string(),
+            )));
+            assert_eq!(
+                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                "ap-northeast-1"
+            );
+        }
+
+        #[test]
+        fn canonical_enum_uses_api_spelling() {
+            let attrs = attrs_with_region(Value::Concrete(ConcreteValue::CanonicalEnum(
+                crate::resource::CanonicalEnumValue::new_for_test(
+                    crate::schema::enum_identity("Region", Some("aws")),
+                    "us-east-1",
+                ),
             )));
             assert_eq!(
                 extract_region_from_attrs(&attrs, "ap-northeast-1"),
@@ -1845,16 +1776,14 @@ mod tests {
 
         #[test]
         fn string_namespaced_form() {
-            // Users sometimes write `region = "aws.Region.us_east_1"` —
-            // quoted-string spelling. The canonicalizer must still
-            // reduce it to the SDK form, matching the EnumIdentifier
-            // path.
+            // A quoted string is a literal, even when its text resembles
+            // namespaced DSL enum syntax.
             let attrs = attrs_with_region(Value::Concrete(ConcreteValue::String(
                 "aws.Region.us_east_1".into(),
             )));
             assert_eq!(
                 extract_region_from_attrs(&attrs, "ap-northeast-1"),
-                "us-east-1"
+                "aws.Region.us_east_1"
             );
         }
 

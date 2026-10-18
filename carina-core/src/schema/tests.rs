@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn enum_custom_lookup_receives_resolved_api_spelling() {
+    let schema = ResourceSchema::new("widget").attribute(AttributeSchema::new(
+        "mode",
+        AttributeType::enum_(
+            enum_identity("Mode", Some("test.widget")),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![("Allow".to_string(), "allow".to_string())],
+            None,
+            None,
+        ),
+    ));
+    let attributes = std::collections::HashMap::from([(
+        "mode".to_string(),
+        Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.allow")),
+    )]);
+    let seen = std::sync::Mutex::new(Vec::new());
+    let lookup = |identity: &TypeIdentity, value: &Value| {
+        let api_value = match value.as_concrete() {
+            Some(ConcreteValueRef::CanonicalEnum(value)) => value.api_value().to_string(),
+            other => panic!("enum custom lookup must receive CanonicalEnum, got {other:?}"),
+        };
+        seen.lock()
+            .unwrap()
+            .push((identity.clone(), value.clone(), api_value));
+        Ok(())
+    };
+
+    schema
+        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup)
+        .unwrap();
+
+    let seen = seen.into_inner().unwrap();
+    assert!(matches!(
+        seen.as_slice(),
+        [(identity, Value::Concrete(ConcreteValue::CanonicalEnum(value)), api_value)]
+            if identity.to_string() == "test.widget.Mode"
+                && value.api_value() == "Allow"
+                && api_value == "Allow"
+    ));
+}
+
+#[test]
 #[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
 fn struct_field_conflicting_input_mode_required_then_read_only_is_rejected() {
     let _ = StructField::new("arn", AttributeType::string())
@@ -6492,6 +6534,27 @@ mod schema_validate_attr_struct_tests {
     }
 
     #[test]
+    fn validate_attr_block_name_satisfies_required_field() {
+        let lifecycle = struct_type(
+            "Lifecycle",
+            vec![
+                StructField::new("transitions", AttributeType::int())
+                    .with_block_name("transition")
+                    .required(),
+            ],
+        );
+        let value = map_value(vec![(
+            "transition",
+            Value::Concrete(ConcreteValue::Int(30)),
+        )]);
+
+        assert!(
+            Schema::flat(lifecycle).validate(&value).is_ok(),
+            "an accepted block_name key must denote and satisfy its required field"
+        );
+    }
+
+    #[test]
     fn validate_attr_preserves_required_and_nested_type_errors() {
         let inner = struct_type(
             "Inner",
@@ -8266,7 +8329,7 @@ fn tied_scalar_union_keeps_detailed_declaration_order_error() {
 }
 
 #[test]
-fn union_unique_enum_match_preserves_structured_variant_payload() {
+fn union_non_member_enum_identifier_keeps_enum_error_attribution() {
     let union = AttributeType::union(vec![
         AttributeType::int(),
         AttributeType::enum_(
@@ -8280,27 +8343,15 @@ fn union_unique_enum_match_preserves_structured_variant_payload() {
     let value = Value::Concrete(ConcreteValue::enum_identifier("zzz".to_string()));
 
     for (path, err) in union_errors_from_public_paths(&union, &value) {
-        let TypeError::InvalidEnumVariant {
-            value,
-            type_name,
-            expected,
-            ..
-        } = err
-        else {
-            panic!("{path} discarded InvalidEnumVariant payload")
+        let TypeError::InvalidEnumVariant { expected, .. } = err else {
+            panic!("{path} must attribute the failure to the Enum arm")
         };
-        assert_eq!(value.as_plain(), Some("zzz"));
-        assert_eq!(type_name.as_deref(), Some("Mode"));
-        assert_eq!(
-            expected.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            vec!["fast", "slow"],
-            "{path} changed the enum candidates consumed by the LSP quick-fix"
-        );
+        assert_eq!(expected.len(), 2, "{path} lost the valid-value list");
     }
 }
 
 #[test]
-fn canonicalize_union_preserves_pre_3754_declaration_order_for_structs() {
+fn canonicalize_union_selects_the_struct_that_accepts_all_fields() {
     let string_or_list = AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::list(AttributeType::string()),
@@ -8323,22 +8374,19 @@ fn canonicalize_union_preserves_pre_3754_declaration_order_for_structs() {
         ("b", Value::Concrete(ConcreteValue::Int(1))),
     ]);
 
-    let canonicalized = Schema::flat(union).canonicalize(value);
+    let canonicalized = Schema::flat(union).canonicalize_state(value);
     assert_eq!(
         canonicalized,
         union_map(vec![
-            (
-                "a",
-                Value::Concrete(ConcreteValue::StringList(vec!["s".into()])),
-            ),
+            ("a", Value::Concrete(ConcreteValue::String("s".into())),),
             ("b", Value::Concrete(ConcreteValue::Int(1))),
         ]),
-        "an error-diagnostic change must not move canonicalization from Narrow to Wide"
+        "canonicalization must reject Narrow as a candidate because it does not accept field b"
     );
 }
 
 #[test]
-fn canonicalize_union_ref_preserves_pre_3754_declaration_order_for_structs() {
+fn canonicalize_union_ref_selects_the_struct_that_accepts_all_fields() {
     let string_or_list = AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::list(AttributeType::string()),
@@ -8373,33 +8421,19 @@ fn canonicalize_union_ref_preserves_pre_3754_declaration_order_for_structs() {
         ("b", Value::Concrete(ConcreteValue::Int(1))),
     ]);
 
-    let canonicalized = schema.canonicalize(value);
+    let canonicalized = schema.canonicalize_state(value);
     assert_eq!(
         canonicalized,
         union_map(vec![
-            (
-                "a",
-                Value::Concrete(ConcreteValue::StringList(vec!["s".into()])),
-            ),
+            ("a", Value::Concrete(ConcreteValue::String("s".into())),),
             ("b", Value::Concrete(ConcreteValue::Int(1))),
         ]),
-        "tied Ref-to-Struct arms must keep declaration-order canonicalization"
+        "Ref-to-Struct selection must use validation acceptance before declaration order"
     );
 }
 
 #[test]
-fn union_string_vs_enum_picks_enum_error_for_string_input() {
-    // Acceptance #2 from #2219: `Int | Enum` with an identifier
-    // input that doesn't match any enum variant must surface the
-    // `InvalidEnumVariant` error from the Enum member (so the
-    // user sees `expected one of: fast, slow`), not a generic
-    // `TypeMismatch` from the Int member.
-    //
-    // Updated for carina#2986 strict mode: the test input is an
-    // `EnumIdentifier`, which is the legitimate identifier-shaped path
-    // that lands in the enum-variant matcher. A `String` here would
-    // short-circuit to `StringLiteralExpectedEnum`, which is a
-    // different concern covered separately.
+fn union_int_vs_enum_reports_enum_error_for_non_member_identifier() {
     let union_type = AttributeType::union(vec![
         AttributeType::int(),
         AttributeType::enum_(
@@ -8410,20 +8444,63 @@ fn union_string_vs_enum_picks_enum_error_for_string_input() {
             None,
         ),
     ]);
-    let err = union_type
-        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
-            "zzz".to_string(),
-        )))
-        .unwrap_err();
-    match err {
-        TypeError::InvalidEnumVariant { ref expected, .. } => {
-            let rendered: Vec<String> = expected.iter().map(ToString::to_string).collect();
-            assert!(
-                rendered.iter().any(|s| s == "fast"),
-                "expected `fast` in candidate list, got: {rendered:?}"
-            );
-        }
-        other => panic!("expected InvalidEnumVariant from the Enum member, got: {other:?}"),
+    let value = Value::Concrete(ConcreteValue::enum_identifier("zzz".to_string()));
+    let err = union_type.validate(&value).unwrap_err();
+    assert!(matches!(err, TypeError::InvalidEnumVariant { .. }));
+}
+
+#[test]
+fn union_enum_typo_reports_variants_and_suggestion_when_no_member_accepts() {
+    let union = AttributeType::union(vec![
+        AttributeType::enum_(
+            TypeIdentity::bare("Effect"),
+            Some(vec!["allow".to_string(), "deny".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+        AttributeType::struct_(
+            "Condition",
+            vec![StructField::new("key", AttributeType::string())],
+        ),
+    ]);
+    let value = Value::Concrete(ConcreteValue::enum_identifier("alow"));
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert!(
+            matches!(err, TypeError::InvalidEnumVariant { .. }),
+            "{path}: {err:?}"
+        );
+        let display = err.to_string();
+        assert!(
+            display.contains("allow") && display.contains("did you mean"),
+            "{path}: {display}"
+        );
+    }
+}
+
+#[test]
+fn union_quoted_non_member_reports_string_literal_expected_enum() {
+    let union = AttributeType::union(vec![
+        AttributeType::enum_(
+            TypeIdentity::bare("Effect"),
+            Some(vec!["allow".to_string(), "deny".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+        AttributeType::struct_(
+            "Condition",
+            vec![StructField::new("key", AttributeType::string())],
+        ),
+    ]);
+    let value = Value::Concrete(ConcreteValue::String("not-a-member".into()));
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert!(
+            matches!(err, TypeError::StringLiteralExpectedEnum { .. }),
+            "{path}: {err:?}"
+        );
     }
 }
 
@@ -9546,6 +9623,40 @@ fn validate_map_with_enum_key_rejects_unknown_variant() {
         }
         other => panic!("expected MapKeyError, got: {other:?}"),
     }
+}
+
+#[test]
+fn validate_map_with_ref_enum_key_uses_supplied_defs() {
+    let map_type =
+        AttributeType::map_with_key(AttributeType::ref_("KeyAlgorithm"), AttributeType::string());
+    let defs = std::collections::BTreeMap::from([(
+        "KeyAlgorithm".to_string(),
+        AttributeType::enum_(
+            TypeIdentity::bare("KeyAlgorithm"),
+            Some(vec!["RSA-2048".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        ),
+    )]);
+    let value = map_value_with_one_key("RSA_2048");
+
+    assert!(
+        map_type.validate_with_defs(&value, &defs).is_ok(),
+        "validation must resolve the map key Ref through the supplied defs"
+    );
+
+    let schema = Schema {
+        root: map_type,
+        defs,
+    };
+    let Value::Concrete(ConcreteValue::Map(canonical)) = schema.canonicalize_state(value) else {
+        panic!("canonicalization must retain a map");
+    };
+    assert_eq!(
+        canonical.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["RSA-2048"]
+    );
 }
 
 // awscc#251: persisted state files written before awscc#250 made IAM

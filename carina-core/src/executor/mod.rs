@@ -83,17 +83,12 @@ pub struct ExecutionInput<'a> {
     /// Provider configs whose default_tags participate in desired-side
     /// normalization before provider patch construction.
     pub provider_configs: &'a [ProviderConfig],
-    /// Provider factories, looked up per-resource by `id.provider`
-    /// (same `find_factory` dispatch the plan path uses) to re-apply typed
-    /// enum resolution on the apply path. carina#3063: like
-    /// `normalize_desired`, this final plan-time stage is undone by apply-time
-    /// re-resolution. A multi-provider plan needs the slice, not a single
-    /// factory.
+    /// Provider factories used for provider-defined custom type validation at
+    /// the apply boundary. Enum resolution uses the schema registry below and
+    /// never delegates spelling conversion to a factory.
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
-    /// Schema registry used to re-apply `Union[String, list(String)]`
-    /// canonicalization (`canonicalize_resources_with_schemas`) — plan
-    /// pipeline stage 1, also undone by apply-time re-resolution
-    /// (carina#3063).
+    /// Schema registry used to re-apply structural and enum canonicalization
+    /// after apply-time reference resolution and provider normalization.
     pub schemas: &'a crate::schema::SchemaRegistry,
     /// Maximum concurrent provider operations.
     pub parallelism: NonZeroUsize,

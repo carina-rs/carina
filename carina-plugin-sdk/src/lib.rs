@@ -198,11 +198,6 @@ pub trait CarinaProvider {
         vec![]
     }
 
-    /// Return enum alias mappings: resource_type -> attr_name -> alias -> canonical_value.
-    fn enum_aliases(&self) -> HashMap<String, HashMap<String, HashMap<String, String>>> {
-        HashMap::new()
-    }
-
     /// Validate a value against a provider-defined custom type.
     /// Returns `Ok(())` if the value is valid or the type is unknown.
     /// Returns `Err(message)` if the value is invalid for the given type.

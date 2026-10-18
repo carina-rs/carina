@@ -1471,7 +1471,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     )];
     // Force the provider segment so the registry lookup ("aws") hits.
     resources[0].id.provider = "aws".to_string();
-    canonicalize_resources_with_schemas(&mut resources, &registry);
+    canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
 
     // State: aws-read singleton list inside the Struct member.
     let mut state_inner = IndexMap::new();
@@ -1542,7 +1542,7 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
         Value::Concrete(ConcreteValue::Map(desired_statement)),
     )];
     resources[0].id.provider = "aws".to_string();
-    canonicalize_resources_with_schemas(&mut resources, &registry);
+    canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
 
     let persisted_statement = || {
         IndexMap::from([
@@ -1683,13 +1683,11 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
 /// Representative subset modeling the same axes as the live plan
 /// against `carina-rs/infra registry/dev/registry` (the verbatim live
 /// capture is `tests/carina3122_live_phantom.rs`). Both sides reach
-/// the differ as `ConcreteValue::String` in fully-qualified namespaced
-/// DSL form; the values are identical and only the element ORDER
-/// differs:
-/// - State (`from`):   `[String("awscc.cloudfront.Distribution.AllowedMethods.head"),
-///                        String("…AllowedMethods.get")]` — order head, get
-/// - Desired (`to`):   `[String("…AllowedMethods.get"),
-///                        String("…AllowedMethods.head")]` — order get, head
+/// the differ in their host-canonicalized form: authored DSL identifiers and
+/// provider API strings both become `CanonicalEnum`. The values are identical
+/// and only the element ORDER differs:
+/// - State (`from`):   `["HEAD", "GET"]` — order head, get
+/// - Desired (`to`):   `[AllowedMethods.get, AllowedMethods.head]` — order get, head
 ///
 /// `allowed_methods` is schema-typed `unordered_list(Enum)`, so
 /// element order is NOT significant: a multiset-equal pair must be
@@ -1719,7 +1717,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
             Some(values.iter().map(|s| s.to_string()).collect()),
             values
                 .iter()
-                .map(|s| (s.to_string(), s.to_lowercase()))
+                .map(|s| (s.to_string(), s.to_lowercase().replace('-', "_")))
                 .collect(),
             None,
             None,
@@ -1775,17 +1773,21 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert("awscc", schema.clone());
 
-    // Both sides are the SAME namespaced DSL String shape (per the
-    // live plan JSON); only element order differs.
-    let ns_method = |type_name: &str, alias: &str| {
-        Value::Concrete(ConcreteValue::String(
-            format!("awscc.cloudfront.Distribution.{type_name}.{alias}").into(),
-        ))
+    let desired_method = |type_name: &str, alias: &str| {
+        Value::Concrete(ConcreteValue::enum_identifier(format!(
+            "awscc.cloudfront.Distribution.{type_name}.{alias}"
+        )))
     };
-    let methods = |type_name: &str, a: &str, b: &str| {
+    let desired_methods = |type_name: &str, a: &str, b: &str| {
         Value::Concrete(ConcreteValue::List(vec![
-            ns_method(type_name, a),
-            ns_method(type_name, b),
+            desired_method(type_name, a),
+            desired_method(type_name, b),
+        ]))
+    };
+    let state_methods = |a: &str, b: &str| {
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String(a.to_ascii_uppercase().into())),
+            Value::Concrete(ConcreteValue::String(b.to_ascii_uppercase().into())),
         ]))
     };
 
@@ -1797,11 +1799,11 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let mut desired_dcb = IndexMap::new();
     desired_dcb.insert(
         "allowed_methods".to_string(),
-        methods("AllowedMethods", "get", "head"),
+        desired_methods("AllowedMethods", "get", "head"),
     );
     desired_dcb.insert(
         "cached_methods".to_string(),
-        methods("CachedMethods", "get", "head"),
+        desired_methods("CachedMethods", "get", "head"),
     );
     desired_dcb.insert(
         "compress".to_string(),
@@ -1810,7 +1812,9 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     desired_dcb.insert("target_origin_id".to_string(), s("s3-origin"));
     desired_dcb.insert(
         "viewer_protocol_policy".to_string(),
-        s("awscc.cloudfront.Distribution.ViewerProtocolPolicy.redirect_to_https"),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "awscc.cloudfront.Distribution.ViewerProtocolPolicy.redirect_to_https",
+        )),
     );
     let mut desired_dc = IndexMap::new();
     desired_dc.insert(
@@ -1824,12 +1828,10 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         ),
     ];
     resources[0].id.provider = "awscc".to_string();
-    canonicalize_resources_with_schemas(&mut resources, &registry);
+    canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
 
-    // State (`from`): same namespaced String values, opposite order
-    // (head, get) — the awscc `normalize_state` pass rewrites the
-    // Cloud Control read-back to this fully-qualified DSL form. PLUS
-    // the server-side read-back defaults the user never authored.
+    // State (`from`): provider API spellings in the opposite order
+    // (HEAD, GET), plus server-side read-back defaults the user never authored.
     // These exact keys/values are from the live plan `--json` diff of
     // `from` vs `to` (registry/dev/registry, state_serial 33). They
     // are present ONLY in `from` (state); `to` (desired) has just the
@@ -1842,14 +1844,8 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     // carina-cli plan path does).
     let empty_list = || Value::Concrete(ConcreteValue::List(vec![]));
     let mut state_dcb = IndexMap::new();
-    state_dcb.insert(
-        "allowed_methods".to_string(),
-        methods("AllowedMethods", "head", "get"),
-    );
-    state_dcb.insert(
-        "cached_methods".to_string(),
-        methods("CachedMethods", "head", "get"),
-    );
+    state_dcb.insert("allowed_methods".to_string(), state_methods("head", "get"));
+    state_dcb.insert("cached_methods".to_string(), state_methods("head", "get"));
     // User-authored default_cache_behavior fields — identical on both
     // sides, so they survive projection and compare equal.
     state_dcb.insert(
@@ -1857,10 +1853,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         Value::Concrete(ConcreteValue::Bool(true)),
     );
     state_dcb.insert("target_origin_id".to_string(), s("s3-origin"));
-    state_dcb.insert(
-        "viewer_protocol_policy".to_string(),
-        s("awscc.cloudfront.Distribution.ViewerProtocolPolicy.redirect_to_https"),
-    );
+    state_dcb.insert("viewer_protocol_policy".to_string(), s("redirect-to-https"));
     // Read-back-only defaults inside default_cache_behavior (NOT in `to`).
     state_dcb.insert("field_level_encryption_id".to_string(), s(""));
     state_dcb.insert("function_associations".to_string(), empty_list());
@@ -1968,7 +1961,7 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
             Some(values.iter().map(|s| s.to_string()).collect()),
             values
                 .iter()
-                .map(|s| (s.to_string(), s.to_lowercase()))
+                .map(|s| (s.to_string(), s.to_lowercase().replace('-', "_")))
                 .collect(),
             None,
             None,
@@ -2007,15 +2000,22 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert("awscc", schema.clone());
 
-    let ns = |alias: &str| {
-        Value::Concrete(ConcreteValue::String(
-            format!("awscc.cloudfront.Distribution.AllowedMethods.{alias}").into(),
-        ))
+    let desired = |alias: &str| {
+        Value::Concrete(ConcreteValue::enum_identifier(format!(
+            "awscc.cloudfront.Distribution.AllowedMethods.{alias}"
+        )))
     };
-    let list = |a: &str, b: &str| Value::Concrete(ConcreteValue::List(vec![ns(a), ns(b)]));
-    let dcb = |a: &str, b: &str| {
+    let desired_list =
+        |a: &str, b: &str| Value::Concrete(ConcreteValue::List(vec![desired(a), desired(b)]));
+    let state_list = |a: &str, b: &str| {
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String(a.to_ascii_uppercase().into())),
+            Value::Concrete(ConcreteValue::String(b.to_ascii_uppercase().into())),
+        ]))
+    };
+    let dcb = |methods: Value| {
         let mut m = IndexMap::new();
-        m.insert("allowed_methods".to_string(), list(a, b));
+        m.insert("allowed_methods".to_string(), methods);
         let mut dc = IndexMap::new();
         dc.insert(
             "default_cache_behavior".to_string(),
@@ -2026,13 +2026,16 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
 
     let mut resources = vec![
         Resource::new("cloudfront.Distribution", "d1")
-            .with_attribute("distribution_config", dcb("get", "head")),
+            .with_attribute("distribution_config", dcb(desired_list("get", "head"))),
     ];
     resources[0].id.provider = "awscc".to_string();
-    canonicalize_resources_with_schemas(&mut resources, &registry);
+    canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
 
     let mut state_attrs = HashMap::new();
-    state_attrs.insert("distribution_config".to_string(), dcb("head", "get"));
+    state_attrs.insert(
+        "distribution_config".to_string(),
+        dcb(state_list("head", "get")),
+    );
     let mut id = ResourceId::with_identity("cloudfront.Distribution", "d1");
     id.provider = "awscc".to_string();
     let mut states = std::collections::HashMap::new();

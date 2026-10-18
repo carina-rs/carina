@@ -6,8 +6,7 @@ use indexmap::IndexMap;
 use crate::executor::normalized::{apply_desired_normalization, apply_desired_normalization_slice};
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    BoxFuture, NoopNormalizer, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
-    ready_noop,
+    BoxFuture, NoopNormalizer, ProviderError, ProviderNormalizer, ProviderResult, ready_noop,
 };
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, UnknownReason,
@@ -85,7 +84,6 @@ async fn normalization_error_stops_later_stages() {
         &mut resources,
         &[provider_config(default_tags)],
         &FailingNormalizer,
-        &[],
         &schemas,
     )
     .await
@@ -122,7 +120,6 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
         &mut resources,
         &[provider_config(default_tags)],
         &NoopNormalizer,
-        &[],
         &schemas,
     )
     .await
@@ -146,124 +143,31 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
     );
 }
 
-struct AliasFactory;
+#[tokio::test]
+async fn unresolved_enum_default_tag_fails_before_mutating_resources() {
+    let default_tags = IndexMap::from([(
+        "Mode".to_string(),
+        Value::Concrete(ConcreteValue::enum_identifier("test.Mode.allow")),
+    )]);
+    let mut resources = vec![Resource::with_provider("test", "thing", "example", None)];
+    let original = resources.clone();
 
-impl ProviderFactory for AliasFactory {
-    fn name(&self) -> &str {
-        "test"
-    }
+    let error = apply_desired_normalization_slice(
+        &mut resources,
+        &[provider_config(default_tags)],
+        &NoopNormalizer,
+        &order_schema(),
+    )
+    .await
+    .expect_err("an unresolved enum default tag must not enter desired resources");
 
-    fn display_name(&self) -> &str {
-        "Test"
-    }
-
-    fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType> {
-        HashMap::new()
-    }
-
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
-    }
-
-    fn create_provider(
-        &self,
-        _binding: Option<&str>,
-        _config: &crate::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn crate::provider::Provider>>> {
-        unreachable!("test factory does not create providers")
-    }
-
-    fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
-        };
-
-        let mode = AttributeType::enum_(
-            enum_identity("Mode", Some("test.thing")),
-            Some(vec!["friendly".to_string()]),
-            Vec::new(),
-            None,
-            None,
-        );
-        vec![
-            ResourceSchema::new("thing")
-                .attribute(AttributeSchema::new("mode", mode.clone()))
-                .attribute(AttributeSchema::new(
-                    "settings",
-                    AttributeType::struct_(
-                        "Settings",
-                        vec![
-                            StructField::new("mode", mode),
-                            StructField::new("peer", AttributeType::string()),
-                        ],
-                    ),
-                )),
-        ]
-    }
-
-    fn get_enum_alias_reverse(
-        &self,
-        _resource_type: &str,
-        attr_name: &str,
-        value: &str,
-    ) -> Option<String> {
-        (attr_name == "mode" && value == "friendly").then(|| "canonical".to_string())
-    }
-}
-
-struct RecordingAliasFactory {
-    calls: Arc<Mutex<Vec<String>>>,
-}
-
-impl ProviderFactory for RecordingAliasFactory {
-    fn name(&self) -> &str {
-        "test"
-    }
-
-    fn display_name(&self) -> &str {
-        "Test"
-    }
-
-    fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType> {
-        HashMap::new()
-    }
-
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
-    }
-
-    fn create_provider(
-        &self,
-        _binding: Option<&str>,
-        _config: &crate::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn crate::provider::Provider>>> {
-        unreachable!("test factory does not create providers")
-    }
-
-    fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push("resolve_enum_aliases".to_string());
-        AliasFactory.schemas()
-    }
-
-    fn get_enum_alias_reverse(
-        &self,
-        resource_type: &str,
-        attr_name: &str,
-        value: &str,
-    ) -> Option<String> {
-        AliasFactory.get_enum_alias_reverse(resource_type, attr_name, value)
-    }
+    assert!(matches!(
+        std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<SerializationError>()),
+        Some(SerializationError::UnresolvedEnumIdentifier { value, .. })
+            if value == "test.Mode.allow"
+    ));
+    assert_eq!(resources, original);
 }
 
 fn order_schema() -> SchemaRegistry {
@@ -370,16 +274,12 @@ async fn desired_normalization_runs_stages_in_order() {
     resource.set_attr("subjects", string_value("one"));
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RecordingAliasFactory {
-        calls: Arc::clone(&calls),
-    })];
     let schemas = order_schema();
 
     let normalized = apply_desired_normalization(
         resource,
         &[provider_config(default_tags)],
         &normalizer,
-        &factories,
         &schemas,
     )
     .await
@@ -387,16 +287,13 @@ async fn desired_normalization_runs_stages_in_order() {
 
     assert_eq!(
         calls.lock().unwrap().clone(),
-        vec![
-            format!(
-                "normalize_desired:{:?}",
-                Some(Value::Concrete(ConcreteValue::StringList(vec![
-                    "one".into()
-                ])))
-            ),
-            "resolve_enum_aliases".to_string(),
-        ],
-        "canonicalize must run before normalize_desired, and enum resolution must run after it"
+        vec![format!(
+            "normalize_desired:{:?}",
+            Some(Value::Concrete(ConcreteValue::StringList(vec![
+                "one".into()
+            ])))
+        )],
+        "canonicalization must run before normalize_desired"
     );
     assert_eq!(
         normalized.as_resource().get_attr("tags"),
@@ -408,9 +305,127 @@ async fn desired_normalization_runs_stages_in_order() {
     );
     assert_eq!(
         normalized.as_resource().get_attr("mode"),
-        Some(&string_value("friendly")),
-        "the typed alias pass must not reclassify the normalizer's API string"
+        Some(&Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::enum_identity("Mode", Some("test.thing")),
+                "friendly",
+            ),
+        ))),
+        "the post-normalizer schema pass must lift the API string"
     );
+}
+
+#[tokio::test]
+async fn desired_normalization_lifts_guest_string_alias_to_api_enum() {
+    struct StringAliasNormalizer;
+
+    impl ProviderNormalizer for StringAliasNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async move {
+                resources[0].set_attr("mode", string_value("allow"));
+                Ok(())
+            })
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a crate::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+    }
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        crate::schema::ResourceSchema::new("thing").attribute(crate::schema::AttributeSchema::new(
+            "mode",
+            crate::schema::AttributeType::enum_(
+                crate::schema::enum_identity("Mode", Some("test.thing")),
+                Some(vec!["Allow".to_string(), "Deny".to_string()]),
+                vec![("Allow".to_string(), "allow".to_string())],
+                None,
+                None,
+            ),
+        )),
+    );
+    let resource = Resource::with_provider("test", "thing", "example", None);
+
+    let normalized = apply_desired_normalization(resource, &[], &StringAliasNormalizer, &schemas)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        normalized.as_resource().get_attr("mode"),
+        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+            if value.api_value() == "Allow"
+    ));
+}
+
+#[tokio::test]
+async fn desired_normalization_rejects_guest_dotted_string_without_shape_stripping() {
+    struct DottedStringNormalizer;
+
+    impl ProviderNormalizer for DottedStringNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async move {
+                resources[0].set_attr("mode", string_value("test.thing.Mode.allow"));
+                Ok(())
+            })
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a crate::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+    }
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        crate::schema::ResourceSchema::new("thing").attribute(crate::schema::AttributeSchema::new(
+            "mode",
+            crate::schema::AttributeType::enum_(
+                crate::schema::enum_identity("Mode", Some("test.thing")),
+                Some(vec!["Allow".to_string(), "Deny".to_string()]),
+                vec![("Allow".to_string(), "allow".to_string())],
+                None,
+                None,
+            ),
+        )),
+    );
+    let resource = Resource::with_provider("test", "thing", "example", None);
+
+    let error = apply_desired_normalization(resource, &[], &DottedStringNormalizer, &schemas)
+        .await
+        .expect_err("guest strings must resolve by literal membership, never dotted shape");
+
+    assert!(error.to_string().contains("test.thing.Mode.allow"));
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[tokio::test]
@@ -427,7 +442,6 @@ async fn desired_normalization_merges_non_empty_provider_default_tags() {
             provider_config(default_tags),
         ],
         &NoopNormalizer,
-        &[],
         &schemas,
     )
     .await
@@ -460,7 +474,6 @@ async fn desired_normalization_merges_default_tags_into_ref_bearing_tags() {
         resource,
         &[provider_config(default_tags)],
         &NoopNormalizer,
-        &[],
         &order_schema(),
     )
     .await
@@ -506,12 +519,9 @@ async fn desired_normalization_resolves_enum_alias_nested_with_resource_ref() {
             ("peer".to_string(), peer_ref.clone()),
         ]))),
     );
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
-
-    let normalized =
-        apply_desired_normalization(resource, &[], &NoopNormalizer, &factories, &order_schema())
-            .await
-            .unwrap();
+    let normalized = apply_desired_normalization(resource, &[], &NoopNormalizer, &order_schema())
+        .await
+        .unwrap();
 
     let Some(Value::Concrete(ConcreteValue::Map(settings))) =
         normalized.as_resource().get_attr("settings")
@@ -558,7 +568,6 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
         &mut resources,
         &[default_config, second_config],
         &NoopNormalizer,
-        &[],
         &schemas,
     )
     .await
@@ -624,7 +633,6 @@ async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
         &mut resources,
         &[provider_config(default_tags)],
         &NoopNormalizer,
-        &[],
         &schemas,
     )
     .await
@@ -689,15 +697,10 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
     );
 
-    let normalized = apply_desired_normalization(
-        resource,
-        &[],
-        &InspectingNormalizer,
-        &[],
-        &SchemaRegistry::new(),
-    )
-    .await
-    .unwrap();
+    let normalized =
+        apply_desired_normalization(resource, &[], &InspectingNormalizer, &SchemaRegistry::new())
+            .await
+            .unwrap();
 
     assert_eq!(
         normalized.as_resource().get_attr("role_arn"),
@@ -739,10 +742,7 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
                     .lock()
                     .unwrap()
                     .push("normalize_desired".to_string());
-                resources[0].set_attr(
-                    "mode",
-                    Value::Concrete(ConcreteValue::enum_identifier("Mode.friendly")),
-                );
+                resources[0].set_attr("mode", string_value("friendly"));
                 Ok(())
             })
         }
@@ -777,7 +777,6 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
     };
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
     let schemas = order_schema();
     let mut resources = vec![resource];
 
@@ -785,7 +784,6 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
         &mut resources,
         &[provider_config(default_tags)],
         &normalizer,
-        &factories,
         &schemas,
     )
     .await
@@ -822,7 +820,7 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
                 if canonical.identity().to_string() == "test.thing.Mode"
                     && canonical.api_value() == "friendly"
         ),
-        "slice wrapper must run enum alias resolution after provider stages"
+        "slice wrapper must re-canonicalize provider-returned enum text"
     );
 }
 
@@ -831,15 +829,13 @@ async fn apply_desired_normalization_is_idempotent() {
     let mut resource = Resource::new("test", "thing");
     resource.set_attr("name", string_value("v1"));
 
-    let first =
-        apply_desired_normalization(resource, &[], &NoopNormalizer, &[], &SchemaRegistry::new())
-            .await
-            .unwrap();
+    let first = apply_desired_normalization(resource, &[], &NoopNormalizer, &SchemaRegistry::new())
+        .await
+        .unwrap();
     let second = apply_desired_normalization(
         first.as_resource().clone(),
         &[],
         &NoopNormalizer,
-        &[],
         &SchemaRegistry::new(),
     )
     .await

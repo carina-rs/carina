@@ -214,19 +214,14 @@ pub fn check_type_expr_value(
             path,
             type_name,
         } => match value {
-            Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => {
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_),
+            ) => {
                 let identity =
                     crate::schema::TypeIdentity::from_schema_type(provider, path, type_name);
                 validate_custom_type(&identity, value, config)
-                    .map_err(|message| validation_mismatch(expected, value, message))
-            }
-            Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
-                let identity =
-                    crate::schema::TypeIdentity::from_schema_type(provider, path, type_name);
-                let validator_value = Value::Concrete(ConcreteValue::String(
-                    canonical.api_value().to_string().into(),
-                ));
-                validate_custom_type(&identity, &validator_value, config)
                     .map_err(|message| validation_mismatch(expected, value, message))
             }
             _ => Err(mismatch(expected, value)),
@@ -642,6 +637,98 @@ mod tests {
                 "canonical enum should satisfy {expected}"
             );
         }
+    }
+
+    #[test]
+    fn schema_enum_identifier_reaches_provider_validator_as_api_spelling() {
+        use std::sync::{Arc, Mutex};
+
+        let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+        let declared_type = crate::schema::AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["API_VALUE".to_string()]),
+            vec![("API_VALUE".to_string(), "dsl_value".to_string())],
+            None,
+            None,
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_validator = Arc::clone(&seen);
+        let config = ProviderContext {
+            custom_type_attribute_types: std::collections::HashMap::from([(
+                identity.clone(),
+                declared_type,
+            )]),
+            custom_type_validator: Some(Box::new(move |_identity, value| {
+                seen_by_validator.lock().unwrap().push(value.to_string());
+                Ok(())
+            })),
+            ..ProviderContext::default()
+        };
+        let schema_type = TypeExpr::SchemaType {
+            provider: "test".to_string(),
+            path: "widget".to_string(),
+            type_name: "Mode".to_string(),
+        };
+        let value = Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
+
+        check_type_expr_value(&schema_type, &value, &config)
+            .expect("the declared enum member must validate");
+
+        assert_eq!(*seen.lock().unwrap(), ["API_VALUE"]);
+    }
+
+    #[test]
+    fn enum_typed_module_and_function_string_reaches_validator_as_api_spelling() {
+        use std::sync::{Arc, Mutex};
+
+        let bare_identity = TypeIdentity::bare("Mode");
+        let schema_identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+        let enum_type = |identity| {
+            crate::schema::AttributeType::enum_(
+                identity,
+                Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+                vec![("Enabled".to_string(), "enabled".to_string())],
+                None,
+                None,
+            )
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_validator = Arc::clone(&seen);
+        let config = ProviderContext {
+            custom_type_attribute_types: std::collections::HashMap::from([
+                (bare_identity.clone(), enum_type(bare_identity)),
+                (schema_identity.clone(), enum_type(schema_identity)),
+            ]),
+            custom_type_validator: Some(Box::new(move |identity, value| {
+                seen_by_validator
+                    .lock()
+                    .unwrap()
+                    .push((identity.to_string(), value.to_string()));
+                Ok(())
+            })),
+            ..ProviderContext::default()
+        };
+        let value = Value::Concrete(ConcreteValue::String("enabled".into()));
+
+        for expected in [
+            TypeExpr::Simple("mode".to_string()),
+            TypeExpr::SchemaType {
+                provider: "test".to_string(),
+                path: "widget".to_string(),
+                type_name: "Mode".to_string(),
+            },
+        ] {
+            check_type_expr_value(&expected, &value, &config)
+                .expect("enum-typed string must resolve through state-text spelling");
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("Mode".to_string(), "Enabled".to_string()),
+                ("test.widget.Mode".to_string(), "Enabled".to_string()),
+            ]
+        );
     }
 
     #[test]

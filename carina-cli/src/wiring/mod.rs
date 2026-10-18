@@ -52,7 +52,7 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    CustomTypeLookup, ResourceSchema, SchemaKind, SchemaRegistry, TypeError, resolve_block_names,
+    CustomTypeLookup, ResourceSchema, SchemaRegistry, TypeError, resolve_block_names,
 };
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
@@ -696,9 +696,9 @@ pub fn apply_anonymous_to_named_renames(
     saved_attrs: &mut LiftedSavedAttrs,
     state_file: &Option<StateFile>,
     claims: &StateBlockClaims,
-) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
+) -> Result<Vec<(ResolvedResourceId, ResolvedResourceId)>, AppError> {
     let Some(sf) = state_file.as_ref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let canonical_providers =
@@ -707,7 +707,7 @@ pub fn apply_anonymous_to_named_renames(
             &|provider_name, attr_name| {
                 provider_config_attribute_type_for(ctx, provider_name, attr_name)
             },
-        );
+        )?;
 
     let renames = identifier::detect_anonymous_to_named_renames(
         resources,
@@ -763,7 +763,7 @@ pub fn apply_anonymous_to_named_renames(
         saved_attrs.remap_resource_id(from.as_inner(), to.as_inner().clone());
     }
 
-    renames
+    Ok(renames)
 }
 
 pub fn reconcile_anonymous_identifiers_with_ctx(
@@ -871,7 +871,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
     let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
         inputs.resources.resources_mut(),
         ctx.schemas(),
-    );
+    )?;
     let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical_resources, inputs.providers);
     if let Some(error) = errors.into_iter().next() {
         return Err(error);
@@ -917,12 +917,15 @@ pub fn compute_anonymous_identifiers_with_ctx(
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
     let canonical_providers =
-        carina_core::value::canonicalize_provider_configs_with_attribute_types(
+        match carina_core::value::canonicalize_provider_configs_with_attribute_types(
             providers,
             &|provider_name, attr_name| {
                 provider_config_attribute_type_for(ctx, provider_name, attr_name)
             },
-        );
+        ) {
+            Ok(providers) => providers,
+            Err(error) => return vec![error.into()],
+        };
 
     match identifier::compute_anonymous_identifiers_with_provider_configs(
         resources.as_mut_slice(),
@@ -940,13 +943,12 @@ pub fn compute_anonymous_identifiers_with_ctx(
 /// Ensures the correct ordering of normalization steps that must run
 /// between reference resolution and plan creation:
 ///
-/// 1. `normalize_desired` — resolve DSL enum identifiers
-/// 2. `normalize_state` — convert raw API values for all prior states
-///    (current desired-resource states and typed orphans) to match DSL format
-/// 3. Host default-tag merge — add tags from each routed provider instance
-///    (must run after `normalize_desired`)
-/// 4. `resolve_enum_aliases` — resolve any surviving typed enum identifiers
-///    in both resources and states
+/// 1. Host schema canonicalization resolves desired enum identifiers.
+/// 2. `normalize_desired` runs provider-specific transforms, followed by
+///    strict host canonicalization of the returned provider text.
+/// 3. Host default-tag merge adds tags from each routed provider instance.
+/// 4. `normalize_state` runs provider-specific state transforms; host schema
+///    walks own all enum lifting used for comparison.
 pub struct PlanPreprocessor<'a> {
     normalizer: &'a dyn ProviderNormalizer,
     ctx: &'a WiringContext,
@@ -975,8 +977,6 @@ async fn normalize_prior_states(
     current_states: &mut HashMap<ResourceId, State>,
     orphans: &mut Orphans,
     normalizer: &dyn ProviderNormalizer,
-    ctx: &WiringContext,
-    data_sources: &[DataSource],
 ) -> Result<(), ProviderError> {
     transform_prior_provider_states(current_states, orphans, async |states| {
         // Hard assert (not debug_assert): RFC #2371 constraint b says state
@@ -986,7 +986,6 @@ async fn normalize_prior_states(
             "Value::Deferred(DeferredValue::Unknown) found in prior states — RFC #2371 constraint b violated"
         );
         normalizer.normalize_state(states).await?;
-        resolve_enum_aliases_in_states(ctx, states, data_sources);
         Ok(())
     })
     .await
@@ -1178,9 +1177,9 @@ impl<'a> PlanPreprocessor<'a> {
     ///
     /// Call after `resolve_refs_with_state_and_remote()` and before
     /// `create_plan()`. This is the single seam both the plan and apply
-    /// pipelines traverse for provider normalization and enum-alias resolution
-    /// in resources and prior states. `create_plan()` resolves typed wait RHS
-    /// values directly against the selected target schema.
+    /// pipelines traverse for provider normalization and host-owned enum
+    /// canonicalization in resources and prior states. `create_plan()` resolves
+    /// typed wait RHS values directly against the selected target schema.
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare(
         &self,
@@ -1216,14 +1215,7 @@ impl<'a> PlanPreprocessor<'a> {
             self.ctx,
         )
         .await?;
-        normalize_prior_states(
-            current_states,
-            orphans,
-            self.normalizer,
-            self.ctx,
-            data_sources,
-        )
-        .await?;
+        normalize_prior_states(current_states, orphans, self.normalizer).await?;
         Ok(())
     }
 }
@@ -1238,24 +1230,16 @@ pub(crate) async fn prepare_desired_side_for_plan(
     normalizer: &dyn ProviderNormalizer,
     ctx: &WiringContext,
 ) -> Result<(), ProviderError> {
-    carina_core::value::canonicalize_data_sources_with_schemas(data_sources, ctx.schemas());
+    carina_core::value::canonicalize_data_sources_with_schemas(data_sources, ctx.schemas())?;
 
-    apply_desired_normalization_slice(
-        resources,
-        provider_configs,
-        normalizer,
-        ctx.factories(),
-        ctx.schemas(),
-    )
-    .await
+    apply_desired_normalization_slice(resources, provider_configs, normalizer, ctx.schemas()).await
 }
 
-/// Normalize enum values in current states to match DSL format.
+/// Apply provider-specific state normalization before host schema lifting.
 ///
-/// Creates normalizers from all registered provider factories and applies
-/// `normalize_state()` to the current states. This converts raw AWS enum
-/// values (e.g., `"ap-northeast-1a"`) to the same DSL format that
-/// `normalize_desired` produces, preventing false diffs.
+/// Enum strings returned by a provider remain API text. The host's later
+/// schema-positioned state lift converts recognized members to canonical enum
+/// values for comparison.
 pub fn normalize_state_with_ctx(
     ctx: &WiringContext,
     provider_configs: &ResolvedProviderConfigs,
@@ -1284,45 +1268,6 @@ pub fn normalize_state_with_ctx(
     }
     // Outermost runtime: not nested.
     rt.block_on(router.normalize_state(current_states))
-}
-
-/// Resolve any typed enum identifiers that survive in current states.
-///
-/// Provider/API [`ConcreteValue::String`] values remain literal. Only a typed
-/// identifier is eligible for schema-driven conversion to `CanonicalEnum`.
-pub fn resolve_enum_aliases_in_states(
-    ctx: &WiringContext,
-    current_states: &mut HashMap<ResourceId, State>,
-    data_sources: &[DataSource],
-) {
-    let data_source_ids: HashSet<&ResourceId> = data_sources
-        .iter()
-        .map(|data_source| &data_source.id)
-        .collect();
-    for (id, state) in current_states.iter_mut() {
-        if !state.exists || id.provider.is_empty() {
-            continue;
-        }
-        let schema_kind = if data_source_ids.contains(id) {
-            SchemaKind::DataSource
-        } else {
-            SchemaKind::Resource
-        };
-        let Some(schema) = ctx
-            .schemas()
-            .get(&id.provider, &id.resource_type, schema_kind)
-        else {
-            continue;
-        };
-        // Reuse the core per-value alias resolver (single source of
-        // truth shared with the resource path, carina#3063).
-        let keys: Vec<String> = state.attributes.keys().cloned().collect();
-        for key in keys {
-            if let Some(value) = state.attributes.get_mut(&key) {
-                carina_core::value::resolve_value_alias_with_schema(value, &key, schema);
-            }
-        }
-    }
 }
 
 pub fn check_unused_bindings<E: carina_core::parser::ExportParamLike>(
@@ -2571,7 +2516,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             &mut saved_attrs,
             state_file,
             state_block_claims,
-        ));
+        )?);
         // Phase 2: resolve data source refs against the consolidated
         // `current_states`, then refresh each via `read_data_source`.
         let ds_wait_aliases: Vec<WaitAliasSpec> = parsed
@@ -2691,7 +2636,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &mut saved_attrs,
                 state_file,
                 state_block_claims,
-            ));
+            )?);
         } else {
             // No state file: all resources are new (not found)
             for resource in &sorted_resources {
@@ -2865,9 +2810,10 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     let prepared_compositions = parsed.compositions.clone();
 
-    // Run the normalization pipeline: normalize_desired → normalize_state →
-    // host default-tag merge → resolve_enum_aliases (resources and states).
-    // Order matters. `create_plan` resolves typed wait RHS values itself.
+    // Run the normalization pipeline: host desired canonicalization → guest
+    // desired normalization → host provider-output canonicalization/default tags →
+    // guest state normalization. Host state lifting follows at the differ
+    // seam. `create_plan` resolves typed wait RHS values itself.
     let wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, ctx);
     let preparation = if refresh_module_constraint_errors.is_empty() {
@@ -3924,7 +3870,7 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
         carina_core::value::canonicalize_data_sources_with_schemas(
             std::slice::from_mut(&mut resolved),
             schemas,
-        );
+        )?;
         let unresolved = unresolved_data_source_inputs(&resolved);
         if unresolved.is_empty() {
             resolutions.push(DataSourceRefreshResolution::Resolved(resolved));
@@ -4186,7 +4132,7 @@ pub fn compute_anonymous_identifiers(
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![], providers);
     let canonical_resources =
-        carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas());
+        carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas())?;
     let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, providers);
     if errors.is_empty() {
         Ok(())
@@ -4212,12 +4158,6 @@ fn errors_to_legacy_result(errors: Vec<AppError>) -> Result<(), AppError> {
                 .join("\n"),
         ))
     }
-}
-
-#[cfg(test)]
-pub fn resolve_enum_aliases(resources: &mut [Resource]) {
-    let ctx = WiringContext::new(vec![], &[]);
-    carina_core::value::resolve_enum_aliases_for_resources(resources, ctx.factories())
 }
 
 #[cfg(test)]

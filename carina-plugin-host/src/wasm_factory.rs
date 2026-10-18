@@ -25,9 +25,9 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, Provider, ProviderError,
-    ProviderFactory, ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadRequest,
-    SavedAttrs, UpdateOutcome, UpdateRequest,
+    BoxFuture, CanonicalCustomTypeValue, CanonicalProviderConfigAttributes, CreateOutcome,
+    CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
+    ProviderReadyConfig, ProviderResult, ReadRequest, SavedAttrs, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
     Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
@@ -1554,24 +1554,6 @@ pub(crate) mod version_checked_bindings {
             }
         }
 
-        pub(super) async fn call_get_enum_aliases(
-            &self,
-            store: &mut Store<HostState>,
-        ) -> wasmtime::Result<String> {
-            match &self.raw {
-                RawWasmBindings::Basic(b) => {
-                    b.carina_provider_provider()
-                        .call_get_enum_aliases(store)
-                        .await
-                }
-                RawWasmBindings::Http(b) => {
-                    b.carina_provider_provider()
-                        .call_get_enum_aliases(store)
-                        .await
-                }
-            }
-        }
-
         pub(super) async fn call_validate_config(
             &self,
             store: &mut Store<HostState>,
@@ -2222,7 +2204,6 @@ enum CachedComponentAcquisition {
 }
 
 type ProviderConfigCompletions = HashMap<String, Vec<CompletionValue>>;
-type ProviderEnumAliases = HashMap<String, HashMap<String, HashMap<String, String>>>;
 
 pub struct WasmProviderFactory {
     engine: Engine,
@@ -2235,7 +2216,6 @@ pub struct WasmProviderFactory {
     schemas: Vec<ResourceSchema>,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
-    cached_enum_aliases: ProviderEnumAliases,
     /// Provider config attribute types (e.g., `region` → `AttributeType::Enum`).
     /// Used by `ProviderFactory::provider_config_attribute_types()` so the host
     /// validates provider attributes against these types using its own carina-core,
@@ -2311,21 +2291,6 @@ fn decode_config_completions_json(
     })
 }
 
-fn decode_enum_aliases_json(
-    json: &str,
-    provider_name: &str,
-    provider_version: &str,
-) -> Result<ProviderEnumAliases, WasmProviderLoadError> {
-    serde_json::from_str(json).map_err(|source| {
-        WasmProviderLoadError::metadata(
-            format!(
-                "provider '{provider_name}' {provider_version} emitted malformed enum aliases JSON"
-            ),
-            source,
-        )
-    })
-}
-
 impl WasmProviderFactory {
     /// Compute the default cache directory (`~/.carina/cache/`).
     /// Returns `None` if the home directory cannot be determined.
@@ -2346,7 +2311,6 @@ impl WasmProviderFactory {
         (
             ProviderConfigCompletions,
             Vec<String>,
-            ProviderEnumAliases,
             HashMap<String, carina_core::schema::AttributeType>,
         ),
         WasmProviderLoadError,
@@ -2381,15 +2345,6 @@ impl WasmProviderFactory {
                     )
                 })?;
 
-        let enum_aliases_json = bindings
-            .call_get_enum_aliases(store)
-            .await
-            .map_err(|source| {
-                metadata_call_error(provider_name, provider_version, "get-enum-aliases", source)
-            })?;
-        let enum_aliases =
-            decode_enum_aliases_json(&enum_aliases_json, provider_name, provider_version)?;
-
         let provider_config_types_json = bindings
             .call_provider_config_attribute_types(store)
             .await
@@ -2415,7 +2370,6 @@ impl WasmProviderFactory {
         Ok((
             config_completions,
             identity_attributes,
-            enum_aliases,
             provider_config_types,
         ))
     }
@@ -2543,12 +2497,8 @@ impl WasmProviderFactory {
         let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json)
             .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
 
-        let (
-            cached_config_completions,
-            cached_identity_attributes,
-            cached_enum_aliases,
-            cached_provider_config_types,
-        ) = Self::load_metadata(&bindings, &mut store, &name, &version).await?;
+        let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
+            Self::load_metadata(&bindings, &mut store, &name, &version).await?;
 
         Ok(Self {
             engine,
@@ -2560,7 +2510,6 @@ impl WasmProviderFactory {
             schemas,
             cached_config_completions,
             cached_identity_attributes,
-            cached_enum_aliases,
             cached_provider_config_types,
             enable_http,
             init_instance: Mutex::new((store, bindings)),
@@ -2819,9 +2768,12 @@ impl ProviderFactory for WasmProviderFactory {
         self.cached_provider_config_types.clone()
     }
 
-    fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String> {
-        let wit_attrs =
-            wasm_convert::core_to_wit_value_map(attributes).map_err(|e| e.to_string())?;
+    fn validate_config(
+        &self,
+        attributes: &CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
+        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes.attributes())
+            .map_err(|e| e.to_string())?;
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -2841,7 +2793,11 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
-    fn validate_custom_type(&self, identity: &TypeIdentity, value: &str) -> Result<(), String> {
+    fn validate_custom_type(
+        &self,
+        identity: &TypeIdentity,
+        value: &CanonicalCustomTypeValue,
+    ) -> Result<(), String> {
         let wit_identity = wasm_convert::core_type_identity_to_wit(identity);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -2849,7 +2805,7 @@ impl ProviderFactory for WasmProviderFactory {
                 let (ref mut store, ref bindings) = *guard;
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 bindings
-                    .call_validate_custom_type(store, &wit_identity, value)
+                    .call_validate_custom_type(store, &wit_identity, value.as_str())
                     .await
                     .map_err(|e| format!("Failed to call validate_custom_type(): {e}"))?
                     .map_err(|e| {
@@ -2862,10 +2818,8 @@ impl ProviderFactory for WasmProviderFactory {
     }
 
     fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String {
-        // Delegate to the shared helper so both quoted-string
-        // (`region = "us-east-1"`) and namespaced-identifier
-        // (`region = aws.Region.us_east_1`) spellings resolve
-        // correctly. carina#3021.
+        // Provider-ready config enums are already canonical host values;
+        // strings remain literal and are never shape-decoded here.
         carina_core::utils::extract_region_from_attrs(attributes, "ap-northeast-1")
     }
 
@@ -2878,19 +2832,6 @@ impl ProviderFactory for WasmProviderFactory {
             .iter()
             .map(|s| s.as_str())
             .collect()
-    }
-
-    fn get_enum_alias_reverse(
-        &self,
-        resource_type: &str,
-        attr_name: &str,
-        value: &str,
-    ) -> Option<String> {
-        self.cached_enum_aliases
-            .get(resource_type)
-            .and_then(|attrs| attrs.get(attr_name))
-            .and_then(|aliases| aliases.get(value))
-            .cloned()
     }
 
     fn create_provider(
@@ -4060,15 +4001,6 @@ mod tests {
             .expect_err("malformed config completions must fail provider loading");
 
         assert!(error.to_string().contains("provider config completions"));
-        assert!(std::error::Error::source(&error).is_some());
-    }
-
-    #[test]
-    fn malformed_enum_aliases_metadata_is_rejected() {
-        let error = decode_enum_aliases_json("not json", "mock", "1.0.0")
-            .expect_err("malformed enum aliases must fail provider loading");
-
-        assert!(error.to_string().contains("enum aliases"));
         assert!(std::error::Error::source(&error).is_some());
     }
 

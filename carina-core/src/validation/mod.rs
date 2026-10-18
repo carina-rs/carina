@@ -180,10 +180,11 @@ impl<'a> RefSink<'a> {
                 Shape::Struct { .. } => {
                     let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
                         .expect("Shape::Struct must expose struct fields internally");
-                    let accepted = crate::schema::build_accepted_field_map(fields);
-                    accepted.get(key).map(|field| Self::AttributeType {
-                        attr_type: &field.field_type,
-                        defs,
+                    crate::schema::struct_field_for_key(fields, key).map(|field| {
+                        Self::AttributeType {
+                            attr_type: &field.field_type,
+                            defs,
+                        }
                     })
                 }
                 Shape::Union => unique_union_map_member(attr_type, defs).and_then(|member| {
@@ -1832,6 +1833,7 @@ fn resolve_dotted_unresolved(
     if config
         .validators
         .keys()
+        .chain(config.custom_type_attribute_types.keys())
         .any(|registered| registered == &identity)
     {
         let schema_path = identity.segments.join(".");
@@ -2094,7 +2096,7 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 /// time. `Secret` is transparent — its inner value is unwrapped because
 /// the secret wrapper survives WASM serialization but the inner value
 /// must still be checked. carina#3182.
-pub(crate) fn value_contains_unresolved_ref(value: &Value) -> bool {
+pub fn value_contains_unresolved_ref(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
@@ -2115,10 +2117,10 @@ pub(crate) fn value_contains_unresolved_ref(value: &Value) -> bool {
 ///
 /// Runs host-side type-level validation using
 /// [`ProviderFactory::provider_config_attribute_types`] first, then
-/// delegates to [`ProviderFactory::validate_config`] for any
-/// provider-specific semantic checks. Keeping format validation
-/// (namespace structure, enum membership) on the host side means fixes
-/// in `carina-core` take effect without rebuilding provider binaries.
+/// canonicalizes schema-known enum values before delegating to
+/// [`ProviderFactory::validate_config`] for provider-specific semantic checks.
+/// The provider sees only canonical API spellings; literal strings are never
+/// decoded by textual shape.
 ///
 /// Attributes containing unresolved references (e.g.
 /// `assume_role = { role_arn = upstream.arn }` at validate time, before
@@ -2138,24 +2140,12 @@ pub fn validate_provider_config<E>(
         let Some(factory) = factories.iter().find(|f| f.name() == provider.name) else {
             continue;
         };
-        crate::executor::provider_ready::validate_provider_config_attributes(
+        crate::executor::provider_ready::validate_and_canonicalize_provider_config(
             factory.as_ref(),
             &provider.name,
             &provider.attributes,
         )
         .map_err(|error| error.to_string())?;
-        // Plugin-side validation. Drop attributes containing unresolved
-        // refs before crossing the WASM boundary; they will be checked
-        // again at plan/apply time post-resolution.
-        let serializable: IndexMap<String, Value> = provider
-            .attributes
-            .iter()
-            .filter(|(_, value)| !value_contains_unresolved_ref(value))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        factory
-            .validate_config(&serializable)
-            .map_err(|e| format!("provider {}: {}", provider.name, e))?;
     }
     Ok(())
 }

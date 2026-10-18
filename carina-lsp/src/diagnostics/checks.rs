@@ -515,6 +515,44 @@ fn deferred_in_current_file(
         == Some(current)
 }
 
+fn collect_enum_provider_namespaces(
+    attr_type: &carina_core::schema::AttributeType,
+    namespaces: &mut HashSet<String>,
+) {
+    use carina_core::schema::RawShape;
+
+    match attr_type.raw_shape() {
+        RawShape::Enum { identity, .. } => {
+            if let Some(provider) = &identity.provider {
+                namespaces.insert(provider.clone());
+            }
+        }
+        RawShape::List { element_type, .. } => {
+            collect_enum_provider_namespaces(element_type, namespaces);
+        }
+        RawShape::Map { key, value } => {
+            collect_enum_provider_namespaces(key, namespaces);
+            collect_enum_provider_namespaces(value, namespaces);
+        }
+        RawShape::Struct { fields, .. } => {
+            for field in fields {
+                collect_enum_provider_namespaces(&field.field_type, namespaces);
+            }
+        }
+        RawShape::Union(members) => {
+            for member in members {
+                collect_enum_provider_namespaces(member, namespaces);
+            }
+        }
+        RawShape::String { .. }
+        | RawShape::Int { .. }
+        | RawShape::Float { .. }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Ref(_) => {}
+    }
+}
+
 impl DiagnosticEngine {
     /// Report anonymous resources that would share an identity scheme derived
     /// from mutable attributes. The core check owns classification and
@@ -885,40 +923,31 @@ impl DiagnosticEngine {
                 continue;
             };
 
-            // Host-side type-level validation (catches malformed namespace
-            // identifiers, invalid enum values, etc.). Provider configs
-            // are flat (no cyclic CFN-style `AttributeType::Ref` today),
-            // so a single empty-`defs` `Schema` view is sufficient.
-            let attr_types = factory.provider_config_attribute_types();
-            let schema_view =
-                carina_core::schema::Schema::with_defs(std::collections::BTreeMap::new());
-            for (attr_name, value) in &provider.attributes {
-                if let Some(attr_type) = attr_types.get(attr_name)
-                    && let Err(e) = schema_view.validate_attr(attr_type, value)
-                    && let Some((line, col)) =
-                        self.find_provider_attr_position(doc, &provider.name, attr_name)
-                {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + attr_name.chars().count() as u32,
-                        DiagnosticSeverity::WARNING,
-                        format!("provider {}: {}: {}", provider.name, attr_name, e),
-                    ));
-                }
-            }
-
-            // Provider-specific validation (semantic checks not expressible
-            // in the attribute type schema).
-            if let Err(e) = factory.validate_config(&provider.attributes)
-                && let Some((line, col)) = self.find_provider_region_position(doc, &provider.name)
-            {
+            let validation =
+                carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
+                    factory.as_ref(),
+                    &provider.name,
+                    &provider.attributes,
+                );
+            if let Err(error) = validation {
+                let position = error
+                    .attribute()
+                    .and_then(|attribute| {
+                        self.find_provider_attr_position(doc, &provider.name, attribute)
+                    })
+                    .or_else(|| self.find_provider_region_position(doc, &provider.name));
+                let Some((line, col)) = position else {
+                    continue;
+                };
+                let width = error.attribute().map_or(6, |attribute| {
+                    u32::try_from(attribute.chars().count()).unwrap_or(u32::MAX)
+                });
                 diagnostics.push(carina_diagnostic(
                     line,
                     col,
-                    col + 6, // "region"
+                    col.saturating_add(width),
                     DiagnosticSeverity::WARNING,
-                    format!("provider {}: {}", provider.name, e),
+                    error.to_string(),
                 ));
             }
         }
@@ -2515,6 +2544,16 @@ impl DiagnosticEngine {
         declared_providers: &HashSet<String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        let mut provider_config_enum_namespaces = HashSet::new();
+        for factory in self
+            .factories
+            .iter()
+            .filter(|factory| declared_providers.contains(factory.name()))
+        {
+            for attr_type in factory.provider_config_attribute_types().values() {
+                collect_enum_provider_namespaces(attr_type, &mut provider_config_enum_namespaces);
+            }
+        }
 
         for (line_idx, line) in text.lines().enumerate() {
             // Look for patterns like "binding_name.property" after "="
@@ -2533,12 +2572,18 @@ impl DiagnosticEngine {
                 // declared in the current document (issue #2019) so that an
                 // enum reference like `awscc.Region.ap_northeast_1` is not
                 // flagged as an undefined `let` binding when the provider is
-                // declared but not yet downloaded.
+                // declared but not yet downloaded. A loaded provider config
+                // may also declare an enum owned by another namespace (for
+                // example awscc's config type is `aws.Region`), so recognize
+                // those schema-derived roots as enum namespaces too.
                 let is_provider_prefix = self
                     .provider_names
                     .iter()
                     .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)))
                     || declared_providers
+                        .iter()
+                        .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)))
+                    || provider_config_enum_namespaces
                         .iter()
                         .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)));
                 if is_provider_prefix {

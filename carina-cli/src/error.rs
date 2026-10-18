@@ -353,6 +353,14 @@ pub enum AppError {
     #[error(transparent)]
     ProviderConfigPreparation(#[from] carina_core::executor::ProviderConfigPreparationError),
 
+    /// Desired resource or data-source enum canonicalization failed.
+    #[error(transparent)]
+    EnumCanonicalization(#[from] carina_core::value::EnumCanonicalizationError),
+
+    /// Provider configuration enum canonicalization failed.
+    #[error(transparent)]
+    ProviderConfigCanonicalization(#[from] carina_core::value::ProviderConfigCanonicalizationError),
+
     /// A source-loaded provider reported a kind other than the block that
     /// selected its artifact.
     #[error(

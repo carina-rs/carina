@@ -403,7 +403,7 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
     );
     assert!(
         rendered.contains(
-            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 5"
+            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 6"
         ),
         "the stable info preflight must report the protocol mismatch: {rendered}"
     );

@@ -44,13 +44,16 @@ impl ProviderFactory for AwsccTestFactory {
     fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
         HashMap::new()
     }
-    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
         Ok(())
     }
     fn validate_custom_type(
         &self,
         _type_name: &carina_core::schema::TypeIdentity,
-        _value: &str,
+        _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> Result<(), String> {
         Ok(())
     }

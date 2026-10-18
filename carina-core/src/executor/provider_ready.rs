@@ -18,7 +18,9 @@ use crate::executor::normalized::apply_desired_normalization;
 pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::evaluate_pending_constraints;
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
-use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
+use crate::provider::{
+    CanonicalCustomTypeValue, CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest,
+};
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, ResolvedDataSource, ResolvedResource,
     Resource, ResourceId, Value,
@@ -63,6 +65,31 @@ pub type ProviderReadyResource = ProviderReady<ResolvedResource>;
 /// A fully resolved data source whose known input constraints have run.
 pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource>;
 
+/// Provider configuration attributes whose schema-known enum leaves are in
+/// host-resolved API spelling.
+///
+/// The field is private and the only producer is
+/// [`validate_and_canonicalize_provider_config`], which also runs host type
+/// checks and provider semantic validation before returning the value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalProviderConfigAttributes {
+    attributes: IndexMap<String, Value>,
+}
+
+impl CanonicalProviderConfigAttributes {
+    pub fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+}
+
+impl Deref for CanonicalProviderConfigAttributes {
+    type Target = IndexMap<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        self.attributes()
+    }
+}
+
 /// Provider configuration that passed every provider-boundary check.
 ///
 /// The attributes remain private so a provider instance cannot be created
@@ -90,13 +117,13 @@ pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource>;
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderReadyConfig {
-    attributes: IndexMap<String, Value>,
+    attributes: CanonicalProviderConfigAttributes,
 }
 
 impl ProviderReadyConfig {
     /// Borrow the checked provider configuration attributes.
     pub fn attributes(&self) -> &IndexMap<String, Value> {
-        &self.attributes
+        self.attributes.attributes()
     }
 }
 
@@ -346,10 +373,16 @@ pub enum ProviderPreparationError {
     Provider(#[from] crate::provider::ProviderError),
 }
 
+impl From<crate::value::EnumCanonicalizationError> for ProviderPreparationError {
+    fn from(error: crate::value::EnumCanonicalizationError) -> Self {
+        Self::Provider(error.into())
+    }
+}
+
 /// Provider-specific configuration validation failure.
 ///
 /// This wrapper lets [`ProviderConfigPreparationError`] retain a typed source
-/// for the string-based [`ProviderFactory::validate_config`] contract.
+/// for the provider-specific [`ProviderFactory::validate_config`] contract.
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct ProviderConfigValidationError {
@@ -376,13 +409,88 @@ pub enum ProviderConfigPreparationError {
     },
 }
 
+impl ProviderConfigPreparationError {
+    /// Attribute responsible for a host-side type/canonicalization failure.
+    pub fn attribute(&self) -> Option<&str> {
+        match self {
+            Self::InvalidAttribute { attribute, .. } => Some(attribute),
+            Self::ProviderValidation { .. } => None,
+        }
+    }
+}
+
+fn canonicalize_provider_config_attributes(
+    provider_name: &str,
+    attributes: &IndexMap<String, Value>,
+    attr_types: &HashMap<String, crate::schema::AttributeType>,
+) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+    let attributes = crate::value::canonicalize_provider_config_attributes_with_types(
+        provider_name,
+        attributes,
+        attr_types,
+    )
+    .map_err(|error| {
+        let (provider, attribute, source) = error.into_parts();
+        ProviderConfigPreparationError::InvalidAttribute {
+            provider,
+            attribute,
+            source: Box::new(source),
+        }
+    })?;
+    Ok(CanonicalProviderConfigAttributes { attributes })
+}
+
+/// Validate and canonicalize one provider configuration through the single
+/// host-to-provider seam.
+///
+/// The complete authored map is first canonicalized with provider-config enum
+/// namespace rules, then host type checks run over that canonical map.
+/// Attributes containing unresolved references are withheld from the provider
+/// validator (the construction-time call has no such values), while every
+/// remaining schema-known enum reaches [`ProviderFactory::validate_config`] in
+/// API spelling.
+pub fn validate_and_canonicalize_provider_config(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    attributes: &IndexMap<String, Value>,
+) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+    let attr_types = factory.provider_config_attribute_types();
+    let canonical =
+        canonicalize_provider_config_attributes(provider_name, attributes, &attr_types)?;
+    validate_provider_config_attributes(provider_name, canonical.attributes(), &attr_types)?;
+
+    let serializable = canonical
+        .attributes
+        .into_iter()
+        .filter(|(_, value)| !crate::validation::value_contains_unresolved_ref(value))
+        .collect();
+    let canonical = CanonicalProviderConfigAttributes {
+        attributes: serializable,
+    };
+
+    factory.validate_config(&canonical).map_err(|message| {
+        let message = if canonical.values().any(crate::value::contains_secret) {
+            "configuration containing a secret failed validation".to_string()
+        } else {
+            message
+        };
+        ProviderConfigPreparationError::ProviderValidation {
+            provider: provider_name.to_string(),
+            source: ProviderConfigValidationError { message },
+        }
+    })?;
+
+    Ok(canonical)
+}
+
 /// Prepare provider configuration for construction and normalization.
 ///
 /// [`ResolvedProviderConfig`] carries the guarantee that every construction-
 /// time attribute is fully resolved. This boundary therefore checks each
-/// attribute against the provider's host-side schema and then runs the
-/// provider-specific configuration validator. This is the sole constructor
-/// for [`ProviderReadyConfig`].
+/// attribute against the provider's host-side schema, replaces enum spellings
+/// with canonical API values, and only then runs the provider-specific
+/// configuration validator. This is the sole constructor for
+/// [`ProviderReadyConfig`].
 ///
 /// A raw parser config cannot skip the provider-resolution capability.
 ///
@@ -401,22 +509,11 @@ pub fn prepare_provider_ready_config(
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
     let provider_name = config.name();
     let attributes = config.attributes();
-    validate_provider_config_attributes(factory, provider_name, attributes)?;
-
-    factory.validate_config(attributes).map_err(|message| {
-        let message = if attributes.values().any(crate::value::contains_secret) {
-            "configuration containing a secret failed validation".to_string()
-        } else {
-            message
-        };
-        ProviderConfigPreparationError::ProviderValidation {
-            provider: provider_name.to_string(),
-            source: ProviderConfigValidationError { message },
-        }
-    })?;
+    let canonical_attributes =
+        validate_and_canonicalize_provider_config(factory, provider_name, attributes)?;
 
     Ok(ProviderReadyConfig {
-        attributes: attributes.clone(),
+        attributes: canonical_attributes,
     })
 }
 
@@ -425,12 +522,11 @@ pub fn prepare_provider_ready_config(
 /// The static validation phase calls this directly because unresolved values
 /// are intentionally allowed there. Provider construction calls it only after
 /// proving the complete map resolved.
-pub(crate) fn validate_provider_config_attributes(
-    factory: &dyn ProviderFactory,
+fn validate_provider_config_attributes(
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
+    attr_types: &HashMap<String, crate::schema::AttributeType>,
 ) -> Result<(), ProviderConfigPreparationError> {
-    let attr_types = factory.provider_config_attribute_types();
     let schema_view = crate::schema::Schema::with_defs(std::collections::BTreeMap::new());
     for (attribute, value) in attributes {
         if let Some(attr_type) = attr_types.get(attribute) {
@@ -564,7 +660,6 @@ async fn prepare_provider_ready_resource_with_value_check(
         value,
         context.provider_configs,
         context.normalizer,
-        context.factories,
         context.schemas,
     )
     .await?;
@@ -632,7 +727,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution(
     crate::value::canonicalize_data_sources_with_schemas(
         std::slice::from_mut(&mut value),
         context.schemas,
-    );
+    )?;
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
@@ -664,15 +759,27 @@ pub fn provider_custom_type_lookup(
     factories: &[Box<dyn ProviderFactory>],
 ) -> impl Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + Send + Sync + '_ {
     move |identity, value| {
-        let Some(text) = value
-            .as_concrete()
-            .and_then(|concrete| concrete.as_string_like())
-        else {
-            return Ok(());
+        let canonical = match value {
+            Value::Concrete(ConcreteValue::String(text)) => {
+                CanonicalCustomTypeValue::from_literal_string(text)
+            }
+            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                if value.identity().same_type(identity) =>
+            {
+                CanonicalCustomTypeValue::from_canonical_enum(value)
+            }
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                return Err(TypeError::ValidationFailed {
+                    message: format!(
+                        "unresolved enum identifier `{raw}` reached provider custom-type validation"
+                    ),
+                });
+            }
+            _ => return Ok(()),
         };
         for factory in factories {
             factory
-                .validate_custom_type(identity, text)
+                .validate_custom_type(identity, &canonical)
                 .map_err(|message| TypeError::ValidationFailed { message })?;
         }
         Ok(())
@@ -748,6 +855,61 @@ mod provider_config_tests {
     use crate::resource::ConcreteValue;
     use crate::schema::AttributeType;
 
+    struct EnumConfigFactory;
+
+    impl ProviderFactory for EnumConfigFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "enum config test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::from([(
+                "region".to_string(),
+                AttributeType::enum_(
+                    crate::schema::TypeIdentity::new(Some("test"), Vec::<String>::new(), "Region"),
+                    Some(vec!["ap-northeast-1".to_string()]),
+                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                    None,
+                    None,
+                ),
+            )])
+        }
+
+        fn validate_config(
+            &self,
+            attributes: &CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
+            match attributes.get("region") {
+                Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                    if value.api_value() == "ap-northeast-1" =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("expected canonical region, got {other:?}")),
+            }
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "ap-northeast-1".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            Vec::new()
+        }
+    }
+
     struct ConfigFactory {
         validate_calls: AtomicUsize,
         plugin_error: Option<&'static str>,
@@ -785,7 +947,10 @@ mod provider_config_tests {
             )])
         }
 
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(
+            &self,
+            _attributes: &CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
             self.validate_calls.fetch_add(1, Ordering::SeqCst);
             match self.plugin_error {
                 Some(message) => Err(message.to_string()),
@@ -839,6 +1004,24 @@ mod provider_config_tests {
 
         assert_eq!(ready.attributes(), &attributes);
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_canonicalizes_enum_before_plugin_validation() {
+        let attributes = config(Value::Concrete(ConcreteValue::enum_identifier(
+            "test.Region.ap_northeast_1",
+        )));
+        let resolved = resolved_configs(attributes);
+
+        let ready =
+            prepare_provider_ready_config(&EnumConfigFactory, resolved.iter().next().unwrap())
+                .expect("provider config enum must be canonicalized before validation");
+
+        assert!(matches!(
+            ready.attributes().get("region"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "ap-northeast-1"
+        ));
     }
 
     #[test]

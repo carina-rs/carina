@@ -623,10 +623,31 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     reg
 });
 
-/// Factory with a modern enum schema plus a conflicting legacy reverse-alias
-/// entry. Schema resolution must retain `CanonicalEnum("all")` and must not
-/// consult the legacy table.
+/// Factory with a modern enum schema. Schema resolution retains the
+/// `CanonicalEnum("all")` API spelling without a provider-owned alias table.
 struct AliasFactory;
+
+fn alias_resource_schema() -> crate::schema::ResourceSchema {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
+
+    ResourceSchema::new("sg").attribute(AttributeSchema::new(
+        "ip_protocol",
+        AttributeType::enum_(
+            enum_identity("IpProtocol", Some("test.ec2.SecurityGroup")),
+            Some(vec!["all".to_string(), "tcp".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        ),
+    ))
+}
+
+static ALIAS_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
+    let mut registry = SchemaRegistry::new();
+    registry.insert("test", alias_resource_schema());
+    registry
+});
+
 impl ProviderFactory for AliasFactory {
     fn name(&self) -> &str {
         "test"
@@ -639,7 +660,7 @@ impl ProviderFactory for AliasFactory {
     }
     fn validate_config(
         &self,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _attributes: &crate::provider::CanonicalProviderConfigAttributes,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -654,26 +675,7 @@ impl ProviderFactory for AliasFactory {
         unreachable!("test factory does not create providers")
     }
     fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
-
-        vec![ResourceSchema::new("sg").attribute(AttributeSchema::new(
-            "ip_protocol",
-            AttributeType::enum_(
-                enum_identity("IpProtocol", Some("test.ec2.SecurityGroup")),
-                Some(vec!["all".to_string(), "tcp".to_string()]),
-                Vec::new(),
-                None,
-                None,
-            ),
-        ))]
-    }
-    fn get_enum_alias_reverse(
-        &self,
-        _resource_type: &str,
-        attr_name: &str,
-        value: &str,
-    ) -> Option<String> {
-        (attr_name == "ip_protocol" && value == "all").then(|| "-1".to_string())
+        vec![alias_resource_schema()]
     }
 }
 
@@ -3884,12 +3886,11 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     assert_eq!(provider.captured_data_source_reads().len(), 1);
 }
 
-/// carina#3063: the apply path must re-apply the plan-time typed enum stage,
-/// not just `normalize_desired`. Apply re-resolves from the authored source;
-/// without this stage the provider would receive an unresolved
-/// `EnumIdentifier` instead of a `CanonicalEnum`.
+/// carina#3063: the apply path must re-apply host schema canonicalization, not
+/// just `normalize_desired`. Apply re-resolves from the authored source;
+/// without this stage the provider would receive an unresolved identifier.
 #[tokio::test]
-async fn test_apply_reapplies_enum_alias_stage() {
+async fn test_apply_reapplies_host_enum_canonicalization() {
     let provider = MockProvider::new();
     // `id.provider = "test"` so the per-resource factory lookup finds
     // `AliasFactory` (whose `name()` is `"test"`).
@@ -3919,7 +3920,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &factories,
-        schemas: &TEST_SCHEMAS,
+        schemas: &ALIAS_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
     };
 
@@ -3941,12 +3942,11 @@ async fn test_apply_reapplies_enum_alias_stage() {
     );
 }
 
-/// carina#3063, Update path: the enum-alias stage must be re-applied on
-/// Update too, not just Create (carina#3060's lesson — aws#315 was an
-/// Update bug). The `UpdateRequest.patch` is built from the re-resolved
-/// `to`; without the apply-path pass it would carry the unresolved DSL form.
+/// carina#3063, Update path: host enum canonicalization must be re-applied on
+/// Update too, not just Create. The patch is built from the re-resolved `to`;
+/// without the apply-path pass it would carry the unresolved DSL form.
 #[tokio::test]
-async fn test_apply_reapplies_enum_alias_stage_update_path() {
+async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "sg", "a", None);
     to_resource.binding = Some("a".to_string());
@@ -3984,7 +3984,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &factories,
-        schemas: &TEST_SCHEMAS,
+        schemas: &ALIAS_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
     };
 

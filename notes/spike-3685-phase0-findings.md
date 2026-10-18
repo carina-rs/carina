@@ -257,7 +257,6 @@ The p2 CLI/I/O imports above come from the wasm32-wasip2 standard library. The p
 
       validate-custom-type: func(ty: type-identity, value: string) -> result<_, provider-error>;
 
-      get-enum-aliases: func() -> string;
 
       normalize-desired: func(resources: list<resource-def>) -> list<resource-def>;
 

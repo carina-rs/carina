@@ -7564,6 +7564,7 @@ fn parse_decrypt_uses_config_decryptor() {
             Ok(format!("decrypted:{ciphertext}"))
         })),
         validators: HashMap::new(),
+        custom_type_attribute_types: HashMap::new(),
         custom_type_validator: None,
         resource_types: Default::default(),
         customs_loaded: false,
@@ -7609,6 +7610,7 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
             Ok(format!("decrypted:{ciphertext}"))
         })),
         validators: HashMap::new(),
+        custom_type_attribute_types: HashMap::new(),
         custom_type_validator: None,
         resource_types: Default::default(),
         customs_loaded: false,
@@ -7676,6 +7678,7 @@ fn parse_custom_validator_accepts_valid() {
     let config = ProviderContext {
         decryptor: None,
         validators,
+        custom_type_attribute_types: HashMap::new(),
         custom_type_validator: None,
         resource_types: Default::default(),
         customs_loaded: false,
@@ -7718,6 +7721,7 @@ fn parse_custom_validator_rejects_invalid() {
     let config = ProviderContext {
         decryptor: None,
         validators,
+        custom_type_attribute_types: HashMap::new(),
         custom_type_validator: None,
         resource_types: Default::default(),
         customs_loaded: false,
@@ -12234,15 +12238,10 @@ fn check_provider_instance_routing_rejects_non_provider_let_binding() {
 
 /// carina#3021 — multi-file shape with **namespaced enum identifiers**
 /// (`aws.Region.us_east_1`) for `region`. This is the form real
-/// configs use; quoted strings (`region = "us-east-1"`) are an
-/// alternate spelling that the parser stores as
-/// `Value::Concrete(ConcreteValue::String)`. Namespaced identifiers
-/// land in `EnumIdentifier`, and the bug was that downstream
-/// `extract_region` only matched the `String` arm — see
-/// [[feedback_scalar_serializer_enum_identifier]] for the class.
-/// The fix is centralised in `utils::extract_region_from_attrs`;
-/// this test pins the parse side so we know the regression test in
-/// `utils` is operating on the same `Value` shape the parser produces.
+/// configs use. Namespaced identifiers land in `EnumIdentifier`; provider
+/// config preparation must resolve that typed value through the loaded schema
+/// before validation, initialization, or region extraction. This test pins the
+/// parser side of that boundary.
 #[test]
 fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
     use crate::config_loader::parse_directory;
@@ -12267,12 +12266,9 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
         .iter()
         .find(|p| p.binding.as_deref() == Some("us"))
         .expect("`us` named instance must exist in parsed.providers");
-    // The parser stamps namespaced region literals as
-    // `EnumIdentifier`. Any downstream `extract_region` /
-    // `convert_region_value` etc. must accept this variant *and* the
-    // plain `String` variant — earlier versions only matched
-    // `String`, silently falling back to a hardcoded default region
-    // when the user wrote `aws.Region.us_east_1`. See carina#3021.
+    // The parser stamps namespaced region literals as `EnumIdentifier` so the
+    // host can resolve them with the provider config schema. It must not erase
+    // that provenance into a string for downstream shape guessing.
     let region_text = match us.attributes.get("region") {
         Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => Some(s.as_str()),
         Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.expose_plaintext()),
@@ -12286,22 +12282,7 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
         us.attributes.get("region")
     );
 
-    // And the canonical conversion must round-trip the namespaced
-    // form to the AWS SDK region string regardless of which `Value`
-    // variant carried it.
-    let canonical = crate::utils::convert_region_value(region_text.unwrap());
-    assert_eq!(
-        canonical, "us-east-1",
-        "convert_region_value must reduce `aws.Region.us_east_1` to the \
-         SDK string `us-east-1`. carina#3021."
-    );
-
-    // The bug also affected the kind default — its region is also
-    // written as a namespaced identifier (`aws.Region.ap_northeast_1`).
-    // The user just happened to see the right value in the plan
-    // output because the host's hardcoded `_ => "ap-northeast-1"`
-    // fallback matched the user's intended region. Verifying the
-    // default here pins that we'd catch that latent bug too.
+    // The kind default uses the same typed parser representation.
     let default = parsed
         .providers
         .iter()
@@ -12315,13 +12296,7 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
     assert_eq!(
         default_region_text,
         Some("aws.Region.ap_northeast_1"),
-        "kind default must also carry its own region in EnumIdentifier \
-         form so the helper canonicalises it instead of falling through \
-         to the hardcoded host default. carina#3021."
-    );
-    assert_eq!(
-        crate::utils::convert_region_value(default_region_text.unwrap()),
-        "ap-northeast-1"
+        "kind default must also retain EnumIdentifier provenance for host schema resolution"
     );
 }
 

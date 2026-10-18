@@ -660,6 +660,7 @@ mod tests {
         let config = ProviderContext {
             decryptor: Some(Box::new(|ciphertext, _| Ok(format!("plain:{ciphertext}")))),
             validators: HashMap::new(),
+            custom_type_attribute_types: HashMap::new(),
             custom_type_validator: None,
             resource_types: Default::default(),
             customs_loaded: false,

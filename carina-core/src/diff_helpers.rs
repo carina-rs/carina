@@ -41,7 +41,7 @@ pub(crate) fn schema_aware_equal(
 /// `Struct`; nested `List<Map>`/`List<Struct>` types therefore still resolve
 /// their entries (carina#3073). This differs intentionally from
 /// [`list_element_type`], which consumes exactly one list boundary. Uses the
-/// canonical `build_accepted_field_map` so a `block_name`-aliased struct field
+/// canonical `struct_field_for_key` lookup so a `block_name`-aliased struct field
 /// resolves like `validate_struct`.
 ///
 /// `defs` is the enclosing schema's `defs` map; any [`AttributeType::Ref`]
@@ -70,8 +70,7 @@ pub(crate) fn map_entry_subtype<'a>(
             crate::schema::Shape::Struct { .. } => {
                 let fields = crate::schema::struct_fields_with_defs(t, defs)
                     .expect("Shape::Struct must expose struct fields internally");
-                return crate::schema::build_accepted_field_map(fields)
-                    .get(key)
+                return crate::schema::struct_field_for_key(fields, key)
                     .map(|field| &field.field_type);
             }
             crate::schema::Shape::Union => {

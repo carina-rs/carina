@@ -18,7 +18,7 @@ Convert the existing `carina-provider-awscc` crate into a dual lib+binary crate.
 ## Non-Goals
 
 - `carina init` / automatic download (Phase 2b)
-- LSP-specific methods: `region_completions`, `get_enum_alias_reverse`, `format_schema_key`, `identity_attributes` (separate work)
+- LSP-specific methods: `region_completions`, `format_schema_key`, `identity_attributes` (separate work)
 - Removing `carina-provider-awscc` as a direct dependency of `carina-cli` (Phase 3+)
 
 ## Architecture
@@ -163,11 +163,13 @@ Delete `carina-provider-mock-process` crate. Add `main.rs` to `carina-provider-m
   │
   ├─ initialize RPC → provider creates AWS CloudControl client
   │
-  ├─ normalize_desired RPC → provider resolves enum identifiers
+  ├─ host resolves desired enum identifiers from schemas
+  ├─ normalize_desired RPC → provider applies non-enum desired transforms
+  ├─ host re-lifts returned enum API strings from schemas
   │
   ├─ read RPC (per resource) → provider calls CloudControl GetResource
   │
-  ├─ normalize_state RPC → provider normalizes state enum values
+  ├─ normalize_state RPC → provider applies non-enum state transforms
   │
   ├─ hydrate_read_state RPC → provider restores unreturned attributes
   │
