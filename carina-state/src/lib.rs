@@ -15,17 +15,22 @@
 //! # Example
 //!
 //! ```ignore
-//! use carina_state::{create_backend, BackendConfig};
+//! use carina_core::parser::BackendConfig as ParserBackendConfig;
+//! use carina_core::resource::{ConcreteValue, Value};
+//! use carina_state::{BackendConfig, create_backend};
+//! use std::collections::HashMap;
 //! use std::path::Path;
 //!
-//! let config = BackendConfig {
+//! let raw_config = ParserBackendConfig {
 //!     backend_type: "s3".to_string(),
 //!     attributes: [
-//!         ("bucket".to_string(), Value::Concrete(ConcreteValue::String("my-state-bucket".to_string()))),
-//!         ("key".to_string(), Value::Concrete(ConcreteValue::String("infra/prod/carina.state".to_string()))),
-//!         ("region".to_string(), Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".to_string()))),
+//!         ("bucket".to_string(), Value::Concrete(ConcreteValue::String("my-state-bucket".into()))),
+//!         ("key".to_string(), Value::Concrete(ConcreteValue::String("infra/prod/carina.state".into()))),
+//!         ("region".to_string(), Value::Concrete(ConcreteValue::enum_identifier("aws.Region.ap_northeast_1"))),
 //!     ].into_iter().collect(),
+//!     attribute_spans: HashMap::new(),
 //! };
+//! let config = BackendConfig::try_from(&raw_config)?;
 //!
 //! let backend = create_backend(Some(&config), Path::new(".")).await?;
 //!
@@ -45,6 +50,7 @@
 //! ```
 
 pub mod backend;
+mod backend_config;
 pub mod backend_lock;
 pub mod backends;
 pub mod lock;
@@ -52,8 +58,12 @@ pub mod state;
 
 // Re-export main types for convenience
 pub use backend::{
-    BackendConfig, BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE,
+    BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE,
     StateBackend,
+};
+pub use backend_config::{
+    BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors,
+    LocalBackendSettings, S3BackendSettings,
 };
 pub use backend_lock::BackendLock;
 pub use backends::{

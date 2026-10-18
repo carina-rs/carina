@@ -10,7 +10,8 @@ pub use url::{StateUrl, load_state_from_url};
 
 use std::path::Path;
 
-use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
+use crate::backend::{BackendError, BackendResult, StateBackend};
+use crate::backend_config::{BackendConfig, LocalBackendSettings};
 
 /// Create a backend from configuration, anchoring local state paths at `base_dir`.
 ///
@@ -34,19 +35,15 @@ async fn create_configured_backend(
     config: &BackendConfig,
     base_dir: &Path,
 ) -> BackendResult<Box<dyn StateBackend>> {
-    match config.backend_type.as_str() {
-        "s3" => {
-            let backend = S3Backend::from_config(config).await?;
+    match config {
+        BackendConfig::S3(settings) => {
+            let backend = S3Backend::from_config(settings).await?;
             Ok(Box::new(backend))
         }
-        "local" => {
-            let backend = LocalBackend::from_config(config, base_dir)?;
+        BackendConfig::Local(settings) => {
+            let backend = LocalBackend::from_config(settings, base_dir)?;
             Ok(Box::new(backend))
         }
-        // Future backends:
-        // "gcs" => Ok(Box::new(GcsBackend::from_config(config)?)),
-        // "azure" => Ok(Box::new(AzureBackend::from_config(config)?)),
-        other => Err(BackendError::unsupported_backend(other)),
     }
 }
 
@@ -56,12 +53,12 @@ async fn create_configured_backend(
 /// the operation is meaningful only for remote backends and should reject a
 /// local backend instead of constructing one.
 pub async fn create_remote_backend(config: &BackendConfig) -> BackendResult<Box<dyn StateBackend>> {
-    if config.is_local() {
-        return Err(BackendError::Configuration(
+    match config {
+        BackendConfig::Local(_) => Err(BackendError::Configuration(
             "Local backend does not manage a remote state bucket".to_string(),
-        ));
+        )),
+        BackendConfig::S3(_) => create_configured_backend(config, Path::new(".")).await,
     }
-    create_configured_backend(config, Path::new(".")).await
 }
 
 /// Resolve a backend from an optional parser BackendConfig for read-only use.
@@ -73,7 +70,7 @@ pub async fn resolve_backend_for_read(
     base_dir: &Path,
 ) -> BackendResult<Box<dyn StateBackend>> {
     if let Some(config) = backend_config {
-        let state_config = BackendConfig::from(config);
+        let state_config = BackendConfig::try_from(config)?;
         create_backend(Some(&state_config), base_dir).await
     } else {
         create_backend(None, base_dir).await
@@ -82,9 +79,9 @@ pub async fn resolve_backend_for_read(
 
 /// Resolve a local backend's state file path, anchoring a relative
 /// `path` (or the unset default) at `base_dir`.
-pub fn anchored_local_path(config: &BackendConfig, base_dir: &Path) -> std::path::PathBuf {
+pub fn anchored_local_path(config: &LocalBackendSettings, base_dir: &Path) -> std::path::PathBuf {
     let path = config
-        .get_string("path")
+        .path()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(LocalBackend::DEFAULT_STATE_FILE));
     if path.is_absolute() {
@@ -97,23 +94,25 @@ pub fn anchored_local_path(config: &BackendConfig, base_dir: &Path) -> std::path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_config::BackendConfigError;
     use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_unsupported_backend() {
-        let config = BackendConfig {
+        let config = carina_core::parser::BackendConfig {
             backend_type: "unsupported".to_string(),
             attributes: HashMap::new(),
+            attribute_spans: HashMap::new(),
         };
 
-        let result = create_backend(Some(&config), Path::new(".")).await;
-        assert!(result.is_err());
-
-        if let Err(BackendError::UnsupportedBackend(name)) = result {
-            assert_eq!(name, "unsupported");
-        } else {
-            panic!("Expected UnsupportedBackend error");
-        }
+        let error = BackendConfig::try_from(&config).unwrap_err();
+        let error = BackendError::from(error);
+        assert_eq!(error.to_string(), "Unsupported backend type: unsupported");
+        assert!(matches!(
+            error,
+            BackendError::InvalidConfig(BackendConfigError::UnsupportedBackend(name))
+                if name == "unsupported"
+        ));
     }
 
     #[tokio::test]
@@ -139,10 +138,12 @@ mod tests {
         let result = resolve_backend_for_read(Some(&config), Path::new(".")).await;
         assert!(result.is_err());
 
-        if let Err(BackendError::UnsupportedBackend(name)) = result {
+        if let Err(BackendError::InvalidConfig(BackendConfigError::UnsupportedBackend(name))) =
+            result
+        {
             assert_eq!(name, "unsupported");
         } else {
-            panic!("Expected UnsupportedBackend error");
+            panic!("Expected typed unsupported-backend config error");
         }
     }
 }

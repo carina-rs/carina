@@ -405,6 +405,13 @@ impl DiagnosticEngine {
             // Check backend in module
             diagnostics.extend(self.check_backend_in_module(doc, parsed, merged));
 
+            // Check backend type, attributes, and required settings.
+            diagnostics.extend(self.check_backend_config(
+                doc,
+                merged_result.as_ref(),
+                current_file_name,
+            ));
+
             // Check upstream state declarations in module
             diagnostics.extend(self.check_upstream_states_in_module(doc, parsed, merged));
 

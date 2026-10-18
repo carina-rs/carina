@@ -3753,6 +3753,40 @@ fn saved_plan_backend_cross_check_rejects_non_addressing_attribute_change() {
 }
 
 #[test]
+fn saved_plan_backend_cross_check_preserves_typed_config_error() {
+    let mut planned = s3_backend_config_with_encrypt(false);
+    planned.attributes.insert(
+        "bucket".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    let current = s3_backend_config_with_encrypt(false);
+
+    let error = ensure_saved_plan_backend_matches_current(
+        Some(&planned),
+        Some(&current),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("infra/foo"),
+        },
+    )
+    .expect_err("an invalid saved backend must fail inspection");
+
+    assert!(
+        matches!(
+            &error,
+            AppError::Backend(carina_state::BackendError::InvalidConfig(
+                carina_state::BackendConfigError::Invalid(errors)
+            )) if errors.errors().iter().any(|error| matches!(
+                error,
+                carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                    if attribute == "bucket"
+            ))
+        ),
+        "typed backend error was erased: {error:?}"
+    );
+}
+
+#[test]
 fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // The schema map is keyed by provider-prefixed names (e.g., "awscc.ec2.Vpc"),
     // but the buggy code used resource.id.resource_type (e.g., "ec2.Vpc") for lookup.

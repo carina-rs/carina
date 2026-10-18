@@ -836,34 +836,6 @@ fn is_dynamic_dsl_member_segment(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
 }
 
-/// Convert a region value from DSL format to AWS SDK format.
-///
-/// Handles the following patterns:
-/// - `aws.Region.ap_northeast_1` -> `ap-northeast-1`
-/// - `awscc.Region.ap_northeast_1` -> `ap-northeast-1`
-/// - `ap-northeast-1` -> `ap-northeast-1` (passthrough)
-///
-/// # Examples
-///
-/// ```
-/// use carina_core::utils::convert_region_value;
-///
-/// assert_eq!(convert_region_value("aws.Region.ap_northeast_1"), "ap-northeast-1");
-/// assert_eq!(convert_region_value("awscc.Region.us_west_2"), "us-west-2");
-/// assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
-/// ```
-pub fn convert_region_value(value: &str) -> String {
-    // Match any `<provider>.Region.<region_name>` pattern (e.g., "aws.Region.ap_northeast_1")
-    if let Some(pos) = value.find(".Region.") {
-        let rest = &value[pos + ".Region.".len()..];
-        // Verify the prefix is a simple provider name (no dots except the one before Region)
-        if !value[..pos].contains('.') {
-            return rest.replace('_', "-");
-        }
-    }
-    value.to_string()
-}
-
 /// Read a provider-ready config's `region` attribute, falling back to
 /// `default_region` when it is absent or unresolved.
 ///
@@ -1416,32 +1388,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    // convert_region_value tests
-
-    #[test]
-    fn test_convert_region_value_aws_prefix() {
-        assert_eq!(
-            convert_region_value("aws.Region.ap_northeast_1"),
-            "ap-northeast-1"
-        );
-        assert_eq!(convert_region_value("aws.Region.us_west_2"), "us-west-2");
-    }
-
-    #[test]
-    fn test_convert_region_value_awscc_prefix() {
-        assert_eq!(
-            convert_region_value("awscc.Region.ap_northeast_1"),
-            "ap-northeast-1"
-        );
-        assert_eq!(convert_region_value("awscc.Region.us_west_2"), "us-west-2");
-    }
-
-    #[test]
-    fn test_convert_region_value_passthrough() {
-        assert_eq!(convert_region_value("us-east-1"), "us-east-1");
-        assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
     }
 
     // Table-driven coverage for #2221. The per-case tests above each pin one

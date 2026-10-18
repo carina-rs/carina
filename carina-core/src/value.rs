@@ -25,8 +25,6 @@ pub enum SerializationContext {
     SecretRedaction,
     /// State backend write path (after apply).
     StateWriteback,
-    /// Backend lock JSON.
-    BackendLock,
     /// WASM provider boundary (`core_to_wit_value` and the JSON
     /// fallback used to inspect provider input/output).
     WasmBoundary,
@@ -38,7 +36,6 @@ impl std::fmt::Display for SerializationContext {
             Self::ValueToJson => write!(f, "JSON conversion"),
             Self::SecretRedaction => write!(f, "secret redaction"),
             Self::StateWriteback => write!(f, "state writeback"),
-            Self::BackendLock => write!(f, "backend lock"),
             Self::WasmBoundary => write!(f, "WASM provider boundary"),
         }
     }
@@ -4306,7 +4303,9 @@ impl CanonicalizedProviderConfigs {
     }
 }
 
-pub(crate) fn canonicalize_provider_config_with_type(
+/// Canonicalize one value using the same enum-resolution rules as provider
+/// configuration attributes.
+pub fn canonicalize_provider_config_with_type(
     provider_name: &str,
     value: Value,
     attr_type: &AttributeType,

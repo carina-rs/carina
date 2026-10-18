@@ -496,6 +496,34 @@ fn collect_known_bindings(merged: &ParsedFile) -> carina_core::binding_index::Bi
     carina_core::binding_index::BindingNameSet::from_parsed(merged)
 }
 
+fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -> bool) -> bool {
+    match value {
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            matches_name(name)
+                || args
+                    .iter()
+                    .any(|arg| contains_matching_function_call(arg, matches_name))
+        }
+        Value::Concrete(ConcreteValue::List(items)) => items
+            .iter()
+            .any(|item| contains_matching_function_call(item, matches_name)),
+        Value::Concrete(ConcreteValue::Map(entries)) => entries
+            .values()
+            .any(|entry| contains_matching_function_call(entry, matches_name)),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+            matches!(
+                part,
+                carina_core::resource::InterpolationPart::Expr(value)
+                    if contains_matching_function_call(value, matches_name)
+            )
+        }),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            contains_matching_function_call(inner, matches_name)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `deferred` was parsed from the editor's current document.
 /// `DeferredForExpression.file` is stamped with the full source path, so we
 /// compare by basename to the LSP-supplied `current_file_name`.
@@ -817,6 +845,117 @@ impl DiagnosticEngine {
                 )
             })
             .collect()
+    }
+
+    /// Validate the current file's backend block through the same built-in
+    /// schema used by CLI validation and runtime backend construction.
+    pub(super) fn check_backend_config(
+        &self,
+        doc: &Document,
+        merged: Option<&MergedParseResult>,
+        current_file_name: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        let Some(merged) = merged else {
+            return Vec::new();
+        };
+        // CLI validation reports only the structural backend-in-module error
+        // for a module-definition directory. Keep editor diagnostics at the
+        // same layer instead of adding backend-schema errors.
+        if carina_core::validation::is_module_definition(&merged.directory.parsed) {
+            return Vec::new();
+        }
+        let Some(current_file_name) = current_file_name else {
+            return Vec::new();
+        };
+        // The loader records backend provenance while it parses each source.
+        // With multiple backend blocks its merged AST is intentionally
+        // last-wins, so only validate when the sole backend belongs to this
+        // buffer.
+        if !merged
+            .directory
+            .sole_backend_file
+            .as_deref()
+            .is_some_and(|path| path.ends_with(current_file_name))
+        {
+            return Vec::new();
+        }
+        let Some(backend) = merged.directory.parsed.backend.as_ref() else {
+            return Vec::new();
+        };
+        let Err(error) = carina_state::BackendConfig::try_from(backend) else {
+            return Vec::new();
+        };
+
+        let backend_anchor = carina_core::parser::top_level_backend_block_spans(&doc.text())
+            .ok()
+            .and_then(|spans| {
+                let [span] = spans.as_slice() else {
+                    return None;
+                };
+                Some((
+                    span.start_line.saturating_sub(1) as u32,
+                    span.start_column.saturating_sub(1) as u32,
+                    span.end_column.saturating_sub(1) as u32,
+                ))
+            });
+
+        let attribute_diagnostic = |error: &carina_state::BackendAttributeError| {
+            // Directory resolution deliberately retains user-function calls
+            // that failed evaluation so other editor checks can continue.
+            // Suppress only those calls, including nested ones. A deferred
+            // builtin with unresolved arguments is still a genuine value-type
+            // mismatch and must remain visible, matching CLI validation.
+            if backend
+                .attributes
+                .get(error.attribute())
+                .is_some_and(|value| {
+                    contains_matching_function_call(value, &|name| {
+                        merged.directory.parsed.user_functions.contains_key(name)
+                    })
+                })
+            {
+                return None;
+            }
+
+            let (line, start, end) = backend
+                .attribute_spans
+                .get(error.attribute())
+                .map(|span| {
+                    (
+                        span.start_line.saturating_sub(1) as u32,
+                        span.start_column.saturating_sub(1) as u32,
+                        span.end_column.saturating_sub(1) as u32,
+                    )
+                })
+                .or(backend_anchor)?;
+            Some(carina_diagnostic(
+                line,
+                start,
+                end,
+                DiagnosticSeverity::ERROR,
+                error.to_string(),
+            ))
+        };
+
+        match error {
+            carina_state::BackendConfigError::Invalid(errors) => errors
+                .errors()
+                .iter()
+                .filter_map(attribute_diagnostic)
+                .collect(),
+            unsupported @ carina_state::BackendConfigError::UnsupportedBackend(_) => {
+                let Some((line, start, end)) = backend_anchor else {
+                    return Vec::new();
+                };
+                vec![carina_diagnostic(
+                    line,
+                    start,
+                    end,
+                    DiagnosticSeverity::ERROR,
+                    unsupported.to_string(),
+                )]
+            }
+        }
     }
 
     /// Check that upstream state declarations are not defined inside modules.

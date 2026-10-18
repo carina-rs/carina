@@ -11,7 +11,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
 
-use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
+use crate::backend::{BackendError, BackendResult, StateBackend};
+use crate::backend_config::LocalBackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
 
@@ -58,9 +59,9 @@ impl LocalBackend {
     }
 
     /// Create a LocalBackend from configuration, anchoring relative paths at `base_dir`.
-    pub fn from_config(config: &BackendConfig, base_dir: &Path) -> BackendResult<Self> {
+    pub fn from_config(config: &LocalBackendSettings, base_dir: &Path) -> BackendResult<Self> {
         let path = config
-            .get_string("path")
+            .path()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(Self::DEFAULT_STATE_FILE));
         let path = if path.is_absolute() {
@@ -566,8 +567,30 @@ impl StateBackend for LocalBackend {
 mod tests {
     use super::*;
     use crate::state::ResourceState;
+    use carina_core::resource::{ConcreteValue, Value};
+    use std::collections::HashMap;
     use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
+
+    fn local_settings(path: Option<String>) -> LocalBackendSettings {
+        let attributes = path
+            .map(|path| {
+                HashMap::from([(
+                    "path".to_string(),
+                    Value::Concrete(ConcreteValue::String(path.into())),
+                )])
+            })
+            .unwrap_or_default();
+        let raw = carina_core::parser::BackendConfig {
+            backend_type: "local".to_string(),
+            attributes,
+            attribute_spans: HashMap::new(),
+        };
+        match crate::BackendConfig::try_from(&raw).unwrap() {
+            crate::BackendConfig::Local(settings) => settings,
+            crate::BackendConfig::S3(_) => unreachable!(),
+        }
+    }
 
     #[tokio::test]
     async fn test_local_backend_read_write() {
@@ -760,12 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_backend_from_config() {
-        use std::collections::HashMap;
-
-        let config = BackendConfig {
-            backend_type: "local".to_string(),
-            attributes: HashMap::new(),
-        };
+        let config = local_settings(None);
 
         let base_dir = tempdir().unwrap();
         let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
@@ -777,21 +795,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_backend_relative_path_is_anchored() {
-        use carina_core::resource::{ConcreteValue, Value};
-        use std::collections::HashMap;
-
         let cwd = std::env::current_dir().unwrap();
         let base_dir = tempdir().unwrap();
-        let mut attributes = HashMap::new();
-        attributes.insert(
-            "path".to_string(),
-            Value::Concrete(ConcreteValue::String("custom.state.json".into())),
-        );
-
-        let config = BackendConfig {
-            backend_type: "local".to_string(),
-            attributes,
-        };
+        let config = local_settings(Some("custom.state.json".to_string()));
 
         let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
         assert_eq!(
@@ -803,23 +809,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_backend_absolute_path_is_preserved() {
-        use carina_core::resource::{ConcreteValue, Value};
-        use std::collections::HashMap;
-
         let base_dir = tempdir().unwrap();
         let state_path = tempdir().unwrap().path().join("absolute.state.json");
-        let mut attributes = HashMap::new();
-        attributes.insert(
-            "path".to_string(),
-            Value::Concrete(ConcreteValue::String(
-                state_path.to_string_lossy().into_owned().into(),
-            )),
-        );
-
-        let config = BackendConfig {
-            backend_type: "local".to_string(),
-            attributes,
-        };
+        let config = local_settings(Some(state_path.to_string_lossy().into_owned()));
 
         let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
         assert_eq!(backend.state_path(), &state_path);

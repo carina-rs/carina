@@ -1206,7 +1206,10 @@ async fn run_apply_with_observer_factory(
     #[allow(unused_assignments)]
     let mut lock_info: Option<LockInfo> = None;
 
-    if verified_backend.is_configured() {
+    let s3_bootstrap = verified_backend
+        .s3_settings()
+        .map(|settings| (settings.bucket().to_owned(), settings.auto_create()));
+    if let Some((bucket_name, auto_create)) = s3_bootstrap {
         // Check if bucket exists (bootstrap detection)
         let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
@@ -1217,12 +1220,6 @@ async fn run_apply_with_observer_factory(
                     .yellow()
                     .bold()
             );
-
-            // Get bucket name from config
-            let bucket_name = verified_backend
-                .string_attribute("bucket")
-                .map(str::to_owned)
-                .ok_or("Missing bucket name in backend configuration")?;
 
             // Check if there's a bucket resource defined with matching name
             let backend_resource_type = backend
@@ -1270,10 +1267,6 @@ async fn run_apply_with_observer_factory(
                 println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
             } else {
                 // Auto-create the bucket if auto_create is enabled
-                let auto_create = verified_backend
-                    .bool_attribute("auto_create")
-                    .unwrap_or(true);
-
                 if auto_create {
                     println!("Auto-creating state bucket: {}", bucket_name.cyan());
                     backend.create_bucket().await.map_err(AppError::Backend)?;
@@ -2271,10 +2264,8 @@ fn ensure_saved_plan_backend_matches_current(
     current_backend_config: Option<&carina_core::parser::BackendConfig>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let planned = BackendLock::for_config(plan_backend_config)
-        .map_err(|e| AppError::Config(format!("Failed to inspect saved plan backend: {e}")))?;
-    let current = BackendLock::for_config(current_backend_config)
-        .map_err(|e| AppError::Config(format!("Failed to inspect current backend: {e}")))?;
+    let planned = BackendLock::for_config(plan_backend_config).map_err(AppError::Backend)?;
+    let current = BackendLock::for_config(current_backend_config).map_err(AppError::Backend)?;
 
     if planned == current {
         Ok(())

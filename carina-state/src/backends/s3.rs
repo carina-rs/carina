@@ -12,9 +12,8 @@ use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use carina_core::utils::convert_region_value;
-
-use crate::backend::{AwsError, BackendConfig, BackendError, BackendResult, StateBackend};
+use crate::backend::{AwsError, BackendError, BackendResult, StateBackend};
+use crate::backend_config::S3BackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
 
@@ -74,22 +73,14 @@ impl S3Backend {
     /// default endpoint. The S3 SDK transparently follows cross-region
     /// redirects, so any region from the chain reaches buckets in other
     /// regions.
-    pub async fn from_config(config: &BackendConfig) -> BackendResult<Self> {
-        let bucket = config
-            .get_string("bucket")
-            .ok_or_else(|| BackendError::configuration("Missing required attribute: bucket"))?
-            .to_string();
-
-        let key = config
-            .get_string("key")
-            .ok_or_else(|| BackendError::configuration("Missing required attribute: key"))?
-            .to_string();
-
-        let encrypt = config.get_bool_or("encrypt", true);
-        let auto_create = config.get_bool_or("auto_create", true);
+    pub async fn from_config(config: &S3BackendSettings) -> BackendResult<Self> {
+        let bucket = config.bucket().to_string();
+        let key = config.key().to_string();
+        let encrypt = config.encrypt();
+        let auto_create = config.auto_create();
 
         let sdk_region = sdk_chain_region().await;
-        let region = resolve_region(config.get_string("region"), sdk_region.as_deref())?;
+        let region = resolve_region(config.region(), sdk_region.as_deref())?;
         let client = build_s3_client(&region).await;
 
         Ok(Self::from_client(
@@ -804,13 +795,12 @@ async fn sdk_chain_region() -> Option<String> {
 
 /// Resolve the region the S3 backend should use.
 ///
-/// Priority: explicit `region` from the backend block (after DSL → AWS
-/// region-code normalization) > region from the AWS SDK chain. If neither
-/// yields a region, return a configuration error rather than silently
-/// picking a default endpoint.
+/// Priority: explicit schema-resolved `region` from the backend block > region
+/// from the AWS SDK chain. If neither yields a region, return a configuration
+/// error rather than silently picking a default endpoint.
 fn resolve_region(explicit: Option<&str>, sdk_chain: Option<&str>) -> BackendResult<String> {
     if let Some(value) = explicit {
-        return Ok(convert_region_value(value));
+        return Ok(value.to_string());
     }
     if let Some(value) = sdk_chain {
         return Ok(value.to_string());
@@ -863,30 +853,8 @@ mod tests {
     use aws_sdk_s3::error::{ErrorMetadata, SdkError};
 
     #[test]
-    fn test_convert_region_value() {
-        assert_eq!(
-            convert_region_value("aws.Region.ap_northeast_1"),
-            "ap-northeast-1"
-        );
-        assert_eq!(convert_region_value("aws.Region.us_west_2"), "us-west-2");
-        assert_eq!(
-            convert_region_value("awscc.Region.ap_northeast_1"),
-            "ap-northeast-1"
-        );
-        assert_eq!(convert_region_value("awscc.Region.us_west_2"), "us-west-2");
-        assert_eq!(convert_region_value("us-east-1"), "us-east-1");
-        assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
-    }
-
-    #[test]
     fn test_resolve_region_prefers_explicit_over_sdk_chain() {
         let resolved = resolve_region(Some("ap-northeast-1"), Some("us-east-1")).unwrap();
-        assert_eq!(resolved, "ap-northeast-1");
-    }
-
-    #[test]
-    fn test_resolve_region_normalizes_dsl_region_value() {
-        let resolved = resolve_region(Some("aws.Region.ap_northeast_1"), None).unwrap();
         assert_eq!(resolved, "ap-northeast-1");
     }
 

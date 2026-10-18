@@ -22,11 +22,11 @@ use std::sync::Arc;
 use carina_core::config_loader::DuplicateDeclaration;
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ProviderContext};
-use carina_core::resource::{ConcreteValue, Value};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, BackendLock, StateBackend, create_backend,
+    BackendConfig as StateBackendConfig, BackendError, BackendLock, S3BackendSettings,
+    StateBackend, create_backend,
 };
 
 use crate::error::AppError;
@@ -91,7 +91,6 @@ pub fn inspect_backend_drift(
 #[must_use = "VerifiedBackend proves Fresh and Drifted were rejected before mutating state"]
 #[derive(Debug, Clone)]
 pub struct VerifiedBackend {
-    parser_config: Option<BackendConfig>,
     state_config: Option<StateBackendConfig>,
     base_dir: PathBuf,
 }
@@ -101,26 +100,10 @@ impl VerifiedBackend {
         create_backend(self.state_config.as_ref(), &self.base_dir).await
     }
 
-    pub fn is_configured(&self) -> bool {
-        self.parser_config.is_some()
-    }
-
-    pub fn string_attribute(&self, key: &str) -> Option<&str> {
-        self.parser_config.as_ref().and_then(|config| {
-            config.attributes.get(key).and_then(|value| match value {
-                Value::Concrete(ConcreteValue::String(value)) => Some(value.expose_plaintext()),
-                _ => None,
-            })
-        })
-    }
-
-    pub fn bool_attribute(&self, key: &str) -> Option<bool> {
-        self.parser_config.as_ref().and_then(|config| {
-            config.attributes.get(key).and_then(|value| match value {
-                Value::Concrete(ConcreteValue::Bool(value)) => Some(*value),
-                _ => None,
-            })
-        })
+    pub fn s3_settings(&self) -> Option<&S3BackendSettings> {
+        self.state_config
+            .as_ref()
+            .and_then(StateBackendConfig::as_s3)
     }
 }
 
@@ -139,8 +122,10 @@ pub fn verify_for_mutation(
             ProjectCommand::new("init", project_dir)
         ))),
         BackendDriftStatus::Unchanged => Ok(VerifiedBackend {
-            parser_config: backend_config.cloned(),
-            state_config: backend_config.map(StateBackendConfig::from),
+            state_config: backend_config
+                .map(StateBackendConfig::try_from)
+                .transpose()
+                .map_err(BackendError::from)?,
             base_dir: verified_base_dir,
         }),
         BackendDriftStatus::Drifted {
@@ -419,11 +404,13 @@ pub(crate) fn validate_and_resolve_errors_with_context(
         ))
     }));
 
-    // A directly validated directory may be either a root configuration or a
-    // standalone module. The shared validator permits module input
-    // declarations unless root-only provider/backend blocks prove that the
-    // directory is a root configuration (#2198).
-    if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed) {
+    // A backend in a module-definition directory is the structural error: the
+    // backend is misplaced, so do not also classify the module's arguments as
+    // misplaced root declarations. Provider + arguments retains the existing
+    // root-arguments rule (#2198).
+    if let Err(msg) = carina_core::validation::validate_no_backend_in_module(parsed) {
+        errors.push(AppError::Validation(msg));
+    } else if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed) {
         errors.push(AppError::Validation(msg));
     }
 
@@ -460,6 +447,13 @@ pub(crate) fn validate_and_resolve_errors_with_context(
 
     // Validate provider region
     errors.extend(validate_provider_region_with_ctx(ctx, parsed));
+
+    if !carina_core::validation::is_module_definition(parsed)
+        && let Some(backend) = &parsed.backend
+        && let Err(error) = StateBackendConfig::try_from(backend)
+    {
+        errors.push(AppError::Backend(error.into()));
+    }
 
     // Enrich provider context with custom type validators from loaded schemas
     let enriched_context = enrich_provider_context(ctx.schemas(), ctx.factories_arc());
@@ -789,6 +783,10 @@ mod tests {
             Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
         );
         attributes.insert(
+            "key".to_string(),
+            Value::Concrete(ConcreteValue::String("state.json".into())),
+        );
+        attributes.insert(
             "region".to_string(),
             Value::Concrete(ConcreteValue::String(region.to_string().into())),
         );
@@ -950,6 +948,37 @@ mod tests {
 
     fn empty_parsed_file() -> carina_core::parser::InferredFile {
         carina_core::parser::InferredFile::default()
+    }
+
+    #[test]
+    fn backend_validation_keeps_the_typed_error() {
+        let raw = carina_core::parser::parse(
+            r#"backend s3 {
+                bucket = "state"
+                key = "state.json"
+                region = true
+            }"#,
+            &ProviderContext::default(),
+        )
+        .unwrap();
+        let mut parsed = empty_parsed_file();
+        parsed.backend = raw.backend;
+        let base = tempfile::tempdir().unwrap();
+
+        let errors = validate_and_resolve_errors(&mut parsed, base.path(), false, &[], &[]);
+
+        assert!(errors.iter().any(|error| {
+            matches!(
+                error,
+                AppError::Backend(BackendError::InvalidConfig(
+                    carina_state::BackendConfigError::Invalid(errors)
+                )) if errors.errors().iter().any(|error| matches!(
+                    error,
+                    carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                        if attribute == "region"
+                ))
+            )
+        }));
     }
 
     #[test]

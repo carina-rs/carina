@@ -899,22 +899,6 @@ fn build_plan_file<E>(
     })
 }
 
-/// Convert a state-layer backend config back into the parser-layer shape saved in `PlanFile`.
-///
-/// This is used only for drifted `plan --out`, where the saved plan must record
-/// the locked backend that supplied state. The input usually comes from
-/// `BackendLock::to_state_config`, whose lock-value round trip has lossy
-/// fallbacks: unsigned numbers may downcast to `i64`, null becomes `Bool(false)`,
-/// and structured values become debug strings. Current backend configs use only
-/// scalar attributes, so this is inert until a future backend adds richer attrs.
-fn parser_backend_config_from_state(config: &StateBackendConfig) -> BackendConfig {
-    BackendConfig {
-        backend_type: config.backend_type.clone(),
-        attributes: config.attributes.clone(),
-        attribute_spans: HashMap::new(),
-    }
-}
-
 /// Format a `SerializationError` from `build_plan_file` into the
 /// CLI's "cannot save plan" diagnostic, suggesting the caller drop
 /// `flag` (e.g. `--json`, `--out`) to fall back to display-only.
@@ -1086,7 +1070,12 @@ pub async fn run_plan(
         &duplicate_declarations,
     )?;
 
-    let mut plan_backend_config = parsed.backend.as_ref().map(StateBackendConfig::from);
+    let mut plan_backend_config = parsed
+        .backend
+        .as_ref()
+        .map(StateBackendConfig::try_from)
+        .transpose()
+        .map_err(carina_state::BackendError::from)?;
     let mut plan_file_backend_config = parsed.backend.clone();
     let mut use_locked_backend = false;
     let drift_note = match inspect_backend_drift(base_dir, parsed.backend.as_ref())? {
@@ -1103,8 +1092,8 @@ pub async fn run_plan(
         } => {
             let warning = drift_warning(&existing, &configured, path);
             eprintln!("{}", warning.yellow());
-            let locked_config = existing.to_state_config();
-            plan_file_backend_config = Some(parser_backend_config_from_state(&locked_config));
+            let locked_config = existing.to_state_config()?;
+            plan_file_backend_config = Some(locked_config.to_parser_config());
             plan_backend_config = Some(locked_config);
             use_locked_backend = true;
             Some(format!(
@@ -1148,14 +1137,10 @@ pub async fn run_plan(
             ));
         } else {
             // Check if there's a matching s3_bucket resource defined
-            let bucket_name = config
-                .attributes
-                .get("bucket")
-                .and_then(|v| match v {
-                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
-                    _ => None,
-                })
-                .ok_or("Backend bucket name not specified")?;
+            let settings = config
+                .as_s3()
+                .ok_or("Backend does not manage an S3 bucket")?;
+            let bucket_name = settings.bucket().to_string();
 
             let backend_resource_type = backend
                 .resource_type()
@@ -1165,24 +1150,17 @@ pub async fn run_plan(
                 r.id.resource_type == backend_resource_type
                     && r.attributes
                         .get("bucket")
-                        .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s == &bucket_name))
+                        .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext() == bucket_name))
             });
 
             if !has_bucket_resource {
-                let auto_create = config
-                    .attributes
-                    .get("auto_create")
-                    .and_then(|v| match v {
-                        Value::Concrete(ConcreteValue::Bool(b)) => Some(*b),
-                        _ => None,
-                    })
-                    .unwrap_or(true);
+                let auto_create = settings.auto_create();
 
                 if auto_create {
                     will_create_state_bucket = true;
-                    state_bucket_name = bucket_name.into_plaintext();
+                    state_bucket_name = bucket_name;
                 } else {
-                    let bucket = match bucket_name.diagnostic_literal() {
+                    let bucket = match settings.bucket_diagnostic_literal() {
                         Some(bucket) => format!("'{bucket}'"),
                         None => "value from env()".to_string(),
                     };
@@ -2045,7 +2023,13 @@ async fn build_upstream_backend(
     // Anchor local-backend state paths at the upstream's source directory
     // so `path = "foo.json"` resolves relative to the upstream, not the
     // downstream process's CWD.
-    let upstream_backend_config = loaded.parsed.backend.as_ref().map(StateBackendConfig::from);
+    let upstream_backend_config = loaded
+        .parsed
+        .backend
+        .as_ref()
+        .map(StateBackendConfig::try_from)
+        .transpose()
+        .map_err(carina_state::BackendError::from)?;
     let backend: Box<dyn StateBackend> =
         create_backend(upstream_backend_config.as_ref(), source_abs)
             .await

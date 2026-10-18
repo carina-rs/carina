@@ -18,8 +18,8 @@ use carina_core::provider::{
     RawSavedAttrs,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId,
-    ResourceId, ResourceIdentity, State, Value,
+    DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
+    ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -371,10 +371,13 @@ pub async fn run_force_unlock(
     let base_dir = get_base_dir(path);
 
     let backend_config = match inspect_backend_drift(base_dir, parsed.backend.as_ref())? {
-        BackendDriftStatus::Drifted { existing, .. } => Some(existing.to_state_config()),
-        BackendDriftStatus::Fresh | BackendDriftStatus::Unchanged => {
-            parsed.backend.as_ref().map(StateBackendConfig::from)
-        }
+        BackendDriftStatus::Drifted { existing, .. } => Some(existing.to_state_config()?),
+        BackendDriftStatus::Fresh | BackendDriftStatus::Unchanged => parsed
+            .backend
+            .as_ref()
+            .map(StateBackendConfig::try_from)
+            .transpose()
+            .map_err(carina_state::BackendError::from)?,
     };
 
     // Bypasses verify_for_mutation by design. On drift, targets the OLD locked backend so users can unlock a stale migration.
@@ -837,19 +840,16 @@ async fn run_state_bucket_delete(
         .backend
         .as_ref()
         .ok_or("No backend configuration found.")?;
+    let state_config = StateBackendConfig::try_from(backend_config)
+        .map_err(carina_state::BackendError::from)
+        .map_err(AppError::Backend)?;
+    let settings = state_config
+        .as_s3()
+        .ok_or("The configured backend does not manage an S3 bucket")?;
 
     // Verify the bucket name matches the backend configuration
-    let config_bucket = backend_config
-        .attributes
-        .get("bucket")
-        .and_then(|v| match v {
-            Value::Concrete(ConcreteValue::String(s)) => Some(s),
-            _ => None,
-        })
-        .ok_or("Backend configuration missing 'bucket' attribute")?;
-
-    if config_bucket.expose_plaintext() != bucket_name {
-        let configured_bucket = match config_bucket.diagnostic_literal() {
+    if settings.bucket() != bucket_name {
+        let configured_bucket = match settings.bucket_diagnostic_literal() {
             Some(bucket) => format!("'{bucket}'"),
             None => "value from env()".to_string(),
         };
@@ -887,7 +887,6 @@ async fn run_state_bucket_delete(
 
     // Bypasses verify_for_mutation by design. The configured-bucket-name guard pins this to the NEW backend; for an orphaned OLD bucket, delete manually via the cloud console.
     // Create backend to get provider metadata
-    let state_config = StateBackendConfig::from(backend_config);
     let backend = create_remote_backend(&state_config)
         .await
         .map_err(AppError::Backend)?;
@@ -2093,7 +2092,7 @@ mod tests {
         UpdateRequest,
     };
     use carina_core::resource::{
-        Composition, CompositionArgument, DeferredValue, ModuleConstraintId,
+        Composition, CompositionArgument, ConcreteValue, DeferredValue, ModuleConstraintId,
         PendingModuleConstraint, Resource, Signature,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};

@@ -105,9 +105,9 @@ pub enum BackendError {
     #[error("Lock no longer held: {0}")]
     LockNotHeld(String),
 
-    /// The backend type is not supported
-    #[error("Unsupported backend type: {0}")]
-    UnsupportedBackend(String),
+    /// A raw backend block failed schema resolution.
+    #[error(transparent)]
+    InvalidConfig(#[from] crate::backend_config::BackendConfigError),
 
     /// Configuration error
     #[error("Backend configuration error: {0}")]
@@ -168,6 +168,13 @@ pub enum BackendError {
     /// Serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    /// A persisted backend address cannot be reconstructed by this release.
+    #[error("{message}")]
+    UnreadableBackendAddress {
+        message: String,
+        error: Box<BackendError>,
+    },
 }
 
 impl From<InvalidResourceIdentityError> for BackendError {
@@ -446,11 +453,6 @@ impl BackendError {
         }
     }
 
-    /// Create an unsupported backend error
-    pub fn unsupported_backend(backend_type: impl Into<String>) -> Self {
-        Self::UnsupportedBackend(backend_type.into())
-    }
-
     /// Create a configuration error
     pub fn configuration(message: impl Into<String>) -> Self {
         Self::Configuration(message.into())
@@ -588,64 +590,16 @@ pub trait StateBackend: Send + Sync {
     }
 }
 
-/// Backend type identifier for the implicit/local filesystem backend.
-/// The single spelling shared by every "is this local?" decision so the
-/// literal `"local"` is not open-coded across modules.
+/// Backend type identifier for S3 remote state.
+pub const S3_BACKEND_TYPE: &str = "s3";
+
+/// Backend type identifier for local filesystem state.
 pub const LOCAL_BACKEND_TYPE: &str = "local";
-
-/// Configuration for a state backend
-#[derive(Debug, Clone)]
-pub struct BackendConfig {
-    /// Backend type (e.g., "s3", "gcs", "local")
-    pub backend_type: String,
-    /// Backend-specific attributes
-    pub attributes: std::collections::HashMap<String, carina_core::resource::Value>,
-}
-
-impl BackendConfig {
-    /// Get a string attribute value
-    pub fn get_string(&self, key: &str) -> Option<&str> {
-        match self.attributes.get(key) {
-            Some(carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::String(s),
-            )) => Some(s.expose_plaintext()),
-            _ => None,
-        }
-    }
-
-    /// Get a boolean attribute value
-    pub fn get_bool(&self, key: &str) -> Option<bool> {
-        match self.attributes.get(key) {
-            Some(carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::Bool(b),
-            )) => Some(*b),
-            _ => None,
-        }
-    }
-
-    /// Get a boolean attribute with a default value
-    pub fn get_bool_or(&self, key: &str, default: bool) -> bool {
-        self.get_bool(key).unwrap_or(default)
-    }
-
-    /// Whether this configuration names the local filesystem backend.
-    pub fn is_local(&self) -> bool {
-        self.backend_type == LOCAL_BACKEND_TYPE
-    }
-}
-
-impl From<&carina_core::parser::BackendConfig> for BackendConfig {
-    fn from(config: &carina_core::parser::BackendConfig) -> Self {
-        Self {
-            backend_type: config.backend_type.clone(),
-            attributes: config.attributes.clone(),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_config::{BackendConfig, BackendConfigError};
     use crate::lock::LockInfo;
 
     #[test]
@@ -669,15 +623,58 @@ mod tests {
 
     #[test]
     fn test_backend_error_display() {
-        let error = BackendError::unsupported_backend("azure");
-        assert_eq!(error.to_string(), "Unsupported backend type: azure");
-
         let error = BackendError::BucketNotFound("my-bucket".to_string());
         assert_eq!(error.to_string(), "Bucket not found: my-bucket");
     }
 
     #[test]
-    fn test_backend_config_from_provider_context() {
+    fn backend_config_error_conversion_preserves_display_and_per_attribute_sources() {
+        let raw = carina_core::parser::parse(
+            r#"backend s3 {
+                bucket = "state"
+                key = "state.json"
+                region = true
+                encrypt = "yes"
+            }"#,
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .unwrap();
+        let config_error = BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap_err();
+        let expected = config_error.to_string();
+
+        let BackendConfigError::Invalid(attribute_errors) = &config_error else {
+            panic!("expected attribute errors, got {config_error:?}");
+        };
+        assert!(
+            attribute_errors
+                .errors()
+                .iter()
+                .all(|error| std::error::Error::source(error).is_some()),
+            "each invalid attribute must retain its TypeError source"
+        );
+        assert!(
+            std::error::Error::source(attribute_errors).is_none(),
+            "the aggregate must not repeat an arbitrary first attribute in error-chain renderers"
+        );
+
+        let error = BackendError::from(config_error);
+
+        assert_eq!(error.to_string(), expected);
+        let BackendError::InvalidConfig(config_source) = &error else {
+            panic!("BackendConfigError must remain typed, got {error:?}");
+        };
+        assert!(
+            std::error::Error::source(config_source).is_none(),
+            "the aggregate display must not be repeated in the source chain"
+        );
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the transparent BackendError must not repeat the aggregate display"
+        );
+    }
+
+    #[test]
+    fn test_backend_config_resolves_parser_context() {
         use carina_core::resource::{ConcreteValue, Value};
 
         let provider_context = carina_core::parser::BackendConfig {
@@ -697,10 +694,12 @@ mod tests {
             attribute_spans: Default::default(),
         };
 
-        let state_config = BackendConfig::from(&provider_context);
-        assert_eq!(state_config.backend_type, "s3");
-        assert_eq!(state_config.get_string("bucket"), Some("my-bucket"));
-        assert_eq!(state_config.get_string("key"), Some("state.json"));
+        let state_config = BackendConfig::try_from(&provider_context).unwrap();
+        let BackendConfig::S3(settings) = state_config else {
+            panic!("expected s3 backend")
+        };
+        assert_eq!(settings.bucket(), "my-bucket");
+        assert_eq!(settings.key(), "state.json");
     }
 
     // carina-rs/carina#2603: BackendError::Aws must surface the

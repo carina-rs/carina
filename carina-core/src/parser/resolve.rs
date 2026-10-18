@@ -622,10 +622,10 @@ fn resolve_resource_refs_with_policy(
     let mut fn_ctx = super::ParseContext::new(config);
     fn_ctx.user_functions = parsed.user_functions.clone();
 
-    // Backend getters consume ordinary values directly and have no secret
-    // transport/writeback seam. Evaluate backend function calls with the same
-    // semantics as resource attributes, then reject any secret-derived result
-    // before validate/plan/apply can resolve a backend from it.
+    // The typed backend resolver consumes ordinary values directly and has no
+    // secret transport/writeback seam. Evaluate backend function calls with
+    // the same semantics as resource attributes, then reject any
+    // secret-derived result before validate/plan/apply can resolve a backend.
     if let Some(backend) = &mut parsed.backend {
         for (key, value) in &mut backend.attributes {
             let evaluated = resolve_function_calls_only(

@@ -99,8 +99,8 @@ pub async fn run_destroy(
 
     // Get the state bucket name for protection check (S3 backend only)
     let protected_bucket = verified_backend
-        .string_attribute("bucket")
-        .map(str::to_owned);
+        .s3_settings()
+        .map(|settings| settings.bucket().to_owned());
 
     // Acquire lock (unless --lock=false)
     let lock_info: Option<LockInfo> = if lock {
