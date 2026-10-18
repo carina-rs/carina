@@ -3865,7 +3865,7 @@ mod tests {
     async fn wasm_serializable_resources_strips_values_in_nested_wrappers() {
         let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
         let unknown = || {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
                 path: upstream_path.clone(),
             }))
         };

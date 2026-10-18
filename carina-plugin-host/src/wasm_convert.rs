@@ -2065,16 +2065,18 @@ mod tests {
     fn unknown_returns_err_in_core_to_wit_value() {
         use carina_core::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamRef { path: p },
+                reason: UnknownReason::UpstreamExport { path: p },
                 context: SerializationContext::WasmBoundary,
             } => assert_eq!(p, path),
-            other => panic!("expected UnknownNotAllowed/UpstreamRef/WasmBoundary, got: {other:?}"),
+            other => {
+                panic!("expected UnknownNotAllowed/UpstreamExport/WasmBoundary, got: {other:?}")
+            }
         }
     }
 
@@ -2093,14 +2095,14 @@ mod tests {
     fn unknown_returns_err_in_core_value_to_json() {
         use carina_core::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
             err,
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamRef { .. },
+                reason: UnknownReason::UpstreamExport { .. },
                 context: SerializationContext::WasmBoundary,
             }
         ));

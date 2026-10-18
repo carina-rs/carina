@@ -2630,10 +2630,12 @@ fn unknown_never_equals_unknown() {
     // suppress real diffs between two attributes that both happen to
     // be "unresolved upstream" of the same binding.
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: path.clone(),
     }));
-    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
+    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        path,
+    }));
     assert_ne!(
         a, b,
         "two `Value::Deferred(DeferredValue::Unknown)`s must never compare equal"
@@ -2669,14 +2671,16 @@ fn unknown_hash_is_deterministic_per_path() {
         h.finish()
     }
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: path.clone(),
     }));
-    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
+    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        path,
+    }));
     assert_eq!(
         hash_of(&a),
         hash_of(&b),
-        "same UpstreamRef path must hash to the same value"
+        "same UpstreamExport path must hash to the same value"
     );
 }
 
@@ -2690,10 +2694,10 @@ fn unknown_hash_differs_per_path() {
     }
     let p1 = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
     let p2 = AccessPath::with_fields("network", "vpc", vec!["cidr_block".into()]);
-    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: p1,
     }));
-    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: p2,
     }));
     assert_ne!(hash_of(&a), hash_of(&b));
@@ -2715,17 +2719,49 @@ fn unknown_round_trips_through_saved_plan_serde() {
     // order to substitute their loop key/value at apply time. Runtime
     // provider/state conversion still rejects Unknown through value_to_json.
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+    let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: path.clone(),
     }));
     let json = serde_json::to_string(&value).expect("serialize saved-plan unknown");
     let decoded: Value = serde_json::from_str(&json).expect("deserialize saved-plan unknown");
     assert!(matches!(
         decoded,
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: decoded_path,
         })) if decoded_path == path
     ));
+}
+
+#[test]
+fn upstream_unknown_wire_tags_remain_stable() {
+    let path = AccessPath::new("network", "vpc_id");
+    let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        path: path.clone(),
+    }));
+    let export_json =
+        r#"{"Unknown":{"UpstreamRef":{"path":{"binding":"network","attribute":"vpc_id"}}}}"#;
+    assert_eq!(serde_json::to_string(&export).unwrap(), export_json);
+    match serde_json::from_str::<Value>(export_json).unwrap() {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+            path: decoded_path,
+        })) => assert_eq!(decoded_path, path),
+        other => panic!("expected UpstreamExport, got {other:?}"),
+    }
+
+    let all_exports = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
+        binding: "network".into(),
+    }));
+    let all_exports_json = r#"{"Unknown":{"UpstreamBareRef":{"binding":"network"}}}"#;
+    assert_eq!(
+        serde_json::to_string(&all_exports).unwrap(),
+        all_exports_json
+    );
+    match serde_json::from_str::<Value>(all_exports_json).unwrap() {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports { binding })) => {
+            assert_eq!(binding, "network")
+        }
+        other => panic!("expected UpstreamAllExports, got {other:?}"),
+    }
 }
 
 #[test]

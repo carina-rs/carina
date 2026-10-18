@@ -1892,7 +1892,7 @@ fn substitute_attrs(
 /// into all compound Value variants so placeholders nested inside
 /// interpolations / function calls / secrets are reached.
 ///
-/// `UnknownReason::UpstreamRef` is the upstream-attribute marker, not a
+/// `UnknownReason::UpstreamExport` is the upstream-export marker, not a
 /// for-binding placeholder, so it is preserved unchanged.
 pub(super) fn substitute_placeholder(
     v: &mut Value,
@@ -1929,8 +1929,8 @@ pub(super) fn substitute_placeholder(
                 }
             }
             // Upstream and empty-interpolation unknowns are not for-expansion placeholders.
-            UnknownReason::UpstreamRef { .. }
-            | UnknownReason::UpstreamBareRef { .. }
+            UnknownReason::UpstreamExport { .. }
+            | UnknownReason::UpstreamAllExports { .. }
             | UnknownReason::EmptyInterpolation
             | UnknownReason::PostCreateReadIncomplete { .. } => {}
             // Function placeholders are substituted by user-function evaluation, not for expansion.
@@ -2266,9 +2266,9 @@ mod substitute_placeholder_tests {
     }
 
     #[test]
-    fn leaves_upstream_ref_unchanged() {
+    fn leaves_upstream_export_unchanged() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let mut v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        let mut v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: path.clone(),
         }));
         substitute_placeholder(
@@ -2280,10 +2280,13 @@ mod substitute_placeholder_tests {
         // `Value::Deferred(DeferredValue::Unknown)` never compares equal (see `impl PartialEq for Value`),
         // so destructure to verify the path survives.
         match v {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path: p })) => {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path: p })) => {
                 assert_eq!(p, path)
             }
-            other => panic!("UpstreamRef must pass through unchanged, got {:?}", other),
+            other => panic!(
+                "UpstreamExport must pass through unchanged, got {:?}",
+                other
+            ),
         }
     }
 

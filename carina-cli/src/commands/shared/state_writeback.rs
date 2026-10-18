@@ -3950,17 +3950,17 @@ mod stage4_unknown_err_tests {
     #[test]
     fn unknown_returns_err_in_dsl_value_to_json() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: path.clone(),
         }));
         let err = dsl_value_to_json(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamRef { path: p },
+                reason: UnknownReason::UpstreamExport { path: p },
                 context: SerializationContext::StateWriteback,
             } => assert_eq!(p, path),
             other => {
-                panic!("expected UnknownNotAllowed/UpstreamRef/StateWriteback, got: {other:?}")
+                panic!("expected UnknownNotAllowed/UpstreamExport/StateWriteback, got: {other:?}")
             }
         }
     }

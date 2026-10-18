@@ -74,7 +74,7 @@ pub enum SerializationError {
     /// state writeback or plan-file write is a resolver bug.
     ///
     /// `path` is stored as a pre-formatted `String` rather than the
-    /// structured `AccessPath` (cf. `UnknownReason::UpstreamRef`)
+    /// structured `AccessPath` (cf. `UnknownReason::UpstreamExport`)
     /// because `SerializationError` is terminating diagnostic data
     /// consumed only via `Display`; programmatic path inspection has
     /// no callers today. Lift to `AccessPath` if a future caller needs
@@ -196,10 +196,10 @@ impl SecretRehydrationSiteError {
 impl std::fmt::Display for UnknownReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnknownReason::UpstreamRef { path } => {
+            UnknownReason::UpstreamExport { path } => {
                 write!(f, "upstream value {}", path.to_dot_string())
             }
-            UnknownReason::UpstreamBareRef { binding } => {
+            UnknownReason::UpstreamAllExports { binding } => {
                 write!(f, "upstream value {}", binding)
             }
             UnknownReason::ForKey => write!(f, "deferred for-binding key"),
@@ -221,10 +221,10 @@ impl std::fmt::Display for UnknownReason {
 /// Render an `UnknownReason` to its plan-display string.
 pub fn render_unknown(reason: &UnknownReason) -> String {
     match reason {
-        UnknownReason::UpstreamRef { path } => {
+        UnknownReason::UpstreamExport { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())
         }
-        UnknownReason::UpstreamBareRef { binding } => {
+        UnknownReason::UpstreamAllExports { binding } => {
             format!("(known after upstream apply: {})", binding)
         }
         UnknownReason::ForKey => "(known after upstream apply: key)".to_string(),
@@ -943,7 +943,7 @@ pub fn merge_secrets_into_provider_json(
 }
 
 /// Secret-only redactor used inside deferred wrappers (`Interpolation`,
-/// `FunctionCall`) where a `Value::Deferred(Unknown(UpstreamRef))` is a
+/// `FunctionCall`) where a `Value::Deferred(Unknown(UpstreamExport))` is a
 /// load-bearing plan-time placeholder, not an error.
 ///
 /// Hashes every `Secret(_)` leaf while passing `Unknown` and other deferred
@@ -1823,7 +1823,7 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
         // `Expr` part (e.g. `id = "${secret_let.value}|tail"`). Walk
         // the parts via the secret-only redactor — a generic
         // `redact_secrets_in_value` recurse would reject the deferred
-        // `Unknown(UpstreamRef)` produced by plan-time stamping (RFC
+        // `Unknown(UpstreamExport)` produced by plan-time stamping (RFC
         // #2371 stage-4 invariant), even though the supported scenario
         // here is exactly "deferred upstream ref inside import id".
         // The dedicated `redact_secrets_only` walker only hashes
@@ -4525,10 +4525,10 @@ mod tests {
     }
 
     #[test]
-    fn render_unknown_upstream_ref() {
+    fn render_unknown_upstream_export() {
         use crate::resource::AccessPath;
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let r = UnknownReason::UpstreamRef { path };
+        let r = UnknownReason::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
             "(known after upstream apply: network.vpc.vpc_id)"
@@ -4536,7 +4536,7 @@ mod tests {
     }
 
     #[test]
-    fn render_unknown_upstream_ref_with_subscript() {
+    fn render_unknown_upstream_export_with_subscript() {
         use crate::resource::{AccessPath, Subscript};
         let path = AccessPath::with_fields_and_subscripts(
             "network",
@@ -4544,7 +4544,7 @@ mod tests {
             Vec::new(),
             vec![Subscript::Int { index: 0 }],
         );
-        let r = UnknownReason::UpstreamRef { path };
+        let r = UnknownReason::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
             "(known after upstream apply: network.accounts[0])"
@@ -4552,7 +4552,7 @@ mod tests {
     }
 
     #[test]
-    fn render_unknown_upstream_ref_with_string_subscript() {
+    fn render_unknown_upstream_export_with_string_subscript() {
         use crate::resource::{AccessPath, Subscript};
         let path = AccessPath::with_fields_and_subscripts(
             "vpc",
@@ -4560,7 +4560,7 @@ mod tests {
             Vec::new(),
             vec![Subscript::Str { key: "Name".into() }],
         );
-        let r = UnknownReason::UpstreamRef { path };
+        let r = UnknownReason::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
             "(known after upstream apply: vpc.tags[\"Name\"])"
@@ -4627,7 +4627,7 @@ mod tests {
         use crate::resource::AccessPath;
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
         assert_eq!(
-            format!("{}", UnknownReason::UpstreamRef { path }),
+            format!("{}", UnknownReason::UpstreamExport { path }),
             "upstream value network.vpc.vpc_id"
         );
         assert_eq!(
@@ -6510,7 +6510,7 @@ mod tests {
         assert_eq!(format_value(&v), "vpc.id");
     }
 
-    /// `Value::Deferred(DeferredValue::Unknown(UpstreamRef))` renders unquoted as
+    /// `Value::Deferred(DeferredValue::Unknown(UpstreamExport))` renders unquoted as
     /// `(known after upstream apply: <ref>)` via `format_value_with_key`.
     /// Stage 2 of RFC #2371 — the variant replaced the NUL-prefixed
     /// `Value::Concrete(ConcreteValue::String)` sentinel from #2367.
@@ -6518,7 +6518,9 @@ mod tests {
     fn test_format_value_unresolved_upstream() {
         use crate::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+            path,
+        }));
         assert_eq!(
             format_value(&v),
             "(known after upstream apply: network.vpc.vpc_id)"
@@ -8002,7 +8004,7 @@ mod tests {
                 ConcreteValue::String("pw".into()),
             )))),
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
                 path: path.clone(),
             })),
             Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
@@ -9339,7 +9341,7 @@ mod tests {
             AccessPath::with_fields("management_route53", "apex_zone_id", Vec::<String>::new());
         let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamRef { path },
+                UnknownReason::UpstreamExport { path },
             ))),
             InterpolationPart::Literal("|registry-dev.carina-rs.dev|NS".into()),
         ]));

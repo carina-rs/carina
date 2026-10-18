@@ -5451,7 +5451,7 @@ fn rendered_typecheck_result_skips_value_unknown() {
     };
     assert!(rendered_typecheck_result(&struct_ty, &unknown, &cfg).is_none());
 
-    let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+    let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: crate::resource::AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
     assert!(rendered_typecheck_result(&TypeExpr::String, &upstream, &cfg).is_none());

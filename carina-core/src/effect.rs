@@ -1452,7 +1452,7 @@ mod tests {
         };
         let inner = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamBareRef {
+                UnknownReason::UpstreamAllExports {
                     binding: "u".into(),
                 },
             ))),
@@ -1499,7 +1499,7 @@ mod tests {
         };
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamBareRef {
+                UnknownReason::UpstreamAllExports {
                     binding: "upstream".into(),
                 },
             ))),
