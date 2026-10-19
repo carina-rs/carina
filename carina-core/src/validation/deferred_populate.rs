@@ -178,10 +178,13 @@ fn collect_unsynchronized_refs(
                 }
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
             for arg in args {
                 collect_unsynchronized_refs(
-                    arg,
+                    arg.walker_value(),
                     attribute_key,
                     holder_binding,
                     by_binding,

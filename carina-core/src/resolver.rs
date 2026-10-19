@@ -285,15 +285,50 @@ fn stamp_unresolved_upstream(
                     .collect(),
             ))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            Value::Deferred(DeferredValue::FunctionCall {
-                name,
-                args: args
-                    .into_iter()
-                    .map(|a| stamp_unresolved_upstream(a, upstream_binding_names))
-                    .collect(),
-            })
-        }
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| {
+                            Ok::<_, std::convert::Infallible>(stamp_unresolved_upstream(
+                                value.clone(),
+                                upstream_binding_names,
+                            ))
+                        })
+                        .expect("infallible function-argument rewrite")
+                })
+                .collect(),
+            source_line,
+        }),
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| {
+                            Ok::<_, std::convert::Infallible>(stamp_unresolved_upstream(
+                                value.clone(),
+                                upstream_binding_names,
+                            ))
+                        })
+                        .expect("infallible function-argument rewrite")
+                })
+                .collect(),
+            source_line,
+        }),
         Value::Deferred(DeferredValue::Access(access)) => {
             let original = Value::Deferred(DeferredValue::Access(access.clone()));
             access
@@ -438,16 +473,24 @@ fn resolve_ref_value_inner(
                 .collect();
             Ok(Value::Deferred(DeferredValue::Interpolation(resolved_parts?)).canonicalize())
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => {
             // First, resolve all arguments
-            let resolved_args: Result<Vec<Value>, String> = args
+            let resolved_args: Result<Vec<crate::resource::FunctionArgument>, String> = args
                 .iter()
-                .map(|a| resolve_ref_value_inner(a, bindings, config))
+                .map(|argument| {
+                    argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
+                })
                 .collect();
             let resolved_args = resolved_args?;
 
             // Check if all args are fully resolved (no remaining refs)
-            let all_resolved = resolved_args.iter().all(|a| !contains_resource_ref(a));
+            let all_resolved = resolved_args
+                .iter()
+                .all(|argument| !contains_resource_ref(argument.walker_value()));
 
             if all_resolved {
                 // Evaluate the built-in function; propagate errors since args are resolved.
@@ -460,8 +503,7 @@ fn resolve_ref_value_inner(
                 use crate::eval_value::EvalValue;
                 let eval_args: Vec<EvalValue> = resolved_args
                     .iter()
-                    .cloned()
-                    .map(EvalValue::from_value)
+                    .map(crate::parser::function_argument_as_eval)
                     .collect();
                 let evaluated = match config {
                     Some(config) => {
@@ -470,22 +512,57 @@ fn resolve_ref_value_inner(
                     None => crate::builtins::evaluate_builtin(name, &eval_args),
                 };
                 match evaluated {
-                    Ok(result) => result.into_value().map_err(|leak| {
-                        format!(
-                            "{}(): produced a closure '{}' (still needs {} arg(s)); \
-                             this should have been caught at parse time",
-                            name, leak.name, leak.remaining_arity
-                        )
-                    }),
+                    Ok(result) => result
+                        .into_value()
+                        .map_err(|error| format!("{name}(): {error}")),
                     Err(e) => Err(format!("{}(): {}", name, e)),
                 }
             } else {
                 // Keep as FunctionCall with partially resolved args
                 Ok(Value::Deferred(DeferredValue::FunctionCall {
-                    name: name.clone(),
+                    name: *name,
                     args: resolved_args,
+                    source_line: *source_line,
                 }))
             }
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let resolved_args = args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let all_resolved = resolved_args.iter().all(|argument| {
+                argument.handle().is_some()
+                    || argument
+                        .value()
+                        .is_some_and(|value| !contains_resource_ref(value))
+            });
+            if !all_resolved {
+                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                    function: function.clone(),
+                    functions: functions.clone(),
+                    args: resolved_args,
+                    source_line: *source_line,
+                }));
+            }
+
+            let default_config = crate::parser::ProviderContext::default();
+            let config = config.unwrap_or(&default_config);
+            crate::parser::evaluate_resolved_user_function(
+                function,
+                functions,
+                &resolved_args,
+                config,
+                source_line.get().unwrap_or(function.body.source_line),
+            )
+            .map_err(|error| error.to_string())
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access_expression = crate::value::format_value(value);
@@ -1364,15 +1441,17 @@ mod tests {
         let bindings = ResolvedBindings::default();
 
         let func = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".into())),
+                Value::Concrete(ConcreteValue::String("-".into())).into(),
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::Concrete(ConcreteValue::String("a".into())),
                     Value::Concrete(ConcreteValue::String("b".into())),
                     Value::Concrete(ConcreteValue::String("c".into())),
-                ])),
+                ]))
+                .into(),
             ],
+            source_line: (0).into(),
         });
 
         let resolved = resolve_ref_value(&func, &bindings).unwrap();
@@ -1394,14 +1473,16 @@ mod tests {
 
         // join("-", ["prefix", vpc.id]) should resolve vpc.id first, then evaluate
         let func = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".into())),
+                Value::Concrete(ConcreteValue::String("-".into())).into(),
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::Concrete(ConcreteValue::String("prefix".into())),
                     Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
-                ])),
+                ]))
+                .into(),
             ],
+            source_line: (0).into(),
         });
 
         let resolved = resolve_ref_value(&func, &bindings).unwrap();
@@ -1426,11 +1507,12 @@ mod tests {
         )]);
         let value = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String(":".into())),
-                    Value::resource_ref("queue", "arn", vec![]),
+                    Value::Concrete(ConcreteValue::String(":".into())).into(),
+                    Value::resource_ref("queue", "arn", vec![]).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 5 },
@@ -1460,11 +1542,12 @@ mod tests {
         bindings.set("queue", attrs, BindingValueSource::Upstream);
         let value = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String(":".into())),
-                    Value::resource_ref("queue", "arn", vec![]),
+                    Value::Concrete(ConcreteValue::String(":".into())).into(),
+                    Value::resource_ref("queue", "arn", vec![]).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 5 },
@@ -1496,11 +1579,12 @@ mod tests {
         bindings.set("q", attrs, BindingValueSource::Local);
         let value = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("-".into())),
-                    Value::resource_ref("q", "identifier", vec![]),
+                    Value::Concrete(ConcreteValue::String("-".into())).into(),
+                    Value::resource_ref("q", "identifier", vec![]).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 5 },
@@ -1673,15 +1757,17 @@ mod tests {
 
         // If a ResourceRef in the args can't be resolved, the FunctionCall is kept
         let func = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".into())),
+                Value::Concrete(ConcreteValue::String("-".into())).into(),
                 Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
                     "unknown".to_string(),
                     "id".to_string(),
                     vec![],
-                )])),
+                )]))
+                .into(),
             ],
+            source_line: (0).into(),
         });
 
         let resolved = resolve_ref_value(&func, &bindings).unwrap();
@@ -1777,12 +1863,16 @@ mod tests {
         // env() with a var name that is extremely unlikely to be set should propagate error
         let bindings = ResolvedBindings::default();
         let value = Value::Deferred(DeferredValue::FunctionCall {
-            name: "env".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String(
-                "CARINA_RESOLVER_TEST_NONEXISTENT_VAR_12345"
-                    .to_string()
-                    .into(),
-            ))],
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![
+                Value::Concrete(ConcreteValue::String(
+                    "CARINA_RESOLVER_TEST_NONEXISTENT_VAR_12345"
+                        .to_string()
+                        .into(),
+                ))
+                .into(),
+            ],
+            source_line: (0).into(),
         });
 
         let result = resolve_ref_value(&value, &bindings);
@@ -1804,11 +1894,12 @@ mod tests {
         // join("-", vpc.tags) should stay as FunctionCall when vpc.tags is unresolved
         let bindings = ResolvedBindings::default();
         let value = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".into())),
-                Value::resource_ref("vpc".to_string(), "tags".to_string(), vec![]),
+                Value::Concrete(ConcreteValue::String("-".into())).into(),
+                Value::resource_ref("vpc".to_string(), "tags".to_string(), vec![]).into(),
             ],
+            source_line: (0).into(),
         });
 
         let result = resolve_ref_value(&value, &bindings);
@@ -1827,12 +1918,16 @@ mod tests {
             vec![(
                 "value",
                 Value::Deferred(DeferredValue::FunctionCall {
-                    name: "env".to_string(),
-                    args: vec![Value::Concrete(ConcreteValue::String(
-                        "CARINA_RESOLVER_STATE_TEST_NONEXISTENT_VAR_12345"
-                            .to_string()
-                            .into(),
-                    ))],
+                    name: crate::builtins::BuiltinFunction::env,
+                    args: vec![
+                        Value::Concrete(ConcreteValue::String(
+                            "CARINA_RESOLVER_STATE_TEST_NONEXISTENT_VAR_12345"
+                                .to_string()
+                                .into(),
+                        ))
+                        .into(),
+                    ],
+                    source_line: (0).into(),
                 }),
             )],
         )];

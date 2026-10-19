@@ -364,32 +364,21 @@ fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
 }
 
 #[test]
-fn bare_handle_keeps_the_main_compatible_anonymous_identity_hash() {
-    let parsed = crate::parser::parse(
+fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
+    let error = crate::parser::parse(
         r#"
             let vpc = mock.test.resource { name = "network" }
             mock.test.Consumer { parent = vpc }
         "#,
         &crate::parser::ProviderContext::default(),
     )
-    .expect("parse anonymous consumer with a bare structural handle");
-    let mut resources = parsed
-        .resources
-        .into_iter()
-        .filter(|resource| resource.id.resource_type == "test.Consumer")
-        .collect::<Vec<_>>();
+    .expect_err("bare handles must never reach identity hashing");
 
-    let schema = ResourceSchema::new("test.Consumer")
-        .attribute(AttributeSchema::new("parent", AttributeType::string()).create_only());
-    let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
-    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
-        .expect("compute anonymous identity");
-
-    assert_eq!(
-        resources[0].id.identity_str(),
-        Some("mock_test_consumer_68efb64c"),
-        "the persisted `${{vpc}}` spelling is part of the historical identity hash",
+    assert!(
+        error
+            .to_string()
+            .contains("'vpc' is a resource, not a value"),
+        "unexpected error: {error}",
     );
 }
 

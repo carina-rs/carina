@@ -3,7 +3,7 @@ title: Expressions
 description: For loops, if/else conditionals, let bindings, pipe operator, compose operator, and function definitions in the Carina DSL.
 ---
 
-Expressions in the Carina DSL produce values. They can appear as attribute values, function arguments, or in any context where a value is expected.
+Expressions in the Carina DSL produce values. They can appear as attribute values, function arguments, or in any context where a value is expected. Resource and module declarations instead produce structural handles; select an attribute or module output before using one as a value.
 
 ## For Expression
 
@@ -280,6 +280,12 @@ Function parameters support:
 - Type annotations: `name: String`
 - Default values: `name: String = "default"`
 - No annotation: `name` (any type accepted)
+
+An untyped parameter can receive either a value or a structural handle. The
+argument determines which: `f(vpc)` binds the parameter as a handle, while
+`f(vpc.vpc_id)` binds it as a value. Select an attribute such as
+`parameter.vpc_id` before using a handle-backed parameter as a value; using
+the parameter bare is invalid.
 
 ```crn
 fn make_tags(env: String, service: String, team: String = 'platform') {

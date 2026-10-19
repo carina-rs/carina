@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::parser::{TypeExpr, ValidateExpr};
 
-use super::{AccessPath, DeferredValue, ResolvedResourceId, Value};
+use super::{AccessPath, DeferredValue, ResolvedResourceId, StructuralOperand, Value};
 
 /// How a [`Composition`]'s attribute is produced from the rest of the
 /// IR.
@@ -181,11 +181,9 @@ impl CompositionAttribute {
 /// must supply the declared type. The optional storage only keeps saved-plan
 /// deserialization backward-compatible: skipped validation metadata
 /// deserializes as `None`, while [`Self::from_value`] always stores `Some`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompositionArgument {
-    value: Value,
-    #[serde(skip)]
+    operand: StructuralOperand,
     declared_type: Option<TypeExpr>,
 }
 
@@ -196,33 +194,78 @@ impl CompositionArgument {
     /// placeholder inventory by construction.
     pub fn contains_redacted_secret_placeholder(&self) -> bool {
         let Self {
-            value,
+            operand,
             declared_type: _declared_type,
         } = self;
-        crate::value::contains_redacted_secret(value)
+        crate::value::contains_redacted_secret(operand.traversal_value())
     }
 
     pub fn from_value(value: Value, declared_type: TypeExpr) -> Self {
         Self {
-            value,
+            operand: StructuralOperand::from_value(value),
+            declared_type: Some(declared_type),
+        }
+    }
+
+    pub(crate) fn from_handle(
+        value: Value,
+        declared_type: TypeExpr,
+        handle: crate::eval_value::StructuralHandle,
+    ) -> Self {
+        Self {
+            operand: StructuralOperand::from_handle_with_access_base(handle, value),
             declared_type: Some(declared_type),
         }
     }
 
     pub fn value(&self) -> &Value {
-        &self.value
+        self.operand.traversal_value()
     }
 
     pub fn declared_type(&self) -> Option<&TypeExpr> {
         self.declared_type.as_ref()
     }
 
+    pub(crate) fn is_handle(&self) -> bool {
+        self.operand.handle().is_some()
+    }
+
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+        self.operand.handle()
+    }
+
+    pub(crate) fn forwarded_parameter(&self) -> Option<&str> {
+        self.operand.parameter()
+    }
+
     /// Rewrite a prefixed/substituted value without dropping its declaration.
     pub fn with_value(&self, value: Value) -> Self {
+        let operand = match self.operand.handle() {
+            Some(handle) => StructuralOperand::from_handle_with_access_base(handle.clone(), value),
+            None => StructuralOperand::from_value(value),
+        };
         Self {
-            value,
+            operand,
             declared_type: self.declared_type.clone(),
         }
+    }
+}
+
+// Saved plans carry only the value-shaped projection. The declared type and
+// parser-only operand classification are live-validation metadata and are
+// deliberately reconstructed only by live expansion.
+impl Serialize for CompositionArgument {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompositionArgument {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self {
+            operand: StructuralOperand::from_value(Value::deserialize(deserializer)?),
+            declared_type: None,
+        })
     }
 }
 

@@ -2,6 +2,33 @@
 
 use crate::resource::{ConcreteValue, Value};
 use crate::schema::AttributeType;
+use std::path::{Component, Path, PathBuf};
+
+/// Lexically normalize a diagnostic source path without consulting the
+/// filesystem. Parent components cancel an immediately preceding normal
+/// component, while leading parents remain intact.
+pub(crate) fn normalize_source_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) =>
+            {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
 
 pub(crate) fn truncate_chars_for_display(value: &str, max_chars: usize) -> (String, &'static str) {
     let mut chars = value.chars();
@@ -980,6 +1007,18 @@ pub fn pretty_with_newline_bytes<T: serde::Serialize>(value: &T) -> serde_json::
 mod tests {
     use super::*;
     use crate::schema::{TypeIdentity, enum_identity};
+
+    #[test]
+    fn normalize_source_path_collapses_parent_components_lexically() {
+        assert_eq!(
+            normalize_source_path(Path::new("mod/../inner/main.crn")),
+            PathBuf::from("inner/main.crn")
+        );
+        assert_eq!(
+            normalize_source_path(Path::new("../mod/../inner/main.crn")),
+            PathBuf::from("../inner/main.crn")
+        );
+    }
 
     /// Build a `TypeIdentity` from the legacy `(name, namespace)` pair
     /// the pre-S2.5b test corpus used. Provider is the first segment of

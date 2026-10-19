@@ -22,9 +22,12 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         | Value::Concrete(ConcreteValue::StringList(_)) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_static_value),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_static_value),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter().all(is_static_value)
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => args.iter().all(|argument| {
+            argument.handle().is_some() || argument.value().is_some_and(is_static_value)
+        }),
         Value::Deferred(DeferredValue::Access(access)) => is_static_value(access.base()),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
@@ -48,6 +51,7 @@ pub(crate) fn is_static_eval(value: &EvalValue) -> bool {
     match value {
         EvalValue::User(v) => is_static_value(v),
         EvalValue::StructuralHandle(_) => true,
+        EvalValue::ProvisionalReference { .. } => false,
         EvalValue::ComputedWithStructuralHandles { value, .. } => is_static_value(value),
         EvalValue::DeferredForValue { .. } => false,
         EvalValue::Closure { captured_args, .. } => captured_args.iter().all(is_static_eval),
@@ -89,7 +93,9 @@ pub(crate) fn evaluate_static_value(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Deferred(DeferredValue::Interpolation(evaluated)).canonicalize())
         }
-        Value::Deferred(DeferredValue::FunctionCall { ref name, ref args }) => {
+        Value::Deferred(DeferredValue::FunctionCall {
+            ref name, ref args, ..
+        }) => {
             if !is_static_value(&value) {
                 return Err(ParseError::InvalidExpression {
                     line: 0,
@@ -100,16 +106,16 @@ pub(crate) fn evaluate_static_value(
                 });
             }
             // Recursively evaluate any nested FunctionCall arguments
-            let evaluated_args: Result<Vec<Value>, ParseError> = args
+            let evaluated_args: Result<Vec<crate::resource::FunctionArgument>, ParseError> = args
                 .iter()
-                .cloned()
-                .map(|v| evaluate_static_value(v, config))
+                .map(|argument| {
+                    argument.try_map_value(|value| evaluate_static_value(value.clone(), config))
+                })
                 .collect();
             let evaluated_args = evaluated_args?;
             let eval_args: Vec<EvalValue> = evaluated_args
                 .iter()
-                .cloned()
-                .map(EvalValue::from_value)
+                .map(crate::parser::functions::function_argument_as_eval)
                 .collect();
             let result = crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
                 .map_err(|e| ParseError::InvalidExpression {
@@ -118,14 +124,37 @@ pub(crate) fn evaluate_static_value(
                 })?;
             result
                 .into_value()
-                .map_err(|leak| ParseError::InvalidExpression {
-                    line: 0,
+                .map_err(|error| ParseError::from_eval_value(error, 0))
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            ref function,
+            ref functions,
+            ref args,
+            source_line,
+        }) => {
+            if !is_static_value(&value) {
+                return Err(ParseError::InvalidExpression {
+                    line: source_line.get().unwrap_or(function.body.source_line),
                     message: format!(
-                        "for iterable function call '{name}' returned a closure '{}' \
-                     (still needs {} arg(s)); finish the partial application",
-                        leak.name, leak.remaining_arity
+                        "for iterable function call '{}' depends on a runtime value; all arguments must be statically known at parse time",
+                        function.name
                     ),
+                });
+            }
+            let line = source_line.get().unwrap_or(function.body.source_line);
+            let evaluated_args = args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| evaluate_static_value(value.clone(), config))
                 })
+                .collect::<Result<Vec<_>, _>>()?;
+            super::functions::evaluate_resolved_user_function(
+                function,
+                functions,
+                &evaluated_args,
+                config,
+                line,
+            )
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let base = evaluate_static_value(access.base().clone(), config)?;

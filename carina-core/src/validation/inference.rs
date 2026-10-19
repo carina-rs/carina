@@ -166,6 +166,13 @@ pub enum InferenceBinding {
     Argument {
         type_expr: TypeExpr,
     },
+    /// A user-defined function whose call may remain deferred until provider
+    /// schemas are available. Its annotation is still enough authority to
+    /// infer an export without evaluating the call or dropping its pending
+    /// argument checks.
+    UserFunction {
+        return_type: Option<TypeExpr>,
+    },
 }
 
 pub type InferenceBindings = HashMap<String, InferenceBinding>;
@@ -202,6 +209,12 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
         out.entry(argument.name.clone())
             .or_insert_with(|| InferenceBinding::Argument {
                 type_expr: argument.type_expr.clone(),
+            });
+    }
+    for function in parsed.user_functions.values() {
+        out.entry(function.name.clone())
+            .or_insert_with(|| InferenceBinding::UserFunction {
+                return_type: function.return_type.clone(),
             });
     }
     out
@@ -404,10 +417,10 @@ pub(crate) fn infer_type_from_value_without_bindings(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             infer_type_from_value_without_bindings(inner)
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             let return_type = builtin_functions()
                 .iter()
-                .find(|function| function.name == name)
+                .find(|function| function.name == name.as_str())
                 .map(|function| function.return_type)
                 .ok_or_else(|| InferenceError::UnknownType {
                     reason: format!("unknown built-in function `{name}`"),
@@ -422,7 +435,7 @@ pub(crate) fn infer_type_from_value_without_bindings(
                             reason: format!("built-in `{name}` has no argument to wrap as secret"),
                         })
                     },
-                    infer_type_from_value_without_bindings,
+                    |argument| infer_type_from_value_without_bindings(argument.walker_value()),
                 ),
                 BuiltinReturnType::List | BuiltinReturnType::Map | BuiltinReturnType::Any => {
                     Err(InferenceError::UnknownType {
@@ -431,14 +444,22 @@ pub(crate) fn infer_type_from_value_without_bindings(
                 }
             }
         }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => function
+            .return_type
+            .clone()
+            .ok_or_else(|| InferenceError::UnknownType {
+                reason: format!(
+                    "user function `{}` has no declared return type",
+                    function.name
+                ),
+            }),
         Value::Deferred(DeferredValue::Access(access)) => {
             let base_type = infer_type_from_value_without_bindings(access.base())?;
-            super::narrow_type_expr(&base_type, std::slice::from_ref(access.step())).ok_or_else(
-                || InferenceError::InvalidAccess {
+            super::narrow_type_expr(&base_type, std::slice::from_ref(access.step()), None)
+                .ok_or_else(|| InferenceError::InvalidAccess {
                     base_type: base_type.to_string(),
                     step: access.step().clone(),
-                },
-            )
+                })
         }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
@@ -504,9 +525,18 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::BindingRef { .. }) => Err(InferenceError::UnknownType {
             reason: "bare binding reference has no attribute to infer".to_string(),
         }),
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             infer_function_call(name, args, bindings, schemas, visiting)
         }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => function
+            .return_type
+            .clone()
+            .ok_or_else(|| InferenceError::UnknownType {
+                reason: format!(
+                    "user function `{}` has no declared return type",
+                    function.name
+                ),
+            }),
         Value::Deferred(DeferredValue::Access(access)) => {
             let base_type =
                 infer_type_from_value_with_visiting(access.base(), bindings, schemas, visiting)?;
@@ -515,15 +545,18 @@ fn infer_type_from_value_with_visiting(
                     reason: "postfix access base type is not known".to_string(),
                 });
             }
-            super::narrow_type_expr(&base_type, std::slice::from_ref(access.step())).ok_or_else(
-                || InferenceError::InvalidAccess {
-                    base_type: base_type.to_string(),
-                    step: access.step().clone(),
-                },
+            super::narrow_type_expr(
+                &base_type,
+                std::slice::from_ref(access.step()),
+                Some(schemas),
             )
+            .ok_or_else(|| InferenceError::InvalidAccess {
+                base_type: base_type.to_string(),
+                step: access.step().clone(),
+            })
         }
         Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { name },
+            crate::resource::UnknownReason::ModuleArgument { name, .. },
         )) => match bindings.get(name) {
             Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
             _ => Err(InferenceError::UnknownType {
@@ -593,7 +626,8 @@ fn infer_resource_ref_with_visiting(
         }) => (provider.as_str(), resource_type.as_str()),
         Some(InferenceBinding::UpstreamState)
         | Some(InferenceBinding::ModuleCall)
-        | Some(InferenceBinding::Argument { .. }) => {
+        | Some(InferenceBinding::Argument { .. })
+        | Some(InferenceBinding::UserFunction { .. }) => {
             return Err(InferenceError::NonInferableBinding {
                 binding: binding.to_string(),
             });
@@ -631,12 +665,12 @@ fn infer_resource_ref_with_visiting(
                 infer_type_from_value_with_visiting(inner, bindings, schemas, visiting);
             visiting.shift_remove(binding);
             let inner_type = inner_type_result?;
-            return super::narrow_type_expr(&inner_type, segments).ok_or_else(|| {
-                InferenceError::UnknownAttribute {
+            return super::narrow_type_expr(&inner_type, segments, Some(schemas)).ok_or_else(
+                || InferenceError::UnknownAttribute {
                     binding: binding.to_string(),
                     attribute: attribute.to_string(),
-                }
-            });
+                },
+            );
         }
         None => {
             return Err(InferenceError::UnknownBinding {
@@ -783,7 +817,7 @@ fn descend_struct_field<'a>(
 ///   validator) → `TypeExpr::SchemaType`, preserving the typed
 ///   identity old CustomEnum-origin schemas carried before enum
 ///   unification.
-fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
+pub(super) fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
     match attr_type.kind() {
         AttrTypeKind::String {
             identity: Some(id), ..
@@ -878,7 +912,7 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
 
 fn infer_function_call(
     name: &str,
-    args: &[Value],
+    args: &[crate::resource::FunctionArgument],
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
@@ -886,10 +920,22 @@ fn infer_function_call(
     let return_type = builtin_functions()
         .iter()
         .find(|f| f.name == name)
-        .map(|f| f.return_type)
-        .ok_or_else(|| InferenceError::UnknownType {
-            reason: format!("unknown built-in function `{}`", name),
-        })?;
+        .map(|f| f.return_type);
+    let Some(return_type) = return_type else {
+        return match bindings.get(name) {
+            Some(InferenceBinding::UserFunction {
+                return_type: Some(return_type),
+            }) => Ok(return_type.clone()),
+            Some(InferenceBinding::UserFunction { return_type: None }) => {
+                Err(InferenceError::UnknownType {
+                    reason: format!("user-defined function `{name}` has no declared return type"),
+                })
+            }
+            _ => Err(InferenceError::UnknownType {
+                reason: format!("unknown built-in function `{name}`"),
+            }),
+        };
+    };
     match return_type {
         BuiltinReturnType::String => Ok(TypeExpr::String),
         BuiltinReturnType::Int => Ok(TypeExpr::Int),
@@ -912,7 +958,14 @@ fn infer_function_call(
                     reason: format!("built-in `{name}` has no argument to wrap as secret"),
                 })
             },
-            |inner| infer_type_from_value_with_visiting(inner, bindings, schemas, visiting),
+            |inner| {
+                infer_type_from_value_with_visiting(
+                    inner.walker_value(),
+                    bindings,
+                    schemas,
+                    visiting,
+                )
+            },
         ),
         BuiltinReturnType::Any => Err(InferenceError::UnknownType {
             reason: format!("built-in `{}` return type depends on arguments", name),
@@ -1260,8 +1313,9 @@ mod tests {
         let r = infer_type_from_value(
             &Value::Concrete(ConcreteValue::List(vec![
                 Value::Deferred(DeferredValue::FunctionCall {
-                    name: "lookup".to_string(),
+                    name: crate::builtins::BuiltinFunction::lookup,
                     args: vec![],
+                    source_line: (0).into(),
                 }),
                 Value::Concrete(ConcreteValue::String("extra".into())),
             ])),
@@ -1370,8 +1424,9 @@ mod tests {
         // `join` returns String per builtins metadata.
         let r = infer_type_from_value(
             &Value::Deferred(DeferredValue::FunctionCall {
-                name: "join".to_string(),
+                name: crate::builtins::BuiltinFunction::join,
                 args: vec![],
+                source_line: (0).into(),
             }),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1407,11 +1462,12 @@ mod tests {
 
         let value = apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())),
-                    Value::resource_ref("role", "arn", vec![]),
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    Value::resource_ref("role", "arn", vec![]).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 1 },
@@ -1475,8 +1531,9 @@ mod tests {
         // required.
         let r = infer_type_from_value(
             &Value::Deferred(DeferredValue::FunctionCall {
-                name: "lookup".to_string(),
+                name: crate::builtins::BuiltinFunction::lookup,
                 args: vec![],
+                source_line: (0).into(),
             }),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1703,16 +1760,8 @@ mod tests {
     }
 
     #[test]
-    fn function_call_unknown_name_fails_inference() {
-        let r = infer_type_from_value(
-            &Value::Deferred(DeferredValue::FunctionCall {
-                name: "nonexistent".to_string(),
-                args: vec![],
-            }),
-            &InferenceBindings::new(),
-            &SchemaRegistry::new(),
-        );
-        assert!(matches!(r, Err(InferenceError::UnknownType { .. })));
+    fn deferred_builtin_identity_rejects_unknown_names() {
+        assert!(crate::builtins::BuiltinFunction::from_name("nonexistent").is_none());
     }
 
     #[test]
@@ -1752,8 +1801,9 @@ mod tests {
                 None,
                 // `lookup` returns Any: inference fails, sentinel produced.
                 Some(Value::Deferred(DeferredValue::FunctionCall {
-                    name: "lookup".to_string(),
+                    name: crate::builtins::BuiltinFunction::lookup,
                     args: vec![],
+                    source_line: (0).into(),
                 })),
             ));
 

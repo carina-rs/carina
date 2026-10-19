@@ -88,7 +88,12 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
             provider_context,
             schemas,
         )
-        .map_err(|e| format!("Module resolution error: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "Module resolution error: {}",
+                e.display_relative_to(base_dir)
+            )
+        })?;
     }
 
     // Collect source texts for each .crn file

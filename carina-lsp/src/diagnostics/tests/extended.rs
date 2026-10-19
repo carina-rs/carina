@@ -4718,7 +4718,7 @@ let child = selector { items = ["x", "y"] }
 }
 
 #[test]
-fn bare_structural_handle_keeps_the_string_attribute_lint() {
+fn bare_structural_handle_is_a_real_engine_parse_error() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let mut schemas = SchemaRegistry::new();
@@ -4746,29 +4746,175 @@ mock.test.resource {
 "#;
 
     let document = create_document(source);
-    let parsed = document.parsed().expect("document parse");
-    let child = parsed
-        .resources
-        .iter()
-        .find(|resource| resource.binding.is_none())
-        .expect("anonymous child resource");
-    assert_eq!(
-        child.get_attr("parent"),
-        Some(&Value::Concrete(ConcreteValue::String("${vpc}".into())))
+    assert!(
+        document.parsed().is_none(),
+        "the parser must reject the handle"
     );
     let diagnostics = engine.analyze(&document, None);
-    assert!(
-        diagnostics.iter().any(|diagnostic| {
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
             diagnostic
                 .message
-                .contains("Expected string, got resource reference 'vpc'. Did you mean 'vpc.name'?")
-        }),
-        "bare-handle compatibility lint disappeared: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>()
+                .contains("'vpc' is a resource, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing bare-handle diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.range.start.line, 7);
+}
+
+#[test]
+fn sibling_bare_structural_handle_is_a_real_engine_parse_error() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
     );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("parent", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let tmp = tempfile::tempdir().unwrap();
+    let source = r#"mock.test.resource {
+  name = "child"
+  parent = vpc
+}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), source).unwrap();
+    std::fs::write(
+        tmp.path().join("network.crn"),
+        r#"let vpc = mock.test.network {
+  name = "network"
+}
+"#,
+    )
+    .unwrap();
+
+    let document = create_document(source);
+    assert!(
+        document.parsed().is_some(),
+        "the buffer-only parser cannot yet classify a sibling name"
+    );
+    let diagnostics = engine.analyze_with_filename(&document, Some("main.crn"), Some(tmp.path()));
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing sibling bare-handle diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.range.start.line, 2);
+}
+
+#[test]
+fn module_argument_substitution_error_is_anchored_to_the_authored_argument() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("identifier", AttributeType::string())),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let module = tmp.path().join("consumer");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments { peer: mock.test.Thing }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [peer] }
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"
+let source = mock.test.Thing { name = "peer" }
+let imported = use { source = "../consumer" }
+let child = imported {
+  peer =
+    source.identifier
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let document = create_document(source);
+    let diagnostics = engine.analyze_with_filename(&document, Some("main.crn"), Some(&root));
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("depends_on parameter 'peer' received a value")
+        })
+        .unwrap_or_else(|| panic!("missing substitution diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.range.start.line, 5, "{diagnostic:#?}");
+    assert_eq!(diagnostic.range.end.line, 5, "{diagnostic:#?}");
+}
+
+#[test]
+fn bare_structural_handle_for_string_module_argument_is_an_error() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let module = tmp.path().join("module");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { parent: String }\n",
+    )
+    .unwrap();
+    let source = r#"let vpc = mock.test.network { name = "network" }
+let imported = use { source = "../module" }
+let instance = imported { parent = vpc }
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let document = create_document(source);
+    assert!(
+        document.parsed().is_some(),
+        "module arguments retain handles"
+    );
+    let diagnostics = engine.analyze_with_filename(&document, Some("main.crn"), Some(&root));
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing module-argument diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.range.start.line, 2);
 }
 
 fn multifile_sibling_let_module_constraint_diagnostics(
@@ -4990,7 +5136,11 @@ checked {}
         matching[0].message,
         "anonymous call to module 'checked': argument 'prefix': prefix must be at most three characters (got 'abcdef')"
     );
-    assert_eq!(matching[0].range.start.line, 2);
+    assert_eq!(
+        matching[0].range.start.line, 2,
+        "diagnostic: {:#?}",
+        matching[0]
+    );
 }
 
 #[test]
@@ -7577,15 +7727,11 @@ fn sibling_user_fn_fixture(main_text: &str) -> (tempfile::TempDir, std::path::Pa
     (tmp, base)
 }
 
-/// Issue #2442: when `fn X(...) { ... }` lives in a sibling `.crn`
-/// (e.g. `helpers.crn`) and a consumer in `main.crn` calls `X(...)`,
-/// `check_unknown_functions` must NOT emit `Unknown function 'X'`.
-/// The check previously consulted only `builtins::is_known_builtin`;
-/// the fix threads the merged-directory `user_functions` through.
-/// CLAUDE.md "Directory-scoped, never single-file": same shape as
-/// #2435 / PR #2120 / PR #2118.
+/// A sibling user function is resolved by the directory function prepass, so
+/// the isolated buffer's provisional unknown-function error must not leak into
+/// the final LSP diagnostics.
 #[test]
-fn check_unknown_functions_skips_sibling_user_fn() {
+fn sibling_user_function_is_not_reported_as_unknown() {
     let main_text = "test.r.res {\n    name = \"x\"\n    val = double(2)\n}\n";
     let (_tmp, base) = sibling_user_fn_fixture(main_text);
 
@@ -7603,18 +7749,10 @@ fn check_unknown_functions_skips_sibling_user_fn() {
     );
 }
 
-/// Companion: a *truly* unknown function name in the consumer must
-/// still produce the diagnostic. Wrap inside another (deferred) call
-/// so the per-file parser keeps the FunctionCall placeholder rather
-/// than rejecting it outright at parse time.
-///
-/// Also pins the round-2 regression class: even when the directory
-/// parse fails (because of the truly-undefined call), sibling-defined
-/// `fn double(...)` must NOT be redlined. Without the per-file
-/// fallback walk, the `merged = None` path would fall back to the
-/// buffer's empty `parsed.user_functions` and report `double` too.
+/// A genuinely unknown name remains a structured parse diagnostic, while the
+/// nested sibling function is still recognized by the directory prepass.
 #[test]
-fn check_unknown_functions_still_warns_when_truly_undefined() {
+fn truly_unknown_function_is_reported_without_redlining_sibling_function() {
     let main_text = "test.r.res {\n    name = \"x\"\n    val = triple(double(2))\n}\n";
     let (_tmp, base) = sibling_user_fn_fixture(main_text);
 
@@ -7694,6 +7832,37 @@ fn check_attributes_blocks_skips_sibling_resource_binding() {
         undefined_resource.is_none(),
         "sibling-defined `let bar = ...` must not produce 'Undefined resource' diagnostic. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// A bare structural alias is a declaration in its own right. The alias may
+/// be declared in a sibling file, and attribute access through it must have
+/// the same CLI/LSP scope semantics as access through the original handle.
+#[test]
+fn sibling_structural_alias_is_known_to_undefined_reference_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("network.crn"),
+        "let vpc = mock.test.resource { name = \"vpc\" }\nlet network = vpc\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("providers.crn"), "provider mock {}\n").unwrap();
+    let main_text = r#"mock.test.resource {
+    name = network.name
+    parent = network.identifier
+}
+"#;
+    std::fs::write(base.join("main.crn"), main_text).unwrap();
+
+    let diagnostics = analyze_with_buffer(&structural_ref_engine(), &base, "main.crn", main_text);
+    let phantom_alias = diagnostics.iter().find(|diagnostic| {
+        diagnostic.message.contains("Undefined resource")
+            && diagnostic.message.contains("'network'")
+    });
+    assert!(
+        phantom_alias.is_none(),
+        "sibling structural alias must come from directory metadata: {diagnostics:#?}",
     );
 }
 
@@ -9084,6 +9253,474 @@ fn nested_user_function_return_mismatch_surfaces_across_sibling_files() {
 }
 
 #[test]
+fn sibling_function_bare_handle_error_is_owned_by_the_function_document() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let functions =
+        "# the call lives in a sibling file\nfn identity(r: mock.test.resource): String { r }\n";
+    let temp = write_tag_key_fixture(&[
+        ("functions.crn", functions),
+        (
+            "main.crn",
+            "let vpc = mock.test.resource { name = 'vpc' }\nlet bad = identity(vpc)\n",
+        ),
+        ("providers.crn", "provider mock {}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&engine, temp.path(), "functions.crn", functions);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'r' is a resource handle, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing sibling function handle diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.range.start.line, 1);
+}
+
+#[test]
+fn sibling_function_handle_field_access_is_valid_in_the_directory_engine() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let functions = "fn name_of(r: mock.test.resource): String { r.name }\n";
+    let temp = write_tag_key_fixture(&[
+        ("functions.crn", functions),
+        (
+            "main.crn",
+            "let vpc = mock.test.resource { name = 'vpc' }\nlet good = name_of(vpc)\n",
+        ),
+        ("providers.crn", "provider mock {}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&engine, temp.path(), "functions.crn", functions);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("resource handle, not a value")
+                && !diagnostic.message.contains("Unknown function")
+        }),
+        "valid sibling handle access produced diagnostics: {diagnostics:#?}",
+    );
+}
+
+fn structural_ref_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("compute.Instance")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("arn", AttributeType::string())),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("parent", AttributeType::string())),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn deferred_sibling_function_type_error_is_one_call_site_error() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("functions.crn"),
+        "fn name_of(r: mock.compute.Instance): String { r.name }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("bindings.crn"),
+        "let wrong = mock.test.resource { name = \"wrong\" }\n",
+    )
+    .unwrap();
+    let source = "mock.test.resource {\n  name = \"consumer\"\n  parent = name_of(wrong)\n}\n";
+    std::fs::write(root.path().join("consumer.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(
+        &structural_ref_engine(),
+        root.path(),
+        "consumer.crn",
+        source,
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("mock.compute.Instance")
+                && diagnostic.message.contains("mock.test.resource")
+                && diagnostic.message.contains("name_of")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        matching[0].range.start.line, 2,
+        "diagnostic: {:#?}",
+        matching[0]
+    );
+}
+
+#[test]
+fn builtin_handle_error_is_reported_at_the_call_site() {
+    let root = tempfile::tempdir().unwrap();
+    let source = "let vpc = mock.compute.Instance { name = \"vpc\" }\nmock.test.resource {\n  name = upper(vpc)\n}\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(matching[0].range.start.line, 2);
+    assert!(!matching[0].message.contains("upper(): upper:"));
+}
+
+#[test]
+fn module_parameter_dependency_and_ref_attribute_are_valid_in_module_scope() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("arguments.crn"),
+        "arguments { r: mock.compute.Instance }\n",
+    )
+    .unwrap();
+    let source = "mock.test.resource {\n  name = \"consumer\"\n  parent = r.name\n  directives { depends_on = [r] }\n}\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("depends_on")
+                && !diagnostic
+                    .message
+                    .contains("cannot apply access .name to mock.compute.Instance")
+        }),
+        "valid typed module-parameter usage produced diagnostics: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn module_parameter_function_mismatch_is_an_error_in_the_root_document() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { r: mock.compute.Instance }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("functions.crn"),
+        "fn name_of(x: mock.test.resource): String { x.name }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "mock.test.resource {\n  name = \"consumer\"\n  parent = name_of(r)\n}\n",
+    )
+    .unwrap();
+    let source = "let vpc = mock.compute.Instance { name = \"vpc\" }\nlet imported = use { source = \"./module\" }\nimported { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("mock.test.resource")
+                && diagnostic.message.contains("mock.compute.Instance")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        matching[0].message.contains("module/main.crn"),
+        "diagnostic should name the module-owned source file: {:#?}",
+        matching[0]
+    );
+    assert!(
+        !matching[0]
+            .message
+            .contains(&root.path().display().to_string()),
+        "diagnostic source path must be relative to the configuration root: {:#?}",
+        matching[0]
+    );
+}
+
+#[test]
+fn non_resource_handle_module_argument_is_an_error_at_the_root_call() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("upstream")).unwrap();
+    let module = root.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments { r: mock.compute.Instance }\nmock.test.resource { name = r.name }\n",
+    )
+    .unwrap();
+    let source = "let up = upstream_state { source = \"./upstream\" }\nlet imported = use { source = \"./module\" }\nimported { r = up }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("'up' is an upstream state")
+                && diagnostic
+                    .message
+                    .contains("not a resource of type mock.compute.Instance")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(matching[0].range.start.line, 2);
+}
+
+#[test]
+fn handle_backed_module_constraint_failure_is_an_error_in_the_lsp() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("checked");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { r: mock.compute.Instance }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("constraints.crn"),
+        "require r.name == \"nope\", \"wrong resource name\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("resource.crn"),
+        "mock.test.resource { name = \"consumer\" parent = r.name }\n",
+    )
+    .unwrap();
+    let source = "let vpc = mock.compute.Instance { name = \"vpc\" }\nlet checked = use { source = \"./checked\" }\nchecked { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("wrong resource name"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn nested_handle_backed_module_constraint_failure_is_an_lsp_error() {
+    let root = tempfile::tempdir().unwrap();
+    let checked = root.path().join("checked");
+    let outer = root.path().join("outer");
+    std::fs::create_dir(&checked).unwrap();
+    std::fs::create_dir(&outer).unwrap();
+    std::fs::write(
+        checked.join("main.crn"),
+        "arguments { inner: mock.compute.Instance }\nrequire inner.name == \"nope\", \"wrong nested resource name\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join("main.crn"),
+        "arguments { r: mock.compute.Instance }\nlet checked = use { source = \"../checked\" }\nchecked { inner = r }\n",
+    )
+    .unwrap();
+    let source = "let vpc = mock.compute.Instance { name = \"vpc\" }\nlet outer = use { source = \"./outer\" }\nouter { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("wrong nested resource name"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(matching[0].range.start.line, 2);
+}
+
+#[test]
+fn bare_handle_in_module_constraint_is_a_located_lsp_error() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("checked");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { r: mock.compute.Instance }\n",
+    )
+    .unwrap();
+    let constraint = "require\n  length(r) > 0,\n  \"bare handle\"\n";
+    std::fs::write(module.join("constraints.crn"), constraint).unwrap();
+    let source = "let vpc = mock.compute.Instance { name = \"vpc\" }\nlet checked = use { source = \"./checked\" }\nchecked { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'r' is a resource handle, not a value")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(matching[0].range.start.line, 2);
+    assert!(
+        matching[0].message.contains("checked/constraints.crn")
+            && matching[0].message.contains("line 2"),
+        "diagnostic must name the module-owned constraint use site: {:#?}",
+        matching[0]
+    );
+}
+
+#[test]
+fn bare_handle_in_argument_validation_is_a_located_lsp_error() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("checked");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        r#"arguments {
+  r: mock.compute.Instance {
+    validation {
+      condition = length(r) > 0
+      error_message = "bare handle"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let source = "let vpc = mock.compute.Instance { name = \"vpc\" }\nlet checked = use { source = \"./checked\" }\nchecked { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'r' is a resource handle, not a value")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(matching[0].range.start.line, 2);
+    assert!(
+        matching[0].message.contains("checked/arguments.crn")
+            && matching[0].message.contains("line 4"),
+        "diagnostic must name the argument validation expression: {:#?}",
+        matching[0]
+    );
+}
+
+#[test]
+fn wrong_resource_handle_module_argument_is_an_lsp_error() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments { r: mock.compute.Instance }\nmock.test.resource { name = r.name }\n",
+    )
+    .unwrap();
+    let source = "let wrong = mock.test.resource { name = \"wrong\" }\nlet imported = use { source = \"./module\" }\nimported { r = wrong }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("mock.compute.Instance")
+                && diagnostic.message.contains("mock.test.resource")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(matching[0].range.start.line, 2);
+}
+
+#[test]
+fn sibling_handle_if_condition_is_a_located_lsp_error() {
+    let root = tempfile::tempdir().unwrap();
+    let source = "let selected = if vpc { mock.test.resource { name = \"yes\" } } else { mock.test.resource { name = \"no\" } }\n";
+    std::fs::write(root.path().join("b.crn"), source).unwrap();
+    std::fs::write(
+        root.path().join("a.crn"),
+        "let vpc = mock.compute.Instance { name = \"vpc\" }\n",
+    )
+    .unwrap();
+
+    let diagnostics = analyze_with_buffer(&structural_ref_engine(), root.path(), "b.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(matching[0].range.start.line, 0);
+}
+
+#[test]
+fn sibling_user_function_for_iterable_uses_the_directory_function_table() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("functions.crn"),
+        "fn names(r): list(String) { [\"a\", \"b\"] }\n",
+    )
+    .unwrap();
+    let source = "for n in names(\"x\") {\n  mock.test.resource {\n    name = n\n  }\n}\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic
+                .message
+                .contains("Unknown built-in function: names")
+                && !diagnostic
+                    .message
+                    .contains("for iterable function call 'names' failed")
+        }),
+        "the directory-defined function must drive the iterable: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn nested_forward_declared_user_function_return_mismatch_surfaces() {
     let root = tempfile::tempdir().unwrap();
     let main = r#"fn f(x: Int): String { 'ok' }
@@ -9572,4 +10209,216 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
     assert_eq!(diagnostics[0].range.start.line, 1);
     assert_eq!(diagnostics[0].range.start.character, 2);
     assert_eq!(diagnostics[0].range.end.character, 12);
+}
+
+#[test]
+fn module_owned_deferred_user_functions_are_not_reclassified_as_builtins() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments { r: String }
+fn suffix(value: String): String { "${value}-x" }
+fn name_with_suffix(value: String): String { suffix(value) }
+attributes { o: String = name_with_suffix(r) }
+mock.test.resource { name = "module-resource" }
+"#,
+    )
+    .unwrap();
+    let source = r#"let vpc = mock.test.resource { name = "vpc" }
+let imported = use { source = "./module" }
+let instance = imported { r = vpc.name }
+mock.test.resource { name = "consumer" parent = instance.o }
+"#;
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic
+                .message
+                .contains("Unknown built-in function: name_with_suffix")
+                && !diagnostic.message.contains("name_with_suffix():")
+        }),
+        "the module-owned definition must travel with its deferred call: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn module_output_handle_user_function_keeps_its_definition_in_lsp() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments { r: mock.test.resource }
+fn suffix(value: String): String { "${value}-x" }
+fn name_with_suffix(value: mock.test.resource): String { suffix(value.name) }
+attributes { o: String = name_with_suffix(r) }
+mock.test.resource { name = "module-resource" }
+"#,
+    )
+    .unwrap();
+    let source = r#"let vpc = mock.test.resource { name = "vpc" }
+let imported = use { source = "./module" }
+let instance = imported { r = vpc }
+mock.test.resource { name = "consumer" parent = instance.o }
+"#;
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("Unknown built-in function")
+                && !diagnostic.message.contains("Unknown function")
+                && !diagnostic.message.contains("resource handle, not a value")
+        }),
+        "the handle-valued call must retain its module definition: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn deferred_module_user_function_body_error_is_reported_by_lsp() {
+    let module = tempfile::tempdir().unwrap();
+    let source = r#"arguments { r: String }
+fn name_with_suffix(value: String): String { missing_helper(value) }
+attributes { o: String = name_with_suffix(r) }
+"#;
+    std::fs::write(module.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), module.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("missing_helper"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 1);
+    assert_eq!(matching[0].range.start.character, 45);
+}
+
+#[test]
+fn nested_forwarded_handle_remains_a_dependency_operand_in_lsp() {
+    let root = tempfile::tempdir().unwrap();
+    let outer = root.path().join("outer");
+    let inner = root.path().join("inner");
+    std::fs::create_dir(&outer).unwrap();
+    std::fs::create_dir(&inner).unwrap();
+    let outer_source = "arguments { r: mock.test.resource }\nlet inner = use { source = \"../inner\" }\ninner { x = r }\n";
+    std::fs::write(outer.join("main.crn"), outer_source).unwrap();
+    std::fs::write(
+        inner.join("main.crn"),
+        "arguments { x: mock.test.resource }\nmock.test.resource {\n  name = \"consumer\"\n  directives { depends_on = [x] }\n}\n",
+    )
+    .unwrap();
+    let source = "let vpc = mock.test.resource { name = \"vpc\" }\nlet outer = use { source = \"./outer\" }\nouter { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    for (base, filename, buffer) in [
+        (root.path(), "main.crn", source),
+        (outer.as_path(), "main.crn", outer_source),
+    ] {
+        let diagnostics = analyze_with_buffer(&structural_ref_engine(), base, filename, buffer);
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                !diagnostic
+                    .message
+                    .contains("depends_on parameter 'x' received a value")
+            }),
+            "a forwarded parameter is still pending handle classification: {diagnostics:#?}",
+        );
+    }
+}
+
+#[test]
+fn nested_bare_handle_lsp_error_uses_the_inner_operand_location() {
+    let root = tempfile::tempdir().unwrap();
+    let outer = root.path().join("outer");
+    let inner = root.path().join("inner");
+    std::fs::create_dir(&outer).unwrap();
+    std::fs::create_dir(&inner).unwrap();
+    std::fs::write(
+        outer.join("main.crn"),
+        "arguments { r: mock.test.resource }\nlet inner = use { source = \"../inner\" }\n\n\ninner { x = r }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        inner.join("main.crn"),
+        "arguments { x: mock.test.resource }\n\n\n\n\nmock.test.resource {\n  name = \"consumer\"\n  parent = x\n}\n",
+    )
+    .unwrap();
+    let source = "let vpc = mock.test.resource { name = \"vpc\" }\nlet outer = use { source = \"./outer\" }\nouter { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("resource handle, not a value"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert!(
+        matching[0].message.contains("inner/main.crn")
+            && matching[0].message.contains("line 8")
+            && matching[0].message.contains("'x' is a resource handle"),
+        "the nested diagnostic must retain one coherent owner: {:#?}",
+        matching[0],
+    );
+    assert!(
+        !matching[0].message.contains("outer/../inner")
+            && !matching[0].message.contains("line 5: 'r'"),
+        "mixed path/line provenance leaked: {:#?}",
+        matching[0],
+    );
+}
+
+#[test]
+fn handle_constraint_lsp_failure_reports_the_selected_operand() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("checked");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments { r: mock.test.resource }\nrequire r.name == \"nope\", \"bad name\"\nmock.test.resource { name = \"consumer\" parent = r.name }\n",
+    )
+    .unwrap();
+    let source = "let vpc = mock.test.resource { name = \"vpc\" }\nlet checked = use { source = \"./checked\" }\nchecked { r = vpc }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("bad name"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert!(
+        matching[0].message.contains("r.name =") && !matching[0].message.contains("got r = vpc"),
+        "the selected operand must own the actual value: {:#?}",
+        matching[0],
+    );
+}
+
+#[test]
+fn validation_subscript_uses_the_regular_expression_parser_in_lsp() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("checked");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments { values: map(String) }\nrequire values[(\"ONE\")] == \"one\", \"wrong element\"\nmock.test.resource { name = \"consumer\" }\n",
+    )
+    .unwrap();
+    let source = "let checked = use { source = \"./checked\" }\nchecked { values = { \"ONE\" = \"one\" } }\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    assert!(
+        diagnostics.is_empty(),
+        "a validation subscript must accept a regular constant expression: {diagnostics:#?}",
+    );
 }

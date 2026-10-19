@@ -1678,10 +1678,10 @@ fn plan_snapshot_exports_multifile_let_chain_5hop() {
 }
 
 #[test]
-fn plan_snapshot_exports_multifile_bare_resource_ref_seed_stays_deferred() {
+fn plan_exports_multifile_resource_attribute_ref_resolves() {
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile_bare_resource_ref");
+    let fp = build_plan_from_fixture_name("exports_multifile_resource_attribute_ref");
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = strip_ansi(&format_plan(
@@ -1697,21 +1697,17 @@ fn plan_snapshot_exports_multifile_bare_resource_ref_seed_stays_deferred() {
     ));
 
     assert!(
-        !output.contains("\"${resource_binding}\"")
-            && !output.contains("'${resource_binding}'")
-            && !output.contains("${resource_binding}"),
-        "bare structural let seed must not render as the parser placeholder string, got:\n{}",
+        output.contains("x = \"fixture-instance\"") || output.contains("x = 'fixture-instance'"),
+        "the sibling resource attribute must resolve through the module output, got:\n{}",
         output
     );
-
-    insta::assert_snapshot!(output);
 }
 
 #[test]
-fn plan_snapshot_exports_multifile_use_alias_seed_does_not_leak() {
+fn plan_exports_multifile_module_output_resolves() {
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile_use_alias_seed_does_not_leak");
+    let fp = build_plan_from_fixture_name("exports_multifile_module_output");
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = strip_ansi(&format_plan(
@@ -1727,12 +1723,10 @@ fn plan_snapshot_exports_multifile_use_alias_seed_does_not_leak() {
     ));
 
     assert!(
-        !output.contains("${use:"),
-        "use-alias seed must not render the parser placeholder string, got:\n{}",
+        output.contains("z = 'x'") || output.contains("z = \"x\""),
+        "the module call output must resolve, got:\n{}",
         output
     );
-
-    insta::assert_snapshot!(output);
 }
 
 #[test]

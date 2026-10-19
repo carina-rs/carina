@@ -161,11 +161,6 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
         let text = doc.text();
 
-        // Parse errors
-        if let Some(error) = doc.parse_error() {
-            diagnostics.push(parse_error_to_diagnostic(error));
-        }
-
         // Empty `${}` interpolation hint. Runs even when other parses
         // succeeded — and especially before the buffer-only checks
         // below — so users get an actionable warning right at the
@@ -179,15 +174,78 @@ impl DiagnosticEngine {
         // filtering, and exports type validation (#2134). The buffer is
         // substituted for its on-disk copy so diagnostics update on
         // keystrokes.
-        let merged_result =
-            base_path.and_then(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+        let merged_attempt =
+            base_path.map(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+        let directory_error_emitted = if let (Some(Err(error)), Some(base), Some(file_name)) =
+            (merged_attempt.as_ref(), base_path, current_file_name)
+            && error
+                .source_file()
+                .is_some_and(|source_file| source_file == base.join(file_name))
+            && let Some(parse_error) = error.parse_error()
+        {
+            // The directory parse has the classified sibling bindings and is
+            // therefore more authoritative than the buffer-only parse (which
+            // may have treated a sibling name as an enum identifier).
+            diagnostics.push(parse_error_to_diagnostic(parse_error));
+            true
+        } else {
+            false
+        };
+        let merged_result = merged_attempt.and_then(Result::ok);
+        let current_file_path = base_path
+            .zip(current_file_name)
+            .map(|(base, file_name)| base.join(file_name));
+        // A buffer parsed by itself cannot resolve sibling user functions.
+        // When the authoritative directory parse succeeds, use its per-file
+        // semantic AST for source-oriented checks instead of dropping every
+        // check merely because the provisional document parse failed.
+        let current_parsed = doc.parsed().or_else(|| {
+            current_file_path.as_deref().and_then(|path| {
+                merged_result
+                    .as_ref()
+                    .and_then(|result| result.directory.semantic_file(path))
+            })
+        });
+        // A source parsed in isolation cannot know sibling function
+        // declarations. Prefer the successful directory parse over that
+        // provisional failure (notably a sibling user function used as a
+        // `for` iterable). When the directory parse also fails—or there is no
+        // directory context—the document-owned parse error remains
+        // authoritative.
+        if merged_result.is_none()
+            && !directory_error_emitted
+            && let Some(error) = doc.parse_error()
+        {
+            diagnostics.push(parse_error_to_diagnostic(error));
+        }
+        // The diagnostic directory parse deliberately preserves a user-function
+        // call when evaluating its body fails, so the rest of the editor checks
+        // can still inspect the authored call. Run the strict resolver on a
+        // clone solely to surface source-owned body errors (for example, a
+        // sibling call that binds a structural handle and then uses the
+        // parameter bare). `ParseError::Located` keeps the diagnostic on the
+        // function document rather than the caller document.
+        if let (Some(result), Some(base), Some(file_name)) =
+            (merged_result.as_ref(), base_path, current_file_name)
+        {
+            let mut strict = result.directory.parsed.clone();
+            if let Err(error) = carina_core::parser::resolve_resource_refs_with_config(
+                &mut strict,
+                &self.provider_context,
+            ) && error
+                .source_file()
+                .is_some_and(|source_file| source_file == base.join(file_name))
+            {
+                diagnostics.push(parse_error_to_diagnostic(&error));
+            }
+        }
         if let Some(result) = merged_result.as_ref() {
             diagnostics.extend(self.duplicate_declaration_diagnostics(
                 doc,
                 current_file_name,
                 &result.directory.duplicate_declarations,
             ));
-        } else if let Some(parsed) = doc.parsed() {
+        } else if let Some(parsed) = current_parsed {
             // An unrelated broken sibling makes the directory parse fail, but
             // the current buffer's successful parse still retains same-file
             // declaration multiplicity. Reuse the loader extractor so export,
@@ -216,7 +274,7 @@ impl DiagnosticEngine {
         let merged = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
-        if let Some(current_file) = doc.parsed() {
+        if let Some(current_file) = current_parsed {
             diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
                 doc,
                 current_file,
@@ -273,10 +331,10 @@ impl DiagnosticEngine {
         //    uses the enriched `customs_loaded=true` context, so the
         //    parser's strict gate raises `ParseError::InvalidExpression`
         //    on the very unknown-type-name shape we want to report.
-        //    `parse_merged_with_buffer` swallows that error through
-        //    `.ok()?`, so without this fallback the diagnostic would
-        //    silently disappear exactly when the user introduces the
-        //    bug. The buffer-only parse uses the bootstrap context
+        //    `parse_merged_with_buffer` returns that directory error; the
+        //    owner-aware path above surfaces errors from the current file,
+        //    while this fallback still handles shapes found only in the
+        //    bootstrap AST. The buffer-only parse uses the bootstrap context
         //    (`customs_loaded=false`), so it always succeeds and
         //    `doc.parsed()` is `Some`, letting the walker still run
         //    against the user's in-flight edits.
@@ -315,8 +373,7 @@ impl DiagnosticEngine {
                     ));
                     findings
                 }
-                None => doc
-                    .parsed()
+                None => current_parsed
                     .map(|p| {
                         let mut parsed = p.clone();
                         let mut findings = carina_core::validation::resolve_file_type_exprs(
@@ -346,7 +403,7 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_depends_on(doc, parsed));
             diagnostics.extend(self.check_wait_bindings(doc, parsed));
             diagnostics.extend(self.check_deferred_populate_refs(doc, parsed));
-        } else if let Some(parsed) = doc.parsed() {
+        } else if let Some(parsed) = current_parsed {
             diagnostics.extend(self.check_depends_on(doc, parsed));
             diagnostics.extend(self.check_wait_bindings(doc, parsed));
             diagnostics.extend(self.check_deferred_populate_refs(doc, parsed));
@@ -384,9 +441,15 @@ impl DiagnosticEngine {
             (None, Some(base)) => {
                 self.collect_sibling_binding_names(&text, current_file_name, base)
             }
-            (None, None) => {
-                self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text))
-            }
+            (None, None) => current_parsed.map_or_else(
+                || self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text)),
+                |parsed| {
+                    carina_core::binding_index::BindingNameSet::from_parsed(parsed)
+                        .iter_names()
+                        .map(String::from)
+                        .collect()
+                },
+            ),
         };
         diagnostics.extend(self.check_undefined_references(
             &text,
@@ -395,7 +458,7 @@ impl DiagnosticEngine {
         ));
 
         // Semantic analysis on parsed file
-        if let Some(parsed) = doc.parsed() {
+        if let Some(parsed) = current_parsed {
             // Check provider in module
             diagnostics.extend(self.check_provider_in_module(doc, parsed, merged));
 
@@ -441,9 +504,6 @@ impl DiagnosticEngine {
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
             let binding_input = merged.unwrap_or(parsed);
-            let current_file_path = base_path
-                .zip(current_file_name)
-                .map(|(base, file_name)| base.join(file_name));
             let semantic_view = checks::SemanticView::for_analysis(
                 parsed,
                 merged,
@@ -480,7 +540,7 @@ impl DiagnosticEngine {
             let export_value_bindings =
                 carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
-            if base_path.is_some() {
+            if let Some(base_path) = base_path {
                 diagnostics.extend(self.check_module_calls(
                     doc,
                     parsed,
@@ -488,10 +548,9 @@ impl DiagnosticEngine {
                     &module_signatures,
                     &inference_bindings,
                 ));
-                let constraint_diagnostics = base_path
-                    .zip(current_file_name)
+                let constraint_diagnostics = current_file_name
                     .zip(merged_result.as_ref())
-                    .map(|((base_path, file_name), result)| {
+                    .map(|(file_name, result)| {
                         self.module_constraint_diagnostics(
                             &base_path.join(file_name),
                             &result.module_constraint_reports,
@@ -508,9 +567,8 @@ impl DiagnosticEngine {
                         doc,
                         parsed,
                         error,
-                        merged_result
-                            .as_ref()
-                            .and_then(|result| result.module_error_owner.as_deref()),
+                        base_path,
+                        current_file_name,
                     )
                 {
                     diagnostics.push(diagnostic);
@@ -926,6 +984,7 @@ impl DiagnosticEngine {
                                     Value::Deferred(DeferredValue::Unknown(
                                         carina_core::resource::UnknownReason::ModuleArgument {
                                             name,
+                                            ..
                                         },
                                     )),
                                 ) => check_resource_ref_type_mismatch(
@@ -1002,30 +1061,6 @@ impl DiagnosticEngine {
                                             .err()
                                             .or_else(|| lookup(identity, value).err())
                                             .map(|inner_err| inner_err.to_string())
-                                    }
-                                }
-                                // String type - check for the legacy bare
-                                // structural-handle transport spelling.
-                                (
-                                    carina_core::schema::Shape::String { .. },
-                                    Value::Concrete(ConcreteValue::String(s)),
-                                ) => {
-                                    if let Some(binding) = s
-                                        .diagnostic_literal()
-                                        .and_then(|s| s.strip_prefix("${"))
-                                        .and_then(|s| s.strip_suffix("}"))
-                                    {
-                                        let suggested_attr = if attr_name.ends_with("_id") {
-                                            "id"
-                                        } else {
-                                            "name"
-                                        };
-                                        Some(format!(
-                                            "Expected string, got resource reference '{}'. Did you mean '{}.{}'?",
-                                            binding, binding, suggested_attr
-                                        ))
-                                    } else {
-                                        None
                                     }
                                 }
                                 // Validate List item types (non-Struct items only;
@@ -1241,16 +1276,6 @@ impl DiagnosticEngine {
                     ));
                 }
             }
-
-            // Check for unknown built-in function calls. Pass the merged
-            // parse so user-defined `fn X(...)` declared in a sibling
-            // `.crn` is not flagged as unknown (#2442). `base_path` is
-            // threaded so the check can fall back to a per-file walk
-            // when the directory parse failed (e.g. an unrelated error
-            // elsewhere in the directory) — without that fallback,
-            // every sibling-defined fn would redline as Unknown the
-            // moment any sibling fails to parse.
-            diagnostics.extend(self.check_unknown_functions(doc, parsed, merged, base_path));
 
             // Check the current buffer's attributes against directory-wide
             // binding authority while keeping diagnostics owned by this file.
@@ -1808,6 +1833,7 @@ fn check_resource_ref_type_mismatch(
 
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
     match error {
+        ParseError::Located { error, .. } => parse_error_to_diagnostic(error),
         ParseError::Syntax(pest_error) => {
             let (line, col) = match pest_error.line_col {
                 pest::error::LineColLocation::Pos((line, col)) => (line, col),
@@ -1828,6 +1854,13 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             100,
             DiagnosticSeverity::ERROR,
             message.clone(),
+        ),
+        ParseError::UnknownFunction { name, line, column } => carina_diagnostic(
+            (*line as u32).saturating_sub(1),
+            (*column as u32).saturating_sub(1),
+            column.saturating_sub(1) as u32 + name.len() as u32,
+            DiagnosticSeverity::ERROR,
+            format!("Unknown function '{name}'"),
         ),
         ParseError::ReservedResourceAttribute {
             attribute,

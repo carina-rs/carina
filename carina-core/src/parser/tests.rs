@@ -402,8 +402,9 @@ fn function_call_is_parsed() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "env".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String("SOME_VAR".into()))],
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::Concrete(ConcreteValue::String("SOME_VAR".into())).into()],
+            source_line: (0).into(),
         }))
     );
 }
@@ -853,6 +854,8 @@ fn parse_directory_module() {
         Some(&Value::Deferred(DeferredValue::Unknown(
             UnknownReason::ModuleArgument {
                 name: "vpc_id".to_string(),
+                source_line: (13).into(),
+                diagnostic_name: None,
             },
         )))
     );
@@ -1952,8 +1955,9 @@ fn pipe_operator_desugars_to_function_call() {
     assert_eq!(
         result.variables.get("x"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "upper".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String("hello".into()))],
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![Value::Concrete(ConcreteValue::String("hello".into())).into()],
+            source_line: (0).into(),
         }))
     );
 }
@@ -1970,8 +1974,9 @@ fn pipe_operator_in_attribute_desugars() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "lower".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String("test".into()))],
+            name: crate::builtins::BuiltinFunction::lower,
+            args: vec![Value::Concrete(ConcreteValue::String("test".into())).into()],
+            source_line: (0).into(),
         }))
     );
 }
@@ -1989,15 +1994,17 @@ fn join_function_call_parsed() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".into())),
+                Value::Concrete(ConcreteValue::String("-".into())).into(),
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::Concrete(ConcreteValue::String("a".into())),
                     Value::Concrete(ConcreteValue::String("b".into())),
                     Value::Concrete(ConcreteValue::String("c".into())),
-                ])),
+                ]))
+                .into(),
             ],
+            source_line: (0).into(),
         }))
     );
 }
@@ -2015,15 +2022,17 @@ fn pipe_with_join_parsed() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".into())),
+                Value::Concrete(ConcreteValue::String("-".into())).into(),
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::Concrete(ConcreteValue::String("a".into())),
                     Value::Concrete(ConcreteValue::String("b".into())),
                     Value::Concrete(ConcreteValue::String("c".into())),
-                ])),
+                ]))
+                .into(),
             ],
+            source_line: (0).into(),
         }))
     );
 }
@@ -2040,33 +2049,37 @@ fn join_with_multiple_pipes() {
     assert_eq!(
         result.variables.get("x"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "upper".to_string(),
-            args: vec![Value::Deferred(DeferredValue::FunctionCall {
-                name: "join".to_string(),
-                args: vec![
-                    Value::Concrete(ConcreteValue::String("-".into())),
-                    Value::Concrete(ConcreteValue::List(vec![
-                        Value::Concrete(ConcreteValue::String("a".into())),
-                        Value::Concrete(ConcreteValue::String("b".into())),
-                    ])),
-                ],
-            })],
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: crate::builtins::BuiltinFunction::join,
+                    args: vec![
+                        Value::Concrete(ConcreteValue::String("-".into())).into(),
+                        Value::Concrete(ConcreteValue::List(vec![
+                            Value::Concrete(ConcreteValue::String("a".into())),
+                            Value::Concrete(ConcreteValue::String("b".into())),
+                        ]))
+                        .into(),
+                    ],
+                    source_line: (0).into(),
+                })
+                .into()
+            ],
+            source_line: (0).into(),
         }))
     );
 }
 
 #[test]
-fn function_call_with_no_args() {
+fn unknown_function_call_is_rejected_during_parsing() {
     let input = r#"
         let x = foo()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(
-        result.variables.get("x"),
-        Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "foo".to_string(),
-            args: vec![],
-        }))
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("an unknown name cannot become a deferred builtin call");
+    assert!(
+        error.to_string().contains("Unknown function 'foo'"),
+        "unexpected error: {error}",
     );
 }
 
@@ -3283,7 +3296,7 @@ fn parse_let_binding_module_call() {
     assert_eq!(call.module_name, "web_tier");
     assert_eq!(call.binding_name, Some("web".to_string()));
     assert_eq!(
-        call.arguments.get("vpc").map(ModuleArgument::value),
+        call.arguments.get("vpc").and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
     );
 }
@@ -3681,8 +3694,9 @@ fn parse_local_let_binding_with_function_call() {
     assert_eq!(
         subnet.get_attr("tag_name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "upper".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String("my-subnet".into()))],
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![Value::Concrete(ConcreteValue::String("my-subnet".into())).into()],
+            source_line: (0).into(),
         }))
     );
 }
@@ -3816,7 +3830,10 @@ fn parse_for_expression_with_index() {
     if let Some(Value::Deferred(DeferredValue::FunctionCall { args, .. })) =
         result.resources[0].get_attr("cidr_block")
     {
-        assert_eq!(args[2], Value::Concrete(ConcreteValue::Int(0)));
+        assert_eq!(
+            args[2].walker_value(),
+            &Value::Concrete(ConcreteValue::Int(0))
+        );
     } else {
         panic!("Expected FunctionCall for cidr_block");
     }
@@ -3824,7 +3841,10 @@ fn parse_for_expression_with_index() {
     if let Some(Value::Deferred(DeferredValue::FunctionCall { args, .. })) =
         result.resources[1].get_attr("cidr_block")
     {
-        assert_eq!(args[2], Value::Concrete(ConcreteValue::Int(1)));
+        assert_eq!(
+            args[2].walker_value(),
+            &Value::Concrete(ConcreteValue::Int(1))
+        );
     } else {
         panic!("Expected FunctionCall for cidr_block");
     }
@@ -3917,11 +3937,14 @@ fn parse_for_expression_with_local_binding() {
     assert_eq!(result.resources.len(), 2);
 
     // Local binding should be resolved within each iteration
-    if let Some(Value::Deferred(DeferredValue::FunctionCall { name, args })) =
+    if let Some(Value::Deferred(DeferredValue::FunctionCall { name, args, .. })) =
         result.resources[0].get_attr("cidr_block")
     {
         assert_eq!(name, "cidr_subnet");
-        assert_eq!(args[2], Value::Concrete(ConcreteValue::Int(0)));
+        assert_eq!(
+            args[2].walker_value(),
+            &Value::Concrete(ConcreteValue::Int(0))
+        );
     } else {
         panic!("Expected FunctionCall for cidr_block");
     }
@@ -3973,7 +3996,7 @@ fn parse_for_expression_with_module_call() {
         prod_call
             .arguments
             .get("vpc_cidr")
-            .map(ModuleArgument::value),
+            .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
         )))
@@ -3988,7 +4011,7 @@ fn parse_for_expression_with_module_call() {
         staging_call
             .arguments
             .get("vpc_cidr")
-            .map(ModuleArgument::value),
+            .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
         )))
@@ -4024,7 +4047,7 @@ fn parse_for_expression_with_module_call_over_list() {
         result.module_calls[0]
             .arguments
             .get("vpc_cidr")
-            .map(ModuleArgument::value),
+            .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
         )))
@@ -4033,7 +4056,7 @@ fn parse_for_expression_with_module_call_over_list() {
         result.module_calls[1]
             .arguments
             .get("vpc_cidr")
-            .map(ModuleArgument::value),
+            .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
         )))
@@ -6324,7 +6347,7 @@ fn user_fn_typed_param_type_mismatch() {
     let msg = format!("{err}");
     assert_eq!(
         msg,
-        "User-defined function error: function 'greet': parameter 'name': expected String, got int (42)"
+        "Invalid expression at line 7: function 'greet': parameter 'name': expected String, got int (42)"
     );
 }
 
@@ -6344,7 +6367,7 @@ fn user_fn_typed_param_int() {
     let msg = format!("{err}");
     assert_eq!(
         msg,
-        "User-defined function error: function 'double': parameter 'x': expected Int, got string 'not_int'"
+        "Invalid expression at line 7: function 'double': parameter 'x': expected Int, got string 'not_int'"
     );
 }
 
@@ -6546,7 +6569,7 @@ fn user_fn_typed_param_bool_mismatch() {
     let msg = format!("{err}");
     assert_eq!(
         msg,
-        "User-defined function error: function 'check': parameter 'flag': expected Bool, got string 'not_bool'. Use true or false."
+        "Invalid expression at line 7: function 'check': parameter 'flag': expected Bool, got string 'not_bool'. Use true or false."
     );
 }
 
@@ -9121,9 +9144,9 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
                 InterpolationPart::Expr(inner) => contains_for_unknown(inner),
                 InterpolationPart::Literal(_) => false,
             }),
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-                args.iter().any(contains_for_unknown)
-            }
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => args
+                .iter()
+                .any(|argument| contains_for_unknown(argument.walker_value())),
             Value::Deferred(DeferredValue::Secret(inner)) => contains_for_unknown(inner),
             _ => false,
         }
@@ -12279,11 +12302,9 @@ fn check_provider_instance_routing_multi_file_named_instance() {
 }
 
 #[test]
-fn check_provider_instance_routing_rejects_non_provider_let_binding() {
+fn parser_rejects_non_provider_handle_in_provider_directive() {
     // `provider = role` where `role` is a *resource* binding (not a
-    // provider instance) must be rejected. The parser already accepts
-    // any identifier here; the routing checker is the place that
-    // distinguishes provider-instance bindings from regular ones.
+    // provider instance) is a typed parser error at the directive site.
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -12299,16 +12320,11 @@ fn check_provider_instance_routing_rejects_non_provider_let_binding() {
             directives { provider = role }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
-    assert_eq!(
-        errs.len(),
-        1,
-        "non-provider let binding must produce one error, got: {errs:?}"
-    );
-    let msg = format!("{}", errs[0]);
+    let error = parse(src, &ProviderContext::default())
+        .expect_err("a resource handle cannot route a provider directive");
+    let msg = error.to_string();
     assert!(
-        msg.contains("role") && msg.contains("provider instance"),
+        msg.contains("'role' is a resource, not a provider instance") && msg.contains("line 13"),
         "error should clarify that `role` is not a provider instance, got: {msg}"
     );
 }
@@ -12630,11 +12646,11 @@ fn postfix_index_on_deferred_function_call_parses_as_access() {
                 }
             );
             match access.base() {
-                Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+                Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
                     assert_eq!(name, "split");
                     assert_eq!(args.len(), 2);
                     assert!(matches!(
-                        &args[1],
+                        args[1].walker_value(),
                         Value::Deferred(DeferredValue::ResourceRef { path })
                             if path.binding() == "role" && path.attribute() == "arn"
                     ));
@@ -12936,158 +12952,441 @@ fn postfix_access_preserves_indexed_resource_binding_address() {
     assert_resource_reference_shape(&direct, "res[0]", "name");
 }
 
-#[test]
-fn postfix_access_typed_structural_binding_preserves_bare_resource_handle() {
-    let parsed = parse(
-        r#"
-            let vpc = mock.test.Thing { name = "source" }
-            mock.test.Consumer { parent = vpc }
-        "#,
-        &ProviderContext::default(),
-    )
-    .expect("bare structural resource handles must retain their provider-facing value");
-
-    assert_eq!(
-        resource_attribute(&parsed, "test.Consumer", "parent"),
-        Value::Concrete(ConcreteValue::String("${vpc}".into()))
+fn assert_bare_handle_error(source: &str, binding: &str, kind: &str) {
+    let error = parse(source, &ProviderContext::default())
+        .expect_err("a bare structural handle must not lower into Value");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("'{binding}' is {kind}, not a value")),
+        "unexpected error: {message}",
+    );
+    assert!(
+        message.contains("at line "),
+        "missing source line: {message}"
+    );
+    assert!(
+        !message.contains("${"),
+        "the removed string sentinel leaked into the diagnostic: {message}",
     );
 }
 
 #[test]
-fn structural_handles_lower_once_to_legacy_runtime_values() {
-    let parsed = parse(
-        r#"
-            let vpc = mock.test.Thing { name = "source" }
-            let alias = vpc
-            let roles = for name in ["one"] {
-                mock.test.Thing { name = name }
-            }
-            let child_module = use { source = "./child" }
-            let child = child_module {}
-            let conditional_child = if true { child_module {} }
+fn bare_resource_handle_is_rejected_in_every_value_position() {
+    for source in [
+        r#"let vpc = mock.test.Thing { name = "source" }
+mock.test.Consumer { name = vpc }"#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+let values = [vpc, "ok"]"#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+let values = { primary = vpc }"#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+exports { handle: String = vpc }"#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+exports { handle = vpc }"#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+let rendered = "prefix-${vpc}""#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+let alias = vpc
+mock.test.Consumer { name = alias }"#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+attributes { handle: String = vpc }"#,
+    ] {
+        let binding = if source.contains("name = alias") {
+            "alias"
+        } else {
+            "vpc"
+        };
+        assert_bare_handle_error(source, binding, "a resource");
+    }
+}
 
-            mock.test.Consumer {
-                direct = vpc
-                alias = alias
-                handles = [vpc, alias]
-                handles_by_name = { direct = vpc, alias = alias }
-                for_handle = roles
-                module_handle = child
-                conditional_module_handle = conditional_child
-            }
-
-            exports {
-                handle: String = vpc
-            }
-        "#,
+#[test]
+fn top_level_value_lowering_reports_the_authored_bare_handle_line() {
+    let error = parse(
+        "let vpc = mock.test.Thing { name = \"source\" }\n\n\nlet values = [vpc]\n",
         &ProviderContext::default(),
     )
-    .expect("structural handles must lower to their legacy transport values");
+    .expect_err("a bare handle nested in a top-level value must be rejected");
 
-    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    assert!(
+        error.to_string().contains("at line 4"),
+        "expected the authored value line, got {error}",
+    );
+}
+
+#[test]
+fn directory_function_resolution_reports_the_authored_call_line() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "let prefix = \"value\"\n\nlet result = missing(prefix)\n",
+    )
+    .unwrap();
+
+    let error = parse_directory(directory.path(), &ProviderContext::default())
+        .expect_err("an unknown deferred function must fail after directory resolution");
+    assert!(
+        error.contains("at line 3"),
+        "expected the authored function-call line, got {error}",
+    );
+}
+
+#[test]
+fn deferred_call_in_user_function_body_reports_the_body_line() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "fn wrapper(): String {\n  missing()\n}\n\nlet result = wrapper()\n",
+    )
+    .unwrap();
+
+    let error = parse_directory(directory.path(), &ProviderContext::default())
+        .expect_err("a deferred call in a function body must fail after directory resolution");
+    assert!(
+        error.contains("at line 2"),
+        "expected the function-body expression line, got {error}",
+    );
+}
+
+#[test]
+fn every_structural_binding_kind_has_a_bare_value_error() {
+    let cases = [
+        (
+            r#"let items = for name in ["one"] { mock.test.Thing { name = name } }
+mock.test.Consumer { name = items }"#,
+            "items",
+            "a for binding",
+        ),
+        (
+            r#"let selected = if true { mock.test.Thing { name = "one" } }
+mock.test.Consumer { name = selected }"#,
+            "selected",
+            "an if binding",
+        ),
+        (
+            r#"let child_module = use { source = "./child" }
+mock.test.Consumer { name = child_module }"#,
+            "child_module",
+            "a module import",
+        ),
+        (
+            r#"let child_module = use { source = "./child" }
+let child = child_module {}
+mock.test.Consumer { name = child }"#,
+            "child",
+            "a module call",
+        ),
+        (
+            r#"let source = mock.test.Thing { name = "source" }
+let ready = wait source { until = source.ready == true }
+mock.test.Consumer { name = ready }"#,
+            "ready",
+            "a wait binding",
+        ),
+        (
+            r#"let orgs = upstream_state { source = "../organizations" }
+mock.test.Consumer { name = orgs }"#,
+            "orgs",
+            "an upstream state",
+        ),
+        (
+            r#"let secondary = provider mock {}
+mock.test.Consumer { name = secondary }"#,
+            "secondary",
+            "a provider instance",
+        ),
+    ];
+
+    for (source, binding, kind) in cases {
+        assert_bare_handle_error(source, binding, kind);
+    }
+}
+
+#[test]
+fn ref_typed_user_function_argument_accepts_a_structural_handle() {
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let parsed = parse(
+        r#"
+            fn resource_name(resource: mock.test.Thing): String {
+                resource.name
+            }
+            let vpc = mock.test.Thing { name = "source" }
+            let name = resource_name(vpc)
+        "#,
+        &context,
+    )
+    .expect("Ref-typed parameters consume typed handles");
+
+    assert_resource_reference_shape(
+        parsed.variables.get("name").expect("function result"),
+        "vpc",
+        "name",
+    );
+}
+
+#[test]
+fn ref_typed_user_function_argument_accepts_a_sibling_resource_handle() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        r#"
+fn resource_name(resource: mock.test.Thing): String {
+  resource.name
+}
+let name = resource_name(vpc)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("resources.crn"),
+        r#"let vpc = mock.test.Thing { name = "source" }
+"#,
+    )
+    .unwrap();
+
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let parsed = parse_directory(directory.path(), &context)
+        .expect("Ref-typed parameters accept resources declared in sibling files");
+
+    assert_resource_reference_shape(
+        parsed.variables.get("name").expect("function result"),
+        "vpc",
+        "name",
+    );
+}
+
+#[test]
+fn ref_typed_user_function_pipe_accepts_a_structural_handle() {
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let parsed = parse(
+        r#"
+            fn resource_name(resource: mock.test.Thing): String {
+                resource.name
+            }
+            let vpc = mock.test.Thing { name = "source" }
+            let name = vpc |> resource_name()
+        "#,
+        &context,
+    )
+    .expect("a pipe into a Ref-typed parameter consumes the typed handle");
+
+    assert_resource_reference_shape(
+        parsed.variables.get("name").expect("function result"),
+        "vpc",
+        "name",
+    );
+}
+
+#[test]
+fn deferred_user_function_call_carries_a_ref_typed_handle() {
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let parsed = parse(
+        r#"
+            fn tag(resource: mock.test.Thing, name: String): String {
+                resource.identifier
+            }
+            let vpc = mock.test.Thing { name = "source" }
+            let other = mock.test.Thing { name = "other" }
+            let tagged = tag(vpc, other.arn)
+        "#,
+        &context,
+    )
+    .expect("a Ref handle must survive the deferred user-function call path");
+
+    assert!(matches!(
+        parsed.variables.get("tagged"),
+        Some(Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }))
+            if function.name == "tag"
+                && matches!(args[0].walker_value(), Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "vpc")
+    ));
+}
+
+#[test]
+fn deferred_user_function_pipe_carries_a_ref_typed_handle() {
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let parsed = parse(
+        r#"
+            fn tag(resource: mock.test.Thing, name: String): String {
+                resource.identifier
+            }
+            let vpc = mock.test.Thing { name = "source" }
+            let other = mock.test.Thing { name = "other" }
+            let tagged = other.arn |> tag(vpc)
+        "#,
+        &context,
+    )
+    .expect("a Ref handle must survive the deferred user-function pipe path");
+
+    assert!(matches!(
+        parsed.variables.get("tagged"),
+        Some(Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }))
+            if function.name == "tag"
+                && matches!(args[0].walker_value(), Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "vpc")
+    ));
+}
+
+#[test]
+fn non_ref_typed_user_function_argument_rejects_a_structural_handle() {
+    assert_bare_handle_error(
+        r#"
+            fn identity(value: String): String { value }
+            let vpc = mock.test.Thing { name = "source" }
+            let name = identity(vpc)
+        "#,
+        "vpc",
+        "a resource",
+    );
+}
+
+#[test]
+fn forward_structural_handle_is_rejected_after_directory_kind_resolution() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "mock.test.Consumer { name = zz }\n\
+         let zz = mock.test.Thing { name = \"source\" }\n",
+    )
+    .unwrap();
+
+    let error = parse_directory(directory.path(), &ProviderContext::default())
+        .expect_err("a forward structural handle is not a value");
+    assert!(
+        error.contains("'zz' is a resource, not a value") && error.contains("line 1"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn sibling_structural_handle_is_rejected_after_directory_kind_resolution() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "mock.test.Consumer { name = sibling }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("sibling.crn"),
+        "let sibling = mock.test.Thing { name = \"source\" }\n",
+    )
+    .unwrap();
+
+    let error = parse_directory(directory.path(), &ProviderContext::default())
+        .expect_err("a sibling structural handle is not a value");
+    assert!(
+        error.contains("'sibling' is a resource, not a value") && error.contains("line 1"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn forward_value_binding_remains_a_value() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "mock.test.Consumer { name = later }\n\
+         let later = \"value\"\n",
+    )
+    .unwrap();
+
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("a forward value binding remains valid");
+    assert_eq!(
+        resource_attribute(&parsed, "test.Consumer", "name"),
+        Value::Concrete(ConcreteValue::String("value".into())),
+    );
+}
+
+#[test]
+fn directives_consume_typed_handles_from_sibling_files() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("bindings.crn"),
+        r#"let dependency = mock.test.Thing { name = "source" }
+let us = provider mock {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        r#"let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives {
+    depends_on = [dependency]
+    provider = us
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("directives accept typed sibling handles");
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .find(|resource| resource.binding.as_deref() == Some("consumer"))
         .expect("consumer");
-    assert_eq!(consumer.get_attr("direct"), Some(&string("${vpc}")));
-    assert_eq!(consumer.get_attr("alias"), Some(&string("${vpc}")));
-    assert_eq!(
-        consumer.get_attr("handles"),
-        Some(&Value::Concrete(ConcreteValue::List(vec![
-            string("${vpc}"),
-            string("${vpc}"),
-        ])))
-    );
-    assert_eq!(
-        consumer.get_attr("handles_by_name"),
-        Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([
-            ("direct".to_string(), string("${vpc}")),
-            ("alias".to_string(), string("${vpc}")),
-        ]))))
-    );
-    assert_eq!(
-        consumer.get_attr("for_handle"),
-        Some(&string("${for:roles}"))
-    );
-    assert_eq!(
-        consumer.get_attr("module_handle"),
-        Some(&string("${module:child_module}"))
-    );
-    assert_eq!(
-        consumer.get_attr("conditional_module_handle"),
-        Some(&string("${module:child_module}"))
-    );
-    assert_eq!(parsed.variables.get("vpc"), Some(&string("${vpc}")));
-    assert_eq!(parsed.variables.get("alias"), Some(&string("${vpc}")));
-    assert_eq!(parsed.variables.get("roles"), Some(&string("${for:roles}")));
-    assert_eq!(
-        parsed.variables.get("child_module"),
-        Some(&string("${use:./child}"))
-    );
-    assert_eq!(
-        parsed.variables.get("child"),
-        Some(&string("${module:child_module}"))
-    );
-    assert_eq!(
-        parsed.variables.get("conditional_child"),
-        Some(&string("${module:child_module}"))
-    );
-    assert_eq!(
-        parsed
-            .export_params
-            .iter()
-            .find(|export| export.name == "handle")
-            .and_then(|export| export.value.as_ref()),
-        Some(&string("${vpc}"))
-    );
+    assert_eq!(consumer.directives.depends_on, vec!["dependency"]);
+    assert_eq!(consumer.directives.provider_instance.as_deref(), Some("us"));
 }
 
 #[test]
-fn side_channel_structural_handles_keep_main_bare_identifier_values() {
-    let parsed = parse(
+fn depends_on_rejects_a_provider_handle() {
+    let error = parse(
         r#"
-            let q = mock.test.Thing { name = "source" }
-            let orgs = upstream_state { source = "../organizations" }
-            let ready = wait q { until = q.ready == true }
-            let secondary = provider mock {}
-
-            mock.test.Consumer {
-                upstream_handle = orgs
-                wait_handle = ready
-                provider_handle = secondary
-            }
-        "#,
+let us = provider mock {}
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [us] }
+}
+"#,
         &ProviderContext::default(),
     )
-    .expect("side-channel structural names remain available as operands");
+    .expect_err("a provider instance is not a dependency target");
 
-    let consumer = parsed
-        .resources
-        .iter()
-        .find(|resource| resource.id.resource_type == "test.Consumer")
-        .expect("consumer");
-    let bare_identifier =
-        |name: &str| Value::Concrete(ConcreteValue::enum_identifier(name.to_string()));
-    assert_eq!(
-        consumer.get_attr("upstream_handle"),
-        Some(&bare_identifier("orgs"))
+    let message = error.to_string();
+    assert!(
+        message.contains("provider instance"),
+        "unexpected error: {message}"
     );
-    assert_eq!(
-        consumer.get_attr("wait_handle"),
-        Some(&bare_identifier("ready"))
+    assert!(
+        message.contains("depends_on"),
+        "unexpected error: {message}"
     );
-    assert_eq!(
-        consumer.get_attr("provider_handle"),
-        Some(&bare_identifier("secondary"))
-    );
-    assert!(!parsed.variables.contains_key("orgs"));
-    assert!(!parsed.variables.contains_key("ready"));
-    assert!(!parsed.variables.contains_key("secondary"));
+    assert!(message.contains("line 5"), "unexpected error: {message}");
 }
 
 #[test]
-fn accessing_a_handle_nested_in_a_computed_list_is_not_a_string_shape_error() {
+fn accessing_a_handle_nested_in_a_computed_list_rejects_the_bare_element() {
     let error = parse(
         r#"
             let q = mock.test.Thing { name = "q" }
@@ -13096,11 +13395,11 @@ fn accessing_a_handle_nested_in_a_computed_list_is_not_a_string_shape_error() {
         "#,
         &ProviderContext::default(),
     )
-    .expect_err("computed containers cannot expose structural handles for postfix access");
+    .expect_err("a computed container cannot contain a bare structural handle");
 
     let message = error.to_string();
     assert!(
-        message.contains("resource handle inside a computed value"),
+        message.contains("'q' is a resource, not a value"),
         "unexpected error: {message}"
     );
     assert!(
@@ -13255,8 +13554,8 @@ fn postfix_access_on_partial_application_is_a_parse_error() {
 }
 
 #[test]
-fn structural_binding_alias_field_access_keeps_not_a_resource_diagnostic() {
-    let error = parse(
+fn structural_binding_alias_field_access_uses_the_canonical_resource() {
+    let parsed = parse(
         r#"
             let x = mock.test.Thing { name = "source" }
             let y = x
@@ -13264,18 +13563,14 @@ fn structural_binding_alias_field_access_keeps_not_a_resource_diagnostic() {
         "#,
         &ProviderContext::default(),
     )
-    .expect_err("a bare resource-handle alias is not itself a resource binding");
+    .expect("postfix access through a structural alias remains valid");
 
-    assert!(
-        error
-            .to_string()
-            .contains("'y' is not a resource, cannot access attribute 'identifier'"),
-        "unexpected error: {error}"
-    );
+    let value = resource_attribute(&parsed, "test.Consumer", "name");
+    assert_resource_reference_shape(&value, "x", "identifier");
 }
 
 #[test]
-fn sibling_structural_alias_keeps_not_a_resource_diagnostic() {
+fn sibling_structural_alias_field_access_uses_the_canonical_resource() {
     use crate::config_loader::parse_directory;
 
     let directory = tempfile::tempdir().unwrap();
@@ -13291,22 +13586,18 @@ fn sibling_structural_alias_keeps_not_a_resource_diagnostic() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("a sibling bare resource-handle alias is not a resource binding");
-    assert!(
-        error
-            .to_string()
-            .contains("'qa' is not a resource, cannot access attribute 'name'"),
-        "unexpected error: {error}",
-    );
-    assert!(
-        !error.to_string().contains("to enum"),
-        "the directory seed lost structural-alias metadata: {error}",
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("a sibling structural alias remains typed through the fixed point");
+    let value = resource_attribute(&parsed, "test.Consumer", "name");
+    assert_eq!(
+        value,
+        Value::Concrete(ConcreteValue::String("source".into())),
+        "directory resolution should follow the alias to q.name",
     );
 }
 
 #[test]
-fn for_iterable_computed_structural_handles_have_a_domain_error() {
+fn for_iterable_computed_structural_handles_rejects_the_bare_element() {
     let error = parse(
         r#"
             let q = mock.test.Thing { name = "q" }
@@ -13319,11 +13610,11 @@ fn for_iterable_computed_structural_handles_have_a_domain_error() {
         "#,
         &ProviderContext::default(),
     )
-    .expect_err("computed collections of resource handles are not iterable values");
+    .expect_err("computed collections cannot contain bare resource handles");
 
     let message = error.to_string();
     assert!(
-        message.contains("resource handle inside a computed value"),
+        message.contains("'q' is a resource, not a value"),
         "unexpected error: {message}",
     );
     assert!(
@@ -13333,7 +13624,7 @@ fn for_iterable_computed_structural_handles_have_a_domain_error() {
 }
 
 #[test]
-fn sibling_for_iterable_computed_handles_keep_typed_diagnostic() {
+fn sibling_computed_handles_keep_the_bare_handle_diagnostic() {
     use crate::config_loader::parse_directory;
 
     let directory = tempfile::tempdir().unwrap();
@@ -13356,10 +13647,10 @@ fn sibling_for_iterable_computed_handles_keep_typed_diagnostic() {
     .unwrap();
 
     let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("directory seeds must retain computed handle metadata");
+        .expect_err("the sibling value cannot contain a bare resource handle");
     let message = error.to_string();
     assert!(
-        message.contains("resource handle inside a computed value"),
+        message.contains("'q' is a resource, not a value"),
         "unexpected error: {message}",
     );
     assert!(
@@ -13624,11 +13915,116 @@ fn for_iterable_structural_binding_has_a_user_facing_description() {
 
     let message = error.to_string();
     assert!(
-        message.contains("iterable is for-binding 'subs'"),
+        message.contains("'subs' is a for binding, not a value"),
         "unexpected error: {message}"
     );
     assert!(
         !message.contains("BindingRef") && !message.contains("Deferred("),
         "Rust Debug output leaked into the diagnostic: {message}"
+    );
+}
+
+#[test]
+fn validation_subscripts_share_expression_string_decoding_and_index_checks() {
+    let parsed = parse(
+        r#"
+            arguments { tags: map(String) }
+            require tags["line\nkey"] == "value", "missing tag"
+            require tags[("KEY")] == "value", "missing parenthesized tag"
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("escaped validation subscript should parse");
+
+    let ValidateExpr::Compare { lhs, .. } = &parsed.requires[0].condition else {
+        panic!(
+            "expected comparison, got {:?}",
+            parsed.requires[0].condition
+        );
+    };
+    let ValidateExpr::Access { path, .. } = lhs.as_ref() else {
+        panic!("expected accessed argument, got {lhs:?}");
+    };
+    assert!(matches!(
+        path.as_slice(),
+        [crate::resource::PathSegment::Subscript {
+            index: crate::resource::Subscript::Str { key },
+        }] if key.expose_plaintext() == "line\nkey"
+    ));
+
+    let ValidateExpr::Compare { lhs, .. } = &parsed.requires[1].condition else {
+        panic!(
+            "expected comparison, got {:?}",
+            parsed.requires[1].condition
+        );
+    };
+    let ValidateExpr::Access { path, .. } = lhs.as_ref() else {
+        panic!("expected accessed argument, got {lhs:?}");
+    };
+    assert!(matches!(
+        path.as_slice(),
+        [crate::resource::PathSegment::Subscript {
+            index: crate::resource::Subscript::Str { key },
+        }] if key.expose_plaintext() == "KEY"
+    ));
+
+    let error = parse(
+        r#"
+            arguments { tags: list(String) }
+            require tags[-1] == "value", "missing tag"
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("negative validation indexes must use the shared rejection");
+    assert!(
+        error
+            .to_string()
+            .contains("index access key must be non-negative"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn deferred_user_calls_share_the_root_lexical_scope() {
+    let parsed = parse(
+        r#"
+            arguments { input: String }
+            fn suffix(value: String): String { "${value}-x" }
+            attributes {
+                first: String = suffix(input)
+                second: String = suffix(input)
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("deferred calls should parse");
+
+    let call_parts = |name: &str| {
+        let value = parsed
+            .attribute_params
+            .iter()
+            .find(|parameter| parameter.name == name)
+            .and_then(|parameter| parameter.value.as_ref())
+            .unwrap_or_else(|| panic!("missing attribute {name}"));
+        let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            ..
+        }) = value
+        else {
+            panic!("expected deferred user call for {name}, got {value:?}");
+        };
+        (function.as_ref(), functions.as_ref())
+    };
+
+    let (first_function, first_scope) = call_parts("first");
+    let (second_function, second_scope) = call_parts("second");
+    assert!(
+        std::ptr::eq(first_function, second_function),
+        "deferred calls must share one resolved function allocation",
+    );
+    assert!(
+        std::ptr::eq(first_scope, second_scope),
+        "deferred calls must share one lexical scope allocation",
     );
 }

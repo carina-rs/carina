@@ -3802,16 +3802,23 @@ mod tests {
                 Value::Deferred(DeferredValue::FunctionCall {
                     name: actual_name,
                     args: actual_args,
+                    ..
                 }),
                 Value::Deferred(DeferredValue::FunctionCall {
                     name: expected_name,
                     args: expected_args,
+                    ..
                 }),
             ) => {
                 assert_eq!(actual_name, expected_name);
                 assert_eq!(actual_args.len(), expected_args.len());
                 for (actual, expected) in actual_args.iter().zip(expected_args) {
-                    assert_value_structure_eq(actual, expected);
+                    assert_value_structure_eq(
+                        actual.value().expect("serialized function argument value"),
+                        expected
+                            .value()
+                            .expect("serialized function argument value"),
+                    );
                 }
             }
             (
@@ -3954,8 +3961,9 @@ mod tests {
         resource.set_attr(
             "unknown_function",
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "identity".into(),
-                args: vec![unknown()],
+                name: carina_core::builtins::BuiltinFunction::upper,
+                args: vec![unknown().into()],
+                source_line: 0.into(),
             }),
         );
         resource.set_attr(
@@ -3978,8 +3986,9 @@ mod tests {
         resource.set_attr(
             "ref_function",
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "identity".into(),
-                args: vec![resource_ref()],
+                name: carina_core::builtins::BuiltinFunction::upper,
+                args: vec![resource_ref().into()],
+                source_line: 0.into(),
             }),
         );
         resource.set_attr(

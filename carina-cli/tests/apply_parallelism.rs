@@ -379,7 +379,7 @@ fn saved_plan_update_scenario(initial: String, updated: String, parallelism: usi
 }
 
 #[test]
-fn apply_parallelism_cli_e2e_covers_caps_and_unknown_update_edges() {
+fn apply_parallelism_cli_e2e_covers_caps_and_dependency_edges() {
     let cap = update_scenario(
         independent_resources("old"),
         independent_resources("new"),
@@ -393,13 +393,6 @@ fn apply_parallelism_cli_e2e_covers_caps_and_unknown_update_edges() {
         1,
     );
     assert_update_schedule("--parallelism 1", &serial, 1, &[1; UPDATE_COUNT]);
-
-    let bare = update_scenario(
-        parent_child_resources("old", |_| "  parent = vpc".to_string()),
-        parent_child_resources("new", |_| "  parent = vpc".to_string()),
-        8,
-    );
-    assert_update_schedule("bare binding", &bare, 8, &[8, 5]);
 
     let depends = update_scenario(
         parent_child_resources("old", |_| "  directives { depends_on = [vpc] }".to_string()),

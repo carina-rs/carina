@@ -204,6 +204,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
@@ -351,7 +352,20 @@ fn assert_fully_resolved(
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
             Err(unresolved_binding_message(
                 attribute_key,
-                UnresolvedSite::FunctionCall { name: name.clone() },
+                UnresolvedSite::FunctionCall {
+                    name: name.to_string(),
+                },
+                leaf.unwrap_or(""),
+                bindings,
+            ))
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
+            let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
+            Err(unresolved_binding_message(
+                attribute_key,
+                UnresolvedSite::FunctionCall {
+                    name: function.name.clone(),
+                },
                 leaf.unwrap_or(""),
                 bindings,
             ))
@@ -439,9 +453,12 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
                 }
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
             for a in args {
-                collect_unresolved_bindings(a, out);
+                collect_unresolved_bindings(a.walker_value(), out);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -1047,8 +1064,9 @@ mod assert_fully_resolved_tests {
     #[test]
     fn function_call_with_unresolved_args_is_rejected() {
         let v = Value::Deferred(DeferredValue::FunctionCall {
-            name: "concat".to_string(),
-            args: vec![dvo_chained_ref()],
+            name: crate::builtins::BuiltinFunction::concat,
+            args: vec![dvo_chained_ref().into()],
+            source_line: (0).into(),
         });
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("FunctionCall that did not evaluate must be rejected");
@@ -1066,11 +1084,12 @@ mod assert_fully_resolved_tests {
         bindings.set("q", attrs, BindingValueSource::Local);
         let value = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("-".into())),
-                    Value::resource_ref("q", "identifier", vec![]),
+                    Value::Concrete(ConcreteValue::String("-".into())).into(),
+                    Value::resource_ref("q", "identifier", vec![]).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 5 },

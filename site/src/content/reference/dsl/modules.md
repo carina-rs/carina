@@ -180,6 +180,27 @@ arguments {
 }
 ```
 
+A structural-handle argument stays a handle inside the module, and code inside
+the module must select an attribute from it. The resource type annotation
+checks that the handle is the expected resource type:
+
+```crn
+arguments {
+  network: awscc.ec2.Vpc
+}
+
+let subnet = awscc.ec2.Subnet {
+  vpc_id = network.vpc_id
+}
+```
+
+Passing a bare resource handle to a value parameter such as `String` is an
+error at the module call. Passing an attribute such as `vpc.vpc_id` instead
+binds a value, even when the parameter has a resource type (resource-typed
+parameters accept identifier strings for provider configurations that model
+references as IDs). Using a handle-backed parameter bare inside the module is
+also an error.
+
 ## Attributes Block
 
 The `attributes` block defines the output values that a module exposes to its caller.
@@ -201,6 +222,9 @@ attributes {
   vpc_id = vpc.vpc_id
 }
 ```
+
+An output must likewise be a value. `vpc_id = vpc` is invalid because `vpc`
+is a resource handle; expose `vpc.vpc_id` (or another attribute) instead.
 
 ## Loading Modules
 

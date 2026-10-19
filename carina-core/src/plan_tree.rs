@@ -611,11 +611,12 @@ mod tests {
 
         let expression = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())),
-                    placeholder,
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    placeholder.into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 1 },

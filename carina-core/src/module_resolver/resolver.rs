@@ -293,16 +293,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         &self,
         parsed: &crate::parser::File<E>,
     ) -> Result<RefCheckWitness, ModuleError> {
-        let imported_modules = self
-            .imported_modules
-            .iter()
-            .map(|(alias, module)| {
-                (
-                    alias.clone(),
-                    super::signature::resolved_signature(module, self.config),
-                )
-            })
-            .collect();
+        let imported_modules = self.resolved_module_signatures();
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
             parsed,
             self.schemas,
@@ -315,6 +306,18 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         )
         .map(|()| RefCheckWitness(()))
         .map_err(ModuleError::ReferenceType)
+    }
+
+    fn resolved_module_signatures(&self) -> super::ResolvedModuleSignatures {
+        self.imported_modules
+            .iter()
+            .map(|(alias, module)| {
+                (
+                    alias.clone(),
+                    super::signature::resolved_signature(module, self.config),
+                )
+            })
+            .collect()
     }
 
     /// Load and cache a module from a directory path.
@@ -424,7 +427,14 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             let content = std::fs::read_to_string(&path)?;
             files.push((path, content));
         }
-        let parsed_files = crate::config_loader::parse_directory_files(&files, self.config)?;
+        let parsed_files = crate::config_loader::parse_directory_files_located(&files, self.config)
+            .map_err(|located| match located.source_file {
+                Some(path) => ModuleError::ParseInFile {
+                    path: crate::utils::normalize_source_path(&path),
+                    error: located.error,
+                },
+                None => ModuleError::Parse(*located.error),
+            })?;
 
         let mut merged = ParsedFile::default();
         for (_, parsed) in parsed_files {
@@ -455,7 +465,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// Process imports and store imported modules
     pub fn process_imports(&mut self, imports: &[UseStatement]) -> Result<(), ModuleError> {
         for import in imports {
-            let module = self.load_module(&import.path)?;
+            let module = self
+                .load_module(&import.path)
+                .map_err(|error| error.with_owning_import(import.alias.clone()))?;
             self.imported_modules.insert(import.alias.clone(), module);
             self.module_paths
                 .insert(import.alias.clone(), import.path.clone());
@@ -508,16 +520,24 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // `.extend()` only needed a disjoint field borrow; the single
         // merge surface needs the whole struct).
         let module_calls = parsed.module_calls.clone();
+        let signatures = self.resolved_module_signatures();
+        let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
+            parsed,
+            self.schemas,
+            &signatures,
+        );
+        let resolved_bindings = crate::binding_index::ResolvedBindings::for_validation(parsed);
+        let mut expanded_calls = Vec::with_capacity(module_calls.len());
         for call in &module_calls {
             let instance_prefix = instance_prefix_for_call(call);
-
-            match self.expand_module_call_checked(call, &instance_prefix, &ref_check) {
-                Ok(expanded) => {
-                    // The module contribution is a `ParsedFile`; fold it
-                    // in via the one shared merge surface so no field can
-                    // be silently dropped here (carina#3126 / carina#3061).
-                    crate::config_loader::merge_parsed_file(parsed, expanded);
-                }
+            match self.expand_module_call_checked(
+                call,
+                &instance_prefix,
+                &ref_check,
+                Some(&binding_index),
+                Some(&resolved_bindings),
+            ) {
+                Ok(expanded) => expanded_calls.push(expanded),
                 Err(e) => {
                     self.base_dir = original_base_dir;
                     self.imported_modules = original_imported;
@@ -525,6 +545,12 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                     return Err(e);
                 }
             }
+        }
+        drop(binding_index);
+        for expanded in expanded_calls {
+            // The module contribution is a `ParsedFile`; fold it in via the
+            // one shared merge surface so no field can be silently dropped.
+            crate::config_loader::merge_parsed_file(parsed, expanded);
         }
 
         // Restore original state
@@ -685,16 +711,35 @@ fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
     // …)`, a whole-`&mut parsed` borrow that conflicts with iterating
     // `&parsed.module_calls` in place.
     let module_calls = parsed.module_calls.clone();
+    let signatures = resolver.resolved_module_signatures();
+    let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
+        parsed,
+        resolver.schemas,
+        &signatures,
+    );
+    let resolved_bindings = crate::binding_index::ResolvedBindings::for_validation(parsed);
+    let mut expanded_calls = Vec::with_capacity(module_calls.len());
     for call in &module_calls {
         let instance_prefix = instance_prefix_for_call(call);
-        let expanded = resolver.expand_module_call_checked(call, &instance_prefix, ref_check)?;
+        let expanded = resolver
+            .expand_module_call_checked(
+                call,
+                &instance_prefix,
+                ref_check,
+                Some(&binding_index),
+                Some(&resolved_bindings),
+            )
+            .map_err(|error| error.with_owning_import(call.module_name.clone()))?;
         // `expand_module_call` returns a parser-phase `ParsedFile`;
         // this caller's `parsed` is a generic `File<E>` (the CLI
         // validate path passes an `InferredFile`). Relabel the
         // export-param-free contribution to the target phase, then
         // fold it in via the one shared merge surface so no field can
         // be silently dropped here (carina#3126 / carina#3061).
-        let expanded = crate::config_loader::relabel_export_phase(expanded);
+        expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
+    }
+    drop(binding_index);
+    for expanded in expanded_calls {
         crate::config_loader::merge_parsed_file(parsed, expanded);
     }
 

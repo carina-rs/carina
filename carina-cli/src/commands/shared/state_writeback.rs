@@ -3793,15 +3793,17 @@ mod export_writeback_tests {
         let export_params = vec![export_param(
             "joined",
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "join".into(),
+                name: carina_core::builtins::BuiltinFunction::join,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("-".into())),
+                    Value::Concrete(ConcreteValue::String("-".into())).into(),
                     Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
                         DeferredValue::ResourceRef {
                             path: AccessPath::new("missing", "value"),
                         },
-                    )])),
+                    )]))
+                    .into(),
                 ],
+                source_line: 0.into(),
             }),
         )];
 
@@ -3930,8 +3932,9 @@ mod stage4_unknown_err_tests {
     #[test]
     fn function_call_returns_unresolved_err() {
         let v = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".into(),
+            name: carina_core::builtins::BuiltinFunction::join,
             args: vec![],
+            source_line: 0.into(),
         });
         let err = PersistedExportValue::encode(&v).unwrap_err();
         assert!(

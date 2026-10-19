@@ -617,9 +617,14 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
             entries.values().any(value_contains_empty_interpolation)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_empty_interpolation(inner),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter().any(value_contains_empty_interpolation)
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => args.iter().any(|argument| {
+            argument
+                .value()
+                .is_some_and(value_contains_empty_interpolation)
+        }),
         Value::Deferred(DeferredValue::Access(access)) => {
             value_contains_empty_interpolation(access.base())
         }
