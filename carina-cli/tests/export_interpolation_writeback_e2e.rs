@@ -92,8 +92,8 @@ fn assert_export_interpolation_writeback(layout: Layout) {
         "plan omitted the resolved prefixed comment:\n{plan_text}",
     );
     assert!(
-        !plan_text.contains("${"),
-        "plan retained raw interpolation:\n{plan_text}",
+        plan_text.contains(r#"interpolated_identifier: String = "id-${r.identifier}""#),
+        "plan omitted the canonical deferred interpolation:\n{plan_text}",
     );
 
     let apply = run(

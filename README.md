@@ -105,20 +105,20 @@ $ carina plan
 Execution Plan:
 
   + aws.ec2.Vpc main_vpc
-      cidr_block: "10.0.0.0/16"
+      cidr_block: '10.0.0.0/16'
       tags:
-        Name: "main-vpc"
+        Name: 'main-vpc'
       vpc_id: (known after apply)
         │
         └─ + aws.ec2.SecurityGroup web_sg
-              description: "Web server security group"
-              group_name: "web-sg"
+              description: 'Web server security group'
+              group_name: 'web-sg'
               vpc_id: main_vpc.vpc_id
               group_id: (known after apply)
               │
               └─ + aws.ec2.SecurityGroupIngress aws_ec2_security_group_ingress_d819070a
-                    cidr_ip: "0.0.0.0/0"
-                    description: "Allow HTTP"
+                    cidr_ip: '0.0.0.0/0'
+                    description: 'Allow HTTP'
                     from_port: 80
                     group_id: web_sg.group_id
                     ip_protocol: tcp
@@ -433,12 +433,12 @@ $ carina destroy
 Destroy Plan:
 
   - aws.ec2.Vpc main_vpc
-      cidr_block: "10.0.0.0/16"
-      vpc_id: "vpc-0123456789abcdef0"
+      cidr_block: '10.0.0.0/16'
+      vpc_id: 'vpc-0123456789abcdef0'
         │
         └─ - aws.ec2.SecurityGroup web_sg
-              group_name: "web-sg"
-              vpc_id: "vpc-0123456789abcdef0"
+              group_name: 'web-sg'
+              vpc_id: 'vpc-0123456789abcdef0'
               │
               └─ - aws.ec2.SecurityGroupIngress aws_ec2_security_group_ingress_d819070a
                     from_port: 80

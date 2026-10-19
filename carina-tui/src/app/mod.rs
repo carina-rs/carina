@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use carina_core::detail_rows::{
     DetailLevel, DetailRow, HistoricalDisplayAttributes, build_detail_rows_by_instance,
-    build_replace_detail_rows_from_display,
+    build_replace_detail_rows_from_display, delete_identifier_fallback_row,
 };
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary, ReplaceDisplayInfo};
@@ -801,16 +801,11 @@ fn effect_to_node(
             generation,
             ..
         } => {
-            // A Delete without a historical display view has no attribute
-            // rows, so retain its provider identifier as a useful fallback.
-            let mut rows = detail_rows;
-            if rows.is_empty() && !identifier.is_empty() {
-                rows.push(DetailRow::Attribute {
-                    key: "identifier".to_string(),
-                    value: identifier.clone(),
-                    ref_binding: None,
-                    annotation: None,
-                });
+            let mut detail_rows = detail_rows;
+            if detail_rows.is_empty()
+                && let Some(row) = delete_identifier_fallback_row(effect)
+            {
+                detail_rows.push(row);
             }
             TreeNode {
                 effect_label: format!("{}", id.human()),
@@ -825,7 +820,7 @@ fn effect_to_node(
                 },
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Delete,
-                detail_rows: rows,
+                detail_rows,
                 children: Vec::new(),
                 depth: 0,
                 parent: None,

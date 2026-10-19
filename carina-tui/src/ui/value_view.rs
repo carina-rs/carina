@@ -1,278 +1,178 @@
-//! Value rendering helpers: color inference, span building, and structural splitting.
+//! Styling for semantically typed values rendered by `carina-core`.
 
+use carina_core::value::{RenderedValue, ValueSpanKind};
 use ratatui::prelude::*;
 
-/// Split a string by `, ` at the top level, respecting nested brackets, braces, and quotes.
-pub(super) fn split_top_level(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0;
-    let mut in_quote = false;
-    let mut start = 0;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => in_quote = !in_quote,
-            b'[' | b'{' if !in_quote => depth += 1,
-            b']' | b'}' if !in_quote => depth -= 1,
-            b',' if !in_quote && depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b' ' => {
-                parts.push(&s[start..i]);
-                start = i + 2;
-                i += 2;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if start < s.len() {
-        parts.push(&s[start..]);
-    }
-    parts
+#[derive(Clone, Copy)]
+pub(super) enum ValueStyle {
+    Semantic,
+    Dimmed,
+    RedStrikethrough,
+    Green,
+    Yellow,
+    DarkGray,
 }
 
-/// Infer a color for a rendered attribute value based on its string form.
-///
-/// - Quoted strings (`"..."`) → Green
-/// - Booleans (`true` / `false`) → Yellow
-/// - Numbers (integer or float) → default (White)
-/// - DSL identifiers (dot-separated, e.g. `awscc.Region.ap_northeast_1`) → Magenta
-/// - Everything else → None (caller decides)
-pub(super) fn value_color(rendered: &str) -> Option<Color> {
-    if rendered.starts_with('"') && rendered.ends_with('"') {
-        return Some(Color::Green);
+fn semantic_style(kind: ValueSpanKind) -> Style {
+    match kind {
+        ValueSpanKind::StringLiteral => Style::default().fg(Color::Green),
+        ValueSpanKind::Bool => Style::default().fg(Color::Yellow),
+        ValueSpanKind::Number => Style::default().fg(Color::White),
+        ValueSpanKind::Enum => Style::default().fg(Color::Magenta),
+        ValueSpanKind::Reference => Style::default().fg(Color::Cyan),
+        ValueSpanKind::Structure
+        | ValueSpanKind::Key
+        | ValueSpanKind::Whitespace
+        | ValueSpanKind::Other => Style::default(),
     }
-    if rendered == "true" || rendered == "false" {
-        return Some(Color::Yellow);
-    }
-    // Integer or float
-    if !rendered.is_empty()
-        && rendered
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
-    {
-        // Must start with a digit or '-'
-        let first = rendered.chars().next().unwrap();
-        if first.is_ascii_digit() || first == '-' {
-            return Some(Color::White);
-        }
-    }
-    // DSL identifier: contains dots, no quotes, no spaces (e.g. binding.attr or awscc.Region.x)
-    // ResourceRef is handled separately (cyan), so this catches remaining dot-notation identifiers
-    if rendered.contains('.') && !rendered.contains(' ') && !rendered.starts_with('{') {
-        return Some(Color::Magenta);
-    }
-    None
 }
 
-/// Build styled spans for a rendered value, coloring sub-elements individually for
-/// lists and maps.
-pub(super) fn value_spans<'a>(rendered: &str, ref_binding: bool) -> Vec<Span<'a>> {
-    let base_style = if ref_binding {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
-
-    // List: color each element individually
-    if rendered.starts_with('[') && rendered.ends_with(']') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return vec![Span::styled(rendered.to_string(), base_style)];
-        }
-        let elements = split_top_level(inner);
-        let mut spans = vec![Span::raw("[")];
-        for (i, elem) in elements.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(", "));
-            }
-            spans.extend(value_spans(elem.trim(), ref_binding));
-        }
-        spans.push(Span::raw("]"));
-        return spans;
+fn span_style(kind: ValueSpanKind, style: ValueStyle) -> Style {
+    if kind == ValueSpanKind::Whitespace {
+        return Style::default();
     }
-
-    // Map: color each value individually
-    if rendered.starts_with('{') && rendered.ends_with('}') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return vec![Span::styled(rendered.to_string(), base_style)];
-        }
-        let entries = split_top_level(inner);
-        let mut spans = vec![Span::raw("{")];
-        for (i, entry) in entries.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(", "));
-            }
-            if let Some(colon_pos) = entry.find(": ") {
-                let key = &entry[..colon_pos];
-                let val = &entry[colon_pos + 2..];
-                spans.push(Span::raw(format!("{}: ", key)));
-                spans.extend(value_spans(val, false));
+    match style {
+        ValueStyle::Semantic => semantic_style(kind),
+        ValueStyle::Dimmed => {
+            let semantic = semantic_style(kind);
+            if semantic.fg.is_some() {
+                semantic.add_modifier(Modifier::DIM)
             } else {
-                spans.push(Span::raw(entry.to_string()));
+                Style::default().fg(Color::DarkGray)
             }
         }
-        spans.push(Span::raw("}"));
-        return spans;
+        ValueStyle::RedStrikethrough => Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::CROSSED_OUT),
+        ValueStyle::Green => Style::default().fg(Color::Green),
+        ValueStyle::Yellow => Style::default().fg(Color::Yellow),
+        ValueStyle::DarkGray => Style::default().fg(Color::DarkGray),
     }
-
-    // Atomic value
-    let style = if ref_binding {
-        Style::default().fg(Color::Cyan)
-    } else if let Some(color) = value_color(rendered) {
-        Style::default().fg(color)
-    } else {
-        Style::default()
-    };
-    vec![Span::styled(rendered.to_string(), style)]
 }
 
-/// Build styled spans for a rendered value with dimmed modifier (for default values).
-pub(super) fn value_spans_dimmed<'a>(rendered: &str) -> Vec<Span<'a>> {
-    let dim_style = Style::default().fg(Color::DarkGray);
+pub(super) fn value_spans<'a>(rendered: &RenderedValue) -> Vec<Span<'a>> {
+    value_spans_styled(rendered, ValueStyle::Semantic)
+}
 
-    // List: color each element individually
-    if rendered.starts_with('[') && rendered.ends_with(']') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return vec![Span::styled(rendered.to_string(), dim_style)];
+pub(super) fn value_spans_dimmed<'a>(rendered: &RenderedValue) -> Vec<Span<'a>> {
+    value_spans_styled(rendered, ValueStyle::Dimmed)
+}
+
+pub(super) fn value_spans_styled<'a>(rendered: &RenderedValue, style: ValueStyle) -> Vec<Span<'a>> {
+    rendered
+        .spans()
+        .iter()
+        .map(|span| Span::styled(span.text().to_string(), span_style(span.kind(), style)))
+        .collect()
+}
+
+pub(super) fn has_semantic_color(rendered: &RenderedValue) -> bool {
+    rendered.spans().iter().any(|span| {
+        matches!(
+            span.kind(),
+            ValueSpanKind::StringLiteral
+                | ValueSpanKind::Bool
+                | ValueSpanKind::Number
+                | ValueSpanKind::Enum
+                | ValueSpanKind::Reference
+        )
+    })
+}
+
+pub(super) fn value_lines_styled<'a>(rendered: &RenderedValue, style: ValueStyle) -> Vec<Line<'a>> {
+    let mut lines = vec![Vec::new()];
+    for span in rendered.spans() {
+        if span.kind() != ValueSpanKind::Whitespace || !span.text().contains('\n') {
+            lines
+                .last_mut()
+                .expect("at least one line")
+                .push(Span::styled(
+                    span.text().to_string(),
+                    span_style(span.kind(), style),
+                ));
+            continue;
         }
-        let elements = split_top_level(inner);
-        let mut spans = vec![Span::styled("[".to_string(), dim_style)];
-        for (i, elem) in elements.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(", ".to_string(), dim_style));
+
+        let mut parts = span.text().split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                lines
+                    .last_mut()
+                    .expect("at least one line")
+                    .push(Span::raw(part.to_string()));
             }
-            spans.extend(value_spans_dimmed(elem.trim()));
+            if parts.peek().is_some() {
+                lines.push(Vec::new());
+            }
         }
-        spans.push(Span::styled("]".to_string(), dim_style));
-        return spans;
     }
-
-    // Map: color each value individually
-    if rendered.starts_with('{') && rendered.ends_with('}') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return vec![Span::styled(rendered.to_string(), dim_style)];
-        }
-        let entries = split_top_level(inner);
-        let mut spans = vec![Span::styled("{".to_string(), dim_style)];
-        for (i, entry) in entries.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(", ".to_string(), dim_style));
-            }
-            if let Some(colon_pos) = entry.find(": ") {
-                let key = &entry[..colon_pos];
-                let val = &entry[colon_pos + 2..];
-                spans.push(Span::styled(format!("{}: ", key), dim_style));
-                spans.extend(value_spans_dimmed(val));
-            } else {
-                spans.push(Span::styled(entry.to_string(), dim_style));
-            }
-        }
-        spans.push(Span::styled("}".to_string(), dim_style));
-        return spans;
-    }
-
-    // Atomic value
-    let style = if let Some(color) = value_color(rendered) {
-        Style::default().fg(color).add_modifier(Modifier::DIM)
-    } else {
-        dim_style
-    };
-    vec![Span::styled(rendered.to_string(), style)]
+    lines.into_iter().map(Line::from).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::value::render_value;
 
     #[test]
-    fn value_color_quoted_string_is_green() {
-        assert_eq!(value_color("\"hello\""), Some(Color::Green));
-        assert_eq!(value_color("\"10.0.0.0/16\""), Some(Color::Green));
-        assert_eq!(value_color("\"\""), Some(Color::Green));
-    }
+    fn semantic_styles_follow_core_span_kinds() {
+        let rendered = render_value(&Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("hello".into())),
+            Value::Concrete(ConcreteValue::Bool(true)),
+            Value::Concrete(ConcreteValue::Int(42)),
+            Value::Concrete(ConcreteValue::enum_identifier("Mode.enabled")),
+            Value::resource_ref("server", "id", Vec::new()),
+        ])));
+        let spans = value_spans(&rendered);
 
-    #[test]
-    fn value_color_boolean_is_yellow() {
-        assert_eq!(value_color("true"), Some(Color::Yellow));
-        assert_eq!(value_color("false"), Some(Color::Yellow));
-    }
-
-    #[test]
-    fn value_color_number_is_white() {
-        assert_eq!(value_color("42"), Some(Color::White));
-        assert_eq!(value_color("3.14"), Some(Color::White));
-        assert_eq!(value_color("-1"), Some(Color::White));
-        assert_eq!(value_color("0"), Some(Color::White));
-    }
-
-    #[test]
-    fn value_color_dsl_identifier_is_magenta() {
-        // DSL identifiers with dots (not quoted, not ResourceRef which is handled separately)
-        assert_eq!(
-            value_color("awscc.Region.ap_northeast_1"),
-            Some(Color::Magenta)
+        assert!(spans.iter().any(|span| span.style.fg == Some(Color::Green)));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Yellow))
         );
+        assert!(spans.iter().any(|span| span.style.fg == Some(Color::White)));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Magenta))
+        );
+        assert!(spans.iter().any(|span| span.style.fg == Some(Color::Cyan)));
         assert_eq!(
-            value_color("aws.s3.VersioningStatus.Enabled"),
-            Some(Color::Magenta)
+            spans.first().expect("opening bracket").style,
+            Style::default()
         );
     }
 
     #[test]
-    fn value_color_other_values_return_none() {
-        assert_eq!(value_color("[1, 2, 3]"), None);
-        assert_eq!(value_color("{key: val}"), None);
-        assert_eq!(value_color(""), None);
+    fn dimmed_semantic_styles_keep_their_colors() {
+        let rendered = render_value(&Value::Concrete(ConcreteValue::String("hello".into())));
+        let spans = value_spans_dimmed(&rendered);
+
+        assert_eq!(spans[0].style.fg, Some(Color::Green));
+        assert!(spans[0].style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
-    fn split_top_level_simple() {
-        assert_eq!(split_top_level(r#""a", "b""#), vec![r#""a""#, r#""b""#]);
-    }
+    fn override_style_does_not_style_layout_whitespace() {
+        let rendered =
+            carina_core::value::PrettyValue::new(Value::Concrete(ConcreteValue::StringList(vec![
+                "a".repeat(70).into(),
+                "b".repeat(70).into(),
+            ])))
+            .render(carina_core::value::PrettyLayout::for_attribute(4, "values"));
+        let spans = value_spans_styled(&rendered, ValueStyle::RedStrikethrough);
 
-    #[test]
-    fn split_top_level_nested() {
-        assert_eq!(split_top_level("[1, 2], [3]"), vec!["[1, 2]", "[3]"]);
-    }
-
-    #[test]
-    fn value_spans_list_creates_multiple_spans() {
-        let spans = value_spans(r#"["hello", 42]"#, false);
-        // Should have: "[", "hello" (green), ", ", "42" (white), "]"
-        assert!(spans.len() > 1, "List should produce multiple spans");
-        // Check that individual elements got colored
-        let has_green = spans.iter().any(|s| s.style.fg == Some(Color::Green));
-        assert!(has_green, "Quoted string element should be green");
-        let has_white = spans.iter().any(|s| s.style.fg == Some(Color::White));
-        assert!(has_white, "Number element should be white");
-    }
-
-    #[test]
-    fn value_spans_map_colors_values() {
-        let spans = value_spans(r#"{Name: "test"}"#, false);
-        assert!(spans.len() > 1, "Map should produce multiple spans");
-        let has_green = spans.iter().any(|s| s.style.fg == Some(Color::Green));
-        assert!(has_green, "Quoted string value should be green");
-    }
-
-    #[test]
-    fn value_spans_ref_binding_cyan() {
-        let spans = value_spans("[binding.attr]", true);
-        let has_cyan = spans.iter().any(|s| s.style.fg == Some(Color::Cyan));
-        assert!(has_cyan, "Ref binding elements should be cyan");
-    }
-
-    #[test]
-    fn value_spans_dimmed_list() {
-        let spans = value_spans_dimmed(r#"["hello"]"#);
-        assert!(spans.len() > 1, "Dimmed list should produce multiple spans");
-        let has_dim_green = spans.iter().any(|s| {
-            s.style.fg == Some(Color::Green) && s.style.add_modifier.contains(Modifier::DIM)
-        });
-        assert!(has_dim_green, "Dimmed list string should be green+dim");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.contains('\n') && span.style == Style::default())
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| { span.style.add_modifier.contains(Modifier::CROSSED_OUT) })
+        );
     }
 }

@@ -8,15 +8,15 @@ Execution Plan:
       statement:
         ~ {
             resource:
-              + "arn:aws:iam::*:role/carina-registry-publish-api-execution"
+              + 'arn:aws:iam::*:role/carina-registry-publish-api-execution'
               # (2 unchanged elements hidden)
             # (3 unchanged fields hidden)
           }
         + {
-            action: ["ecr:CreateRepository"]
-            effect: "Allow"
-            resource: ["arn:aws:ecr:*:*:repository/carina-registry-publish-api"]
-            sid: "ECRRepository"
+            action: ['ecr:CreateRepository']
+            effect: 'Allow'
+            resource: ['arn:aws:ecr:*:*:repository/carina-registry-publish-api']
+            sid: 'ECRRepository'
           }
       # (2 unchanged attributes hidden)
 

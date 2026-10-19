@@ -18,6 +18,7 @@ use subtle::ConstantTimeEq;
 use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
 use crate::explicit::ExplicitFields;
+use crate::parser::display_string_literal;
 use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
 pub use enum_value::{
@@ -906,7 +907,7 @@ impl AsRef<Resource> for ResolvedResource {
 
 /// A `[index]` subscript appended to an `AccessPath`'s field chain.
 ///
-/// `binding.field[0]` and `binding.field["k"]` parse into the same
+/// `binding.field[0]` and `binding.field['k']` parse into the same
 /// `binding` + `attribute` + `field_path` as `binding.field`, plus a
 /// trailing `Subscript` capturing the `[…]` form. Distinguishing
 /// integer from string at this layer lets cross-directory shape checks
@@ -920,15 +921,13 @@ impl AsRef<Resource> for ResolvedResource {
 pub enum Subscript {
     /// Integer subscript: `[0]`. Valid against `list(_)` exports.
     Int { index: i64 },
-    /// String subscript: `["k"]`. Valid against `map(_)` exports.
+    /// String subscript: `['k']`. Valid against `map(_)` exports.
     Str { key: ValueString },
 }
 
 impl Subscript {
-    /// Append this subscript to `out` in source-form: `[0]` or `["k"]`.
-    /// String keys go through `{:?}` so embedded quotes/backslashes
-    /// round-trip as valid DSL source — the same form is used by
-    /// diagnostic messages so escapes matter there too.
+    /// Append this subscript to `out` in canonical source form: `[0]` or
+    /// `['k']`. String keys use the same literal encoder as `carina fmt`.
     pub fn append_to_dot_string(&self, out: &mut String) {
         use std::fmt::Write as _;
         match self {
@@ -937,7 +936,7 @@ impl Subscript {
             }
             Subscript::Str { key } => match key.diagnostic_literal() {
                 Some(key) => {
-                    let _ = write!(out, "[{key:?}]");
+                    let _ = write!(out, "[{}]", display_string_literal(key));
                 }
                 None => out.push_str("[value from env()]"),
             },
@@ -970,7 +969,7 @@ impl Subscript {
 pub enum PathSegment {
     /// A `.field` continuation.
     Field { name: String },
-    /// A `[index]` / `["key"]` subscript.
+    /// A `[index]` / `['key']` subscript.
     Subscript {
         #[serde(flatten)]
         index: Subscript,
@@ -979,7 +978,7 @@ pub enum PathSegment {
 
 impl PathSegment {
     /// Append this segment in DSL source form (`.field`, `[0]`, or
-    /// `["key"]`). Diagnostic-sensitive string keys stay redacted through
+    /// `['key']`). Diagnostic-sensitive string keys stay redacted through
     /// [`Subscript::append_to_dot_string`].
     pub fn append_to_dot_string(&self, out: &mut String) {
         match self {
@@ -1494,7 +1493,7 @@ impl ValueAccessError {
             Some(keys) => format!(
                 "; available keys: {}",
                 keys.iter()
-                    .map(|key| format!("{key:?}"))
+                    .map(|key| display_string_literal(key))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1512,7 +1511,7 @@ impl ValueAccessError {
                     Some(keys) if keys.is_empty() => "<no keys>".to_string(),
                     Some(keys) => keys
                         .iter()
-                        .map(|key| format!("{key:?}"))
+                        .map(|key| display_string_literal(key))
                         .collect::<Vec<_>>()
                         .join(", "),
                 };
@@ -1535,7 +1534,8 @@ impl std::fmt::Display for ValueAccessError {
                 len,
             } => write!(
                 f,
-                "field {name:?} not found in map{}",
+                "field {} not found in map{}",
+                display_string_literal(name),
                 Self::available_suffix(available, *len)
             ),
             Self::MissingKey {
@@ -1545,7 +1545,7 @@ impl std::fmt::Display for ValueAccessError {
             } => {
                 let key = key
                     .diagnostic_literal()
-                    .map_or_else(|| "value from env()".to_string(), |key| format!("{key:?}"));
+                    .map_or_else(|| "value from env()".to_string(), display_string_literal);
                 write!(
                     f,
                     "key {key} not found in map{}",

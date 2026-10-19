@@ -6,7 +6,7 @@ expression: output
 Execution Plan:
 
   - awscc.ec2.Vpc main (deposed vpc-old)
-      cidr_block: "10.220.0.0/16"
-      vpc_id: "vpc-old"
+      cidr_block: '10.220.0.0/16'
+      vpc_id: 'vpc-old'
 
 Plan: 0 to add, 0 to change, 1 to destroy.

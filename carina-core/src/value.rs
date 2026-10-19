@@ -6,11 +6,13 @@ use std::convert::Infallible;
 use indexmap::IndexMap;
 use thiserror::Error;
 
+use crate::parser::{display_double_quoted_literal_part, display_string_literal};
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, RedactedSecretHash,
     UnknownReason, Value,
 };
 use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
+use crate::utils::is_identifier_safe;
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
 /// caller of a failing serialization (e.g. `--out plan.json`) can
@@ -562,45 +564,221 @@ pub fn format_value(value: &Value) -> String {
     format_value_with_key(value, None)
 }
 
+/// Semantic category attached to a fragment of a rendered value.
+///
+/// Frontends use this metadata for styling; they must not infer value
+/// structure or types by parsing the rendered Carina source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueSpanKind {
+    StringLiteral,
+    Bool,
+    Number,
+    Enum,
+    Reference,
+    Structure,
+    Key,
+    Whitespace,
+    Other,
+}
+
+/// One semantically typed fragment of a [`RenderedValue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueSpan {
+    kind: ValueSpanKind,
+    text: String,
+}
+
+impl ValueSpan {
+    pub fn kind(&self) -> ValueSpanKind {
+        self.kind
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// A value rendered by Carina's canonical formatter, retaining enough
+/// structure for frontends to style it without re-parsing the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedValue {
+    plain: String,
+    spans: Vec<ValueSpan>,
+}
+
+impl RenderedValue {
+    pub fn plain(&self) -> &str {
+        &self.plain
+    }
+
+    pub fn spans(&self) -> &[ValueSpan] {
+        &self.spans
+    }
+}
+
+impl std::fmt::Display for RenderedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.plain())
+    }
+}
+
+/// A user-provided map key rendered with Carina's canonical map-key rule.
+///
+/// The rendered text is private so display IR cannot carry an unencoded raw
+/// key. Callers may construct this type from a raw key, but cannot bypass the
+/// identifier-safe/string-literal decision made here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedKey {
+    raw: String,
+    text: String,
+}
+
+impl RenderedKey {
+    pub fn from_raw(key: &str) -> Self {
+        Self {
+            raw: key.to_string(),
+            text: if is_identifier_safe(key) {
+                key.to_string()
+            } else {
+                display_string_literal(key)
+            },
+        }
+    }
+
+    pub fn plain(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl std::fmt::Display for RenderedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.plain())
+    }
+}
+
+/// A value retained for indentation-aware rendering without exposing the raw
+/// [`Value`] to display frontends.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrettyValue {
+    value: Value,
+}
+
+impl PrettyValue {
+    pub fn new(value: Value) -> Self {
+        Self { value }
+    }
+
+    pub fn render(&self, layout: PrettyLayout) -> RenderedValue {
+        render_value_pretty(&self.value, layout)
+    }
+
+    pub fn needs_trailing_separator(&self) -> bool {
+        needs_trailing_separator(&self.value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
+/// Render a value together with semantic span metadata.
+pub fn render_value(value: &Value) -> RenderedValue {
+    let mut sink = SpanSink::default();
+    format_value_into(value, &mut sink).expect("SpanSink writes are infallible");
+    sink.rendered
+}
+
+/// Render persisted JSON through the same typed sink used by [`render_value`].
+///
+/// JSON null has no corresponding [`Value`] variant, so it is emitted as an
+/// `Other` token. Every representable value uses the same token kinds and
+/// canonical string/map-key encoding as the ordinary value formatter.
+pub fn render_json_value(value: &serde_json::Value) -> RenderedValue {
+    let mut sink = SpanSink::default();
+    format_json_value_into(value, &mut sink).expect("SpanSink writes are infallible");
+    sink.rendered
+}
+
+/// Render a value for a deferred-for template, replacing typed upstream
+/// placeholders while the value tree is still available. No rendered text is
+/// inspected to identify the placeholder.
+pub(crate) fn render_value_with_upstream_deferred_label(
+    value: &Value,
+    upstream_binding: &str,
+    verb: &str,
+) -> RenderedValue {
+    let mut sink = SpanSink::default();
+    let context = FormatContext {
+        upstream_deferred_label: Some((upstream_binding, verb)),
+    };
+    format_value_into_context(value, &mut sink, context).expect("SpanSink writes are infallible");
+    sink.rendered
+}
+
+fn render_single_span(kind: ValueSpanKind, text: impl Into<String>) -> RenderedValue {
+    let text = text.into();
+    let spans = (!text.is_empty())
+        .then(|| ValueSpan {
+            kind,
+            text: text.clone(),
+        })
+        .into_iter()
+        .collect();
+    RenderedValue { plain: text, spans }
+}
+
+/// Wrap display-only text that is not a Carina value literal in the typed
+/// rendering container. This is reserved for placeholders and identifiers
+/// whose bespoke human form intentionally differs from `format_value`.
+pub(crate) fn render_other(text: impl Into<String>) -> RenderedValue {
+    render_single_span(ValueSpanKind::Other, text)
+}
+
+pub(crate) fn render_enum_text(text: impl Into<String>) -> RenderedValue {
+    render_single_span(ValueSpanKind::Enum, text)
+}
+
+pub(crate) fn render_string_text(text: &str) -> RenderedValue {
+    render_single_span(ValueSpanKind::StringLiteral, display_string_literal(text))
+}
+
 /// Format a `Value` for user-visible messages where DSL literal quotes
 /// around bare strings get in the way.
 pub fn format_value_user_facing(value: &Value) -> String {
-    let formatted = format_value(value);
-    if matches!(value, Value::Concrete(ConcreteValue::String(_))) {
-        formatted
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .unwrap_or(&formatted)
-            .to_string()
-    } else {
-        formatted
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().to_string(),
+        _ => format_value(value),
     }
 }
 
 /// Format a `Value` for display, with an optional key for context
 pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
     let mut sink = StringSink::default();
-    // `StringSink::write_str` never returns Err (it has no overflow
+    // `StringSink::write_token` never returns Err (it has no overflow
     // budget), so the `Result` here is structurally `Ok(())`. Treat the
     // unwrap as proof of that — never an actual fallible path.
     format_value_into(value, &mut sink).expect("StringSink writes are infallible");
     sink.buf
 }
 
-/// Marker returned by [`FormatSink::write_str`] when a budget-bounded
+/// Marker returned by [`FormatSink::write_token`] when a budget-bounded
 /// sink (e.g. [`WidthCounter`]) has exceeded its limit. [`StringSink`]
 /// never returns this.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Overflow;
 
 /// Output sink for [`format_value_into`]. The trait lets the same
-/// formatting code path drive either a [`StringSink`] (for the public
-/// `String`-returning APIs like `format_value_with_key`) or a
-/// [`WidthCounter`] (for the byte-length-only fast path used by
-/// [`format_value_pretty`]'s inline-vs-vertical decision). #2434.
+/// formatting code path drive the public [`format_value`] text, the semantic
+/// spans returned by [`render_value`], and the [`WidthCounter`] used by
+/// [`render_value_pretty`]'s inline-vs-vertical decision. #2434.
 ///
 /// Historically the byte-length path was its own arm-by-arm
-/// `inline_width` mirror of `format_value_with_key`, kept consistent by
+/// `inline_width` mirror of `format_value`, kept consistent by
 /// a parity test. That shape silently rotted when a `Value` variant was
 /// added on one side but not the other; the trait fuses both into a
 /// single source of truth so a new variant only needs one update.
@@ -609,7 +787,7 @@ pub(crate) trait FormatSink {
     /// whole render — used by the budget-bounded sink to bail out as
     /// soon as the running width exceeds the limit, without visiting
     /// the rest of the value tree.
-    fn write_str(&mut self, s: &str) -> Result<(), Overflow>;
+    fn write_token(&mut self, kind: ValueSpanKind, s: &str) -> Result<(), Overflow>;
 }
 
 #[derive(Default)]
@@ -618,8 +796,43 @@ pub(crate) struct StringSink {
 }
 
 impl FormatSink for StringSink {
-    fn write_str(&mut self, s: &str) -> Result<(), Overflow> {
+    fn write_token(&mut self, _kind: ValueSpanKind, s: &str) -> Result<(), Overflow> {
         self.buf.push_str(s);
+        Ok(())
+    }
+}
+
+struct SpanSink {
+    rendered: RenderedValue,
+}
+
+impl Default for SpanSink {
+    fn default() -> Self {
+        Self {
+            rendered: RenderedValue {
+                plain: String::new(),
+                spans: Vec::new(),
+            },
+        }
+    }
+}
+
+impl FormatSink for SpanSink {
+    fn write_token(&mut self, kind: ValueSpanKind, s: &str) -> Result<(), Overflow> {
+        if s.is_empty() {
+            return Ok(());
+        }
+        self.rendered.plain.push_str(s);
+        if let Some(last) = self.rendered.spans.last_mut()
+            && last.kind == kind
+        {
+            last.text.push_str(s);
+        } else {
+            self.rendered.spans.push(ValueSpan {
+                kind,
+                text: s.to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -643,7 +856,7 @@ impl WidthCounter {
 }
 
 impl FormatSink for WidthCounter {
-    fn write_str(&mut self, s: &str) -> Result<(), Overflow> {
+    fn write_token(&mut self, _kind: ValueSpanKind, s: &str) -> Result<(), Overflow> {
         let next = self.running.checked_add(s.len()).ok_or(Overflow)?;
         if next > self.budget {
             return Err(Overflow);
@@ -651,6 +864,11 @@ impl FormatSink for WidthCounter {
         self.running = next;
         Ok(())
     }
+}
+
+fn write_map_key<S: FormatSink + ?Sized>(key: &str, sink: &mut S) -> Result<(), Overflow> {
+    let rendered = RenderedKey::from_raw(key);
+    sink.write_token(ValueSpanKind::Key, rendered.plain())
 }
 
 /// Render a `Duration` to its canonical surface form.
@@ -681,124 +899,253 @@ pub fn render_duration(d: std::time::Duration) -> String {
 }
 
 /// Render `value` into `sink` using the same code path that produces
-/// the public `format_value_with_key` output. The single source of
+/// the public [`format_value`] output. The single source of
 /// truth for plan-display value formatting; sinks downstream of this
 /// function decide whether to materialise a `String` or just count
 /// bytes (#2434).
-pub(crate) fn format_value_into<S: FormatSink>(
+pub(crate) fn format_value_into(value: &Value, sink: &mut dyn FormatSink) -> Result<(), Overflow> {
+    format_value_into_context(value, sink, FormatContext::default())
+}
+
+#[derive(Clone, Copy, Default)]
+struct FormatContext<'a> {
+    upstream_deferred_label: Option<(&'a str, &'a str)>,
+}
+
+fn format_value_into_context(
     value: &Value,
-    sink: &mut S,
+    sink: &mut dyn FormatSink,
+    context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => {
-            sink.write_str("\"")?;
-            sink.write_str(s.expose_plaintext())?;
-            sink.write_str("\"")
-        }
+        Value::Concrete(ConcreteValue::String(s)) => sink.write_token(
+            ValueSpanKind::StringLiteral,
+            &display_string_literal(s.expose_plaintext()),
+        ),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
             // Preserve unresolved parser-surface enum syntax verbatim. The
             // typed variant, rather than its text shape, is what authorizes
             // unquoted rendering.
-            sink.write_str(s.as_str())
+            sink.write_token(ValueSpanKind::Enum, s.as_str())
         }
-        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => sink.write_str(c.api_value()),
-        Value::Concrete(ConcreteValue::Int(n)) => sink.write_str(&n.to_string()),
-        Value::Concrete(ConcreteValue::Duration(d)) => sink.write_str(&render_duration(*d)),
-        Value::Concrete(ConcreteValue::Float(f)) => {
-            let s = f.to_string();
-            sink.write_str(&s)?;
-            if !s.contains('.') {
-                sink.write_str(".0")?;
-            }
-            Ok(())
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            sink.write_token(ValueSpanKind::Enum, c.api_value())
         }
+        Value::Concrete(ConcreteValue::Int(n)) => {
+            sink.write_token(ValueSpanKind::Number, &n.to_string())
+        }
+        Value::Concrete(ConcreteValue::Duration(d)) => {
+            // Duration literals were not classified as numeric by either
+            // frontend's previous color rules (`1h` is not a number token).
+            // Keep that presentation while still rendering through the
+            // canonical value formatter.
+            sink.write_token(ValueSpanKind::Other, &render_duration(*d))
+        }
+        Value::Concrete(ConcreteValue::Float(f)) => write_float(*f, sink),
         Value::Concrete(ConcreteValue::Bool(b)) => {
-            sink.write_str(if *b { "true" } else { "false" })
+            sink.write_token(ValueSpanKind::Bool, if *b { "true" } else { "false" })
         }
         Value::Concrete(ConcreteValue::List(items)) => {
-            sink.write_str("[")?;
+            sink.write_token(ValueSpanKind::Structure, "[")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    sink.write_str(", ")?;
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
                 }
-                format_value_into(item, sink)?;
+                format_value_into_context(item, sink, context)?;
             }
-            sink.write_str("]")
+            sink.write_token(ValueSpanKind::Structure, "]")
         }
         Value::Concrete(ConcreteValue::StringList(items)) => {
             // Canonicalised string-or-list-of-strings shape (#2510).
-            // Renders with the same `[ "a", "b" ]` form as `Value::Concrete(ConcreteValue::List)`
+            // Renders with the same `['a', 'b']` form as `Value::Concrete(ConcreteValue::List)`
             // of `Value::Concrete(ConcreteValue::String)` so plan output stays uniform.
-            sink.write_str("[")?;
+            sink.write_token(ValueSpanKind::Structure, "[")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    sink.write_str(", ")?;
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
                 }
-                sink.write_str("\"")?;
-                sink.write_str(item.expose_plaintext())?;
-                sink.write_str("\"")?;
+                sink.write_token(
+                    ValueSpanKind::StringLiteral,
+                    &display_string_literal(item.expose_plaintext()),
+                )?;
             }
-            sink.write_str("]")
+            sink.write_token(ValueSpanKind::Structure, "]")
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
-            sink.write_str("{")?;
+            sink.write_token(ValueSpanKind::Structure, "{")?;
             for (i, k) in keys.iter().enumerate() {
                 if i > 0 {
-                    sink.write_str(", ")?;
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
                 }
-                sink.write_str(k)?;
-                sink.write_str(": ")?;
-                format_value_into(&map[*k], sink)?;
+                write_map_key(k, sink)?;
+                sink.write_token(ValueSpanKind::Structure, ": ")?;
+                format_value_into_context(&map[*k], sink, context)?;
             }
-            sink.write_str("}")
+            sink.write_token(ValueSpanKind::Structure, "}")
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            sink.write_str(&path.to_dot_string())
+            sink.write_token(ValueSpanKind::Reference, &path.to_dot_string())
         }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => sink.write_str(binding),
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            sink.write_token(ValueSpanKind::Reference, binding)
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            sink.write_str("\"")?;
+            sink.write_token(ValueSpanKind::StringLiteral, "\"")?;
             for part in parts {
                 match part {
-                    InterpolationPart::Literal(s) => sink.write_str(s.expose_plaintext())?,
+                    InterpolationPart::Literal(s) => sink.write_token(
+                        ValueSpanKind::StringLiteral,
+                        &display_double_quoted_literal_part(s.expose_plaintext()),
+                    )?,
                     InterpolationPart::Expr(v) => {
-                        sink.write_str("${")?;
-                        format_value_into(v, sink)?;
-                        sink.write_str("}")?;
+                        sink.write_token(ValueSpanKind::Structure, "${")?;
+                        format_value_into_context(v, sink, context)?;
+                        sink.write_token(ValueSpanKind::Structure, "}")?;
                     }
                 }
             }
-            sink.write_str("\"")
+            sink.write_token(ValueSpanKind::StringLiteral, "\"")
         }
         Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            sink.write_str(name)?;
-            sink.write_str("(")?;
+            sink.write_token(ValueSpanKind::Other, name)?;
+            sink.write_token(ValueSpanKind::Structure, "(")?;
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
-                    sink.write_str(", ")?;
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
                 }
-                format_value_into(arg, sink)?;
+                format_value_into_context(arg, sink, context)?;
             }
-            sink.write_str(")")
+            sink.write_token(ValueSpanKind::Structure, ")")
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             if let Some(path) = deferred_for_access_display_path(access) {
-                sink.write_str("(known after upstream apply: ")?;
-                sink.write_str(&path)?;
-                sink.write_str(")")
+                if let Some((upstream_binding, verb)) = context.upstream_deferred_label {
+                    write_upstream_deferred_label(sink, upstream_binding, verb)
+                } else {
+                    sink.write_token(ValueSpanKind::Other, "(known after upstream apply: ")?;
+                    sink.write_token(ValueSpanKind::Other, &path)?;
+                    sink.write_token(ValueSpanKind::Other, ")")
+                }
             } else if let Some(reason) = access_chain_unknown_root(access.base()) {
-                sink.write_str(&render_unknown(reason))
+                write_unknown(reason, sink, context)
             } else {
-                format_value_into(access.base(), sink)?;
-                sink.write_str(&access.step().to_dot_string())
+                format_value_into_context(access.base(), sink, context)?;
+                sink.write_token(ValueSpanKind::Reference, &access.step().to_dot_string())
             }
         }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
-            sink.write_str("(secret)")
+            sink.write_token(ValueSpanKind::Other, "(secret)")
         }
-        Value::Deferred(DeferredValue::Unknown(reason)) => sink.write_str(&render_unknown(reason)),
+        Value::Deferred(DeferredValue::Unknown(reason)) => write_unknown(reason, sink, context),
+    }
+}
+
+fn write_float(value: f64, sink: &mut dyn FormatSink) -> Result<(), Overflow> {
+    let text = value.to_string();
+    sink.write_token(ValueSpanKind::Number, &text)?;
+    if !text.contains('.') {
+        sink.write_token(ValueSpanKind::Number, ".0")?;
+    }
+    Ok(())
+}
+
+fn format_json_value_into(
+    value: &serde_json::Value,
+    sink: &mut dyn FormatSink,
+) -> Result<(), Overflow> {
+    match value {
+        serde_json::Value::Null => sink.write_token(ValueSpanKind::Other, "null"),
+        serde_json::Value::Bool(value) => {
+            sink.write_token(ValueSpanKind::Bool, if *value { "true" } else { "false" })
+        }
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                sink.write_token(ValueSpanKind::Number, &value.to_string())
+            } else if let Some(value) = value.as_u64() {
+                sink.write_token(ValueSpanKind::Number, &value.to_string())
+            } else {
+                write_float(value.as_f64().unwrap_or(0.0), sink)
+            }
+        }
+        serde_json::Value::String(value) => {
+            sink.write_token(ValueSpanKind::StringLiteral, &display_string_literal(value))
+        }
+        serde_json::Value::Array(values) => {
+            sink.write_token(ValueSpanKind::Structure, "[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
+                }
+                format_json_value_into(value, sink)?;
+            }
+            sink.write_token(ValueSpanKind::Structure, "]")
+        }
+        serde_json::Value::Object(values) => {
+            if let Some(value) = json_to_canonical_enum(values) {
+                return sink.write_token(ValueSpanKind::Enum, value.api_value());
+            }
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort();
+            sink.write_token(ValueSpanKind::Structure, "{")?;
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
+                }
+                write_map_key(key, sink)?;
+                sink.write_token(ValueSpanKind::Structure, ": ")?;
+                format_json_value_into(&values[*key], sink)?;
+            }
+            sink.write_token(ValueSpanKind::Structure, "}")
+        }
+    }
+}
+
+fn write_unknown(
+    reason: &UnknownReason,
+    sink: &mut dyn FormatSink,
+    context: FormatContext<'_>,
+) -> Result<(), Overflow> {
+    if is_upstream_deferred_reason(reason)
+        && let Some((upstream_binding, verb)) = context.upstream_deferred_label
+    {
+        write_upstream_deferred_label(sink, upstream_binding, verb)
+    } else {
+        sink.write_token(ValueSpanKind::Other, &render_unknown(reason))
+    }
+}
+
+fn write_upstream_deferred_label(
+    sink: &mut dyn FormatSink,
+    upstream_binding: &str,
+    verb: &str,
+) -> Result<(), Overflow> {
+    sink.write_token(
+        ValueSpanKind::Other,
+        &format!("(known after {upstream_binding} {verb})"),
+    )
+}
+
+fn is_upstream_deferred_reason(reason: &UnknownReason) -> bool {
+    matches!(
+        reason,
+        UnknownReason::UpstreamExport { .. }
+            | UnknownReason::UpstreamAllExports { .. }
+            | UnknownReason::ForKey
+            | UnknownReason::ForIndex
+            | UnknownReason::ForValue
+    )
+}
+
+pub(crate) fn is_upstream_deferred_marker_value(value: &Value) -> bool {
+    match value {
+        Value::Deferred(DeferredValue::Unknown(reason)) => is_upstream_deferred_reason(reason),
+        Value::Deferred(DeferredValue::Access(access)) => {
+            deferred_for_access_display_path(access).is_some()
+                || access_chain_unknown_root(access.base()).is_some_and(is_upstream_deferred_reason)
+        }
+        _ => false,
     }
 }
 
@@ -2934,40 +3281,49 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states(
 }
 
 /// Maximum line width before list-of-string and Map values expand vertically
-/// in `format_value_pretty`. Fixed (not terminal-derived) so snapshot tests are
+/// in [`render_value_pretty`]. Fixed (not terminal-derived) so snapshot tests are
 /// deterministic and CI/PR-comment readers see identical output.
 pub(crate) const PRETTY_LINE_LIMIT: usize = 80;
 
-/// Layout context for `format_value_pretty`.
+/// Layout context for [`render_value_pretty`].
 ///
-/// Carries the column at which the parent attribute's *key* is rendered
-/// (`parent_indent_cols`) and the parent attribute's *key* itself. The
-/// helper uses these to decide whether the value fits inline (`<indent>key:
-/// <inline-value>` ≤ 80 cols) and at what column to indent vertical
-/// continuation lines (children render at `parent_indent_cols + 2`,
-/// YAML-conventional).
-///
-/// The struct exists so the two `usize` / `&str` fields can't be passed
-/// in the wrong order, and to leave room for future fields (e.g. a
-/// custom width budget) without breaking the call signature.
+/// Stores the already-rendered key width rather than accepting an arbitrary
+/// key string. Callers must choose between a schema attribute and a typed
+/// [`RenderedKey`], so user map keys cannot be encoded a second time.
 #[derive(Debug, Clone, Copy)]
-pub struct PrettyLayout<'a> {
+pub struct PrettyLayout {
     /// Column at which the parent attribute's key is rendered (i.e. how
     /// many leading spaces precede `<key>:` on its line).
-    pub parent_indent_cols: usize,
-    /// Parent attribute's key, used to compute `<indent>key: ` width when
-    /// deciding inline-vs-vertical.
-    pub key: &'a str,
+    parent_indent_cols: usize,
+    key_cols: usize,
 }
 
-impl<'a> PrettyLayout<'a> {
+impl PrettyLayout {
+    pub fn for_attribute(parent_indent_cols: usize, key: &str) -> Self {
+        Self {
+            parent_indent_cols,
+            key_cols: key.chars().count(),
+        }
+    }
+
+    pub fn for_map_key(parent_indent_cols: usize, key: &RenderedKey) -> Self {
+        Self {
+            parent_indent_cols,
+            key_cols: key.plain().chars().count(),
+        }
+    }
+
+    fn for_raw_map_key(parent_indent_cols: usize, key: &str) -> Self {
+        Self::for_map_key(parent_indent_cols, &RenderedKey::from_raw(key))
+    }
+
     /// Width of the prefix (`<indent>key: `) that the caller has already
     /// emitted, in columns. Used as the budget consumed before any value
     /// content can fit on the same line. Map keys can carry non-ASCII
     /// characters (the `Value::Concrete(ConcreteValue::Map)` key type is `String` with no
     /// encoding constraint), so width is measured in Unicode scalar values.
     fn prefix_cols(&self) -> usize {
-        self.parent_indent_cols + self.key.chars().count() + 2
+        self.parent_indent_cols + self.key_cols + 2
     }
 
     /// Column for child entries / keys when expanding vertically.
@@ -2984,7 +3340,7 @@ impl<'a> PrettyLayout<'a> {
 /// indentation will line up correctly.
 ///
 /// Behavior:
-/// - Scalar variants are identical to `format_value_with_key(value, None)`.
+/// - Scalar variants are identical to [`format_value`].
 /// - `Value::Concrete(ConcreteValue::List)` of all `Value::Concrete(ConcreteValue::Map)` always renders vertically. Each
 ///   element's first key is prefixed with `* ` at `parent_indent_cols + 2`;
 ///   continuation keys align at `parent_indent_cols + 4`. Map keys are
@@ -3004,26 +3360,37 @@ impl<'a> PrettyLayout<'a> {
 /// When adding a new layout-bearing `Value` variant, add a new arm here
 /// — the wildcard fallthrough collapses to the inline form and skips
 /// the line-budget check, which is wrong for any container variant.
-pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
+/// Render a human-readable value with semantic span metadata.
+pub(crate) fn render_value_pretty(value: &Value, layout: PrettyLayout) -> RenderedValue {
+    let mut sink = SpanSink::default();
+    render_value_pretty_into(value, layout, &mut sink).expect("SpanSink writes are infallible");
+    sink.rendered
+}
+
+fn render_value_pretty_into<S: FormatSink>(
+    value: &Value,
+    layout: PrettyLayout,
+    sink: &mut S,
+) -> Result<(), Overflow> {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => {
             if items.is_empty() {
-                return "[]".to_string();
+                return sink.write_token(ValueSpanKind::Structure, "[]");
             }
             if is_list_of_maps(value) {
-                return format_list_of_maps_vertical(items, layout.child_indent_cols());
+                return format_list_of_maps_vertical(items, layout.child_indent_cols(), sink);
             }
             // #2434: measure first, build only when we know it fits.
-            // Pre-fix this called `format_value_with_key` unconditionally
+            // Pre-fix this built the inline form unconditionally
             // and discarded the result on overflow — quadratic on deep
             // nested values because `format_*_vertical` recurses back
-            // into `format_value_pretty`, which built-and-discarded again
+            // into `render_value_pretty`, which built-and-discarded again
             // at every level.
             let budget = PRETTY_LINE_LIMIT.saturating_sub(layout.prefix_cols());
             if inline_width(value, budget).is_some() {
-                return format_value_with_key(value, None);
+                return format_value_into(value, sink);
             }
-            format_list_of_scalars_vertical(items, layout.child_indent_cols())
+            format_list_of_scalars_vertical(items, layout.child_indent_cols(), sink)
         }
         Value::Concrete(ConcreteValue::StringList(items)) => {
             // #2528: `Value::Concrete(ConcreteValue::StringList)` is the canonicalized form the
@@ -3035,47 +3402,47 @@ pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
             // across lines instead of dumping inline. Lift items to
             // `Value::Concrete(ConcreteValue::String)` for the vertical fallback so the per-item
             // rendering (including DSL-enum resolution)
-            // stays byte-identical to `format_value_with_key`'s arm.
+            // stays byte-identical to [`format_value`]'s arm.
             if items.is_empty() {
-                return "[]".to_string();
+                return sink.write_token(ValueSpanKind::Structure, "[]");
             }
             let budget = PRETTY_LINE_LIMIT.saturating_sub(layout.prefix_cols());
             if inline_width(value, budget).is_some() {
-                return format_value_with_key(value, None);
+                return format_value_into(value, sink);
             }
             let lifted: Vec<Value> = items
                 .iter()
                 .cloned()
                 .map(|s| Value::Concrete(ConcreteValue::String(s)))
                 .collect();
-            format_list_of_scalars_vertical(&lifted, layout.child_indent_cols())
+            format_list_of_scalars_vertical(&lifted, layout.child_indent_cols(), sink)
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             if map.is_empty() {
-                return "{}".to_string();
+                return sink.write_token(ValueSpanKind::Structure, "{}");
             }
             let budget = PRETTY_LINE_LIMIT.saturating_sub(layout.prefix_cols());
             if inline_width(value, budget).is_some() {
-                return format_value_with_key(value, None);
+                return format_value_into(value, sink);
             }
-            format_map_vertical(map, layout.child_indent_cols())
+            format_map_vertical(map, layout.child_indent_cols(), sink)
         }
-        _ => format_value_with_key(value, None),
+        _ => format_value_into(value, sink),
     }
 }
 
-/// Compute the byte length of `format_value_with_key(value, None)` without
+/// Compute the byte length of [`format_value`] without
 /// allocating the rendered string, short-circuiting to `None` as soon as
 /// the running total exceeds `budget` (#2434).
 ///
 /// Implemented as a thin wrapper around [`format_value_into`] with a
 /// [`WidthCounter`] sink, so the byte count is byte-for-byte identical
-/// to what `format_value_with_key` would emit by construction —
+/// to what [`format_value`] would emit by construction —
 /// adding a new `Value` variant only needs one site update (the
 /// `format_value_into` arm), not a measure/build pair that could rot
 /// out of sync.
 ///
-/// `format_value_pretty` is the only intended caller; `pub(crate)`
+/// [`render_value_pretty`] is the only intended caller; `pub(crate)`
 /// lets the value tests pin the boundary behaviour.
 pub(crate) fn inline_width(value: &Value, budget: usize) -> Option<usize> {
     let mut counter = WidthCounter::new(budget);
@@ -3096,60 +3463,63 @@ pub(crate) fn inline_width(value: &Value, budget: usize) -> Option<usize> {
 /// insert a blank line before any sibling key that follows a multi-element
 /// list-of-maps so the boundary stays visible (#2555); this function only
 /// handles the inter-element separators inside the list itself.
-fn format_list_of_maps_vertical(items: &[Value], entry_indent_cols: usize) -> String {
+fn format_list_of_maps_vertical<S: FormatSink>(
+    items: &[Value],
+    entry_indent_cols: usize,
+    sink: &mut S,
+) -> Result<(), Overflow> {
     let entry_indent = " ".repeat(entry_indent_cols);
     let continuation_indent = " ".repeat(entry_indent_cols + 2);
-    let mut out = String::new();
     let mut first_element = true;
     for item in items {
         if let Value::Concrete(ConcreteValue::Map(map)) = item {
             if !first_element {
-                out.push('\n');
+                sink.write_token(ValueSpanKind::Whitespace, "\n")?;
             }
             first_element = false;
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
             for (i, k) in keys.iter().enumerate() {
-                let child_layout = PrettyLayout {
-                    parent_indent_cols: entry_indent_cols + 2,
-                    key: k,
-                };
-                let val_str = format_value_pretty(&map[*k], child_layout);
-                out.push('\n');
+                let child_layout = PrettyLayout::for_raw_map_key(entry_indent_cols + 2, k);
+                sink.write_token(ValueSpanKind::Whitespace, "\n")?;
                 if i == 0 {
-                    out.push_str(&entry_indent);
-                    out.push_str("* ");
+                    sink.write_token(ValueSpanKind::Whitespace, &entry_indent)?;
+                    sink.write_token(ValueSpanKind::Structure, "* ")?;
                 } else {
-                    out.push_str(&continuation_indent);
+                    sink.write_token(ValueSpanKind::Whitespace, &continuation_indent)?;
                 }
-                out.push_str(k);
-                out.push_str(": ");
-                out.push_str(&val_str);
+                write_map_key(k, sink)?;
+                sink.write_token(ValueSpanKind::Structure, ": ")?;
+                render_value_pretty_into(&map[*k], child_layout, sink)?;
             }
         }
     }
-    out
+    Ok(())
 }
 
 /// Render a list-of-scalars vertically inside a bracketed block. Items
 /// indent at `item_indent_cols`; closing `]` aligns with the parent line
 /// (one level shallower).
-fn format_list_of_scalars_vertical(items: &[Value], item_indent_cols: usize) -> String {
+fn format_list_of_scalars_vertical<S: FormatSink>(
+    items: &[Value],
+    item_indent_cols: usize,
+    sink: &mut S,
+) -> Result<(), Overflow> {
     // Invariant: `item_indent_cols` is always `child_indent_cols()` of some
     // `PrettyLayout`, which is `parent_indent_cols + 2`, so >= 2.
     debug_assert!(item_indent_cols >= 2);
     let item_indent = " ".repeat(item_indent_cols);
     let close_indent = " ".repeat(item_indent_cols - 2);
-    let mut out = String::from("[\n");
+    sink.write_token(ValueSpanKind::Structure, "[")?;
+    sink.write_token(ValueSpanKind::Whitespace, "\n")?;
     for item in items {
-        out.push_str(&item_indent);
-        out.push_str(&format_value_with_key(item, None));
-        out.push(',');
-        out.push('\n');
+        sink.write_token(ValueSpanKind::Whitespace, &item_indent)?;
+        format_value_into(item, sink)?;
+        sink.write_token(ValueSpanKind::Structure, ",")?;
+        sink.write_token(ValueSpanKind::Whitespace, "\n")?;
     }
-    out.push_str(&close_indent);
-    out.push(']');
-    out
+    sink.write_token(ValueSpanKind::Whitespace, &close_indent)?;
+    sink.write_token(ValueSpanKind::Structure, "]")
 }
 
 /// Render a map vertically. Each key is at `key_indent_cols` and its value
@@ -3159,29 +3529,28 @@ fn format_list_of_scalars_vertical(items: &[Value], item_indent_cols: usize) -> 
 /// element starts but not element *ends* (#2555). The blank is only
 /// inserted when a sibling actually follows, avoiding orphan whitespace
 /// at the end of a block.
-fn format_map_vertical(map: &IndexMap<String, Value>, key_indent_cols: usize) -> String {
+fn format_map_vertical<S: FormatSink>(
+    map: &IndexMap<String, Value>,
+    key_indent_cols: usize,
+    sink: &mut S,
+) -> Result<(), Overflow> {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort();
     let key_indent = " ".repeat(key_indent_cols);
-    let mut out = String::new();
     let mut prev_needs_separator = false;
     for k in keys {
-        let child_layout = PrettyLayout {
-            parent_indent_cols: key_indent_cols,
-            key: k,
-        };
-        let val_str = format_value_pretty(&map[k], child_layout);
+        let child_layout = PrettyLayout::for_raw_map_key(key_indent_cols, k);
         if prev_needs_separator {
-            out.push('\n');
+            sink.write_token(ValueSpanKind::Whitespace, "\n")?;
         }
         prev_needs_separator = needs_trailing_separator(&map[k]);
-        out.push('\n');
-        out.push_str(&key_indent);
-        out.push_str(k);
-        out.push_str(": ");
-        out.push_str(&val_str);
+        sink.write_token(ValueSpanKind::Whitespace, "\n")?;
+        sink.write_token(ValueSpanKind::Whitespace, &key_indent)?;
+        write_map_key(k, sink)?;
+        sink.write_token(ValueSpanKind::Structure, ": ")?;
+        render_value_pretty_into(&map[k], child_layout, sink)?;
     }
-    out
+    Ok(())
 }
 
 /// Check if a value is a list of maps (list-of-struct)
@@ -3235,7 +3604,7 @@ pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
 /// matches — a lone element is visually no more ambiguous than a
 /// regular map under the parent key, and skipping the blank for it
 /// avoids noise around common single-statement policies. (#2555)
-pub fn needs_trailing_separator(value: &Value) -> bool {
+pub(crate) fn needs_trailing_separator(value: &Value) -> bool {
     is_list_of_maps(value)
         && matches!(value, Value::Concrete(ConcreteValue::List(items)) if items.len() >= 2)
 }
@@ -4698,7 +5067,7 @@ mod tests {
         let r = UnknownReason::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
-            "(known after upstream apply: vpc.tags[\"Name\"])"
+            "(known after upstream apply: vpc.tags['Name'])"
         );
     }
 
@@ -5178,8 +5547,22 @@ mod tests {
 
     #[test]
     fn test_format_value_string() {
-        let v = Value::Concrete(ConcreteValue::String("hello".into()));
-        assert_eq!(format_value(&v), "\"hello\"");
+        let v = Value::Concrete(ConcreteValue::String("web-sg".into()));
+        assert_eq!(format_value(&v), "'web-sg'");
+    }
+
+    #[test]
+    fn test_format_value_string_uses_canonical_literal_escaping() {
+        let text = "quote \" slash \\ newline\n interpolation ${value}";
+        let value = Value::Concrete(ConcreteValue::String(text.into()));
+
+        assert_eq!(
+            format_value(&value),
+            crate::parser::display_string_literal(text)
+        );
+        let rendered_width = format_value(&value).len();
+        assert_eq!(inline_width(&value, rendered_width - 1), None);
+        assert_eq!(inline_width(&value, rendered_width), Some(rendered_width));
     }
 
     #[test]
@@ -5191,14 +5574,18 @@ mod tests {
             "aws.s3.VersioningStatus.Enabled",
         ] {
             let value = Value::Concrete(ConcreteValue::String(text.into()));
-            assert_eq!(format_value(&value), format!("\"{text}\""));
+            assert_eq!(
+                format_value(&value),
+                crate::parser::display_string_literal(text)
+            );
         }
     }
 
     #[test]
     fn test_format_value_user_facing_string_is_unquoted() {
-        let v = Value::Concrete(ConcreteValue::String("hello".into()));
-        assert_eq!(format_value_user_facing(&v), "hello");
+        let plaintext = "hello 'quoted'\n${name}";
+        let v = Value::Concrete(ConcreteValue::String(plaintext.into()));
+        assert_eq!(format_value_user_facing(&v), plaintext);
     }
 
     #[test]
@@ -5223,7 +5610,7 @@ mod tests {
     #[test]
     fn test_format_value_bare_enum_string() {
         let v = Value::Concrete(ConcreteValue::String("dedicated".into()));
-        assert_eq!(format_value(&v), "\"dedicated\"");
+        assert_eq!(format_value(&v), "'dedicated'");
     }
 
     #[test]
@@ -6707,7 +7094,7 @@ mod tests {
 
         assert_eq!(
             format_value(&value),
-            "split(\"/\", (known after upstream apply))[1]"
+            "split('/', (known after upstream apply))[1]"
         );
     }
 
@@ -7660,58 +8047,304 @@ mod tests {
     // The "closure cannot become data" guarantee is now enforced at the
     // type level by `EvalValue::into_value`.
 
-    // ----- format_value_pretty tests -----
+    // ----- render_value_pretty tests -----
 
     /// Helper to construct a layout for tests.
-    fn layout(parent_indent_cols: usize, key: &str) -> PrettyLayout<'_> {
-        PrettyLayout {
-            parent_indent_cols,
-            key,
-        }
+    fn layout(parent_indent_cols: usize, key: &str) -> PrettyLayout {
+        PrettyLayout::for_attribute(parent_indent_cols, key)
     }
 
     #[test]
-    fn format_value_pretty_string_matches_format_value() {
+    fn render_value_pretty_string_matches_format_value() {
         let v = Value::Concrete(ConcreteValue::String("hello".into()));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
+        assert_eq!(
+            render_value_pretty(&v, layout(0, "k")).plain(),
+            format_value(&v)
+        );
     }
 
     #[test]
-    fn format_value_pretty_int_renders_as_integer_literal() {
+    fn rendered_value_records_semantic_span_kinds() {
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("hello".into())),
+            Value::Concrete(ConcreteValue::Bool(true)),
+            Value::Concrete(ConcreteValue::Int(42)),
+            Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
+            Value::resource_ref("server", "id", Vec::new()),
+        ]));
+
+        let rendered = render_value(&value);
+        assert_eq!(rendered.plain(), format_value(&value));
+        assert_eq!(
+            rendered
+                .spans()
+                .iter()
+                .map(|span| (span.kind(), span.text()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ValueSpanKind::Structure, "["),
+                (ValueSpanKind::StringLiteral, "'hello'"),
+                (ValueSpanKind::Structure, ", "),
+                (ValueSpanKind::Bool, "true"),
+                (ValueSpanKind::Structure, ", "),
+                (ValueSpanKind::Number, "42"),
+                (ValueSpanKind::Structure, ", "),
+                (ValueSpanKind::Enum, "test.Mode.enabled"),
+                (ValueSpanKind::Structure, ", "),
+                (ValueSpanKind::Reference, "server.id"),
+                (ValueSpanKind::Structure, "]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn interpolation_preserves_expression_span_kinds() {
+        let value = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("prefix ".into()),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
+                binding: "cert".to_string(),
+            })),
+            InterpolationPart::Literal(".example".into()),
+        ]));
+
+        let rendered = render_value(&value);
+        assert_eq!(rendered.plain(), "\"prefix ${cert}.example\"");
+        assert_eq!(
+            rendered
+                .spans()
+                .iter()
+                .map(|span| (span.kind(), span.text()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ValueSpanKind::StringLiteral, "\"prefix "),
+                (ValueSpanKind::Structure, "${"),
+                (ValueSpanKind::Reference, "cert"),
+                (ValueSpanKind::Structure, "}"),
+                (ValueSpanKind::StringLiteral, ".example\""),
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_value_preserves_duration_and_postfix_access_color_categories() {
+        let duration = render_value(&Value::Concrete(ConcreteValue::Duration(
+            std::time::Duration::from_secs(3600),
+        )));
+        assert_eq!(
+            duration
+                .spans()
+                .iter()
+                .map(|span| (span.kind(), span.text()))
+                .collect::<Vec<_>>(),
+            vec![(ValueSpanKind::Other, "1h")]
+        );
+
+        let binding = render_value(&Value::Deferred(DeferredValue::BindingRef {
+            binding: "x".to_string(),
+        }));
+        assert_eq!(
+            binding
+                .spans()
+                .iter()
+                .map(|span| (span.kind(), span.text()))
+                .collect::<Vec<_>>(),
+            vec![(ValueSpanKind::Reference, "x")]
+        );
+
+        let access = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "split".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())),
+                    Value::Deferred(DeferredValue::BindingRef {
+                        binding: "x".to_string(),
+                    }),
+                ],
+            }),
+            crate::resource::PathSegment::Subscript {
+                index: crate::resource::Subscript::Int { index: 1 },
+            },
+            1,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect("a deferred base retains postfix access");
+        let rendered = render_value(&access);
+        assert_eq!(rendered.plain(), "split('/', x)[1]");
+        assert_eq!(
+            rendered
+                .spans()
+                .iter()
+                .map(|span| (span.kind(), span.text()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ValueSpanKind::Other, "split"),
+                (ValueSpanKind::Structure, "("),
+                (ValueSpanKind::StringLiteral, "'/'"),
+                (ValueSpanKind::Structure, ", "),
+                (ValueSpanKind::Reference, "x"),
+                (ValueSpanKind::Structure, ")"),
+                (ValueSpanKind::Reference, "[1]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn map_keys_use_canonical_literal_when_not_identifier_safe() {
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("it's".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            ("a-b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+            (
+                "kubernetes.io/role".to_string(),
+                Value::Concrete(ConcreteValue::Int(3)),
+            ),
+            (
+                "safe_key".to_string(),
+                Value::Concrete(ConcreteValue::Int(4)),
+            ),
+        ])));
+
+        assert_eq!(
+            format_value(&value),
+            r#"{'a-b': 2, "it's": 1, 'kubernetes.io/role': 3, safe_key: 4}"#
+        );
+    }
+
+    #[test]
+    fn rendered_key_owns_the_canonical_map_key_text() {
+        assert_eq!(RenderedKey::from_raw("safe_key").plain(), "safe_key");
+        assert_eq!(RenderedKey::from_raw("a-b").plain(), "'a-b'");
+        assert_eq!(RenderedKey::from_raw("it's").plain(), r#""it's""#);
+    }
+
+    #[test]
+    fn pretty_value_renders_only_through_the_core_formatter() {
+        let key = RenderedKey::from_raw("a-b");
+        let value = PrettyValue::new(Value::Concrete(ConcreteValue::Float(1.0)));
+
+        assert_eq!(
+            value.render(PrettyLayout::for_map_key(0, &key)).plain(),
+            "1.0"
+        );
+        assert!(!value.needs_trailing_separator());
+    }
+
+    #[test]
+    fn json_values_render_with_core_text_and_span_kinds() {
+        let rendered = render_json_value(&serde_json::json!({
+            "a-b": ["value", 1.0, true, null]
+        }));
+
+        assert_eq!(rendered.plain(), "{'a-b': ['value', 1.0, true, null]}");
+        assert_eq!(
+            rendered
+                .spans()
+                .iter()
+                .map(ValueSpan::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ValueSpanKind::Structure,
+                ValueSpanKind::Key,
+                ValueSpanKind::Structure,
+                ValueSpanKind::StringLiteral,
+                ValueSpanKind::Structure,
+                ValueSpanKind::Number,
+                ValueSpanKind::Structure,
+                ValueSpanKind::Bool,
+                ValueSpanKind::Structure,
+                ValueSpanKind::Other,
+                ValueSpanKind::Structure,
+            ]
+        );
+    }
+
+    #[test]
+    fn persisted_canonical_enum_json_renders_as_an_enum_value() {
+        let value = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+                "vpc",
+            ),
+        ));
+        let json = value_to_json(&value).expect("canonical enum is JSON-serializable");
+
+        let rendered = render_json_value(&json);
+
+        assert_eq!(rendered.plain(), "vpc");
+        assert_eq!(
+            rendered
+                .spans()
+                .iter()
+                .map(|span| (span.kind(), span.text()))
+                .collect::<Vec<_>>(),
+            vec![(ValueSpanKind::Enum, "vpc")]
+        );
+    }
+
+    #[test]
+    fn pretty_map_keys_use_the_same_canonical_rule() {
+        let long_value = Value::Concrete(ConcreteValue::String("x".repeat(70).into()));
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("it's".to_string(), long_value.clone()),
+            ("a-b".to_string(), long_value.clone()),
+            ("kubernetes.io/role".to_string(), long_value),
+        ])));
+
+        let rendered = render_value_pretty(&value, layout(0, "config"));
+        assert!(rendered.plain().starts_with('\n'));
+        assert!(rendered.plain().contains("  'a-b': "));
+        assert!(rendered.plain().contains("  \"it's\": "));
+        assert!(rendered.plain().contains("  'kubernetes.io/role': "));
+        assert!(
+            rendered
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == ValueSpanKind::Key)
+                .all(|span| span.text() != "it's")
+        );
+    }
+
+    #[test]
+    fn render_value_pretty_int_renders_as_integer_literal() {
         let v = Value::Concrete(ConcreteValue::Int(42));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), "42");
+        assert_eq!(render_value_pretty(&v, layout(0, "k")).plain(), "42");
     }
 
     #[test]
-    fn format_value_pretty_bool_renders_as_keyword() {
+    fn render_value_pretty_bool_renders_as_keyword() {
         let v = Value::Concrete(ConcreteValue::Bool(true));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), "true");
+        assert_eq!(render_value_pretty(&v, layout(0, "k")).plain(), "true");
     }
 
     #[test]
-    fn format_value_pretty_dsl_enum_resolves_to_provider_value() {
+    fn render_value_pretty_dsl_enum_resolves_to_provider_value() {
         let v = Value::Concrete(ConcreteValue::String(
             "aws.s3.Bucket.VersioningStatus.enabled".into(),
         ));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
+        assert_eq!(
+            render_value_pretty(&v, layout(0, "k")).plain(),
+            format_value(&v)
+        );
     }
 
     #[test]
-    fn format_value_pretty_secret_masked() {
+    fn render_value_pretty_secret_masked() {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("my-password".into()),
         ))));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), "(secret)");
+        assert_eq!(render_value_pretty(&v, layout(0, "k")).plain(), "(secret)");
     }
 
     #[test]
-    fn format_value_pretty_unknown_renders_like_format_value() {
+    fn render_value_pretty_unknown_renders_like_format_value() {
         let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
+        assert_eq!(
+            render_value_pretty(&v, layout(0, "k")).plain(),
+            format_value(&v)
+        );
     }
 
     #[test]
-    fn format_value_pretty_list_of_maps_vertical() {
+    fn render_value_pretty_list_of_maps_vertical() {
         let mut s1 = IndexMap::new();
         s1.insert(
             "sid".to_string(),
@@ -7740,13 +8373,14 @@ mod tests {
         // col 10. Element boundaries also get a blank line. The `*`
         // marker (#2552) replaces the `- ` marker that #2545 dropped to
         // avoid the destroy-marker collision.
-        let out = format_value_pretty(&v, layout(6, "statement"));
-        let expected = "\n        * effect: \"Allow\"\n          sid: \"First\"\n\n        * effect: \"Deny\"\n          sid: \"Second\"";
+        let rendered = render_value_pretty(&v, layout(6, "statement"));
+        let out = rendered.plain();
+        let expected = "\n        * effect: 'Allow'\n          sid: 'First'\n\n        * effect: 'Deny'\n          sid: 'Second'";
         assert_eq!(out, expected);
     }
 
     #[test]
-    fn format_value_pretty_list_of_maps_single_entry() {
+    fn render_value_pretty_list_of_maps_single_entry() {
         let mut m = IndexMap::new();
         m.insert(
             "k".to_string(),
@@ -7757,8 +8391,9 @@ mod tests {
         )]));
         // parent_indent_cols=4 → entry_indent_cols=6, `* ` at col 6, key
         // at col 8.
-        let out = format_value_pretty(&v, layout(4, "items"));
-        assert_eq!(out, "\n      * k: \"v\"");
+        let rendered = render_value_pretty(&v, layout(4, "items"));
+        let out = rendered.plain();
+        assert_eq!(out, "\n      * k: 'v'");
         // Single element must not introduce a blank-line separator.
         assert!(
             !out.contains("\n\n"),
@@ -7767,7 +8402,7 @@ mod tests {
     }
 
     #[test]
-    fn format_value_pretty_list_of_maps_three_entries_separated_by_blank_lines() {
+    fn render_value_pretty_list_of_maps_three_entries_separated_by_blank_lines() {
         let make = |sid: &str| {
             let mut m = IndexMap::new();
             m.insert(
@@ -7777,7 +8412,8 @@ mod tests {
             Value::Concrete(ConcreteValue::Map(m))
         };
         let v = Value::Concrete(ConcreteValue::List(vec![make("A"), make("B"), make("C")]));
-        let out = format_value_pretty(&v, layout(4, "items"));
+        let rendered = render_value_pretty(&v, layout(4, "items"));
+        let out = rendered.plain();
         // Exactly N-1 = 2 blank-line separators between three elements.
         // The trailing blank before the next sibling key (#2555) is
         // emitted by the parent (`format_map_vertical` /
@@ -7801,7 +8437,7 @@ mod tests {
     /// force the outer Map to expand vertically rather than render
     /// inline. (#2555)
     #[test]
-    fn format_value_pretty_map_with_list_of_maps_then_sibling_separates() {
+    fn render_value_pretty_map_with_list_of_maps_then_sibling_separates() {
         let long = "x".repeat(40);
         let mut s1 = IndexMap::new();
         s1.insert(
@@ -7826,13 +8462,14 @@ mod tests {
             Value::Concrete(ConcreteValue::String("2012".into())),
         );
         let v = Value::Concrete(ConcreteValue::Map(outer));
-        let out = format_value_pretty(&v, layout(2, "config"));
+        let rendered = render_value_pretty(&v, layout(2, "config"));
+        let out = rendered.plain();
         // The blank-line MUST sit between the last element's last key
         // and the sibling `version:` key. Use unique key names so the
         // assertion can't be satisfied by the inter-element blank
         // between two `sid:`s.
         assert!(
-            out.contains(&format!("sid_b: \"{long}\"\n\n")),
+            out.contains(&format!("sid_b: '{long}'\n\n")),
             "blank line must follow last list-of-maps element before sibling: {out:?}"
         );
     }
@@ -7841,7 +8478,7 @@ mod tests {
     /// must NOT receive a trailing blank, otherwise the resource-block
     /// separator above it doubles into two blank lines. (#2555)
     #[test]
-    fn format_value_pretty_map_with_trailing_list_of_maps_no_orphan_blank() {
+    fn render_value_pretty_map_with_trailing_list_of_maps_no_orphan_blank() {
         let long = "x".repeat(40);
         let mut s1 = IndexMap::new();
         s1.insert(
@@ -7866,7 +8503,8 @@ mod tests {
             ])),
         );
         let v = Value::Concrete(ConcreteValue::Map(outer));
-        let out = format_value_pretty(&v, layout(2, "config"));
+        let rendered = render_value_pretty(&v, layout(2, "config"));
+        let out = rendered.plain();
         assert!(
             !out.ends_with("\n\n"),
             "trailing list-of-maps must not leave an orphan blank: {out:?}"
@@ -7874,22 +8512,25 @@ mod tests {
     }
 
     #[test]
-    fn format_value_pretty_empty_list_inline() {
+    fn render_value_pretty_empty_list_inline() {
         let v = Value::Concrete(ConcreteValue::List(vec![]));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), "[]");
+        assert_eq!(render_value_pretty(&v, layout(0, "k")).plain(), "[]");
     }
 
     #[test]
-    fn format_value_pretty_list_of_strings_under_80_inline() {
+    fn render_value_pretty_list_of_strings_under_80_inline() {
         let v = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("a".into())),
             Value::Concrete(ConcreteValue::String("b".into())),
         ]));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), "[\"a\", \"b\"]");
+        assert_eq!(
+            render_value_pretty(&v, layout(0, "k")).plain(),
+            "['a', 'b']"
+        );
     }
 
     #[test]
-    fn format_value_pretty_list_of_strings_over_80_vertical() {
+    fn render_value_pretty_list_of_strings_over_80_vertical() {
         // 5 strings of ~20 chars each → inline ~110 chars
         let items: Vec<Value> = (0..5)
             .map(|i| {
@@ -7900,13 +8541,14 @@ mod tests {
             .collect();
         let v = Value::Concrete(ConcreteValue::List(items));
         // parent_indent_cols=4, key="action" → first item starts at parent_indent+2 = col 6.
-        let out = format_value_pretty(&v, layout(4, "action"));
+        let rendered = render_value_pretty(&v, layout(4, "action"));
+        let out = rendered.plain();
         assert!(
             out.starts_with("[\n"),
             "expected bracket-newline start, got: {out}"
         );
         assert!(
-            out.contains("\n      \"iam:LongActionName0\","),
+            out.contains("\n      'iam:LongActionName0',"),
             "missing first item line at col 6: {out}"
         );
         assert!(
@@ -7916,7 +8558,7 @@ mod tests {
     }
 
     #[test]
-    fn format_value_pretty_list_of_strings_threshold_boundary_exact_80_inline() {
+    fn render_value_pretty_list_of_strings_threshold_boundary_exact_80_inline() {
         // Inline form fits exactly within 80 cols at parent_indent=0, key="x" (1 char):
         // total = 0 + 1 + 2 + len(inline). For len(inline)=77, total=80 → stay inline.
         let item = "x".repeat(73); // inline = 1 + 1 + 73 + 1 + 1 = 77
@@ -7926,11 +8568,11 @@ mod tests {
         let inline = format_value_with_key(&v, None);
         assert_eq!(inline.len(), 77, "fixture sanity: {} chars", inline.len());
         // total budget = 0 + 1 + 2 + 77 = 80, exactly at limit → inline.
-        assert_eq!(format_value_pretty(&v, layout(0, "x")), inline);
+        assert_eq!(render_value_pretty(&v, layout(0, "x")).plain(), inline);
     }
 
     #[test]
-    fn format_value_pretty_list_of_strings_threshold_boundary_81_expands() {
+    fn render_value_pretty_list_of_strings_threshold_boundary_81_expands() {
         // 1 char over threshold: 0 + 1 + 2 + 78 = 81 → expand.
         let item = "x".repeat(74); // inline = 78
         let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -7938,7 +8580,8 @@ mod tests {
         )]));
         let inline = format_value_with_key(&v, None);
         assert_eq!(inline.len(), 78, "fixture sanity: {} chars", inline.len());
-        let out = format_value_pretty(&v, layout(0, "x"));
+        let rendered = render_value_pretty(&v, layout(0, "x"));
+        let out = rendered.plain();
         assert!(
             out.starts_with("[\n"),
             "1 over threshold should expand, got: {out}"
@@ -7946,7 +8589,7 @@ mod tests {
     }
 
     #[test]
-    fn format_value_pretty_list_of_strings_indent_pushes_over_threshold() {
+    fn render_value_pretty_list_of_strings_indent_pushes_over_threshold() {
         // Inline form is 75 chars; at parent_indent=10, key="kk" (2),
         // total = 10 + 2 + 2 + 75 = 89 → expand.
         let inline_target = 75;
@@ -7956,12 +8599,13 @@ mod tests {
         )]));
         let inline = format_value_with_key(&v, None);
         assert_eq!(inline.len(), inline_target);
-        let out = format_value_pretty(&v, layout(10, "kk"));
+        let rendered = render_value_pretty(&v, layout(10, "kk"));
+        let out = rendered.plain();
         assert!(out.starts_with("[\n"), "deep indent should expand: {out}");
     }
 
     #[test]
-    fn format_value_pretty_list_of_maps_with_nested_map() {
+    fn render_value_pretty_list_of_maps_with_nested_map() {
         let mut inner = IndexMap::new();
         inner.insert("StringEquals".to_string(), {
             let mut m = IndexMap::new();
@@ -7985,16 +8629,17 @@ mod tests {
         )]));
         // parent_indent_cols=4 → entry_indent_cols=6; first sorted key
         // is preceded by `* ` at col 6 (#2552).
-        let out = format_value_pretty(&v, layout(4, "statement"));
+        let rendered = render_value_pretty(&v, layout(4, "statement"));
+        let out = rendered.plain();
         assert!(
             out.contains("      * condition:"),
             "expected `* condition:` at col 6, got: {out}"
         );
-        assert!(out.contains("sid: \"X\""), "expected sid line, got: {out}");
+        assert!(out.contains("sid: 'X'"), "expected sid line, got: {out}");
     }
 
     #[test]
-    fn format_value_pretty_list_of_maps_with_long_string_list_inside() {
+    fn render_value_pretty_list_of_maps_with_long_string_list_inside() {
         let actions: Vec<Value> = (0..6)
             .map(|i| Value::Concrete(ConcreteValue::String(format!("iam:Action{:03}", i).into())))
             .collect();
@@ -8010,22 +8655,23 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(entry),
         )]));
-        let out = format_value_pretty(&v, layout(4, "statement"));
+        let rendered = render_value_pretty(&v, layout(4, "statement"));
+        let out = rendered.plain();
         assert!(
             out.contains("action: ["),
             "expected expanded action list bracket: {out}"
         );
         assert!(
-            out.contains("\"iam:Action000\","),
+            out.contains("'iam:Action000',"),
             "expected first action on its own line: {out}"
         );
     }
 
     #[test]
-    fn format_value_pretty_string_list_under_dynamic_key_breaks_vertically() {
+    fn render_value_pretty_string_list_under_dynamic_key_breaks_vertically() {
         // #2528 hypothesis: when the deepest value is `Value::Concrete(ConcreteValue::StringList)`
         // (the canonical form #2511 folds `Union[String, list(String)]`
-        // into) rather than `Value::Concrete(ConcreteValue::List)`, `format_value_pretty` treats
+        // into) rather than `Value::Concrete(ConcreteValue::List)`, `render_value_pretty` treats
         // it as a scalar fallthrough and renders inline. This pins the
         // expected vertical break.
         let mut string_like = IndexMap::new();
@@ -8042,22 +8688,23 @@ mod tests {
         // Mirror the layout under `condition.string_like:` (parent at
         // col 12 from the MapExpanded entry indentation). Inside a Map
         // the value text starts after `<key>: ` so the bracketed form
-        // appears as `<key>: [\n   "...",\n   "..."\n  ]` — one element
+        // appears as `<key>: [\n   '...',\n   '...'\n  ]` — one element
         // per line with a trailing comma. The inline form is the
         // single-line `<key>: ["...", "..."]` with no `\n` mid-list.
-        let out = format_value_pretty(&v, layout(12, "string_like"));
+        let rendered = render_value_pretty(&v, layout(12, "string_like"));
+        let out = rendered.plain();
         assert!(
-            out.contains(":sub: [\n"),
+            out.contains("'token.actions.githubusercontent.com:sub': [\n"),
             "expected dynamic-key StringList to start its bracketed form, got:\n{out}"
         );
         assert!(
-            out.contains("refs/heads/main\",\n"),
+            out.contains("refs/heads/main',\n"),
             "expected first element on its own line with trailing comma, got:\n{out}"
         );
     }
 
     #[test]
-    fn format_value_pretty_top_level_string_list_breaks_vertically_when_oversize() {
+    fn render_value_pretty_top_level_string_list_breaks_vertically_when_oversize() {
         // The same fix applies when a top-level attribute value is
         // already canonicalized to `Value::Concrete(ConcreteValue::StringList)`. Pre-fix the
         // wildcard arm collapsed it to `["a", "b", ...]` even when the
@@ -8066,7 +8713,8 @@ mod tests {
             "a".repeat(40).into(),
             "b".repeat(40).into(),
         ]));
-        let out = format_value_pretty(&v, layout(0, "k"));
+        let rendered = render_value_pretty(&v, layout(0, "k"));
+        let out = rendered.plain();
         assert!(
             out.starts_with("[\n"),
             "expected oversize StringList to expand vertically, got:\n{out}"
@@ -8074,7 +8722,7 @@ mod tests {
     }
 
     #[test]
-    fn format_value_pretty_string_list_does_not_reclassify_marker_shaped_text() {
+    fn render_value_pretty_string_list_does_not_reclassify_marker_shaped_text() {
         // Only the persisted-state decoder assigns marker semantics. A plain
         // string that happens to use the reserved prefix stays a string.
         let marker_shaped_text = format!("{}{}", SECRET_PREFIX, "deadbeef".repeat(8));
@@ -8082,15 +8730,16 @@ mod tests {
             marker_shaped_text.clone().into(),
             "x".repeat(80).into(), // force vertical
         ]));
-        let out = format_value_pretty(&v, layout(0, "k"));
+        let rendered = render_value_pretty(&v, layout(0, "k"));
+        let out = rendered.plain();
         assert!(
-            out.contains(&format!("\"{marker_shaped_text}\",")),
+            out.contains(&format!("'{marker_shaped_text}',")),
             "ordinary marker-shaped text must remain visible as a string, got:\n{out}"
         );
     }
 
     #[test]
-    fn format_value_pretty_nested_map_with_dynamic_key_list_value_breaks_vertically() {
+    fn render_value_pretty_nested_map_with_dynamic_key_list_value_breaks_vertically() {
         // #2528: an IAM trust-policy `condition.<operator>.<context-key>:
         // [list]` shape — a multi-element list-of-strings nested inside
         // a Map inside a Map inside a list-of-maps inside a Map field.
@@ -8134,37 +8783,41 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(entry),
         )]));
-        let out = format_value_pretty(&v, layout(4, "statement"));
+        let rendered = render_value_pretty(&v, layout(4, "statement"));
+        let out = rendered.plain();
         // The dynamic-key list value must break across lines (bracketed
         // form), not collapse to `<dynamic-key>: ["a", "b"]`.
         assert!(
-            out.contains(":sub: ["),
+            out.contains("'token.actions.githubusercontent.com:sub': ["),
             "expected dynamic-key list to start its bracket form, got:\n{out}"
         );
         assert!(
-            out.contains("\"repo:carina-rs/infra:ref:refs/heads/main\","),
+            out.contains("'repo:carina-rs/infra:ref:refs/heads/main',"),
             "expected first list element on its own line with trailing comma, got:\n{out}"
         );
     }
 
     #[test]
-    fn format_value_pretty_empty_map_inline() {
+    fn render_value_pretty_empty_map_inline() {
         let v = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), "{}");
+        assert_eq!(render_value_pretty(&v, layout(0, "k")).plain(), "{}");
     }
 
     #[test]
-    fn format_value_pretty_small_map_inline_fits() {
+    fn render_value_pretty_small_map_inline_fits() {
         let mut m = IndexMap::new();
         m.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
         m.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(2)));
         let v = Value::Concrete(ConcreteValue::Map(m));
         // {a: 1, b: 2} = 12 chars; total = 0 + 1 + 2 + 12 = 15 → inline.
-        assert_eq!(format_value_pretty(&v, layout(0, "k")), "{a: 1, b: 2}");
+        assert_eq!(
+            render_value_pretty(&v, layout(0, "k")).plain(),
+            "{a: 1, b: 2}"
+        );
     }
 
     #[test]
-    fn format_value_pretty_top_level_map_expands_when_over_threshold() {
+    fn render_value_pretty_top_level_map_expands_when_over_threshold() {
         let mut m = IndexMap::new();
         m.insert(
             "first_key".to_string(),
@@ -8179,7 +8832,8 @@ mod tests {
         assert!(inline.len() > PRETTY_LINE_LIMIT, "fixture sanity");
 
         // parent_indent_cols=0, key="cfg" → child keys at col 2.
-        let out = format_value_pretty(&v, layout(0, "cfg"));
+        let rendered = render_value_pretty(&v, layout(0, "cfg"));
+        let out = rendered.plain();
         assert!(
             out.starts_with("\n  first_key: "),
             "expected child keys at col 2, got: {out}"
@@ -8191,7 +8845,7 @@ mod tests {
     }
 
     #[test]
-    fn format_value_pretty_scalar_variants_match_format_value_with_key() {
+    fn render_value_pretty_scalar_variants_match_format_value() {
         // Lock the "scalar fallthrough" contract.
         use crate::resource::AccessPath;
 
@@ -8224,8 +8878,8 @@ mod tests {
 
         for v in &cases {
             assert_eq!(
-                format_value_pretty(v, layout(0, "k")),
-                format_value_with_key(v, None),
+                render_value_pretty(v, layout(0, "k")).plain(),
+                format_value(v),
                 "scalar fallthrough drift for variant: {v:?}"
             );
         }
@@ -8907,18 +9561,18 @@ mod tests {
     // ----- inline_width tests (#2434) -----
 
     /// Parity oracle: every variant `inline_width` claims to know the
-    /// width of must report the same byte length as `format_value_with_key`
-    /// would emit. Anything else is a drift bug — the optimization
+    /// width of must report the same byte length as `format_value` would
+    /// emit. Anything else is a drift bug — the optimization
     /// silently changes the inline-vs-vertical decision boundary.
     fn assert_inline_width_matches_build(v: &Value) {
-        // `format_value_pretty`'s overflow check uses byte length
+        // `render_value_pretty`'s overflow check uses byte length
         // (`inline.len()`), so `inline_width` must report bytes too.
-        let built = format_value_with_key(v, None);
+        let built = format_value(v);
         let measured = inline_width(v, usize::MAX);
         assert_eq!(
             measured,
             Some(built.len()),
-            "inline_width vs format_value_with_key drift for {v:?}: built={built:?}",
+            "inline_width vs format_value drift for {v:?}: built={built:?}",
         );
     }
 
@@ -9001,7 +9655,7 @@ mod tests {
     #[test]
     fn canonicalize_format_value_string_list() {
         let v = Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]));
-        assert_eq!(format_value(&v), "[\"a\", \"b\"]");
+        assert_eq!(format_value(&v), "['a', 'b']");
     }
 
     #[test]
@@ -9467,9 +10121,27 @@ mod tests {
         // `format_value` must render `Value::Concrete(ConcreteValue::StringList)` with bracket
         // syntax — not a `_` wildcard fallback that would print debug
         // garbage in plan output.
-        let v = Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]));
+        let special = "quote \" slash \\ newline\n interpolation ${value}";
+        let v = Value::Concrete(ConcreteValue::StringList(vec!["a".into(), special.into()]));
         let formatted = format_value(&v);
-        assert_eq!(formatted, "[\"a\", \"b\"]");
+        assert_eq!(
+            formatted,
+            format!(
+                "[{}, {}]",
+                crate::parser::display_string_literal("a"),
+                crate::parser::display_string_literal(special)
+            )
+        );
+    }
+
+    #[test]
+    fn format_value_interpolation_escapes_literal_parts() {
+        let value = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("say \"hello\"".into()),
+            InterpolationPart::Expr(Value::resource_ref("server", "name", Vec::new())),
+        ]));
+
+        assert_eq!(format_value(&value), "\"say \\\"hello\\\"${server.name}\"");
     }
 
     #[test]
@@ -9492,9 +10164,9 @@ mod tests {
     }
 
     #[test]
-    fn format_value_pretty_decision_unchanged_after_inline_width() {
+    fn render_value_pretty_decision_unchanged_after_inline_width() {
         // End-to-end: the inline-vs-vertical decision in
-        // `format_value_pretty` must be byte-identical to the pre-fix
+        // `render_value_pretty` must be byte-identical to the pre-fix
         // build-then-measure shape. Construct values that straddle
         // PRETTY_LINE_LIMIT (80) at the prefix boundary and confirm both
         // sides of the boundary still pick the same form.
@@ -9503,9 +10175,9 @@ mod tests {
             Value::Concrete(ConcreteValue::String("aaaaaaaaaaaa".into())),
             Value::Concrete(ConcreteValue::String("bbbbbbbbbbbb".into())),
         ]));
-        let small = format_value_pretty(&small_list, layout(0, "k"));
+        let small = render_value_pretty(&small_list, layout(0, "k"));
         assert!(
-            !small.contains('\n'),
+            !small.plain().contains('\n'),
             "small list must render inline, got: {small:?}"
         );
 
@@ -9515,9 +10187,9 @@ mod tests {
             Value::Concrete(ConcreteValue::String("b".repeat(40).into())),
             Value::Concrete(ConcreteValue::String("c".repeat(40).into())),
         ]));
-        let big = format_value_pretty(&big_list, layout(0, "k"));
+        let big = render_value_pretty(&big_list, layout(0, "k"));
         assert!(
-            big.contains('\n'),
+            big.plain().contains('\n'),
             "oversize list must render vertically, got: {big:?}"
         );
     }

@@ -391,7 +391,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         "saved-plan display should mark the deposed delete:\n{stdout}"
     );
     assert!(
-        stdout.contains("name: \"main-old\"") && stdout.contains("status: \"STALE\""),
+        stdout.contains("name: 'main-old'") && stdout.contains("status: 'STALE'"),
         "saved-plan display should render deposed attributes from state:\n{stdout}"
     );
 }

@@ -2051,7 +2051,9 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         delete_rows,
         vec![carina_core::detail_rows::DetailRow::Attribute {
             key: "name".to_string(),
-            value: "\"old\"".to_string(),
+            value: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+                "old".into(),
+            ))),
             ref_binding: None,
             annotation: None,
         }]

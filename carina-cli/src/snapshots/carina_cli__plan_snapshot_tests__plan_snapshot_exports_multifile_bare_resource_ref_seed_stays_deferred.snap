@@ -5,11 +5,11 @@ expression: output
 Execution Plan:
 
   + mock.compute.Instance inst.resource_binding
-      name: "fixture-instance"
+      name: 'fixture-instance'
       arn: (known after apply)
 
 Exports:
 
-  + x = (known after apply)
+  + x = inst.resource_binding
 
 Plan: 1 to add, 0 to change, 0 to destroy, 1 export change(s).

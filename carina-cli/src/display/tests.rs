@@ -5,9 +5,10 @@ use colored::Colorize;
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    AccessMissPolicy, ConcreteValue, DeferredValue, Directives, PathSegment, ResolvedResource,
-    Resource, ResourceId, State, UnknownReason, Value, apply_postfix_access,
+    AccessMissPolicy, ConcreteValue, DeferredValue, Directives, InterpolationPart, PathSegment,
+    ResolvedResource, Resource, ResourceId, State, UnknownReason, Value, apply_postfix_access,
 };
+use carina_core::value::{PrettyLayout, PrettyValue, render_value};
 
 fn for_value_access(fields: &[&str]) -> Value {
     fields.iter().fold(
@@ -1219,43 +1220,17 @@ fn format_effect_move_separates_type_and_name_with_space() {
 }
 
 #[test]
-fn split_top_level_simple_elements() {
-    assert_eq!(
-        split_top_level(r#""a", "b", "c""#),
-        vec![r#""a""#, r#""b""#, r#""c""#]
-    );
-}
-
-#[test]
-fn split_top_level_nested_brackets() {
-    assert_eq!(split_top_level("[1, 2], [3, 4]"), vec!["[1, 2]", "[3, 4]"]);
-}
-
-#[test]
-fn split_top_level_nested_braces() {
-    assert_eq!(
-        split_top_level("{a: 1, b: 2}, {c: 3}"),
-        vec!["{a: 1, b: 2}", "{c: 3}"]
-    );
-}
-
-#[test]
-fn split_top_level_quoted_commas() {
-    assert_eq!(
-        split_top_level(r#""a, b", "c""#),
-        vec![r#""a, b""#, r#""c""#]
-    );
-}
-
-#[test]
 fn colored_value_list_elements_colored_individually() {
-    // Each element in a list should be colored by its type
-    let result = colored_value(r#"["hello", "world"]"#, false);
+    let rendered = render_value(&Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("hello".into())),
+        Value::Concrete(ConcreteValue::String("world".into())),
+    ])));
+    let result = colored_value(&rendered);
     // Each quoted string should be green, not the whole list
     assert!(result.contains('['));
     assert!(result.contains(']'));
     // The individual strings should have color codes
-    let green_hello = "\"hello\"".green().to_string();
+    let green_hello = "'hello'".green().to_string();
     assert!(
         result.contains(&green_hello),
         "Expected green-colored hello in: {}",
@@ -1264,8 +1239,12 @@ fn colored_value_list_elements_colored_individually() {
 }
 
 #[test]
-fn colored_value_list_ref_binding_cyan() {
-    let result = colored_value("[binding.attr]", true);
+fn colored_value_resource_reference_is_cyan_from_span_kind() {
+    let result = colored_value(&render_value(&Value::resource_ref(
+        "binding",
+        "attr",
+        Vec::new(),
+    )));
     let cyan_elem = "binding.attr".cyan().to_string();
     assert!(
         result.contains(&cyan_elem),
@@ -1276,8 +1255,15 @@ fn colored_value_list_ref_binding_cyan() {
 
 #[test]
 fn colored_value_map_values_colored() {
-    let result = colored_value(r#"{Name: "test-vpc", count: 42}"#, false);
-    let green_val = "\"test-vpc\"".green().to_string();
+    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+        (
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("test-vpc".into())),
+        ),
+        ("count".to_string(), Value::Concrete(ConcreteValue::Int(42))),
+    ])));
+    let result = colored_value(&render_value(&value));
+    let green_val = "'test-vpc'".green().to_string();
     let white_val = "42".white().to_string();
     assert!(
         result.contains(&green_val),
@@ -1292,13 +1278,73 @@ fn colored_value_map_values_colored() {
 }
 
 #[test]
+fn colored_value_map_key_apostrophe_does_not_swallow_following_values() {
+    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+        (
+            "it's".to_string(),
+            Value::Concrete(ConcreteValue::String("first".into())),
+        ),
+        (
+            "later".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+    ])));
+
+    let result = colored_value(&render_value(&value));
+    assert!(result.contains(r#""it's": "#));
+    assert!(result.contains(&"'first'".green().to_string()));
+    assert!(result.contains(&"true".yellow().to_string()));
+}
+
+#[test]
+fn colored_value_keeps_interpolation_with_quoted_argument_as_one_list_element() {
+    let interpolation =
+        Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "join".to_string(),
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("it's".into())),
+                    Value::Deferred(DeferredValue::BindingRef {
+                        binding: "x".to_string(),
+                    }),
+                ],
+            }),
+        )]));
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        interpolation,
+        Value::Concrete(ConcreteValue::String("next".into())),
+    ]));
+
+    let result = colored_value(&render_value(&value));
+    assert!(result.contains(&r#""${join("it's", x)}""#.green().to_string()));
+    assert!(result.contains(&"'next'".green().to_string()));
+}
+
+#[test]
+fn colored_value_does_not_split_colon_inside_vertical_string() {
+    let value = Value::Concrete(ConcreteValue::StringList(vec![
+        "a: b".into(),
+        "a value long enough to force this list onto vertical lines in plan output".into(),
+    ]));
+    let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(20, "values"));
+
+    assert!(rendered.plain().contains("\n"));
+    assert!(
+        colored_value(&rendered).contains(&"'a: b'".green().to_string()),
+        "the colon-bearing string must remain one green span"
+    );
+}
+
+#[test]
 fn colored_value_empty_list() {
-    assert_eq!(colored_value("[]", false), "[]");
+    let value = Value::Concrete(ConcreteValue::List(Vec::new()));
+    assert_eq!(colored_value(&render_value(&value)), "[]");
 }
 
 #[test]
 fn colored_value_empty_map() {
-    assert_eq!(colored_value("{}", false), "{}");
+    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::new()));
+    assert_eq!(colored_value(&render_value(&value)), "{}");
 }
 
 /// Strip ANSI SGR (color) escape sequences for assertion purposes.
@@ -1307,6 +1353,117 @@ fn colored_value_empty_map() {
 fn strip_ansi(s: &str) -> String {
     let re = regex_lite::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
     re.replace_all(s, "").to_string()
+}
+
+fn assert_no_ansi_style_crosses_newline(rendered: &str) {
+    let chars: Vec<char> = rendered.chars().collect();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'[') {
+            let mut end = i + 2;
+            while end < chars.len() && chars[end] != 'm' {
+                end += 1;
+            }
+            let params: String = chars[i + 2..end].iter().collect();
+            if params == "0" {
+                depth = (depth - 1).max(0);
+            } else {
+                depth += 1;
+            }
+            i = end + 1;
+            continue;
+        }
+        if chars[i] == '\n' {
+            assert_eq!(
+                depth, 0,
+                "an ANSI style span crossed a newline: {rendered:?}"
+            );
+        }
+        i += 1;
+    }
+}
+
+fn multiline_list_of_maps_for_gutter_test() -> Value {
+    Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::String("first".into())),
+        )]))),
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::String("second".into())),
+        )]))),
+    ]))
+}
+
+#[test]
+fn render_value_ansi_restores_gutter_without_styling_line_boundaries() {
+    struct ColorOverrideGuard;
+    impl Drop for ColorOverrideGuard {
+        fn drop(&mut self) {
+            colored::control::unset_override();
+        }
+    }
+
+    colored::control::set_override(true);
+    let _guard = ColorOverrideGuard;
+    let prefix = "     │  ";
+    let rendered = PrettyValue::new(multiline_list_of_maps_for_gutter_test())
+        .render(PrettyLayout::for_attribute(prefix.chars().count(), "items"));
+    let ansi = render_value_ansi(&rendered, AnsiValueStyle::Semantic, Some(prefix));
+    let plain = strip_ansi(&ansi);
+
+    assert!(
+        ansi.contains("\u{1b}[32m"),
+        "fixture must exercise ANSI: {ansi:?}"
+    );
+    assert!(
+        plain
+            .lines()
+            .skip(1)
+            .all(|line| line.starts_with(prefix.trim_end())),
+        "every continuation line must retain the gutter: {plain:?}"
+    );
+    assert!(
+        plain.lines().any(|line| line == prefix.trim_end()),
+        "the inter-element blank line must contain only the bare gutter: {plain:?}"
+    );
+    assert_no_ansi_style_crosses_newline(&ansi);
+    for line in ansi.lines().skip(1) {
+        let plain_line = strip_ansi(line);
+        if plain_line == prefix.trim_end() {
+            assert_eq!(line, prefix.trim_end(), "the bare gutter must be unstyled");
+            continue;
+        }
+        let tail = plain_line
+            .strip_prefix(prefix)
+            .expect("non-blank continuation lines retain the full gutter prefix");
+        let extra_indent = tail.bytes().take_while(|byte| *byte == b' ').count();
+        let unstyled_prefix = format!("{prefix}{}", &tail[..extra_indent]);
+        assert!(
+            line.starts_with(&unstyled_prefix),
+            "ANSI must not precede the continuation indentation or gutter: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn render_value_ansi_single_line_with_gutter_is_unchanged() {
+    let rendered = render_value(&Value::Concrete(ConcreteValue::List(Vec::new())));
+    assert_eq!(
+        render_value_ansi(&rendered, AnsiValueStyle::Semantic, Some("     │  ")),
+        "[]"
+    );
+}
+
+#[test]
+fn render_value_ansi_space_only_prefix_preserves_pretty_layout() {
+    let prefix = "      ";
+    let rendered = PrettyValue::new(multiline_list_of_maps_for_gutter_test())
+        .render(PrettyLayout::for_attribute(prefix.chars().count(), "items"));
+    let output = render_value_ansi(&rendered, AnsiValueStyle::Semantic, Some(prefix));
+    assert_eq!(strip_ansi(&output), rendered.plain());
 }
 
 #[test]
@@ -1320,18 +1477,24 @@ fn colored_value_preserves_vertical_list_layout() {
     colored::control::set_override(true);
     let _guard = ColorOverrideGuard;
 
-    // `format_value_pretty` emits a multi-line bracketed form for lists that
+    // `PrettyValue::render` emits a multi-line bracketed form for lists that
     // exceed the 80-col threshold. `colored_value` must NOT collapse the
     // layout back to inline — it should color atoms in place and keep
     // newlines / leading indentation intact.
-    let input = "[\n  \"a\",\n  \"b\",\n  \"c\",\n]";
-    let result = colored_value(input, false);
+    let value = Value::Concrete(ConcreteValue::StringList(vec![
+        "a".repeat(40).into(),
+        "b".repeat(40).into(),
+        "c".repeat(40).into(),
+    ]));
+    let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(0, "values"));
+    let input = rendered.plain();
+    let result = colored_value(&rendered);
     let stripped = strip_ansi(&result);
     assert_eq!(
         stripped, input,
         "vertical layout (newlines, indent, trailing comma, closing bracket) must be preserved verbatim",
     );
-    let green_a = "\"a\"".green().to_string();
+    let green_a = format!("'{}'", "a".repeat(40)).green().to_string();
     assert!(
         result.contains(&green_a),
         "string atoms inside the vertical list should still be colored: {result:?}",
@@ -1343,8 +1506,10 @@ fn colored_value_preserves_vertical_list_closing_bracket_alone() {
     // The closing `]` sits on its own line, indented to the parent. This is
     // the most layout-fragile token — earlier impls collapsed it into the
     // previous line as `,]`. Pin its standalone-line preservation explicitly.
-    let input = "[\n  \"x\",\n]";
-    let result = colored_value(input, false);
+    let value = Value::Concrete(ConcreteValue::StringList(vec!["x".repeat(80).into()]));
+    let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(0, "values"));
+    let input = rendered.plain();
+    let result = colored_value(&rendered);
     let stripped = strip_ansi(&result);
     assert_eq!(stripped, input);
     assert!(
@@ -1356,8 +1521,16 @@ fn colored_value_preserves_vertical_list_closing_bracket_alone() {
 #[test]
 fn colored_value_preserves_vertical_map_layout() {
     // Same constraint for `format_map_vertical` output.
-    let input = "\n  k1: \"v1\"\n  k2: 42";
-    let result = colored_value(input, false);
+    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+        (
+            "k1".to_string(),
+            Value::Concrete(ConcreteValue::String("v1".into())),
+        ),
+        ("k2".to_string(), Value::Concrete(ConcreteValue::Int(42))),
+    ])));
+    let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(75, "value"));
+    let input = rendered.plain();
+    let result = colored_value(&rendered);
     let stripped = strip_ansi(&result);
     assert_eq!(
         stripped, input,
@@ -1366,18 +1539,57 @@ fn colored_value_preserves_vertical_map_layout() {
 }
 
 #[test]
-fn format_export_value_duration_renders_canonical() {
-    // Regression: simplify + Round 1 added the Value::Concrete(ConcreteValue::Duration) arm so
-    // exports of a Duration attribute don't fall through to the
-    // wildcard "(known after apply)" placeholder. Pin the canonical
-    // form here so a future refactor cannot silently regress to either
-    // the wildcard or the {:?} Debug shape.
+fn plan_export_duration_renders_canonical() {
     let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
-    assert_eq!(format_export_value(&v), "1min");
+    assert_eq!(render_value(&v).plain(), "1min");
 }
 
 #[test]
-fn format_export_value_shows_env_plaintext_in_plan_output() {
+fn plan_export_values_use_the_core_value_formatter() {
+    use crate::commands::plan::ExportChange;
+    use carina_core::resource::RawEnumIdentifier;
+
+    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+        (
+            "ratio".to_string(),
+            Value::Concrete(ConcreteValue::Float(1.0)),
+        ),
+        (
+            "region".to_string(),
+            Value::Concrete(ConcreteValue::EnumIdentifier(RawEnumIdentifier::parse(
+                "aws.Region.ap_northeast_1",
+            ))),
+        ),
+    ])));
+    let change = ExportChange::Added {
+        name: "settings".to_string(),
+        type_expr: None,
+        new_value: value,
+    };
+
+    assert_eq!(
+        strip_ansi(&format_export_change(&change)),
+        "  + settings = {ratio: 1.0, region: aws.Region.ap_northeast_1}\n"
+    );
+}
+
+#[test]
+fn persisted_plan_export_maps_use_the_core_value_formatter() {
+    use crate::commands::plan::ExportChange;
+
+    let change = ExportChange::Removed {
+        name: "settings".to_string(),
+        old_json: serde_json::json!({"ratio": 1.0}),
+    };
+
+    assert_eq!(
+        strip_ansi(&format_export_change(&change)),
+        "  - settings = {ratio: 1.0}\n"
+    );
+}
+
+#[test]
+fn plan_export_shows_env_plaintext() {
     let name = "CARINA_TEST_ENV_EXPORT_PLAN_DISPLAY";
     unsafe {
         std::env::set_var(name, "hunter2SECRET");
@@ -1388,7 +1600,7 @@ fn format_export_value_shows_env_plaintext_in_plan_output() {
     )
     .expect("env value");
 
-    assert_eq!(format_export_value(&value), "'hunter2SECRET'");
+    assert_eq!(render_value(&value).plain(), "'hunter2SECRET'");
 
     unsafe {
         std::env::remove_var(name);
@@ -1397,17 +1609,16 @@ fn format_export_value_shows_env_plaintext_in_plan_output() {
 
 #[test]
 fn format_deferred_value_duration_renders_canonical() {
-    // Same shape as format_export_value but on the deferred-for path.
+    // Same canonical formatter, with the deferred-for context applied.
     let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
-    let result =
-        carina_core::plan_tree::format_deferred_for_template_value(&v, "ttl", "cert", "applies");
+    let result = carina_core::plan_tree::render_deferred_for_template_value(&v, "cert", "applies");
     // The deferred path may inject ANSI dimming for Unknown variants,
     // but a resolved Duration must render verbatim.
-    assert_eq!(result, "1min");
+    assert_eq!(result.plain(), "1min");
 }
 
 /// Regression for #3115: a deleted-effect attribute whose value is a
-/// multi-line `format_value_pretty` map (e.g. CloudFront
+/// multi-line `PrettyValue::render` map (e.g. CloudFront
 /// `default_cache_behavior`) must not bleed the red strikethrough
 /// across the *leading indentation whitespace* of continuation lines.
 ///
@@ -1424,7 +1635,7 @@ fn format_deferred_value_duration_renders_canonical() {
 fn delete_pretty_attribute_does_not_strike_indentation() {
     use indexmap::IndexMap;
 
-    // A nested map forces `format_value_pretty` into a multi-line
+    // A nested map forces `PrettyValue::render` into a multi-line
     // vertical layout with indented continuation lines, mirroring the
     // real CloudFront `default_cache_behavior` shape from the bug
     // report.
@@ -1445,7 +1656,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
 
     let row = DetailRow::PrettyAttribute {
         key: "default_cache_behavior".to_string(),
-        value: Value::Concrete(ConcreteValue::Map(cache_behavior)),
+        value: PrettyValue::new(Value::Concrete(ConcreteValue::Map(cache_behavior))),
     };
     let effect = Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(
@@ -1474,9 +1685,8 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
     // A style that opens on one line and resets on a later line keeps
     // strikethrough/red active across the intervening newline(s), so
     // the terminal paints the strike over the leading indentation of
-    // every continuation line. The correct shape (matching the
-    // non-delete `color_lines` path) opens and closes the style
-    // *within* each line, after that line's indentation.
+    // every continuation line. The typed-span renderer opens and closes
+    // the style *within* each line, after that line's indentation.
     //
     // Invariant: at every `\n`, the ANSI style depth must be zero —
     // no styling span may cross a line boundary.
@@ -1524,8 +1734,8 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
 fn forcing_changed_uses_plain_green_cli_value() {
     let row = DetailRow::ChangedForcesReplacement {
         key: "name".to_string(),
-        old: "\"old\"".to_string(),
-        new: "\"new\"".to_string(),
+        old: render_value(&Value::Concrete(ConcreteValue::String("old".into()))),
+        new: render_value(&Value::Concrete(ConcreteValue::String("new".into()))),
     };
     let effect = Effect::Update {
         from: Box::new(State::existing(
@@ -1542,17 +1752,22 @@ fn forcing_changed_uses_plain_green_cli_value() {
     colored::control::unset_override();
 
     assert!(
-        out.contains("\u{1b}[32m\"new\"\u{1b}[0m"),
+        out.contains("\u{1b}[32m'new'\u{1b}[0m"),
         "forcing Changed rows must render the new value with plain green: {out:?}"
     );
 }
 
 #[test]
 fn forcing_changed_multiline_green_style_does_not_cross_newline() {
+    let new = PrettyValue::new(Value::Concrete(ConcreteValue::StringList(vec![
+        "new".repeat(30).into(),
+    ])))
+    .render(PrettyLayout::for_attribute(60, "rules"));
+    assert!(new.plain().contains('\n'));
     let row = DetailRow::ChangedForcesReplacement {
         key: "rules".to_string(),
-        old: "[]".to_string(),
-        new: "[\n  \"new\"\n]".to_string(),
+        old: render_value(&Value::Concrete(ConcreteValue::List(Vec::new()))),
+        new,
     };
     let effect = Effect::Update {
         from: Box::new(State::existing(
@@ -1569,9 +1784,38 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
     colored::control::unset_override();
 
     assert!(
-        out.contains("\u{1b}[32m[\u{1b}[0m\n\u{1b}[32m  \"new\"\u{1b}[0m\n\u{1b}[32m]\u{1b}[0m"),
-        "forcing Changed multiline values must reset green styling before each newline: {out:?}"
+        !out.contains("\u{1b}[32m\n"),
+        "green must not cross a newline: {out:?}"
     );
+    assert!(
+        !out.contains("\n\u{1b}[32m  "),
+        "indentation must remain unstyled: {out:?}"
+    );
+}
+
+#[test]
+fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
+    let row = DetailRow::StringListDiff {
+        key: "items".to_string(),
+        unchanged: Vec::new(),
+        added: vec![render_value(&Value::Concrete(ConcreteValue::String(
+            "a".into(),
+        )))],
+        removed: Vec::new(),
+    };
+    let effect = Effect::Update {
+        from: Box::new(State::existing(
+            ResourceId::with_identity("test.Widget", "w"),
+            HashMap::new(),
+        )),
+        to: resolved(Resource::new("test.Widget", "w")),
+        changed_attributes: vec!["items".to_string()],
+    };
+
+    let mut out = String::new();
+    render_detail_row(&mut out, &row, &effect, "");
+
+    assert!(out.contains("  + 'a'\n"), "rendered row: {out:?}");
 }
 
 /// When a state refresh has been printed above the plan output, a single
@@ -1873,55 +2117,4 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
         ctx.printed.contains(&1),
         "suppressed move dependent should be consumed"
     );
-}
-
-/// carina#3356: `reindent_with_gutter` restores the tree gutter on every
-/// continuation line of a multi-line value block. The caller emits
-/// `attr_prefix` ahead of line 0, so line 0 is returned verbatim; each
-/// later line's leading `attr_prefix`-width spaces are swapped for the
-/// gutter string, preserving the value-relative indent past the gutter.
-#[test]
-fn test_reindent_with_gutter_restores_gutter_on_continuation_lines() {
-    // attr_prefix is 8 columns wide: 5 spaces, `│`, 2 spaces.
-    let attr_prefix = "     │  ";
-    // `format_value_pretty`-style block: line 0 bare (caller prepends the
-    // prefix), continuation lines indented with plain spaces sized to the
-    // gutter width + value indent. The `*`-marked element key sits 2 cols
-    // past the gutter; the sibling continuation key aligns 2 further in.
-    let block = "\n          * action: \"x\"\n            effect: \"y\"";
-    let out = reindent_with_gutter(block, attr_prefix);
-    assert_eq!(
-        out,
-        "\n     │    * action: \"x\"\n     │      effect: \"y\"",
-    );
-}
-
-/// A blank inter-element separator (empty line) collapses to the bare
-/// gutter with no trailing padding, matching the tree's own `│`-only
-/// continuation lines (and avoiding trailing-whitespace noise).
-#[test]
-fn test_reindent_with_gutter_blank_line_becomes_bare_gutter() {
-    let attr_prefix = "     │  ";
-    let block = "\n          * a: \"x\"\n\n          * b: \"y\"";
-    let out = reindent_with_gutter(block, attr_prefix);
-    assert_eq!(out, "\n     │    * a: \"x\"\n     │\n     │    * b: \"y\"",);
-}
-
-/// A single-line value has no continuation rows, so it is returned
-/// unchanged — the caller's `attr_prefix` on line 0 already suffices.
-#[test]
-fn test_reindent_with_gutter_single_line_unchanged() {
-    assert_eq!(reindent_with_gutter("\"scalar\"", "     │  "), "\"scalar\"");
-}
-
-/// For a root resource the gutter is pure spaces, so reindenting is a
-/// no-op (leading spaces swapped for an equal-width run of spaces) and a
-/// blank separator trims back to empty — existing root-level snapshots
-/// must stay byte-identical.
-#[test]
-fn test_reindent_with_gutter_no_gutter_is_noop() {
-    let attr_prefix = "      "; // 6 spaces, no `│`
-    let block = "\n        * a: \"x\"\n\n        * b: \"y\"";
-    let out = reindent_with_gutter(block, attr_prefix);
-    assert_eq!(out, block);
 }

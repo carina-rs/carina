@@ -5,8 +5,10 @@ use colored::Colorize;
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
+use carina_core::value::render_json_value;
 use carina_state::{StateBackend, resolve_backend_for_read};
 
+use crate::display::colored_value;
 use crate::error::AppError;
 use carina_core::hint::ProjectCommand;
 
@@ -93,7 +95,11 @@ fn print_single_export(
             );
         }
         OutputFormat::Human => {
-            println!("{} = {}", key.bold(), format_json_value(value));
+            println!(
+                "{} = {}",
+                key.bold(),
+                colored_value(&render_json_value(value))
+            );
         }
     }
 
@@ -129,27 +135,16 @@ fn print_all_exports(
             let mut keys: Vec<&String> = exports.keys().collect();
             keys.sort();
             for key in keys {
-                println!("{} = {}", key.bold(), format_json_value(&exports[key]));
+                println!(
+                    "{} = {}",
+                    key.bold(),
+                    colored_value(&render_json_value(&exports[key]))
+                );
             }
         }
     }
 
     Ok(())
-}
-
-/// Format a serde_json::Value for human-readable display.
-fn format_json_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => format!("\"{}\"", s),
-        serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(format_json_value).collect();
-            format!("[{}]", items.join(", "))
-        }
-        serde_json::Value::Object(map) => {
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| format!("{:?}", map))
-        }
-        _ => value.to_string(),
-    }
 }
 
 /// Format a value for --raw output (no quoting, no key).
@@ -194,22 +189,35 @@ mod tests {
     }
 
     #[test]
-    fn format_json_value_string() {
+    fn human_json_value_string() {
         let v = serde_json::Value::String("vpc-0abc123".into());
-        assert_eq!(format_json_value(&v), "\"vpc-0abc123\"");
+        assert_eq!(render_json_value(&v).plain(), "'vpc-0abc123'");
     }
 
     #[test]
-    fn format_json_value_array() {
+    fn human_json_value_array() {
         let v = serde_json::json!(["459524413166", "151116838382"]);
-        let formatted = format_json_value(&v);
-        assert_eq!(formatted, "[\"459524413166\", \"151116838382\"]");
+        let formatted = render_json_value(&v);
+        assert_eq!(formatted.plain(), "['459524413166', '151116838382']");
     }
 
     #[test]
-    fn format_json_value_number() {
+    fn human_json_value_number() {
         let v = serde_json::json!(42);
-        assert_eq!(format_json_value(&v), "42");
+        assert_eq!(render_json_value(&v).plain(), "42");
+    }
+
+    #[test]
+    fn human_json_value_object_uses_carina_literals_recursively() {
+        let value = serde_json::json!({
+            "safe_key": "plain",
+            "it's": ["quoted", {"a-b": "nested"}],
+        });
+
+        assert_eq!(
+            render_json_value(&value).plain(),
+            r#"{"it's": ['quoted', {'a-b': 'nested'}], safe_key: 'plain'}"#
+        );
     }
 
     #[test]

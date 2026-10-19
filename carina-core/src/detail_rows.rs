@@ -20,7 +20,10 @@ use crate::resource::{
     ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value, pair_list_elements,
 };
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
-use crate::value::{format_value, format_value_with_key, is_list_of_maps};
+use crate::value::{
+    PrettyValue, RenderedKey, RenderedValue, is_list_of_maps, render_enum_text, render_other,
+    render_string_text, render_value,
+};
 
 /// Controls how much detail is shown in plan output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +227,7 @@ pub enum DetailRow {
     /// A normal attribute value (for Create/Delete effects)
     Attribute {
         key: String,
-        value: String,
+        value: RenderedValue,
         /// If this attribute is a ResourceRef, stores the binding name for navigation
         ref_binding: Option<String>,
         /// Optional annotation (e.g., "# default_tags") shown after the value
@@ -235,22 +238,20 @@ pub enum DetailRow {
         key: String,
         entries: Vec<MapExpandedEntry>,
     },
-    /// An attribute whose value is rendered with `format_value_pretty` at
-    /// render time. Used for list-of-map attributes on Create — carries the
-    /// raw `Value` rather than a pre-stringified form so the renderer can
-    /// supply the actual indent column when calling `format_value_pretty`.
-    PrettyAttribute { key: String, value: Value },
+    /// An attribute whose value is rendered with indentation supplied by the
+    /// frontend while the formatting itself remains owned by core.
+    PrettyAttribute { key: String, value: PrettyValue },
     /// An attribute that changed (for Update effects)
     Changed {
         key: String,
-        old: String,
-        new: String,
+        old: RenderedValue,
+        new: RenderedValue,
     },
     /// An attribute that changed and forces replacement.
     ChangedForcesReplacement {
         key: String,
-        old: String,
-        new: String,
+        old: RenderedValue,
+        new: RenderedValue,
     },
     /// A map attribute with key-level diffs.
     MapDiff {
@@ -285,54 +286,50 @@ pub enum DetailRow {
     /// Per-element `List<String>` diff (#2943).
     StringListDiff {
         key: String,
-        unchanged: Vec<String>,
-        added: Vec<String>,
-        removed: Vec<String>,
+        unchanged: Vec<RenderedValue>,
+        added: Vec<RenderedValue>,
+        removed: Vec<RenderedValue>,
     },
     /// Per-element `List<String>` diff that forces replacement.
     StringListDiffForcesReplacement {
         key: String,
-        unchanged: Vec<String>,
-        added: Vec<String>,
-        removed: Vec<String>,
+        unchanged: Vec<RenderedValue>,
+        added: Vec<RenderedValue>,
+        removed: Vec<RenderedValue>,
     },
     /// An attribute that was removed (for Update effects)
-    Removed { key: String, old: String },
+    Removed { key: String, old: RenderedValue },
     /// An attribute with a schema default value (for Create effects in Full mode)
-    Default { key: String, value: String },
+    Default { key: String, value: RenderedValue },
     /// A read-only attribute (known after apply, for Create effects in Full mode)
     ReadOnly { key: String },
     /// Summary of hidden unchanged attributes (for Update/Replace effects in Full mode)
     HiddenUnchanged { count: usize },
     /// A removed create-only attribute that forces replacement.
-    ReplaceRemoved { key: String, old: String },
+    ReplaceRemoved { key: String, old: RenderedValue },
     /// A cascade-triggered create-only attribute (value not yet known)
     ReplaceCascade {
         key: String,
-        old: String,
-        new: String,
+        old: RenderedValue,
+        new: RenderedValue,
     },
-    /// Temporary name note for create-before-destroy replacement
+    /// Temporary name note for create-before-destroy replacement.
     TemporaryNameNote {
         can_rename: bool,
-        temporary_value: String,
-        original_value: String,
+        temporary_value: RenderedValue,
+        original_value: RenderedValue,
         attribute: String,
     },
 }
 
 /// A single entry in an expanded map (e.g., tags with default_tags annotation).
 ///
-/// `value` is kept as a raw `Value` so renderers can apply
-/// `format_value_pretty` with the actual indent column. Pre-stringifying
-/// at build time would force nested complex values (list-of-maps,
-/// long string lists) onto a single line because a `String` carries no
-/// indentation context. Renderers should pass the column at which the
-/// entry's `key` is rendered as `PrettyLayout::parent_indent_cols`.
+/// The value retains its structure behind [`PrettyValue`] so frontends can
+/// supply their actual indentation without gaining access to the raw value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapExpandedEntry {
-    pub key: String,
-    pub value: Value,
+    pub key: RenderedKey,
+    pub value: PrettyValue,
     /// Optional annotation (e.g., "# default_tags") shown after the value
     pub annotation: Option<String>,
 }
@@ -341,19 +338,19 @@ pub struct MapExpandedEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MapDiffEntryIR {
     Added {
-        key: String,
-        value: String,
+        key: RenderedKey,
+        value: RenderedValue,
         /// Optional annotation (e.g., "# default_tags") shown after the value.
         annotation: Option<String>,
     },
     Removed {
-        key: String,
-        value: String,
+        key: RenderedKey,
+        value: RenderedValue,
     },
     Changed {
-        key: String,
-        old: String,
-        new: String,
+        key: RenderedKey,
+        old: RenderedValue,
+        new: RenderedValue,
         /// Optional annotation (e.g., "# default_tags") shown after the new value.
         annotation: Option<String>,
     },
@@ -362,7 +359,7 @@ pub enum MapDiffEntryIR {
     /// `entries` is `NonEmptyVec` so renderers do not need to defend
     /// against an empty container header (#2910).
     NestedMapDiff {
-        key: String,
+        key: RenderedKey,
         entries: NonEmptyVec<MapDiffEntryIR>,
     },
     /// Nested list-of-maps diff: when both old and new values are lists of maps,
@@ -370,7 +367,7 @@ pub enum MapDiffEntryIR {
     /// constructor enforces "at least one of unchanged/modified/added/removed
     /// is non-empty" (#2910).
     NestedListOfMapsDiff {
-        key: String,
+        key: RenderedKey,
         block: NonEmptyListOfMapsBlock,
     },
     /// Per-element `List<String>` field diff inside a nested map (#3234).
@@ -379,10 +376,10 @@ pub enum MapDiffEntryIR {
     /// `principal.aws`) renders as multi-line `+` / `-` markers instead
     /// of the inline `[A] → [A, B]` form that overflows the terminal.
     StringListChanged {
-        key: String,
-        unchanged: Vec<String>,
-        added: Vec<String>,
-        removed: Vec<String>,
+        key: RenderedKey,
+        unchanged: Vec<RenderedValue>,
+        added: Vec<RenderedValue>,
+        removed: Vec<RenderedValue>,
     },
 }
 
@@ -393,7 +390,7 @@ pub enum MapDiffEntryIR {
 /// header with nothing under it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NonEmptyListOfMapsBlock {
-    unchanged: Vec<String>,
+    unchanged: Vec<RenderedValue>,
     modified: Vec<ListOfMapsDiffModified>,
     added: Vec<ListOfMapsDiffItem>,
     removed: Vec<ListOfMapsDiffItem>,
@@ -401,7 +398,7 @@ pub struct NonEmptyListOfMapsBlock {
 
 impl NonEmptyListOfMapsBlock {
     pub fn from_parts(
-        unchanged: Vec<String>,
+        unchanged: Vec<RenderedValue>,
         modified: Vec<ListOfMapsDiffModified>,
         added: Vec<ListOfMapsDiffItem>,
         removed: Vec<ListOfMapsDiffItem>,
@@ -418,7 +415,7 @@ impl NonEmptyListOfMapsBlock {
         }
     }
 
-    pub fn unchanged(&self) -> &[String] {
+    pub fn unchanged(&self) -> &[RenderedValue] {
         &self.unchanged
     }
     pub fn modified(&self) -> &[ListOfMapsDiffModified] {
@@ -434,16 +431,12 @@ impl NonEmptyListOfMapsBlock {
 
 /// A wholly added or removed item in a list-of-maps diff (#2877).
 ///
-/// Fields carry the raw `Value` rather than a pre-stringified form so the
-/// renderer can supply the actual indent column when calling
-/// `format_value_pretty`. Pre-stringifying at build time would force
-/// nested complex values (long string lists, nested maps) onto a single
-/// line because a `String` carries no indentation context — that was
-/// exactly the bug fixed in #2877.
+/// Fields retain their structure behind [`PrettyValue`] so renderers can
+/// supply their actual indent column without gaining access to raw values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListOfMapsDiffItem {
     /// Map fields in the order they should be rendered (alphabetical).
-    pub fields: Vec<(String, Value)>,
+    pub fields: Vec<(RenderedKey, PrettyValue)>,
 }
 
 /// Whether a `ListOfMapsDiffItem` is a wholly-added or wholly-removed
@@ -477,22 +470,22 @@ pub struct ListOfMapsDiffModified {
 pub enum ListOfMapsDiffField {
     /// Field value changed
     Changed {
-        key: String,
-        old: String,
-        new: String,
+        key: RenderedKey,
+        old: RenderedValue,
+        new: RenderedValue,
     },
     /// Field value is a nested map that changed — show recursive key-level diffs
     NestedMapChanged {
-        key: String,
+        key: RenderedKey,
         entries: Vec<MapDiffEntryIR>,
     },
     /// Per-element `List<String>` field diff inside a modified
     /// list-of-maps element (#2943).
     StringListChanged {
-        key: String,
-        unchanged: Vec<String>,
-        added: Vec<String>,
-        removed: Vec<String>,
+        key: RenderedKey,
+        unchanged: Vec<RenderedValue>,
+        added: Vec<RenderedValue>,
+        removed: Vec<RenderedValue>,
     },
 }
 
@@ -559,11 +552,11 @@ pub fn build_detail_rows_by_instance(
             // interpolation renders as `(known after upstream apply: …)`
             // instead of being silently substituted to empty.
             // `format_import_identifier` prints concrete identifiers bare
-            // and falls back to the structured `format_value_with_key`
+            // and falls back to the structured canonical value formatter
             // shape only for the deferred / interpolation case.
             vec![DetailRow::Attribute {
                 key: "id".to_string(),
-                value: crate::effect::format_import_identifier(identifier),
+                value: render_other(crate::effect::format_import_identifier(identifier)),
                 ref_binding: None,
                 annotation: None,
             }]
@@ -574,6 +567,27 @@ pub fn build_detail_rows_by_instance(
         | Effect::DeferredCreate { .. }
         | Effect::DeferredReplace(_) => Vec::new(),
     }
+}
+
+/// Build the TUI-only identifier fallback for a delete whose normal detail
+/// rows are empty.
+///
+/// Taking the typed effect keeps arbitrary text from being promoted into a
+/// [`RenderedValue`] by downstream renderers. Callers remain responsible for
+/// deciding whether their display surface should show this fallback.
+pub fn delete_identifier_fallback_row(effect: &Effect) -> Option<DetailRow> {
+    let Effect::Delete { identifier, .. } = effect else {
+        return None;
+    };
+    if identifier.is_empty() {
+        return None;
+    }
+    Some(DetailRow::Attribute {
+        key: "identifier".to_string(),
+        value: render_other(identifier),
+        ref_binding: None,
+        annotation: None,
+    })
 }
 
 fn build_create_rows(
@@ -598,14 +612,14 @@ fn build_create_rows(
             continue;
         }
         // `Value::Concrete(ConcreteValue::List)` (any element type) goes through PrettyAttribute so
-        // `format_value_pretty` can apply its 80-col threshold and YAML-style
+        // `PrettyValue::render` can apply its 80-col threshold and YAML-style
         // vertical layout. `Value::Concrete(ConcreteValue::Map)` keeps the existing MapExpanded path
         // because that variant carries per-entry annotation slots that
         // PrettyAttribute does not represent (used by tags/default_tags).
         if let Value::Concrete(ConcreteValue::List(_)) = value {
             rows.push(DetailRow::PrettyAttribute {
                 key: key.to_string(),
-                value: value.clone(),
+                value: PrettyValue::new(value.clone()),
             });
         } else if let Value::Concrete(ConcreteValue::Map(map)) = value {
             rows.push(build_expanded_map_row(key, map));
@@ -618,7 +632,7 @@ fn build_create_rows(
             };
             rows.push(DetailRow::Attribute {
                 key: key.to_string(),
-                value: format_value_with_key(value, Some(key)),
+                value: render_value(value),
                 ref_binding,
                 annotation: None,
             });
@@ -653,8 +667,8 @@ fn build_expanded_map_row(key: &str, map: &IndexMap<String, Value>) -> DetailRow
     let entries = keys
         .into_iter()
         .map(|k| MapExpandedEntry {
-            key: k.clone(),
-            value: map[k].clone(),
+            key: RenderedKey::from_raw(k),
+            value: PrettyValue::new(map[k].clone()),
             annotation: None,
         })
         .collect();
@@ -677,8 +691,8 @@ fn build_expanded_tags_row(
             let value = &map[key];
             let annotation = default_tag_annotation(default_tag_keys, key);
             MapExpandedEntry {
-                key: key.clone(),
-                value: value.clone(),
+                key: RenderedKey::from_raw(key),
+                value: PrettyValue::new(value.clone()),
                 annotation,
             }
         })
@@ -764,7 +778,12 @@ struct AttributeDiffRows {
     effectively_unchanged: usize,
 }
 
-fn changed_row(key: String, old: String, new: String, forces_replacement: bool) -> DetailRow {
+fn changed_row(
+    key: String,
+    old: RenderedValue,
+    new: RenderedValue,
+    forces_replacement: bool,
+) -> DetailRow {
     if forces_replacement {
         DetailRow::ChangedForcesReplacement { key, old, new }
     } else {
@@ -798,9 +817,9 @@ fn list_of_maps_diff_row(
 
 fn string_list_diff_row(
     key: String,
-    unchanged: Vec<String>,
-    added: Vec<String>,
-    removed: Vec<String>,
+    unchanged: Vec<RenderedValue>,
+    added: Vec<RenderedValue>,
+    removed: Vec<RenderedValue>,
     forces_replacement: bool,
 ) -> DetailRow {
     if forces_replacement {
@@ -945,14 +964,14 @@ fn build_attribute_diff_rows(
         if is_same {
             if forces_replacement {
                 let old_str = old_value
-                    .map(|v| format_value_with_key(v, Some(key)))
-                    .unwrap_or_else(|| "(none)".to_string());
+                    .map(render_value)
+                    .unwrap_or_else(|| render_other("(none)"));
                 let new_str = ctx
                     .cascade_ref_hints
                     .iter()
                     .find(|(attr, _)| attr == key)
-                    .map(|(_, hint)| hint.clone())
-                    .unwrap_or_else(|| format_value_with_key(new_value, Some(key)));
+                    .map(|(_, hint)| render_other(hint.clone()))
+                    .unwrap_or_else(|| render_value(new_value));
                 rows.push(DetailRow::ReplaceCascade {
                     key: key.to_string(),
                     old: old_str,
@@ -1007,9 +1026,9 @@ fn build_attribute_diff_rows(
             ));
         } else {
             let old_str = old_value
-                .map(|v| format_value_with_key(v, Some(key)))
-                .unwrap_or_else(|| "(none)".to_string());
-            let new_str = format_value_with_key(new_value, Some(key));
+                .map(render_value)
+                .unwrap_or_else(|| render_other("(none)"));
+            let new_str = render_value(new_value);
             // carina#3258: if the attribute's two sides render
             // identically, `~ key: X → X` is a lie — the upstream
             // differ flagged the attribute as changed but the display
@@ -1025,7 +1044,7 @@ fn build_attribute_diff_rows(
             // `"(secret)"`, so display equality is meaningless and
             // suppression would hide a real secret rotation.
             if !forces_replacement
-                && old_str == new_str
+                && old_str.plain() == new_str.plain()
                 && old_value.is_none_or(|v| !crate::value::contains_secret(v))
                 && !crate::value::contains_secret(new_value)
             {
@@ -1162,8 +1181,8 @@ fn build_replace_rows_from_attributes(
     if let Some(temp) = temporary_name {
         rows.push(DetailRow::TemporaryNameNote {
             can_rename: temp.can_rename,
-            temporary_value: temp.temporary_value.clone(),
-            original_value: temp.original_value.clone(),
+            temporary_value: render_string_text(&temp.temporary_value),
+            original_value: render_string_text(&temp.original_value),
             attribute: temp.attribute.clone(),
         });
     }
@@ -1196,7 +1215,7 @@ fn build_replace_removed_row(
     let Some(old_value) = old_value else {
         return DetailRow::ReplaceRemoved {
             key: key.to_string(),
-            old: "(none)".to_string(),
+            old: render_other("(none)"),
         };
     };
 
@@ -1223,7 +1242,7 @@ fn build_replace_removed_row(
 
     DetailRow::ReplaceRemoved {
         key: key.to_string(),
-        old: format_value_with_key(old_value, Some(key)),
+        old: render_value(old_value),
     }
 }
 
@@ -1254,7 +1273,7 @@ fn build_removed_attr_row(
 
     DetailRow::Removed {
         key: key.to_string(),
-        old: format_value_with_key(old_value, Some(key)),
+        old: render_value(old_value),
     }
 }
 
@@ -1272,7 +1291,7 @@ fn build_delete_rows(
         keys.sort();
         for key in keys {
             let value = &attrs[key];
-            // Route lists through PrettyAttribute so `format_value_pretty`
+            // Route lists through PrettyAttribute so `PrettyValue::render`
             // applies its 80-col threshold and YAML-style vertical layout,
             // mirroring `build_create_rows`. Without this, a list-of-maps
             // like `domain_validation_options` renders on one long,
@@ -1280,7 +1299,7 @@ fn build_delete_rows(
             if let Value::Concrete(ConcreteValue::List(_)) = value {
                 rows.push(DetailRow::PrettyAttribute {
                     key: key.to_string(),
-                    value: value.clone(),
+                    value: PrettyValue::new(value.clone()),
                 });
             } else if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 rows.push(build_expanded_map_row(key, map));
@@ -1293,7 +1312,7 @@ fn build_delete_rows(
                 };
                 rows.push(DetailRow::Attribute {
                     key: key.to_string(),
-                    value: format_value_with_key(value, Some(key)),
+                    value: render_value(value),
                     ref_binding,
                     annotation: None,
                 });
@@ -1326,8 +1345,8 @@ fn build_map_removed_row(key: &str, old_value: &Value) -> Option<DetailRow> {
     let entries: Vec<MapDiffEntryIR> = sorted_keys
         .into_iter()
         .map(|k| MapDiffEntryIR::Removed {
-            key: k.clone(),
-            value: format_value_with_key(&old_map[k], Some(k)),
+            key: RenderedKey::from_raw(k),
+            value: render_value(&old_map[k]),
         })
         .collect();
     let entries = NonEmptyVec::from_vec(entries)?;
@@ -1365,7 +1384,7 @@ fn build_map_diff_row(
                 | MapDiffEntryIR::Changed {
                     key, annotation, ..
                 } => {
-                    *annotation = default_tag_annotation(default_tag_keys, key);
+                    *annotation = default_tag_annotation(default_tag_keys, key.raw());
                 }
                 MapDiffEntryIR::Removed { .. }
                 | MapDiffEntryIR::NestedMapDiff { .. }
@@ -1398,8 +1417,8 @@ fn compute_map_diff_entries(
                 .added
                 .iter()
                 .map(|entry| MapDiffEntryIR::Added {
-                    key: entry.key.clone(),
-                    value: format_value_with_key(&entry.value, Some(&entry.key)),
+                    key: RenderedKey::from_raw(&entry.key),
+                    value: render_value(&entry.value),
                     annotation: None,
                 })
                 .collect();
@@ -1449,7 +1468,7 @@ fn compute_map_diff_entries(
                     // never renders empty.
                     if let Some(entries_nev) = NonEmptyVec::from_vec(nested) {
                         entries.push(MapDiffEntryIR::NestedMapDiff {
-                            key: e.key.clone(),
+                            key: RenderedKey::from_raw(&e.key),
                             entries: entries_nev,
                         });
                     }
@@ -1470,7 +1489,7 @@ fn compute_map_diff_entries(
                         NonEmptyListOfMapsBlock::from_parts(Vec::new(), modified, added, removed)
                     {
                         entries.push(MapDiffEntryIR::NestedListOfMapsDiff {
-                            key: e.key.clone(),
+                            key: RenderedKey::from_raw(&e.key),
                             block,
                         });
                     }
@@ -1479,28 +1498,28 @@ fn compute_map_diff_entries(
                 {
                     // #3234: see MapDiffEntryIR::StringListChanged docs.
                     entries.push(MapDiffEntryIR::StringListChanged {
-                        key: e.key.clone(),
+                        key: RenderedKey::from_raw(&e.key),
                         unchanged: diff.unchanged,
                         added: diff.added,
                         removed: diff.removed,
                     });
                 } else {
-                    let old_s = format_value_with_key(&e.old_value, Some(&e.key));
-                    let new_s = format_value_with_key(&e.new_value, Some(&e.key));
+                    let old_s = render_value(&e.old_value);
+                    let new_s = render_value(&e.new_value);
                     // carina#3258: see the renderer-truth note in
                     // `build_update_rows` (including the secret
                     // bypass). Map-level hidden counts roll up at the
                     // attribute level, so silently dropping the entry
                     // (matching the schema-aware leaf-skip arm above)
                     // is the correct behavior here.
-                    if old_s == new_s
+                    if old_s.plain() == new_s.plain()
                         && !crate::value::contains_secret(&e.old_value)
                         && !crate::value::contains_secret(&e.new_value)
                     {
                         continue;
                     }
                     entries.push(MapDiffEntryIR::Changed {
-                        key: e.key.clone(),
+                        key: RenderedKey::from_raw(&e.key),
                         old: old_s,
                         new: new_s,
                         annotation: None,
@@ -1509,15 +1528,15 @@ fn compute_map_diff_entries(
             }
             crate::diff_helpers::MapDiffItem::Added(e) => {
                 entries.push(MapDiffEntryIR::Added {
-                    key: e.key.clone(),
-                    value: format_value_with_key(&e.value, Some(&e.key)),
+                    key: RenderedKey::from_raw(&e.key),
+                    value: render_value(&e.value),
                     annotation: None,
                 });
             }
             crate::diff_helpers::MapDiffItem::Removed(e) => {
                 entries.push(MapDiffEntryIR::Removed {
-                    key: e.key.clone(),
-                    value: format_value_with_key(&e.value, Some(&e.key)),
+                    key: RenderedKey::from_raw(&e.key),
+                    value: render_value(&e.value),
                 });
             }
         }
@@ -1558,7 +1577,7 @@ fn compute_list_of_maps_diff_parts(
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
 ) -> (
-    Vec<String>,
+    Vec<RenderedValue>,
     Vec<ListOfMapsDiffModified>,
     Vec<ListOfMapsDiffItem>,
     Vec<ListOfMapsDiffItem>,
@@ -1649,16 +1668,8 @@ fn compute_list_of_maps_diff_parts(
     // Build output parts
     let mut unchanged = Vec::new();
     for (ni, new_item) in new_items.iter().enumerate() {
-        if let Value::Concrete(ConcreteValue::Map(map)) = new_item
-            && new_matched[ni]
-        {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            unchanged.push(format!("{{{}}}", fields.join(", ")));
+        if matches!(new_item, Value::Concrete(ConcreteValue::Map(_))) && new_matched[ni] {
+            unchanged.push(render_value(new_item));
         }
     }
 
@@ -1711,30 +1722,30 @@ fn compute_list_of_maps_diff_parts(
                         continue;
                     }
                     fields.push(ListOfMapsDiffField::NestedMapChanged {
-                        key: k.to_string(),
+                        key: RenderedKey::from_raw(k),
                         entries: nested,
                     });
                 } else if let Some(diff) =
                     compute_string_list_change(old_val, &new_map[k], field_type, defs)
                 {
                     fields.push(ListOfMapsDiffField::StringListChanged {
-                        key: k.to_string(),
+                        key: RenderedKey::from_raw(k),
                         unchanged: diff.unchanged,
                         added: diff.added,
                         removed: diff.removed,
                     });
                 } else {
                     let old_v = old_val
-                        .map(format_value)
-                        .unwrap_or_else(|| "(none)".to_string());
-                    let new_v = format_value(&new_map[k]);
+                        .map(render_value)
+                        .unwrap_or_else(|| render_other("(none)"));
+                    let new_v = render_value(&new_map[k]);
                     // carina#3258: see the renderer-truth note in
                     // `build_update_rows` (including the secret
                     // bypass). Fold display-equal peers into the
                     // per-element hidden-unchanged count so the
                     // summary stays consistent with the rendered
                     // evidence.
-                    if old_v == new_v
+                    if old_v.plain() == new_v.plain()
                         && old_val.is_none_or(|v| !crate::value::contains_secret(v))
                         && !crate::value::contains_secret(&new_map[k])
                     {
@@ -1742,7 +1753,7 @@ fn compute_list_of_maps_diff_parts(
                         continue;
                     }
                     fields.push(ListOfMapsDiffField::Changed {
-                        key: k.to_string(),
+                        key: RenderedKey::from_raw(k),
                         old: old_v,
                         new: new_v,
                     });
@@ -1818,7 +1829,7 @@ fn collect_added_removed_items(indices: &[usize], items: &[Value]) -> Vec<ListOf
                 entries.sort_by(|a, b| a.0.cmp(b.0));
                 let fields = entries
                     .into_iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| (RenderedKey::from_raw(k), PrettyValue::new(v.clone())))
                     .collect();
                 Some(ListOfMapsDiffItem { fields })
             } else {
@@ -1855,71 +1866,107 @@ fn compute_string_list_change(
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> Option<crate::diff_helpers::StringListDiff> {
-    let mut new_list = crate::value::as_string_list(new_value)?;
-    let mut old_list = match old_value {
-        Some(ov) => crate::value::as_string_list(ov)?,
+) -> Option<crate::diff_helpers::StringListDiff<RenderedValue>> {
+    let enum_context = attr_type
+        .and_then(|attr_type| string_list_inner_type(attr_type, defs))
+        .and_then(AttributeType::enum_parts)
+        .map(|(_, values, _, _, dsl_map)| EnumListDiffContext {
+            valid_values: values.into_iter().flatten().map(String::as_str).collect(),
+            dsl_map,
+        });
+
+    let new_list = project_string_list_diff_elements(new_value, enum_context.as_ref())?;
+    let old_list = match old_value {
+        Some(old_value) => project_string_list_diff_elements(old_value, enum_context.as_ref())?,
         None => Vec::new(),
     };
     // carina#3075: when the element type is a `Enum`, the set-diff
     // must compare enum *values*, not raw spellings — otherwise a
     // DSL-alias element (`allow`) vs its API-canonical form (`Allow`) is
     // reported as a phantom `- allow / + Allow` pair alongside any genuine
-    // add/remove. Canonicalize only typed enum values to the API spelling;
-    // ordinary strings remain literal (including dotted prefixes) and share
-    // only the differ's case-insensitive equality.
-    let is_enum_list = if let Some((_, values, _, _, dsl_map)) = attr_type
-        .and_then(|attr_type| string_list_inner_type(attr_type, defs))
-        .and_then(|t| t.enum_parts())
-    {
-        let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
-        new_list = enum_string_list_for_diff(new_value, &valid, &dsl_map)?;
-        old_list = match old_value {
-            Some(value) => enum_string_list_for_diff(value, &valid, &dsl_map)?,
-            None => Vec::new(),
-        };
-        true
-    } else {
-        false
-    };
-    let diff = if is_enum_list {
-        crate::diff_helpers::compute_string_list_diff_by(
-            &old_list,
-            &new_list,
-            crate::resource::enum_values_equal,
-        )
-    } else {
-        crate::diff_helpers::compute_string_list_diff(&old_list, &new_list)
-    };
+    // add/remove. Canonicalize only typed enum values to the API spelling.
+    // Ordinary strings remain literal comparison keys (including dotted
+    // prefixes), while the enum-list equality rule still compares keys
+    // case-insensitively.
+    let enum_typed = enum_context.is_some();
+    let diff = crate::diff_helpers::compute_string_list_diff_by(
+        &old_list,
+        &new_list,
+        |left, right| {
+            if enum_typed {
+                crate::resource::enum_values_equal(&left.comparison_key, &right.comparison_key)
+            } else {
+                left.comparison_key == right.comparison_key
+            }
+        },
+        |element| element.display.clone(),
+    );
     if diff.added.is_empty() && diff.removed.is_empty() {
         return None;
     }
     Some(diff)
 }
 
-fn enum_string_list_for_diff(
+struct StringListDiffElement {
+    comparison_key: String,
+    display: RenderedValue,
+}
+
+struct EnumListDiffContext<'a> {
+    valid_values: Vec<&'a str>,
+    dsl_map: crate::schema::DslMap<'a>,
+}
+
+/// Project a list-like value exactly once, retaining both the comparison key
+/// and the display text from the same source element. Only typed enum values
+/// are canonicalized; strings stay strings even when the schema's element
+/// type is an enum.
+fn project_string_list_diff_elements(
     value: &Value,
-    valid_values: &[&str],
-    dsl_map: &crate::schema::DslMap<'_>,
-) -> Option<Vec<String>> {
+    enum_context: Option<&EnumListDiffContext<'_>>,
+) -> Option<Vec<StringListDiffElement>> {
     match value {
         Value::Concrete(ConcreteValue::StringList(items)) => Some(
             items
                 .iter()
-                .map(|item| item.expose_plaintext().to_string())
+                .map(|item| {
+                    let plaintext = item.expose_plaintext();
+                    StringListDiffElement {
+                        comparison_key: plaintext.to_string(),
+                        display: render_string_text(plaintext),
+                    }
+                })
                 .collect(),
         ),
         Value::Concrete(ConcreteValue::List(items)) => items
             .iter()
             .map(|item| match item {
                 Value::Concrete(ConcreteValue::String(text)) => {
-                    Some(text.expose_plaintext().to_string())
+                    let plaintext = text.expose_plaintext();
+                    Some(StringListDiffElement {
+                        comparison_key: plaintext.to_string(),
+                        display: render_string_text(plaintext),
+                    })
                 }
                 Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) => {
-                    Some(identifier.canonical_api_spelling(valid_values, dsl_map))
+                    let comparison_key = enum_context.map_or_else(
+                        || identifier.as_str().to_string(),
+                        |context| {
+                            identifier
+                                .canonical_api_spelling(&context.valid_values, &context.dsl_map)
+                        },
+                    );
+                    Some(StringListDiffElement {
+                        display: render_enum_text(comparison_key.clone()),
+                        comparison_key,
+                    })
                 }
                 Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-                    Some(value.api_value().to_string())
+                    let comparison_key = value.api_value().to_string();
+                    Some(StringListDiffElement {
+                        display: render_enum_text(comparison_key.clone()),
+                        comparison_key,
+                    })
                 }
                 _ => None,
             })
@@ -1981,6 +2028,14 @@ mod tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn rendered_key(key: &str) -> RenderedKey {
+        RenderedKey::from_raw(key)
+    }
+
+    fn pretty_value(value: Value) -> PrettyValue {
+        PrettyValue::new(value)
     }
 
     fn build_detail_rows(
@@ -2079,7 +2134,7 @@ mod tests {
     #[test]
     fn non_empty_list_of_maps_block_accepts_any_non_empty_section() {
         let block = NonEmptyListOfMapsBlock::from_parts(
-            vec!["{ k: v }".to_string()],
+            vec![render_other("{ k: v }")],
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2164,12 +2219,12 @@ mod tests {
             })
             .expect("tags must render as an expanded map");
         assert!(entries.iter().any(|entry| {
-            entry.key == "ManagedBy" && entry.annotation.as_deref() == Some("# default_tags")
+            entry.key.raw() == "ManagedBy" && entry.annotation.as_deref() == Some("# default_tags")
         }));
         assert!(
             entries
                 .iter()
-                .any(|entry| { entry.key == "Name" && entry.annotation.is_none() })
+                .any(|entry| { entry.key.raw() == "Name" && entry.annotation.is_none() })
         );
     }
 
@@ -2196,7 +2251,9 @@ mod tests {
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::Changed { key, old, new }
-            if key == "versioning" && old == "\"Disabled\"" && new == "\"Enabled\""));
+            if key == "versioning"
+                && old.plain() == "'Disabled'"
+                && new.plain() == "'Enabled'"));
     }
 
     #[test]
@@ -2262,24 +2319,24 @@ mod tests {
             entries,
             [
                 MapDiffEntryIR::Added {
-                    key: "Added".to_string(),
-                    value: "\"added\"".to_string(),
+                    key: rendered_key("Added"),
+                    value: render_string_text("added"),
                     annotation: Some("# default_tags".to_string()),
                 },
                 MapDiffEntryIR::Changed {
-                    key: "Changed".to_string(),
-                    old: "\"default-old\"".to_string(),
-                    new: "\"default-new\"".to_string(),
+                    key: rendered_key("Changed"),
+                    old: render_string_text("default-old"),
+                    new: render_string_text("default-new"),
                     annotation: Some("# default_tags".to_string()),
                 },
                 MapDiffEntryIR::Removed {
-                    key: "Removed".to_string(),
-                    value: "\"removed\"".to_string(),
+                    key: rendered_key("Removed"),
+                    value: render_string_text("removed"),
                 },
                 MapDiffEntryIR::Changed {
-                    key: "UserWins".to_string(),
-                    old: "\"user-old\"".to_string(),
-                    new: "\"user-new\"".to_string(),
+                    key: rendered_key("UserWins"),
+                    old: render_string_text("user-old"),
+                    new: render_string_text("user-new"),
                     annotation: None,
                 },
             ]
@@ -2321,13 +2378,13 @@ mod tests {
             entries,
             [
                 MapDiffEntryIR::Added {
-                    key: "ManagedBy".to_string(),
-                    value: "\"carina\"".to_string(),
+                    key: rendered_key("ManagedBy"),
+                    value: render_string_text("carina"),
                     annotation: Some("# default_tags".to_string()),
                 },
                 MapDiffEntryIR::Added {
-                    key: "Team".to_string(),
-                    value: "\"x\"".to_string(),
+                    key: rendered_key("Team"),
+                    value: render_string_text("x"),
                     annotation: Some("# default_tags".to_string()),
                 },
             ]
@@ -2438,24 +2495,24 @@ mod tests {
             entries,
             [
                 MapDiffEntryIR::Added {
-                    key: "Added".to_string(),
-                    value: "\"added\"".to_string(),
+                    key: rendered_key("Added"),
+                    value: render_string_text("added"),
                     annotation: Some("# default_tags".to_string()),
                 },
                 MapDiffEntryIR::Changed {
-                    key: "Changed".to_string(),
-                    old: "\"default-old\"".to_string(),
-                    new: "\"default-new\"".to_string(),
+                    key: rendered_key("Changed"),
+                    old: render_string_text("default-old"),
+                    new: render_string_text("default-new"),
                     annotation: Some("# default_tags".to_string()),
                 },
                 MapDiffEntryIR::Removed {
-                    key: "Removed".to_string(),
-                    value: "\"removed\"".to_string(),
+                    key: rendered_key("Removed"),
+                    value: render_string_text("removed"),
                 },
                 MapDiffEntryIR::Changed {
-                    key: "UserWins".to_string(),
-                    old: "\"user-old\"".to_string(),
-                    new: "\"user-new\"".to_string(),
+                    key: rendered_key("UserWins"),
+                    old: render_string_text("user-old"),
+                    new: render_string_text("user-new"),
                     annotation: None,
                 },
             ]
@@ -2621,6 +2678,44 @@ mod tests {
     }
 
     #[test]
+    fn delete_identifier_fallback_requires_a_non_empty_delete_effect() {
+        let id = ResourceId::with_identity("s3.Bucket", "old-bucket");
+        let effect = Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(id),
+            identifier: "old-bucket".to_string(),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+        assert!(
+            rows.is_empty(),
+            "the general builder must not add TUI-only rows"
+        );
+
+        let Some(DetailRow::Attribute { key, value, .. }) = delete_identifier_fallback_row(&effect)
+        else {
+            panic!("expected an identifier fallback row, got {rows:?}");
+        };
+        assert_eq!(key, "identifier");
+        assert_eq!(value.plain(), "old-bucket");
+
+        let mut empty_identifier = effect.clone();
+        let Effect::Delete { identifier, .. } = &mut empty_identifier else {
+            unreachable!();
+        };
+        identifier.clear();
+        assert!(delete_identifier_fallback_row(&empty_identifier).is_none());
+
+        let create = Effect::Create(resolved(Resource::new("s3.Bucket", "new-bucket")));
+        assert!(delete_identifier_fallback_row(&create).is_none());
+    }
+
+    #[test]
     fn test_update_removed_attribute() {
         let from = State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
@@ -2700,8 +2795,8 @@ mod tests {
             rows,
             vec![DetailRow::ChangedForcesReplacement {
                 key: "cidr_block".to_string(),
-                old: "\"10.0.0.0/16\"".to_string(),
-                new: "\"10.1.0.0/16\"".to_string(),
+                old: render_string_text("10.0.0.0/16"),
+                new: render_string_text("10.1.0.0/16"),
             }]
         );
     }
@@ -2819,12 +2914,14 @@ mod tests {
                     vec![ListOfMapsDiffItem {
                         fields: vec![
                             (
-                                "name".to_string(),
-                                Value::Concrete(ConcreteValue::String("legacy".into())),
+                                rendered_key("name"),
+                                pretty_value(Value::Concrete(ConcreteValue::String(
+                                    "legacy".into(),
+                                ))),
                             ),
                             (
-                                "priority".to_string(),
-                                Value::Concrete(ConcreteValue::Int(10))
+                                rendered_key("priority"),
+                                pretty_value(Value::Concrete(ConcreteValue::Int(10)))
                             ),
                         ],
                     }],
@@ -2854,16 +2951,16 @@ mod tests {
             DetailRow::MapExpanded { key, entries } => {
                 assert_eq!(key, "tags");
                 assert_eq!(entries.len(), 2);
-                assert_eq!(entries[0].key, "Environment");
+                assert_eq!(entries[0].key.plain(), "Environment");
                 assert_eq!(
-                    entries[0].value,
-                    Value::Concrete(ConcreteValue::String("prod".into()))
+                    entries[0].value.value(),
+                    &Value::Concrete(ConcreteValue::String("prod".into()))
                 );
                 assert!(entries[0].annotation.is_none());
-                assert_eq!(entries[1].key, "Name");
+                assert_eq!(entries[1].key.plain(), "Name");
                 assert_eq!(
-                    entries[1].value,
-                    Value::Concrete(ConcreteValue::String("test".into()))
+                    entries[1].value.value(),
+                    &Value::Concrete(ConcreteValue::String("test".into()))
                 );
                 assert!(entries[1].annotation.is_none());
             }
@@ -2872,7 +2969,7 @@ mod tests {
     }
 
     /// Regression: a Map attribute whose entry value is itself a list-of-maps
-    /// must carry the raw `Value` so the renderer can pretty-print it. If
+    /// must retain its structure so the renderer can pretty-print it. If
     /// the build phase pre-stringifies entry values, the inline form
     /// `[{...}, {...}]` is locked in and the renderer cannot expand it
     /// onto multiple lines (issue #2409).
@@ -2925,11 +3022,11 @@ mod tests {
             .expect("expected MapExpanded row for policy_document");
         let stmt_entry = entries
             .iter()
-            .find(|e| e.key == "statement")
+            .find(|e| e.key.raw() == "statement")
             .expect("expected `statement` entry");
-        match &stmt_entry.value {
+        match stmt_entry.value.value() {
             Value::Concrete(ConcreteValue::List(items)) => {
-                assert_eq!(items.len(), 2, "list-of-maps preserved as raw Value");
+                assert_eq!(items.len(), 2, "list-of-maps preserved structurally");
                 assert!(
                     matches!(items[0], Value::Concrete(ConcreteValue::Map(_))),
                     "inner element kept as Value::Concrete(ConcreteValue::Map), not stringified"
@@ -2976,10 +3073,10 @@ mod tests {
             DetailRow::MapExpanded { key, entries } => {
                 assert_eq!(key, "tags");
                 assert_eq!(entries.len(), 1);
-                assert_eq!(entries[0].key, "Name");
+                assert_eq!(entries[0].key.plain(), "Name");
                 assert_eq!(
-                    entries[0].value,
-                    Value::Concrete(ConcreteValue::String("test".into()))
+                    entries[0].value.value(),
+                    &Value::Concrete(ConcreteValue::String("test".into()))
                 );
             }
             other => panic!("expected MapExpanded, got {:?}", other),
@@ -2991,7 +3088,7 @@ mod tests {
         // Regression: the Delete path used to stringify list attributes onto
         // one long line (asymmetric with build_create_rows). A list-of-maps
         // like `domain_validation_options` must route through
-        // PrettyAttribute so format_value_pretty's vertical layout applies.
+        // PrettyAttribute so PrettyValue::render's vertical layout applies.
         let id = ResourceId::with_identity("acm.Certificate", "cert");
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id.clone()),
@@ -3037,10 +3134,10 @@ mod tests {
         );
         assert!(
             matches!(
-                pretty_value.unwrap(),
+                pretty_value.unwrap().value(),
                 Value::Concrete(ConcreteValue::List(_))
             ),
-            "PrettyAttribute should carry the raw Value::Concrete(ConcreteValue::List)"
+            "PrettyAttribute should retain the list structure behind its typed wrapper"
         );
     }
 
@@ -3099,7 +3196,7 @@ mod tests {
             rows,
             vec![DetailRow::ReplaceRemoved {
                 key: "legacy_token".to_string(),
-                old: "\"tok\"".to_string(),
+                old: render_string_text("tok"),
             }]
         );
     }
@@ -3134,12 +3231,12 @@ mod tests {
                 key: "settings".to_string(),
                 entries: NonEmptyVec::from_vec(vec![
                     MapDiffEntryIR::Removed {
-                        key: "mode".to_string(),
-                        value: "\"legacy\"".to_string(),
+                        key: rendered_key("mode"),
+                        value: render_string_text("legacy"),
                     },
                     MapDiffEntryIR::Removed {
-                        key: "version".to_string(),
-                        value: "1".to_string(),
+                        key: rendered_key("version"),
+                        value: render_value(&Value::Concrete(ConcreteValue::Int(1))),
                     },
                 ])
                 .unwrap(),
@@ -3179,12 +3276,14 @@ mod tests {
                     vec![ListOfMapsDiffItem {
                         fields: vec![
                             (
-                                "name".to_string(),
-                                Value::Concrete(ConcreteValue::String("legacy".into())),
+                                rendered_key("name"),
+                                pretty_value(Value::Concrete(ConcreteValue::String(
+                                    "legacy".into(),
+                                ))),
                             ),
                             (
-                                "priority".to_string(),
-                                Value::Concrete(ConcreteValue::Int(10))
+                                rendered_key("priority"),
+                                pretty_value(Value::Concrete(ConcreteValue::Int(10)))
                             ),
                         ],
                     }],
@@ -3250,7 +3349,9 @@ mod tests {
             rows.iter().any(|row| matches!(
                 row,
                 DetailRow::ChangedForcesReplacement { key, old, new }
-                    if key == "name" && old == "\"edge-old\"" && new == "\"edge-new\""
+                    if key == "name"
+                        && old.plain() == "'edge-old'"
+                        && new.plain() == "'edge-new'"
             )),
             "create-only name diff should still be marked as forcing replacement: {rows:?}"
         );
@@ -3259,8 +3360,8 @@ mod tests {
                 row,
                 DetailRow::Changed { key, old, new }
                     if key == "description"
-                        && old == "\"old description\""
-                        && new == "\"new description\""
+                        && old.plain() == "'old description'"
+                        && new.plain() == "'new description'"
             )),
             "non-forcing description diff must render as a normal diff row: {rows:?}"
         );
@@ -3269,8 +3370,8 @@ mod tests {
                 row,
                 DetailRow::Changed { key, old, new }
                     if key == "metric_name"
-                        && old == "\"edge-old-metric\""
-                        && new == "\"edge-new-metric\""
+                        && old.plain() == "'edge-old-metric'"
+                        && new.plain() == "'edge-new-metric'"
             )),
             "non-forcing metric_name diff must render as a normal diff row: {rows:?}"
         );
@@ -3312,7 +3413,9 @@ mod tests {
             rows.iter().any(|row| matches!(
                 row,
                 DetailRow::ReplaceCascade { key, old, new }
-                    if key == "arn" && old == "\"arn:old\"" && new == "${web_acl.arn}"
+                    if key == "arn"
+                        && old.plain() == "'arn:old'"
+                        && new.plain() == "${web_acl.arn}"
             )),
             "same forcing key should render ReplaceCascade with the cascade hint: {rows:?}"
         );
@@ -3339,7 +3442,9 @@ mod tests {
             rows.iter().any(|row| matches!(
                 row,
                 DetailRow::ReplaceCascade { key, old, new }
-                    if key == "arn" && old == "\"arn:old\"" && new == "\"arn:old\""
+                    if key == "arn"
+                        && old.plain() == "'arn:old'"
+                        && new.plain() == "'arn:old'"
             )),
             "same forcing key should fall back to formatting the new value: {rows:?}"
         );
@@ -3468,7 +3573,9 @@ mod tests {
             rows.iter().any(|row| matches!(
                 row,
                 DetailRow::ChangedForcesReplacement { key, old, new }
-                    if key == "aliases" && old == "[\"only-one\"]" && new == "[\"only-one\"]"
+                    if key == "aliases"
+                        && old.plain() == "['only-one']"
+                        && new.plain() == "['only-one']"
             )),
             "forcing display-equal scalar key must remain visible: {rows:?}"
         );
@@ -3524,8 +3631,8 @@ mod tests {
                 row,
                 DetailRow::ChangedForcesReplacement { key, old, new }
                     if key == "server_defaulted_name"
-                        && old == "\"old-name\""
-                        && new == "\"new-name\""
+                        && old.plain() == "'old-name'"
+                        && new.plain() == "'new-name'"
             )),
             "forcing key should use raw state old value even when projection omits it: {rows:?}"
         );
@@ -3563,7 +3670,8 @@ mod tests {
 
         assert!(
             rows.iter()
-                .any(|row| matches!(row, DetailRow::Removed { key, old } if key == "tag" && old == "\"legacy\"")),
+                .any(|row| matches!(row, DetailRow::Removed { key, old }
+                    if key == "tag" && old.plain() == "'legacy'")),
             "replace rows must render non-forcing removed attributes alongside forcing changes: {rows:?}"
         );
     }
@@ -3598,10 +3706,10 @@ mod tests {
         );
         assert!(
             matches!(
-                pretty_value.unwrap(),
+                pretty_value.unwrap().value(),
                 Value::Concrete(ConcreteValue::List(_))
             ),
-            "PrettyAttribute should carry the raw Value::Concrete(ConcreteValue::List)"
+            "PrettyAttribute should retain the list structure behind its typed wrapper"
         );
     }
 
@@ -3625,7 +3733,7 @@ mod tests {
     #[test]
     fn create_row_list_of_strings_emits_pretty_attribute() {
         // list-of-string must route through PrettyAttribute so
-        // format_value_pretty's 80-col threshold can apply.
+        // PrettyValue::render's 80-col threshold can apply.
         let resource = Resource::new("iam.Role", "test").with_attribute(
             "managed_policy_arns",
             Value::Concrete(ConcreteValue::List(vec![
@@ -3651,8 +3759,11 @@ mod tests {
             "expected PrettyAttribute row for list-of-string attribute, got: {rows:?}"
         );
         assert!(
-            matches!(pretty.unwrap(), Value::Concrete(ConcreteValue::List(_))),
-            "PrettyAttribute should carry the raw Value::Concrete(ConcreteValue::List)"
+            matches!(
+                pretty.unwrap().value(),
+                Value::Concrete(ConcreteValue::List(_))
+            ),
+            "PrettyAttribute should retain the list structure behind its typed wrapper"
         );
     }
 
@@ -4141,8 +4252,20 @@ mod tests {
         )
         .expect("literal dotted strings must produce a visible list diff");
 
-        assert_eq!(diff.removed, vec!["A.json"]);
-        assert_eq!(diff.added, vec!["json"]);
+        assert_eq!(
+            diff.removed
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["'A.json'"]
+        );
+        assert_eq!(
+            diff.added
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["'json'"]
+        );
     }
 
     #[test]
@@ -4168,9 +4291,81 @@ mod tests {
         )
         .expect("X → Y must remain a visible list diff");
 
-        assert_eq!(diff.unchanged, vec!["Allow"]);
-        assert_eq!(diff.removed, vec!["X"]);
-        assert_eq!(diff.added, vec!["Y"]);
+        assert_eq!(
+            diff.unchanged
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["Allow"]
+        );
+        assert_eq!(
+            diff.removed
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["'X'"]
+        );
+        assert_eq!(
+            diff.added
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["Y"]
+        );
+    }
+
+    #[test]
+    fn enum_list_diff_keeps_each_duplicate_and_cross_shape_display_attached() {
+        let attr_type = AttributeType::unordered_list(AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Mode"),
+            Some(vec![
+                "Allow".to_string(),
+                "Deny".to_string(),
+                "Legacy".to_string(),
+            ]),
+            Vec::new(),
+            None,
+            None,
+        ));
+        let old = Value::Concrete(ConcreteValue::StringList(vec![
+            "allow".into(),
+            "legacy".into(),
+        ]));
+        let new = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::enum_identifier("Allow")),
+            Value::Concrete(ConcreteValue::String("allow".into())),
+            Value::Concrete(ConcreteValue::enum_identifier("Deny")),
+        ]));
+
+        let diff = compute_string_list_change(
+            Some(&old),
+            &new,
+            Some(&attr_type),
+            crate::schema::empty_defs_for_schema_walks(),
+        )
+        .expect("Deny and legacy must produce a visible list diff");
+
+        assert_eq!(
+            diff.unchanged
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["Allow", "'allow'"]
+        );
+        assert_eq!(
+            diff.added
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["Deny"]
+        );
+        assert_eq!(
+            diff.removed
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["'legacy'"]
+        );
     }
 
     #[test]
@@ -4292,9 +4487,18 @@ mod tests {
         else {
             panic!("expected StringListChanged, got: {entries:?}");
         };
-        assert_eq!(key, "modes");
-        assert_eq!(unchanged, &["Allow"]);
-        assert_eq!(added, &["Deny"]);
+        assert_eq!(key.plain(), "modes");
+        assert_eq!(
+            unchanged
+                .iter()
+                .map(RenderedValue::plain)
+                .collect::<Vec<_>>(),
+            vec!["Allow"]
+        );
+        assert_eq!(
+            added.iter().map(RenderedValue::plain).collect::<Vec<_>>(),
+            vec!["Deny"]
+        );
         assert!(removed.is_empty(), "no alias-only removal: {removed:?}");
     }
 
@@ -4360,7 +4564,7 @@ mod tests {
             "only the genuine `Deny` add, got added: {added:?}"
         );
         assert!(
-            added[0].eq_ignore_ascii_case("deny"),
+            added[0].plain().eq_ignore_ascii_case("deny"),
             "the genuine add is Deny, got: {added:?}"
         );
     }
@@ -4730,7 +4934,7 @@ mod tests {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                MapDiffEntryIR::Changed { key, .. } if key == "password"
+                MapDiffEntryIR::Changed { key, .. } if key.raw() == "password"
             )),
             "secret rotation under a map-diff must still produce a Changed entry, got: {entries:?}"
         );
@@ -4794,7 +4998,7 @@ mod tests {
             m.fields
                 .as_slice()
                 .iter()
-                .any(|f| matches!(f, ListOfMapsDiffField::Changed { key, .. } if key == "password"))
+                .any(|f| matches!(f, ListOfMapsDiffField::Changed { key, .. } if key.raw() == "password"))
         });
         assert!(
             password_changed,
@@ -4870,7 +5074,7 @@ mod tests {
         );
         assert!(
             !modified[0].fields.as_slice().iter().any(
-                |field| matches!(field, ListOfMapsDiffField::Changed { key, .. } if key == "sid")
+                |field| matches!(field, ListOfMapsDiffField::Changed { key, .. } if key.raw() == "sid")
             ),
             "the modified statement must retain its sid: {:?}",
             modified[0]
@@ -4963,7 +5167,7 @@ mod tests {
         assert_eq!(modified[0].fields.as_slice().len(), 1);
         assert!(matches!(
             &modified[0].fields.as_slice()[0],
-            ListOfMapsDiffField::Changed { key, .. } if key == "description"
+            ListOfMapsDiffField::Changed { key, .. } if key.raw() == "description"
         ));
     }
 
@@ -4996,10 +5200,14 @@ mod tests {
         // Schema-blind: `allow` (state) is not in the new raw set
         // {`Allow`,`Deny`} → removed; both `Allow` and `Deny` are not
         // in the old raw set {`allow`} → added.
-        assert_eq!(removed, &vec!["allow".to_string()], "schema-blind removal");
         assert_eq!(
-            added,
-            &vec!["Allow".to_string(), "Deny".to_string()],
+            removed.iter().map(RenderedValue::plain).collect::<Vec<_>>(),
+            vec!["allow"],
+            "schema-blind removal"
+        );
+        assert_eq!(
+            added.iter().map(RenderedValue::plain).collect::<Vec<_>>(),
+            vec!["Allow", "Deny"],
             "schema-blind additions"
         );
     }

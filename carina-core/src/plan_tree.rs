@@ -13,7 +13,9 @@ use crate::detail_rows::DetailRow;
 use crate::effect::Effect;
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::value::format_value_with_key;
+use crate::value::{
+    RenderedValue, is_upstream_deferred_marker_value, render_value_with_upstream_deferred_label,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildRenderItem {
@@ -110,52 +112,25 @@ pub fn deferred_for_detail_rows(
     attrs.sort_by_key(|(key, _)| key.clone());
     rows.extend(attrs.into_iter().map(|(key, value)| DetailRow::Attribute {
         key: key.clone(),
-        value: format_deferred_for_template_value(value, key, upstream_binding, verb),
+        value: render_deferred_for_template_value(value, upstream_binding, verb),
         ref_binding: None,
         annotation: None,
     }));
     rows
 }
 
-pub fn format_deferred_for_template_value(
+pub fn render_deferred_for_template_value(
     value: &Value,
-    key: &str,
     upstream_binding: &str,
     verb: &str,
-) -> String {
-    let formatted = format_value_with_key(value, Some(key));
-    let replaced = replace_known_after_upstream(&formatted, upstream_binding, verb);
-    if let Some(inner) = replaced
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .filter(|value| value.starts_with("(known after ") && !value.contains(','))
-    {
-        inner.to_string()
-    } else {
-        replaced
-    }
-}
-
-pub fn replace_known_after_upstream(input: &str, upstream_binding: &str, verb: &str) -> String {
-    const PREFIX: &str = "(known after upstream apply";
-    let replacement = format!("(known after {upstream_binding} {verb})");
-    let mut output = String::with_capacity(input.len());
-    let mut rest = input;
-
-    while let Some(start) = rest.find(PREFIX) {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start..];
-        if let Some(end) = after_start.find(')') {
-            output.push_str(&replacement);
-            rest = &after_start[end + 1..];
-        } else {
-            output.push_str(after_start);
-            rest = "";
+) -> RenderedValue {
+    let value = match value {
+        Value::Concrete(ConcreteValue::List(items)) if matches!(items.as_slice(), [item] if is_upstream_deferred_marker_value(item)) => {
+            &items[0]
         }
-    }
-
-    output.push_str(rest);
-    output
+        _ => value,
+    };
+    render_value_with_upstream_deferred_label(value, upstream_binding, verb)
 }
 
 /// Intermediate data for tree-building: maps from effect indices to their
@@ -590,8 +565,8 @@ mod tests {
     use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
-        ConcreteValue, DeferredValue, Directives, PathSegment, ResolvedResource, Resource,
-        ResourceId, ResourceIdentity, State, Subscript, UnknownReason, Value,
+        ConcreteValue, DeferredValue, Directives, InterpolationPart, PathSegment, ResolvedResource,
+        Resource, ResourceId, ResourceIdentity, State, Subscript, UnknownReason, Value,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
@@ -621,16 +596,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            format_deferred_for_template_value(&direct_access, "name", "cert", "applies"),
+            render_deferred_for_template_value(&direct_access, "cert", "applies").plain(),
             "(known after cert applies)"
         );
         assert_eq!(
-            format_deferred_for_template_value(
+            render_deferred_for_template_value(
                 &Value::Concrete(ConcreteValue::List(vec![direct_access])),
-                "resource_records",
                 "cert",
                 "applies",
-            ),
+            )
+            .plain(),
             "(known after cert applies)"
         );
 
@@ -650,8 +625,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            format_deferred_for_template_value(&expression, "name", "cert", "applies"),
-            "split(\"/\", (known after cert applies))[1]"
+            render_deferred_for_template_value(&expression, "cert", "applies").plain(),
+            "split('/', (known after cert applies))[1]"
+        );
+    }
+
+    #[test]
+    fn deferred_for_display_does_not_rewrite_marker_text_inside_strings() {
+        let value = Value::Concrete(ConcreteValue::String(
+            "(known after upstream apply: user text)".into(),
+        ));
+
+        assert_eq!(
+            render_deferred_for_template_value(&value, "cert", "applies").plain(),
+            "'(known after upstream apply: user text)'"
+        );
+    }
+
+    #[test]
+    fn deferred_for_display_does_not_rewrite_marker_text_inside_map_keys() {
+        let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "(known after upstream apply: x)".to_string(),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        )])));
+
+        assert_eq!(
+            render_deferred_for_template_value(&value, "cert", "applies").plain(),
+            "{'(known after upstream apply: x)': (known after cert applies)}"
+        );
+    }
+
+    #[test]
+    fn deferred_for_display_rewrites_access_inside_interpolation() {
+        let access = crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            PathSegment::Field {
+                name: "resource_record_name".to_string(),
+            },
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+        let value = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(access),
+            InterpolationPart::Literal(".example".into()),
+        ]));
+
+        assert_eq!(
+            render_deferred_for_template_value(&value, "cert", "applies").plain(),
+            "\"${(known after cert applies)}.example\""
         );
     }
 

@@ -5,24 +5,24 @@ expression: output
 Execution Plan:
 
   + awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb
-      cidr_block: "10.0.0.0/16"
+      cidr_block: '10.0.0.0/16'
       config:
         statement: 
           * action: [
-              "iam:CreateRole",
-              "iam:DeleteRole",
-              "iam:GetRole",
-              "iam:UpdateRole",
+              'iam:CreateRole',
+              'iam:DeleteRole',
+              'iam:GetRole',
+              'iam:UpdateRole',
             ]
-            effect: "Allow"
-            resource: "arn:aws:iam::*:role/carina-*-deploy"
-            sid: "ManageDeployRoles"
+            effect: 'Allow'
+            resource: 'arn:aws:iam::*:role/carina-*-deploy'
+            sid: 'ManageDeployRoles'
 
-          * action: "iam:GetOpenIDConnectProvider"
-            effect: "Allow"
-            resource: "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com"
-            sid: "ReadOIDCProvider"
+          * action: 'iam:GetOpenIDConnectProvider'
+            effect: 'Allow'
+            resource: 'arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com'
+            sid: 'ReadOIDCProvider'
 
-        version: "2012-10-17"
+        version: '2012-10-17'
 
 Plan: 1 to add, 0 to change, 0 to destroy.

@@ -147,10 +147,7 @@ fn interpolation_inherits_diagnostic_sensitivity_from_string_expression() {
     .canonicalize();
 
     assert_eq!(crate::ValueDescription::of(&value).to_string(), "string");
-    assert_eq!(
-        crate::value::format_value(&value),
-        r#""prefix-hunter2SECRET""#
-    );
+    assert_eq!(crate::value::format_value(&value), "'prefix-hunter2SECRET'");
     assert_eq!(
         crate::value::value_to_json(&value).unwrap(),
         serde_json::json!("prefix-hunter2SECRET")
@@ -2252,18 +2249,28 @@ fn access_path_subscripts_render_with_escapes() {
     );
     assert_eq!(int_path.to_dot_string(), "orgs.accounts[0]");
 
-    // String subscript with embedded quote escapes through {:?}.
+    // The canonical encoder can retain a double quote inside single quotes.
     let str_path = AccessPath::with_fields_and_subscripts(
         "orgs",
         "accounts",
         Vec::new(),
         vec![Subscript::Str { key: "a\"b".into() }],
     );
-    let rendered = str_path.to_dot_string();
-    assert!(
-        rendered.contains("\\\""),
-        "embedded quote must escape, got: {rendered}"
+    assert_eq!(str_path.to_dot_string(), "orgs.accounts['a\"b']");
+}
+
+#[test]
+fn string_subscript_display_uses_canonical_literal() {
+    use crate::resource::{AccessPath, Subscript};
+
+    let path = AccessPath::with_fields_and_subscripts(
+        "resource",
+        "tags",
+        Vec::new(),
+        vec![Subscript::Str { key: "Name".into() }],
     );
+
+    assert_eq!(path.to_dot_string(), "resource.tags['Name']");
 }
 
 #[test]

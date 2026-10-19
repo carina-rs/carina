@@ -258,7 +258,7 @@ fn saved_plan_apply_preserves_default_tag_annotation_without_persisting_provenan
     assert!(
         stdout
             .lines()
-            .any(|line| line.contains(r#"ManagedBy: "carina"  # default_tags"#)),
+            .any(|line| line.contains("ManagedBy: 'carina'  # default_tags")),
         "saved-plan apply must annotate the default tag; stdout:\n{stdout}"
     );
 
@@ -347,7 +347,7 @@ fn apply_updates_default_tags_without_persisting_host_metadata() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.trim() == r#"+ Team: "x"  # default_tags"#),
+            .any(|line| line.trim() == "+ Team: 'x'  # default_tags"),
         "update plan must annotate the newly injected default tag; stdout:\n{stdout}"
     );
 

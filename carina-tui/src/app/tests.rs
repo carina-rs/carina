@@ -203,7 +203,7 @@ fn host_metadata_fields_are_not_rendered_as_attributes() {
 fn format_value_display() {
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String("hello".into()))),
-        "\"hello\""
+        "'hello'"
     );
     assert_eq!(format_value(&Value::Concrete(ConcreteValue::Int(42))), "42");
     assert_eq!(
@@ -627,27 +627,27 @@ fn format_value_preserves_strings_that_resemble_enum_identifiers() {
                 .to_string()
                 .into()
         ))),
-        "\"awscc.ec2.vpc_endpoint.VpcEndpointType.Interface\""
+        "'awscc.ec2.vpc_endpoint.VpcEndpointType.Interface'"
     );
 
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
             "aws.s3.VersioningStatus.Enabled".into()
         ))),
-        "\"aws.s3.VersioningStatus.Enabled\""
+        "'aws.s3.VersioningStatus.Enabled'"
     );
 
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
             "aws.Region.ap_northeast_1".into()
         ))),
-        "\"aws.Region.ap_northeast_1\""
+        "'aws.Region.ap_northeast_1'"
     );
 
     // Regular string should be quoted as-is
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String("my-bucket".into()))),
-        "\"my-bucket\""
+        "'my-bucket'"
     );
 
     // ResourceRef should NOT be resolved (not a DSL enum)
@@ -684,7 +684,9 @@ fn create_effect_attributes_preserve_dotted_string_values() {
         .iter()
         .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "name"))
         .expect("name detail row should exist");
-    assert!(matches!(string_row, DetailRow::Attribute { value, .. } if value == "\"A.json\""));
+    assert!(
+        matches!(string_row, DetailRow::Attribute { value, .. } if value.plain() == "'A.json'")
+    );
 
     // ResourceRef should remain unresolved
     let ref_row = node
@@ -692,7 +694,7 @@ fn create_effect_attributes_preserve_dotted_string_values() {
         .iter()
         .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "vpc_id"))
         .expect("vpc_id detail row should exist");
-    assert!(matches!(ref_row, DetailRow::Attribute { value, .. } if value == "vpc.vpc_id"));
+    assert!(matches!(ref_row, DetailRow::Attribute { value, .. } if value.plain() == "vpc.vpc_id"));
 }
 
 #[test]

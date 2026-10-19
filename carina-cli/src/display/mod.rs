@@ -20,9 +20,11 @@ use carina_core::plan_tree::{
     deferred_for_detail_rows, deferred_for_display_name, deferred_for_source, deferred_for_verb,
     extract_compact_hint,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
+use carina_core::resource::ResourceId;
+#[cfg(test)]
+use carina_core::resource::Value;
 use carina_core::schema::SchemaRegistry;
-use carina_core::value::format_value_pretty;
+use carina_core::value::{RenderedValue, ValueSpanKind, render_json_value, render_value};
 
 use crate::DetailLevel;
 
@@ -228,60 +230,6 @@ fn format_compact_name(
     }
 }
 
-/// Format an export value for plan display.
-fn format_export_value(value: &Value) -> String {
-    match value {
-        Value::Concrete(ConcreteValue::String(s)) => {
-            format!("'{}'", s.expose_plaintext())
-        }
-        Value::Concrete(ConcreteValue::Int(i)) => i.to_string(),
-        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
-        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
-        Value::Concrete(ConcreteValue::Duration(d)) => carina_core::value::render_duration(*d),
-        Value::Deferred(DeferredValue::ResourceRef { path }) => path.to_dot_string().to_string(),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            let formatted: Vec<String> = items.iter().map(format_export_value).collect();
-            format!("[{}]", formatted.join(", "))
-        }
-        Value::Concrete(ConcreteValue::StringList(items)) => {
-            let formatted: Vec<String> = items
-                .iter()
-                .map(|s| format!("'{}'", s.expose_plaintext()))
-                .collect();
-            format!("[{}]", formatted.join(", "))
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let formatted: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{} = {}", k, format_export_value(v)))
-                .collect();
-            format!("{{{}}}", formatted.join(", "))
-        }
-        _ => "(known after apply)".to_string(),
-    }
-}
-
-/// Format a `serde_json::Value` for export display (old values stored in state).
-fn format_json_export_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => format!("'{}'", s),
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Array(items) => {
-            let formatted: Vec<String> = items.iter().map(format_json_export_value).collect();
-            format!("[{}]", formatted.join(", "))
-        }
-        serde_json::Value::Object(map) => {
-            let formatted: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{} = {}", k, format_json_export_value(v)))
-                .collect();
-            format!("{{{}}}", formatted.join(", "))
-        }
-    }
-}
-
 /// Format a single export change entry (add/modify/remove) as a displayable line.
 fn format_export_change(change: &crate::commands::plan::ExportChange) -> String {
     use crate::commands::plan::ExportChange;
@@ -302,7 +250,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
                 top_level_sigil_prefix(&Sigil::export_added()),
                 name,
                 type_str.dimmed(),
-                format_export_value(new_value)
+                colored_value(&render_value(new_value))
             )
             .unwrap();
         }
@@ -322,9 +270,9 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
                 top_level_sigil_prefix(&Sigil::export_modified()),
                 name,
                 type_str.dimmed(),
-                format_json_export_value(old_json),
+                colored_value(&render_json_value(old_json)),
                 "→".dimmed(),
-                format_export_value(new_value)
+                colored_value(&render_value(new_value))
             )
             .unwrap();
         }
@@ -334,7 +282,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
                 "{}{} = {}",
                 top_level_sigil_prefix(&Sigil::export_removed()),
                 name,
-                format_json_export_value(old_json)
+                colored_value(&render_json_value(old_json))
             )
             .unwrap();
         }
@@ -1360,331 +1308,113 @@ fn group_roots_by_outermost_composition(
     CompositionGroups { grouped, ungrouped }
 }
 
-/// Split a string by `, ` at the top level, respecting nested brackets, braces, and quotes.
-fn split_top_level(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0;
-    let mut in_quote = false;
-    let mut start = 0;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => in_quote = !in_quote,
-            b'[' | b'{' if !in_quote => depth += 1,
-            b']' | b'}' if !in_quote => depth -= 1,
-            b',' if !in_quote && depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b' ' => {
-                parts.push(&s[start..i]);
-                start = i + 2;
-                i += 2;
-                continue;
+#[derive(Clone, Copy)]
+enum AnsiValueStyle {
+    Semantic,
+    Dimmed,
+    RedStrikethrough,
+    Green,
+    Magenta,
+}
+
+fn style_value_span(kind: ValueSpanKind, text: &str, style: AnsiValueStyle) -> String {
+    if kind == ValueSpanKind::Whitespace {
+        return text.to_string();
+    }
+    match style {
+        AnsiValueStyle::Semantic => match kind {
+            ValueSpanKind::StringLiteral => text.green().to_string(),
+            ValueSpanKind::Bool => text.yellow().to_string(),
+            ValueSpanKind::Number => text.white().to_string(),
+            ValueSpanKind::Enum => text.magenta().to_string(),
+            ValueSpanKind::Reference => text.cyan().to_string(),
+            ValueSpanKind::Structure
+            | ValueSpanKind::Key
+            | ValueSpanKind::Other
+            | ValueSpanKind::Whitespace => text.to_string(),
+        },
+        AnsiValueStyle::Dimmed => match kind {
+            ValueSpanKind::StringLiteral => text.green().dimmed().to_string(),
+            ValueSpanKind::Bool => text.yellow().dimmed().to_string(),
+            ValueSpanKind::Number => text.white().dimmed().to_string(),
+            ValueSpanKind::Enum => text.magenta().dimmed().to_string(),
+            ValueSpanKind::Reference => text.cyan().dimmed().to_string(),
+            ValueSpanKind::Structure | ValueSpanKind::Key | ValueSpanKind::Other => {
+                text.dimmed().to_string()
             }
-            _ => {}
-        }
-        i += 1;
+            ValueSpanKind::Whitespace => text.to_string(),
+        },
+        AnsiValueStyle::RedStrikethrough => text.red().strikethrough().to_string(),
+        AnsiValueStyle::Green => text.green().to_string(),
+        AnsiValueStyle::Magenta => text.magenta().to_string(),
     }
-    if start < s.len() {
-        parts.push(&s[start..]);
-    }
-    parts
 }
 
-/// Color a single atomic value (not a list or map).
-fn color_atom(rendered: &str, ref_binding: bool) -> String {
-    if ref_binding {
-        return rendered.cyan().to_string();
-    }
-    if rendered.starts_with('"') && rendered.ends_with('"') {
-        return rendered.green().to_string();
-    }
-    if rendered == "true" || rendered == "false" {
-        return rendered.yellow().to_string();
-    }
-    if !rendered.is_empty()
-        && rendered
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
-    {
-        let first = rendered.chars().next().unwrap();
-        if first.is_ascii_digit() || first == '-' {
-            return rendered.white().to_string();
-        }
-    }
-    if rendered.contains('.') && !rendered.contains(' ') && !rendered.starts_with('{') {
-        return rendered.magenta().to_string();
-    }
-    rendered.to_string()
-}
-
-/// Color a single atomic value with dimmed modifier.
-fn color_atom_dimmed(rendered: &str) -> String {
-    if rendered.starts_with('"') && rendered.ends_with('"') {
-        return rendered.green().dimmed().to_string();
-    }
-    if rendered == "true" || rendered == "false" {
-        return rendered.yellow().dimmed().to_string();
-    }
-    if !rendered.is_empty()
-        && rendered
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
-    {
-        let first = rendered.chars().next().unwrap();
-        if first.is_ascii_digit() || first == '-' {
-            return rendered.white().dimmed().to_string();
-        }
-    }
-    if rendered.contains('.') && !rendered.contains(' ') && !rendered.starts_with('{') {
-        return rendered.magenta().dimmed().to_string();
-    }
-    rendered.dimmed().to_string()
-}
-
-/// Determine ANSI color for a rendered value string based on its type.
-///
-/// Mirrors the `value_color()` logic in `carina-tui/src/ui.rs`:
-/// - Quoted strings (`"..."`) → green
-/// - Booleans (`true`/`false`) → yellow
-/// - Numbers → white
-/// - DSL identifiers (dot-notation, e.g. `awscc.Region.ap_northeast_1`) → magenta
-/// - ResourceRef values → cyan (handled separately via `ref_binding`)
-/// - Lists (`[...]`) → each element colored individually
-/// - Maps (`{...}`) → each value colored individually
-fn colored_value(rendered: &str, ref_binding: bool) -> String {
-    // Multi-line input from `format_value_pretty`'s vertical layout
-    // (`format_list_of_scalars_vertical` / `format_map_vertical`). The inline
-    // `starts_with('[') && ends_with(']')` branch below would `split_top_level`
-    // the body and re-`join(", ")` it, collapsing the layout back to inline.
-    // Color atoms in place and preserve newlines + leading indentation +
-    // structural punctuation (`[`, `]`, `{`, `}`, `,`) verbatim instead.
-    if rendered.contains('\n') {
-        return color_lines(rendered, ref_binding);
-    }
-    // List: color each element individually
-    if rendered.starts_with('[') && rendered.ends_with(']') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return rendered.to_string();
-        }
-        let elements = split_top_level(inner);
-        let colored_elements: Vec<String> = elements
+fn render_value_ansi(
+    rendered: &RenderedValue,
+    style: AnsiValueStyle,
+    continuation_prefix: Option<&str>,
+) -> String {
+    let Some(prefix) = continuation_prefix else {
+        return rendered
+            .spans()
             .iter()
-            .map(|e| colored_value(e.trim(), ref_binding))
+            .map(|span| style_value_span(span.kind(), span.text(), style))
             .collect();
-        return format!("[{}]", colored_elements.join(", "));
-    }
-    // Map: color each value individually
-    if rendered.starts_with('{') && rendered.ends_with('}') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return rendered.to_string();
-        }
-        let entries = split_top_level(inner);
-        let colored_entries: Vec<String> = entries
-            .iter()
-            .map(|entry| {
-                if let Some(colon_pos) = entry.find(": ") {
-                    let key = &entry[..colon_pos];
-                    let val = &entry[colon_pos + 2..];
-                    format!("{}: {}", key, colored_value(val, false))
+    };
+
+    let prefix_cols = prefix.chars().count();
+    let mut out = String::new();
+    let mut continuation = false;
+    let mut pending_indent = String::new();
+
+    for span in rendered.spans() {
+        if span.kind() == ValueSpanKind::Whitespace {
+            for ch in span.text().chars() {
+                if ch == '\n' {
+                    if continuation {
+                        out.push_str(prefix.trim_end());
+                        pending_indent.clear();
+                    }
+                    out.push('\n');
+                    continuation = true;
+                } else if continuation {
+                    pending_indent.push(ch);
                 } else {
-                    entry.to_string()
+                    out.push(ch);
                 }
-            })
-            .collect();
-        return format!("{{{}}}", colored_entries.join(", "));
-    }
-    color_atom(rendered, ref_binding)
-}
-
-fn forcing_value(rendered: &str) -> String {
-    rendered
-        .lines()
-        .map(|line| line.green().to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Color a multi-line `format_value_pretty` payload while preserving its
-/// vertical layout. For each line, separate leading whitespace and a trailing
-/// `,`, then color the middle. Atoms that look like list items (`"x"`, `42`)
-/// or `key: value` map entries get atom-coloring; structural lines like `[`,
-/// `]`, `{`, `}` fall through `color_atom` unchanged.
-fn color_lines(rendered: &str, ref_binding: bool) -> String {
-    let mut out = String::with_capacity(rendered.len());
-    for (i, line) in rendered.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let indent_end = line
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(line.len());
-        let (indent, body) = line.split_at(indent_end);
-        out.push_str(indent);
-        if body.is_empty() {
+            }
             continue;
         }
-        let (core, trailing_comma) = if let Some(stripped) = body.strip_suffix(',') {
-            (stripped, ",")
-        } else {
-            (body, "")
-        };
-        // Split `key: value` to color only the value half. Safe because keys
-        // emitted by `format_map_vertical` are bare attribute names (never
-        // quoted strings that could contain `": "`).
-        if let Some(colon_pos) = core.find(": ") {
-            let key = &core[..colon_pos];
-            let val = &core[colon_pos + 2..];
-            out.push_str(key);
-            out.push_str(": ");
-            out.push_str(&color_atom(val, ref_binding));
-        } else {
-            out.push_str(&color_atom(core, ref_binding));
+
+        if continuation {
+            out.push_str(prefix);
+            let leading_spaces = pending_indent
+                .bytes()
+                .take_while(|byte| *byte == b' ')
+                .count();
+            let drop = leading_spaces.min(prefix_cols);
+            out.push_str(&pending_indent[drop..]);
+            pending_indent.clear();
+            continuation = false;
         }
-        out.push_str(trailing_comma);
+        out.push_str(&style_value_span(span.kind(), span.text(), style));
     }
+
     out
 }
 
-/// Apply red + strikethrough to a (possibly multi-line)
-/// `format_value_pretty` payload **per line**, leaving each line's
-/// leading indentation whitespace unstyled.
-///
-/// Styling the whole multi-line string in one shot
-/// (`pretty.red().strikethrough()`) opens the ANSI style once and
-/// resets it once, so the style spans the newline-leading indentation
-/// of every continuation line — the terminal then paints the strike
-/// across the indent, making the line look far longer than its
-/// content (#3115). This mirrors `color_lines`' indent handling so
-/// the strike starts at the content column, not the left edge.
-fn strike_lines(rendered: &str) -> String {
-    let mut out = String::with_capacity(rendered.len());
-    for (i, line) in rendered.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let indent_end = line
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(line.len());
-        let (indent, body) = line.split_at(indent_end);
-        out.push_str(indent);
-        if !body.is_empty() {
-            out.push_str(&body.red().strikethrough().to_string());
-        }
-    }
-    out
+pub(crate) fn colored_value(rendered: &RenderedValue) -> String {
+    render_value_ansi(rendered, AnsiValueStyle::Semantic, None)
 }
 
-/// Re-apply the tree gutter to every continuation line of a rendered,
-/// multi-line attribute-value block.
-///
-/// `format_value_pretty` lays out a vertical value (list-of-struct,
-/// list-of-scalars, expanded map) with its continuation lines indented by
-/// **plain spaces** sized to the parent attribute's column width. The
-/// caller emits `<attr_prefix><key>: <block>` and the `attr_prefix` —
-/// which carries the `│` tree glyph for a nested resource — lands only on
-/// the first physical row. Every continuation row then floats at the same
-/// column but without the `│`, detaching the value from the tree until the
-/// next sibling row snaps the gutter back (#3356). This is the CLI
-/// analogue of the continuation-row gutter loss #2523 fixed for the TUI
-/// (`carina-tui`); the same value-block class reaches the CLI renderer via
-/// the list-expansion path, so #2523's TUI-side fix does not cover it.
-///
-/// The fix is to swap the first `attr_prefix` columns of leading
-/// whitespace on each continuation line for `attr_prefix` itself, so the
-/// gutter glyph is restored at its column while the value-relative indent
-/// past it is preserved. Lines shorter than the gutter (the blank
-/// inter-element separators injected for #2555) collapse to the bare
-/// gutter with no trailing padding, matching how the tree draws its own
-/// `│`-only continuation lines.
-///
-/// Only continuation lines are touched; line 0 is returned verbatim
-/// because the caller emits `attr_prefix` (or the diff `+ {` opener) ahead
-/// of it directly. Leading whitespace is plain (the per-line colorizers
-/// keep the indent unstyled), so splitting on the first column boundary
-/// never lands inside an ANSI escape.
-fn reindent_with_gutter(block: &str, attr_prefix: &str) -> String {
-    if !block.contains('\n') {
-        return block.to_string();
-    }
-    let gutter_cols = attr_prefix.chars().count();
-    let mut out = String::with_capacity(block.len() + attr_prefix.len());
-    for (i, line) in block.split('\n').enumerate() {
-        if i == 0 {
-            out.push_str(line);
-            continue;
-        }
-        out.push('\n');
-        // Drop the first `gutter_cols` leading spaces (always plain ASCII
-        // spaces from `format_value_pretty`'s indenters), then keep
-        // whatever indentation/content follows that column. ASCII spaces
-        // are 1 byte each, so the column count is the byte count.
-        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
-        let drop = leading_spaces.min(gutter_cols);
-        let rest = &line[drop..];
-        if rest.is_empty() {
-            // Blank separator line: emit the bare gutter, no trailing pad.
-            out.push_str(attr_prefix.trim_end());
-        } else {
-            out.push_str(attr_prefix);
-            out.push_str(rest);
-        }
-    }
-    out
+fn forcing_value(rendered: &RenderedValue) -> String {
+    render_value_ansi(rendered, AnsiValueStyle::Green, None)
 }
 
 /// Apply type-based coloring to a value, with dimmed modifier for default values.
-fn colored_value_dimmed(rendered: &str) -> String {
-    // List: color each element individually
-    if rendered.starts_with('[') && rendered.ends_with(']') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return rendered.dimmed().to_string();
-        }
-        let elements = split_top_level(inner);
-        let colored_elements: Vec<String> = elements
-            .iter()
-            .map(|e| colored_value_dimmed(e.trim()))
-            .collect();
-        return format!(
-            "{}{}{}",
-            "[".dimmed(),
-            colored_elements.join(&", ".dimmed().to_string()),
-            "]".dimmed()
-        );
-    }
-    // Map: color each value individually
-    if rendered.starts_with('{') && rendered.ends_with('}') {
-        let inner = &rendered[1..rendered.len() - 1];
-        if inner.is_empty() {
-            return rendered.dimmed().to_string();
-        }
-        let entries = split_top_level(inner);
-        let colored_entries: Vec<String> = entries
-            .iter()
-            .map(|entry| {
-                if let Some(colon_pos) = entry.find(": ") {
-                    let key = &entry[..colon_pos];
-                    let val = &entry[colon_pos + 2..];
-                    format!(
-                        "{}{} {}",
-                        key.dimmed(),
-                        ":".dimmed(),
-                        colored_value_dimmed(val)
-                    )
-                } else {
-                    entry.dimmed().to_string()
-                }
-            })
-            .collect();
-        return format!(
-            "{}{}{}",
-            "{".dimmed(),
-            colored_entries.join(&", ".dimmed().to_string()),
-            "}".dimmed()
-        );
-    }
-    color_atom_dimmed(rendered)
+fn colored_value_dimmed(rendered: &RenderedValue) -> String {
+    render_value_ansi(rendered, AnsiValueStyle::Dimmed, None)
 }
 
 /// Render a single `DetailRow` into the output string with ANSI colors.
@@ -1696,12 +1426,14 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
         DetailRow::Attribute {
             key,
             value,
-            ref_binding,
+            ref_binding: _,
             annotation,
         } => {
             let cv = match effect {
-                Effect::Delete { .. } => value.red().strikethrough().to_string(),
-                _ => colored_value(value, ref_binding.is_some()),
+                Effect::Delete { .. } => {
+                    render_value_ansi(value, AnsiValueStyle::RedStrikethrough, None)
+                }
+                _ => colored_value(value),
             };
             let annotation_suffix = annotation_suffix(annotation.as_deref());
             writeln!(out, "{}{}: {}{}", attr_prefix, key, cv, annotation_suffix).unwrap();
@@ -1710,16 +1442,15 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             // attr_prefix may contain the tree glyph `│` (U+2502, 1 column
             // wide but 3 bytes in UTF-8), so use `chars().count()` for column
             // count, not `.len()`.
-            let layout = carina_core::value::PrettyLayout {
-                parent_indent_cols: attr_prefix.chars().count(),
-                key,
-            };
-            let pretty = format_value_pretty(value, layout);
+            let layout =
+                carina_core::value::PrettyLayout::for_attribute(attr_prefix.chars().count(), key);
+            let pretty = value.render(layout);
             let cv = match effect {
-                Effect::Delete { .. } => strike_lines(&pretty),
-                _ => colored_value(&pretty, false),
+                Effect::Delete { .. } => {
+                    render_value_ansi(&pretty, AnsiValueStyle::RedStrikethrough, Some(attr_prefix))
+                }
+                _ => render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix)),
             };
-            let cv = reindent_with_gutter(&cv, attr_prefix);
             writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
         }
         DetailRow::MapExpanded { key, entries } => {
@@ -1736,17 +1467,18 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 if prev_needs_separator {
                     writeln!(out, "{}", attr_prefix.trim_end()).unwrap();
                 }
-                prev_needs_separator = carina_core::value::needs_trailing_separator(&entry.value);
-                let layout = carina_core::value::PrettyLayout {
-                    parent_indent_cols: entry_indent_cols,
-                    key: &entry.key,
-                };
-                let pretty = carina_core::value::format_value_pretty(&entry.value, layout);
+                prev_needs_separator = entry.value.needs_trailing_separator();
+                let layout =
+                    carina_core::value::PrettyLayout::for_map_key(entry_indent_cols, &entry.key);
+                let pretty = entry.value.render(layout);
                 let cv = match effect {
-                    Effect::Delete { .. } => strike_lines(&pretty),
-                    _ => colored_value(&pretty, false),
+                    Effect::Delete { .. } => render_value_ansi(
+                        &pretty,
+                        AnsiValueStyle::RedStrikethrough,
+                        Some(attr_prefix),
+                    ),
+                    _ => render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix)),
                 };
-                let cv = reindent_with_gutter(&cv, attr_prefix);
                 let annotation_suffix = annotation_suffix(entry.annotation.as_deref());
                 writeln!(
                     out,
@@ -1762,8 +1494,8 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 "{}{}: {} → {}",
                 attr_prefix,
                 key,
-                old.red().strikethrough(),
-                colored_value(new, false),
+                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
+                colored_value(new),
             )
             .unwrap();
         }
@@ -1773,7 +1505,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 "{}{}: {} → {} {}",
                 attr_prefix,
                 key,
-                old.red().strikethrough(),
+                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
                 forcing_value(new),
                 "(forces replacement)".magenta()
             )
@@ -1865,7 +1597,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 "{}{}: {} → {}",
                 attr_prefix,
                 key,
-                old.red().strikethrough(),
+                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
                 "(removed)".red().strikethrough()
             )
             .unwrap();
@@ -1906,7 +1638,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 "{}{}: {} → {} {}",
                 attr_prefix,
                 key,
-                old.red().strikethrough(),
+                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
                 "(removed)".red().strikethrough(),
                 "(forces replacement)".magenta()
             )
@@ -1918,8 +1650,8 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 "{}{}: {} → {} {}",
                 attr_prefix,
                 key,
-                old.red().strikethrough(),
-                new.green(),
+                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
+                render_value_ansi(new, AnsiValueStyle::Green, None),
                 "(forces replacement, known after apply)".magenta()
             )
             .unwrap();
@@ -1933,20 +1665,20 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             if *can_rename {
                 writeln!(
                     out,
-                    "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
+                    "{}  {} via temporary name {}, will rename back to {} after old resource is deleted",
                     attr_prefix,
                     "note:".magenta().bold(),
-                    temporary_value.magenta(),
-                    original_value.green()
+                    render_value_ansi(temporary_value, AnsiValueStyle::Magenta, None),
+                    render_value_ansi(original_value, AnsiValueStyle::Green, None)
                 )
                 .unwrap();
             } else {
                 writeln!(
                     out,
-                    "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
+                    "{}  {} name will be {} (cannot rename create-only attribute \"{}\")",
                     attr_prefix,
                     "note:".magenta().bold(),
-                    temporary_value.magenta(),
+                    render_value_ansi(temporary_value, AnsiValueStyle::Magenta, None),
                     attribute.magenta()
                 )
                 .unwrap();
@@ -1972,8 +1704,8 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                     attr_prefix,
                     "~".yellow(),
                     key,
-                    old.red().strikethrough(),
-                    colored_value(new, false),
+                    render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
+                    colored_value(new),
                     annotation_suffix
                 )
                 .unwrap();
@@ -1990,7 +1722,7 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                     attr_prefix,
                     "+".green(),
                     key,
-                    colored_value(value, false),
+                    colored_value(value),
                     annotation_suffix
                 )
                 .unwrap();
@@ -2002,7 +1734,7 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                     attr_prefix,
                     "-".red().strikethrough(),
                     key,
-                    value.red().strikethrough()
+                    render_value_ansi(value, AnsiValueStyle::RedStrikethrough, None)
                 )
                 .unwrap();
             }
@@ -2051,18 +1783,18 @@ fn annotation_suffix(annotation: Option<&str>) -> String {
 /// at the top level.
 fn render_string_list_diff_entries(
     out: &mut String,
-    unchanged: &[String],
-    added: &[String],
-    removed: &[String],
+    unchanged: &[RenderedValue],
+    added: &[RenderedValue],
+    removed: &[RenderedValue],
     attr_prefix: &str,
 ) {
     for s in removed {
         writeln!(
             out,
-            "{}  {} \"{}\"",
+            "{}  {} {}",
             attr_prefix,
             "-".red().strikethrough(),
-            s.red().strikethrough()
+            render_value_ansi(s, AnsiValueStyle::RedStrikethrough, None)
         )
         .unwrap();
     }
@@ -2072,7 +1804,7 @@ fn render_string_list_diff_entries(
             "{}  {} {}",
             attr_prefix,
             "+".green(),
-            format!("\"{}\"", s).green()
+            render_value_ansi(s, AnsiValueStyle::Green, None)
         )
         .unwrap();
     }
@@ -2090,7 +1822,7 @@ fn render_string_list_diff_entries(
 /// Render a list-of-maps diff with ANSI colors.
 fn render_list_of_maps_diff(
     out: &mut String,
-    unchanged: &[String],
+    unchanged: &[RenderedValue],
     modified: &[ListOfMapsDiffModified],
     added: &[ListOfMapsDiffItem],
     removed: &[ListOfMapsDiffItem],
@@ -2122,8 +1854,8 @@ fn render_list_of_maps_diff(
                             attr_prefix,
                             "~".yellow(),
                             key,
-                            old.red().strikethrough(),
-                            new.green()
+                            render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
+                            render_value_ansi(new, AnsiValueStyle::Green, None)
                         )
                         .unwrap();
                     }
@@ -2199,7 +1931,7 @@ fn render_list_of_maps_diff(
 /// (`~ {\n  key: value\n  ...\n}`) so all three diff markers (`+`, `-`,
 /// `~`) share the same visual shape.
 ///
-/// Each field's value is laid out via `format_value_pretty` so nested
+/// Each field's value is laid out via `PrettyValue::render` so nested
 /// long lists / maps wrap to multiple indented lines instead of dumping
 /// inline. The pre-fix path stringified the whole element with
 /// `format_value` and emitted it on one line (`+ {action: [...], ...}`),
@@ -2232,17 +1964,17 @@ fn render_added_removed_block(
         if prev_needs_separator {
             writeln!(out, "{}", attr_prefix.trim_end()).unwrap();
         }
-        prev_needs_separator = carina_core::value::needs_trailing_separator(value);
-        let layout = carina_core::value::PrettyLayout {
-            parent_indent_cols: field_indent_cols,
-            key,
-        };
-        let pretty = format_value_pretty(value, layout);
+        prev_needs_separator = value.needs_trailing_separator();
+        let layout = carina_core::value::PrettyLayout::for_map_key(field_indent_cols, key);
+        let pretty = value.render(layout);
         let cv = match kind {
-            ListOfMapsDiffItemKind::Added => colored_value(&pretty, false),
-            ListOfMapsDiffItemKind::Removed => strike_lines(&pretty),
+            ListOfMapsDiffItemKind::Added => {
+                render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
+            }
+            ListOfMapsDiffItemKind::Removed => {
+                render_value_ansi(&pretty, AnsiValueStyle::RedStrikethrough, Some(attr_prefix))
+            }
         };
-        let cv = reindent_with_gutter(&cv, attr_prefix);
         writeln!(out, "{}{}: {}", field_indent, key, cv).unwrap();
     }
     writeln!(out, "{}    }}", attr_prefix).unwrap();
@@ -2257,8 +1989,8 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
                 result_parts.push(format!(
                     "{}: {} → {}",
                     key,
-                    old.red().strikethrough(),
-                    new.green()
+                    render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
+                    render_value_ansi(new, AnsiValueStyle::Green, None)
                 ));
             }
             ListOfMapsDiffField::NestedMapChanged { key, .. } => {

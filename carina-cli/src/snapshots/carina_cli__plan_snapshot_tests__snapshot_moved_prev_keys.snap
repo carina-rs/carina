@@ -7,13 +7,13 @@ Execution Plan:
   ~ awscc.ec2.Vpc new_vpc (moved from: old_vpc)
       tags:
         - {
-            key: "Name"
-            value: "old"
+            key: 'Name'
+            value: 'old'
           }
       # (1 unchanged attribute hidden)
         │
         └─ + awscc.ec2.Subnet awscc_ec2_subnet_5590d965
-              cidr_block: "10.0.1.0/24"
+              cidr_block: '10.0.1.0/24'
               vpc_id: new_vpc.vpc_id
 
 Plan: 1 to add, 1 to change, 0 to destroy, 1 to move.

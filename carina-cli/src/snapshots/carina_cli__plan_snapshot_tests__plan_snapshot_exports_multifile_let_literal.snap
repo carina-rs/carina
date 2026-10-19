@@ -5,7 +5,7 @@ expression: output
 Execution Plan:
 
   + mock.compute.Instance inst.cluster
-      cluster_name: "literal-via-resource-attr"
+      cluster_name: 'literal-via-resource-attr'
       arn: (known after apply)
 
 Exports:

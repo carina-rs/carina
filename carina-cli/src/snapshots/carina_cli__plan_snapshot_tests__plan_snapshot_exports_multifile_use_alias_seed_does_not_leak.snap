@@ -7,6 +7,6 @@ Execution Plan:
 
 Exports:
 
-  + z = (known after apply)
+  + z = foo
 
 Plan: 0 to add, 0 to change, 0 to destroy, 1 export change(s).

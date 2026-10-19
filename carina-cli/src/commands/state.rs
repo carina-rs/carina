@@ -3575,7 +3575,7 @@ mod tests {
         let output = format_state_show(&deposed_format_state());
         assert_eq!(
             output,
-            "# awscc.ec2.Vpc (main)\n  cidr_block = \"10.0.0.0/16\"\n  vpc_id = \"vpc-new\"\n  (deposed dep-a vpc-old)\n    cidr_block = \"10.0.1.0/16\"\n    vpc_id = \"vpc-old\"\n  (deposed dep-b vpc-older)\n    vpc_id = \"vpc-older\"\n\n# awscc.ec2.Subnet (abandoned)\n  (deposed dep-shell subnet-old)\n    subnet_id = \"subnet-old\"\n"
+            "# awscc.ec2.Vpc (main)\n  cidr_block = '10.0.0.0/16'\n  vpc_id = 'vpc-new'\n  (deposed dep-a vpc-old)\n    cidr_block = '10.0.1.0/16'\n    vpc_id = 'vpc-old'\n  (deposed dep-b vpc-older)\n    vpc_id = 'vpc-older'\n\n# awscc.ec2.Subnet (abandoned)\n  (deposed dep-shell subnet-old)\n    subnet_id = 'subnet-old'\n"
         );
     }
 

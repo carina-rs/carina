@@ -16,7 +16,7 @@ use crate::resource::{
     RawEnumIdentifier, Resource, Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
-use crate::value::{CanonicalizationPurpose, DesiredValueSource, format_value_with_key};
+use crate::value::{CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value};
 
 mod resolved_attr_type;
 mod resolved_union_members;
@@ -6602,8 +6602,8 @@ impl ResourceSchema {
     }
 
     /// Returns default-value attributes not specified by the user, sorted by name.
-    /// Each entry is (attribute_name, formatted_default_value).
-    pub fn compute_default_attrs(&self, user_keys: &HashSet<&str>) -> Vec<(String, String)> {
+    /// Each entry is (attribute_name, rendered_default_value).
+    pub fn compute_default_attrs(&self, user_keys: &HashSet<&str>) -> Vec<(String, RenderedValue)> {
         let mut default_attrs: Vec<(&str, &Value)> = self
             .default_value_attributes()
             .into_iter()
@@ -6612,7 +6612,7 @@ impl ResourceSchema {
         default_attrs.sort_by_key(|(a, _)| *a);
         default_attrs
             .into_iter()
-            .map(|(name, val)| (name.to_string(), format_value_with_key(val, Some(name))))
+            .map(|(name, val)| (name.to_string(), render_value(val)))
             .collect()
     }
 

@@ -6,11 +6,11 @@ Execution Plan:
 
   ~ awscc.ec2.Vpc vpc
       tags:
-        + Component: "registry"
-        + Environment: "dev"
-        + ManagedBy: "carina"
-        + Project: "carina-rs"
-        + Repository: "carina-rs/infra"
+        + Component: 'registry'
+        + Environment: 'dev'
+        + ManagedBy: 'carina'
+        + Project: 'carina-rs'
+        + Repository: 'carina-rs/infra'
       # (1 unchanged attribute hidden)
 
 Plan: 0 to add, 1 to change, 0 to destroy.

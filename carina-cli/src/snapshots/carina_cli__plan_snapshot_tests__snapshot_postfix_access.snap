@@ -5,11 +5,11 @@ expression: output
 Execution Plan:
 
   + awscc.issue3885.Role role
-      role_name: "demo-role"
+      role_name: 'demo-role'
       arn: (known after apply)
         │
         └─ + awscc.ec2.SecurityGroup awscc_ec2_security_group_c31b947c
-              group_name: split("/", role.arn)[1]
-              vpc_id: "vpc-123"
+              group_name: split('/', role.arn)[1]
+              vpc_id: 'vpc-123'
 
 Plan: 2 to add, 0 to change, 0 to destroy.
