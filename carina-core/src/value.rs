@@ -1029,12 +1029,7 @@ fn format_value_into_context(
             }
             sink.write_token(ValueSpanKind::Structure, ")")
         }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            args,
-            source_line: _,
-            ..
-        }) => {
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
             sink.write_token(ValueSpanKind::Other, &function.name)?;
             sink.write_token(ValueSpanKind::Structure, "(")?;
             for (i, arg) in args.iter().enumerate() {
