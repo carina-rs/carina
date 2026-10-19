@@ -239,9 +239,12 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
                 }
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
             for arg in args {
-                visit_unknowns(arg, f);
+                visit_unknowns(arg.walker_value(), f);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),

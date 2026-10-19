@@ -134,7 +134,9 @@ pub fn check_type_expr_value(
             TypeExpr::Union(_) => {}
             _ => return Ok(()),
         },
-        Value::Deferred(DeferredValue::FunctionCall { .. })
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        )
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => return Ok(()),
         Value::Deferred(DeferredValue::Access(_)) => {
@@ -240,6 +242,12 @@ pub fn check_type_expr_value(
             _ => Err(mismatch(expected, value)),
         },
         TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => match value {
+            // Ref annotations are also the established boundary type for
+            // provider IDs. Real modules pass both literal IDs and resource
+            // attributes such as `vpc.vpc_id`; the latter defers in the
+            // ResourceRef arm above and a resolved ID arrives here as String.
+            // Structural handles take a separate typed ModuleArgument /
+            // EvalValue path and must not be conflated with this value case.
             Value::Concrete(ConcreteValue::String(_) | ConcreteValue::CanonicalEnum(_)) => Ok(()),
             Value::Concrete(ConcreteValue::EnumIdentifier(identifier))
                 if is_qualified_enum_identifier(identifier.as_str()) =>
@@ -396,6 +404,14 @@ mod tests {
         )
     }
 
+    #[test]
+    fn ref_parameter_accepts_literal_and_attribute_string_values() {
+        let expected = TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.Vpc"));
+        check(&expected, &string("vpc-123")).expect("literal provider ID");
+        check(&expected, &Value::resource_ref("vpc", "vpc_id", Vec::new()))
+            .expect("resource attribute provider ID");
+    }
+
     fn check_with_config(
         expected: &TypeExpr,
         value: &Value,
@@ -413,8 +429,12 @@ mod tests {
 
         crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
-                args: vec![string("/"), Value::resource_ref("role", "arn", vec![])],
+                name: crate::builtins::BuiltinFunction::split,
+                args: vec![
+                    string("/").into(),
+                    Value::resource_ref("role", "arn", vec![]).into(),
+                ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 1 },
@@ -439,8 +459,12 @@ mod tests {
 
         let list_with_string_key = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
-                args: vec![string("/"), Value::resource_ref("q", "identifier", vec![])],
+                name: crate::builtins::BuiltinFunction::split,
+                args: vec![
+                    string("/").into(),
+                    Value::resource_ref("q", "identifier", vec![]).into(),
+                ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Str { key: "key".into() },
@@ -451,8 +475,9 @@ mod tests {
         .unwrap();
         let field_on_string = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "upper".to_string(),
-                args: vec![Value::resource_ref("q", "identifier", vec![])],
+                name: crate::builtins::BuiltinFunction::upper,
+                args: vec![Value::resource_ref("q", "identifier", vec![]).into()],
+                source_line: (0).into(),
             }),
             PathSegment::Field {
                 name: "field".to_string(),
@@ -588,8 +613,9 @@ mod tests {
     fn unresolved_values_follow_the_shared_deferred_policy() {
         let resource_ref = Value::resource_ref("source", "value", Vec::new());
         let function = Value::Deferred(DeferredValue::FunctionCall {
-            name: "identity".to_string(),
+            name: crate::builtins::BuiltinFunction::upper,
             args: Vec::new(),
+            source_line: (0).into(),
         });
         let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
         let untyped_binding = Value::Deferred(DeferredValue::BindingRef {

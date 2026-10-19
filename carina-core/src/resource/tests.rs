@@ -2,11 +2,76 @@ use super::*;
 use crate::explicit::ExplicitFields;
 
 #[test]
+fn module_argument_source_location_is_not_value_data() {
+    let located = Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+        name: "r".to_string(),
+        source_line: (17).into(),
+        diagnostic_name: None,
+    }));
+    let same_operand_other_line =
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+            name: "r".to_string(),
+            source_line: (23).into(),
+            diagnostic_name: None,
+        }));
+
+    assert_eq!(located, same_operand_other_line);
+    let encoded = serde_json::to_string(&located).expect("serialize parser placeholder");
+    assert!(
+        !encoded.contains("source_line") && !encoded.contains("17"),
+        "diagnostic location leaked into Value serialization: {encoded}",
+    );
+}
+
+#[test]
+fn function_call_source_location_is_not_value_data() {
+    let call_at = |line: usize| {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![Value::Concrete(ConcreteValue::String("value".into())).into()],
+            source_line: line.into(),
+        })
+    };
+    let located = call_at(17);
+
+    assert_eq!(located, call_at(23));
+    let encoded = serde_json::to_string(&located).expect("serialize deferred call");
+    assert!(
+        !encoded.contains("source_line") && !encoded.contains("17"),
+        "diagnostic location leaked into Value serialization: {encoded}",
+    );
+    let decoded: Value = serde_json::from_str(&encoded).expect("deserialize deferred call");
+    let Value::Deferred(DeferredValue::FunctionCall { source_line, .. }) = decoded else {
+        panic!("expected a deferred function call");
+    };
+    assert_eq!(source_line.get(), None);
+}
+
+#[test]
+fn deferred_function_call_deserialization_rejects_non_builtin_names() {
+    let builtin = DeferredValue::FunctionCall {
+        name: crate::builtins::BuiltinFunction::upper,
+        args: vec![Value::Concrete(ConcreteValue::String("value".into())).into()],
+        source_line: DiagnosticSourceLine::synthetic(),
+    };
+    let encoded = serde_json::to_string(&builtin).expect("serialize deferred builtin call");
+    let invalid = encoded.replace("upper", "user_helper");
+
+    let error = serde_json::from_str::<DeferredValue>(&invalid)
+        .expect_err("a deferred builtin call cannot carry a user-function name");
+    assert!(
+        error.to_string().contains("user_helper"),
+        "unexpected deserialization error: {error}",
+    );
+}
+
+#[test]
 fn deferred_access_serde_round_trips() {
     let original = apply_postfix_access(
         Value::Deferred(DeferredValue::FunctionCall {
-            name: "lookup".to_string(),
-            args: vec![Value::resource_ref("source", "values", vec![])],
+            name: crate::builtins::BuiltinFunction::lookup,
+            args: vec![Value::resource_ref("source", "values", vec![]).into()],
+            source_line: (0).into(),
         }),
         PathSegment::Subscript {
             index: Subscript::Str { key: "name".into() },
@@ -186,14 +251,16 @@ fn value_serde_round_trip() {
             InterpolationPart::Literal("-suffix".into()),
         ])),
         Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".into())),
+                Value::Concrete(ConcreteValue::String("-".into())).into(),
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::Concrete(ConcreteValue::String("a".into())),
                     Value::Concrete(ConcreteValue::String("b".into())),
-                ])),
+                ]))
+                .into(),
             ],
+            source_line: (0).into(),
         }),
     ];
 
@@ -2343,8 +2410,9 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
             InterpolationPart::Expr(Value::resource_ref("c", "id", vec![])),
         ])),
         Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
-            args: vec![Value::resource_ref("d", "id", vec![])],
+            name: crate::builtins::BuiltinFunction::join,
+            args: vec![Value::resource_ref("d", "id", vec![]).into()],
+            source_line: (0).into(),
         }),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
             "e",
@@ -2381,10 +2449,14 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
             })),
         ])),
         Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
-            args: vec![Value::Deferred(DeferredValue::BindingRef {
-                binding: "d".to_string(),
-            })],
+            name: crate::builtins::BuiltinFunction::join,
+            args: vec![
+                Value::Deferred(DeferredValue::BindingRef {
+                    binding: "d".to_string(),
+                })
+                .into(),
+            ],
+            source_line: (0).into(),
         }),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
             DeferredValue::BindingRef {
@@ -2553,16 +2625,21 @@ fn canonicalize_recurses_into_list_and_map() {
 #[test]
 fn canonicalize_recurses_into_function_call_args() {
     let v = Value::Deferred(DeferredValue::FunctionCall {
-        name: "upper".into(),
-        args: vec![Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("foo".into()),
-        ]))],
+        name: crate::builtins::BuiltinFunction::upper,
+        args: vec![
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("foo".into()),
+            ]))
+            .into(),
+        ],
+        source_line: (0).into(),
     });
     assert_eq!(
         v.canonicalize(),
         Value::Deferred(DeferredValue::FunctionCall {
-            name: "upper".into(),
-            args: vec![Value::Concrete(ConcreteValue::String("foo".into()))],
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![Value::Concrete(ConcreteValue::String("foo".into())).into()],
+            source_line: (0).into(),
         })
     );
 }
@@ -2658,10 +2735,14 @@ fn canonicalize_is_idempotent() {
             ])),
         )]))),
         Value::Deferred(DeferredValue::FunctionCall {
-            name: "upper".into(),
-            args: vec![Value::Deferred(DeferredValue::Interpolation(vec![
-                InterpolationPart::Literal("x".into()),
-            ]))],
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![
+                Value::Deferred(DeferredValue::Interpolation(vec![
+                    InterpolationPart::Literal("x".into()),
+                ]))
+                .into(),
+            ],
+            source_line: (0).into(),
         }),
     ];
     for v in inputs {
@@ -2934,8 +3015,9 @@ fn as_deferred_returns_projection_for_deferred_variants() {
         ),
         (
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "join".to_string(),
+                name: crate::builtins::BuiltinFunction::join,
                 args: vec![],
+                source_line: (0).into(),
             }),
             "FunctionCall",
         ),

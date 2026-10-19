@@ -3,12 +3,23 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use super::Rule;
+use crate::eval_value::EvalValueError;
+use std::path::{Path, PathBuf};
 
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
 
 /// Parse error
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    /// A semantic parse/evaluation error whose expression is owned by another
+    /// file in the same directory. The inner error retains the precise line;
+    /// this wrapper retains which document that line belongs to.
+    #[error("{path}: {error}")]
+    Located {
+        path: PathBuf,
+        error: Box<ParseError>,
+    },
+
     // A pest diagnostic is a terminal, already formatted leaf. Keep it in
     // Display and do not expose it again through Error::source.
     #[error("Syntax error: {0}")]
@@ -16,6 +27,17 @@ pub enum ParseError {
 
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
+
+    /// A call whose name is neither a declared user function nor a builtin.
+    /// Keeping this structured lets the declaration prepass defer forward and
+    /// sibling calls without treating a genuinely unknown name as a builtin.
+    #[error("Invalid expression at line {line}: Unknown function '{name}'")]
+    UnknownFunction {
+        name: String,
+        line: usize,
+        /// One-based source column of the function name.
+        column: usize,
+    },
 
     #[error(
         "Reserved attribute name '{attribute}' at line {line}, column {column}: names starting with '_' are reserved for Carina"
@@ -171,6 +193,31 @@ pub struct ParseWarning {
 }
 
 impl ParseError {
+    pub(crate) fn in_file(self, path: impl Into<PathBuf>) -> Self {
+        if matches!(self, Self::Located { .. }) {
+            self
+        } else {
+            Self::Located {
+                path: path.into(),
+                error: Box::new(self),
+            }
+        }
+    }
+
+    pub fn source_file(&self) -> Option<&Path> {
+        match self {
+            Self::Located { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_eval_value(error: EvalValueError, line: usize) -> Self {
+        ParseError::InvalidExpression {
+            line,
+            message: error.to_string(),
+        }
+    }
+
     /// Construct an `UndefinedIdentifier` error with did-you-mean suggestion
     /// and sorted in-scope binding list. `known_bindings` is the set of
     /// names that are in scope at the check site — they will be sorted

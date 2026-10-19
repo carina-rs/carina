@@ -3,7 +3,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use super::ProviderContext;
-use super::ast::{ParsedFile, ProviderConfig};
+use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
@@ -441,6 +441,7 @@ pub enum ProviderConfigResolutionError {
 /// the pre-apply resolver needs while staying scoped to the two
 /// types that actually go through it ([`Resource`] and [`DataSource`]).
 trait PreApplyResourceMut {
+    fn id(&self) -> &crate::resource::ResourceId;
     fn attributes(&self) -> &IndexMap<String, Value>;
     fn dependency_bindings(&self) -> &BTreeSet<String>;
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
@@ -448,6 +449,9 @@ trait PreApplyResourceMut {
 }
 
 impl PreApplyResourceMut for Resource {
+    fn id(&self) -> &crate::resource::ResourceId {
+        &self.id
+    }
     fn attributes(&self) -> &IndexMap<String, Value> {
         &self.attributes
     }
@@ -463,6 +467,9 @@ impl PreApplyResourceMut for Resource {
 }
 
 impl PreApplyResourceMut for DataSource {
+    fn id(&self) -> &crate::resource::ResourceId {
+        &self.id
+    }
     fn attributes(&self) -> &IndexMap<String, Value> {
         &self.attributes
     }
@@ -480,8 +487,8 @@ impl PreApplyResourceMut for DataSource {
 /// Mutable iterator over the pre-apply resolvable resources — managed
 /// resources then data sources (carina#3181). Used by the resolver to
 /// rewrite refs in place across both typed slices in one walk.
-fn iter_pre_apply_resources_mut(
-    parsed: &mut ParsedFile,
+fn iter_pre_apply_resources_mut<E>(
+    parsed: &mut File<E>,
 ) -> impl Iterator<Item = &mut dyn PreApplyResourceMut> + '_ {
     parsed
         .resources
@@ -508,11 +515,50 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
 /// the merged directory parse triggers user-fn evaluation here, even when
 /// the per-file parse couldn't evaluate it because the `fn` declaration
 /// lived in a sibling `.crn` (#2444).
-pub fn resolve_resource_refs_with_config(
-    parsed: &mut ParsedFile,
+pub fn resolve_resource_refs_with_config<E: ExportParamLike>(
+    parsed: &mut File<E>,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     resolve_resource_refs_with_policy(parsed, config, false, false)
+}
+
+/// Evaluate deferred function calls in the raw resource snapshot retained for
+/// identity and dependency provenance, while leaving ordinary references in
+/// expression form. Sibling functions require the directory-merged function
+/// table, so this runs after file merge rather than during each file's parse.
+pub(crate) fn resolve_snapshot_function_calls_with_config(
+    parsed: &mut ParsedFile,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for resource in parsed.iter_top_level_resources() {
+        if let Some(binding) = resource.binding() {
+            binding_map.insert(binding.to_string(), resource.resolved_attributes());
+        }
+    }
+
+    let mut fn_ctx = super::ParseContext::new(config);
+    fn_ctx.replace_user_functions(parsed.user_functions.clone());
+
+    // This snapshot preserves authored references for identity/dependency
+    // provenance; it is not a second validation surface. Provider-backed
+    // annotations cannot be classified in the bootstrap context, and the
+    // resolved tree runs their authoritative checks after schemas load.
+    // Evaluate the same function bodies here without annotations so the raw
+    // snapshot does not retain a user-function call that plan-time value
+    // resolution would later mistake for an unknown builtin.
+    for function in fn_ctx.user_functions_mut().values_mut() {
+        for parameter in &mut function.params {
+            parameter.param_type = None;
+        }
+        function.return_type = None;
+    }
+    for resource in iter_pre_apply_resources_mut(parsed) {
+        for value in resource.attributes_mut().values_mut() {
+            *value = resolve_function_calls_only(value, &binding_map, &fn_ctx, true, false)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve one file before its sibling declarations have been merged.
@@ -540,12 +586,24 @@ pub(crate) fn resolve_resource_refs_for_diagnostics(
     resolve_resource_refs_with_policy(parsed, config, false, true)
 }
 
-fn resolve_resource_refs_with_policy(
-    parsed: &mut ParsedFile,
+fn resolve_resource_refs_with_policy<E: ExportParamLike>(
+    parsed: &mut File<E>,
     config: &ProviderContext,
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<(), ParseError> {
+    let pending_ctx = super::ParseContext::new(config);
+    for check in parsed
+        .parser_binding_metadata
+        .pending_function_type_checks()
+    {
+        super::functions::validate_pending_function_type_check(
+            check,
+            &parsed.user_functions,
+            &pending_ctx,
+        )?;
+    }
+
     // Save dependency bindings before resolution may change ResourceRef binding names.
     // This preserves direct dependencies that would be lost by recursive resolution
     // (e.g., tgw_attach.transit_gateway_id resolves to tgw.id, losing the tgw_attach dep).
@@ -619,7 +677,20 @@ fn resolve_resource_refs_with_policy(
     // path (would need to restore on every `?` exit), so we accept a
     // single map clone per call.
     let mut fn_ctx = super::ParseContext::new(config);
-    fn_ctx.user_functions = parsed.user_functions.clone();
+    fn_ctx.replace_user_functions(parsed.user_functions.clone());
+
+    let resource_source_files: HashMap<crate::resource::ResourceId, std::path::PathBuf> = parsed
+        .resources
+        .iter()
+        .map(|resource| &resource.id)
+        .chain(parsed.data_sources.iter().map(|resource| &resource.id))
+        .filter_map(|id| {
+            parsed
+                .parser_binding_metadata
+                .resource_source_file(id)
+                .map(|path| (id.clone(), path.to_path_buf()))
+        })
+        .collect();
 
     // The typed backend resolver consumes ordinary values directly and has no
     // secret transport/writeback seam. Evaluate backend function calls with
@@ -660,6 +731,7 @@ fn resolve_resource_refs_with_policy(
     // pre-apply ref resolution; `Composition` is excluded — its refs
     // are resolved on the post-apply path.
     for resource in iter_pre_apply_resources_mut(parsed) {
+        let source_file = resource_source_files.get(resource.id()).cloned();
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
 
         for (key, expr) in resource.attributes().iter() {
@@ -669,7 +741,11 @@ fn resolve_resource_refs_with_policy(
                 &fn_ctx,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| match &source_file {
+                Some(path) => error.in_file(path.clone()),
+                None => error,
+            })?;
             resolved_attrs.insert(key.clone(), resolved);
         }
 
@@ -785,16 +861,20 @@ fn resolve_resource_refs_with_policy(
         // See the matching attribute-output guard above. Annotated exports
         // need their concrete values for boundary checking; unannotated
         // exports must retain the expression for return-type inference.
-        if export.type_expr.is_some()
-            && let Some(value) = &mut export.value
-        {
-            *value = resolve_function_calls_only(
-                value,
-                &binding_map,
-                &fn_ctx,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
-            )?;
+        if export.type_expr_opt().is_some() {
+            let resolved = export
+                .value()
+                .map(|value| {
+                    resolve_function_calls_only(
+                        value,
+                        &binding_map,
+                        &fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )
+                })
+                .transpose()?;
+            export.set_value(resolved);
         }
     }
 
@@ -831,8 +911,8 @@ pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::H
 ///
 /// Plain value-shaped `let` bindings carry their pass-1 value so bare
 /// sibling identifiers parse to that value instead of a deferred
-/// placeholder. Structural names always become typed structural seeds, even
-/// when `parsed.variables` retains a legacy bare resource-handle value.
+/// placeholder. Structural names always become typed structural seeds and
+/// remain outside `parsed.variables`.
 #[cfg(test)]
 pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSeed<'_>> {
     let structural = parsed.structural_binding_names();
@@ -858,6 +938,7 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
 ) -> Vec<BindingSeed<'a>> {
     let mut names: Vec<&'a str> = structural.iter().copied().collect();
     names.extend(variables.keys().map(String::as_str));
+    names.extend(metadata.structural_handles().keys().map(String::as_str));
     names.sort_unstable();
     names.dedup();
 
@@ -865,18 +946,29 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
         .into_iter()
         .map(|name| {
             if module_parameters.contains(name) {
-                BindingSeed::module_parameter(name)
+                match metadata.structural_handles().get(name) {
+                    Some(handle) => BindingSeed::typed_structural(name, handle),
+                    None => BindingSeed::module_parameter(name),
+                }
             } else if let Some(handle) = metadata.structural_aliases().get(name) {
                 BindingSeed::structural_alias(name, handle)
-            } else if structural.contains(name) {
-                BindingSeed::structural(name)
+            } else if let Some(handle) = metadata.structural_handles().get(name) {
+                BindingSeed::typed_structural(name, handle)
             } else if let Some(value) = variables.get(name) {
+                // The bootstrap structural-name set can conservatively
+                // contain an `if` binding whose provisional condition made
+                // us inspect a structural branch. Once the fixed point has a
+                // real value for that binding, the classified value wins.
                 match metadata.value_structural_handles(name) {
                     Some(structural_handles) => {
                         BindingSeed::value_with_structural_handles(name, value, structural_handles)
                     }
                     None => BindingSeed::value(name, value),
                 }
+            } else if structural.contains(name) {
+                // Function names participate in directory scope checks but
+                // are not value-position structural handles.
+                BindingSeed::provisional(name)
             } else {
                 unreachable!(
                     "collect_seed_bindings_from_parts names are either structural or in variables"
@@ -996,9 +1088,12 @@ fn collect_reference_roots(
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             push_root(path.binding(), variables, structural, roots);
         }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
             for arg in args {
-                collect_reference_roots(arg, variables, structural, roots);
+                collect_reference_roots(arg.walker_value(), variables, structural, roots);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -1197,7 +1292,7 @@ fn accumulate_undefined_reference_errors(
     }
     for call in &parsed.module_calls {
         for v in call.arguments.values() {
-            check(v.value());
+            check(v.walker_value());
         }
     }
     for export in &parsed.export_params {
@@ -1329,68 +1424,92 @@ fn resolve_value_with_config(
                 .collect();
             Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            let resolved_args: Result<Vec<Value>, ParseError> = args
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let evaluation_line = source_line.get().unwrap_or(function.body.source_line);
+            let resolved_args = args
                 .iter()
-                .map(|a| {
-                    resolve_value_with_config(
-                        a,
-                        binding_map,
-                        fn_ctx,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
-                    )
+                .map(|argument| {
+                    argument.try_map_value(|value| {
+                        resolve_value_with_config(
+                            value,
+                            binding_map,
+                            fn_ctx,
+                            defer_unknown_functions,
+                            preserve_failed_user_calls,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let evaluated = super::functions::evaluate_resolved_user_function(
+                function,
+                functions,
+                &resolved_args,
+                fn_ctx.config,
+                evaluation_line,
+            );
+            if preserve_failed_user_calls && evaluated.is_err() {
+                return Ok(value.clone());
+            }
+            evaluated
+        }
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => {
+            let authored_line = source_line.get();
+            let resolved_args: Result<Vec<crate::resource::FunctionArgument>, ParseError> = args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| {
+                        resolve_value_with_config(
+                            value,
+                            binding_map,
+                            fn_ctx,
+                            defer_unknown_functions,
+                            preserve_failed_user_calls,
+                        )
+                    })
                 })
                 .collect();
             let resolved_args = resolved_args?;
 
-            let all_args_resolved = resolved_args.iter().all(is_static_value);
+            let all_args_resolved = resolved_args.iter().all(|argument| {
+                argument.handle().is_some() || argument.value().is_some_and(is_static_value)
+            });
 
             let eval_args: Vec<EvalValue> = resolved_args
                 .iter()
-                .cloned()
-                .map(EvalValue::from_value)
+                .map(super::functions::function_argument_as_eval)
                 .collect();
-            match crate::builtins::evaluate_builtin_with_config(name, &eval_args, fn_ctx.config) {
-                Ok(result) => result
-                    .into_value()
-                    .map_err(|leak| ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "{}(): produced a closure '{}' (still needs {} arg(s)); \
-                         finish the partial application before using the result as data",
-                            name, leak.name, leak.remaining_arity
-                        ),
-                    }),
+            match crate::builtins::evaluate_builtin_with_config(
+                name.as_str(),
+                &eval_args,
+                fn_ctx.config,
+            ) {
+                Ok(result) => result.into_value().map_err(|error| match authored_line {
+                    Some(line) => ParseError::from_eval_value(error, line),
+                    None => ParseError::UserFunctionError(error.to_string()),
+                }),
                 Err(e) => {
-                    // Builtin lookup failed. The name may be a user-fn
-                    // that became visible only after directory merge
-                    // (#2444): evaluate against the merged `fn_ctx`
-                    // built once at the top of the resolver pass.
-                    // Truly-undefined names with all-static args still
-                    // error.
-                    if let Some(user_fn) = fn_ctx.user_functions.get(name) {
-                        let evaluated = super::functions::evaluate_user_function(
-                            user_fn,
-                            &resolved_args,
-                            fn_ctx,
-                        );
-                        if preserve_failed_user_calls && evaluated.is_err() {
-                            return Ok(value.clone());
-                        }
-                        return evaluated;
-                    }
                     if all_args_resolved && !defer_unknown_functions {
-                        // All args are resolved but builtin failed — propagate the error
-                        Err(ParseError::InvalidExpression {
-                            line: 0,
-                            message: format!("{}(): {}", name, e),
+                        // All args are resolved but evaluation failed — propagate the error.
+                        let message = format!("{}(): {}", name, e);
+                        Err(match authored_line {
+                            Some(line) => ParseError::InvalidExpression { line, message },
+                            None => ParseError::UserFunctionError(message),
                         })
                     } else {
                         // Args contain unresolved refs — keep as FunctionCall for later resolution
                         Ok(Value::Deferred(DeferredValue::FunctionCall {
-                            name: name.clone(),
+                            name: *name,
                             args: resolved_args,
+                            source_line: *source_line,
                         }))
                     }
                 }
@@ -1431,15 +1550,17 @@ fn resolve_function_calls_only(
 ) -> Result<Value, ParseError> {
     use crate::resource::InterpolationPart;
     match value {
-        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Access(_)) => {
-            resolve_value_with_config(
-                value,
-                binding_map,
-                fn_ctx,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
-            )
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_),
+        ) => resolve_value_with_config(
+            value,
+            binding_map,
+            fn_ctx,
+            defer_unknown_functions,
+            preserve_failed_user_calls,
+        ),
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
@@ -1547,7 +1668,7 @@ pub fn resolve_provider_unresolved_attributes<E>(
             .or_default();
     }
     let mut fn_ctx = super::ParseContext::new(config);
-    fn_ctx.user_functions = parsed.user_functions.clone();
+    fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     for provider in &mut parsed.providers {
         let mut resolved: IndexMap<String, Value> = IndexMap::new();
@@ -1595,7 +1716,7 @@ pub fn resolve_provider_attributes_with_remote<E>(
     }
 
     let mut fn_ctx = super::ParseContext::new(config);
-    fn_ctx.user_functions = parsed.user_functions.clone();
+    fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     let mut providers = Vec::with_capacity(parsed.providers.len());
     for provider in &parsed.providers {
@@ -1692,16 +1813,15 @@ mod seed_precedence_tests {
     use crate::parser::entry::SeedKind;
 
     #[test]
-    fn structural_let_retains_legacy_value_and_still_seeds_as_structural() {
+    fn structural_let_stays_out_of_value_model_and_seeds_as_typed_structural() {
         let parsed = crate::parser::parse(
             "let cluster = mock.compute.Instance { name = \"example\" }",
             &crate::parser::ProviderContext::default(),
         )
         .expect("parse structural let");
-        assert_eq!(
-            parsed.variables.get("cluster"),
-            Some(&Value::Concrete(ConcreteValue::String("${cluster}".into()))),
-            "structural handles must keep the main-compatible transport value"
+        assert!(
+            !parsed.variables.contains_key("cluster"),
+            "structural handles must not enter the Value model"
         );
 
         let seeds = collect_seed_bindings_merged(&parsed);
@@ -1711,7 +1831,7 @@ mod seed_precedence_tests {
             .expect("cluster seed missing");
 
         match cluster_seed.kind() {
-            SeedKind::Structural
+            SeedKind::TypedStructural(_)
             | SeedKind::Provisional
             | SeedKind::StructuralAlias(_)
             | SeedKind::ModuleParameter => {}
@@ -1745,7 +1865,7 @@ mod seed_precedence_tests {
                     "Value seed must carry the actual literal"
                 );
             }
-            SeedKind::Structural
+            SeedKind::TypedStructural(_)
             | SeedKind::Provisional
             | SeedKind::StructuralAlias(_)
             | SeedKind::ModuleParameter => {

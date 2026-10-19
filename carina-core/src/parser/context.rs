@@ -4,27 +4,35 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use super::ast::{DeferredForExpression, ProviderConfig, UpstreamState, UserFunction, WaitBinding};
+use super::ast::{
+    DeferredForExpression, PendingFunctionTypeCheck, ProviderConfig, UpstreamState, UserFunction,
+    WaitBinding,
+};
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
-use crate::eval_value::{EvalValue, StructuralHandle};
+use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
 use crate::resource::Resource;
 use indexmap::IndexMap;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// Parser-local lexical binding kind.
 ///
 /// Structural bindings (resources, module calls, `for` results, waits,
 /// upstream state, and imports) are distinct from ordinary values. Their
-/// parser-only handle records both reference behavior and main-compatible bare
-/// value transport, preventing access parsing from mistaking a structural
-/// address such as `roles[0]` for value indexing.
+/// parser-only handle records reference behavior without entering the public
+/// value model, preventing access parsing from mistaking a structural address
+/// such as `roles[0]` for value indexing.
 #[derive(Clone)]
 pub(super) enum ParseBinding {
-    Value(EvalValue),
+    Value {
+        value: EvalValue,
+        source_line: usize,
+    },
     Structural {
         handle: StructuralHandle,
-        retain_value: bool,
     },
 }
 
@@ -47,7 +55,15 @@ pub(crate) struct ParseContext<'cfg> {
     /// Imported modules (alias -> path)
     pub(super) imported_modules: HashMap<String, String>,
     /// User-defined functions
-    pub(super) user_functions: HashMap<String, UserFunction>,
+    pub(super) user_functions: Arc<HashMap<String, UserFunction>>,
+    /// Interned user-function definitions used by deferred call nodes.
+    /// Invalidated together with `user_function_scope` whenever the mutable
+    /// parser table changes.
+    resolved_user_functions: RefCell<HashMap<String, Arc<UserFunction>>>,
+    /// Function names injected from sibling files for this directory parse.
+    /// A local definition may replace its seed once; a second local
+    /// definition remains a duplicate.
+    pub(super) seeded_user_functions: HashSet<String>,
     /// Functions currently being evaluated (for recursion detection)
     pub(super) evaluating_functions: Vec<String>,
     /// Parser configuration (decryptor, custom validators)
@@ -73,6 +89,15 @@ pub(crate) struct ParseContext<'cfg> {
     /// collide with the seed installed because the same name is
     /// declared in a sibling `.crn`. See #2817.
     pub(super) seeded_bindings: HashSet<String>,
+    /// Bootstrap-evaluated calls whose provider-backed annotations must be
+    /// checked once schemas are available. Shared by cloned lexical contexts
+    /// so calls evaluated inside function bodies and loops reach the file.
+    pub(super) pending_function_type_checks: Rc<RefCell<Vec<PendingFunctionTypeCheck>>>,
+    /// Directory bootstrap parses may encounter a sibling name before the
+    /// fixed point has classified it as a value or structural binding. Static
+    /// control-flow expressions defer only that provisional case; the final
+    /// parse runs with this disabled and reports the classified error.
+    pub(super) defer_provisional_static_conditions: bool,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -81,7 +106,9 @@ impl<'cfg> ParseContext<'cfg> {
             bindings: IndexMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
-            user_functions: HashMap::new(),
+            user_functions: Arc::new(HashMap::new()),
+            resolved_user_functions: RefCell::new(HashMap::new()),
+            seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
             config,
             structural_bindings: HashSet::new(),
@@ -91,7 +118,63 @@ impl<'cfg> ParseContext<'cfg> {
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
             seeded_bindings: HashSet::new(),
+            pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
+            defer_provisional_static_conditions: false,
         }
+    }
+
+    pub(super) fn record_pending_function_type_check(&self, check: PendingFunctionTypeCheck) {
+        let mut checks = self.pending_function_type_checks.borrow_mut();
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    }
+
+    fn invalidate_user_function_cache(&self) {
+        self.resolved_user_functions.borrow_mut().clear();
+    }
+
+    pub(super) fn replace_user_functions(&mut self, functions: HashMap<String, UserFunction>) {
+        self.user_functions = Arc::new(functions);
+        self.invalidate_user_function_cache();
+    }
+
+    pub(super) fn replace_shared_user_functions(
+        &mut self,
+        functions: Arc<HashMap<String, UserFunction>>,
+    ) {
+        self.user_functions = functions;
+        self.invalidate_user_function_cache();
+    }
+
+    pub(super) fn extend_user_functions(&mut self, functions: HashMap<String, UserFunction>) {
+        Arc::make_mut(&mut self.user_functions).extend(functions);
+        self.invalidate_user_function_cache();
+    }
+
+    pub(super) fn insert_user_function(&mut self, name: String, function: UserFunction) {
+        Arc::make_mut(&mut self.user_functions).insert(name, function);
+        self.invalidate_user_function_cache();
+    }
+
+    pub(super) fn user_functions_mut(&mut self) -> &mut HashMap<String, UserFunction> {
+        self.invalidate_user_function_cache();
+        Arc::make_mut(&mut self.user_functions)
+    }
+
+    pub(super) fn resolved_user_function(&self, name: &str) -> Option<Arc<UserFunction>> {
+        if let Some(function) = self.resolved_user_functions.borrow().get(name) {
+            return Some(Arc::clone(function));
+        }
+        let function = Arc::new(self.user_functions.get(name)?.clone());
+        self.resolved_user_functions
+            .borrow_mut()
+            .insert(name.to_string(), Arc::clone(&function));
+        Some(function)
+    }
+
+    pub(super) fn shared_user_function_scope(&self) -> Arc<HashMap<String, UserFunction>> {
+        Arc::clone(&self.user_functions)
     }
 
     /// True if `name` was pre-registered via the directory-aware seed
@@ -112,23 +195,27 @@ impl<'cfg> ParseContext<'cfg> {
     }
 
     pub(super) fn set_variable(&mut self, name: String, value: impl Into<EvalValue>) {
-        self.bindings
-            .insert(name, ParseBinding::Value(value.into()));
+        self.set_variable_at_line(name, value, 0);
     }
 
-    pub(super) fn set_structural_binding(
+    pub(super) fn set_variable_at_line(
         &mut self,
         name: String,
-        handle: StructuralHandle,
-        retain_value: bool,
+        value: impl Into<EvalValue>,
+        source_line: usize,
     ) {
         self.bindings.insert(
             name,
-            ParseBinding::Structural {
-                handle,
-                retain_value,
+            ParseBinding::Value {
+                value: value.into(),
+                source_line,
             },
         );
+    }
+
+    pub(super) fn set_structural_binding(&mut self, name: String, handle: StructuralHandle) {
+        self.bindings
+            .insert(name, ParseBinding::Structural { handle });
     }
 
     pub(super) fn set_structural_alias(&mut self, name: String, handle: StructuralHandle) {
@@ -136,21 +223,20 @@ impl<'cfg> ParseContext<'cfg> {
             name.clone(),
             ParseBinding::Structural {
                 handle: handle.with_alias(name),
-                retain_value: true,
             },
         );
     }
 
     pub(super) fn get_variable(&self, name: &str) -> Option<&EvalValue> {
         match self.bindings.get(name) {
-            Some(ParseBinding::Value(value)) => Some(value),
+            Some(ParseBinding::Value { value, .. }) => Some(value),
             Some(ParseBinding::Structural { .. }) | None => None,
         }
     }
 
     pub(super) fn lookup_binding(&self, name: &str) -> ParseBindingRef<'_> {
         match self.bindings.get(name) {
-            Some(ParseBinding::Value(value)) => ParseBindingRef::Value(value),
+            Some(ParseBinding::Value { value, .. }) => ParseBindingRef::Value(value),
             Some(ParseBinding::Structural { handle, .. }) => ParseBindingRef::Structural(handle),
             None => ParseBindingRef::Unbound,
         }
@@ -167,8 +253,13 @@ impl<'cfg> ParseContext<'cfg> {
         ) {
             self.set_structural_binding(
                 name.clone(),
-                StructuralHandle::binding(name.clone()),
-                false,
+                StructuralHandle::new(
+                    StructuralHandleKind::Resource(super::ast::ResourceTypePath::new(
+                        resource.id.provider.clone(),
+                        resource.id.resource_type.clone(),
+                    )),
+                    name.clone(),
+                ),
             );
         }
         self.resource_bindings.insert(name, resource);

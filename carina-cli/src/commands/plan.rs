@@ -2126,8 +2126,9 @@ mod load_upstream_states_tests {
             attributes: indexmap::IndexMap::from([(
                 "region".to_string(),
                 Value::Deferred(DeferredValue::FunctionCall {
-                    name: "no_such_provider_function".to_string(),
+                    name: carina_core::builtins::BuiltinFunction::upper,
                     args: Vec::new(),
+                    source_line: 0.into(),
                 }),
             )]),
             default_tags: indexmap::IndexMap::new(),
@@ -2147,7 +2148,7 @@ mod load_upstream_states_tests {
         )
         .await
         {
-            Ok(_) => panic!("unknown provider function must fail resolution"),
+            Ok(_) => panic!("invalid provider function call must fail resolution"),
             Err(error) => error,
         };
 
@@ -2158,7 +2159,7 @@ mod load_upstream_states_tests {
         let rendered = error.to_string();
         assert_eq!(
             rendered
-                .matches("Unknown built-in function: no_such_provider_function")
+                .matches("upper() expects 1 argument (string), got 0")
                 .count(),
             1,
             "{rendered}"

@@ -213,6 +213,7 @@ fn walk_custom_lookup_on_path<'a>(
     if matches!(
         value,
         Value::Deferred(DeferredValue::FunctionCall { .. })
+            | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
             | Value::Deferred(DeferredValue::Access(_))
             | Value::Deferred(DeferredValue::ResourceRef { .. })
             | Value::Deferred(DeferredValue::Interpolation(_))
@@ -5814,6 +5815,9 @@ impl Value {
             Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
             Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
                 format!("FunctionCall({})", name)
+            }
+            Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
+                format!("FunctionCall({})", function.name)
             }
             Value::Deferred(DeferredValue::Access(_)) => "Access".to_string(),
             Value::Deferred(DeferredValue::Secret(_)) => "Secret".to_string(),

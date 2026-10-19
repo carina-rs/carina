@@ -6,7 +6,7 @@
 use super::CarinaParser;
 use super::ProviderContext;
 use super::Rule;
-use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, WaitBinding};
+use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction, WaitBinding};
 use super::blocks::attributes::{
     parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
@@ -28,11 +28,14 @@ use super::let_binding::{LetBindingKind, parse_let_binding_extended};
 use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
-use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleMetadata};
+use crate::eval_value::{EvalValue, EvalValueError, StructuralHandle, StructuralHandleMetadata};
 use crate::resource::{DataSource, Resource, Value};
 use indexmap::IndexMap;
 use pest::Parser;
 use pest::error::LineColLocation;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub(crate) struct BindingSeed<'a> {
@@ -47,7 +50,7 @@ pub(crate) enum SeedKind<'a> {
         structural_handles: Option<&'a StructuralHandleMetadata>,
     },
     ModuleParameter,
-    Structural,
+    TypedStructural(&'a StructuralHandle),
     Provisional,
     StructuralAlias(&'a StructuralHandle),
 }
@@ -100,10 +103,10 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn structural(name: &'a str) -> Self {
+    pub(crate) fn typed_structural(name: &'a str, handle: &'a StructuralHandle) -> Self {
         Self {
             name,
-            kind: SeedKind::Structural,
+            kind: SeedKind::TypedStructural(handle),
         }
     }
 
@@ -378,9 +381,9 @@ fn pair_contains_rule(pair: &pest::iterators::Pair<Rule>, expected: Rule) -> boo
 /// Value seeds are installed as typed value bindings; all other binding
 /// kinds are installed as typed structural bindings plus a placeholder
 /// `Resource` in `ctx.resource_bindings`. This keeps sibling value access
-/// and structural reference paths distinct. A bare seeded structural name
-/// lowers to main's historical `BindingRef` shape, while same-file handles
-/// retain their historical sentinel-string transport.
+/// and structural reference paths distinct. Provisional names may temporarily
+/// use a `BindingRef` until the directory fixed point learns their declaration
+/// kind; confirmed structural handles never lower into `Value`.
 ///
 /// The seed list is the directory aggregate: every binding declared in
 /// any sibling `.crn` (resource bindings, argument names, attribute
@@ -397,22 +400,236 @@ pub fn parse_with_seeded_bindings(
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
 ) -> Result<ParsedFile, ParseError> {
-    parse_with_seeded_bindings_inner(input, config, seeds, true)
+    let user_functions = top_level_user_functions(input, config)?;
+    parse_with_seeded_bindings_inner(input, config, seeds, &user_functions, true)
 }
 
-pub(crate) fn parse_with_seeded_bindings_without_literal_warnings(
+/// Parse only the top-level function declarations from one source file.
+/// Directory parsing uses this lightweight prepass to make sibling and
+/// forward functions available while parsing structure-producing expressions
+/// such as `for n in names(...)`.
+pub(crate) fn top_level_user_functions(
+    input: &str,
+    config: &ProviderContext,
+) -> Result<HashMap<String, UserFunction>, ParseError> {
+    resolve_top_level_user_functions(&[(None, input)], config)
+}
+
+/// Parse the directory's function declarations as one lexical scope.
+///
+/// Function bodies are resolved in dependency order. This keeps builtin calls
+/// strongly typed while still allowing a body to call a forward declaration or
+/// a function declared in a sibling file.
+pub(crate) fn top_level_user_functions_in_files(
+    files: &[(PathBuf, String)],
+    config: &ProviderContext,
+) -> Result<HashMap<String, UserFunction>, ParseError> {
+    let sources = files
+        .iter()
+        .map(|(path, input)| (Some(path.as_path()), input.as_str()))
+        .collect::<Vec<_>>();
+    resolve_top_level_user_functions(&sources, config)
+}
+
+fn resolve_top_level_user_functions(
+    sources: &[(Option<&Path>, &str)],
+    config: &ProviderContext,
+) -> Result<HashMap<String, UserFunction>, ParseError> {
+    // Preserve the old directory behavior for duplicate names: a later file
+    // owns the seed, while two declarations in the same file are an error.
+    let mut owners = HashMap::<String, usize>::new();
+    for (source_index, (path, input)) in sources.iter().enumerate() {
+        let preprocess_result = preprocess_function_source(input)
+            .map_err(|error| locate_function_error(error, *path))?;
+        let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+            .map_err(|error| map_pest_error_lines(error, &preprocess_result.line_map))
+            .map_err(|error| locate_function_error(ParseError::Syntax(error), *path))?;
+        let mut local_names = HashSet::new();
+        for pair in pairs {
+            if pair.as_rule() != Rule::file {
+                continue;
+            }
+            for statement in pair
+                .into_inner()
+                .flat_map(|statement| statement.into_inner())
+            {
+                if statement.as_rule() != Rule::fn_def {
+                    continue;
+                }
+                let name = statement
+                    .clone()
+                    .into_inner()
+                    .next()
+                    .expect("fn_def always starts with an identifier")
+                    .as_str()
+                    .to_string();
+                if !local_names.insert(name.clone()) {
+                    return Err(locate_function_error(
+                        ParseError::UserFunctionError(
+                            "duplicate function definition in one file".to_string(),
+                        ),
+                        *path,
+                    ));
+                }
+                owners.insert(name, source_index);
+            }
+        }
+    }
+
+    let mut pending = owners.keys().cloned().collect::<HashSet<_>>();
+    let mut ctx = ParseContext::new(config);
+    let mut functions = HashMap::new();
+
+    while !pending.is_empty() {
+        let mut made_progress = false;
+        for (source_index, (path, input)) in sources.iter().enumerate() {
+            let preprocess_result = preprocess_function_source(input)
+                .map_err(|error| locate_function_error(error, *path))?;
+            let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+                .map_err(|error| map_pest_error_lines(error, &preprocess_result.line_map))
+                .map_err(|error| locate_function_error(ParseError::Syntax(error), *path))?;
+            for pair in pairs {
+                if pair.as_rule() != Rule::file {
+                    continue;
+                }
+                for statement in pair
+                    .into_inner()
+                    .flat_map(|statement| statement.into_inner())
+                {
+                    if statement.as_rule() != Rule::fn_def {
+                        continue;
+                    }
+                    let name = statement
+                        .clone()
+                        .into_inner()
+                        .next()
+                        .expect("fn_def always starts with an identifier")
+                        .as_str()
+                        .to_string();
+                    if !pending.contains(&name) || owners.get(&name) != Some(&source_index) {
+                        continue;
+                    }
+
+                    let mut warnings = Vec::new();
+                    match parse_fn_def(statement, &ctx, &mut warnings) {
+                        Ok(mut function) => {
+                            function.body.source_file = path.map(Path::to_path_buf);
+                            ctx.insert_user_function(name.clone(), function.clone());
+                            // Calls made while parsing another declaration must
+                            // remain deferred until the complete table exists.
+                            ctx.seeded_user_functions.insert(name.clone());
+                            functions.insert(name.clone(), function);
+                            pending.remove(&name);
+                            made_progress = true;
+                        }
+                        Err(ParseError::UnknownFunction {
+                            name: dependency, ..
+                        }) if owners.contains_key(&dependency) => {
+                            // The dependency is declared but has not been parsed
+                            // yet. A later pass will retry this body.
+                        }
+                        Err(error) => return Err(locate_function_error(error, *path)),
+                    }
+                }
+            }
+        }
+
+        if !made_progress {
+            let mut cycle = pending.iter().cloned().collect::<Vec<_>>();
+            cycle.sort_unstable();
+            let name = cycle
+                .into_iter()
+                .next()
+                .expect("non-empty pending function set");
+            let source_index = owners[&name];
+            return Err(locate_function_error(
+                ParseError::RecursiveFunction(name),
+                sources[source_index].0,
+            ));
+        }
+    }
+
+    Ok(functions)
+}
+
+fn preprocess_function_source(input: &str) -> Result<crate::heredoc::PreprocessResult, ParseError> {
+    crate::heredoc::preprocess_heredocs(input).map_err(|error| {
+        let line = match &error {
+            crate::heredoc::HeredocError::Unterminated { line, .. } => *line,
+        };
+        ParseError::InvalidExpression {
+            line,
+            message: error.to_string(),
+        }
+    })
+}
+
+fn locate_function_error(error: ParseError, path: Option<&Path>) -> ParseError {
+    match path {
+        Some(path) => error.in_file(path.to_path_buf()),
+        None => error,
+    }
+}
+
+pub(crate) fn top_level_argument_names(input: &str) -> Result<Vec<String>, ParseError> {
+    let preprocess_result = crate::heredoc::preprocess_heredocs(input).map_err(|error| {
+        let line = match &error {
+            crate::heredoc::HeredocError::Unterminated { line, .. } => *line,
+        };
+        ParseError::InvalidExpression {
+            line,
+            message: error.to_string(),
+        }
+    })?;
+    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+        .map_err(|error| map_pest_error_lines(error, &preprocess_result.line_map))?;
+    let mut names = Vec::new();
+    for pair in pairs {
+        if pair.as_rule() != Rule::file {
+            continue;
+        }
+        for statement in pair
+            .into_inner()
+            .flat_map(|statement| statement.into_inner())
+        {
+            if statement.as_rule() != Rule::arguments_block {
+                continue;
+            }
+            for parameter in statement.into_inner() {
+                if parameter.as_rule() != Rule::arguments_param {
+                    continue;
+                }
+                if let Some(name) = parameter.into_inner().next() {
+                    names.push(name.as_str().to_string());
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+
+pub(crate) fn parse_with_directory_context(
     input: &str,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
+    user_functions: &HashMap<String, UserFunction>,
+    bindings_fully_classified: bool,
 ) -> Result<ParsedFile, ParseError> {
-    parse_with_seeded_bindings_inner(input, config, seeds, false)
+    parse_with_seeded_bindings_inner(
+        input,
+        config,
+        seeds,
+        user_functions,
+        bindings_fully_classified,
+    )
 }
 
 fn parse_with_seeded_bindings_inner(
     input: &str,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
-    collect_literal_warnings: bool,
+    seeded_user_functions: &HashMap<String, UserFunction>,
+    bindings_fully_classified: bool,
 ) -> Result<ParsedFile, ParseError> {
     let preprocess_result =
         crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
@@ -421,15 +638,22 @@ fn parse_with_seeded_bindings_inner(
         })?;
     let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
         .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
-    let single_quote_warnings = if collect_literal_warnings {
+    // Bootstrap passes use provisional sibling names and exist only to
+    // classify declarations. The final pass both emits source warnings and
+    // evaluates static conditions against the now-typed seed table.
+    let single_quote_warnings = if bindings_fully_classified {
         collect_single_quoted_interpolation_warnings(pairs.clone(), &preprocess_result.line_map)
     } else {
         Vec::new()
     };
 
     let mut ctx = ParseContext::new(config);
+    ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.warnings.extend(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
+    ctx.extend_user_functions(seeded_user_functions.clone());
+    ctx.seeded_user_functions
+        .extend(seeded_user_functions.keys().cloned());
     let mut providers = Vec::new();
     let mut resources = Vec::new();
     let mut data_sources: Vec<DataSource> = Vec::new();
@@ -508,7 +732,7 @@ fn parse_with_seeded_bindings_inner(
                                 state_blocks.push(parse_moved_block(stmt)?);
                             }
                             Rule::require_statement => {
-                                requires.push(parse_require_statement(stmt)?);
+                                requires.push(parse_require_statement(stmt, &ctx)?);
                             }
                             Rule::for_expr => {
                                 let iterable_name =
@@ -557,12 +781,14 @@ fn parse_with_seeded_bindings_inner(
                                         "function '{fn_name}' shadows a built-in function"
                                     )));
                                 }
-                                if ctx.user_functions.contains_key(&fn_name) {
+                                if ctx.user_functions.contains_key(&fn_name)
+                                    && !ctx.seeded_user_functions.remove(&fn_name)
+                                {
                                     return Err(ParseError::UserFunctionError(format!(
                                         "duplicate function definition: '{fn_name}'"
                                     )));
                                 }
-                                ctx.user_functions.insert(fn_name, user_fn);
+                                ctx.insert_user_function(fn_name, user_fn);
                             }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
@@ -582,10 +808,6 @@ fn parse_with_seeded_bindings_inner(
                                 let is_discard = name == "_";
                                 let is_upstream_state = ctx.upstream_states.contains_key(&name);
                                 let is_wait_binding = ctx.wait_bindings.contains_key(&name);
-                                let is_provider_instance = ctx
-                                    .named_provider_instances
-                                    .iter()
-                                    .any(|provider| provider.binding.as_deref() == Some(&name));
                                 if !is_discard {
                                     // A seeded placeholder (from a sibling-file
                                     // declaration during the directory-aware
@@ -606,7 +828,7 @@ fn parse_with_seeded_bindings_inner(
                                     }
                                     match binding_kind {
                                         LetBindingKind::Value => {
-                                            ctx.set_variable(name.clone(), value);
+                                            ctx.set_variable_at_line(name.clone(), value, line);
                                         }
                                         LetBindingKind::Structural => {
                                             let handle = value
@@ -618,13 +840,7 @@ fn parse_with_seeded_bindings_inner(
                                                         "structural let binding {name:?}"
                                                     ),
                                                 })?;
-                                            ctx.set_structural_binding(
-                                                name.clone(),
-                                                handle,
-                                                !(is_upstream_state
-                                                    || is_wait_binding
-                                                    || is_provider_instance),
-                                            );
+                                            ctx.set_structural_binding(name.clone(), handle);
                                         }
                                         LetBindingKind::StructuralAlias => {
                                             let handle = value
@@ -745,42 +961,69 @@ fn parse_with_seeded_bindings_inner(
     // mattered.
     let mut parser_binding_metadata = ParserBindingMetadata::default();
     for (name, binding) in &ctx.bindings {
+        // Directory seeds are context, not declarations owned by this file.
+        // In particular a provisional seed means only "this name exists";
+        // recording it as local structural metadata would misclassify every
+        // forward value binding before the fixed point can resolve its RHS.
+        if ctx.is_seeded_binding(name) {
+            continue;
+        }
         match binding {
-            ParseBinding::Structural { handle, .. } if handle.alias_name().is_some() => {
-                parser_binding_metadata.insert_structural_alias(name.clone(), handle.clone());
+            ParseBinding::Structural { handle, .. } => {
+                parser_binding_metadata.insert_structural_handle(name.clone(), handle.clone());
+                if handle.alias_name().is_some() {
+                    parser_binding_metadata.insert_structural_alias(name.clone(), handle.clone());
+                }
             }
-            ParseBinding::Value(value) => {
+            ParseBinding::Value {
+                value,
+                source_line: _,
+            } => {
                 if let Some(metadata) = value.structural_handle_metadata() {
                     parser_binding_metadata
                         .insert_value_structural_handles(name.clone(), metadata.clone());
                 }
             }
-            ParseBinding::Structural { .. } => {}
         }
     }
-    let variables: IndexMap<String, Value> = std::mem::take(&mut ctx.bindings)
-        .into_iter()
-        .filter_map(|(name, binding)| match binding {
-            ParseBinding::Value(eval) => match eval.into_value() {
-                Ok(value) => Some((name, value)),
-                Err(_leak) => None,
-            },
-            ParseBinding::Structural {
-                handle,
-                retain_value: true,
-            } => Some((name, handle.into_value())),
-            ParseBinding::Structural {
-                retain_value: false,
-                ..
-            } => None,
-        })
-        .collect();
+    for check in ctx.pending_function_type_checks.borrow().iter().cloned() {
+        parser_binding_metadata.insert_pending_function_type_check(check);
+    }
+    let seeded_bindings = ctx.seeded_bindings.clone();
+    let mut variables = IndexMap::new();
+    for (name, binding) in std::mem::take(&mut ctx.bindings) {
+        if seeded_bindings.contains(&name) {
+            continue;
+        }
+        let ParseBinding::Value {
+            value: eval,
+            source_line,
+        } = binding
+        else {
+            continue;
+        };
+        match eval.into_value() {
+            Ok(value) => {
+                variables.insert(name, value);
+            }
+            Err(EvalValueError::Closure(_)) => {
+                // Partial applications are evaluator-only bindings. A later
+                // pipe/call already consumed them if they were used.
+            }
+            Err(error @ EvalValueError::BareStructuralHandle(_)) => {
+                return Err(ParseError::from_eval_value(error, source_line));
+            }
+        }
+    }
 
     // carina#3181: managed resources and data sources are collected into
     // separate typed `Vec`s from the start — `resources` is managed-only,
     // `data_sources` holds the `read`-keyword resources. The parser never
     // synthesizes composition resources (that is the module expander's job),
     // so `compositions` is empty here.
+
+    let mut user_functions = Arc::unwrap_or_clone(ctx.user_functions);
+    user_functions.retain(|name, _| !ctx.seeded_user_functions.contains(name));
 
     Ok(ParsedFile {
         providers,
@@ -797,7 +1040,7 @@ fn parse_with_seeded_bindings_inner(
         export_params,
         backend,
         state_blocks,
-        user_functions: ctx.user_functions,
+        user_functions,
         upstream_states,
         wait_bindings,
         requires,
@@ -944,16 +1187,14 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     Value::Deferred(crate::resource::DeferredValue::Unknown(
                         crate::resource::UnknownReason::ModuleArgument {
                             name: seed.name().to_string(),
+                            source_line: (0).into(),
+                            diagnostic_name: None,
                         },
                     )),
                 );
             }
-            SeedKind::Structural => {
-                ctx.set_structural_binding(
-                    seed.name().to_string(),
-                    StructuralHandle::from_seed(seed.name()),
-                    false,
-                );
+            SeedKind::TypedStructural(handle) => {
+                ctx.set_structural_binding(seed.name().to_string(), handle.clone());
                 let placeholder = Resource::new(
                     "_seeded",
                     crate::resource::ResourceIdentity::new(seed.name().to_string()),
@@ -961,16 +1202,19 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                 ctx.set_resource_binding(seed.name().to_string(), placeholder);
             }
             SeedKind::Provisional => {
-                ctx.set_structural_binding(
+                ctx.set_variable(
                     seed.name().to_string(),
-                    StructuralHandle::provisional(seed.name()),
-                    false,
+                    EvalValue::provisional_reference(seed.name()),
                 );
                 let placeholder = Resource::new(
                     "_seeded",
                     crate::resource::ResourceIdentity::new(seed.name().to_string()),
                 );
-                ctx.set_resource_binding(seed.name().to_string(), placeholder);
+                // A provisional name is only known to exist; inserting the
+                // resource-path placeholder must not upgrade its value binding
+                // to a confirmed structural handle.
+                ctx.resource_bindings
+                    .insert(seed.name().to_string(), placeholder);
             }
             SeedKind::StructuralAlias(handle) => {
                 ctx.set_structural_alias(seed.name().to_string(), handle.clone());
@@ -988,16 +1232,10 @@ pub(crate) fn parse_expression(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
+    let line = pair.line_col().0;
     let eval = parse_expression_eval(pair, ctx)?;
     eval.into_value()
-        .map_err(|leak| ParseError::InvalidExpression {
-            line: 0,
-            message: format!(
-                "expression evaluates to a closure '{}' (still needs {} arg(s)); finish the \
-             partial application — closures are not valid as data",
-                leak.name, leak.remaining_arity
-            ),
-        })
+        .map_err(|error| ParseError::from_eval_value(error, line))
 }
 
 /// Parse an expression and return the raw `EvalValue`, preserving any

@@ -190,9 +190,19 @@ fn format_value(value: &Value) -> String {
                 .collect();
             format!("\"{inner}\"")
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            let arg_strs: Vec<_> = args.iter().map(format_value).collect();
+        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+            let arg_strs: Vec<_> = args
+                .iter()
+                .map(|argument| format_value(argument.walker_value()))
+                .collect();
             format!("{}({})", name, arg_strs.join(", "))
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+            let arg_strs: Vec<_> = args
+                .iter()
+                .map(|argument| format_value(argument.walker_value()))
+                .collect();
+            format!("{}({})", function.name, arg_strs.join(", "))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             if access.display_root().is_some() {
@@ -505,9 +515,18 @@ impl RootConfigSignature {
                     }
                 }
             }
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
                 for arg in args {
-                    Self::collect_typed_dependencies(from, attr_key, arg, graph, binding_types);
+                    Self::collect_typed_dependencies(
+                        from,
+                        attr_key,
+                        arg.walker_value(),
+                        graph,
+                        binding_types,
+                    );
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
@@ -1025,12 +1044,15 @@ impl ModuleSignature {
                     }
                 }
             }
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
                 for arg in args {
                     Self::collect_typed_dependencies(
                         from,
                         attr_key,
-                        arg,
+                        arg.walker_value(),
                         graph,
                         binding_types,
                         argument_types,
@@ -1071,7 +1093,7 @@ impl ModuleSignature {
                 );
             }
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument { name },
+                crate::resource::UnknownReason::ModuleArgument { name, .. },
             )) => {
                 let target_type = argument_types
                     .get(name)

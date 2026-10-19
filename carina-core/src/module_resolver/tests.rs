@@ -2154,26 +2154,29 @@ fn test_substitute_arguments_function_call() {
 
     // FunctionCall like cidr_subnet(cidr, 8, 0) where cidr is a module argument
     let value = Value::Deferred(DeferredValue::FunctionCall {
-        name: "cidr_subnet".to_string(),
+        name: crate::builtins::BuiltinFunction::cidr_subnet,
         args: vec![
             Value::Deferred(DeferredValue::BindingRef {
                 binding: "cidr".to_string(),
-            }),
-            Value::Concrete(ConcreteValue::Int(8)),
-            Value::Concrete(ConcreteValue::Int(0)),
+            })
+            .into(),
+            Value::Concrete(ConcreteValue::Int(8)).into(),
+            Value::Concrete(ConcreteValue::Int(0)).into(),
         ],
+        source_line: (0).into(),
     });
     let result = substitute_arguments(&value, &inputs).expect("substitution");
 
     assert_eq!(
         result,
         Value::Deferred(DeferredValue::FunctionCall {
-            name: "cidr_subnet".to_string(),
+            name: crate::builtins::BuiltinFunction::cidr_subnet,
             args: vec![
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                Value::Concrete(ConcreteValue::Int(8)),
-                Value::Concrete(ConcreteValue::Int(0)),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
+                Value::Concrete(ConcreteValue::Int(8)).into(),
+                Value::Concrete(ConcreteValue::Int(0)).into(),
             ],
+            source_line: (0).into(),
         })
     );
 }
@@ -2454,7 +2457,7 @@ fn test_nested_module_cycle_detection() {
     );
     let err = result.unwrap_err();
     assert!(
-        matches!(err, ModuleError::CircularImport(_)),
+        matches!(err.root_cause(), ModuleError::CircularImport(_)),
         "Expected CircularImport error, got: {:?}",
         err
     );
@@ -2479,12 +2482,13 @@ fn test_expand_module_call_with_function_call_argument() {
             args.insert(
                 "cidr_block".to_string(),
                 Value::Deferred(DeferredValue::FunctionCall {
-                    name: "cidr_subnet".to_string(),
+                    name: crate::builtins::BuiltinFunction::cidr_subnet,
                     args: vec![
-                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                        Value::Concrete(ConcreteValue::Int(8)),
-                        Value::Concrete(ConcreteValue::Int(0)),
+                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
+                        Value::Concrete(ConcreteValue::Int(8)).into(),
+                        Value::Concrete(ConcreteValue::Int(0)).into(),
                     ],
+                    source_line: (0).into(),
                 }),
             );
             args.insert(
@@ -2507,12 +2511,13 @@ fn test_expand_module_call_with_function_call_argument() {
     assert_eq!(
         vpc.get_attr("cidr_block"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
-            name: "cidr_subnet".to_string(),
+            name: crate::builtins::BuiltinFunction::cidr_subnet,
             args: vec![
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                Value::Concrete(ConcreteValue::Int(8)),
-                Value::Concrete(ConcreteValue::Int(0)),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
+                Value::Concrete(ConcreteValue::Int(8)).into(),
+                Value::Concrete(ConcreteValue::Int(0)).into(),
             ],
+            source_line: (0).into(),
         }))
     );
 }
@@ -2569,8 +2574,8 @@ fn test_load_module_parse_error_cleans_resolving_set() {
     );
     let err = result.unwrap_err();
     assert!(
-        matches!(&err, ModuleError::Parse(_)),
-        "expected Parse error on first attempt, got: {err:?}"
+        matches!(&err, ModuleError::ParseInFile { .. }),
+        "expected located Parse error on first attempt, got: {err:?}"
     );
 
     // Second attempt: should still get parse error, not circular import
@@ -2579,8 +2584,8 @@ fn test_load_module_parse_error_cleans_resolving_set() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(&err, ModuleError::Parse(_)),
-        "expected Parse error on second attempt, not CircularImport, got: {err:?}"
+        matches!(&err, ModuleError::ParseInFile { .. }),
+        "expected located Parse error on second attempt, not CircularImport, got: {err:?}"
     );
 
     let _ = fs::remove_dir_all(&tmp_root);
@@ -2779,8 +2784,8 @@ fn create_module_with_port_validation() -> ParsedFile {
             type_expr: TypeExpr::Int,
             default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
-            validations: vec![ValidationBlock {
-                condition: ValidateExpr::And(
+            validations: vec![ValidationBlock::new(
+                ValidateExpr::And(
                     Box::new(ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("port".to_string())),
                         op: CompareOp::Gte,
@@ -2792,8 +2797,8 @@ fn create_module_with_port_validation() -> ParsedFile {
                         rhs: Box::new(ValidateExpr::Int(65535)),
                     }),
                 ),
-                error_message: Some("Port must be between 1 and 65535".to_string()),
-            }],
+                Some("Port must be between 1 and 65535".to_string()),
+            )],
         }],
         attribute_params: vec![],
         export_params: vec![],
@@ -2849,8 +2854,8 @@ fn test_argument_validation_with_resource_reference_is_pending() {
 
     let mut module = create_module_with_port_validation();
     module.arguments[0].type_expr = TypeExpr::String;
-    module.arguments[0].validations = vec![ValidationBlock {
-        condition: ValidateExpr::Compare {
+    module.arguments[0].validations = vec![ValidationBlock::new(
+        ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::FunctionCall {
                 name: "length".to_string(),
                 args: vec![ValidateExpr::Var("port".to_string())],
@@ -2858,8 +2863,8 @@ fn test_argument_validation_with_resource_reference_is_pending() {
             op: CompareOp::Gt,
             rhs: Box::new(ValidateExpr::Int(0)),
         },
-        error_message: Some("port must not be empty".to_string()),
-    }];
+        Some("port must not be empty".to_string()),
+    )];
     let resolver = {
         let mut resolver = ModuleResolver::new(".");
         resolver
@@ -3153,14 +3158,14 @@ fn test_argument_validation_no_message_uses_default() {
             type_expr: TypeExpr::Int,
             default: None,
             description: None,
-            validations: vec![ValidationBlock {
-                condition: ValidateExpr::Compare {
+            validations: vec![ValidationBlock::new(
+                ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::Var("count".to_string())),
                     op: CompareOp::Gt,
                     rhs: Box::new(ValidateExpr::Int(0)),
                 },
-                error_message: None,
-            }],
+                None,
+            )],
         }],
         attribute_params: vec![],
         export_params: vec![],
@@ -3221,8 +3226,8 @@ fn test_argument_validation_len_with_list() {
             type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
             default: None,
             description: None,
-            validations: vec![ValidationBlock {
-                condition: ValidateExpr::Compare {
+            validations: vec![ValidationBlock::new(
+                ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::FunctionCall {
                         name: "len".to_string(),
                         args: vec![ValidateExpr::Var("tags".to_string())],
@@ -3230,8 +3235,8 @@ fn test_argument_validation_len_with_list() {
                     op: CompareOp::Gte,
                     rhs: Box::new(ValidateExpr::Int(1)),
                 },
-                error_message: Some("At least one tag is required".to_string()),
-            }],
+                Some("At least one tag is required".to_string()),
+            )],
         }],
         attribute_params: vec![],
         export_params: vec![],
@@ -3332,9 +3337,9 @@ fn test_require_block_passes() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock {
+        requires: vec![RequireBlock::new(
             // !enable_https || cert_arn != null
-            condition: ValidateExpr::Or(
+            ValidateExpr::Or(
                 Box::new(ValidateExpr::Not(Box::new(ValidateExpr::Var(
                     "enable_https".to_string(),
                 )))),
@@ -3344,8 +3349,8 @@ fn test_require_block_passes() {
                     rhs: Box::new(ValidateExpr::Null),
                 }),
             ),
-            error_message: "cert_arn is required when HTTPS is enabled".to_string(),
-        }],
+            "cert_arn is required when HTTPS is enabled".to_string(),
+        )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
         warnings: vec![],
@@ -3416,16 +3421,16 @@ fn test_require_block_fails_with_not_expr() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock {
+        requires: vec![RequireBlock::new(
             // !enable_https || has_cert
-            condition: ValidateExpr::Or(
+            ValidateExpr::Or(
                 Box::new(ValidateExpr::Not(Box::new(ValidateExpr::Var(
                     "enable_https".to_string(),
                 )))),
                 Box::new(ValidateExpr::Var("has_cert".to_string())),
             ),
-            error_message: "cert is required when HTTPS is enabled".to_string(),
-        }],
+            "cert is required when HTTPS is enabled".to_string(),
+        )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
         warnings: vec![],
@@ -3492,9 +3497,9 @@ fn test_require_block_len_function() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock {
+        requires: vec![RequireBlock::new(
             // len(subnet_ids) >= 2
-            condition: ValidateExpr::Compare {
+            ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::FunctionCall {
                     name: "len".to_string(),
                     args: vec![ValidateExpr::Var("subnet_ids".to_string())],
@@ -3502,8 +3507,8 @@ fn test_require_block_len_function() {
                 op: CompareOp::Gte,
                 rhs: Box::new(ValidateExpr::Int(2)),
             },
-            error_message: "ALB requires at least two subnets".to_string(),
-        }],
+            "ALB requires at least two subnets".to_string(),
+        )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
         warnings: vec![],
@@ -3596,15 +3601,15 @@ fn test_require_block_multiple_constraints() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock {
+        requires: vec![RequireBlock::new(
             // min_size <= max_size
-            condition: ValidateExpr::Compare {
+            ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::Var("min_size".to_string())),
                 op: CompareOp::Lte,
                 rhs: Box::new(ValidateExpr::Var("max_size".to_string())),
             },
-            error_message: "min_size must be <= max_size".to_string(),
-        }],
+            "min_size must be <= max_size".to_string(),
+        )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
         warnings: vec![],
@@ -4206,6 +4211,8 @@ fn module_argument_postfix_access_preserves_deferred_caller_value() {
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument {
                 name: "items".to_string(),
+                source_line: (0).into(),
+                diagnostic_name: None,
             },
         )),
         PathSegment::Subscript {
@@ -4216,11 +4223,12 @@ fn module_argument_postfix_access_preserves_deferred_caller_value() {
     )
     .unwrap();
     let caller_value = Value::Deferred(DeferredValue::FunctionCall {
-        name: "split".to_string(),
+        name: crate::builtins::BuiltinFunction::split,
         args: vec![
-            Value::Concrete(ConcreteValue::String(":".into())),
-            Value::resource_ref("source", "name", vec![]),
+            Value::Concrete(ConcreteValue::String(":".into())).into(),
+            Value::resource_ref("source", "name", vec![]).into(),
         ],
+        source_line: (0).into(),
     });
 
     let substituted = substitute_arguments(
@@ -4234,9 +4242,215 @@ fn module_argument_postfix_access_preserves_deferred_caller_value() {
         Value::Deferred(DeferredValue::Access(access))
             if access.source_line() == 3
             && matches!(access.step(), PathSegment::Subscript { index: Subscript::Int { index: 1 } })
-            && matches!(access.base(), Value::Deferred(DeferredValue::FunctionCall { name, args })
-            if name == "split" && matches!(&args[1], Value::Deferred(DeferredValue::ResourceRef { path }) if path.binding() == "source"))
+            && matches!(access.base(), Value::Deferred(DeferredValue::FunctionCall { name, args, .. })
+            if name == "split" && matches!(args[1].walker_value(), Value::Deferred(DeferredValue::ResourceRef { path }) if path.binding() == "source"))
     ));
+}
+
+#[test]
+fn ref_function_parameter_substitutes_a_module_parameter_handle() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/selector");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { vpc: mock.test.Thing }
+
+fn id_of(resource: mock.test.Thing): String {
+  resource.identifier
+}
+
+let identifier = id_of(vpc)
+let selected = mock.test.Consumer { parent = identifier }
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let source = mock.test.Thing { name = "source" }
+let selector = use { source = "../modules/selector" }
+let child = selector { vpc = source }
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
+    resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("a Ref-typed function parameter must substitute a module handle");
+
+    let selected = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("child.selected"))
+        .expect("expanded consumer");
+    assert_eq!(
+        selected.get_attr("parent"),
+        Some(&Value::resource_ref("source", "identifier", vec![])),
+    );
+}
+
+#[test]
+fn module_parameter_handle_rewrites_depends_on_to_the_caller_binding() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/consumer");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("arguments.crn"),
+        "arguments { peer: mock.test.Thing }\n",
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("resource.crn"),
+        r#"
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [peer] }
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let source = mock.test.Thing { name = "peer" }
+let imported = use { source = "../modules/consumer" }
+let child = imported { peer = source }
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
+    resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("a module handle in depends_on must expand to the caller binding");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("child.consumer"))
+        .expect("expanded consumer");
+    assert_eq!(consumer.directives.depends_on, vec!["source"]);
+    let dependencies = crate::deps::get_resource_dependencies(consumer);
+    assert!(dependencies.contains("source"));
+    assert!(!dependencies.contains("child.peer"));
+}
+
+#[test]
+fn module_dependency_substitution_error_reports_the_call_argument_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/consumer");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"arguments { peer: mock.test.Thing }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [peer] }
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let source = mock.test.Thing { name = "peer" }
+let imported = use { source = "../modules/consumer" }
+let child = imported {
+  peer = source.identifier
+}
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
+    let error = resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("a value cannot satisfy a module dependency handle");
+
+    let message = error.to_string();
+    assert!(message.contains("at line 5"), "unexpected error: {message}");
+    assert!(
+        message.contains("depends_on parameter 'peer' received a value"),
+        "unexpected error: {message}",
+    );
+}
+
+#[test]
+fn module_value_argument_binding_collision_is_not_treated_as_a_handle() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/consumer");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { peer: mock.test.Thing }
+let consumer = mock.test.Consumer { parent = peer.name }
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let peer = mock.test.Thing { name = "peer" }
+let imported = use { source = "../modules/consumer" }
+let child = imported { peer = peer.identifier }
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
+    resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("the typed Value variant must survive a binding-name collision");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("child.consumer"))
+        .expect("expanded consumer");
+    assert_eq!(
+        consumer.get_attr("parent"),
+        Some(&Value::resource_ref(
+            "peer",
+            "identifier",
+            vec!["name".to_string()],
+        )),
+    );
 }
 
 // #2393 — transitive default chain `a → b → c`. Each default is resolved
@@ -4439,7 +4653,7 @@ m {}
         // walk order. Either is fine — the contract is that the loop
         // terminates without panicking and preserves a structured,
         // statically typed placeholder rather than inventing a value.
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name })) => {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name, .. })) => {
             assert!(
                 name == "a" || name == "b",
                 "expected cyclic argument to point at `a` or `b`, got: {name:?}"
@@ -5001,9 +5215,111 @@ fn ref_argument_forwarded_to_scalar_is_rejected_before_expansion() {
 }
 
 #[test]
-fn ref_argument_forwarded_to_string_remains_supported() {
-    resolve_ref_forwarding_fixture("String")
-        .expect("Ref-typed arguments still transport id strings across module boundaries");
+fn ref_argument_forwarded_to_string_is_rejected_as_a_bare_handle() {
+    let error = resolve_ref_forwarding_fixture("String")
+        .expect_err("a bare handle cannot cross into a String parameter");
+    assert!(
+        error.to_string().contains("'a' is a resource, not a value"),
+        "{error}",
+    );
+}
+
+#[test]
+fn ref_argument_forwarded_to_ref_remains_typed() {
+    resolve_ref_forwarding_fixture("mock.test.resource")
+        .expect("Ref-typed arguments remain handles across module boundaries");
+}
+
+#[test]
+fn ref_typed_module_argument_field_access_uses_the_caller_binding() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("child");
+    fs::create_dir_all(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"arguments {
+  source: mock.test.resource
+}
+let consumer = mock.test.consumer {
+  parent = source.name
+}
+"#,
+    )
+    .expect("module source");
+    let root_source = r#"let source = mock.test.resource { name = 'root' }
+let child = use { source = './child' }
+let instance = child { source = source }
+"#;
+    fs::write(tmp.path().join("main.crn"), root_source).expect("root source");
+
+    let mut config = ProviderContext::default();
+    config
+        .resource_types
+        .insert(("mock".to_string(), "test.resource".to_string()));
+    let mut parsed = crate::parser::parse(root_source, &config).expect("root parse");
+    resolve_modules_with_config(
+        &mut parsed,
+        tmp.path(),
+        &config,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module expansion");
+
+    let value = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("instance.consumer"))
+        .and_then(|resource| resource.get_attr("parent"))
+        .expect("expanded consumer parent");
+    assert!(
+        matches!(
+            value,
+            Value::Deferred(DeferredValue::ResourceRef { path })
+                if path.binding() == "source" && path.attribute() == "name"
+        ),
+        "module argument access must retain the caller binding, got {value:?}",
+    );
+}
+
+#[test]
+fn ref_typed_module_argument_used_bare_is_rejected_in_module_context() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("child");
+    fs::create_dir_all(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"arguments {
+  source: mock.test.resource
+}
+let consumer = mock.test.consumer {
+  parent = source
+}
+"#,
+    )
+    .expect("module source");
+    let root_source = r#"let source = mock.test.resource { name = 'root' }
+let child = use { source = './child' }
+let instance = child { source = source }
+"#;
+
+    let mut config = ProviderContext::default();
+    config
+        .resource_types
+        .insert(("mock".to_string(), "test.resource".to_string()));
+    let mut parsed = crate::parser::parse(root_source, &config).expect("root parse");
+    let error = resolve_modules_with_config(
+        &mut parsed,
+        tmp.path(),
+        &config,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("bare module handle use must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("'source' is a resource handle, not a value")
+            && message.contains("line 5"),
+        "unexpected error: {message}",
+    );
 }
 
 /// Three-deep pass-through: outer → middle → inner all forwarding the

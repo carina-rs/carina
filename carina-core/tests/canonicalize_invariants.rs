@@ -75,9 +75,12 @@ fn check_value(v: &Value, path: &str) {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             check_value(inner, &format!("{}/<secret>", path))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             for (i, a) in args.iter().enumerate() {
-                check_value(a, &format!("{}/{}({})", path, name, i));
+                check_value(
+                    a.value().expect("canonicalized function argument value"),
+                    &format!("{}/{}({})", path, name, i),
+                );
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -136,7 +139,7 @@ fn parse_resolve_yields_canonical_interpolations() {
     for call in &parsed.module_calls {
         for (k, v) in &call.arguments {
             check_value(
-                v.value(),
+                v.value().expect("fixture module argument is a value"),
                 &format!("module_call({}).{}", call.module_name, k),
             );
         }

@@ -9,7 +9,6 @@ use crate::position;
 use carina_core::binding_index::{
     BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings,
 };
-use carina_core::builtins;
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
     AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, TypeExpr,
@@ -28,7 +27,6 @@ use super::{DiagnosticEngine, carina_diagnostic};
 pub(super) struct MergedParseResult {
     pub(super) directory: DirectoryParseResult,
     pub(super) module_error: Option<carina_core::module_resolver::ModuleError>,
-    pub(super) module_error_owner: Option<String>,
     pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
 }
 
@@ -112,8 +110,18 @@ fn value_depends_on_module_output(
                     )
             )
         }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => args.iter().any(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => args.iter().any(|argument| {
+            argument.value().is_some_and(|value| {
+                value_depends_on_module_output(
+                    value,
+                    module_bindings,
+                    variables,
+                    visiting_variables,
+                )
+            })
         }),
         Value::Deferred(DeferredValue::Access(access)) => value_depends_on_module_output(
             access.base(),
@@ -260,6 +268,7 @@ impl<'a> ContextFreeValue<'a> {
                 | Value::Deferred(DeferredValue::ResourceRef { .. })
                 | Value::Deferred(DeferredValue::BindingRef { .. })
                 | Value::Deferred(DeferredValue::FunctionCall { .. })
+                | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
                 | Value::Deferred(DeferredValue::Access(_))
                 | Value::Deferred(DeferredValue::Unknown(_))
                 | Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
@@ -317,7 +326,7 @@ impl SemanticLookup for ModuleCall {
         };
         self.arguments
             .get(argument)
-            .map(|argument| argument.value())
+            .and_then(|argument| argument.value())
     }
 }
 
@@ -507,11 +516,19 @@ fn collect_known_bindings(merged: &ParsedFile) -> carina_core::binding_index::Bi
 
 fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -> bool) -> bool {
     match value {
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             matches_name(name)
-                || args
-                    .iter()
-                    .any(|arg| contains_matching_function_call(arg, matches_name))
+                || args.iter().any(|arg| {
+                    arg.value()
+                        .is_some_and(|value| contains_matching_function_call(value, matches_name))
+                })
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+            matches_name(&function.name)
+                || args.iter().any(|arg| {
+                    arg.value()
+                        .is_some_and(|value| contains_matching_function_call(value, matches_name))
+                })
         }
         Value::Concrete(ConcreteValue::List(items)) => items
             .iter()
@@ -1193,7 +1210,7 @@ impl DiagnosticEngine {
         doc: &Document,
         current_file_name: Option<&str>,
         base_path: &std::path::Path,
-    ) -> Option<MergedParseResult> {
+    ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
         let mut overrides: HashMap<String, String> = HashMap::new();
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
@@ -1203,13 +1220,11 @@ impl DiagnosticEngine {
                 base_path,
                 &self.provider_context,
                 &overrides,
-            )
-            .ok()?;
+            )?;
         // Module expansion is a no-op for configs without `module_call`.
         // Retain an error while continuing with the partially expanded parse:
         // source-level checks still have useful work to do, and concrete
         // value-constraint failures are surfaced at the owning call site.
-        let root_imports = result.parsed.uses.clone();
         let module_resolution = carina_core::module_resolver::resolve_modules_with_diagnostics(
             &mut result.parsed,
             base_path,
@@ -1217,36 +1232,14 @@ impl DiagnosticEngine {
             &self.schemas,
         );
         let module_error = module_resolution.error;
-        // Nested expansion can fail while a root import is being loaded,
-        // before the resolver has a root instance prefix to attach. Identify
-        // that import alias on the error path so the LSP can still anchor the
-        // diagnostic at its authored root call.
-        let module_error_owner = module_error.as_ref().and_then(|expected| {
-            root_imports.iter().find_map(|import| {
-                let mut isolated = ParsedFile::default();
-                isolated.uses.push(import.clone());
-                match carina_core::module_resolver::RefCheckedModuleGraph::check(
-                    &mut isolated,
-                    base_path,
-                    &self.provider_context,
-                    &self.schemas,
-                ) {
-                    Err(candidate) if candidate.to_string() == expected.to_string() => {
-                        Some(import.alias.clone())
-                    }
-                    _ => None,
-                }
-            })
-        });
         let _ = carina_core::parser::resolve_provider_unresolved_attributes(
             &mut result.parsed,
             &self.provider_context,
         );
         let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
-        Some(MergedParseResult {
+        Ok(MergedParseResult {
             directory: result,
             module_error,
-            module_error_owner,
             module_constraint_reports: module_resolution.constraint_reports,
         })
     }
@@ -1259,14 +1252,52 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         error: &carina_core::module_resolver::ModuleError,
-        owner: Option<&str>,
+        base_path: &std::path::Path,
+        current_file_name: Option<&str>,
     ) -> Option<Diagnostic> {
-        let (constraint_instance, direct_module, severity, message) = match error {
+        let owner = error.owning_import();
+        let error = error.root_cause();
+        let current_source = current_file_name.map(|name| base_path.join(name));
+        if let carina_core::module_resolver::ModuleError::BareStructuralHandleArgument {
+            module,
+            source_path,
+            ..
+        } = error
+        {
+            let error_source = std::path::Path::new(source_path);
+            let error_source = if error_source.is_absolute() {
+                error_source.to_path_buf()
+            } else {
+                base_path.join(error_source)
+            };
+            if parsed.module_calls.iter().any(|call| {
+                call.module_name == *module
+                    && current_source
+                        .as_ref()
+                        .is_some_and(|current_source| current_source == &error_source)
+            }) {
+                // `check_module_calls` runs the same shared handle-sink check
+                // and can underline the exact argument expression. Keep the
+                // resolver fallback for nested/module-owned failures only.
+                return None;
+            }
+        }
+        let relative_message = error.display_relative_to(base_path);
+        let (
+            constraint_instance,
+            direct_module,
+            direct_error_line,
+            direct_error_source,
+            severity,
+            message,
+        ) = match error {
             carina_core::module_resolver::ModuleError::Constraint(diagnostic) => (
                 Some(diagnostic.instance.as_str()),
                 None,
+                None,
+                None,
                 DiagnosticSeverity::ERROR,
-                error.to_string(),
+                relative_message,
             ),
             carina_core::module_resolver::ModuleError::ReferenceType(joined) => {
                 // Output/resource/function declaration failures belong to the
@@ -1282,6 +1313,8 @@ impl DiagnosticEngine {
                 (
                     None,
                     None,
+                    None,
+                    None,
                     DiagnosticSeverity::WARNING,
                     format!(
                         "Reference type validation failed: {}",
@@ -1289,11 +1322,33 @@ impl DiagnosticEngine {
                     ),
                 )
             }
-            carina_core::module_resolver::ModuleError::ArgumentValueAccess { module, .. } => (
+            carina_core::module_resolver::ModuleError::ArgumentValueAccess {
+                module,
+                source_path,
+                line,
+                ..
+            }
+            | carina_core::module_resolver::ModuleError::BareStructuralHandleArgument {
+                module,
+                source_path,
+                line,
+                ..
+            } => (
                 None,
                 Some(module.as_str()),
+                Some(*line),
+                Some(source_path.as_str()),
                 DiagnosticSeverity::ERROR,
-                error.to_string(),
+                relative_message,
+            ),
+            carina_core::module_resolver::ModuleError::Parse(_)
+            | carina_core::module_resolver::ModuleError::ParseInFile { .. } => (
+                None,
+                None,
+                None,
+                None,
+                DiagnosticSeverity::ERROR,
+                relative_message,
             ),
             _ => return None,
         };
@@ -1317,6 +1372,29 @@ impl DiagnosticEngine {
                 }
                 if constraint_instance.is_some_and(|instance| instance == root_instance) {
                     return None;
+                }
+                if direct_module.is_some_and(|module| call.module_name == module)
+                    && let Some(line) = direct_error_line.filter(|line| *line > 0)
+                    && direct_error_source.is_some_and(|error_source| {
+                        let error_source = std::path::Path::new(error_source);
+                        let error_source = if error_source.is_absolute() {
+                            error_source.to_path_buf()
+                        } else {
+                            base_path.join(error_source)
+                        };
+                        current_source
+                            .as_ref()
+                            .is_some_and(|current_source| error_source == *current_source)
+                    })
+                {
+                    let line = (line as u32).saturating_sub(1);
+                    let width = doc
+                        .text()
+                        .lines()
+                        .nth(line as usize)
+                        .map_or(1, |source| source.chars().count().max(1))
+                        as u32;
+                    return Some(carina_diagnostic(line, 0, width, severity, message.clone()));
                 }
                 let occurrence = module_call_occurrence(&parsed.module_calls, call_index)?;
                 let (line, col, width) = self
@@ -1860,11 +1938,56 @@ impl DiagnosticEngine {
 
                     // Type validation for known parameters
                     let arg = matching_arg.unwrap();
+                    let Ok(Some(resolved_parameter)) =
+                        carina_core::validation::resolve_parameter_type_for_check(
+                            &arg.type_expr,
+                            &self.provider_context,
+                        )
+                    else {
+                        // Dotted type-resolution diagnostics are emitted by
+                        // the shared validation path. Never guess handle-ness
+                        // from the unresolved syntax here.
+                        continue;
+                    };
+                    let semantic_argument = semantic_view
+                        .lookup(call)
+                        .and_then(|semantic_call| semantic_call.arguments.get(arg_name))
+                        .or_else(|| call.arguments.get(arg_name));
+                    if let Some(result) = semantic_argument.and_then(|argument| {
+                        carina_core::validation::check_module_argument_handle_sink(
+                            argument,
+                            &resolved_parameter,
+                        )
+                    }) {
+                        if let Err(error) = result
+                            && let Some((line, col)) = self.find_module_call_arg_position(
+                                doc,
+                                call,
+                                call_occurrence,
+                                arg_name,
+                            )
+                        {
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                col + arg_name.len() as u32,
+                                DiagnosticSeverity::ERROR,
+                                format!(
+                                    "module call '{}' argument '{}': {error}",
+                                    call.module_name, arg_name,
+                                ),
+                            ));
+                        }
+                        // Core has completely checked this typed handle. Its
+                        // value-shaped projection is walker-only and must not
+                        // enter the ordinary value type checker below.
+                        continue;
+                    }
                     if let Some(semantic_value) = semantic_view
                         .value_for_typecheck(call, TypecheckValueSlot::ModuleArgument(arg_name))
                         && let Err(type_error) =
                             carina_core::validation::typecheck::check_type_expr_value(
-                                &arg.type_expr,
+                                &resolved_parameter.as_type_expr(),
                                 semantic_value,
                                 &self.provider_context,
                                 carina_core::validation::typecheck::TypecheckInference::Available {
@@ -1986,6 +2109,15 @@ impl DiagnosticEngine {
                     binding_index,
                 )
             {
+                if semantic_call
+                    .arguments
+                    .get(&error.argument)
+                    .is_some_and(|argument| argument.bare_handle_error().is_some())
+                {
+                    // `check_module_calls` routes classified handles through
+                    // core's shared sink checker at error severity.
+                    continue;
+                }
                 let call_occurrence =
                     module_call_occurrence(&parsed.module_calls, call_index).unwrap_or_default();
                 let argument_position = self
@@ -2170,6 +2302,13 @@ impl DiagnosticEngine {
         occurrence: usize,
         arg_name: &str,
     ) -> Option<(u32, u32)> {
+        if let Some(span) = call.argument_source_span(arg_name) {
+            return Some((
+                span.start_line.saturating_sub(1) as u32,
+                span.start_column.saturating_sub(1) as u32,
+            ));
+        }
+
         let text = doc.text();
         let mut in_module_call = false;
         let mut remaining = occurrence;
@@ -2796,153 +2935,6 @@ impl DiagnosticEngine {
         }
 
         diagnostics
-    }
-
-    /// Check for unknown built-in function calls in parsed resource attributes.
-    ///
-    /// User-defined functions declared in any sibling `.crn` are excluded
-    /// from the unknown-function diagnostic — without this, `fn X(...)` in
-    /// `helpers.crn` is flagged as Unknown when called from `main.crn`
-    /// (#2442).
-    ///
-    /// The "known user-fns" set is built defensively:
-    ///   * `merged.user_functions` when the directory-merged parse
-    ///     succeeded (the cheap, common case); else
-    ///   * a per-file walk of `base_path`'s `.crn` siblings via
-    ///     `collect_sibling_user_fn_names`. Without this fallback any
-    ///     unrelated parse-blocking error elsewhere in the directory
-    ///     would redline every correctly-defined sibling `fn` as
-    ///     Unknown. Else
-    ///   * the buffer's own `parsed.user_functions` (single-file path,
-    ///     no `base_path`).
-    pub(super) fn check_unknown_functions(
-        &self,
-        doc: &Document,
-        parsed: &ParsedFile,
-        merged: Option<&ParsedFile>,
-        base_path: Option<&std::path::Path>,
-    ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-        // Build a flat name set — the diagnostic only checks
-        // `contains(name)`, never inspects the function body. Avoiding
-        // `UserFunction` clones keeps the slow path cheap.
-        let user_fns: HashSet<String> = match (merged, base_path) {
-            (Some(m), _) => m.user_functions.keys().cloned().collect(),
-            (None, Some(base)) => self.collect_sibling_user_fn_names(doc, base),
-            (None, None) => parsed.user_functions.keys().cloned().collect(),
-        };
-
-        for rref in parsed.iter_all_resources() {
-            for value in rref.attributes().values() {
-                self.collect_unknown_function_diagnostics(doc, value, &user_fns, &mut diagnostics);
-            }
-        }
-
-        diagnostics
-    }
-
-    /// Walk every `.crn` file in `base_path` independently and collect
-    /// their user-function names. Used as a fallback when the full
-    /// directory parse failed (`parse_directory_with_overrides` returns
-    /// `Err` if any sibling has a parse error or the resolver bails).
-    /// A per-file failure is non-fatal — we just skip that file. The
-    /// open buffer's own user-fn names are taken from `doc` so unsaved
-    /// edits are honored.
-    fn collect_sibling_user_fn_names(
-        &self,
-        doc: &Document,
-        base_path: &std::path::Path,
-    ) -> HashSet<String> {
-        let mut out: HashSet<String> = HashSet::new();
-        // Buffer-defined fns first (unsaved edits beat on-disk).
-        if let Some(parsed) = doc.parsed() {
-            out.extend(parsed.user_functions.keys().cloned());
-        }
-        let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(base_path) else {
-            return out;
-        };
-        for file in files {
-            let Ok(content) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            let Ok(parsed) = carina_core::parser::parse(&content, &self.provider_context) else {
-                continue;
-            };
-            out.extend(parsed.user_functions.into_keys());
-        }
-        out
-    }
-
-    /// Recursively walk a Value tree to find FunctionCall nodes with unknown names.
-    fn collect_unknown_function_diagnostics(
-        &self,
-        doc: &Document,
-        value: &Value,
-        user_fns: &HashSet<String>,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) {
-        match value {
-            Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-                if !builtins::is_known_builtin(name)
-                    && !user_fns.contains(name)
-                    && let Some((line, col)) = self.find_function_call_position(doc, name)
-                {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + name.len() as u32,
-                        DiagnosticSeverity::ERROR,
-                        format!("Unknown function '{}'", name),
-                    ));
-                }
-                // Also check nested function calls in arguments
-                for arg in args {
-                    self.collect_unknown_function_diagnostics(doc, arg, user_fns, diagnostics);
-                }
-            }
-            Value::Concrete(ConcreteValue::List(items)) => {
-                for item in items {
-                    self.collect_unknown_function_diagnostics(doc, item, user_fns, diagnostics);
-                }
-            }
-            Value::Concrete(ConcreteValue::Map(map)) => {
-                for v in map.values() {
-                    self.collect_unknown_function_diagnostics(doc, v, user_fns, diagnostics);
-                }
-            }
-            Value::Deferred(DeferredValue::Interpolation(parts)) => {
-                for part in parts {
-                    if let carina_core::resource::InterpolationPart::Expr(expr) = part {
-                        self.collect_unknown_function_diagnostics(doc, expr, user_fns, diagnostics);
-                    }
-                }
-            }
-            Value::Deferred(DeferredValue::Access(access)) => {
-                self.collect_unknown_function_diagnostics(
-                    doc,
-                    access.base(),
-                    user_fns,
-                    diagnostics,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    /// Find the position of a function call name in the document text.
-    fn find_function_call_position(&self, doc: &Document, func_name: &str) -> Option<(u32, u32)> {
-        let text = doc.text();
-        let pattern = format!("{}(", func_name);
-
-        for (line_idx, line) in text.lines().enumerate() {
-            if let Some(byte_pos) = line.find(&pattern) {
-                return Some((
-                    line_idx as u32,
-                    position::byte_offset_to_char_offset(line, byte_pos),
-                ));
-            }
-        }
-        None
     }
 
     /// Check for unknown attributes on resource references (typo detection).

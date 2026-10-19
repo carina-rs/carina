@@ -26,14 +26,16 @@ pub use ast::{
     UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
+#[cfg(test)]
+pub(crate) use entry::parse_with_seeded_bindings;
 pub use entry::{
     AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse, parse_and_resolve,
     top_level_anonymous_resource_spans, top_level_backend_block_spans,
     top_level_exports_block_spans, top_level_state_block_spans, top_level_upstream_state_spans,
 };
 pub(crate) use entry::{
-    BindingSeed, parse_with_seeded_bindings, parse_with_seeded_bindings_without_literal_warnings,
-    top_level_let_binding_names,
+    BindingSeed, parse_with_directory_context, top_level_argument_names,
+    top_level_let_binding_names, top_level_user_functions_in_files,
 };
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{
@@ -44,8 +46,8 @@ pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_heredoc_part, unescape_string,
 };
 pub use expressions::string_literal::{display_string_literal, encode_string_literal};
-pub(crate) use functions::evaluate_user_function;
 pub use functions::{contains_function_call, provider_context_lookup, validate_custom_type};
+pub(crate) use functions::{evaluate_resolved_user_function, function_argument_as_eval};
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
     ResolvedProviderConfigs, SavedProviderConfigs, check_identifier_scope,
@@ -56,6 +58,7 @@ pub use resolve::{
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
     resolve_resource_refs_defer_unknown_functions, resolve_resource_refs_for_diagnostics,
+    resolve_snapshot_function_calls_with_config,
 };
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::BUILTIN_BARE_CUSTOM_TYPES;
@@ -71,10 +74,7 @@ pub(crate) use blocks::resource::{
 pub(crate) use context::{ParseContext, extract_key_string, first_inner, next_pair};
 pub use expressions::for_expr::ForBinding;
 pub use expressions::validate_expr::CompareOp;
-pub(crate) use let_binding::{
-    LetBindingKind, LetBindingRhs, if_structural_handle, module_structural_handle,
-    structural_handle,
-};
+pub(crate) use let_binding::{LetBindingKind, LetBindingRhs, if_structural_handle};
 pub(crate) use static_eval::{evaluate_static_value, is_static_eval, is_static_value};
 
 use pest_derive::Parser;

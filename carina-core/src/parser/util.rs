@@ -62,7 +62,9 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
         Value::Deferred(DeferredValue::Interpolation(_)) => "string",
-        Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        ) => "function call",
         Value::Deferred(DeferredValue::Access(_)) => "access expression",
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
@@ -77,6 +79,7 @@ pub(crate) fn eval_type_name(value: &EvalValue) -> &'static str {
     match value {
         EvalValue::User(v) => value_type_name(v),
         EvalValue::StructuralHandle(_) => "resource handle",
+        EvalValue::ProvisionalReference { .. } => "unresolved reference",
         EvalValue::ComputedWithStructuralHandles { value, .. } => value_type_name(value),
         EvalValue::DeferredForValue { .. } => "unknown",
         EvalValue::Closure { .. } => "closure",

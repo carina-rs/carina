@@ -293,10 +293,10 @@ plan-exports-multifile-let-chain:
 	$(PLAN_FIXTURE) exports_multifile_let_chain
 plan-exports-multifile-let-chain-5hop:
 	$(PLAN_FIXTURE) exports_multifile_let_chain_5hop
-plan-exports-multifile-bare-resource-ref:
-	$(PLAN_FIXTURE) exports_multifile_bare_resource_ref
-plan-exports-multifile-use-alias-seed:
-	$(PLAN_FIXTURE) exports_multifile_use_alias_seed_does_not_leak
+plan-exports-multifile-resource-attribute-ref:
+	$(PLAN_FIXTURE) exports_multifile_resource_attribute_ref
+plan-exports-multifile-module-output:
+	$(PLAN_FIXTURE) exports_multifile_module_output
 plan-exports-multifile-string-let-attr-rejected:
 	$(PLAN_FIXTURE) exports_multifile_string_let_attr_access_rejected
 plan-policy-pretty:
@@ -341,8 +341,8 @@ plan-multi-instance-module:
         plan-exports plan-exports-multifile \
         plan-exports-multifile-let-literal plan-exports-multifile-let-chain \
         plan-exports-multifile-let-chain-5hop \
-        plan-exports-multifile-bare-resource-ref \
-        plan-exports-multifile-use-alias-seed \
+        plan-exports-multifile-resource-attribute-ref \
+        plan-exports-multifile-module-output \
         plan-exports-multifile-string-let-attr-rejected \
         plan-policy-pretty \
         plan-policy-pretty-nested plan-policy-pretty-dynamic-key-list \

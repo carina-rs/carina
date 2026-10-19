@@ -13,9 +13,9 @@ use crate::ValueDescription;
 use crate::eval_value::EvalValue;
 use crate::parser::{
     LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, Rule,
-    evaluate_static_value, first_inner, if_structural_handle, is_static_value,
-    module_structural_handle, next_pair, parse_expression, parse_module_call,
-    parse_read_resource_expr, parse_resource_expr, structural_handle,
+    evaluate_static_value, first_inner, if_structural_handle, is_static_value, next_pair,
+    parse_expression, parse_expression_eval, parse_module_call, parse_read_resource_expr,
+    parse_resource_expr,
 };
 use crate::resource::{ConcreteValue, DataSource, Resource, Value};
 
@@ -43,12 +43,28 @@ pub(crate) fn parse_if_expr(
 
     // Parse the condition expression
     let condition_pair = next_pair(&mut inner, "condition", "if expression")?;
-    let condition_value = parse_expression(condition_pair, ctx)?;
+    let condition_line = condition_pair.line_col().0;
+    let condition_value = parse_expression_eval(condition_pair, ctx)?;
+
+    // Pass 1 of a directory fixed point knows that a sibling name exists but
+    // not whether it is a value or a structural handle. Parse one branch to
+    // classify this let binding, then let the final seeded parse evaluate (or
+    // reject) the now-classified condition. Crucially, do not lower the
+    // provisional name to a BindingRef here.
+    if matches!(condition_value, EvalValue::ProvisionalReference { .. })
+        && ctx.defer_provisional_static_conditions
+    {
+        let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
+        return parse_if_body_to_rhs(if_body_pair, ctx, binding_name);
+    }
+    let condition_value = condition_value
+        .into_value()
+        .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
 
     // Ensure the condition is statically evaluable
     if !is_static_value(&condition_value) {
         return Err(ParseError::InvalidExpression {
-            line: 0,
+            line: condition_line,
             message: "if condition depends on a runtime value; \
                       condition must be statically known at parse time"
                 .to_string(),
@@ -62,7 +78,7 @@ pub(crate) fn parse_if_expr(
         Value::Concrete(ConcreteValue::Bool(b)) => *b,
         other => {
             return Err(ParseError::InvalidExpression {
-                line: 0,
+                line: condition_line,
                 message: format!(
                     "if condition must be a Bool value, got: {}",
                     ValueDescription::of(other)
@@ -106,7 +122,7 @@ pub(crate) fn parse_if_body_to_rhs(
     let result = parse_if_body(pair, ctx, binding_name)?;
     match result {
         IfBodyResult::Resource(r) => Ok((
-            structural_handle(binding_name),
+            if_structural_handle(binding_name),
             vec![*r],
             vec![],
             vec![],
@@ -114,7 +130,7 @@ pub(crate) fn parse_if_body_to_rhs(
             LetBindingKind::Structural,
         )),
         IfBodyResult::DataSource(d) => Ok((
-            structural_handle(binding_name),
+            if_structural_handle(binding_name),
             vec![],
             vec![*d],
             vec![],
@@ -122,7 +138,7 @@ pub(crate) fn parse_if_body_to_rhs(
             LetBindingKind::Structural,
         )),
         IfBodyResult::ModuleCall(c) => {
-            let handle = module_structural_handle(binding_name, &c.module_name);
+            let handle = if_structural_handle(binding_name);
             Ok((
                 handle,
                 vec![],
@@ -204,12 +220,22 @@ pub(crate) fn parse_if_value_expr(
 
     // Parse the condition expression
     let condition_pair = next_pair(&mut inner, "condition", "if value expression")?;
-    let condition_value = parse_expression(condition_pair, ctx)?;
+    let condition_line = condition_pair.line_col().0;
+    let condition_value = parse_expression_eval(condition_pair, ctx)?;
+    if matches!(condition_value, EvalValue::ProvisionalReference { .. })
+        && ctx.defer_provisional_static_conditions
+    {
+        let if_body_pair = next_pair(&mut inner, "if body", "if value expression")?;
+        return parse_if_body_value(if_body_pair, ctx);
+    }
+    let condition_value = condition_value
+        .into_value()
+        .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
 
     // Ensure the condition is statically evaluable
     if !is_static_value(&condition_value) {
         return Err(ParseError::InvalidExpression {
-            line: 0,
+            line: condition_line,
             message: "if condition depends on a runtime value; \
                       condition must be statically known at parse time"
                 .to_string(),
@@ -223,7 +249,7 @@ pub(crate) fn parse_if_value_expr(
         Value::Concrete(ConcreteValue::Bool(b)) => *b,
         other => {
             return Err(ParseError::InvalidExpression {
-                line: 0,
+                line: condition_line,
                 message: format!(
                     "if condition must be a Bool value, got: {}",
                     ValueDescription::of(other)
@@ -245,7 +271,7 @@ pub(crate) fn parse_if_value_expr(
         parse_if_body_value(else_body, ctx)
     } else {
         Err(ParseError::InvalidExpression {
-            line: 0,
+            line: condition_line,
             message: "if expression in value position requires an else clause \
                       when condition is false"
                 .to_string(),

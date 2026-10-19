@@ -106,6 +106,17 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
         .iter()
         .map(|us| us.binding.as_str())
         .collect();
+    // A module parameter is a typed, parser-approved dependency target whose
+    // concrete handle is supplied by the caller during expansion. It is not a
+    // local resource binding, so standalone module validation must recognize
+    // it from the module signature instead of reconstructing validity from
+    // `bindings_by_name`. Expansion performs the corresponding value-vs-handle
+    // check and rewrites the dependency to the caller's canonical binding.
+    let module_parameter_names: HashSet<&str> = parsed
+        .arguments
+        .iter()
+        .map(|argument| argument.name.as_str())
+        .collect();
 
     for resource in parsed.iter_all_resources() {
         let depends_on = depends_on_of(resource);
@@ -166,6 +177,9 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
             }
 
             let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
+                if module_parameter_names.contains(dep_name.as_str()) {
+                    continue;
+                }
                 diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': binding '{}' is not declared in this scope",
@@ -373,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_state_target_is_diagnosed_as_error() {
+    fn upstream_state_target_is_rejected_by_the_typed_directive_parser() {
         let src = r#"
             let orgs = upstream_state { source = "../organizations" }
             let bucket = aws.s3.Bucket {
@@ -381,15 +395,13 @@ mod tests {
                 directives { depends_on = [orgs] }
             }
         "#;
-        let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
-        let errors = diag_messages(&diags, Severity::Error);
+        let error = parse_and_resolve(src).expect_err("upstream state is not a dependency target");
+        let rendered = error.to_string();
         assert!(
-            errors
-                .iter()
-                .any(|m| m.contains("upstream_state") && m.contains("'orgs'")),
-            "expected upstream_state error, got {:?}",
-            errors
+            rendered.contains("line 5")
+                && rendered.contains("'orgs' is an upstream state")
+                && rendered.contains("cannot be used as a dependency target"),
+            "expected a typed upstream-state directive error, got {rendered:?}",
         );
     }
 

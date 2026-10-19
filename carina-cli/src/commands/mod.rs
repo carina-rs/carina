@@ -477,6 +477,11 @@ pub(crate) fn validate_and_resolve_errors_with_context(
     {
         errors.push(AppError::Validation(finding));
     }
+    if let Err(error) =
+        carina_core::parser::resolve_resource_refs_with_config(parsed, &enriched_context)
+    {
+        errors.push(AppError::Config(error.to_string()));
+    }
     if !skip_resource_validation {
         errors.extend(validate_module_internal_ref_types(
             ctx,
@@ -539,9 +544,12 @@ pub(crate) fn validate_and_resolve_errors_with_context(
             &module_walk,
             &enriched_context,
         ));
-        let message = match &e {
+        let message = match e.root_cause() {
             module_resolver::ModuleError::Constraint(_) => e.to_string(),
-            _ => format!("Module resolution error: {e}"),
+            _ => format!(
+                "Module resolution error: {}",
+                e.display_relative_to(base_dir)
+            ),
         };
         errors.push(AppError::Config(message));
         return errors;

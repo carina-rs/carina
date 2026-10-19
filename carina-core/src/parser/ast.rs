@@ -10,12 +10,14 @@ use super::util::snake_to_pascal;
 use crate::binding_index::{BindingValueSource, IterableBindings};
 use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, Directives, GraphNode, LeafNode,
-    Resource, ResourceId, ResourceIdentity, UnknownReason, Value,
+    Composition, ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode,
+    LeafNode, PathSegment, Resource, ResourceId, ResourceIdentity, StructuralOperand,
+    StructuralOperandRef, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -239,7 +241,7 @@ impl<'a> ResourceRef<'a> {
 }
 
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceTypePath {
     /// Provider name (e.g., "aws")
     pub provider: String,
@@ -462,6 +464,31 @@ pub struct ArgumentParameter {
 pub struct ValidationBlock {
     pub condition: ValidateExpr,
     pub error_message: Option<String>,
+    #[serde(skip)]
+    source: ModuleCallSource,
+}
+
+impl ValidationBlock {
+    pub fn new(condition: ValidateExpr, error_message: Option<String>) -> Self {
+        Self {
+            condition,
+            error_message,
+            source: ModuleCallSource::default(),
+        }
+    }
+
+    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+        self.source.call_span = Some(span);
+        self
+    }
+
+    pub(crate) fn set_source_file(&mut self, file: PathBuf) {
+        self.source.file = Some(file);
+    }
+
+    pub(crate) fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
+        self.source.diagnostic_source()
+    }
 }
 
 // `CompareOp` lives in `expressions::validate_expr` (re-exported above).
@@ -481,6 +508,23 @@ pub enum ValidateExpr {
     String(String),
     /// Variable reference (argument name)
     Var(String),
+    /// Attribute/index access rooted at a module argument. The path remains
+    /// explicit until module expansion knows whether the caller supplied a
+    /// value or a structural handle.
+    Access {
+        argument: String,
+        path: Vec<PathSegment>,
+    },
+    /// Module-expansion result for one argument operand. Retaining the
+    /// authored argument name keeps diagnostics stable while the typed value
+    /// (often a caller-side `ResourceRef`) resolves during plan/apply.
+    BoundArgument {
+        argument: String,
+        /// Authored operand, including any postfix path, used for diagnostics.
+        #[serde(default)]
+        operand: String,
+        value: Value,
+    },
     /// Comparison: lhs op rhs
     Compare {
         lhs: Box<ValidateExpr>,
@@ -508,6 +552,31 @@ pub enum ValidateExpr {
 pub struct RequireBlock {
     pub condition: ValidateExpr,
     pub error_message: String,
+    #[serde(skip)]
+    source: ModuleCallSource,
+}
+
+impl RequireBlock {
+    pub fn new(condition: ValidateExpr, error_message: String) -> Self {
+        Self {
+            condition,
+            error_message,
+            source: ModuleCallSource::default(),
+        }
+    }
+
+    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+        self.source.call_span = Some(span);
+        self
+    }
+
+    pub(crate) fn set_source_file(&mut self, file: PathBuf) {
+        self.source.file = Some(file);
+    }
+
+    pub(crate) fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
+        self.source.diagnostic_source()
+    }
 }
 
 /// Attribute parameter definition (in `attributes { ... }` block)
@@ -892,7 +961,12 @@ pub struct FnParam {
 /// The body of a user-defined function: a value expression.
 /// Functions are pure value transformations only.
 #[derive(Debug, Clone)]
-pub struct UserFunctionBody(pub Value);
+pub struct UserFunctionBody {
+    pub value: Value,
+    pub source_line: usize,
+    /// Owning `.crn` file, stamped by the directory loader after parsing.
+    pub source_file: Option<std::path::PathBuf>,
+}
 
 /// User-defined pure function
 #[derive(Debug, Clone)]
@@ -902,7 +976,7 @@ pub struct UserFunction {
     /// Optional return type annotation
     pub return_type: Option<TypeExpr>,
     /// Local let bindings inside the function body (name, expression)
-    pub local_lets: Vec<(String, Value)>,
+    pub local_lets: Vec<(String, Value, usize)>,
     /// The body of the function
     pub body: UserFunctionBody,
 }
@@ -910,13 +984,22 @@ pub struct UserFunction {
 /// Module call (instantiation)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleArgument {
-    value: Value,
-    access_base: Option<Value>,
+    operand: StructuralOperand,
 }
 
 impl ModuleArgument {
+    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_> {
+        self.operand.value_ref()
+    }
+
+    pub(crate) fn access_ref(&self) -> StructuralOperandRef<'_> {
+        self.operand.access_ref()
+    }
+
     pub(crate) fn from_parts(value: Value, access_base: Option<Value>) -> Self {
-        Self { value, access_base }
+        Self {
+            operand: StructuralOperand::from_value_with_access_base(value, access_base),
+        }
     }
 
     pub fn new(value: Value) -> Self {
@@ -927,26 +1010,45 @@ impl ModuleArgument {
         Self::from_parts(value, Some(access_base))
     }
 
-    pub fn value(&self) -> &Value {
-        &self.value
+    pub(crate) fn from_handle(handle: StructuralHandle) -> Self {
+        Self {
+            operand: StructuralOperand::from_handle(handle),
+        }
+    }
+
+    pub fn value(&self) -> Option<&Value> {
+        self.operand.value()
+    }
+
+    /// Return the authored bare-handle diagnostic without exposing the
+    /// parser-internal handle representation to downstream consumers.
+    pub fn bare_handle_error(&self) -> Option<String> {
+        self.handle().map(|handle| handle.bare_error().to_string())
+    }
+
+    pub(crate) fn handle(&self) -> Option<&StructuralHandle> {
+        self.operand.handle()
+    }
+
+    pub(crate) fn pending_parameter(&self) -> Option<&str> {
+        self.operand.parameter()
     }
 
     pub(crate) fn access_base(&self) -> Option<&Value> {
-        self.access_base.as_ref()
+        self.operand.explicit_access_base()
     }
 
-    pub(crate) fn value_for_access(&self) -> &Value {
-        self.access_base.as_ref().unwrap_or(&self.value)
+    /// Value-shaped projection reserved for generic reference/dependency
+    /// walkers. Semantic consumers must use the typed operand accessors.
+    pub(crate) fn walker_value(&self) -> &Value {
+        self.operand.traversal_value()
     }
 
     pub(crate) fn try_rewrite<E>(
         &mut self,
-        mut rewrite: impl FnMut(&Value) -> Result<Value, E>,
+        rewrite: impl FnMut(&Value) -> Result<Value, E>,
     ) -> Result<(), E> {
-        let value = rewrite(&self.value)?;
-        let access_base = self.access_base.as_ref().map(&mut rewrite).transpose()?;
-        self.value = value;
-        self.access_base = access_base;
+        self.operand = self.operand.try_map(rewrite)?;
         Ok(())
     }
 }
@@ -1018,6 +1120,17 @@ impl ModuleCall {
         self.source.call_span
     }
 
+    /// Parser-authored span for one call argument before a source file is
+    /// attached by directory loading.
+    pub fn argument_source_span(&self, name: &str) -> Option<ModuleCallSourceSpan> {
+        self.source.argument_spans.get(name).copied()
+    }
+
+    /// Parser-authored span for one call argument's value expression.
+    pub fn argument_value_source_span(&self, name: &str) -> Option<ModuleCallSourceSpan> {
+        self.source.argument_value_spans.get(name).copied()
+    }
+
     /// Source identity retained by a directory-loaded module call.
     pub fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
         self.source.diagnostic_source()
@@ -1029,6 +1142,7 @@ pub(crate) struct ModuleCallSource {
     pub(crate) file: Option<std::path::PathBuf>,
     pub(crate) call_span: Option<ModuleCallSourceSpan>,
     pub(crate) argument_spans: HashMap<String, ModuleCallSourceSpan>,
+    pub(crate) argument_value_spans: HashMap<String, ModuleCallSourceSpan>,
     pub(crate) expansion_key: Option<String>,
 }
 
@@ -1078,11 +1192,34 @@ pub struct ModuleCallDiagnosticSource {
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParserBindingMetadata {
+    structural_handles: IndexMap<String, StructuralHandle>,
     structural_aliases: IndexMap<String, StructuralHandle>,
     value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
+    resource_source_files: HashMap<ResourceId, PathBuf>,
+    pending_function_type_checks: Vec<PendingFunctionTypeCheck>,
+}
+
+/// A call whose body was evaluable during bootstrap parsing but whose dotted
+/// parameter annotation needs provider schemas before it can be checked.
+/// Kept parser-only so the computed result can drive structural parsing (for
+/// example a `for` iterable) without silently dropping the later type check.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingFunctionTypeCheck {
+    pub(crate) function_name: String,
+    pub(crate) arguments: Vec<FunctionArgument>,
+    pub(crate) source_line: usize,
+    pub(crate) source_file: Option<PathBuf>,
 }
 
 impl ParserBindingMetadata {
+    pub(crate) fn structural_handles(&self) -> &IndexMap<String, StructuralHandle> {
+        &self.structural_handles
+    }
+
+    pub(crate) fn insert_structural_handle(&mut self, name: String, handle: StructuralHandle) {
+        self.structural_handles.insert(name, handle);
+    }
+
     pub(crate) fn structural_aliases(&self) -> &IndexMap<String, StructuralHandle> {
         &self.structural_aliases
     }
@@ -1103,15 +1240,50 @@ impl ParserBindingMetadata {
         self.value_structural_handles.insert(name, metadata);
     }
 
+    pub(crate) fn insert_resource_source_file(&mut self, id: ResourceId, path: PathBuf) {
+        self.resource_source_files.insert(id, path);
+    }
+
+    pub(crate) fn resource_source_file(&self, id: &ResourceId) -> Option<&Path> {
+        self.resource_source_files.get(id).map(PathBuf::as_path)
+    }
+
+    pub(crate) fn insert_pending_function_type_check(&mut self, check: PendingFunctionTypeCheck) {
+        if !self.pending_function_type_checks.contains(&check) {
+            self.pending_function_type_checks.push(check);
+        }
+    }
+
+    pub(crate) fn pending_function_type_checks(&self) -> &[PendingFunctionTypeCheck] {
+        &self.pending_function_type_checks
+    }
+
+    pub(crate) fn set_pending_function_source_file(&mut self, path: &Path) {
+        for check in &mut self.pending_function_type_checks {
+            check.source_file = Some(path.to_path_buf());
+        }
+    }
+
+    pub(crate) fn clear_pending_function_type_checks(&mut self) {
+        self.pending_function_type_checks.clear();
+    }
+
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.structural_handles.retain(|name, _| keep(name));
         self.structural_aliases.retain(|name, _| keep(name));
         self.value_structural_handles.retain(|name, _| keep(name));
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
+        self.structural_handles.extend(other.structural_handles);
         self.structural_aliases.extend(other.structural_aliases);
         self.value_structural_handles
             .extend(other.value_structural_handles);
+        self.resource_source_files
+            .extend(other.resource_source_files);
+        for check in other.pending_function_type_checks {
+            self.insert_pending_function_type_check(check);
+        }
     }
 }
 
@@ -1614,6 +1786,12 @@ impl<E> File<E> {
         names.extend(self.user_functions.keys().map(String::as_str));
         names.extend(self.providers.iter().filter_map(|p| p.binding.as_deref()));
         names.extend(self.structural_bindings.iter().map(String::as_str));
+        names.extend(
+            self.parser_binding_metadata
+                .structural_handles()
+                .keys()
+                .map(String::as_str),
+        );
         names
     }
 
@@ -1915,7 +2093,9 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
-        Value::Deferred(DeferredValue::FunctionCall { .. }) => "deferred function call",
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        ) => "deferred function call",
         Value::Deferred(DeferredValue::Access(_)) => "deferred access expression",
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
@@ -2040,9 +2220,18 @@ fn substitute_placeholder_with_policy(
                 substitute_placeholder_with_policy(val, index, key, value, miss_policy)?;
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
             for arg in args.iter_mut() {
-                substitute_placeholder_with_policy(arg, index, key, value, miss_policy)?;
+                substitute_placeholder_with_policy(
+                    arg.walker_value_mut(),
+                    index,
+                    key,
+                    value,
+                    miss_policy,
+                )?;
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -2094,8 +2283,9 @@ mod substitute_placeholder_tests {
         let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
         let call = |value: &str| {
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "upper".to_string(),
-                args: vec![string(value)],
+                name: crate::builtins::BuiltinFunction::upper,
+                args: vec![string(value).into()],
+                source_line: (0).into(),
             })
         };
         let mut argument = ModuleArgument::with_access_base(call("value"), call("access"));
@@ -2103,13 +2293,13 @@ mod substitute_placeholder_tests {
         argument
             .try_rewrite(|value| match value {
                 Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-                    Ok::<_, std::convert::Infallible>(args[0].clone())
+                    Ok::<_, std::convert::Infallible>(args[0].walker_value().clone())
                 }
                 other => Ok(other.clone()),
             })
             .unwrap();
 
-        assert_eq!(argument.value(), &string("value"));
+        assert_eq!(argument.value(), Some(&string("value")));
         assert_eq!(argument.access_base(), Some(&string("access")));
     }
 
@@ -2183,7 +2373,11 @@ mod substitute_placeholder_tests {
                 params: Vec::new(),
                 return_type: None,
                 local_lets: Vec::new(),
-                body: UserFunctionBody(Value::Concrete(ConcreteValue::Int(1))),
+                body: UserFunctionBody {
+                    value: Value::Concrete(ConcreteValue::Int(1)),
+                    source_line: 1,
+                    source_file: None,
+                },
             },
         );
         parsed.providers.push(ProviderConfig {

@@ -565,9 +565,19 @@ fn deterministic_value_string(value: &Value) -> String {
                 .collect();
             format!("Interpolation([{}])", strs.join(", "))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            let arg_strs: Vec<String> = args.iter().map(deterministic_value_string).collect();
+        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|argument| deterministic_value_string(argument.walker_value()))
+                .collect();
             format!("FunctionCall({}({}))", name, arg_strs.join(", "))
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|argument| deterministic_value_string(argument.walker_value()))
+                .collect();
+            format!("FunctionCall({}({}))", function.name, arg_strs.join(", "))
         }
         Value::Deferred(DeferredValue::Access(access)) => format!(
             "Access({}{})",
@@ -596,7 +606,7 @@ fn deterministic_value_string(value: &Value) -> String {
                 UnknownReason::FnParam { name } => {
                     format!("Unknown(FnParam({name}))")
                 }
-                UnknownReason::ModuleArgument { name } => {
+                UnknownReason::ModuleArgument { name, .. } => {
                     format!("Unknown(ModuleArgument({name}))")
                 }
                 UnknownReason::FnLocal { name } => {

@@ -425,9 +425,11 @@ pub fn load_configuration_with_config(
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
             file_inputs.push((file.clone(), content));
         }
-        let parsed_files = match parse_directory_files(&file_inputs, config) {
+        let parsed_files = match parse_directory_files_located(&file_inputs, config) {
             Ok(v) => v,
-            Err(e) => return Err(format!("{}: {}", path.display(), e)),
+            Err(located) => {
+                return Err(located.render(path));
+            }
         };
         let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
@@ -443,7 +445,7 @@ pub fn load_configuration_with_config(
             if let Err(e) =
                 parser::resolve_resource_refs_defer_unknown_functions(&mut parsed, config)
             {
-                parse_errors.push(format!("{}: {}", file.display(), e));
+                parse_errors.push(LocatedParseError::in_file(&file, e).render(path));
                 continue;
             }
 
@@ -481,6 +483,11 @@ pub fn load_configuration_with_config(
         // Resolve references on the merged result so cross-file
         // `ResourceRef`s can see every sibling binding.
         if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
+            return Err(e.to_string());
+        }
+        if let Err(e) =
+            parser::resolve_snapshot_function_calls_with_config(&mut unresolved_merged, config)
+        {
             return Err(e.to_string());
         }
 
@@ -537,7 +544,9 @@ pub fn parse_directory_with_overrides(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<ParsedFile, String> {
-    parse_directory_with_overrides_impl(dir, config, overrides, false).map(|result| result.parsed)
+    parse_directory_with_overrides_impl(dir, config, overrides, false)
+        .map(|result| result.parsed)
+        .map_err(|error| error.to_string())
 }
 
 /// Directory parse result for editor and other non-blocking consumers that
@@ -557,6 +566,51 @@ pub struct DirectoryParseResult {
     pub semantic_files: Vec<(PathBuf, ParsedFile)>,
 }
 
+/// A directory parse failure with source ownership retained for editor
+/// diagnostics.
+///
+/// CLI-facing loaders continue to render this as the same string they
+/// historically returned. Editors can additionally inspect [`Self::source_file`]
+/// and only publish parser errors owned by the document being analyzed.
+#[derive(Debug, thiserror::Error)]
+pub enum DirectoryParseFailure {
+    #[error("{0}")]
+    Message(String),
+    #[error("{location}: {error}")]
+    Parse {
+        location: PathBuf,
+        source_file: Option<PathBuf>,
+        error: Box<parser::ParseError>,
+    },
+}
+
+impl DirectoryParseFailure {
+    fn from_parse_error(error: parser::ParseError) -> Self {
+        match error {
+            parser::ParseError::Located { path, error } => Self::Parse {
+                location: path.clone(),
+                source_file: Some(path),
+                error,
+            },
+            error => Self::Message(error.to_string()),
+        }
+    }
+
+    pub fn source_file(&self) -> Option<&Path> {
+        match self {
+            Self::Parse { source_file, .. } => source_file.as_deref(),
+            Self::Message(_) => None,
+        }
+    }
+
+    pub fn parse_error(&self) -> Option<&parser::ParseError> {
+        match self {
+            Self::Parse { error, .. } => Some(error.as_ref()),
+            Self::Message(_) => None,
+        }
+    }
+}
+
 impl DirectoryParseResult {
     pub fn semantic_file(&self, path: &Path) -> Option<&ParsedFile> {
         self.semantic_files
@@ -573,7 +627,7 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     dir: &Path,
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
-) -> Result<DirectoryParseResult, String> {
+) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(dir, config, overrides, true)
 }
 
@@ -582,8 +636,8 @@ fn parse_directory_with_overrides_impl(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
     preserve_failed_user_calls: bool,
-) -> Result<DirectoryParseResult, String> {
-    let files = find_crn_files_in_dir(dir)?;
+) -> Result<DirectoryParseResult, DirectoryParseFailure> {
+    let files = find_crn_files_in_dir(dir).map_err(DirectoryParseFailure::Message)?;
     let mut paths: Vec<(std::path::PathBuf, String)> = files
         .into_iter()
         .filter_map(|p| {
@@ -599,7 +653,10 @@ fn parse_directory_with_overrides_impl(
         }
     }
     if paths.is_empty() {
-        return Err(format!("No .crn files found in {}", dir.display()));
+        return Err(DirectoryParseFailure::Message(format!(
+            "No .crn files found in {}",
+            dir.display()
+        )));
     }
 
     // Resolve every file's source text (disk or override) up front so
@@ -608,15 +665,26 @@ fn parse_directory_with_overrides_impl(
     for (file, name) in &paths {
         let content = match overrides.get(name) {
             Some(buffer) => buffer.clone(),
-            None => fs::read_to_string(file)
-                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?,
+            None => fs::read_to_string(file).map_err(|e| {
+                DirectoryParseFailure::Message(format!("Failed to read {}: {}", file.display(), e))
+            })?,
         };
         file_inputs.push((file.clone(), content));
     }
 
-    let parsed_files = match parse_directory_files(&file_inputs, config) {
+    let parsed_files = match parse_directory_files_located(&file_inputs, config) {
         Ok(v) => v,
-        Err(e) => return Err(format!("{}: {}", dir.display(), e)),
+        Err(located) => {
+            let location = located
+                .source_file
+                .clone()
+                .unwrap_or_else(|| dir.to_path_buf());
+            return Err(DirectoryParseFailure::Parse {
+                location,
+                source_file: located.source_file,
+                error: located.error,
+            });
+        }
     };
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
     let semantic_files = if preserve_failed_user_calls {
@@ -650,8 +718,8 @@ fn parse_directory_with_overrides_impl(
     } else {
         parser::resolve_resource_refs_with_config(&mut merged, config)
     };
-    if let Err(e) = resolve_result {
-        return Err(e.to_string());
+    if let Err(error) = resolve_result {
+        return Err(DirectoryParseFailure::from_parse_error(error));
     }
     // `finalize_provider_configs` is intentionally NOT called here. The
     // merged result is pre-module-expansion; deferred provider
@@ -796,7 +864,7 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 /// - **Scope pass** collects top-level `let` names from the grammar without
 ///   evaluating their right-hand sides.
 /// - **Pass 1.a** parses every input with those names installed as provisional
-///   structural bindings. The result is used only to classify the real
+///   references whose value/structural kind is not known yet. The result is used only to classify the real
 ///   directory-wide declarations; its values are discarded because sibling
 ///   lets have not reached their fixed point yet.
 /// - **Value fixed point** repeatedly parses every input with the current
@@ -826,35 +894,105 @@ struct DirectorySeedState {
     metadata: crate::parser::ParserBindingMetadata,
 }
 
+#[derive(Debug)]
+pub(crate) struct LocatedParseError {
+    pub(crate) source_file: Option<PathBuf>,
+    pub(crate) error: Box<parser::ParseError>,
+}
+
+impl LocatedParseError {
+    fn in_file(path: &Path, error: parser::ParseError) -> Self {
+        match error {
+            parser::ParseError::Located { path, error } => Self {
+                source_file: Some(path),
+                error,
+            },
+            error => Self {
+                source_file: Some(path.to_path_buf()),
+                error: Box::new(error),
+            },
+        }
+    }
+
+    fn directory_wide(error: parser::ParseError) -> Self {
+        match error {
+            parser::ParseError::Located { path, error } => Self {
+                source_file: Some(path),
+                error,
+            },
+            error => Self {
+                source_file: None,
+                error: Box::new(error),
+            },
+        }
+    }
+
+    fn render(&self, fallback: &Path) -> String {
+        let location = self.source_file.as_deref().unwrap_or(fallback);
+        format!("{}: {}", location.display(), self.error)
+    }
+}
+
 pub fn parse_directory_files(
     files: &[(PathBuf, String)],
     config: &ProviderContext,
 ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, parser::ParseError> {
+    // This lower-level API historically returned the leaf parse error. CLI
+    // and LSP callers use the located variant below when rendering a file.
+    parse_directory_files_located(files, config).map_err(|located| *located.error)
+}
+
+pub(crate) fn parse_directory_files_located(
+    files: &[(PathBuf, String)],
+    config: &ProviderContext,
+) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
+    let directory_functions = parser::top_level_user_functions_in_files(files, config)
+        .map_err(LocatedParseError::directory_wide)?;
+    let mut directory_module_parameters = HashSet::new();
+    for (path, content) in files {
+        directory_module_parameters.extend(
+            parser::top_level_argument_names(content)
+                .map_err(|error| LocatedParseError::in_file(path, error))?,
+        );
+    }
+
     // Establish lexical scope without evaluating any RHS. Postfix access on a
     // sibling name can otherwise fail on the identifier's enum fallback before
     // the value fixed point gets a chance to type the name.
     let mut provisional_names = Vec::new();
-    for (_, content) in files {
-        provisional_names.extend(parser::top_level_let_binding_names(content)?);
+    for (path, content) in files {
+        provisional_names.extend(
+            parser::top_level_let_binding_names(content)
+                .map_err(|error| LocatedParseError::in_file(path, error))?,
+        );
     }
     provisional_names.sort_unstable();
     provisional_names.dedup();
-    let provisional_seeds: Vec<_> = provisional_names
+    let mut provisional_seeds: Vec<_> = provisional_names
         .iter()
+        .filter(|name| !directory_module_parameters.contains(name.as_str()))
         .map(|name| parser::BindingSeed::provisional(name))
         .collect();
+    provisional_seeds.extend(
+        directory_module_parameters
+            .iter()
+            .map(|name| parser::BindingSeed::module_parameter(name)),
+    );
 
     // Pass 1.a: classify declarations with the complete syntactic scope.
     // Errors here propagate identically to Pass 2 (same input, same parser
     // path), so don't try to be clever about saving them.
     let mut pass1_union = ParsedFile::default();
     let mut pass_1a_local_variables = Vec::with_capacity(files.len());
-    for (_, content) in files {
-        let parsed = parser::parse_with_seeded_bindings_without_literal_warnings(
+    for (path, content) in files {
+        let parsed = parser::parse_with_directory_context(
             content,
             config,
             &provisional_seeds,
-        )?;
+            &directory_functions,
+            false,
+        )
+        .map_err(|error| LocatedParseError::in_file(path, error))?;
         pass_1a_local_variables.push(local_variable_names(&parsed));
         merge_parsed_file(&mut pass1_union, parsed);
     }
@@ -864,10 +1002,13 @@ pub fn parse_directory_files(
         .iter()
         .map(|argument| argument.name.as_str())
         .collect();
-    parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)?;
+    parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
+        .map_err(LocatedParseError::directory_wide)?;
+    let mut seed_metadata = pass1_union.parser_binding_metadata.clone();
+    seed_metadata.clear_pending_function_type_checks();
     let mut bindings_current = DirectorySeedState {
         variables: pass1_union.variables.clone(),
-        metadata: pass1_union.parser_binding_metadata.clone(),
+        metadata: seed_metadata,
     };
     let iteration_cap = pass1_union.variables.len() + 1;
     let mut converged = false;
@@ -879,9 +1020,15 @@ pub fn parse_directory_files(
             &bindings_current.variables,
             &bindings_current.metadata,
         );
-        let bindings_next =
-            parse_local_variable_union(files, config, &seeds, &pass_1a_local_variables)?;
-        parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)?;
+        let bindings_next = parse_local_variable_union(
+            files,
+            config,
+            &seeds,
+            &pass_1a_local_variables,
+            &directory_functions,
+        )?;
+        parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)
+            .map_err(LocatedParseError::directory_wide)?;
 
         if bindings_next == bindings_current {
             converged = true;
@@ -896,13 +1043,15 @@ pub fn parse_directory_files(
     // test because constructing non-monotone seed input requires bypassing
     // the parser internals.
     if !converged {
-        return Err(parser::ParseError::InternalError {
-            expected: "let resolution fixed point".to_string(),
-            context: format!(
-                "let resolution did not converge after {iteration_cap} iterations; \
-                 this is a bug - please file an issue with the offending directory"
-            ),
-        });
+        return Err(LocatedParseError::directory_wide(
+            parser::ParseError::InternalError {
+                expected: "let resolution fixed point".to_string(),
+                context: format!(
+                    "let resolution did not converge after {iteration_cap} iterations; \
+                     this is a bug - please file an issue with the offending directory"
+                ),
+            },
+        ));
     }
 
     let final_seeds = parser::collect_seed_bindings_from_parts(
@@ -915,7 +1064,14 @@ pub fn parse_directory_files(
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());
     for ((path, content), local_variable_names) in files.iter().zip(pass_1a_local_variables) {
-        let mut parsed = parser::parse_with_seeded_bindings(content, config, &final_seeds)?;
+        let mut parsed = parser::parse_with_directory_context(
+            content,
+            config,
+            &final_seeds,
+            &directory_functions,
+            true,
+        )
+        .map_err(|error| LocatedParseError::in_file(path, error))?;
         stamp_parsed_file_source(&mut parsed, path);
         out.push((
             path.clone(),
@@ -929,6 +1085,31 @@ pub fn parse_directory_files(
 }
 
 fn stamp_parsed_file_source(parsed: &mut ParsedFile, path: &Path) {
+    parsed
+        .parser_binding_metadata
+        .set_pending_function_source_file(path);
+    let resource_ids = parsed
+        .resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .chain(
+            parsed
+                .data_sources
+                .iter()
+                .map(|resource| resource.id.clone()),
+        )
+        .chain(
+            parsed
+                .deferred_for_expressions
+                .iter()
+                .map(|deferred| deferred.template_resource.id.clone()),
+        )
+        .collect::<Vec<_>>();
+    for id in resource_ids {
+        parsed
+            .parser_binding_metadata
+            .insert_resource_source_file(id, path.to_path_buf());
+    }
     for call in &mut parsed.module_calls {
         call.set_source_file(path.to_path_buf());
     }
@@ -937,6 +1118,17 @@ fn stamp_parsed_file_source(parsed: &mut ParsedFile, path: &Path) {
     }
     for parameter in &mut parsed.export_params {
         parameter.set_source_file(path.to_path_buf());
+    }
+    for parameter in &mut parsed.arguments {
+        for validation in &mut parameter.validations {
+            validation.set_source_file(path.to_path_buf());
+        }
+    }
+    for requirement in &mut parsed.requires {
+        requirement.set_source_file(path.to_path_buf());
+    }
+    for function in parsed.user_functions.values_mut() {
+        function.body.source_file = Some(path.to_path_buf());
     }
     let file = Some(path.display().to_string());
     for warning in &mut parsed.warnings {
@@ -948,7 +1140,12 @@ fn stamp_parsed_file_source(parsed: &mut ParsedFile, path: &Path) {
 }
 
 fn local_variable_names(parsed: &ParsedFile) -> HashSet<String> {
-    parsed.variables.keys().cloned().collect()
+    parsed
+        .variables
+        .keys()
+        .chain(parsed.parser_binding_metadata.structural_handles().keys())
+        .cloned()
+        .collect()
 }
 
 fn parse_local_variable_union(
@@ -956,18 +1153,23 @@ fn parse_local_variable_union(
     config: &ProviderContext,
     seeds: &[parser::BindingSeed<'_>],
     local_variables_by_file: &[HashSet<String>],
-) -> Result<DirectorySeedState, parser::ParseError> {
+    user_functions: &HashMap<String, parser::UserFunction>,
+) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
     let mut metadata = crate::parser::ParserBindingMetadata::default();
-    for ((_, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
+    for ((path, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
         let mut parsed =
-            parser::parse_with_seeded_bindings_without_literal_warnings(content, config, seeds)?;
+            parser::parse_with_directory_context(content, config, seeds, user_functions, false)
+                .map_err(|error| LocatedParseError::in_file(path, error))?;
         parsed
             .variables
             .retain(|name, _| local_variables.contains(name));
         parsed
             .parser_binding_metadata
             .retain(|name| local_variables.contains(name));
+        parsed
+            .parser_binding_metadata
+            .clear_pending_function_type_checks();
         variables.extend(parsed.variables);
         metadata.extend(parsed.parser_binding_metadata);
     }
@@ -1519,6 +1721,60 @@ mod tests {
     }
 
     #[test]
+    fn load_configuration_renders_a_function_body_file_once() {
+        let dir = create_temp_dir("function_body_file_once");
+        let main = dir.join("main.crn");
+        let functions = dir.join("fns.crn");
+        fs::write(
+            &main,
+            "let vpc = mock.test.resource { name = \"vpc\" }\n\
+             mock.test.resource { name = g(vpc.name) }\n",
+        )
+        .unwrap();
+        fs::write(&functions, "fn g(r: String): String { r.name }\n").unwrap();
+        fs::write(dir.join("providers.crn"), "provider mock {}\n").unwrap();
+
+        let error = match load_configuration(&dir) {
+            Ok(_) => panic!("invalid function body unexpectedly loaded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.matches(&functions.display().to_string()).count(),
+            1,
+            "{error}"
+        );
+        assert!(!error.contains(&main.display().to_string()), "{error}");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_renders_a_same_file_function_error_once() {
+        let dir = create_temp_dir("same_file_function_error_once");
+        let main = dir.join("main.crn");
+        fs::write(
+            &main,
+            "fn g(r: String): String { r.name }\n\
+             let vpc = mock.test.resource { name = \"vpc\" }\n\
+             mock.test.resource { name = g(vpc.name) }\n",
+        )
+        .unwrap();
+        fs::write(dir.join("providers.crn"), "provider mock {}\n").unwrap();
+
+        let error = match load_configuration(&dir) {
+            Ok(_) => panic!("invalid function body unexpectedly loaded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.matches(&main.display().to_string()).count(),
+            1,
+            "{error}"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
     fn load_configuration_rejects_file_path() {
         let dir = create_temp_dir("load_rejects_file");
         let file = dir.join("test.crn");
@@ -1836,6 +2092,38 @@ awscc.ec2.SecurityGroup {
             loaded.identifier_scope_errors.is_empty(),
             "no identifier-scope errors expected, got: {:?}",
             loaded.identifier_scope_errors,
+        );
+    }
+
+    #[test]
+    fn provisional_sibling_if_reclassifies_a_resource_branch_as_a_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = vec![
+            (temp.path().join("a.crn"), "let flag = false\n".to_string()),
+            (
+                temp.path().join("b.crn"),
+                "let selected = if flag { mock.test.Thing { name = \"unused\" } } else { \"fallback\" }\n"
+                    .to_string(),
+            ),
+            (
+                temp.path().join("c.crn"),
+                "let observed = selected\n".to_string(),
+            ),
+        ];
+
+        let parsed = parse_directory_files(&files, &ProviderContext::default())
+            .expect("directory fixed point");
+        let consumer = parsed
+            .iter()
+            .find_map(|(path, parsed)| {
+                path.ends_with("c.crn")
+                    .then(|| parsed.parsed().variables.get("observed"))
+                    .flatten()
+            })
+            .expect("consumer value");
+        assert_eq!(
+            consumer,
+            &Value::Concrete(crate::resource::ConcreteValue::String("fallback".into()))
         );
     }
 
@@ -2212,6 +2500,53 @@ awscc.ec2.SecurityGroup {
         assert_eq!(
             messages,
             vec!["duplicate export 'x': declared 2 times in main.crn"]
+        );
+    }
+
+    #[test]
+    fn located_parse_failure_renders_its_body_file_once() {
+        let caller = Path::new("q3/main.crn");
+        let body = Path::new("q3/fns.crn");
+        let body_error = parser::ParseError::InvalidExpression {
+            line: 1,
+            message: "cannot apply access .name to string".to_string(),
+        }
+        .in_file(body);
+        let located = LocatedParseError::in_file(caller, body_error);
+        let location = located
+            .source_file
+            .clone()
+            .unwrap_or_else(|| caller.to_path_buf());
+        let failure = DirectoryParseFailure::Parse {
+            location,
+            source_file: located.source_file,
+            error: located.error,
+        };
+
+        assert_eq!(
+            failure.to_string(),
+            "q3/fns.crn: Invalid expression at line 1: cannot apply access .name to string",
+        );
+    }
+
+    #[test]
+    fn located_parse_failure_does_not_repeat_the_same_file() {
+        let file = Path::new("p4/main.crn");
+        let error = parser::ParseError::InvalidExpression {
+            line: 2,
+            message: "bad call".to_string(),
+        }
+        .in_file(file);
+        let located = LocatedParseError::in_file(file, error);
+        let failure = DirectoryParseFailure::Parse {
+            location: located.source_file.clone().unwrap(),
+            source_file: located.source_file,
+            error: located.error,
+        };
+
+        assert_eq!(
+            failure.to_string(),
+            "p4/main.crn: Invalid expression at line 2: bad call",
         );
     }
 }
