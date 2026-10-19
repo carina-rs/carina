@@ -2646,8 +2646,10 @@ fn test_canonical_create_only_string_matches_state_round_trip() {
     };
 
     for value in values {
-        let state_json = crate::value::value_to_json(&value).expect("value should serialize");
-        let persisted = crate::value::persisted_json_to_dsl_value(&state_json)
+        let state_json = crate::value::PersistedValue::encode_provider_value(&value, None)
+            .expect("value should serialize for persisted state");
+        let persisted = state_json
+            .decode()
             .expect("persisted state value should decode");
         assert_eq!(
             canonical_create_only_value_string(&value),

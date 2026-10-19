@@ -1,0 +1,34 @@
+{
+  "version": 11,
+  "serial": 9,
+  "lineage": "issue-3896-v11-nested-fixture",
+  "carina_version": "0.7.0",
+  "resources": [
+    {
+      "resource_type": "test.Resource",
+      "identity": "main",
+      "provider": "mock",
+      "identifier": "main-id",
+      "attributes": {
+        "settings": {
+          "$k": "_secret:argon2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "legacy_enum": {
+            "Enum": {
+              "identity": {
+                "provider": "test",
+                "segments": ["widget"],
+                "kind": "Mode"
+              },
+              "api_value": "active"
+            }
+          },
+          "items": [
+            {
+              "$nested": "preserved"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

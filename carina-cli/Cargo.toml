@@ -47,7 +47,7 @@ tokio-util = "0.7"
 [dev-dependencies]
 argon2 = "0.5"
 async-trait = "0.1"
-carina-core = { path = "../carina-core", features = ["test-shutdown"] }
+carina-core = { path = "../carina-core", features = ["test-shutdown", "test-utils"] }
 carina-plugin-host = { path = "../carina-plugin-host", features = ["test-utils"] }
 carina-state = { path = "../carina-state", features = ["test-utils"] }
 carina-lsp = { path = "../carina-lsp" }

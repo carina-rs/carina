@@ -1,0 +1,66 @@
+{
+  "version": 12,
+  "serial": 7,
+  "lineage": "issue-3896-v12-fixture",
+  "carina_version": "0.8.0",
+  "resources": [
+    {
+      "resource_type": "test.Resource",
+      "identity": "main",
+      "provider": "mock",
+      "identifier": "current-id",
+      "attributes": {
+        "legacy_enum": {
+          "Enum": {
+            "identity": {
+              "provider": "aws",
+              "segments": ["ec2", "Eip"],
+              "kind": "Domain"
+            },
+            "api_value": "vpc"
+          }
+        },
+        "dollar_map": {
+          "$x": "current"
+        }
+      },
+      "deposed": [
+        {
+          "key": "old",
+          "identifier": "deposed-id",
+          "attributes": {
+            "legacy_enum": {
+              "Enum": {
+                "identity": {
+                  "provider": "aws",
+                  "segments": ["ec2", "Eip"],
+                  "kind": "Domain"
+                },
+                "api_value": "standard"
+              }
+            },
+            "dollar_map": {
+              "$x": "deposed"
+            }
+          },
+          "dependency_bindings": []
+        }
+      ]
+    }
+  ],
+  "exports": {
+    "legacy_enum": {
+      "Enum": {
+        "identity": {
+          "provider": "aws",
+          "segments": ["ec2", "Eip"],
+          "kind": "Domain"
+        },
+        "api_value": "vpc"
+      }
+    },
+    "dollar_map": {
+      "$x": "export"
+    }
+  }
+}

@@ -1581,13 +1581,39 @@ fn persisted_plan_export_maps_use_the_core_value_formatter() {
 
     let change = ExportChange::Removed {
         name: "settings".to_string(),
-        old_json: serde_json::json!({"ratio": 1.0}),
+        old_json: serde_json::from_value(serde_json::json!({
+            "ratio": 1.0
+        }))
+        .unwrap(),
     };
 
     assert_eq!(
         strip_ansi(&format_export_change(&change)),
         "  - settings = {ratio: 1.0}\n"
     );
+}
+
+#[test]
+fn modified_plan_export_formats_old_and_new_floats_identically() {
+    use crate::commands::plan::ExportChange;
+
+    for (value, expected) in [
+        (1e21, "1000000000000000000000.0"),
+        (1e-7, "0.0000001"),
+        (1.0, "1.0"),
+    ] {
+        let change = ExportChange::Modified {
+            name: "ratio".to_string(),
+            type_expr: None,
+            old_json: serde_json::from_value(serde_json::json!(value)).unwrap(),
+            new_value: Value::Concrete(ConcreteValue::Float(value)),
+        };
+
+        assert_eq!(
+            strip_ansi(&format_export_change(&change)),
+            format!("  ~ ratio = {expected} → {expected}\n")
+        );
+    }
 }
 
 #[test]

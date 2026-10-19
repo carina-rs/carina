@@ -2677,9 +2677,7 @@ mod tests {
         state
             .upsert_resource(ResourceState::new("ec2.Vpc", "main", "awscc"))
             .expect("test state setup must be valid");
-        state
-            .exports
-            .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
+        state.insert_export_json_for_test("vpc_id", serde_json::json!("vpc-12345"));
 
         let destroyed = vec![DestroyedInstance {
             id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
@@ -2710,9 +2708,7 @@ mod tests {
         state
             .upsert_resource(resource)
             .expect("test state setup must be valid");
-        state
-            .exports
-            .insert("vpc_id".to_string(), serde_json::json!("vpc-new"));
+        state.insert_export_json_for_test("vpc_id", serde_json::json!("vpc-new"));
 
         let destroyed = vec![DestroyedInstance {
             id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),

@@ -1,4 +1,5 @@
 use super::*;
+use carina_core::resource::DeferredValue;
 use carina_core::value::{EXPLICIT_LEGACY_SECRET_PREFIX, LEGACY_SECRET_PREFIX};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
@@ -2061,6 +2062,166 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
 }
 
 #[test]
+fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
+    let state = check_and_migrate(include_str!(
+        "../../tests/fixtures/state-v12-tagged-enum-json.json"
+    ))
+    .expect("v12 fixture should migrate")
+    .into_state();
+
+    assert_eq!(state.version, 13);
+    let row = state
+        .find_resource("mock", "test.Resource", "main")
+        .expect("fixture resource exists");
+
+    for attributes in [
+        row.persisted_attributes(),
+        row.deposed[0].persisted_attributes(),
+    ] {
+        assert!(matches!(
+            attributes.get("legacy_enum"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(_)))
+        ));
+        assert!(matches!(
+            attributes.get("dollar_map"),
+            Some(Value::Concrete(ConcreteValue::Map(map))) if map.contains_key("$x")
+        ));
+    }
+    assert_eq!(
+        row.format_attribute_for_state_show("dollar_map", true),
+        Some("{\n  \"$x\": \"current\"\n}".to_string())
+    );
+
+    let remote = state.build_remote_bindings();
+    assert!(matches!(
+        remote.get("legacy_enum"),
+        Some(Value::Concrete(ConcreteValue::CanonicalEnum(_)))
+    ));
+    assert!(matches!(
+        remote.get("dollar_map"),
+        Some(Value::Concrete(ConcreteValue::Map(map))) if map.contains_key("$x")
+    ));
+
+    let migrated_json = serde_json::to_value(&state).expect("migrated state serializes");
+    let current = &migrated_json["resources"][0]["attributes"];
+    let deposed = &migrated_json["resources"][0]["deposed"][0]["attributes"];
+    let exports = &migrated_json["exports"];
+    for tree in [current, deposed, exports] {
+        assert!(tree["legacy_enum"].get("$enum").is_some());
+        assert!(tree["dollar_map"].get("$$x").is_some());
+        assert!(tree["dollar_map"].get("$x").is_none());
+    }
+}
+
+#[test]
+fn current_state_rejects_unknown_reserved_payloads_in_attributes_and_exports() {
+    let base = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "reserved-payload-validation",
+        "carina_version": "0.8.0",
+        "resources": [],
+        "exports": {},
+    });
+    let invalid = serde_json::json!({"$future": {}});
+
+    let mut attribute_state = base.clone();
+    attribute_state["resources"] = serde_json::json!([{
+        "resource_type": "test.Resource",
+        "identity": "main",
+        "provider": "mock",
+        "identifier": "current-id",
+        "attributes": {"bad": invalid.clone()},
+    }]);
+
+    let mut export_state = base;
+    export_state["exports"] = serde_json::json!({"bad": invalid});
+
+    for (state, expected) in [
+        (attribute_state, "not valid persisted JSON"),
+        (export_state, "host-reserved"),
+    ] {
+        let error = check_and_migrate(&state.to_string())
+            .expect_err("unknown host payload must fail closed");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_reason() {
+    let mut state = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "attribute-error-detail",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "main",
+            "provider": "mock",
+            "identifier": "current-id",
+            "attributes": {"event_pattern": {"$foo": 1}},
+        }],
+        "exports": {},
+    });
+
+    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    assert!(
+        message.contains("persisted attribute \"event_pattern\""),
+        "{message}"
+    );
+    assert!(message.contains("host-reserved"), "{message}");
+    assert!(message.contains("$foo"), "{message}");
+
+    state["resources"][0]["attributes"] = serde_json::json!({});
+    state["resources"][0]["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "old-id",
+        "attributes": {
+            "mode": {"$enum": {"identity": {"provider": "test"}, "api_value": "x"}}
+        },
+        "dependency_bindings": [],
+    }]);
+    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    assert!(
+        message.contains("persisted attribute \"mode\""),
+        "{message}"
+    );
+    assert!(
+        message.contains("malformed $enum persisted enum payload"),
+        "{message}"
+    );
+}
+
+#[test]
+fn current_state_export_errors_include_the_export_name_and_payload_reason() {
+    let state = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "export-error-detail",
+        "carina_version": "test",
+        "resources": [],
+        "exports": {
+            "broken_mode": {
+                "$enum": {"identity": {"provider": "test"}, "api_value": "x"}
+            }
+        },
+    });
+
+    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    assert!(
+        message.contains("persisted export \"broken_mode\""),
+        "{message}"
+    );
+    assert!(
+        message.contains("malformed $enum persisted enum payload"),
+        "{message}"
+    );
+}
+
+#[test]
 fn v8_state_migrates_to_current_with_empty_deposed() {
     use super::check_and_migrate;
 
@@ -2098,10 +2259,10 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 }
 
 #[test]
-fn v11_state_migrates_to_v12_and_upgrades_raw_legacy_secrets_at_row_load() {
+fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 12);
+    assert_eq!(StateFile::CURRENT_VERSION, 13);
     let json = format!(
         r#"{{
         "version": 11,
@@ -2123,12 +2284,15 @@ fn v11_state_migrates_to_v12_and_upgrades_raw_legacy_secrets_at_row_load() {
         "ab".repeat(32),
     );
 
-    let outcome = check_and_migrate(&json).expect("v11 state should migrate to v12");
+    let outcome = check_and_migrate(&json).expect("v11 state should migrate to current");
     assert_eq!(
         outcome.migration(),
-        Some(MigrationInfo { from: 11, to: 12 })
+        Some(MigrationInfo {
+            from: 11,
+            to: StateFile::CURRENT_VERSION,
+        })
     );
-    assert_eq!(outcome.state().version, 12);
+    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
     let row = outcome
         .state()
         .find_resource("mock", "test.resource", "legacy")
@@ -2136,12 +2300,68 @@ fn v11_state_migrates_to_v12_and_upgrades_raw_legacy_secrets_at_row_load() {
     let marker = row
         .persisted_attributes()
         .encoded_value("comment")
-        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.as_json().as_str())
         .expect("legacy marker should remain persisted");
     assert!(
         marker.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
         "row load must make the legacy marker self-contained: {marker}",
     );
+}
+
+#[test]
+fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
+    let state = check_and_migrate(include_str!(
+        "../../tests/fixtures/state-v11-nested-persisted-values.json"
+    ))
+    .expect("v11 fixture should migrate")
+    .into_state();
+    let row = state
+        .find_resource("mock", "test.Resource", "main")
+        .expect("fixture resource exists");
+    let settings = row
+        .persisted_attributes()
+        .get("settings")
+        .expect("settings should decode");
+    let Value::Concrete(ConcreteValue::Map(settings)) = settings else {
+        panic!("settings should remain a map");
+    };
+
+    assert!(matches!(
+        settings.get("$k"),
+        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+    ));
+    assert!(matches!(
+        settings.get("legacy_enum"),
+        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+            if value.api_value() == "active"
+    ));
+    assert!(matches!(
+        settings.get("items"),
+        Some(Value::Concrete(ConcreteValue::List(items)))
+            if matches!(
+                items.first(),
+                Some(Value::Concrete(ConcreteValue::Map(item)))
+                    if matches!(
+                        item.get("$nested"),
+                        Some(Value::Concrete(ConcreteValue::String(value)))
+                            if value.expose_plaintext() == "preserved"
+                    )
+            )
+    ));
+
+    let encoded = row
+        .persisted_attributes()
+        .encoded_value("settings")
+        .expect("settings should remain persisted")
+        .as_json();
+    assert!(
+        encoded["$$k"]
+            .as_str()
+            .is_some_and(|value| value.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)),
+        "the raw v11 marker should be upgraded after its key is escaped"
+    );
+    assert!(encoded["legacy_enum"].get("$enum").is_some());
+    assert_eq!(encoded["items"][0]["$$nested"], "preserved");
 }
 
 #[test]
@@ -2770,6 +2990,87 @@ fn test_merge_write_only_attributes() {
 }
 
 #[test]
+fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribute() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
+    use carina_core::value::SerializationError;
+
+    let historical = persisted_attributes_from_state_json(&HashMap::from([(
+        "placeholder".to_string(),
+        serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
+    )]));
+    let redacted = historical
+        .get("placeholder")
+        .expect("legacy marker should decode to a redacted secret");
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "a".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("x".into()),
+            )))),
+        ),
+        ("b".to_string(), redacted),
+    ])));
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
+        .with_attribute("settings", desired);
+
+    for provider_attributes in [
+        HashMap::new(),
+        HashMap::from([(
+            "settings".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        )]),
+    ] {
+        let provider_state = State::existing(resource.id.clone(), provider_attributes);
+        let error = ResourceState::from_provider_state_for_resource_and_schema(
+            &resolved(&resource),
+            &provider_state,
+            None,
+            None,
+            None,
+        )
+        .expect_err("desired redacted secrets must never be written as new state");
+
+        assert!(matches!(
+            error,
+            ResourceStateEncodingError::Serialization(
+                SerializationError::RedactedSecretNotAllowed { .. }
+            )
+        ));
+    }
+}
+
+#[test]
+fn write_only_merge_does_not_persist_desired_redacted_secret() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
+
+    let historical = persisted_attributes_from_state_json(&HashMap::from([(
+        "placeholder".to_string(),
+        serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
+    )]));
+    let redacted = historical
+        .get("placeholder")
+        .expect("legacy marker should decode to a redacted secret");
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "a".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("x".into()),
+            )))),
+        ),
+        ("b".to_string(), redacted),
+    ])));
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
+        .with_attribute("settings", desired);
+    let mut row = ResourceState::new("test.Resource", "main", "mock");
+
+    row.merge_write_only_attributes(&resource, &["settings".to_string()])
+        .expect("unencodable desired write-only values are skipped");
+
+    assert!(!row.persisted_attributes().contains_key("settings"));
+    assert!(row.write_only_attributes.is_empty());
+}
+
+#[test]
 fn test_merge_write_only_attributes_not_in_desired() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
@@ -3112,7 +3413,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     let attrs = HashMap::from([(
         "password".to_string(),
         Value::Concrete(ConcreteValue::String(
-            upgraded.as_str().unwrap().to_string().into(),
+            upgraded.as_json().as_str().unwrap().to_string().into(),
         )),
     )]);
 
@@ -3124,7 +3425,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     );
 
     let stored = state_json_from_persisted_attributes(&stored);
-    assert_eq!(stored.get("password"), Some(&upgraded));
+    assert_eq!(stored.get("password"), Some(upgraded.as_json()));
 }
 
 #[test]
@@ -3610,7 +3911,10 @@ fn build_remote_bindings_returns_exports() {
     let mut state = StateFile::new();
     state.exports.insert(
         "account_id".to_string(),
-        serde_json::Value::String("123456789012".to_string()),
+        PersistedExportValue::encode(&Value::Concrete(ConcreteValue::String(
+            "123456789012".into(),
+        )))
+        .expect("test export is persistable"),
     );
     let bindings = state.build_remote_bindings();
     assert_eq!(
@@ -3618,6 +3922,31 @@ fn build_remote_bindings_returns_exports() {
         Some(&Value::Concrete(ConcreteValue::String(
             "123456789012".into()
         )))
+    );
+}
+
+#[test]
+fn build_remote_bindings_keeps_secret_shaped_export_strings_literal() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("not-an-export-secret".into()),
+    ))));
+    let marker = PersistedValue::encode_provider_value(&secret, None)
+        .expect("secret marker is persistable")
+        .as_json()
+        .as_str()
+        .expect("secret marker is a string")
+        .to_string();
+    let literal = Value::Concrete(ConcreteValue::String(marker.clone().into()));
+
+    let mut state = StateFile::new();
+    state.exports.insert(
+        "literal_marker".to_string(),
+        PersistedExportValue::encode(&literal).expect("literal export is persistable"),
+    );
+
+    assert_eq!(
+        state.build_remote_bindings().get("literal_marker"),
+        Some(&Value::Concrete(ConcreteValue::String(marker.into()))),
     );
 }
 

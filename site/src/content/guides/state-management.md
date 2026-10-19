@@ -13,6 +13,11 @@ By default, state is stored locally as `carina.state.json`. For team usage, conf
 
 ### State format upgrades
 
+State format v13 gives host-owned values a reserved `$` namespace. Canonical
+enums are stored under `$enum`; user map keys that begin with `$` are escaped
+with one additional `$` and restored when state is read. Loading an older state
+file migrates legacy enum objects and `$`-prefixed user keys automatically.
+
 State format v12 upgrades old raw secret markers when the state file is read.
 An `_secret:argon2:<hash>` value from an earlier state version is bound to the
 provider, resource type, stored identity, and top-level attribute key from its

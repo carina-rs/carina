@@ -8,7 +8,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use carina_core::resource::{ConcreteValue, DeferredValue, Value as CoreValue};
-use carina_core::value::value_to_json;
+use carina_core::value::PersistedValue;
 
 const STATE_SECRET_PREFIX: &str = "_secret:";
 const V2_SECRET_PREFIX: &str = "_secret:$argon2id$";
@@ -201,21 +201,36 @@ fn assert_plan_is_redacted(scenario: &Scenario, plaintexts: &[&str]) {
 }
 
 fn provider_resource_by_name<'a>(provider: &'a Value, name: &str) -> &'a Value {
-    provider
-        .as_object()
-        .expect("provider state object")
+    provider_resources(provider)
         .values()
         .find(|attributes| attributes.get("name") == Some(&Value::String(name.to_string())))
         .unwrap_or_else(|| panic!("provider state has no resource named {name}: {provider:#}"))
 }
 
-fn provider_resource_by_name_mut<'a>(provider: &'a mut Value, name: &str) -> &'a mut Value {
+fn provider_resources(provider: &Value) -> &serde_json::Map<String, Value> {
     provider
-        .as_object_mut()
+        .get("states")
+        .unwrap_or(provider)
+        .as_object()
         .expect("provider state object")
+}
+
+fn provider_resource_by_name_mut<'a>(provider: &'a mut Value, name: &str) -> &'a mut Value {
+    provider_resources_mut(provider)
         .values_mut()
         .find(|attributes| attributes.get("name") == Some(&Value::String(name.to_string())))
         .unwrap_or_else(|| panic!("provider state has no resource named {name}"))
+}
+
+fn provider_resources_mut(provider: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if provider.get("states").is_some() {
+        provider
+            .get_mut("states")
+            .and_then(Value::as_object_mut)
+            .expect("versioned provider state object")
+    } else {
+        provider.as_object_mut().expect("provider state object")
+    }
 }
 
 fn state_resource_by_name<'a>(state: &'a Value, name: &str) -> &'a Value {
@@ -1275,11 +1290,15 @@ mock.test.resource {{
         .to_string();
     let reconciled_identity = "state_preserved_anonymous_identity_3861";
     state["resources"][0]["identity"] = Value::String(reconciled_identity.to_string());
-    state["resources"][0]["attributes"]["comment"] =
-        value_to_json(&CoreValue::Deferred(DeferredValue::Secret(Box::new(
-            CoreValue::Concrete(ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into())),
-        ))))
-        .expect("rehash state secret for the reconciled identity");
+    state["resources"][0]["attributes"]["comment"] = PersistedValue::encode_provider_value(
+        &CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into()),
+        )))),
+        None,
+    )
+    .expect("rehash state secret for the reconciled identity")
+    .as_json()
+    .clone();
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&state).expect("serialize reconciled state"),
@@ -1287,7 +1306,7 @@ mock.test.resource {{
     .expect("write reconciled state");
 
     let mut provider = scenario.provider_json();
-    let provider_object = provider.as_object_mut().expect("provider state object");
+    let provider_object = provider_resources_mut(&mut provider);
     let old_key = provider_object
         .keys()
         .next()

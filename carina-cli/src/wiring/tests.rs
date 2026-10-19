@@ -6882,7 +6882,7 @@ exports { team_prefix: String = "x" }"#,
         .unwrap();
 
         let mut upstream_state = StateFile::new();
-        upstream_state.exports.insert(
+        upstream_state.insert_export_json_for_test(
             "team_prefix".to_string(),
             serde_json::json!("Tokyo_Platform"),
         );

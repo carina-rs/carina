@@ -2363,8 +2363,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // attribute from `Custom` to `Enum` (e.g. awscc#250 for IAM
     // policy `version`/`effect`) store enum values as plain JSON
     // strings. `build_saved_attrs` bridges those through the
-    // schema-blind `persisted_json_to_dsl_value` into
-    // `ConcreteValue::String`,
+    // schema-blind `PersistedValue` decoder into `ConcreteValue::String`,
     // which the strict carina#2986 Phase 4 validator then rejects at
     // the now-`Enum` position. Lift recognized members to
     // `ConcreteValue::EnumIdentifier` against each resource's current

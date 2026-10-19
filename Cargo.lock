@@ -1147,6 +1147,7 @@ dependencies = [
  "carina-core",
  "carina-plugin-sdk",
  "carina-provider-protocol",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

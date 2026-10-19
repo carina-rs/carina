@@ -639,9 +639,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
     let write_upstream = |role_arn: &str| {
         let mut state = StateFile::new();
-        state
-            .exports
-            .insert("role_arn".to_string(), serde_json::json!(role_arn));
+        state.insert_export_json_for_test("role_arn", serde_json::json!(role_arn));
         std::fs::write(
             upstream.join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
             carina_core::utils::pretty_with_newline(&state).unwrap(),
@@ -2820,7 +2818,13 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         state.find_resource("mock", "test.resource", "b").is_none(),
         "resource B must not be persisted"
     );
-    assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("a")));
+    assert_eq!(
+        state
+            .exports
+            .get("ax")
+            .map(carina_core::value::PersistedExportValue::as_json),
+        Some(&serde_json::json!("a"))
+    );
     assert!(!state.exports.contains_key("bx"));
     assert_eq!(state.serial, 1);
 }
@@ -4832,7 +4836,9 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     .0;
 
     assert_eq!(
-        exports.get("account_id"),
+        exports
+            .get("account_id")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&serde_json::Value::String("459524413166".to_string())),
         "resolve_export_values_post_apply should resolve ResourceRef values to actual values. Got: {:?}",
         exports
@@ -4937,7 +4943,9 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     .0;
 
     assert_eq!(
-        exports.get("role_arn"),
+        exports
+            .get("role_arn")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&serde_json::Value::String(
             "arn:aws:iam::123456789012:role/github-actions-carina".to_string()
         )),
@@ -5063,7 +5071,9 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     .0;
 
     assert_eq!(
-        exports.get("role_arn"),
+        exports
+            .get("role_arn")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&serde_json::Value::String(
             "arn:aws:iam::123456789012:role/chained".to_string()
         )),
@@ -5256,7 +5266,9 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     .0;
 
     assert_eq!(
-        exports.get("role_arn"),
+        exports
+            .get("role_arn")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&serde_json::Value::String(post_apply_arn.to_string())),
         "exports.role_arn must be the POST-apply ARN ({post_apply_arn}) — \
          the value carried by state.resources, NOT a pre-apply snapshot. \
@@ -5368,7 +5380,9 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
 
     let expected_json = serde_json::json!([new_arn]);
     assert_eq!(
-        exports.get("admin_access_role_arns"),
+        exports
+            .get("admin_access_role_arns")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&expected_json),
         "data-source-derived export must resolve via current_states read result, got: {exports:?}",
     );

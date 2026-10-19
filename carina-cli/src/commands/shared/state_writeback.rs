@@ -15,6 +15,9 @@ use carina_core::resource::{
     State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::value::PersistedExportValue;
+#[cfg(test)]
+use carina_core::value::PersistedValue;
 use carina_state::{
     DeposedInstance, DeposedKey, LockInfo, PreviousSecretHashAuthority, ResourceState,
     StateBackend, StateFile,
@@ -217,7 +220,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// caller as [`SkippedExports`] for exit-status handling.
 pub(crate) struct ExportResolution {
     /// Exports that resolved to concrete JSON and are safe to persist.
-    resolved: HashMap<String, serde_json::Value>,
+    resolved: HashMap<String, PersistedExportValue>,
     /// Exports omitted because their value still depends on unresolved
     /// apply-time data.
     skipped: Vec<SkippedExport>,
@@ -313,7 +316,7 @@ impl ExportResolution {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_parts(self) -> (HashMap<String, serde_json::Value>, Vec<SkippedExport>) {
+    pub(crate) fn into_parts(self) -> (HashMap<String, PersistedExportValue>, Vec<SkippedExport>) {
         (self.resolved, self.skipped)
     }
 }
@@ -493,7 +496,7 @@ pub(crate) fn materialize_exports(
     let mut skipped = Vec::new();
     for param in export_params.iter() {
         if let Some(ref value) = param.value {
-            match dsl_value_to_json(value) {
+            match PersistedExportValue::encode(value) {
                 Ok(json) => {
                     resolved_exports.insert(param.name.clone(), json);
                 }
@@ -530,112 +533,6 @@ pub(crate) fn materialize_exports(
         resolved: resolved_exports,
         skipped,
     })
-}
-
-/// Convert a DSL Value to a serde_json::Value for export state persistence.
-///
-/// Returns concrete JSON for a representable value. Deferred values and
-/// non-finite floats are errors because earlier passes should have eliminated
-/// them. Secrets are also errors: export validation rejects them before
-/// planning, and this boundary must never silently drop an export if that
-/// invariant is bypassed.
-pub(crate) fn dsl_value_to_json(
-    value: &carina_core::resource::Value,
-) -> Result<serde_json::Value, carina_core::value::SerializationError> {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-    use carina_core::value::{SerializationContext, SerializationError};
-    let ctx = SerializationContext::StateWriteback;
-    match value {
-        Value::Concrete(ConcreteValue::String(s)) => {
-            Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
-        }
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-            Ok(serde_json::Value::String(s.to_string()))
-        }
-        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-            Ok(carina_core::value::canonical_enum_to_json(c))
-        }
-        Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
-        Value::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
-        Value::Concrete(ConcreteValue::Float(f)) => {
-            // Non-finite floats (NaN / +inf / -inf) cannot be represented
-            // in JSON. Surface as `NonFiniteFloat`; silently dropping a
-            // non-finite export would hide a real upstream bug. Mirrors
-            // `value_to_json` in `carina-core/src/value.rs`. (#2859)
-            let num =
-                serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
-                    value: *f,
-                    context: ctx,
-                })?;
-            Ok(serde_json::Value::Number(num))
-        }
-        Value::Concrete(ConcreteValue::Duration(d)) => {
-            Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
-        }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            let json_items: Vec<_> = items
-                .iter()
-                .map(dsl_value_to_json)
-                .collect::<Result<_, _>>()?;
-            Ok(serde_json::Value::Array(json_items))
-        }
-        Value::Concrete(ConcreteValue::StringList(items)) => Ok(serde_json::Value::Array(
-            items
-                .iter()
-                .map(|s| serde_json::Value::String(s.expose_plaintext().to_owned()))
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let json_map: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .map(|(key, value)| dsl_value_to_json(value).map(|value| (key.clone(), value)))
-                .collect::<Result<_, _>>()?;
-            Ok(serde_json::Value::Object(json_map))
-        }
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            Err(SerializationError::UnresolvedResourceRef {
-                path: path.to_dot_string(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            Err(SerializationError::UnresolvedResourceRef {
-                path: binding.clone(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::Interpolation(_)) => {
-            Err(SerializationError::UnresolvedInterpolation { context: ctx })
-        }
-        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
-            Err(SerializationError::UnresolvedFunctionCall {
-                name: name.to_string(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
-            Err(SerializationError::UnresolvedFunctionCall {
-                name: function.name.clone(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::Access(_)) => Err(SerializationError::UnresolvedAccess {
-            expression: carina_core::value::format_value(value),
-            context: ctx,
-        }),
-        Value::Deferred(DeferredValue::Secret(_)) => {
-            Err(SerializationError::SecretNotAllowed { context: ctx })
-        }
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(SerializationError::RedactedSecretNotAllowed { context: ctx })
-        }
-    }
 }
 
 pub(crate) struct ApplyStateSave<'a> {
@@ -1568,13 +1465,14 @@ mod apply_state_save_tests {
             let row = state
                 .find_resource("mock", "listener.Listener", "listener")
                 .expect("written listener row");
-            let stored_json = carina_core::value::value_to_json(
+            let stored_json = PersistedValue::encode_provider_value(
                 &row.persisted_attributes()
                     .get("rules")
                     .expect("stored rules"),
+                None,
             )
             .expect("stored rules are JSON");
-            let stored = stored_json.as_array().expect("stored rules");
+            let stored = stored_json.as_json().as_array().expect("stored rules");
             assert_eq!(stored.len(), 2);
             assert_eq!(stored[0]["port"], 443);
             assert_eq!(stored[1]["port"], 80);
@@ -3638,16 +3536,17 @@ mod apply_state_save_tests {
             "replacement Delete for moved target must not be suppressed"
         );
 
-        let persisted_secret = carina_core::value::value_to_json(&Value::Deferred(
-            carina_core::resource::DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("previously-secret".into()),
+        let persisted_secret = PersistedValue::encode_provider_value(
+            &Value::Deferred(carina_core::resource::DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("previously-secret".into())),
             ))),
-        ))
+            None,
+        )
         .expect("persist previous secret marker");
         let mut existing = ResourceState::new("s3.Bucket", "old_bucket", "awscc")
             .with_identifier("bucket-old-id")
             .with_attribute("bucket_name", serde_json::json!("old-name"))
-            .with_attribute("comment", persisted_secret.clone());
+            .with_attribute("comment", persisted_secret.as_json().clone());
         existing.dependency_bindings.insert("logs".to_string());
         let mut state_file = StateFile::new();
         state_file
@@ -3693,7 +3592,8 @@ mod apply_state_save_tests {
         let deposed_attributes = serde_json::to_value(row.deposed[0].persisted_attributes())
             .expect("serialize deposed attributes");
         assert_eq!(
-            deposed_attributes["comment"], persisted_secret,
+            &deposed_attributes["comment"],
+            persisted_secret.as_json(),
             "Move + Replace must use the source row as previous-hash authority when deposing the old generation",
         );
     }
@@ -3766,7 +3666,7 @@ mod export_writeback_tests {
 
     fn resolve_export_parts(
         export_params: &[InferredExportParam],
-    ) -> (HashMap<String, serde_json::Value>, Vec<SkippedExport>) {
+    ) -> (HashMap<String, PersistedExportValue>, Vec<SkippedExport>) {
         let state = StateFile::new();
         let post_apply_states = PostApplyStates::from_current_and_state(&HashMap::new(), &state);
         let checked = carina_core::validation::check_export_values_pre_apply(
@@ -3812,7 +3712,10 @@ mod export_writeback_tests {
 
         let (resolved, skipped) = resolve_export_parts(&export_params);
 
-        assert_eq!(resolved.get("ok_export"), Some(&serde_json::json!("ok")));
+        assert_eq!(
+            resolved.get("ok_export").map(PersistedExportValue::as_json),
+            Some(&serde_json::json!("ok"))
+        );
         assert!(
             !resolved.contains_key("target_group_arn"),
             "unresolved export must be omitted from resolved map"
@@ -3856,7 +3759,10 @@ mod export_writeback_tests {
         let (resolved, skipped) = resolve_export_parts(&export_params);
 
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get("ok_export"), Some(&serde_json::json!("ok")));
+        assert_eq!(
+            resolved.get("ok_export").map(PersistedExportValue::as_json),
+            Some(&serde_json::json!("ok"))
+        );
         assert_eq!(skipped.len(), 2);
         assert_eq!(skipped[0].name, "first_missing");
         assert_eq!(skipped[1].name, "second_missing");
@@ -3912,18 +3818,15 @@ mod export_writeback_tests {
     #[test]
     fn write_into_preserves_prior_skipped_exports_and_drops_orphans() {
         let mut state = StateFile::new();
-        state
-            .exports
-            .insert("ax".to_string(), serde_json::json!("old-a"));
-        state
-            .exports
-            .insert("bx".to_string(), serde_json::json!("old-b"));
-        state
-            .exports
-            .insert("orphan".to_string(), serde_json::json!("old-orphan"));
+        state.insert_export_json_for_test("ax", serde_json::json!("old-a"));
+        state.insert_export_json_for_test("bx", serde_json::json!("old-b"));
+        state.insert_export_json_for_test("orphan", serde_json::json!("old-orphan"));
 
         let skipped = ExportResolution {
-            resolved: HashMap::from([("ax".to_string(), serde_json::json!("new-a"))]),
+            resolved: HashMap::from([(
+                "ax".to_string(),
+                serde_json::from_value(serde_json::json!("new-a")).unwrap(),
+            )]),
             skipped: vec![SkippedExport {
                 name: "bx".to_string(),
                 reason: "unresolved reference b.name".to_string(),
@@ -3933,8 +3836,14 @@ mod export_writeback_tests {
 
         assert_eq!(skipped.len(), 1);
         assert_eq!(state.exports.len(), 2);
-        assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("new-a")));
-        assert_eq!(state.exports.get("bx"), Some(&serde_json::json!("old-b")));
+        assert_eq!(
+            state.exports.get("ax").map(PersistedExportValue::as_json),
+            Some(&serde_json::json!("new-a"))
+        );
+        assert_eq!(
+            state.exports.get("bx").map(PersistedExportValue::as_json),
+            Some(&serde_json::json!("old-b"))
+        );
         assert!(!state.exports.contains_key("orphan"));
     }
 
@@ -3955,17 +3864,17 @@ mod stage4_unknown_err_tests {
     use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
     use carina_core::value::{SerializationContext, SerializationError};
 
-    /// RFC #2371 stage 4 contract pin: `dsl_value_to_json` returns
+    /// RFC #2371 stage 4 contract pin: the persisted export encoder returns
     /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Deferred(DeferredValue::Unknown)`.
     /// State files must never carry the variant (constraint b); a
     /// silent fallback would re-introduce v1 corruption.
     #[test]
-    fn unknown_returns_err_in_dsl_value_to_json() {
+    fn unknown_returns_err_from_persisted_export_encode() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
         let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: path.clone(),
         }));
-        let err = dsl_value_to_json(&v).unwrap_err();
+        let err = PersistedExportValue::encode(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
                 reason: UnknownReason::UpstreamExport { path: p },
@@ -3985,7 +3894,7 @@ mod stage4_unknown_err_tests {
         let v = Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
         });
-        let err = dsl_value_to_json(&v).unwrap_err();
+        let err = PersistedExportValue::encode(&v).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -4006,7 +3915,7 @@ mod stage4_unknown_err_tests {
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("x".into()),
         ]));
-        let err = dsl_value_to_json(&v).unwrap_err();
+        let err = PersistedExportValue::encode(&v).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -4027,7 +3936,7 @@ mod stage4_unknown_err_tests {
             args: vec![],
             source_line: 0.into(),
         });
-        let err = dsl_value_to_json(&v).unwrap_err();
+        let err = PersistedExportValue::encode(&v).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -4048,7 +3957,7 @@ mod stage4_unknown_err_tests {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("password".into()),
         ))));
-        let error = dsl_value_to_json(&v).expect_err("secret export must be rejected");
+        let error = PersistedExportValue::encode(&v).expect_err("secret export must be rejected");
         assert!(
             matches!(
                 error,
@@ -4058,6 +3967,56 @@ mod stage4_unknown_err_tests {
             ),
             "{error}",
         );
+    }
+
+    fn enum_shaped_user_map() -> Value {
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "Enum".to_string(),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                (
+                    "identity".to_string(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "provider".to_string(),
+                            Value::Concrete(ConcreteValue::String("aws".into())),
+                        ),
+                        (
+                            "segments".to_string(),
+                            Value::Concrete(ConcreteValue::List(vec![
+                                Value::Concrete(ConcreteValue::String("ec2".into())),
+                                Value::Concrete(ConcreteValue::String("Eip".into())),
+                            ])),
+                        ),
+                        (
+                            "kind".to_string(),
+                            Value::Concrete(ConcreteValue::String("Domain".into())),
+                        ),
+                    ]))),
+                ),
+                (
+                    "api_value".to_string(),
+                    Value::Concrete(ConcreteValue::String("vpc".into())),
+                ),
+            ]))),
+        )])))
+    }
+
+    #[test]
+    fn enum_shaped_user_map_round_trips_through_attribute_and_export_writeback() {
+        let value = enum_shaped_user_map();
+        let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
+        let state = State::existing(id, HashMap::from([("payload".to_string(), value.clone())]));
+        let row = ResourceState::new("test.Resource", "main", "mock")
+            .with_attributes_from_state(&state)
+            .expect("attribute writeback succeeds");
+
+        assert_eq!(
+            row.persisted_attributes().get("payload"),
+            Some(value.clone())
+        );
+
+        let export_json = PersistedExportValue::encode(&value).expect("export writeback succeeds");
+        assert_eq!(export_json.decode(), Some(value));
     }
 
     #[test]
@@ -4075,9 +4034,9 @@ mod stage4_unknown_err_tests {
         let v = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
 
         assert_eq!(
-            dsl_value_to_json(&v).unwrap(),
-            serde_json::json!({
-                "Enum": {
+            PersistedExportValue::encode(&v).unwrap().as_json(),
+            &serde_json::json!({
+                "$enum": {
                     "identity": {
                         "provider": "aws",
                         "segments": ["ec2", "Eip"],
@@ -4090,14 +4049,14 @@ mod stage4_unknown_err_tests {
     }
 
     /// Non-finite floats (NaN / +inf / -inf) cannot be represented in
-    /// JSON. `dsl_value_to_json` must surface them as
+    /// JSON. The persisted export encoder must surface them as
     /// `SerializationError::NonFiniteFloat` rather than silently dropping the export.
     /// (#2859)
     #[test]
     fn non_finite_float_returns_err() {
         for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let v = Value::Concrete(ConcreteValue::Float(f));
-            let err = dsl_value_to_json(&v).unwrap_err();
+            let err = PersistedExportValue::encode(&v).unwrap_err();
             match err {
                 SerializationError::NonFiniteFloat {
                     value,

@@ -5,7 +5,7 @@ use colored::Colorize;
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
-use carina_core::value::render_json_value;
+use carina_core::value::{PersistedExportValue, render_export_json_value};
 use carina_state::{StateBackend, resolve_backend_for_read};
 
 use crate::display::colored_value;
@@ -67,7 +67,7 @@ pub async fn run_export(
 
 fn print_single_export(
     key: &str,
-    exports: &HashMap<String, serde_json::Value>,
+    exports: &HashMap<String, PersistedExportValue>,
     format: &OutputFormat,
 ) -> Result<(), AppError> {
     let value = exports.get(key).ok_or_else(|| {
@@ -86,19 +86,20 @@ fn print_single_export(
 
     match format {
         OutputFormat::Raw => {
-            println!("{}", format_raw_value(value));
+            println!("{}", format_raw_value(&value.decoded_json()));
         }
         OutputFormat::Json => {
+            let value = value.decoded_json();
             println!(
                 "{}",
-                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
             );
         }
         OutputFormat::Human => {
             println!(
                 "{} = {}",
                 key.bold(),
-                colored_value(&render_json_value(value))
+                colored_value(&render_export_json_value(value))
             );
         }
     }
@@ -107,7 +108,7 @@ fn print_single_export(
 }
 
 fn print_all_exports(
-    exports: &HashMap<String, serde_json::Value>,
+    exports: &HashMap<String, PersistedExportValue>,
     format: &OutputFormat,
 ) -> Result<(), AppError> {
     if exports.is_empty() {
@@ -126,9 +127,13 @@ fn print_all_exports(
             ));
         }
         OutputFormat::Json => {
+            let exports: std::collections::BTreeMap<_, _> = exports
+                .iter()
+                .map(|(key, value)| (key, value.decoded_json()))
+                .collect();
             println!(
                 "{}",
-                serde_json::to_string_pretty(exports).unwrap_or_else(|_| format!("{:?}", exports))
+                serde_json::to_string_pretty(&exports).unwrap_or_else(|_| format!("{:?}", exports))
             );
         }
         OutputFormat::Human => {
@@ -138,7 +143,7 @@ fn print_all_exports(
                 println!(
                     "{} = {}",
                     key.bold(),
-                    colored_value(&render_json_value(&exports[key]))
+                    colored_value(&render_export_json_value(&exports[key]))
                 );
             }
         }
@@ -161,6 +166,10 @@ fn format_raw_value(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persisted(value: serde_json::Value) -> PersistedExportValue {
+        serde_json::from_value(value).expect("test value is valid persisted JSON")
+    }
 
     #[test]
     fn format_raw_string() {
@@ -190,32 +199,32 @@ mod tests {
 
     #[test]
     fn human_json_value_string() {
-        let v = serde_json::Value::String("vpc-0abc123".into());
-        assert_eq!(render_json_value(&v).plain(), "'vpc-0abc123'");
+        let v = persisted(serde_json::Value::String("vpc-0abc123".into()));
+        assert_eq!(render_export_json_value(&v).plain(), "'vpc-0abc123'");
     }
 
     #[test]
     fn human_json_value_array() {
-        let v = serde_json::json!(["459524413166", "151116838382"]);
-        let formatted = render_json_value(&v);
+        let v = persisted(serde_json::json!(["459524413166", "151116838382"]));
+        let formatted = render_export_json_value(&v);
         assert_eq!(formatted.plain(), "['459524413166', '151116838382']");
     }
 
     #[test]
     fn human_json_value_number() {
-        let v = serde_json::json!(42);
-        assert_eq!(render_json_value(&v).plain(), "42");
+        let v = persisted(serde_json::json!(42));
+        assert_eq!(render_export_json_value(&v).plain(), "42");
     }
 
     #[test]
     fn human_json_value_object_uses_carina_literals_recursively() {
-        let value = serde_json::json!({
+        let value = persisted(serde_json::json!({
             "safe_key": "plain",
             "it's": ["quoted", {"a-b": "nested"}],
-        });
+        }));
 
         assert_eq!(
-            render_json_value(&value).plain(),
+            render_export_json_value(&value).plain(),
             r#"{"it's": ['quoted', {'a-b': 'nested'}], safe_key: 'plain'}"#
         );
     }
@@ -223,7 +232,10 @@ mod tests {
     #[test]
     fn print_single_export_found() {
         let mut exports = HashMap::new();
-        exports.insert("vpc_id".to_string(), serde_json::json!("vpc-0abc123"));
+        exports.insert(
+            "vpc_id".to_string(),
+            persisted(serde_json::json!("vpc-0abc123")),
+        );
         let result = print_single_export("vpc_id", &exports, &OutputFormat::Human);
         assert!(result.is_ok());
     }
@@ -231,7 +243,10 @@ mod tests {
     #[test]
     fn print_single_export_not_found() {
         let mut exports = HashMap::new();
-        exports.insert("vpc_id".to_string(), serde_json::json!("vpc-0abc123"));
+        exports.insert(
+            "vpc_id".to_string(),
+            persisted(serde_json::json!("vpc-0abc123")),
+        );
         let err = print_single_export("missing", &exports, &OutputFormat::Human).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("missing"));
@@ -263,7 +278,7 @@ mod tests {
     #[test]
     fn print_all_exports_raw_requires_name() {
         let mut exports = HashMap::new();
-        exports.insert("key".to_string(), serde_json::json!("value"));
+        exports.insert("key".to_string(), persisted(serde_json::json!("value")));
         let err = print_all_exports(&exports, &OutputFormat::Raw).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--raw requires"));
@@ -272,8 +287,14 @@ mod tests {
     #[test]
     fn print_all_exports_human() {
         let mut exports = HashMap::new();
-        exports.insert("vpc_id".to_string(), serde_json::json!("vpc-0abc123"));
-        exports.insert("accounts".to_string(), serde_json::json!(["459524413166"]));
+        exports.insert(
+            "vpc_id".to_string(),
+            persisted(serde_json::json!("vpc-0abc123")),
+        );
+        exports.insert(
+            "accounts".to_string(),
+            persisted(serde_json::json!(["459524413166"])),
+        );
         let result = print_all_exports(&exports, &OutputFormat::Human);
         assert!(result.is_ok());
     }
@@ -281,7 +302,10 @@ mod tests {
     #[test]
     fn print_all_exports_json() {
         let mut exports = HashMap::new();
-        exports.insert("vpc_id".to_string(), serde_json::json!("vpc-0abc123"));
+        exports.insert(
+            "vpc_id".to_string(),
+            persisted(serde_json::json!("vpc-0abc123")),
+        );
         let result = print_all_exports(&exports, &OutputFormat::Json);
         assert!(result.is_ok());
     }

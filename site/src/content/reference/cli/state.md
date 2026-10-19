@@ -45,12 +45,22 @@ Output groups attributes under each resource:
   bucket = 'my-bucket-name'
 ```
 
+Human-readable output shows canonical enums as their provider API strings and
+restores user map keys exactly as authored, including keys that start with
+`$`.
+
 #### Flags
 
 | Flag | Description |
 |------|-------------|
 | `--tui` | Display state in interactive TUI mode |
-| `--json` | Output full state as JSON |
+| `--json` | Output the raw state-file JSON |
+
+`state show --json` is a state-file inspection command, so its output retains
+the version 13 persisted encoding. Canonical enums use a `$enum` host payload,
+and each user map key beginning with `$` has one additional leading `$` (for
+example, `$or` is stored as `$$or`). This differs intentionally from the
+decoded output of `state lookup --json`.
 
 ### `lookup`
 
@@ -75,6 +85,10 @@ carina state lookup my_bucket.bucket
 ```
 
 Single attribute values are returned as raw values (no quotes for strings), suitable for shell usage. Use `--json` to always output JSON.
+
+Lookup output is decoded for use as ordinary JSON: canonical enums are their
+provider API strings, and `$`-prefixed user keys are unescaped. It never emits
+the raw `$enum` or `$$` state-file representation.
 
 #### Flags
 
@@ -133,3 +147,9 @@ Carina stores state in `carina.state.json` (local backend) or in an S3 bucket (r
 - **lineage** -- unique identifier for the state, used for drift detection
 - **serial** -- incrementing version number
 - **resources** -- list of managed resources with their provider, type, name, binding, attributes, and dependency bindings
+
+State format version 13 reserves single-`$` object keys for host payloads.
+Canonical enums are stored as `$enum` payloads, while user keys beginning with
+`$` are escaped by adding one leading `$`. Carina decodes that representation
+when values are shown through human output, `state lookup --json`, exports, or
+`upstream_state`; only `state show --json` exposes the raw file encoding.

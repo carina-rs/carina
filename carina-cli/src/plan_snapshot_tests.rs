@@ -1784,12 +1784,12 @@ fn plan_snapshot_export_changes_mixed() {
         ExportChange::Modified {
             name: "changed".to_string(),
             type_expr: Some(TypeExpr::Int),
-            old_json: serde_json::json!(42),
+            old_json: serde_json::from_value(serde_json::json!(42)).unwrap(),
             new_value: Value::Concrete(ConcreteValue::Int(100)),
         },
         ExportChange::Removed {
             name: "obsolete".to_string(),
-            old_json: serde_json::json!("gone"),
+            old_json: serde_json::from_value(serde_json::json!("gone")).unwrap(),
         },
     ];
     let output = format_plan(

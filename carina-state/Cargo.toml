@@ -27,6 +27,7 @@ thiserror = "2"
 hostname = "0.4"
 
 [dev-dependencies]
+carina-core = { path = "../carina-core", features = ["test-utils"] }
 indexmap = "2"
 tempfile = "3"
 # In-process AWS service emulator: the S3 backend's integration tests
