@@ -4383,7 +4383,7 @@ mod tests {
             .into_parts();
         let upgraded_marker = persisted
             .encoded_value("comment")
-            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.as_json().as_str())
             .expect("state load upgrades the raw legacy marker")
             .to_string();
         let attributes = persisted.to_values();

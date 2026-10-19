@@ -2880,9 +2880,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
     // Pre-existing state with stale exports
     let mut state_in = StateFile::new();
-    state_in
-        .exports
-        .insert("old".to_string(), serde_json::json!("stale"));
+    state_in.insert_export_json_for_test("old", serde_json::json!("stale"));
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
@@ -2950,7 +2948,10 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     let state = written.as_ref().expect("state should be written");
     assert_eq!(state.exports.len(), 1);
     assert_eq!(
-        state.exports.get("account_id"),
+        state
+            .exports
+            .get("account_id")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&serde_json::json!("123456789012"))
     );
 }
@@ -2966,9 +2967,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
     };
     let lock = LockInfo::new("apply");
     let mut state_in = StateFile::new();
-    state_in
-        .exports
-        .insert("role_arn".to_string(), serde_json::json!("prior-arn"));
+    state_in.insert_export_json_for_test("role_arn", serde_json::json!("prior-arn"));
     let export_params = vec![InferredExportParam {
         name: "role_arn".to_string(),
         type_expr: TypeExpr::Unknown,
@@ -3000,7 +2999,10 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
     let state = written.as_ref().expect("state should be written");
     assert_eq!(state.serial, 1, "state save must happen before the error");
     assert_eq!(
-        state.exports.get("role_arn"),
+        state
+            .exports
+            .get("role_arn")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&serde_json::json!("prior-arn")),
         "a skipped export must preserve its prior persisted value",
     );
@@ -3024,11 +3026,11 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
     // Pre-existing state with exports left over from a previous
     // apply whose `exports {}` block has since been removed.
     let mut state_in = StateFile::new();
-    state_in.exports.insert(
+    state_in.insert_export_json_for_test(
         "zone_id".to_string(),
         serde_json::json!("Z0788351HTU0H3UKV38I"),
     );
-    state_in.exports.insert(
+    state_in.insert_export_json_for_test(
         "nameservers".to_string(),
         serde_json::json!(["ns-1572.awsdns-04.co.uk"]),
     );
@@ -3096,9 +3098,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
     let lock = LockInfo::new("apply");
 
     let mut state_in = StateFile::new();
-    state_in
-        .exports
-        .insert("vpc_id".to_string(), serde_json::json!("vpc-0abc123"));
+    state_in.insert_export_json_for_test("vpc_id", serde_json::json!("vpc-0abc123"));
 
     let result = ApplyResult {
         success_count: 0,
@@ -3141,7 +3141,10 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
     let written = captured.lock().unwrap();
     let state = written.as_ref().expect("state should be written");
     assert_eq!(
-        state.exports.get("vpc_id"),
+        state
+            .exports
+            .get("vpc_id")
+            .map(carina_core::value::PersistedExportValue::as_json),
         Some(&serde_json::json!("vpc-0abc123")),
         "state.exports must survive apply-from-plan (export_params: None), got: {:?}",
         state.exports
@@ -3248,7 +3251,13 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         state.find_resource("mock", "test.resource", "b").is_none(),
         "failed resource B must not be persisted"
     );
-    assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("a-id")));
+    assert_eq!(
+        state
+            .exports
+            .get("ax")
+            .map(carina_core::value::PersistedExportValue::as_json),
+        Some(&serde_json::json!("a-id"))
+    );
     assert!(
         !state.exports.contains_key("bx"),
         "unresolved export bx must be omitted"

@@ -17,9 +17,11 @@ use carina_core::plan::Plan;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+#[cfg(test)]
+use carina_core::value::PersistedValue;
 use carina_core::value::{
-    redact_secrets_in_plan_with_desired_and_historical, redact_secrets_in_resource,
-    redact_secrets_in_resource_reusing_persisted_hashes,
+    PersistedExportValue, redact_secrets_in_plan_with_desired_and_historical,
+    redact_secrets_in_resource, redact_secrets_in_resource_reusing_persisted_hashes,
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
@@ -1587,12 +1589,12 @@ pub enum ExportChange {
     Modified {
         name: String,
         type_expr: Option<carina_core::parser::TypeExpr>,
-        old_json: serde_json::Value,
+        old_json: PersistedExportValue,
         new_value: Value,
     },
     Removed {
         name: String,
-        old_json: serde_json::Value,
+        old_json: PersistedExportValue,
     },
 }
 
@@ -1610,13 +1612,13 @@ impl ExportChange {
 /// against current state-recorded exports.
 ///
 /// `checked_exports` exposes display-only values resolved against current
-/// resource states. `current_exports` is the JSON-serialized map from
+/// resource states. `current_exports` is the typed persisted-value map from
 /// `StateFile.exports`.
 pub fn compute_export_diffs(
     checked_exports: &carina_core::validation::ExportsCheckedPreApply<
         carina_core::parser::InferredExportParam,
     >,
-    current_exports: &HashMap<String, serde_json::Value>,
+    current_exports: &HashMap<String, PersistedExportValue>,
 ) -> Vec<ExportChange> {
     let mut changes = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1634,7 +1636,7 @@ pub fn compute_export_diffs(
         // (the deferred-for body will resolve it later). Map both the
         // skip variants and the Unknown error to `None`; the diff
         // surfaces as a "value not yet known" change without a JSON.
-        let new_json = crate::commands::shared::state_writeback::dsl_value_to_json(value).ok();
+        let new_json = PersistedExportValue::encode(value).ok();
         match (current_exports.get(&param.name), new_json) {
             (None, _) => changes.push(ExportChange::Added {
                 name: param.name.clone(),
@@ -2108,7 +2110,7 @@ mod load_upstream_states_tests {
     fn write_state(dir: &Path, exports: &[(&str, serde_json::Value)]) {
         let mut state = StateFile::new();
         for (k, v) in exports {
-            state.exports.insert(k.to_string(), v.clone());
+            state.insert_export_json_for_test(*k, v.clone());
         }
         fs::write(
             dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
@@ -2669,9 +2671,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .unwrap();
 
         let mut state_a = StateFile::new();
-        state_a
-            .exports
-            .insert("region".to_string(), serde_json::json!("ap-northeast-1"));
+        state_a.insert_export_json_for_test("region", serde_json::json!("ap-northeast-1"));
         fs::write(
             dir_a.join("carina.state.json"),
             serde_json::to_string(&state_a).unwrap(),
@@ -2818,8 +2818,9 @@ mod run_plan_out_tests {
                 path: AccessPath::new("producer", "identifier"),
             }),
         );
-        let persisted_update_marker = carina_core::value::value_to_json(
+        let persisted_update_marker = PersistedValue::encode_provider_value(
             updated.attributes.get("comment").expect("updated secret"),
+            None,
         )
         .expect("persisted update marker");
         let mut state_file = StateFile::new();
@@ -2827,7 +2828,7 @@ mod run_plan_out_tests {
             .upsert_resource(
                 carina_state::ResourceState::new("test.resource", "updated", "mock")
                     .with_identifier("updated-id")
-                    .with_attribute("comment", persisted_update_marker.clone()),
+                    .with_attribute("comment", persisted_update_marker.as_json().clone()),
             )
             .expect("persisted update row");
         let mut plan = Plan::new();
@@ -2903,7 +2904,8 @@ mod run_plan_out_tests {
         );
         assert_eq!(
             saved.sorted_resources[1].attributes["comment"],
-            carina_core::value::persisted_json_to_dsl_value(&persisted_update_marker)
+            persisted_update_marker
+                .decode()
                 .expect("lift persisted update marker"),
             "both saved-plan copies must use the matching persisted digest",
         );
@@ -3194,6 +3196,10 @@ mod export_diff_tests {
     use carina_core::parser::{InferredExportParam, TypeExpr};
     use carina_core::resource::DeferredValue;
 
+    fn persisted(value: serde_json::Value) -> PersistedExportValue {
+        serde_json::from_value(value).expect("test value is valid persisted JSON")
+    }
+
     fn param(name: &str, value: Value) -> InferredExportParam {
         InferredExportParam {
             name: name.to_string(),
@@ -3232,7 +3238,7 @@ mod export_diff_tests {
             Value::Concrete(ConcreteValue::Int(42)),
         )]);
         let mut current = HashMap::new();
-        current.insert("count".to_string(), serde_json::json!(7));
+        current.insert("count".to_string(), persisted(serde_json::json!(7)));
         let changes = compute_export_diffs(&params, &current);
         assert_eq!(changes.len(), 1);
         assert!(matches!(changes[0], ExportChange::Modified { .. }));
@@ -3245,7 +3251,7 @@ mod export_diff_tests {
             Value::Concrete(ConcreteValue::Int(42)),
         )]);
         let mut current = HashMap::new();
-        current.insert("count".to_string(), serde_json::json!(42));
+        current.insert("count".to_string(), persisted(serde_json::json!(42)));
         let changes = compute_export_diffs(&params, &current);
         assert!(changes.is_empty());
     }
@@ -3254,7 +3260,7 @@ mod export_diff_tests {
     fn compute_export_diffs_removed_when_param_missing() {
         let params = checked(Vec::new());
         let mut current = HashMap::new();
-        current.insert("stale".to_string(), serde_json::json!("old"));
+        current.insert("stale".to_string(), persisted(serde_json::json!("old")));
         let changes = compute_export_diffs(&params, &current);
         assert_eq!(changes.len(), 1);
         assert!(matches!(changes[0], ExportChange::Removed { .. }));
@@ -3267,8 +3273,8 @@ mod export_diff_tests {
             param("modified", Value::Concrete(ConcreteValue::Int(2))),
         ]);
         let mut current = HashMap::new();
-        current.insert("modified".to_string(), serde_json::json!(99));
-        current.insert("removed".to_string(), serde_json::json!("old"));
+        current.insert("modified".to_string(), persisted(serde_json::json!(99)));
+        current.insert("removed".to_string(), persisted(serde_json::json!("old")));
         let changes = compute_export_diffs(&params, &current);
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].name(), "added");
@@ -3344,15 +3350,15 @@ mod export_diff_tests {
 #[cfg(test)]
 mod plan_serialization_error_tests {
     //! RFC #2371 stage 4: serialization-boundary errors are now produced
-    //! by `value_to_json` / `redact_secrets_in_*` directly, surfaced
-    //! through `build_plan_file`'s `SerializationError` return. Verify
-    //! the actionable wording and that every effect shape (top-level
-    //! attributes, nested List/Map, Replace cascade) propagates the
-    //! error.
+    //! by `PersistedValue::encode_provider_value` / `redact_secrets_in_*`
+    //! directly, surfaced through `build_plan_file`'s `SerializationError`
+    //! return. Verify the actionable wording and that every effect shape
+    //! (top-level attributes, nested List/Map, Replace cascade) propagates
+    //! the error.
     use carina_core::resource::{
         AccessPath, ConcreteValue, DeferredValue, Resource, UnknownReason, Value,
     };
-    use carina_core::value::{SerializationError, redact_secrets_in_resource, value_to_json};
+    use carina_core::value::{PersistedValue, SerializationError, redact_secrets_in_resource};
 
     fn upstream_unknown() -> Value {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
@@ -3363,7 +3369,7 @@ mod plan_serialization_error_tests {
 
     #[test]
     fn value_to_json_errors_on_top_level_unknown() {
-        let err = value_to_json(&upstream_unknown()).unwrap_err();
+        let err = PersistedValue::encode_provider_value(&upstream_unknown(), None).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
                 reason: UnknownReason::UpstreamExport { path },
@@ -3382,14 +3388,15 @@ mod plan_serialization_error_tests {
             upstream_unknown(),
         ]));
         assert!(matches!(
-            value_to_json(&list_val).unwrap_err(),
+            PersistedValue::encode_provider_value(&list_val, None).unwrap_err(),
             SerializationError::UnknownNotAllowed { .. }
         ));
 
         let mut m: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         m.insert("Name".into(), upstream_unknown());
         assert!(matches!(
-            value_to_json(&Value::Concrete(ConcreteValue::Map(m))).unwrap_err(),
+            PersistedValue::encode_provider_value(&Value::Concrete(ConcreteValue::Map(m)), None,)
+                .unwrap_err(),
             SerializationError::UnknownNotAllowed { .. }
         ));
     }
@@ -3412,8 +3419,11 @@ mod plan_serialization_error_tests {
             (UnknownReason::ForKey, "ForKey"),
             (UnknownReason::ForIndex, "ForIndex"),
         ] {
-            let err = value_to_json(&Value::Deferred(DeferredValue::Unknown(variant.clone())))
-                .unwrap_err();
+            let err = PersistedValue::encode_provider_value(
+                &Value::Deferred(DeferredValue::Unknown(variant.clone())),
+                None,
+            )
+            .unwrap_err();
             match err {
                 SerializationError::UnknownNotAllowed { reason, .. } => {
                     assert_eq!(reason, variant, "expected {label} round-trip");

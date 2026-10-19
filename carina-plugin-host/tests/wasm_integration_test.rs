@@ -13,6 +13,7 @@ use carina_core::resource::{
     ResolvedResource, Resource, ResourceId, State, UnknownReason, Value,
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
+use carina_core::value::PersistedValue;
 use carina_plugin_host::WasmProviderFactory;
 
 fn lifted_saved_attrs(
@@ -918,8 +919,9 @@ async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("wasm-wire-secret".into()),
     ))));
-    let marker = carina_core::value::value_to_json(&secret)
+    let marker = PersistedValue::encode_provider_value(&secret, None)
         .expect("serialize test secret")
+        .as_json()
         .as_str()
         .expect("secret marker string")
         .to_string();

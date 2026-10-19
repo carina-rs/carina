@@ -551,10 +551,11 @@ fn format_state_lookup(
             .exports
             .get(key)
             .ok_or_else(|| AppError::Config(format!("Export key '{}' not found in state.", key)))?;
+        let value = value.decoded_json();
         return if json_output {
-            Ok(serde_json::to_string_pretty(value).unwrap())
+            Ok(serde_json::to_string_pretty(&value).unwrap())
         } else {
-            Ok(format_raw_value(value))
+            Ok(format_raw_value(&value))
         };
     }
 
@@ -567,8 +568,12 @@ fn format_state_lookup(
 }
 
 /// Build a sorted view of `state.exports` for deterministic JSON output.
-fn sorted_exports(state: &StateFile) -> std::collections::BTreeMap<&String, &serde_json::Value> {
-    state.exports.iter().collect()
+fn sorted_exports(state: &StateFile) -> std::collections::BTreeMap<&String, serde_json::Value> {
+    state
+        .exports
+        .iter()
+        .map(|(key, value)| (key, value.decoded_json()))
+        .collect()
 }
 
 /// Resolve a query of the form `<binding>` or `<binding>.<attribute>`
@@ -4505,7 +4510,7 @@ mod tests {
             .clone();
         let after_first_json = encoded_persisted_attributes(&after_first);
         assert!(
-            after_first_json["status"].get("Enum").is_some(),
+            after_first_json["status"].get("$enum").is_some(),
             "enum state should be stored in canonical enum shape"
         );
 
@@ -4955,9 +4960,7 @@ mod tests {
         state
             .upsert_resource(rs)
             .expect("test state setup must be valid");
-        state
-            .exports
-            .insert("vpc_id".to_string(), serde_json::json!("from-export"));
+        state.insert_export_json_for_test("vpc_id", serde_json::json!("from-export"));
 
         // `exports.vpc_id` should find the resource's attribute, not
         // the export key, because a `binding = "exports"` resource

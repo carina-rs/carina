@@ -24,7 +24,7 @@ use carina_core::resource::ResourceId;
 #[cfg(test)]
 use carina_core::resource::Value;
 use carina_core::schema::SchemaRegistry;
-use carina_core::value::{RenderedValue, ValueSpanKind, render_json_value, render_value};
+use carina_core::value::{RenderedValue, ValueSpanKind, render_export_json_value, render_value};
 
 use crate::DetailLevel;
 
@@ -270,7 +270,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
                 top_level_sigil_prefix(&Sigil::export_modified()),
                 name,
                 type_str.dimmed(),
-                colored_value(&render_json_value(old_json)),
+                colored_value(&render_export_json_value(old_json)),
                 "→".dimmed(),
                 colored_value(&render_value(new_value))
             )
@@ -282,7 +282,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
                 "{}{} = {}",
                 top_level_sigil_prefix(&Sigil::export_removed()),
                 name,
-                colored_value(&render_json_value(old_json))
+                colored_value(&render_export_json_value(old_json))
             )
             .unwrap();
         }

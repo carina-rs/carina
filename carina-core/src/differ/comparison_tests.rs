@@ -1083,11 +1083,12 @@ fn equal_plaintexts_get_distinct_digests_that_both_verify() {
 #[test]
 fn provider_null_fields_do_not_create_a_secret_diff() {
     let provider_json = serde_json::json!({ "a": "x", "b": null });
-    let marker = crate::provider::hash_provider_json_as_secret(&provider_json, None)
+    let provider_value = crate::value::PersistedValue::from_serialized_json(provider_json).unwrap();
+    let marker = crate::provider::hash_provider_json_as_secret(&provider_value, None)
         .expect("hash provider secret");
     let current = HashMap::from([(
         "config".to_string(),
-        persisted_secret(marker.as_str().expect("secret marker")),
+        persisted_secret(marker.as_json().as_str().expect("secret marker")),
     )]);
     let desired = HashMap::from([(
         "config".to_string(),

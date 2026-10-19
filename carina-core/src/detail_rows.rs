@@ -2850,9 +2850,14 @@ mod tests {
             generation.clone(),
             identifier.clone(),
         );
-        let persisted: PersistedAttributes = serde_json::from_value(serde_json::json!({
-            "comment": PLAINTEXT,
-        }))
+        let persisted = PersistedAttributes::from_persisted_values(HashMap::from([(
+            "comment".to_string(),
+            crate::value::PersistedValue::encode_provider_value(
+                &Value::Concrete(ConcreteValue::String(PLAINTEXT.into())),
+                None,
+            )
+            .expect("encode persisted comment"),
+        )]))
         .expect("persisted attributes");
         historical.set_delete_from_persisted(delete_key, &persisted);
 

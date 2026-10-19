@@ -18,6 +18,11 @@ carina export [OPTIONS] [NAME]
 
 Output as JSON. With a NAME, prints `{"<name>": <value>}`. Without, prints the full export map.
 
+JSON export output is decoded for consumers: canonical enums are printed as
+their provider API strings, and user map keys beginning with `$` keep their
+original spelling. The state file's raw `$enum` payloads and `$$` key escaping
+are not exposed by this command.
+
 ### `--raw`
 
 Output the raw value without the export name or surrounding quotes. Requires a NAME. Useful for piping a single export into another command.

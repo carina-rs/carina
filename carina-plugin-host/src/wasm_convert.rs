@@ -22,7 +22,7 @@ use carina_core::schema::{
     StructField as CoreStructField, UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
 };
 use carina_core::value::{
-    SerializationContext, SerializationError, persisted_json_to_dsl_value, persisted_secret_marker,
+    PersistedValue, SerializationContext, SerializationError, persisted_secret_marker,
 };
 use carina_core::wait::BindingPattern as CoreBindingPattern;
 use carina_core::wait::predicate::{AttrPath as CoreAttrPath, AttrPathError};
@@ -760,8 +760,16 @@ fn decode_persisted_json_string(value: &str) -> Result<CoreValue, WasmValueDecod
             WasmValueDecodeErrorKind::RawLegacySecretMarker,
         ));
     }
-    let json = serde_json::Value::String(value.to_string());
-    Ok(persisted_json_to_dsl_value(&json).expect("a JSON string always converts to a DSL value"))
+    Ok(
+        PersistedValue::from_persisted_secret_marker(value).map_or_else(
+            || CoreValue::Concrete(ConcreteValue::String(value.into())),
+            |persisted| {
+                persisted
+                    .decode()
+                    .expect("a persisted secret marker always converts to a DSL value")
+            },
+        ),
+    )
 }
 
 // -- ResourceId --
@@ -1596,8 +1604,9 @@ mod tests {
         let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
             ConcreteValue::String(plaintext.into()),
         ))));
-        let marker = carina_core::value::value_to_json(&secret)
+        let marker = PersistedValue::encode_provider_value(&secret, None)
             .expect("serialize test secret")
+            .as_json()
             .as_str()
             .expect("secret marker string")
             .to_string();

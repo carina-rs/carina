@@ -515,8 +515,8 @@ fn shape_for_projection<'a>(
 ///
 /// Persisted state files (S3/local JSON) written *before* that schema
 /// change store these values as plain JSON strings. On load the
-/// schema-blind bridge `persisted_json_to_dsl_value` (carina-state) turns
-/// ordinary strings into `ConcreteValue::String`. `carina validate`/`plan` then
+/// schema-blind [`crate::value::PersistedValue`] decoder turns ordinary strings
+/// into `ConcreteValue::String`. `carina validate`/`plan` then
 /// re-validate upstream-state-referenced resources against the *new*
 /// schema, and the loaded `String` is rejected at the now-`Enum`
 /// position even though the stored value is perfectly valid.

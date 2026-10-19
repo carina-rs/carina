@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use carina_core::effect::PlanOp;
@@ -14,9 +15,51 @@ use carina_core::provider::{
 };
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-use carina_core::value::{json_to_dsl_value, value_to_json};
+use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
+use serde::{Deserialize, Serialize};
 
 pub const BUILTIN_PROVIDER_NAME: &str = "mock";
+
+const MOCK_STATE_VERSION: u32 = 1;
+
+type MockStates = HashMap<String, HashMap<String, PersistedValue>>;
+type RawMockStates = HashMap<String, HashMap<String, serde_json::Value>>;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedMockStateFile {
+    version: u32,
+    states: RawMockStates,
+}
+
+#[derive(Serialize)]
+struct MockStateFileRef<'a> {
+    version: u32,
+    states: &'a MockStates,
+}
+
+#[derive(Debug)]
+struct MockStateValueDecodeError {
+    resource_key: String,
+    attribute_key: String,
+    source: serde_json::Error,
+}
+
+impl std::fmt::Display for MockStateValueDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mock state resource {:?} attribute {:?} is not valid persisted JSON",
+            self.resource_key, self.attribute_key
+        )
+    }
+}
+
+impl std::error::Error for MockStateValueDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// Return whether Carina selects its built-in mock provider.
 ///
@@ -125,6 +168,8 @@ struct PartialConfig {
 
 static ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
 static MAX_ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
+static MOCK_STATE_LOCK: Mutex<()> = Mutex::new(());
+static MOCK_STATE_WRITE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 struct ActiveUpdateGuard {
     resource: String,
@@ -222,23 +267,99 @@ impl MockProvider {
         self
     }
 
-    fn load_states(&self) -> HashMap<String, HashMap<String, serde_json::Value>> {
-        if let Ok(content) = fs::read_to_string(&self.state_file) {
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            HashMap::new()
-        }
+    fn load_states(&self) -> io::Result<MockStates> {
+        let content = match fs::read_to_string(&self.state_file) {
+            Ok(content) => content,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(error),
+        };
+        Self::decode_state_file(&content)
     }
 
-    fn save_states(
-        &self,
-        states: &HashMap<String, HashMap<String, serde_json::Value>>,
-    ) -> Result<(), std::io::Error> {
+    fn decode_state_file(content: &str) -> io::Result<MockStates> {
+        let encoded: serde_json::Value = serde_json::from_str(content)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+        let is_versioned = encoded
+            .as_object()
+            .is_some_and(|object| object.contains_key("version") || object.contains_key("states"));
+        let (mut states, migrate_legacy) = if is_versioned {
+            let file: EncodedMockStateFile = serde_json::from_value(encoded)
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+            if file.version != MOCK_STATE_VERSION {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "unsupported mock state version {}; expected {}",
+                        file.version, MOCK_STATE_VERSION
+                    ),
+                ));
+            }
+            (file.states, false)
+        } else {
+            let states: RawMockStates = serde_json::from_value(encoded)
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+            (states, true)
+        };
+
+        let mut decoded = HashMap::with_capacity(states.len());
+        for (resource_key, attributes) in &mut states {
+            let mut decoded_attributes = HashMap::with_capacity(attributes.len());
+            for (attribute_key, value) in attributes {
+                if migrate_legacy {
+                    migrate_legacy_persisted_json(value);
+                }
+                let value = serde_json::from_value(value.take()).map_err(|source| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        MockStateValueDecodeError {
+                            resource_key: resource_key.clone(),
+                            attribute_key: attribute_key.clone(),
+                            source,
+                        },
+                    )
+                })?;
+                decoded_attributes.insert(attribute_key.clone(), value);
+            }
+            decoded.insert(resource_key.clone(), decoded_attributes);
+        }
+        Ok(decoded)
+    }
+
+    fn load_states_for_operation(&self) -> ProviderResult<MockStates> {
+        self.load_states()
+            .map_err(|error| ProviderError::internal_caused_by("Failed to load mock state", error))
+    }
+
+    fn lock_state_file() -> ProviderResult<MutexGuard<'static, ()>> {
+        MOCK_STATE_LOCK
+            .lock()
+            .map_err(|_| ProviderError::internal("Mock state lock is poisoned"))
+    }
+
+    fn save_states(&self, states: &MockStates) -> Result<(), std::io::Error> {
         if let Some(parent) = self.state_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = carina_core::utils::pretty_with_newline(states)?;
-        fs::write(&self.state_file, content)
+        let content = carina_core::utils::pretty_with_newline(&MockStateFileRef {
+            version: MOCK_STATE_VERSION,
+            states,
+        })?;
+        let sequence = MOCK_STATE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let file_name = self
+            .state_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("mock-state.json");
+        let temporary = self.state_file.with_file_name(format!(
+            ".{file_name}.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::write(&temporary, content)?;
+        if let Err(error) = fs::rename(&temporary, &self.state_file) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn resource_key(id: &ResourceId) -> Option<String> {
@@ -341,16 +462,24 @@ impl MockProvider {
 
     fn populate_test_resource_identifier_json(
         id: &ResourceId,
-        attrs: &mut HashMap<String, serde_json::Value>,
+        attrs: &mut HashMap<String, PersistedValue>,
     ) {
-        let name = attrs
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        if let Some(identifier) = Self::test_resource_identifier(id, name.as_deref()) {
+        let name =
             attrs
-                .entry("identifier".to_string())
-                .or_insert_with(|| serde_json::Value::String(identifier));
+                .get("name")
+                .and_then(PersistedValue::decode)
+                .and_then(|value| match value {
+                    Value::Concrete(ConcreteValue::String(value)) => Some(value.into_plaintext()),
+                    _ => None,
+                });
+        if let Some(identifier) = Self::test_resource_identifier(id, name.as_deref()) {
+            attrs.entry("identifier".to_string()).or_insert_with(|| {
+                PersistedValue::encode_provider_value(
+                    &Value::Concrete(ConcreteValue::String(identifier.into())),
+                    None,
+                )
+                .expect("mock identifier is persistable")
+            });
         }
     }
 
@@ -436,13 +565,14 @@ impl MockProvider {
             tokio::time::sleep(delay).await;
         }
 
-        let mut states = self.load_states();
+        let _state_guard = Self::lock_state_file()?;
+        let mut states = self.load_states_for_operation()?;
         let key = Self::resolved_resource_key(&id)?;
 
-        let mut attrs: HashMap<String, serde_json::Value> = resource
+        let mut attrs: HashMap<String, PersistedValue> = resource
             .attributes
             .iter()
-            .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
+            .map(|(k, v)| PersistedValue::encode_provider_value(v, None).map(|jv| (k.clone(), jv)))
             .collect::<Result<_, _>>()
             .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
         Self::populate_test_resource_identifier_json(&id, &mut attrs);
@@ -590,7 +720,8 @@ impl Provider for MockProvider {
                 tokio::time::sleep(delay).await;
             }
 
-            let states = self.load_states();
+            let _state_guard = Self::lock_state_file()?;
+            let states = self.load_states_for_operation()?;
             let Some(key) = Self::resource_key(&id) else {
                 return Ok(State::not_found(id));
             };
@@ -598,7 +729,7 @@ impl Provider for MockProvider {
             let state = if let Some(attrs) = states.get(&key) {
                 let attributes: HashMap<String, Value> = attrs
                     .iter()
-                    .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+                    .filter_map(|(k, v)| v.decode().map(|val| (k.clone(), val)))
                     .collect();
                 State::existing(id, attributes).with_identifier("mock-id")
             } else {
@@ -668,11 +799,14 @@ impl Provider for MockProvider {
                 }
             }
 
-            let mut states = self.load_states();
+            let _state_guard = Self::lock_state_file()?;
+            let mut states = self.load_states_for_operation()?;
             let partial_update = self.partial_update_config_for(&id);
-            let mut attrs: HashMap<String, serde_json::Value> = attributes
+            let mut attrs: HashMap<String, PersistedValue> = attributes
                 .iter()
-                .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
+                .map(|(k, v)| {
+                    PersistedValue::encode_provider_value(v, None).map(|jv| (k.clone(), jv))
+                })
                 .collect::<Result<_, _>>()
                 .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
             if let Some(config) = partial_update {
@@ -728,7 +862,8 @@ impl Provider for MockProvider {
                 })?;
             }
 
-            let mut states = self.load_states();
+            let _state_guard = Self::lock_state_file()?;
+            let mut states = self.load_states_for_operation()?;
 
             states.remove(&key);
             self.save_states(&states)
@@ -845,7 +980,10 @@ mod tests {
         };
         let mut states = HashMap::new();
         let mut entry = HashMap::new();
-        entry.insert("k".to_string(), serde_json::json!("v"));
+        entry.insert(
+            "k".to_string(),
+            serde_json::from_value(serde_json::json!("v")).unwrap(),
+        );
         states.insert("aws.s3.Bucket.b".to_string(), entry);
         provider.save_states(&states).unwrap();
         let bytes = fs::read(&state_file).unwrap();
@@ -855,6 +993,186 @@ mod tests {
             "MockProvider state file must end with a trailing newline; got {:?}",
             bytes.last().map(|b| *b as char),
         );
+    }
+
+    #[test]
+    fn unversioned_state_migrates_dollar_keys_and_legacy_enums() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        fs::write(
+            &state_file,
+            carina_core::utils::pretty_with_newline(&serde_json::json!({
+                "test.resource.legacy": {
+                    "payload": {"$x": "kept"},
+                    "mode": {
+                        "Enum": {
+                            "identity": {
+                                "provider": "mock",
+                                "segments": ["test", "resource"],
+                                "kind": "Mode"
+                            },
+                            "api_value": "active"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = MockProvider {
+            state_file,
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let state = runtime
+            .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
+            .expect("legacy mock state should load after migration");
+
+        let Some(Value::Concrete(ConcreteValue::Map(payload))) = state.attributes.get("payload")
+        else {
+            panic!("legacy payload should remain a user map")
+        };
+        assert_eq!(payload.get("$x"), Some(&string_value("kept")));
+        let Some(Value::Concrete(ConcreteValue::CanonicalEnum(mode))) =
+            state.attributes.get("mode")
+        else {
+            panic!("legacy enum should migrate to a canonical enum")
+        };
+        assert_eq!(mode.api_value(), "active");
+    }
+
+    #[test]
+    fn corrupt_or_invalid_state_file_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        let provider = MockProvider {
+            state_file: state_file.clone(),
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "broken", None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        for (content, terminal_detail) in [
+            ("{".to_string(), "EOF while parsing an object"),
+            (
+                serde_json::json!({
+                    "version": 1,
+                    "states": {
+                        "test.resource.broken": {
+                            "payload": {"$unknown": true}
+                        }
+                    }
+                })
+                .to_string(),
+                "mock state resource \"test.resource.broken\" attribute \"payload\" is not valid persisted JSON",
+            ),
+        ] {
+            fs::write(&state_file, content).unwrap();
+            let error = runtime
+                .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
+                .expect_err("corrupt mock state must not look like an empty store");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("Failed to load mock state")
+                    && rendered.contains(terminal_detail),
+                "unexpected error: {error}"
+            );
+            assert_eq!(rendered.matches(terminal_detail).count(), 1, "{rendered}");
+        }
+    }
+
+    #[test]
+    fn versioned_state_file_round_trips() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _op_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
+        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        let provider = MockProvider {
+            state_file: state_file.clone(),
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "versioned", None);
+        let payload = Value::Concrete(ConcreteValue::Map(
+            [("$x".to_string(), string_value("kept"))]
+                .into_iter()
+                .collect(),
+        ));
+        let resource = Resource::with_provider("mock", "test.resource", "versioned", None)
+            .with_attribute("payload", payload.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(provider.create_resource(id.clone(), resource))
+            .expect("create should save versioned mock state");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        assert_eq!(raw.get("version"), Some(&serde_json::json!(1)));
+        assert!(raw.get("states").is_some());
+
+        let state = runtime
+            .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
+            .expect("new mock state should reload");
+        assert_eq!(state.attributes.get("payload"), Some(&payload));
+    }
+
+    #[test]
+    fn canonical_enum_survives_create_then_read() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _op_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
+        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            state_file: tmp.path().join("mock-state.json"),
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "enum", None);
+        let canonical: carina_core::value::PersistedValue =
+            serde_json::from_value(serde_json::json!({
+                "$enum": {
+                    "identity": {
+                        "provider": "mock",
+                        "segments": ["test", "resource"],
+                        "kind": "Mode"
+                    },
+                    "api_value": "active"
+                }
+            }))
+            .expect("canonical enum fixture is valid");
+        let canonical = canonical
+            .decode()
+            .expect("canonical enum fixture is non-null");
+        let resource = Resource::with_provider("mock", "test.resource", "enum", None)
+            .with_attribute("mode", canonical.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let read = runtime.block_on(async {
+            provider
+                .create_resource(id.clone(), resource)
+                .await
+                .expect("create succeeds");
+            provider
+                .read(&id, Some("mock-id"), ReadRequest)
+                .await
+                .expect("read succeeds")
+        });
+
+        assert_eq!(read.attributes.get("mode"), Some(&canonical));
     }
 
     #[test]

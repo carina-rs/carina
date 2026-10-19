@@ -40,9 +40,7 @@ impl DestroyCancellationFixture {
              provider mock {{}}\n"
         );
         let mut state = StateFile::new();
-        state
-            .exports
-            .insert("surviving_export".to_string(), serde_json::json!("value"));
+        state.insert_export_json_for_test("surviving_export", serde_json::json!("value"));
 
         for name in names.iter().rev() {
             crn.push_str(&format!(
@@ -75,9 +73,7 @@ impl DestroyCancellationFixture {
             "backend local {{ path = \"{state_path}\" }}\nprovider mock {{}}\n"
         ));
         let mut state = StateFile::new();
-        state
-            .exports
-            .insert("surviving_export".to_string(), serde_json::json!("value"));
+        state.insert_export_json_for_test("surviving_export", serde_json::json!("value"));
 
         for name in names {
             let identity = carina_core::resource::ResourceIdentity::try_from(name.to_owned())
