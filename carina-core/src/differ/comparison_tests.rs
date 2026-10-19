@@ -7,20 +7,11 @@ use crate::schema::TypeIdentity;
 use crate::value::value_to_json;
 use indexmap::IndexMap;
 
-fn persisted_secret(marker: &str) -> Value {
-    if let Some(hash) = crate::value::persisted_secret_hash(marker) {
-        return serde_json::from_value(serde_json::json!({
-            "RedactedSecret": { "hash": hash }
-        }))
-        .expect("deserialize persisted secret");
-    }
-    crate::provider::persisted_attributes_from_test_state_row(
-        &ResourceId::with_provider_identity("test", "service.Widget", "widget", None),
-        HashMap::from([("config".to_string(), serde_json::json!(marker))]),
-    )
-    .expect("state row decode")
-    .get("config")
-    .expect("test fixture must be a complete persisted secret marker")
+fn persisted_secret(encoded: &serde_json::Value) -> Value {
+    crate::value::PersistedValue::from_serialized_json(encoded.clone())
+        .expect("valid persisted secret")
+        .decode()
+        .expect("persisted secret decodes to a typed value")
 }
 
 #[test]
@@ -826,18 +817,16 @@ fn secret_unchanged_same_hash() {
     ))));
     // Compute the hash that would be stored in state
     let hash_json = value_to_json(&secret_value).unwrap();
-    let hash_str = hash_json.as_str().unwrap().to_string();
-
-    // State has the hash string, desired has the Secret wrapper
+    // State has a typed hash, desired has the Secret wrapper.
     assert!(type_aware_equal(
         &secret_value,
-        &persisted_secret(&hash_str),
+        &persisted_secret(&hash_json),
         None,
         crate::schema::empty_defs_for_schema_walks(),
     ));
     // Reversed order should also work
     assert!(type_aware_equal(
-        &persisted_secret(&hash_str),
+        &persisted_secret(&hash_json),
         &secret_value,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -856,12 +845,10 @@ fn secret_changed_different_hash() {
     ))));
     // Compute the hash for the OLD secret (stored in state)
     let old_hash_json = value_to_json(&old_secret).unwrap();
-    let old_hash_str = old_hash_json.as_str().unwrap().to_string();
-
     // New desired vs old state hash should be different
     assert!(!type_aware_equal(
         &new_secret,
-        &persisted_secret(&old_hash_str),
+        &persisted_secret(&old_hash_json),
         None,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -875,10 +862,8 @@ fn secret_in_find_changed_attributes_no_change() {
         ConcreteValue::String("my-password".into()),
     ))));
     let hash_json = value_to_json(&secret_value).unwrap();
-    let hash_str = hash_json.as_str().unwrap().to_string();
-
     let desired = HashMap::from([("password".to_string(), secret_value)]);
-    let current = HashMap::from([("password".to_string(), persisted_secret(&hash_str))]);
+    let current = HashMap::from([("password".to_string(), persisted_secret(&hash_json))]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
@@ -919,10 +904,8 @@ fn secret_in_find_changed_attributes_changed() {
         ConcreteValue::String("new-password".into()),
     ))));
     let old_hash_json = value_to_json(&old_secret).unwrap();
-    let old_hash_str = old_hash_json.as_str().unwrap().to_string();
-
     let desired = HashMap::from([("password".to_string(), new_secret)]);
-    let current = HashMap::from([("password".to_string(), persisted_secret(&old_hash_str))]);
+    let current = HashMap::from([("password".to_string(), persisted_secret(&old_hash_json))]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
@@ -993,13 +976,12 @@ fn secret_in_map_no_change_when_hash_matches() {
 
     // State: tags map with the secret hash (as stored by from_provider_state)
     let hash_json = value_to_json(&secret_value).unwrap();
-    let hash_str = hash_json.as_str().unwrap().to_string();
     let state_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
             Value::Concrete(ConcreteValue::String("test".into())),
         ),
-        ("SecretTag".to_string(), persisted_secret(&hash_str)),
+        ("SecretTag".to_string(), persisted_secret(&hash_json)),
     ])));
 
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
@@ -1019,10 +1001,8 @@ fn secret_with_embedded_salt_no_change_when_hash_matches() {
         ConcreteValue::String("my-password".into()),
     ))));
     let hash_json = value_to_json(&secret_value).unwrap();
-    let hash_str = hash_json.as_str().unwrap().to_string();
-
     let desired = HashMap::from([("master_password".to_string(), secret_value)]);
-    let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_str))]);
+    let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_json))]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
@@ -1041,10 +1021,8 @@ fn secret_with_embedded_salt_detects_change() {
         ConcreteValue::String("new-password".into()),
     ))));
     let hash_json = value_to_json(&old_secret).unwrap();
-    let hash_str = hash_json.as_str().unwrap().to_string();
-
     let desired = HashMap::from([("master_password".to_string(), new_secret)]);
-    let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_str))]);
+    let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_json))]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None);
     assert!(
@@ -1069,10 +1047,7 @@ fn equal_plaintexts_get_distinct_digests_that_both_verify() {
 
     let desired = HashMap::from([("master_password".to_string(), secret)]);
     for hash in [hash1, hash2] {
-        let current = HashMap::from([(
-            "master_password".to_string(),
-            persisted_secret(hash.as_str().unwrap()),
-        )]);
+        let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash))]);
         assert!(
             find_changed_attributes(&desired, &current, None, None, None).is_empty(),
             "each independently salted digest must verify the plaintext",
@@ -1086,10 +1061,7 @@ fn provider_null_fields_do_not_create_a_secret_diff() {
     let provider_value = crate::value::PersistedValue::from_serialized_json(provider_json).unwrap();
     let marker = crate::provider::hash_provider_json_as_secret(&provider_value, None)
         .expect("hash provider secret");
-    let current = HashMap::from([(
-        "config".to_string(),
-        persisted_secret(marker.as_json().as_str().expect("secret marker")),
-    )]);
+    let current = HashMap::from([("config".to_string(), persisted_secret(marker.as_json()))]);
     let desired = HashMap::from([(
         "config".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -1631,11 +1603,9 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
     );
     desired.id.provider = "test".to_string();
 
-    let secret_hash = persisted_secret(&format!(
-        "{}{}",
-        crate::value::LEGACY_SECRET_PREFIX,
-        "deadbeef".repeat(8)
-    ));
+    let secret_hash = persisted_secret(&serde_json::json!({
+        "$secret": format!("argon2-legacy:73616c74:{}", "deadbeef".repeat(8)),
+    }));
     let persisted_config = || {
         IndexMap::from([
             (

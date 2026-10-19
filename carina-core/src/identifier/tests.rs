@@ -6,6 +6,19 @@ use crate::schema::{
 };
 use indexmap::IndexMap;
 
+#[test]
+fn redacted_secret_identifier_material_bytes_are_legacy_compatible() {
+    let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
+    let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
+        .expect("valid explicit legacy digest");
+    let value = Value::Deferred(DeferredValue::RedactedSecret { hash });
+
+    assert_eq!(
+        deterministic_value_string(&value).as_bytes(),
+        format!("RedactedSecret(_secret:{digest})").as_bytes(),
+    );
+}
+
 fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     registry: &SchemaRegistry,

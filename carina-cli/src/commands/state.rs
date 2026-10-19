@@ -2100,15 +2100,32 @@ mod tests {
         PendingModuleConstraint, Resource, Signature,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    use carina_core::value::{LEGACY_SECRET_PREFIX, SECRET_PREFIX};
     use carina_state::{DeposedInstance, DeposedKey};
     use indexmap::IndexMap;
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
+    const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
+
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn structural_legacy_secret(hash_hex: &str) -> serde_json::Value {
+        json!({
+            carina_core::value::PERSISTED_SECRET_KEY:
+                format!("argon2-legacy:73616c74:{hash_hex}"),
+        })
+    }
+
+    fn structural_secret_digest(value: &serde_json::Value) -> &str {
+        let object = value.as_object().expect("secret is a structural object");
+        assert_eq!(object.len(), 1);
+        object
+            .get(carina_core::value::PERSISTED_SECRET_KEY)
+            .and_then(serde_json::Value::as_str)
+            .expect("secret tag carries a digest")
     }
 
     struct ModuleConstraintRefreshBackend {
@@ -3822,11 +3839,9 @@ mod tests {
             .persisted_attributes()
             .clone();
         let encoded = encoded_persisted_attributes(&persisted);
-        let stored = encoded
-            .get("password")
-            .and_then(|value| value.as_str())
-            .expect("password should be stored as a string hash");
-        assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+        let stored =
+            structural_secret_digest(encoded.get("password").expect("password should be stored"));
+        assert!(stored.starts_with("$argon2id$"), "got {stored}");
         assert!(!stored.contains("plain-secret"));
     }
 
@@ -3895,18 +3910,16 @@ mod tests {
         let mut state = StateFile::new();
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
-        row.deposed
-            .push(DeposedInstance::from_persisted_json_for_resource(
-                &id,
-                deposed_key("secret-key"),
-                "db-old".to_string(),
-                None,
-                HashMap::from([(
-                    "password".to_string(),
-                    json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-                )]),
-                BTreeSet::new(),
-            ));
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            deposed_key("secret-key"),
+            "db-old".to_string(),
+            None,
+            HashMap::from([(
+                "password".to_string(),
+                structural_legacy_secret(&"ab".repeat(32)),
+            )]),
+            BTreeSet::new(),
+        ));
         state
             .upsert_resource(row)
             .expect("test state setup must be valid");
@@ -3937,11 +3950,12 @@ mod tests {
             .deposed[0]
             .persisted_attributes();
         let encoded = encoded_persisted_attributes(persisted);
-        let stored = encoded
-            .get("password")
-            .and_then(|value| value.as_str())
-            .expect("password should remain a stored secret hash");
-        assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+        let stored = structural_secret_digest(
+            encoded
+                .get("password")
+                .expect("password should remain a stored secret hash"),
+        );
+        assert!(stored.starts_with("$argon2id$"), "got {stored}");
         assert!(!stored.contains("plain-secret"));
         assert_eq!(
             summary,
@@ -3960,18 +3974,16 @@ mod tests {
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
+            "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
         });
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
-        row.deposed
-            .push(DeposedInstance::from_persisted_json_for_resource(
-                &id,
-                deposed_key("nested-secret-key"),
-                "vpc-old".to_string(),
-                None,
-                HashMap::from([("tags".to_string(), previous_tags.clone())]),
-                BTreeSet::new(),
-            ));
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            deposed_key("nested-secret-key"),
+            "vpc-old".to_string(),
+            None,
+            HashMap::from([("tags".to_string(), previous_tags.clone())]),
+            BTreeSet::new(),
+        ));
         state
             .upsert_resource(row)
             .expect("test state setup must be valid");
@@ -4010,10 +4022,8 @@ mod tests {
         let encoded = encoded_persisted_attributes(persisted);
         let stored_tags = encoded.get("tags").expect("tags should be stored");
         assert_eq!(stored_tags["Name"], json!("new-name"));
-        let secret = stored_tags["SecretTag"]
-            .as_str()
-            .expect("secret tag should stay a string");
-        assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+        let secret = structural_secret_digest(&stored_tags["SecretTag"]);
+        assert!(secret.starts_with("$argon2id$"), "got {secret}");
         assert!(!secret.contains("plain-secret"));
 
         refresh_deposed_generations_until_cancelled(
@@ -4173,10 +4183,7 @@ mod tests {
             .upsert_resource(
                 ResourceState::new("db.Instance", "main", "awscc")
                     .with_identifier("db-current")
-                    .with_attribute(
-                        "password",
-                        json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-                    ),
+                    .with_attribute("password", structural_legacy_secret(&"ab".repeat(32))),
             )
             .expect("test state setup must be valid");
         let fresh = State::existing(
@@ -4202,11 +4209,12 @@ mod tests {
             .unwrap()
             .persisted_attributes();
         let encoded = encoded_persisted_attributes(persisted);
-        let stored = encoded
-            .get("password")
-            .and_then(|value| value.as_str())
-            .expect("password should remain a stored secret hash");
-        assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+        let stored = structural_secret_digest(
+            encoded
+                .get("password")
+                .expect("password should remain a stored secret hash"),
+        );
+        assert!(stored.starts_with("$argon2id$"), "got {stored}");
         assert!(!stored.contains("plain-secret"));
         assert_eq!(counts.updated, 1);
         assert_eq!(counts.unchanged, 0);
@@ -4217,7 +4225,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
-            "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
+            "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
         });
         let mut state = StateFile::new();
         state
@@ -4258,10 +4266,8 @@ mod tests {
         let encoded = encoded_persisted_attributes(persisted);
         let stored_tags = encoded.get("tags").expect("tags should be stored");
         assert_eq!(stored_tags["Name"], json!("new-name"));
-        let secret = stored_tags["SecretTag"]
-            .as_str()
-            .expect("secret tag should stay a string");
-        assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+        let secret = structural_secret_digest(&stored_tags["SecretTag"]);
+        assert!(secret.starts_with("$argon2id$"), "got {secret}");
         assert!(!secret.contains("plain-secret"));
         assert_eq!(counts.updated, 1);
         assert_eq!(counts.unchanged, 0);
@@ -4334,7 +4340,7 @@ mod tests {
     }
 
     #[test]
-    fn current_refresh_locates_plain_raw_legacy_marker_in_write_only_attribute() {
+    fn current_refresh_keeps_plain_raw_legacy_marker_in_write_only_attribute() {
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
@@ -4353,7 +4359,7 @@ mod tests {
                 .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
         );
 
-        let error = diff_display_update_resource(
+        diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
             &fresh,
             &mut state,
@@ -4362,21 +4368,15 @@ mod tests {
             "",
             &mut StateRefreshCounts::default(),
         )
-        .expect_err("marker-shaped write-only plaintext must fail closed without panicking");
+        .expect("marker-shaped write-only plaintext must remain an ordinary string");
 
-        let AppError::ResourceStateEncoding(located) = &error else {
-            panic!("expected typed resource-state encoding error, got {error:?}")
-        };
-        assert_eq!(located.resource(), &id);
-        let carina_state::ResourceStateEncodingError::PersistedAttributes(attribute_error) =
-            located.encoding_error()
-        else {
-            panic!("expected persisted-attribute validation error")
-        };
-        assert_eq!(attribute_error.attribute_key(), "password");
-        let rendered = error.to_string();
-        assert!(rendered.contains(&id.to_string()), "{rendered}");
-        assert!(rendered.contains("password"), "{rendered}");
+        let row = state
+            .find_resource("awscc", "db.Instance", "main")
+            .expect("refreshed row must remain");
+        assert_eq!(
+            row.persisted_attributes().get("password"),
+            carina_core::value::json_to_dsl_value(&json!(marker))
+        );
     }
 
     #[tokio::test]

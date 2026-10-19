@@ -126,9 +126,9 @@ pub enum SerializationError {
     /// persist plaintext or a placeholder.
     #[error("cannot serialize saved-plan field {location}: secret values are not allowed")]
     SavedPlanFieldSecretNotAllowed { location: String },
-    /// A saved-plan placeholder reached a runtime serialization boundary
-    /// without first being rehydrated and verified.
-    #[error("cannot serialize at {context}: saved-plan secret was not rehydrated")]
+    /// A typed redacted-secret placeholder reached a serialization boundary
+    /// that accepts only ordinary or plaintext values.
+    #[error("cannot serialize at {context}: redacted secret is not allowed at this boundary")]
     RedactedSecretNotAllowed { context: SerializationContext },
 }
 
@@ -260,11 +260,7 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
     }
 }
 
-/// Secret value prefix used in state serialization.
-pub const SECRET_PREFIX: &str = RedactedSecretHash::V2_MARKER_PREFIX;
-pub const LEGACY_SECRET_PREFIX: &str = RedactedSecretHash::LEGACY_MARKER_PREFIX;
-pub const EXPLICIT_LEGACY_SECRET_PREFIX: &str = RedactedSecretHash::EXPLICIT_LEGACY_MARKER_PREFIX;
-
+pub use carina_provider_protocol::PERSISTED_SECRET_KEY;
 const PERSISTED_ENUM_KEY: &str = "$enum";
 const LEGACY_ENUM_KEY: &str = "Enum";
 
@@ -297,6 +293,8 @@ pub enum PersistedValueDecodeError {
     InvalidHostObject { keys: Vec<String> },
     #[error("malformed {PERSISTED_ENUM_KEY} persisted enum payload")]
     MalformedEnum,
+    #[error("malformed {PERSISTED_SECRET_KEY} persisted secret payload")]
+    MalformedSecret,
 }
 
 /// A complete resource-state value tree in Carina's persisted JSON encoding.
@@ -368,7 +366,7 @@ impl PersistedValue {
     /// Decode through the persisted codec. Validation at construction makes
     /// this infallible; JSON null continues to mean an absent DSL value.
     pub fn decode(&self) -> Option<Value> {
-        persisted_json_to_dsl_value(&self.encoded, SecretMarkerDecoding::Lift)
+        persisted_json_to_dsl_value(&self.encoded, PersistedPurpose::State)
             .expect("PersistedValue validates the reserved namespace at construction")
     }
 
@@ -387,11 +385,11 @@ impl PersistedValue {
 
     /// Decode host tags and key escaping back into ordinary JSON.
     ///
-    /// This is intended for JSON/raw display surfaces. Persisted secret
-    /// markers remain opaque strings, while canonical enums become their
-    /// provider API value and user `$` keys regain their original spelling.
+    /// This is intended for JSON/raw display surfaces. Persisted secrets
+    /// become the fixed string `(secret)`, canonical enums become their
+    /// provider API value, and user `$` keys regain their original spelling.
     pub fn decoded_json(&self) -> serde_json::Value {
-        decode_persisted_json(&self.encoded, SecretMarkerDecoding::Lift)
+        decode_persisted_json(&self.encoded, PersistedPurpose::State)
             .expect("PersistedValue validates the reserved namespace at construction")
             .into_ordinary_json()
     }
@@ -405,18 +403,8 @@ impl PersistedValue {
     pub(crate) fn from_serialized_json(
         encoded: serde_json::Value,
     ) -> Result<Self, PersistedValueDecodeError> {
-        decode_persisted_json(&encoded, SecretMarkerDecoding::Lift)?;
+        decode_persisted_json(&encoded, PersistedPurpose::State)?;
         Ok(Self { encoded })
-    }
-
-    /// Construct the one persisted scalar accepted from the legacy WASM
-    /// state-normalization boundary without exposing a general raw-JSON
-    /// constructor.
-    pub fn from_persisted_secret_marker(marker: &str) -> Option<Self> {
-        persisted_secret_hash(marker)?;
-        Some(Self {
-            encoded: serde_json::Value::String(marker.to_string()),
-        })
     }
 
     pub(crate) fn saved_plan_secret_inventory(value: &Value) -> Option<Self> {
@@ -439,9 +427,9 @@ impl<'de> serde::Deserialize<'de> for PersistedValue {
 
 /// A complete export value tree in Carina's persisted JSON encoding.
 ///
-/// Export strings never acquire resource-state secret-marker semantics. This
-/// distinct container type makes that rule structural for remote-state reads
-/// and export display instead of relying on each caller to choose a mode.
+/// Export strings never acquire secret semantics from their contents. This
+/// distinct container type also rejects structural secret tags for remote-state
+/// reads and export display.
 #[cfg_attr(
     not(feature = "test-utils"),
     doc = r#"
@@ -473,7 +461,7 @@ impl PersistedExportValue {
     }
 
     pub fn decode(&self) -> Option<Value> {
-        persisted_json_to_dsl_value(&self.encoded, SecretMarkerDecoding::Literal)
+        persisted_json_to_dsl_value(&self.encoded, PersistedPurpose::Export)
             .expect("PersistedExportValue validates the reserved namespace at construction")
     }
 
@@ -489,7 +477,7 @@ impl PersistedExportValue {
     }
 
     pub fn decoded_json(&self) -> serde_json::Value {
-        decode_persisted_json(&self.encoded, SecretMarkerDecoding::Literal)
+        decode_persisted_json(&self.encoded, PersistedPurpose::Export)
             .expect("PersistedExportValue validates the reserved namespace at construction")
             .into_ordinary_json()
     }
@@ -501,7 +489,7 @@ impl PersistedExportValue {
     }
 
     fn from_serialized_json(encoded: serde_json::Value) -> Result<Self, PersistedValueDecodeError> {
-        decode_persisted_json(&encoded, SecretMarkerDecoding::Literal)?;
+        decode_persisted_json(&encoded, PersistedPurpose::Export)?;
         Ok(Self { encoded })
     }
 }
@@ -561,24 +549,27 @@ impl<'a> PersistedView<'a> {
             .map(|values| PersistedListView { values })
     }
 
-    pub(crate) fn as_str(self) -> Option<&'a str> {
-        self.encoded.as_str()
+    pub(crate) fn redacted_secret_hash(self) -> Option<RedactedSecretHash> {
+        let values = self.encoded.as_object()?;
+        if values.len() != 1 {
+            return None;
+        }
+        values
+            .get(PERSISTED_SECRET_KEY)?
+            .as_str()
+            .and_then(RedactedSecretHash::from_encoded_digest)
     }
 
-    pub(crate) fn secret_hash(self) -> Option<RedactedSecretHash> {
-        self.as_str().and_then(persisted_secret_hash)
-    }
-
-    pub(crate) fn is_secret_marker(self) -> bool {
-        self.secret_hash().is_some()
+    pub(crate) fn is_redacted_secret(self) -> bool {
+        self.redacted_secret_hash().is_some()
     }
 
     pub(crate) fn is_null(self) -> bool {
         self.encoded.is_null()
     }
 
-    pub(crate) fn decode_marker_strings_literally(self) -> Option<Value> {
-        persisted_json_to_dsl_value(self.encoded, SecretMarkerDecoding::Literal)
+    pub(crate) fn decode_value(self) -> Option<Value> {
+        persisted_json_to_dsl_value(self.encoded, PersistedPurpose::State)
             .expect("PersistedView is a subtree of a validated persisted value")
     }
 
@@ -785,17 +776,16 @@ fn value_to_json_inner(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             if persist_secrets {
                 let material = canonical_secret_hash_material(inner)?;
-                let previous = previous.and_then(PersistedView::secret_hash);
-                Ok(serde_json::Value::String(
-                    RedactedSecretHash::reuse_or_generate(&material, previous.as_ref())
-                        .persisted_marker(),
+                let previous = previous.and_then(PersistedView::redacted_secret_hash);
+                Ok(persisted_secret_json(
+                    &RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()),
                 ))
             } else {
                 value_to_json_inner(inner, None, false, encoding, allow_redacted_secrets)
             }
         }
         Value::Deferred(DeferredValue::RedactedSecret { hash }) if allow_redacted_secrets => {
-            Ok(serde_json::Value::String(persisted_secret_marker(hash)))
+            Ok(persisted_secret_json(hash))
         }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
             Err(SerializationError::RedactedSecretNotAllowed { context: ctx })
@@ -818,10 +808,17 @@ pub(crate) fn persist_secret_json(
     previous: Option<PersistedView<'_>>,
 ) -> Result<serde_json::Value, SerializationError> {
     let material = canonical_secret_hash_material(plaintext)?;
-    let previous = previous.and_then(PersistedView::secret_hash);
-    Ok(serde_json::Value::String(
-        RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()).persisted_marker(),
+    let previous = previous.and_then(PersistedView::redacted_secret_hash);
+    Ok(persisted_secret_json(
+        &RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()),
     ))
+}
+
+fn persisted_secret_json(hash: &RedactedSecretHash) -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::from_iter([(
+        PERSISTED_SECRET_KEY.to_string(),
+        serde_json::Value::String(hash.encoded_digest()),
+    )]))
 }
 
 /// Extract only redacted-secret leaves from a saved-plan value in persisted
@@ -830,7 +827,7 @@ pub(crate) fn persist_secret_json(
 fn saved_plan_secret_hashes_json(value: &Value) -> Option<serde_json::Value> {
     match value {
         Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
-            Some(serde_json::Value::String(persisted_secret_marker(hash)))
+            Some(persisted_secret_json(hash))
         }
         Value::Concrete(ConcreteValue::Map(values)) => {
             let values: serde_json::Map<_, _> = values
@@ -865,9 +862,9 @@ fn saved_plan_secret_hashes_json(value: &Value) -> Option<serde_json::Value> {
 /// are recursively unwrapped. Deferred values retain their stable template
 /// representation for saved-plan verification.
 pub(crate) fn canonical_secret_hash_material(value: &Value) -> Result<Vec<u8>, SerializationError> {
-    // Secret marker material predates the persisted `$` namespace. Keep its
-    // byte representation stable: issue #3896 changes persisted value trees,
-    // not secret-marker derivation (#3897 tracks marker concerns separately).
+    // Secret hash material predates the structural persisted encoding. Keep
+    // these bytes stable even though state now carries digests in `$secret`
+    // tags; identifiers and saved hashes depend on this representation.
     let canonical = match value_to_json_inner(
         value,
         None,
@@ -962,15 +959,14 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
     json_to_dsl_value_inner(json)
 }
 
-/// Convert persisted state JSON to a DSL value, lifting self-contained PHC and
-/// explicit-salt legacy markers into their opaque typed representation.
-/// Raw pre-v12 legacy markers are accepted only by the state-file loader,
-/// which upgrades them before this conversion runs.
+/// Convert persisted state JSON to a DSL value, lifting structural `$secret`
+/// tags into their opaque typed representation. Versioned state migrations
+/// rewrite legacy string encodings before this conversion runs.
 fn persisted_json_to_dsl_value(
     json: &serde_json::Value,
-    secret_markers: SecretMarkerDecoding,
+    purpose: PersistedPurpose,
 ) -> Result<Option<Value>, PersistedValueDecodeError> {
-    decode_persisted_json(json, secret_markers).map(DecodedPersistedJson::into_dsl_value)
+    decode_persisted_json(json, purpose).map(DecodedPersistedJson::into_dsl_value)
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1004,9 +1000,9 @@ fn json_to_dsl_value_inner(json: &serde_json::Value) -> Option<Value> {
 }
 
 #[derive(Clone, Copy)]
-enum SecretMarkerDecoding {
-    Lift,
-    Literal,
+enum PersistedPurpose {
+    State,
+    Export,
 }
 
 enum DecodedPersistedJson {
@@ -1055,7 +1051,7 @@ impl DecodedPersistedJson {
             Self::Number(value) => serde_json::Value::Number(value),
             Self::String(value) => serde_json::Value::String(value),
             Self::Enum(value) => serde_json::Value::String(value.api_value().to_string()),
-            Self::Secret(hash) => serde_json::Value::String(persisted_secret_marker(&hash)),
+            Self::Secret(_) => serde_json::Value::String("(secret)".to_string()),
             Self::Array(values) => {
                 serde_json::Value::Array(values.into_iter().map(Self::into_ordinary_json).collect())
             }
@@ -1071,22 +1067,16 @@ impl DecodedPersistedJson {
 
 fn decode_persisted_json(
     json: &serde_json::Value,
-    secret_markers: SecretMarkerDecoding,
+    purpose: PersistedPurpose,
 ) -> Result<DecodedPersistedJson, PersistedValueDecodeError> {
     match json {
         serde_json::Value::Null => Ok(DecodedPersistedJson::Null),
         serde_json::Value::Bool(value) => Ok(DecodedPersistedJson::Bool(*value)),
         serde_json::Value::Number(value) => Ok(DecodedPersistedJson::Number(value.clone())),
-        serde_json::Value::String(value) => match secret_markers {
-            SecretMarkerDecoding::Lift => match persisted_secret_hash(value) {
-                Some(hash) => Ok(DecodedPersistedJson::Secret(hash)),
-                None => Ok(DecodedPersistedJson::String(value.clone())),
-            },
-            SecretMarkerDecoding::Literal => Ok(DecodedPersistedJson::String(value.clone())),
-        },
+        serde_json::Value::String(value) => Ok(DecodedPersistedJson::String(value.clone())),
         serde_json::Value::Array(values) => values
             .iter()
-            .map(|value| decode_persisted_json(value, secret_markers))
+            .map(|value| decode_persisted_json(value, purpose))
             .collect::<Result<Vec<_>, _>>()
             .map(DecodedPersistedJson::Array),
         serde_json::Value::Object(values) => {
@@ -1096,6 +1086,20 @@ fn decode_persisted_json(
                 .cloned()
                 .collect();
             if !host_keys.is_empty() {
+                if values.len() == 1 && host_keys.as_slice() == [PERSISTED_SECRET_KEY] {
+                    if matches!(purpose, PersistedPurpose::Export) {
+                        return Err(PersistedValueDecodeError::InvalidHostObject {
+                            keys: values.keys().cloned().collect(),
+                        });
+                    }
+                    let digest = values
+                        .get(PERSISTED_SECRET_KEY)
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(PersistedValueDecodeError::MalformedSecret)?;
+                    let hash = RedactedSecretHash::from_encoded_digest(digest)
+                        .ok_or(PersistedValueDecodeError::MalformedSecret)?;
+                    return Ok(DecodedPersistedJson::Secret(hash));
+                }
                 if values.len() == 1 && host_keys.as_slice() == [PERSISTED_ENUM_KEY] {
                     let canonical = json_to_canonical_enum(values)
                         .ok_or(PersistedValueDecodeError::MalformedEnum)?;
@@ -1110,7 +1114,7 @@ fn decode_persisted_json(
                 .iter()
                 .map(|(key, value)| {
                     let key = key.strip_prefix('$').unwrap_or(key).to_string();
-                    decode_persisted_json(value, secret_markers).map(|value| (key, value))
+                    decode_persisted_json(value, purpose).map(|value| (key, value))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()
                 .map(DecodedPersistedJson::Object)
@@ -1313,7 +1317,7 @@ pub fn render_export_json_value(value: &PersistedExportValue) -> RenderedValue {
 
 fn render_persisted_json(value: PersistedView<'_>) -> RenderedValue {
     let mut sink = SpanSink::default();
-    let value = decode_persisted_json(value.encoded, SecretMarkerDecoding::Literal)
+    let value = decode_persisted_json(value.encoded, PersistedPurpose::Export)
         .expect("persisted value types validate the reserved namespace at construction");
     format_decoded_persisted_json_into(&value, &mut sink).expect("SpanSink writes are infallible");
     sink.rendered
@@ -1930,14 +1934,15 @@ fn merge_secrets_into_provider_json_inner(
             if !secret_value_requires_provider_material(inner) {
                 return persist_secret_json(inner, previous);
             }
-            if provider.is_secret_marker() {
+            if provider.is_redacted_secret() {
                 return Ok(provider.to_owned_json());
             }
-            let provider_value = provider.decode_marker_strings_literally().ok_or(
-                SerializationError::SecretNotAllowed {
-                    context: SerializationContext::StateWriteback,
-                },
-            )?;
+            let provider_value =
+                provider
+                    .decode_value()
+                    .ok_or(SerializationError::SecretNotAllowed {
+                        context: SerializationContext::StateWriteback,
+                    })?;
             persist_secret_json(&provider_value, previous)
         }
         Value::Concrete(ConcreteValue::Map(desired_map)) => {
@@ -2474,8 +2479,8 @@ impl<'a> SecretRedactionGuide<'a> {
                     _ => None,
                 }
             }
-            Self::Persisted(value) if value.is_secret_marker() => Some(plaintext),
-            Self::PersistedDesired(value) if value.is_secret_marker() => match source {
+            Self::Persisted(value) if value.is_redacted_secret() => Some(plaintext),
+            Self::PersistedDesired(value) if value.is_redacted_secret() => match source {
                 Value::Deferred(
                     DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. },
                 ) => Some(plaintext),
@@ -2491,7 +2496,7 @@ impl<'a> SecretRedactionGuide<'a> {
             | Self::RedactedDesired(Value::Deferred(DeferredValue::RedactedSecret { hash })) => {
                 Some(hash.clone())
             }
-            Self::Persisted(marker) | Self::PersistedDesired(marker) => marker.secret_hash(),
+            Self::Persisted(value) | Self::PersistedDesired(value) => value.redacted_secret_hash(),
             _ => None,
         }
     }
@@ -2537,22 +2542,6 @@ impl<'a> SecretRedactionGuide<'a> {
             _ => None,
         }
     }
-}
-
-/// Parse the typed digest carried by a complete persisted secret marker.
-pub fn persisted_secret_hash(value: &str) -> Option<RedactedSecretHash> {
-    RedactedSecretHash::parse_persisted_marker(value)
-}
-
-/// Whether `value` is a complete persisted secret marker.
-pub fn is_persisted_secret(value: &str) -> bool {
-    RedactedSecretHash::is_persisted_marker(value)
-}
-
-/// Reconstruct the byte-identical state/provider wire marker for an opaque
-/// persisted hash.
-pub fn persisted_secret_marker(hash: &RedactedSecretHash) -> String {
-    hash.persisted_marker()
 }
 
 fn redact_with_guide(
@@ -2645,7 +2634,7 @@ pub fn redact_plaintext_using_secret_shape(
 /// Redact provider plaintext at paths marked by secret hashes in persisted
 /// state. Fresh provider plaintext is hashed with a new embedded salt.
 /// State values themselves are lifted into typed placeholders when decoded,
-/// so this function never infers marker semantics from its source value.
+/// so this function never classifies source strings as secrets by content.
 fn redact_plaintext_using_persisted_state(
     plaintext: &Value,
     persisted: PersistedView<'_>,
@@ -2709,7 +2698,7 @@ fn mask_plaintext_using_persisted_json_shape(
     plaintext: &Value,
     persisted: PersistedView<'_>,
 ) -> Value {
-    if persisted.is_secret_marker() {
+    if persisted.is_redacted_secret() {
         return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone())));
     }
     match plaintext {
@@ -5760,6 +5749,192 @@ mod tests {
         })
     }
 
+    fn valid_marker_shaped_string(material: &str) -> String {
+        format!(
+            "_secret:{}",
+            RedactedSecretHash::generate(material.as_bytes()).encoded_digest()
+        )
+    }
+
+    fn redacted_hash_from_persisted_json(value: &serde_json::Value) -> RedactedSecretHash {
+        value
+            .get(PERSISTED_SECRET_KEY)
+            .and_then(serde_json::Value::as_str)
+            .and_then(RedactedSecretHash::from_encoded_digest)
+            .expect("structural persisted secret with a valid digest")
+    }
+
+    #[test]
+    fn canonical_secret_hash_material_bytes_are_legacy_compatible() {
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "$secret".to_string(),
+                Value::Concrete(ConcreteValue::String("literal".into())),
+            ),
+            (
+                "list".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::Int(1)),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                ])),
+            ),
+        ])));
+
+        assert_eq!(
+            canonical_secret_hash_material(&value).expect("canonical material"),
+            br#"{"$secret":"literal","list":[1,true]}"#,
+        );
+    }
+
+    #[test]
+    fn persisted_codec_never_reclassifies_marker_shaped_strings() {
+        let marker = valid_marker_shaped_string("plain-marker-collision");
+        let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
+        let persisted = PersistedValue::encode_provider_value(&plain, None)
+            .expect("plain marker-shaped string is persistable");
+
+        assert_eq!(persisted.as_json(), &serde_json::json!(marker));
+        assert_eq!(persisted.decode(), Some(plain));
+    }
+
+    #[test]
+    fn persisted_codec_keeps_nested_marker_shaped_strings_plain() {
+        let marker = valid_marker_shaped_string("nested-marker-collision");
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "list".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String(marker.clone().into()),
+                )])),
+            ),
+            (
+                "map".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "value".to_string(),
+                    Value::Concrete(ConcreteValue::String(marker.clone().into())),
+                )]))),
+            ),
+            (
+                "string_list".to_string(),
+                Value::Concrete(ConcreteValue::StringList(vec![marker.clone().into()])),
+            ),
+        ])));
+        let persisted = PersistedValue::encode_provider_value(&value, None)
+            .expect("nested marker-shaped strings are persistable");
+        let decoded = persisted.decode().expect("persisted map is non-null");
+        let Value::Concrete(ConcreteValue::Map(decoded)) = decoded else {
+            panic!("persisted value must decode as a map")
+        };
+
+        assert!(matches!(
+            decoded.get("list"),
+            Some(Value::Concrete(ConcreteValue::List(values)))
+                if matches!(
+                    values.as_slice(),
+                    [Value::Concrete(ConcreteValue::String(value))]
+                        if value.expose_plaintext() == marker
+                )
+        ));
+        assert!(matches!(
+            decoded.get("map"),
+            Some(Value::Concrete(ConcreteValue::Map(values)))
+                if matches!(
+                    values.get("value"),
+                    Some(Value::Concrete(ConcreteValue::String(value)))
+                        if value.expose_plaintext() == marker
+                )
+        ));
+        assert!(matches!(
+            decoded.get("string_list"),
+            Some(Value::Concrete(ConcreteValue::List(values)))
+                if matches!(
+                    values.as_slice(),
+                    [Value::Concrete(ConcreteValue::String(value))]
+                        if value.expose_plaintext() == marker
+                )
+        ));
+    }
+
+    #[test]
+    fn persisted_codec_encodes_real_secrets_as_structural_tags() {
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("structural-secret".into()),
+        ))));
+        let persisted = PersistedValue::encode_provider_value(&secret, None)
+            .expect("real secret is persistable");
+        let object = persisted
+            .as_json()
+            .as_object()
+            .expect("a redacted secret must use a structural object");
+
+        assert_eq!(object.len(), 1);
+        let digest = object
+            .get("$secret")
+            .and_then(serde_json::Value::as_str)
+            .expect("the structural tag carries a bare digest");
+        assert!(digest.starts_with("$argon2id$"));
+        assert!(!digest.starts_with("_secret:"));
+        assert!(matches!(
+            persisted.decode(),
+            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        ));
+        assert_eq!(persisted.decoded_json(), serde_json::json!("(secret)"));
+        assert!(!persisted.decoded_json().to_string().contains(digest));
+    }
+
+    #[test]
+    fn persisted_codec_escapes_user_secret_keys() {
+        let user_map = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "$secret".to_string(),
+            Value::Concrete(ConcreteValue::String("ordinary".into())),
+        )])));
+        let persisted = PersistedValue::encode_provider_value(&user_map, None)
+            .expect("user map is persistable");
+
+        assert_eq!(
+            persisted.as_json(),
+            &serde_json::json!({"$$secret": "ordinary"})
+        );
+        assert_eq!(
+            persisted.decoded_json(),
+            serde_json::json!({"$secret": "ordinary"})
+        );
+        assert_eq!(persisted.decode(), Some(user_map));
+    }
+
+    #[test]
+    fn persisted_codec_rejects_malformed_mixed_and_unknown_host_objects() {
+        let digest = RedactedSecretHash::generate(b"host-object-errors").encoded_digest();
+        for invalid in [
+            serde_json::json!({"$secret": 42}),
+            serde_json::json!({"$secret": "not-a-digest"}),
+            serde_json::json!({"$secret": digest, "sibling": true}),
+            serde_json::json!({"$unknown": true}),
+        ] {
+            assert!(
+                serde_json::from_value::<PersistedValue>(invalid).is_err(),
+                "invalid host object must fail closed",
+            );
+        }
+    }
+
+    #[test]
+    fn exports_keep_marker_shaped_strings_literal_and_reject_secret_tags() {
+        let marker = valid_marker_shaped_string("export-marker-collision");
+        let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
+        let persisted = PersistedExportValue::encode(&plain).expect("plain export is persistable");
+
+        assert_eq!(persisted.as_json(), &serde_json::json!(marker));
+        assert_eq!(persisted.decode(), Some(plain));
+        assert!(
+            serde_json::from_value::<PersistedExportValue>(serde_json::json!({
+                "$secret": RedactedSecretHash::generate(b"forbidden-export").encoded_digest(),
+            }))
+            .is_err(),
+            "exports must reject typed redacted-secret tags",
+        );
+    }
+
     #[test]
     fn render_duration_picks_largest_clean_unit() {
         use std::time::Duration;
@@ -6117,15 +6292,15 @@ mod tests {
     }
 
     #[test]
-    fn state_row_load_upgrades_raw_legacy_markers_to_self_contained_markers() {
+    fn state_row_load_upgrades_raw_legacy_marker_to_structural_secret_tag() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let marker = format!("{LEGACY_SECRET_PREFIX}{hash}");
-        let json = serde_json::json!({ "nested": [marker.clone()] });
+        let marker = format!("_secret:argon2:{hash}");
+        let mut json = serde_json::json!({ "nested": [marker.clone()] });
 
         let ordinary = json_to_dsl_value(&json).expect("ordinary JSON value");
         assert!(!contains_redacted_secret(&ordinary));
 
-        let context_free = persisted_json_to_dsl_value(&json, SecretMarkerDecoding::Lift)
+        let context_free = persisted_json_to_dsl_value(&json, PersistedPurpose::State)
             .expect("valid persisted JSON")
             .expect("persisted JSON value");
         assert!(
@@ -6133,26 +6308,22 @@ mod tests {
             "a raw legacy marker is not a context-free persisted encoding",
         );
 
-        let id = crate::resource::ResourceId::with_provider_identity(
-            "mock",
+        json = crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
+            json,
             "test.resource",
             "old",
-            None,
-        );
-        let attributes = crate::provider::persisted_attributes_from_test_state_row(
-            &id,
-            HashMap::from([("tags".to_string(), json)]),
+            "tags",
         )
-        .expect("state row decode");
-        let upgraded = attributes
-            .encoded_value("tags")
-            .expect("upgraded persisted JSON");
+        .expect("migrate legacy test state document");
         assert!(
-            upgraded.as_json()["nested"][0]
+            json["nested"][0][PERSISTED_SECRET_KEY]
                 .as_str()
-                .is_some_and(|marker| marker.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)),
+                .is_some_and(|digest| digest.starts_with("argon2-legacy:")),
         );
-        let persisted = attributes.get("tags").expect("persisted JSON value");
+        let persisted = PersistedValue::from_serialized_json(json)
+            .expect("migrated persisted JSON")
+            .decode()
+            .expect("persisted JSON value");
         let Value::Concrete(ConcreteValue::Map(map)) = persisted else {
             panic!("persisted object must remain a map")
         };
@@ -6162,15 +6333,15 @@ mod tests {
         assert!(matches!(
             values.as_slice(),
             [Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })]
-                if loaded.persisted_marker().starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
+                if loaded.encoded_digest().starts_with("argon2-legacy:")
         ));
     }
 
     #[test]
     fn raw_legacy_secret_digest_is_not_context_free() {
-        let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
+        let digest = format!("argon2:{}", "ab".repeat(32));
         assert!(
-            persisted_secret_hash(&marker).is_none(),
+            RedactedSecretHash::from_encoded_digest(&digest).is_none(),
             "a raw legacy digest must first be upgraded by its state-file row",
         );
     }
@@ -6178,30 +6349,26 @@ mod tests {
     #[test]
     fn redacted_secret_hash_deserialize_accepts_only_its_serialized_encoding() {
         let bare_hash = "ab".repeat(32);
-        let marker = format!("{LEGACY_SECRET_PREFIX}{bare_hash}");
-        let id = crate::resource::ResourceId::with_provider_identity(
-            "mock",
-            "test.resource",
-            "old",
-            None,
-        );
-        let attributes = crate::provider::persisted_attributes_from_test_state_row(
-            &id,
-            HashMap::from([("comment".to_string(), serde_json::json!(marker))]),
+        let marker = format!("_secret:argon2:{bare_hash}");
+        let migrated =
+            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
+                serde_json::json!(marker),
+                "test.resource",
+                "old",
+                "comment",
+            )
+            .expect("migrate legacy test state document");
+        let digest = RedactedSecretHash::from_encoded_digest(
+            migrated[PERSISTED_SECRET_KEY]
+                .as_str()
+                .expect("migrated digest"),
         )
-        .expect("state row decode");
-        let digest = attributes
-            .redacted_secret_hash("comment")
-            .expect("state load must upgrade a raw legacy marker");
+        .expect("state load must upgrade a raw legacy marker");
         let encoded = serde_json::to_value(&digest).expect("serialize typed digest");
 
         let decoded_hash: RedactedSecretHash =
             serde_json::from_value(encoded).expect("deserialize serialized digest");
-        assert!(
-            decoded_hash
-                .persisted_marker()
-                .starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
-        );
+        assert!(decoded_hash.encoded_digest().starts_with("argon2-legacy:"));
         assert!(
             serde_json::from_value::<RedactedSecretHash>(serde_json::json!(marker)).is_err(),
             "the full state marker is not the typed digest's serde encoding",
@@ -6228,13 +6395,16 @@ mod tests {
         );
 
         let v2 = RedactedSecretHash::generate(b"serde-v2");
-        let v2_marker = v2.persisted_marker();
+        let v2_digest = v2.encoded_digest();
         let v2_encoded = serde_json::to_value(&v2).expect("serialize v2 digest");
         let decoded_v2_hash: RedactedSecretHash =
             serde_json::from_value(v2_encoded).expect("deserialize serialized v2 digest");
-        assert_eq!(decoded_v2_hash.persisted_marker(), v2_marker);
+        assert_eq!(decoded_v2_hash.encoded_digest(), v2_digest);
         assert!(
-            serde_json::from_value::<RedactedSecretHash>(serde_json::json!(v2_marker)).is_err(),
+            serde_json::from_value::<RedactedSecretHash>(serde_json::json!(format!(
+                "_secret:{v2_digest}"
+            )))
+            .is_err(),
             "the full v2 state marker is not the typed digest's serde encoding",
         );
     }
@@ -8158,13 +8328,7 @@ mod tests {
             ConcreteValue::String("my-password".into()),
         ))));
         let json = value_to_json(&v).unwrap();
-        let s = json.as_str().unwrap();
-        assert!(
-            s.starts_with(SECRET_PREFIX),
-            "Expected secret hash prefix, got: {}",
-            s
-        );
-        let hash = persisted_secret_hash(s).expect("v2 marker carries a validated PHC digest");
+        let hash = redacted_hash_from_persisted_json(&json);
         assert!(hash.verify(serde_json::to_vec(&serde_json::json!("my-password")).unwrap()));
     }
 
@@ -8247,11 +8411,11 @@ mod tests {
         let json = value_to_json(&v).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj.get("Name").unwrap().as_str().unwrap(), "test");
-        let secret_val = obj.get("SecretTag").unwrap().as_str().unwrap();
+        let secret_val = obj.get("SecretTag").expect("secret map value");
         assert!(
-            secret_val.starts_with(SECRET_PREFIX),
-            "Expected secret hash in map value JSON, got: {}",
-            secret_val
+            redacted_hash_from_persisted_json(secret_val)
+                .encoded_digest()
+                .starts_with("$argon2id$")
         );
     }
 
@@ -8273,22 +8437,21 @@ mod tests {
             "equal plaintexts must not reveal equality through their digests"
         );
         let material = serde_json::to_vec(&serde_json::json!("my-password")).unwrap();
-        for marker in [json1, json2] {
-            let hash = persisted_secret_hash(marker.as_str().unwrap()).unwrap();
+        for encoded in [json1, json2] {
+            let hash = redacted_hash_from_persisted_json(&encoded);
             assert!(hash.verify(&material));
         }
     }
 
     #[test]
-    fn generated_secret_marker_is_parameterized_argon2id_phc() {
+    fn generated_secret_digest_is_parameterized_argon2id_phc() {
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("phc-password".into()),
         ))));
-        let marker = value_to_json(&secret).expect("serialize secret");
-        let marker = marker.as_str().expect("secret marker string");
-        let phc = marker
-            .strip_prefix("_secret:")
-            .expect("persisted marker prefix");
+        let encoded = value_to_json(&secret).expect("serialize secret");
+        let phc = encoded[PERSISTED_SECRET_KEY]
+            .as_str()
+            .expect("structural secret digest");
         let parsed = argon2::PasswordHash::new(phc).expect("valid PHC string");
 
         assert_eq!(parsed.algorithm.as_str(), "argon2id");
@@ -8319,18 +8482,20 @@ mod tests {
     }
 
     #[test]
-    fn persisted_secret_marker_rejects_non_carina_argon2_parameters() {
+    fn persisted_secret_digest_rejects_non_carina_argon2_parameters() {
         use argon2::password_hash::{PasswordHasher, SaltString};
 
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("bounded-argon2".into()),
         ))));
-        let marker = value_to_json(&secret).expect("serialize secret");
-        let marker = marker.as_str().expect("secret marker string");
+        let encoded = value_to_json(&secret).expect("serialize secret");
+        let digest = encoded[PERSISTED_SECRET_KEY]
+            .as_str()
+            .expect("structural secret digest");
         let mut invalid = vec![
             (
                 "memory cost",
-                marker.replacen(
+                digest.replacen(
                     &format!("m={}", argon2::Params::DEFAULT_M_COST),
                     "m=1048576",
                     1,
@@ -8338,13 +8503,13 @@ mod tests {
             ),
             (
                 "time cost",
-                marker.replacen(&format!("t={}", argon2::Params::DEFAULT_T_COST), "t=3", 1),
+                digest.replacen(&format!("t={}", argon2::Params::DEFAULT_T_COST), "t=3", 1),
             ),
             (
                 "parallelism",
-                marker.replacen(&format!("p={}", argon2::Params::DEFAULT_P_COST), "p=2", 1),
+                digest.replacen(&format!("p={}", argon2::Params::DEFAULT_P_COST), "p=2", 1),
             ),
-            ("version", marker.replacen("v=19", "v=16", 1)),
+            ("version", digest.replacen("v=19", "v=16", 1)),
         ];
         for (label, salt, output_len) in [
             ("salt length", b"short-salt".as_slice(), 32),
@@ -8363,12 +8528,12 @@ mod tests {
             let phc = hasher
                 .hash_password(b"bounded-argon2", &salt)
                 .expect("hash test password");
-            invalid.push((label, format!("_secret:{phc}")));
+            invalid.push((label, phc.to_string()));
         }
 
-        for (label, marker) in invalid {
+        for (label, digest) in invalid {
             assert!(
-                persisted_secret_hash(&marker).is_none(),
+                RedactedSecretHash::from_encoded_digest(&digest).is_none(),
                 "state must reject a non-Carina Argon2 {label}",
             );
         }
@@ -8437,17 +8602,19 @@ mod tests {
 
     #[test]
     fn provider_secret_material_treats_nested_marker_strings_as_plaintext() {
-        let nested_marker = PersistedValue::encode_provider_value(
+        let nested_secret = PersistedValue::encode_provider_value(
             &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String("nested-secret".into()),
             )))),
             None,
         )
-        .expect("nested marker is persistable")
-        .as_json()
-        .as_str()
-        .expect("secret encodes as a marker")
-        .to_string();
+        .expect("nested secret is persistable");
+        let nested_marker = format!(
+            "_secret:{}",
+            nested_secret.as_json()[PERSISTED_SECRET_KEY]
+                .as_str()
+                .expect("structural secret digest")
+        );
         let provider_plaintext = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "a".to_string(),
             Value::Concrete(ConcreteValue::String(nested_marker.into())),
@@ -8627,12 +8794,12 @@ mod tests {
         let resource = resource_with_comment_secret("same-resource", "PLAIN");
         let state_value = value_to_json(resource.attributes.get("comment").expect("comment"))
             .expect("serialize state secret");
-        let state_hash = persisted_secret_hash(state_value.as_str().unwrap()).unwrap();
+        let state_hash = redacted_hash_from_persisted_json(&state_value);
         let persisted =
             crate::provider::PersistedAttributes::from_persisted_values(HashMap::from([(
                 "comment".to_string(),
-                PersistedValue::from_persisted_secret_marker(state_value.as_str().unwrap())
-                    .expect("state value is a persisted secret marker"),
+                PersistedValue::from_serialized_json(state_value)
+                    .expect("state value is a persisted structural secret"),
             )]))
             .expect("persisted attributes");
         let redacted = redact_secrets_in_resource_reusing_persisted_hashes(&resource, &persisted)
@@ -8706,7 +8873,7 @@ mod tests {
         assert_eq!(
             redacted_state.attributes.get("settings"),
             Some(&expected_redacted),
-            "persisted markers must classify plaintext below escaped keys",
+            "persisted secret tags must classify plaintext below escaped keys",
         );
 
         let masked =
@@ -9869,9 +10036,9 @@ mod tests {
 
     #[test]
     fn render_value_pretty_string_list_does_not_reclassify_marker_shaped_text() {
-        // Only the persisted-state decoder assigns marker semantics. A plain
-        // string that happens to use the reserved prefix stays a string.
-        let marker_shaped_text = format!("{}{}", SECRET_PREFIX, "deadbeef".repeat(8));
+        // No decoder assigns semantics from a string's spelling. A string that
+        // happens to use the historical prefix stays a string.
+        let marker_shaped_text = format!("_secret:argon2:{}", "deadbeef".repeat(8));
         let v = Value::Concrete(ConcreteValue::StringList(vec![
             marker_shaped_text.clone().into(),
             "x".repeat(80).into(), // force vertical

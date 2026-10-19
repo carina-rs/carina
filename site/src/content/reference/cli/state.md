@@ -57,10 +57,11 @@ restores user map keys exactly as authored, including keys that start with
 | `--json` | Output the raw state-file JSON |
 
 `state show --json` is a state-file inspection command, so its output retains
-the version 13 persisted encoding. Canonical enums use a `$enum` host payload,
-and each user map key beginning with `$` has one additional leading `$` (for
-example, `$or` is stored as `$$or`). This differs intentionally from the
-decoded output of `state lookup --json`.
+the version 14 persisted encoding. Canonical enums use a `$enum` host payload,
+redacted secrets use a `$secret` host payload, and each user map key beginning
+with `$` has one additional leading `$` (for example, `$secret` is stored as
+`$$secret`). This differs intentionally from the decoded output of
+`state lookup --json`.
 
 ### `lookup`
 
@@ -87,8 +88,10 @@ carina state lookup my_bucket.bucket
 Single attribute values are returned as raw values (no quotes for strings), suitable for shell usage. Use `--json` to always output JSON.
 
 Lookup output is decoded for use as ordinary JSON: canonical enums are their
-provider API strings, and `$`-prefixed user keys are unescaped. It never emits
-the raw `$enum` or `$$` state-file representation.
+provider API strings, `$`-prefixed user keys are unescaped, and redacted
+secrets are the fixed string `(secret)`. It never emits the raw `$enum`,
+`$secret`, or `$$` state-file representation. Consequently, a real redacted
+secret remains distinguishable from a user map whose key is `$secret`.
 
 #### Flags
 
@@ -148,8 +151,10 @@ Carina stores state in `carina.state.json` (local backend) or in an S3 bucket (r
 - **serial** -- incrementing version number
 - **resources** -- list of managed resources with their provider, type, name, binding, attributes, and dependency bindings
 
-State format version 13 reserves single-`$` object keys for host payloads.
-Canonical enums are stored as `$enum` payloads, while user keys beginning with
-`$` are escaped by adding one leading `$`. Carina decodes that representation
-when values are shown through human output, `state lookup --json`, exports, or
-`upstream_state`; only `state show --json` exposes the raw file encoding.
+State format version 14 reserves single-`$` object keys for host payloads.
+Canonical enums are stored as `$enum` payloads and redacted secrets as
+`$secret` payloads, while user keys beginning with `$` are escaped by adding
+one leading `$`. Carina decodes that representation when values are shown
+through human output, `state lookup --json`, exports, or `upstream_state`;
+decoded display views render a redacted secret as `(secret)`. Only
+`state show --json` exposes the raw file encoding.

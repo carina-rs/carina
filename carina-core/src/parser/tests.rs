@@ -7639,9 +7639,11 @@ fn parse_decrypt_uses_config_decryptor() {
     );
     assert_eq!(crate::value::format_value(secret_val), "(secret)");
     let state_value = crate::value::value_to_json(secret_val).unwrap();
-    let state_value = state_value.as_str().expect("Argon2id secret hash");
-    assert!(state_value.starts_with(crate::value::SECRET_PREFIX));
-    assert!(!state_value.contains("decrypted:AQICAHh"));
+    let digest = state_value[crate::value::PERSISTED_SECRET_KEY]
+        .as_str()
+        .expect("Argon2id secret digest");
+    assert!(crate::resource::RedactedSecretHash::from_encoded_digest(digest).is_some());
+    assert!(!state_value.to_string().contains("decrypted:AQICAHh"));
 }
 
 #[test]
@@ -7676,9 +7678,11 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
     );
     assert_eq!(crate::value::format_value(value), "(secret)");
     let state_value = crate::value::value_to_json(value).unwrap();
-    let state_value = state_value.as_str().expect("Argon2id secret hash");
-    assert!(state_value.starts_with(crate::value::SECRET_PREFIX));
-    assert!(!state_value.contains("decrypted:ciphertext"));
+    let digest = state_value[crate::value::PERSISTED_SECRET_KEY]
+        .as_str()
+        .expect("Argon2id secret digest");
+    assert!(crate::resource::RedactedSecretHash::from_encoded_digest(digest).is_some());
+    assert!(!state_value.to_string().contains("decrypted:ciphertext"));
 }
 
 #[test]

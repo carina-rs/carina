@@ -588,7 +588,10 @@ fn deterministic_value_string(value: &Value) -> String {
             format!("Secret({})", deterministic_value_string(inner))
         }
         Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
-            format!("RedactedSecret({})", hash.persisted_marker())
+            format!(
+                "RedactedSecret({})",
+                crate::resource::legacy_secret_identity_material(hash)
+            )
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::UnknownReason;

@@ -1,16 +1,14 @@
 use super::*;
 use carina_core::resource::DeferredValue;
-use carina_core::value::{EXPLICIT_LEGACY_SECRET_PREFIX, LEGACY_SECRET_PREFIX};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
+
+const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
 fn persisted_attributes_from_state_json(
     attributes: &HashMap<String, serde_json::Value>,
 ) -> PersistedAttributes {
-    persisted_attributes_for_test_state_row(
-        &ResourceId::with_provider_identity("test", "test.resource", "fixture-row", None),
-        attributes.clone(),
-    )
+    persisted_attributes_from_test_json(attributes.clone())
 }
 
 fn state_json_from_persisted_attributes(
@@ -27,6 +25,44 @@ fn persisted_json_attribute(
     key: &str,
 ) -> Option<serde_json::Value> {
     state_json_from_persisted_attributes(attributes).remove(key)
+}
+
+fn structural_legacy_secret(hash_hex: &str) -> serde_json::Value {
+    serde_json::json!({
+        carina_core::value::PERSISTED_SECRET_KEY:
+            format!("argon2-legacy:73616c74:{hash_hex}"),
+    })
+}
+
+fn structural_secret_digest(value: &serde_json::Value) -> &str {
+    let object = value.as_object().expect("secret is a structural object");
+    assert_eq!(object.len(), 1, "secret tag must have exactly one key");
+    let digest = object
+        .get(carina_core::value::PERSISTED_SECRET_KEY)
+        .and_then(serde_json::Value::as_str)
+        .expect("secret tag carries a digest");
+    assert!(
+        carina_core::resource::RedactedSecretHash::from_encoded_digest(digest).is_some(),
+        "invalid secret digest",
+    );
+    digest
+}
+
+fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String(plaintext.into()),
+    ))));
+    let encoded = PersistedValue::encode_provider_value(&secret, None)
+        .expect("test secret must be persistable");
+    format!(
+        "_secret:{}",
+        encoded
+            .as_json()
+            .as_object()
+            .and_then(|tag| tag.get(carina_core::value::PERSISTED_SECRET_KEY))
+            .and_then(serde_json::Value::as_str)
+            .expect("structural test secret carries a digest")
+    )
 }
 
 fn resolved(resource: &carina_core::resource::Resource) -> carina_core::resource::ResolvedResource {
@@ -64,6 +100,47 @@ fn test_state_file_new() {
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
+}
+
+#[test]
+fn v14_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
+    use carina_core::resource::{Resource, State as ProviderState};
+
+    assert_eq!(StateFile::CURRENT_VERSION, 14);
+    let marker = valid_legacy_marker_shaped_string("state-marker-collision");
+    let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
+        .with_attribute("authored", plain.clone());
+    let provider_state = ProviderState::existing(
+        resource.id.clone(),
+        HashMap::from([
+            ("authored".to_string(), plain.clone()),
+            ("provider_only".to_string(), plain.clone()),
+        ]),
+    )
+    .with_identifier("provider-id");
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        None,
+        None,
+        None,
+    )
+    .expect("marker-shaped plaintext is valid provider state");
+    let mut state = StateFile::new();
+    state.upsert_resource(row).expect("insert test row");
+
+    let json = serde_json::to_string(&state).expect("serialize current state");
+    let reloaded = check_and_migrate(&json)
+        .expect("reload current state")
+        .into_state();
+    let loaded = reloaded.build_state_for_resource(&resource.id);
+
+    assert_eq!(loaded.attributes.get("authored"), Some(&plain));
+    assert_eq!(loaded.attributes.get("provider_only"), Some(&plain));
+    let raw: serde_json::Value = serde_json::from_str(&json).expect("state JSON");
+    assert_eq!(raw["resources"][0]["attributes"]["authored"], marker);
+    assert_eq!(raw["resources"][0]["attributes"]["provider_only"], marker);
 }
 
 #[test]
@@ -1642,10 +1719,7 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
         .upsert_resource(
             ResourceState::new("test.resource", "old", "mock")
                 .with_identifier("mock-id")
-                .with_attribute(
-                    "comment".to_string(),
-                    serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}")),
-                ),
+                .with_attribute("comment".to_string(), structural_legacy_secret(hash)),
         )
         .expect("test state setup must be valid");
 
@@ -1662,10 +1736,8 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
         match loaded {
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })) => {
                 assert!(
-                    loaded
-                        .persisted_marker()
-                        .starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
-                    "state load must make the legacy salt self-contained",
+                    loaded.encoded_digest().starts_with("argon2-legacy:"),
+                    "state load must retain the typed explicit legacy digest",
                 );
             }
             other => panic!("persisted secret hash lost its type at the state boundary: {other:?}"),
@@ -1678,16 +1750,16 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
     use carina_core::resource::{DeferredValue, Value};
 
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let marker = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}"));
+    let tag = structural_legacy_secret(hash);
     let row =
-        ResourceState::new("test.resource", "main", "mock").with_attribute("token", marker.clone());
+        ResourceState::new("test.resource", "main", "mock").with_attribute("token", tag.clone());
     let deposed = DeposedInstance {
         key: DeposedKey::new_unique(),
         identifier: "old-id".to_string(),
         provider_instance: None,
         attributes: persisted_attributes_from_state_json(&HashMap::from([(
             "token".to_string(),
-            marker,
+            tag,
         )])),
         dependency_bindings: BTreeSet::new(),
     };
@@ -1699,7 +1771,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
         assert!(matches!(
             decoded.get("token"),
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if loaded.persisted_marker().starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)
+                if loaded.encoded_digest().starts_with("argon2-legacy:")
         ));
     }
 }
@@ -1707,17 +1779,17 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
 #[test]
 fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let marker = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{hash}"));
+    let tag = structural_legacy_secret(hash);
     let mut row = ResourceState::new("test.resource", "main", "mock")
         .with_identifier("current-id")
-        .with_attribute("token", marker.clone());
+        .with_attribute("token", tag.clone());
     row.deposed.push(DeposedInstance {
         key: DeposedKey::new_unique(),
         identifier: "old-id".to_string(),
         provider_instance: None,
         attributes: persisted_attributes_from_state_json(&HashMap::from([(
             "token".to_string(),
-            marker,
+            tag,
         )])),
         dependency_bindings: BTreeSet::new(),
     });
@@ -2069,7 +2141,7 @@ fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
     .expect("v12 fixture should migrate")
     .into_state();
 
-    assert_eq!(state.version, 13);
+    assert_eq!(state.version, 14);
     let row = state
         .find_resource("mock", "test.Resource", "main")
         .expect("fixture resource exists");
@@ -2111,6 +2183,137 @@ fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
         assert!(tree["dollar_map"].get("$$x").is_some());
         assert!(tree["dollar_map"].get("$x").is_none());
     }
+}
+
+#[test]
+fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_literal() {
+    let marker = valid_legacy_marker_shaped_string("v13-self-contained");
+    let digest = marker
+        .strip_prefix("_secret:")
+        .expect("test marker uses the legacy boundary prefix");
+    let fixture = include_str!("../../tests/fixtures/state-v13-structural-secret-marker.json")
+        .replace("__SELF_CONTAINED_MARKER__", &marker);
+    let outcome = check_and_migrate(&fixture).expect("v13 fixture should migrate");
+
+    assert_eq!(
+        outcome.migration(),
+        Some(MigrationInfo { from: 13, to: 14 })
+    );
+    let state = outcome.into_state();
+    let row = state
+        .find_resource("mock", "test.Resource", "main")
+        .expect("fixture resource exists");
+    for attributes in [
+        row.persisted_attributes(),
+        row.deposed[0].persisted_attributes(),
+    ] {
+        assert!(matches!(
+            attributes.get("self_contained"),
+            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        ));
+        assert!(matches!(
+            attributes.get("raw_legacy"),
+            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        ));
+    }
+    assert!(matches!(
+        row.persisted_attributes().get("malformed"),
+        Some(Value::Concrete(ConcreteValue::String(value)))
+            if value.expose_plaintext() == "_secret:argon2:not-a-hash"
+    ));
+    assert!(matches!(
+        row.persisted_attributes().get("nested"),
+        Some(Value::Concrete(ConcreteValue::Map(values)))
+            if matches!(
+                values.get("$secret"),
+                Some(Value::Concrete(ConcreteValue::String(value)))
+                    if value.expose_plaintext() == "user-value"
+            )
+    ));
+
+    let encoded = serde_json::to_value(&state).expect("migrated state serializes");
+    let current = &encoded["resources"][0]["attributes"];
+    let deposed = &encoded["resources"][0]["deposed"][0]["attributes"];
+    assert_eq!(
+        current["self_contained"],
+        serde_json::json!({"$secret": digest})
+    );
+    assert_eq!(
+        deposed["self_contained"],
+        serde_json::json!({"$secret": digest})
+    );
+    assert!(
+        current["explicit_legacy"]["$secret"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("argon2-legacy:"))
+    );
+    assert!(
+        current["raw_legacy"]["$secret"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("argon2-legacy:"))
+    );
+    assert!(current["nested"]["items"][0].get("$secret").is_some());
+    assert!(current["nested"]["map"]["value"].get("$secret").is_some());
+    assert_eq!(current["nested"]["$$secret"], "user-value");
+
+    assert_eq!(encoded["exports"]["self_contained"], marker);
+    assert_eq!(
+        encoded["exports"]["raw_legacy"],
+        "_secret:argon2:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    );
+    assert_eq!(
+        encoded["exports"]["user_map"]["$$secret"],
+        "export-user-value"
+    );
+    assert!(matches!(
+        state.build_remote_bindings().get("self_contained"),
+        Some(Value::Concrete(ConcreteValue::String(value)))
+            if value.expose_plaintext() == marker
+    ));
+}
+
+#[test]
+fn v13_raw_row_salted_secret_still_verifies_after_structural_migration() {
+    use argon2::Argon2;
+
+    let plaintext = "pre-v12-row-secret";
+    let material = serde_json::to_vec(&serde_json::json!(plaintext)).expect("secret material");
+    let salt = b"carina:mock.test.Resource:main:raw_legacy";
+    let mut output = [0_u8; 32];
+    Argon2::default()
+        .hash_password_into(&material, salt, &mut output)
+        .expect("hash legacy fixture");
+    let json = serde_json::json!({
+        "version": 13,
+        "serial": 1,
+        "lineage": "v13-row-salt-verification",
+        "carina_version": "0.8.0",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "main",
+            "provider": "mock",
+            "identifier": "current-id",
+            "attributes": {
+                "raw_legacy": format!("{LEGACY_SECRET_PREFIX}{}", hex::encode(output)),
+            },
+        }],
+        "exports": {},
+    });
+    let state = check_and_migrate(&json.to_string())
+        .expect("v13 raw legacy state migrates")
+        .into_state();
+    let hash = state.resources()[0]
+        .persisted_attributes()
+        .redacted_secret_hash("raw_legacy")
+        .expect("raw legacy value remains typed");
+
+    assert!(hash.verify(&material));
+    assert!(
+        serde_json::to_value(&state).expect("serialize migrated state")["resources"][0]
+            ["attributes"]["raw_legacy"]
+            .get("$secret")
+            .is_some()
+    );
 }
 
 #[test]
@@ -2262,7 +2465,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 13);
+    assert_eq!(StateFile::CURRENT_VERSION, 14);
     let json = format!(
         r#"{{
         "version": 11,
@@ -2297,14 +2500,15 @@ fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
         .state()
         .find_resource("mock", "test.resource", "legacy")
         .expect("legacy row should survive migration");
-    let marker = row
+    let encoded = row
         .persisted_attributes()
         .encoded_value("comment")
-        .and_then(|value| value.as_json().as_str())
-        .expect("legacy marker should remain persisted");
+        .expect("legacy secret should remain persisted")
+        .as_json();
+    let digest = structural_secret_digest(encoded);
     assert!(
-        marker.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
-        "row load must make the legacy marker self-contained: {marker}",
+        digest.starts_with("argon2-legacy:"),
+        "row load must make the legacy digest self-contained: {digest}",
     );
 }
 
@@ -2355,9 +2559,9 @@ fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
         .expect("settings should remain persisted")
         .as_json();
     assert!(
-        encoded["$$k"]
+        encoded["$$k"][carina_core::value::PERSISTED_SECRET_KEY]
             .as_str()
-            .is_some_and(|value| value.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX)),
+            .is_some_and(|value| value.starts_with("argon2-legacy:")),
         "the raw v11 marker should be upgraded after its key is escaped"
     );
     assert!(encoded["legacy_enum"].get("$enum").is_some());
@@ -2367,7 +2571,7 @@ fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
 #[test]
 fn state_row_load_rejects_raw_legacy_salt_that_cannot_round_trip() {
     let json = serde_json::json!({
-        "version": StateFile::CURRENT_VERSION,
+        "version": 13,
         "serial": 1,
         "lineage": "oversized-legacy-salt",
         "carina_version": "0.4.0",
@@ -2383,8 +2587,9 @@ fn state_row_load_rejects_raw_legacy_salt_that_cannot_round_trip() {
     })
     .to_string();
 
-    let error = check_and_migrate(&json)
-        .expect_err("state load must reject a legacy salt that its marker parser cannot reload");
+    let error = check_and_migrate(&json).expect_err(
+        "state load must reject a legacy salt that its encoded-digest parser cannot reload",
+    );
     let message = error.to_string();
     assert!(message.contains("comment"), "{message}");
     assert!(message.contains("maximum is 4096 bytes"), "{message}");
@@ -2996,11 +3201,11 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
         "placeholder".to_string(),
-        serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
+        structural_legacy_secret(&"ab".repeat(32)),
     )]));
     let redacted = historical
         .get("placeholder")
-        .expect("legacy marker should decode to a redacted secret");
+        .expect("structural tag should decode to a redacted secret");
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "a".to_string(),
@@ -3045,11 +3250,11 @@ fn write_only_merge_does_not_persist_desired_redacted_secret() {
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
         "placeholder".to_string(),
-        serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
+        structural_legacy_secret(&"ab".repeat(32)),
     )]));
     let redacted = historical
         .get("placeholder")
-        .expect("legacy marker should decode to a redacted secret");
+        .expect("structural tag should decode to a redacted secret");
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "a".to_string(),
@@ -3202,7 +3407,6 @@ fn test_from_provider_state_secret_stored_as_hash() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
     };
-    use carina_core::value::SECRET_PREFIX;
 
     let mut resource = Resource::with_provider("awscc", "rds.db_instance", "my-db", None);
     resource.set_attr(
@@ -3240,12 +3444,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
     // State should store the hash, not the plain password
     let stored_json = persisted_json_attribute(&rs.attributes, "master_password")
         .expect("master_password should be stored");
-    let stored = stored_json.as_str().unwrap();
-    assert!(
-        stored.starts_with(SECRET_PREFIX),
-        "Expected secret hash, got: {}",
-        stored
-    );
+    let stored = structural_secret_digest(&stored_json);
     assert!(
         !stored.contains("my-password"),
         "State should not contain the plain password"
@@ -3255,15 +3454,11 @@ fn test_from_provider_state_secret_stored_as_hash() {
 #[test]
 fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
     let existing = ResourceState::new("db.Instance", "main", "awscc")
         .with_identifier("db-old")
-        .with_attribute(
-            "password",
-            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-        );
+        .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
@@ -3289,18 +3484,15 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     .expect("provider state should serialize");
     let stored_json =
         persisted_json_attribute(&rs.attributes, "password").expect("password should be stored");
-    let stored = stored_json
-        .as_str()
-        .expect("password should remain a stored secret hash");
+    let stored = structural_secret_digest(&stored_json);
 
-    assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+    assert!(stored.starts_with("$argon2id$"), "got {stored}");
     assert!(!stored.contains("plain-secret"));
 }
 
 #[test]
 fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::value::SECRET_PREFIX;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
     let attrs = HashMap::from([(
@@ -3309,7 +3501,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     )]);
     let existing = persisted_attributes_from_state_json(&HashMap::from([(
         "password".to_string(),
-        serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
+        structural_legacy_secret(&"ab".repeat(32)),
     )]));
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
@@ -3319,12 +3511,10 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
     let stored = state_json_from_persisted_attributes(&stored);
-    let password = stored
-        .get("password")
-        .and_then(|value| value.as_str())
-        .expect("password should remain a stored secret hash");
+    let password =
+        structural_secret_digest(stored.get("password").expect("password remains stored"));
 
-    assert!(password.starts_with(SECRET_PREFIX), "got {password}");
+    assert!(password.starts_with("$argon2id$"), "got {password}");
     assert!(!password.contains("plain-secret"));
 }
 
@@ -3340,21 +3530,21 @@ fn with_attributes_from_state_reuses_matching_secret_digest() {
     let first = ResourceState::new("test.resource", "stable", "mock")
         .with_attributes_from_state(&provider_state)
         .unwrap();
-    let first_marker =
-        persisted_json_attribute(&first.attributes, "comment").expect("first secret marker");
+    let first_encoded =
+        persisted_json_attribute(&first.attributes, "comment").expect("first encoded secret");
 
     let second = first.with_attributes_from_state(&provider_state).unwrap();
-    let second_marker =
-        persisted_json_attribute(&second.attributes, "comment").expect("second secret marker");
+    let second_encoded =
+        persisted_json_attribute(&second.attributes, "comment").expect("second encoded secret");
 
     assert_eq!(
-        first_marker, second_marker,
-        "unchanged secret marker churned"
+        first_encoded, second_encoded,
+        "unchanged secret encoding churned"
     );
 }
 
 #[test]
-fn with_attributes_from_state_reports_raw_legacy_attribute_key() {
+fn with_attributes_from_state_keeps_raw_legacy_shaped_text_plain() {
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
 
     let id = ResourceId::with_provider_identity("mock", "test.resource", "plain", None);
@@ -3363,45 +3553,44 @@ fn with_attributes_from_state_reports_raw_legacy_attribute_key() {
         id,
         HashMap::from([(
             "comment".to_string(),
-            Value::Concrete(ConcreteValue::String(marker.into())),
+            Value::Concrete(ConcreteValue::String(marker.clone().into())),
         )]),
     );
 
-    let error = ResourceState::new("test.resource", "plain", "mock")
+    let row = ResourceState::new("test.resource", "plain", "mock")
         .with_attributes_from_state(&provider_state)
-        .expect_err("marker-shaped provider plaintext must fail closed");
-    let ResourceStateEncodingError::PersistedAttributes(source) = error else {
-        panic!("expected persisted-attribute validation error")
-    };
-    assert_eq!(source.attribute_key(), "comment");
+        .expect("marker-shaped provider plaintext is ordinary text");
+    assert_eq!(
+        persisted_json_attribute(row.persisted_attributes(), "comment"),
+        Some(serde_json::json!(marker)),
+    );
 }
 
 #[test]
-fn merge_write_only_attributes_reports_raw_legacy_attribute_key() {
+fn merge_write_only_attributes_keeps_raw_legacy_shaped_text_plain() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
 
     let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
     let resource = Resource::with_provider("mock", "test.resource", "plain", None).with_attribute(
         "password",
-        Value::Concrete(ConcreteValue::String(marker.into())),
+        Value::Concrete(ConcreteValue::String(marker.clone().into())),
     );
     let mut row = ResourceState::new("test.resource", "plain", "mock");
 
-    let error = row
-        .merge_write_only_attributes(&resource, &["password".to_string()])
-        .expect_err("marker-shaped desired plaintext must fail closed");
-    let ResourceStateEncodingError::PersistedAttributes(source) = error else {
-        panic!("expected persisted-attribute validation error")
-    };
-    assert_eq!(source.attribute_key(), "password");
+    row.merge_write_only_attributes(&resource, &["password".to_string()])
+        .expect("marker-shaped desired plaintext is ordinary text");
+    assert_eq!(
+        persisted_json_attribute(row.persisted_attributes(), "password"),
+        Some(serde_json::json!(marker)),
+    );
 }
 
 #[test]
 fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
-    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::resource::Resource;
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let previous = serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)));
+    let previous = structural_legacy_secret(&"ab".repeat(32));
     let existing = persisted_attributes_from_state_json(&HashMap::from([(
         "password".to_string(),
         previous.clone(),
@@ -3412,9 +3601,9 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         .clone();
     let attrs = HashMap::from([(
         "password".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            upgraded.as_json().as_str().unwrap().to_string().into(),
-        )),
+        existing
+            .get("password")
+            .expect("structural secret decodes to a typed value"),
     )]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
@@ -3438,10 +3627,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     );
     let existing = ResourceState::new("db.Instance", "main", "awscc")
         .with_identifier("db-old")
-        .with_attribute(
-            "password",
-            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-        );
+        .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
@@ -3482,10 +3668,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     );
     let existing = ResourceState::new("db.Instance", "main", "awscc")
         .with_identifier("db-old")
-        .with_attribute(
-            "password",
-            serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-        );
+        .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
@@ -3517,13 +3700,12 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
 #[test]
 fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::value::SECRET_PREFIX;
     use indexmap::IndexMap;
 
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
+        "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
     });
     let mut provider_tags = IndexMap::new();
     provider_tags.insert(
@@ -3554,16 +3736,17 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         .get("tags")
         .and_then(|value| value.as_object())
         .expect("tags should remain a map");
-    let secret = stored_tags
-        .get("SecretTag")
-        .and_then(|value| value.as_str())
-        .expect("secret tag should remain a string");
+    let secret = structural_secret_digest(
+        stored_tags
+            .get("SecretTag")
+            .expect("secret tag remains stored"),
+    );
 
     assert_eq!(
         stored_tags.get("Name"),
         Some(&serde_json::json!("new-name"))
     );
-    assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+    assert!(secret.starts_with("$argon2id$"), "got {secret}");
     assert!(!secret.contains("plain-secret"));
 
     let second_existing = persisted_attributes_from_state_json(&HashMap::from([(
@@ -3587,7 +3770,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
     let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
     let previous_tags = serde_json::json!({
         "Name": "old-name",
-        "SecretTag": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
+        "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
     });
     let attrs = HashMap::from([(
         "tags".to_string(),
@@ -3607,29 +3790,26 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         .get("tags")
         .and_then(|value| value.as_object())
         .expect("tags should remain a map");
-    let secret = stored_tags
-        .get("SecretTag")
-        .and_then(|value| value.as_str())
-        .expect("missing secret tag should keep the previous hash");
+    let secret = structural_secret_digest(
+        stored_tags
+            .get("SecretTag")
+            .expect("missing secret tag keeps the previous hash"),
+    );
 
     assert!(!stored_tags.contains_key("Name"));
-    assert!(
-        secret.starts_with(EXPLICIT_LEGACY_SECRET_PREFIX),
-        "got {secret}"
-    );
+    assert!(secret.starts_with("argon2-legacy:"), "got {secret}");
 }
 
 #[test]
 fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::value::SECRET_PREFIX;
     use indexmap::IndexMap;
 
     let resource = Resource::with_provider("awscc", "service.Widget", "main", None);
     let previous_items = serde_json::json!([
         {
             "Name": "one",
-            "Token": format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32)),
+            "Token": structural_legacy_secret(&"ab".repeat(32)),
         },
         {
             "Name": "two",
@@ -3673,15 +3853,13 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
     let stored = state_json_from_persisted_attributes(&stored);
-    let stored_items = stored
-        .get("items")
-        .and_then(|value| value.as_str())
-        .expect("untrusted array alignment should hash the whole array");
-
-    assert!(
-        stored_items.starts_with(SECRET_PREFIX),
-        "got {stored_items}"
+    let stored_items = structural_secret_digest(
+        stored
+            .get("items")
+            .expect("untrusted array alignment hashes the whole array"),
     );
+
+    assert!(stored_items.starts_with("$argon2id$"), "got {stored_items}");
     assert!(!stored_items.contains("plain-secret"));
 }
 
@@ -3690,7 +3868,6 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
     };
-    use carina_core::value::SECRET_PREFIX;
 
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     let mut tags_map = IndexMap::new();
@@ -3751,12 +3928,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     assert_eq!(tags_obj.get("Name").unwrap().as_str().unwrap(), "test");
 
     // SecretTag should be stored as a hash, not the plain value
-    let secret_stored = tags_obj.get("SecretTag").unwrap().as_str().unwrap();
-    assert!(
-        secret_stored.starts_with(SECRET_PREFIX),
-        "Expected secret hash in map value, got: {}",
-        secret_stored
-    );
+    let secret_stored = structural_secret_digest(tags_obj.get("SecretTag").unwrap());
     assert!(
         !secret_stored.contains("super-secret-value"),
         "State should not contain the plain secret value in map"
@@ -3768,7 +3940,6 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
     };
-    use carina_core::value::SECRET_PREFIX;
 
     // User specifies only SecretTag in tags
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
@@ -3834,12 +4005,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     );
 
     // SecretTag should be stored as a hash, not the plain value
-    let secret_stored = tags_obj.get("SecretTag").unwrap().as_str().unwrap();
-    assert!(
-        secret_stored.starts_with(SECRET_PREFIX),
-        "Expected secret hash in map value, got: {}",
-        secret_stored
-    );
+    let secret_stored = structural_secret_digest(tags_obj.get("SecretTag").unwrap());
     assert!(
         !secret_stored.contains("super-secret-value"),
         "State should not contain the plain secret value in map"
@@ -3851,7 +4017,6 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
     };
-    use carina_core::value::SECRET_PREFIX;
 
     let mut resource = Resource::with_provider("awscc", "test.resource", "my-res", None);
     resource.set_attr(
@@ -3898,12 +4063,8 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     assert_eq!(values_arr[0].as_str().unwrap(), "public");
 
     // Second item should be stored as a hash
-    let secret_stored = values_arr[1].as_str().unwrap();
-    assert!(
-        secret_stored.starts_with(SECRET_PREFIX),
-        "Expected secret hash in list value, got: {}",
-        secret_stored
-    );
+    let secret_stored = structural_secret_digest(&values_arr[1]);
+    assert!(secret_stored.starts_with("$argon2id$"));
 }
 
 #[test]
@@ -3927,15 +4088,7 @@ fn build_remote_bindings_returns_exports() {
 
 #[test]
 fn build_remote_bindings_keeps_secret_shaped_export_strings_literal() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("not-an-export-secret".into()),
-    ))));
-    let marker = PersistedValue::encode_provider_value(&secret, None)
-        .expect("secret marker is persistable")
-        .as_json()
-        .as_str()
-        .expect("secret marker is a string")
-        .to_string();
+    let marker = valid_legacy_marker_shaped_string("not-an-export-secret");
     let literal = Value::Concrete(ConcreteValue::String(marker.clone().into()));
 
     let mut state = StateFile::new();

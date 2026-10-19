@@ -18,14 +18,13 @@ use crate::effect::PlanOp;
 use crate::parser::ProviderConfig;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker,
-    ResolvedResource, Resource, ResourceId, ResourceIdentity, State, Value, ValueString,
+    ResolvedResource, Resource, ResourceId, State, Value, ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
 use crate::schema::{ResourceSchema, SchemaRegistry, Shape, TypeIdentity};
 use crate::value::{
-    PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView,
-    SerializationError, persisted_secret_hash,
+    PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
 };
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
@@ -792,16 +791,15 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 
 /// Attribute storage in the state-file JSON format.
 ///
-/// State-file construction goes through [`EncodedStateRowAttributes`]; this
-/// type deliberately implements serialization but not deserialization. The
-/// invariant is that values enter the DSL value layer only through
-/// [`Self::get`] or [`Self::to_values`], which decode complete persisted secret
-/// markers as typed `RedactedSecret` values rather than ordinary strings.
+/// State-file construction goes through [`Self::from_encoded`]; this type
+/// deliberately implements serialization but not deserialization. The
+/// invariant is that values enter the DSL value layer only through [`Self::get`]
+/// or [`Self::to_values`], which decode structural `$secret` tags as typed
+/// `RedactedSecret` values. Persisted strings always remain strings.
 ///
-/// Raw JSON cannot be inserted after construction. Context-free callers use
-/// [`Self::from_persisted_values`]. A state row that may contain raw pre-v12 markers is
-/// decoded through [`EncodedStateRowAttributes`], which obtains the legacy
-/// salt inputs from the same serialized row as the attributes.
+/// Raw JSON cannot be inserted after construction. State loaders call
+/// [`Self::from_encoded`] after versioned migrations rewrite legacy encodings;
+/// callers that already hold validated values use [`Self::from_persisted_values`].
 ///
 /// ```compile_fail
 /// use carina_core::provider::PersistedAttributes;
@@ -824,21 +822,6 @@ pub struct PersistedAttributes {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistedAttributesError {
-    /// A context-free persisted attribute contained a raw pre-v12 marker.
-    #[error(
-        "persisted attribute {attribute_key:?} contains a raw pre-v12 secret marker; raw pre-v12 markers are accepted only from a state-file row"
-    )]
-    RawLegacyMarker { attribute_key: String },
-    /// The row-derived salt cannot be represented by the self-contained
-    /// legacy marker format.
-    #[error(
-        "persisted attribute {attribute_key:?} has a pre-v12 legacy salt of {actual} bytes; the maximum is {maximum} bytes"
-    )]
-    LegacySaltTooLong {
-        attribute_key: String,
-        actual: usize,
-        maximum: usize,
-    },
     #[error(transparent)]
     InvalidPersistedValue(PersistedAttributeDecodeError),
     #[error(transparent)]
@@ -898,55 +881,10 @@ impl std::error::Error for PersistedWireValueError {
 impl PersistedAttributesError {
     pub fn attribute_key(&self) -> &str {
         match self {
-            Self::RawLegacyMarker { attribute_key }
-            | Self::LegacySaltTooLong { attribute_key, .. } => attribute_key,
             Self::InvalidPersistedValue(error) => &error.attribute_key,
             Self::InvalidWireValue(error) => &error.attribute_key,
         }
     }
-}
-
-/// The identity and raw attributes decoded together from one state-file row.
-///
-/// Fields are private, so callers cannot pair a raw marker with a separately
-/// supplied resource id. Serde is the only constructor; decoding immediately
-/// upgrades raw pre-v12 markers using this row's own provider, type, and
-/// identity.
-///
-/// ```compile_fail
-/// use carina_core::provider::EncodedStateRowAttributes;
-///
-/// let _ = EncodedStateRowAttributes {
-///     provider: "mock".to_string(),
-///     resource_type: "test.resource".to_string(),
-///     identity: "wrong-row".try_into().unwrap(),
-///     attributes: Default::default(),
-/// };
-/// ```
-#[derive(Debug, Deserialize)]
-pub struct EncodedStateRowAttributes {
-    provider: String,
-    resource_type: String,
-    #[serde(alias = "name")]
-    identity: ResourceIdentity,
-    attributes: HashMap<String, serde_json::Value>,
-}
-
-/// A decoded state row plus the private origin needed to decode its deposed
-/// generations through the same raw-legacy upgrade boundary.
-#[derive(Debug)]
-pub struct DecodedStateRowAttributes {
-    provider: String,
-    resource_type: String,
-    identity: ResourceIdentity,
-    origin: StateRowLegacyOrigin,
-    attributes: PersistedAttributes,
-}
-
-#[derive(Debug)]
-struct StateRowLegacyOrigin {
-    display_type: String,
-    identity: String,
 }
 
 impl Serialize for PersistedAttributes {
@@ -983,68 +921,9 @@ impl<'a> PreviousSecretHashAuthority<'a> {
     }
 }
 
-impl EncodedStateRowAttributes {
-    pub fn decode(self) -> Result<DecodedStateRowAttributes, PersistedAttributesError> {
-        let display_type = if self.provider.is_empty() {
-            self.resource_type.clone()
-        } else {
-            format!("{}.{}", self.provider, self.resource_type)
-        };
-        let origin = StateRowLegacyOrigin {
-            display_type,
-            identity: self.identity.as_str().to_string(),
-        };
-        let attributes = PersistedAttributes::from_state_row_origin(self.attributes, &origin)?;
-        Ok(DecodedStateRowAttributes {
-            provider: self.provider,
-            resource_type: self.resource_type,
-            identity: self.identity,
-            origin,
-            attributes,
-        })
-    }
-}
-
-impl DecodedStateRowAttributes {
-    /// Decode another attribute map stored in the same state row, such as a
-    /// deposed generation, using the row's original legacy salt inputs.
-    pub fn decode_related_attributes(
-        &self,
-        encoded: HashMap<String, serde_json::Value>,
-    ) -> Result<PersistedAttributes, PersistedAttributesError> {
-        PersistedAttributes::from_state_row_origin(encoded, &self.origin)
-    }
-
-    pub fn into_parts(self) -> (String, String, ResourceIdentity, PersistedAttributes) {
-        (
-            self.provider,
-            self.resource_type,
-            self.identity,
-            self.attributes,
-        )
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn persisted_attributes_from_test_state_row(
-    id: &ResourceId,
-    attributes: HashMap<String, serde_json::Value>,
-) -> Result<PersistedAttributes, PersistedAttributesError> {
-    let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
-        "provider": id.provider,
-        "resource_type": id.resource_type,
-        "identity": id.identity_str().expect("test state row has a resolved identity"),
-        "attributes": attributes,
-    }))
-    .expect("test state row uses the encoded state shape");
-    let decoded = encoded.decode()?;
-    let (_, _, _, attributes) = decoded.into_parts();
-    Ok(attributes)
-}
-
 impl PersistedAttributes {
     /// Encode the typed placeholders captured in a saved-plan resource into
-    /// their state-marker representation.
+    /// their structural persisted representation.
     pub fn from_saved_plan_attributes<'a>(
         attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
     ) -> Self {
@@ -1057,16 +936,10 @@ impl PersistedAttributes {
         Self { encoded }
     }
 
-    /// Reconstruct saved attributes inside a provider guest from the values
-    /// carried by Carina's persisted-state WIT channel.
-    ///
-    /// The host decodes the state-file codec before crossing WIT: user map
-    /// keys are already unescaped, canonical enums are provider API strings,
-    /// and opaque secret hashes are marker strings. This constructor lifts
-    /// those marker strings recursively and then re-encodes the values as
-    /// validated provider/history state. It must not be used for ordinary
-    /// provider responses, whose marker-shaped strings are user data.
-    pub fn from_persisted_wire_values(
+    /// Reconstruct saved attributes from an already-typed persisted-state
+    /// transport. Redacted secrets arrive as `RedactedSecret`; strings are
+    /// always encoded as strings without content inspection.
+    pub fn from_typed_persisted_wire_values(
         values: HashMap<String, Value>,
     ) -> Result<Self, PersistedAttributesError> {
         let mut values: Vec<_> = values.into_iter().collect();
@@ -1074,11 +947,6 @@ impl PersistedAttributes {
 
         let mut encoded = HashMap::with_capacity(values.len());
         for (attribute_key, value) in values {
-            let value = lift_persisted_wire_secret_markers(value).map_err(|()| {
-                PersistedAttributesError::RawLegacyMarker {
-                    attribute_key: attribute_key.clone(),
-                }
-            })?;
             let value = PersistedValue::encode_provider_value(&value, None).map_err(|error| {
                 PersistedAttributesError::InvalidWireValue(PersistedWireValueError {
                     attribute_key: attribute_key.clone(),
@@ -1090,49 +958,19 @@ impl PersistedAttributes {
         Ok(Self { encoded })
     }
 
-    fn from_state_row_origin(
-        mut encoded: HashMap<String, serde_json::Value>,
-        origin: &StateRowLegacyOrigin,
-    ) -> Result<Self, PersistedAttributesError> {
-        for (key, value) in &mut encoded {
-            upgrade_raw_legacy_markers_for_state_row(value, origin, key)?;
-        }
-        Self::from_encoded(encoded)
-    }
-
     /// Construct a persisted attribute map from complete values produced by
     /// the core persisted encoder.
     pub fn from_persisted_values(
         encoded: HashMap<String, PersistedValue>,
     ) -> Result<Self, PersistedAttributesError> {
-        if let Some(attribute_key) = encoded
-            .iter()
-            .filter(|(_, value)| contains_raw_legacy_secret_marker_json(value.as_json()))
-            .map(|(key, _)| key)
-            .min()
-        {
-            return Err(PersistedAttributesError::RawLegacyMarker {
-                attribute_key: attribute_key.clone(),
-            });
-        }
         Ok(Self { encoded })
     }
 
-    /// Validate JSON entering through the state-row load seam. Raw pre-v12
-    /// legacy markers are rejected outside the row-aware upgrader.
-    fn from_encoded(
+    /// Validate JSON entering through the state-row load seam after versioned
+    /// migrations have rewritten legacy encodings.
+    pub fn from_encoded(
         encoded: HashMap<String, serde_json::Value>,
     ) -> Result<Self, PersistedAttributesError> {
-        if let Some(attribute_key) = encoded
-            .iter()
-            .filter(|(_, value)| contains_raw_legacy_secret_marker_json(value))
-            .map(|(key, _)| key)
-            .min()
-        {
-            return Err(PersistedAttributesError::RawLegacyMarker {
-                attribute_key: attribute_key.clone(),
-            });
-        }
         let encoded = encoded
             .into_iter()
             .map(|(attribute_key, value)| {
@@ -1151,12 +989,12 @@ impl PersistedAttributes {
         Ok(Self { encoded })
     }
 
-    /// Decode one stored attribute with persisted secret-marker semantics.
+    /// Decode one stored attribute with structural persisted-secret semantics.
     pub fn get(&self, key: &str) -> Option<Value> {
         self.encoded.get(key)?.decode()
     }
 
-    /// Decode every non-null stored attribute with persisted marker semantics.
+    /// Decode every non-null stored attribute with structural persisted-secret semantics.
     pub fn to_values(&self) -> HashMap<String, Value> {
         self.encoded
             .iter()
@@ -1379,110 +1217,6 @@ impl PersistedAttributes {
     }
 }
 
-fn lift_persisted_wire_secret_markers(value: Value) -> Result<Value, ()> {
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => {
-            let marker = value.expose_plaintext();
-            if crate::resource::RedactedSecretHash::is_raw_legacy_marker(marker) {
-                return Err(());
-            }
-            Ok(match persisted_secret_hash(marker) {
-                Some(hash) => Value::Deferred(DeferredValue::RedactedSecret { hash }),
-                None => Value::Concrete(ConcreteValue::String(value)),
-            })
-        }
-        Value::Concrete(ConcreteValue::StringList(values)) => {
-            if values.iter().any(|value| {
-                let value = value.expose_plaintext();
-                crate::resource::RedactedSecretHash::is_raw_legacy_marker(value)
-                    || persisted_secret_hash(value).is_some()
-            }) {
-                values
-                    .into_iter()
-                    .map(|value| {
-                        lift_persisted_wire_secret_markers(Value::Concrete(ConcreteValue::String(
-                            value,
-                        )))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(ConcreteValue::List)
-                    .map(Value::Concrete)
-            } else {
-                Ok(Value::Concrete(ConcreteValue::StringList(values)))
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(values)) => values
-            .into_iter()
-            .map(|(key, value)| lift_persisted_wire_secret_markers(value).map(|value| (key, value)))
-            .collect::<Result<IndexMap<_, _>, _>>()
-            .map(ConcreteValue::Map)
-            .map(Value::Concrete),
-        Value::Concrete(ConcreteValue::List(values)) => values
-            .into_iter()
-            .map(lift_persisted_wire_secret_markers)
-            .collect::<Result<Vec<_>, _>>()
-            .map(ConcreteValue::List)
-            .map(Value::Concrete),
-        value => Ok(value),
-    }
-}
-
-fn contains_raw_legacy_secret_marker_json(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(value) => {
-            crate::resource::RedactedSecretHash::is_raw_legacy_marker(value)
-        }
-        serde_json::Value::Array(values) => {
-            values.iter().any(contains_raw_legacy_secret_marker_json)
-        }
-        serde_json::Value::Object(values) => {
-            values.values().any(contains_raw_legacy_secret_marker_json)
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            false
-        }
-    }
-}
-
-fn upgrade_raw_legacy_markers_for_state_row(
-    value: &mut serde_json::Value,
-    origin: &StateRowLegacyOrigin,
-    top_level_attribute_key: &str,
-) -> Result<(), PersistedAttributesError> {
-    match value {
-        serde_json::Value::String(marker) => {
-            match crate::resource::RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
-                marker,
-                &origin.display_type,
-                &origin.identity,
-                top_level_attribute_key,
-            ) {
-                Ok(Some(hash)) => *marker = hash.persisted_marker(),
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(PersistedAttributesError::LegacySaltTooLong {
-                        attribute_key: top_level_attribute_key.to_string(),
-                        actual: error.actual,
-                        maximum: error.maximum,
-                    });
-                }
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                upgrade_raw_legacy_markers_for_state_row(value, origin, top_level_attribute_key)?;
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                upgrade_raw_legacy_markers_for_state_row(value, origin, top_level_attribute_key)?;
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretHashShape {
     None,
@@ -1495,7 +1229,7 @@ fn secret_hash_shape(value: &PersistedValue) -> SecretHashShape {
 }
 
 fn secret_hash_shape_view(value: PersistedView<'_>) -> SecretHashShape {
-    if value.is_secret_marker() {
+    if value.is_redacted_secret() {
         SecretHashShape::TopLevel
     } else if value
         .as_list()
@@ -1584,7 +1318,7 @@ fn merge_previous_secret_hashes_into_provider_json_inner(
     previous_value: PersistedView<'_>,
     provider_value: Option<PersistedView<'_>>,
 ) -> serde_json::Value {
-    if previous_value.is_secret_marker() {
+    if previous_value.is_redacted_secret() {
         let Some(provider_value) = provider_value else {
             return previous_value.to_owned_json();
         };
@@ -1682,7 +1416,7 @@ pub(crate) fn hash_provider_json_as_secret(
     hash_provider_view_as_secret(provider_value.view(), previous.map(PersistedValue::view)).map(
         |encoded| {
             PersistedValue::from_serialized_json(encoded)
-                .expect("a persisted secret marker is valid persisted JSON")
+                .expect("a structural persisted secret is valid persisted JSON")
         },
     )
 }
@@ -1695,7 +1429,7 @@ fn hash_provider_view_as_secret(
         return Err("cannot hash null provider secret".to_string());
     }
     let plaintext = provider_value
-        .decode_marker_strings_literally()
+        .decode_value()
         .ok_or_else(|| "cannot hash null provider secret".to_string())?;
     crate::value::persist_secret_json(&plaintext, previous).map_err(|error| error.to_string())
 }
@@ -3123,28 +2857,21 @@ mod tests {
     }
 
     #[test]
-    fn raw_legacy_persisted_attributes_require_a_state_row_constructor() {
-        let marker = format!("{}{}", crate::value::LEGACY_SECRET_PREFIX, "ab".repeat(32));
+    fn marker_shaped_strings_remain_plain_in_persisted_attributes() {
+        let marker = format!("_secret:argon2:{}", "ab".repeat(32));
         let encoded = serde_json::json!({ "token": marker });
-        let error = PersistedAttributes::from_encoded(
+        let persisted = PersistedAttributes::from_encoded(
             serde_json::from_value(encoded.clone()).expect("attribute object"),
         )
-        .expect_err("the checked context-free constructor must reject raw legacy markers");
-        assert_eq!(error.attribute_key(), "token");
+        .expect("marker-shaped strings are ordinary persisted values");
+        let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
+        assert_eq!(persisted.get("token"), Some(plain.clone()));
 
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
-        let persisted = persisted_attributes_from_test_state_row(
-            &id,
+        let persisted = PersistedAttributes::from_encoded(
             serde_json::from_value(encoded).expect("attribute object"),
         )
         .expect("state row decode");
-        assert!(matches!(
-            persisted.get("token"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { hash }))
-                if hash.persisted_marker().starts_with(
-                    crate::value::EXPLICIT_LEGACY_SECRET_PREFIX
-                )
-        ));
+        assert_eq!(persisted.get("token"), Some(plain));
     }
 
     #[test]
@@ -3180,9 +2907,6 @@ mod tests {
                 Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(
                     ConcreteValue::List(values.into_iter().map(host_value_to_guest_wire).collect()),
                 ),
-                Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
-                    Value::Concrete(ConcreteValue::String(hash.persisted_marker().into()))
-                }
                 value => value,
             }
         }
@@ -3259,40 +2983,28 @@ mod tests {
             .into_iter()
             .map(|(key, value)| (key, host_value_to_guest_wire(value)))
             .collect();
-        let guest = PersistedAttributes::from_persisted_wire_values(wire_values)
+        let guest = PersistedAttributes::from_typed_persisted_wire_values(wire_values)
             .expect("guest must reconstruct host-decoded saved attributes");
 
         assert_eq!(guest.to_values(), expected);
     }
 
     #[test]
-    fn state_loaded_legacy_attributes_round_trip_through_persisted_wire_values() {
-        let marker = format!("{}{}", crate::value::LEGACY_SECRET_PREFIX, "ab".repeat(32));
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
-        let loaded = persisted_attributes_from_test_state_row(
-            &id,
-            HashMap::from([("token".to_string(), serde_json::json!(marker))]),
-        )
-        .expect("state row decode");
-
-        let Value::Deferred(DeferredValue::RedactedSecret { hash }) =
-            loaded.get("token").expect("loaded token")
-        else {
-            panic!("state row decode must lift the legacy marker")
-        };
-        let guest = PersistedAttributes::from_persisted_wire_values(HashMap::from([(
+    fn typed_persisted_wire_values_preserve_explicit_legacy_digest() {
+        let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
+        let hash =
+            RedactedSecretHash::from_encoded_digest(&digest).expect("valid explicit legacy digest");
+        let typed = Value::Deferred(DeferredValue::RedactedSecret { hash });
+        let guest = PersistedAttributes::from_typed_persisted_wire_values(HashMap::from([(
             "token".to_string(),
-            Value::Concrete(ConcreteValue::String(hash.persisted_marker().into())),
+            typed.clone(),
         )]))
-        .expect("guest must decode the host's self-contained legacy marker");
-        let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) = guest.get("token")
-        else {
-            panic!("guest decode must preserve legacy secret semantics")
-        };
-        assert!(
-            hash.persisted_marker()
-                .starts_with("_secret:argon2-legacy:"),
-            "host wire must carry the explicit legacy salt",
+        .expect("typed persisted wire values must encode");
+
+        assert_eq!(guest.get("token"), Some(typed));
+        assert_eq!(
+            guest.encoded_value("token").map(PersistedValue::as_json),
+            Some(&serde_json::json!({ "$secret": digest })),
         );
     }
 
@@ -3303,55 +3015,52 @@ mod tests {
         argon2::Argon2::default()
             .hash_password_into(material, b"carina-secret-v1", &mut output)
             .expect("hash pre-v12 fallback-salt fixture");
-        let marker = format!(
-            "{}{}",
-            crate::value::LEGACY_SECRET_PREFIX,
-            hex::encode(output)
-        );
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
-        let loaded = persisted_attributes_from_test_state_row(
-            &id,
-            HashMap::from([("password".to_string(), serde_json::json!(marker))]),
-        )
-        .expect("state row decode");
-        let loaded_hash = loaded
-            .redacted_secret_hash("password")
-            .expect("state row decode must lift the legacy marker");
-        let round_trip = PersistedAttributes::from_persisted_wire_values(HashMap::from([(
-            "password".to_string(),
-            Value::Concrete(ConcreteValue::String(loaded_hash.persisted_marker().into())),
-        )]))
-        .expect("decode upgraded legacy digest from the persisted wire");
-        let hash = round_trip
-            .redacted_secret_hash("password")
-            .expect("upgraded marker remains typed");
+        let encoded =
+            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
+                serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
+                "mock.test.resource",
+                "old",
+                "password",
+            )
+            .expect("migrate row-bound legacy digest");
+        let persisted =
+            PersistedValue::from_serialized_json(encoded).expect("migrated structural secret");
+        let Value::Deferred(DeferredValue::RedactedSecret { hash }) =
+            persisted.decode().expect("typed migrated secret")
+        else {
+            panic!("migration must produce a typed redacted secret")
+        };
 
         assert!(hash.verify(material));
-        assert!(
-            hash.persisted_marker()
-                .starts_with(crate::value::EXPLICIT_LEGACY_SECRET_PREFIX)
-        );
+        assert!(hash.encoded_digest().starts_with("argon2-legacy:"));
     }
 
     #[test]
-    fn state_row_upgrade_rejects_legacy_salt_too_long_for_its_marker_format() {
-        let marker = format!("{}{}", crate::value::LEGACY_SECRET_PREFIX, "ab".repeat(32));
-        let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "x".repeat(5000),
-            "attributes": { "token": marker },
-        }))
-        .expect("decode oversized state row shape");
-
-        let error = encoded
-            .decode()
-            .expect_err("an upgraded marker must never exceed the parser's salt bound");
-        assert_eq!(error.attribute_key(), "token");
-        assert!(matches!(
-            error,
-            PersistedAttributesError::LegacySaltTooLong { .. }
-        ));
+    fn state_row_upgrade_rejects_legacy_salt_too_long_for_its_digest_format() {
+        let error =
+            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
+                serde_json::json!(format!("_secret:argon2:{}", "ab".repeat(32))),
+                "mock.test.resource",
+                &"x".repeat(5000),
+                "token",
+            )
+            .expect_err("an upgraded legacy digest must never exceed the parser's salt bound");
+        match error {
+            crate::resource::legacy_secret_migration::LegacySecretMigrationError::StateAttribute {
+                key,
+                source,
+            } => {
+                assert_eq!(key, "token");
+                assert!(matches!(
+                    *source,
+                    crate::resource::legacy_secret_migration::LegacySecretMigrationError::LegacySaltTooLong {
+                        actual,
+                        maximum: 4096,
+                    } if actual > 4096
+                ));
+            }
+            other => panic!("unexpected migration error: {other:?}"),
+        }
     }
 
     #[test]
@@ -3385,22 +3094,26 @@ mod tests {
         let tags = hashes
             .encoded_value("tags")
             .and_then(|value| value.as_json().as_object())
-            .expect("sparse marker object");
+            .expect("sparse secret inventory object");
         assert!(
             tags.get("S")
+                .and_then(|value| value.get(crate::value::PERSISTED_SECRET_KEY))
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(crate::value::is_persisted_secret),
+                .and_then(RedactedSecretHash::from_encoded_digest)
+                .is_some(),
         );
         assert!(!tags.contains_key("Vpc"));
         let items = hashes
             .encoded_value("items")
             .and_then(|value| value.as_json().as_array())
-            .expect("sparse marker list");
+            .expect("sparse secret inventory list");
         assert!(items[0].is_null(), "list indexes must remain stable");
         assert!(
             items[1]
-                .as_str()
-                .is_some_and(crate::value::is_persisted_secret),
+                .get(crate::value::PERSISTED_SECRET_KEY)
+                .and_then(serde_json::Value::as_str)
+                .and_then(RedactedSecretHash::from_encoded_digest)
+                .is_some(),
         );
     }
 
@@ -3408,12 +3121,14 @@ mod tests {
     fn provider_secret_hash_drops_null_fields_before_hashing() {
         let provider_json = serde_json::json!({ "a": "x", "b": null });
         let provider_value = PersistedValue::from_serialized_json(provider_json).unwrap();
-        let marker = hash_provider_json_as_secret(&provider_value, None)
+        let encoded_secret = hash_provider_json_as_secret(&provider_value, None)
             .expect("hash canonical provider secret");
-        let digest = crate::value::persisted_secret_hash(
-            marker.as_json().as_str().expect("persisted marker string"),
-        )
-        .expect("typed secret digest");
+        let digest = encoded_secret
+            .as_json()
+            .get(crate::value::PERSISTED_SECRET_KEY)
+            .and_then(serde_json::Value::as_str)
+            .and_then(RedactedSecretHash::from_encoded_digest)
+            .expect("typed secret digest");
         let desired_material =
             serde_json::to_vec(&serde_json::json!({ "a": "x" })).expect("serialize desired secret");
 

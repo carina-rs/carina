@@ -8,6 +8,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::PERSISTED_SECRET_KEY;
+
 fn default_true() -> bool {
     true
 }
@@ -42,6 +44,14 @@ pub struct TypeIdentity {
 ///
 /// Custom Serialize/Deserialize to produce untagged JSON (strings as `"hello"`,
 /// ints as `42`, etc.) without hitting serde's recursive monomorphization limit.
+///
+/// Redacted secrets are not representable at this ordinary boundary:
+///
+/// ```compile_fail
+/// use carina_provider_protocol::types::Value;
+///
+/// let _ = Value::RedactedSecret("digest".to_string());
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
@@ -110,13 +120,204 @@ impl Value {
             serde_json::Value::Array(a) => {
                 Value::List(a.into_iter().map(Value::from_json).collect())
             }
-            serde_json::Value::Object(m) => Value::Map(
-                m.into_iter()
-                    .map(|(k, v)| (k, Value::from_json(v)))
+            serde_json::Value::Object(values) => Value::Map(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::from_json(value)))
                     .collect(),
             ),
             serde_json::Value::Null => Value::String(String::new()),
         }
+    }
+}
+
+/// A value that crosses a persisted-state boundary.
+///
+/// This is deliberately distinct from [`Value`]: only persisted positions can
+/// carry an opaque redacted-secret digest or interpret the reserved
+/// [`PERSISTED_SECRET_KEY`] JSON object.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PersistedValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    RedactedSecret(String),
+    StringList(Vec<String>),
+    List(Vec<PersistedValue>),
+    Map(HashMap<String, PersistedValue>),
+}
+
+impl Serialize for PersistedValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Int(value) => serializer.serialize_i64(*value),
+            Self::Float(value) => serializer.serialize_f64(*value),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::RedactedSecret(digest) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(PERSISTED_SECRET_KEY, digest)?;
+                map.end()
+            }
+            Self::StringList(values) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    seq.serialize_element(value)?;
+                }
+                seq.end()
+            }
+            Self::List(values) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    seq.serialize_element(value)?;
+                }
+                seq.end()
+            }
+            Self::Map(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    let key = if key.starts_with('$') {
+                        Cow::Owned(format!("${key}"))
+                    } else {
+                        Cow::Borrowed(key.as_str())
+                    };
+                    map.serialize_entry(key.as_ref(), value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PersistedValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let json = serde_json::Value::deserialize(deserializer)?;
+        Self::from_json(json).map_err(D::Error::custom)
+    }
+}
+
+impl PersistedValue {
+    fn from_json(json: serde_json::Value) -> Result<Self, String> {
+        match json {
+            serde_json::Value::Bool(value) => Ok(Self::Bool(value)),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    Ok(Self::Int(value))
+                } else {
+                    Ok(Self::Float(value.as_f64().unwrap_or(0.0)))
+                }
+            }
+            serde_json::Value::String(value) => Ok(Self::String(value)),
+            serde_json::Value::Array(values) => values
+                .into_iter()
+                .map(Self::from_json)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::List),
+            serde_json::Value::Object(mut values) => {
+                if values.len() == 1 && values.contains_key(PERSISTED_SECRET_KEY) {
+                    return match values.remove(PERSISTED_SECRET_KEY) {
+                        Some(serde_json::Value::String(digest)) => Ok(Self::RedactedSecret(digest)),
+                        _ => Err(format!("malformed {PERSISTED_SECRET_KEY} protocol value")),
+                    };
+                }
+                if values
+                    .keys()
+                    .any(|key| key.starts_with('$') && !key.starts_with("$$"))
+                {
+                    return Err("invalid host-reserved protocol value".to_string());
+                }
+                values
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let key = key.strip_prefix('$').unwrap_or(&key).to_string();
+                        Self::from_json(value).map(|value| (key, value))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()
+                    .map(Self::Map)
+            }
+            serde_json::Value::Null => Ok(Self::String(String::new())),
+        }
+    }
+
+    /// Convert a persisted value into an ordinary provider value.
+    ///
+    /// This is fallible because a redacted secret is intentionally unavailable
+    /// at ordinary/cloud-value positions.
+    pub fn into_value(self) -> Result<Value, RedactedSecretValueError> {
+        self.try_into()
+    }
+
+    /// Clone this persisted value into an ordinary provider value when it does
+    /// not contain a redacted secret.
+    pub fn to_value(&self) -> Result<Value, RedactedSecretValueError> {
+        self.try_into()
+    }
+}
+
+/// Returned when a persisted value cannot be exposed as an ordinary value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactedSecretValueError;
+
+impl std::fmt::Display for RedactedSecretValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a redacted secret cannot be converted to an ordinary provider value")
+    }
+}
+
+impl std::error::Error for RedactedSecretValueError {}
+
+impl From<Value> for PersistedValue {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Bool(value) => Self::Bool(value),
+            Value::Int(value) => Self::Int(value),
+            Value::Float(value) => Self::Float(value),
+            Value::String(value) => Self::String(value),
+            Value::StringList(values) => Self::StringList(values),
+            Value::List(values) => Self::List(values.into_iter().map(Self::from).collect()),
+            Value::Map(values) => Self::Map(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::from(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl TryFrom<PersistedValue> for Value {
+    type Error = RedactedSecretValueError;
+
+    fn try_from(value: PersistedValue) -> Result<Self, Self::Error> {
+        match value {
+            PersistedValue::Bool(value) => Ok(Self::Bool(value)),
+            PersistedValue::Int(value) => Ok(Self::Int(value)),
+            PersistedValue::Float(value) => Ok(Self::Float(value)),
+            PersistedValue::String(value) => Ok(Self::String(value)),
+            PersistedValue::RedactedSecret(_) => Err(RedactedSecretValueError),
+            PersistedValue::StringList(values) => Ok(Self::StringList(values)),
+            PersistedValue::List(values) => values
+                .into_iter()
+                .map(Self::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::List),
+            PersistedValue::Map(values) => values
+                .into_iter()
+                .map(|(key, value)| Self::try_from(value).map(|value| (key, value)))
+                .collect::<Result<HashMap<_, _>, _>>()
+                .map(Self::Map),
+        }
+    }
+}
+
+impl TryFrom<&PersistedValue> for Value {
+    type Error = RedactedSecretValueError;
+
+    fn try_from(value: &PersistedValue) -> Result<Self, Self::Error> {
+        value.clone().try_into()
     }
 }
 
@@ -127,6 +328,47 @@ pub struct State {
     pub identifier: Option<String>,
     pub attributes: HashMap<String, Value>,
     pub exists: bool,
+}
+
+/// Mirrors a WIT `persisted-state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedState {
+    pub id: ResourceId,
+    pub identifier: Option<String>,
+    pub attributes: HashMap<String, PersistedValue>,
+    pub exists: bool,
+}
+
+impl From<State> for PersistedState {
+    fn from(state: State) -> Self {
+        Self {
+            id: state.id,
+            identifier: state.identifier,
+            attributes: state
+                .attributes
+                .into_iter()
+                .map(|(key, value)| (key, value.into()))
+                .collect(),
+            exists: state.exists,
+        }
+    }
+}
+
+impl TryFrom<PersistedState> for State {
+    type Error = RedactedSecretValueError;
+
+    fn try_from(state: PersistedState) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: state.id,
+            identifier: state.identifier,
+            attributes: state
+                .attributes
+                .into_iter()
+                .map(|(key, value)| Value::try_from(value).map(|value| (key, value)))
+                .collect::<Result<_, _>>()?,
+            exists: state.exists,
+        })
+    }
 }
 
 /// Result of a create operation.
@@ -147,10 +389,10 @@ pub enum CreateOutcome {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum UpdateOutcome {
     Success {
-        state: State,
+        state: PersistedState,
     },
     PartialSuccess {
-        state: State,
+        state: PersistedState,
         diagnostic: PartialReadDiagnostic,
     },
 }
@@ -208,8 +450,43 @@ pub struct CreateRequest {
 /// `update-request` in `wit/types.wit`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateRequest {
-    pub from: State,
+    pub from: PersistedState,
     pub patch: UpdatePatch,
+}
+
+impl PersistedState {
+    /// Apply an ordinary update patch while retaining every unmentioned
+    /// persisted attribute, including redacted secrets.
+    pub fn apply_patch(&mut self, patch: &UpdatePatch) {
+        for op in &patch.ops {
+            match op.kind {
+                PatchOpKind::Add | PatchOpKind::Replace => {
+                    if let Some(value) = op.value.clone() {
+                        self.attributes.insert(op.key.clone(), value.into());
+                    } else {
+                        self.attributes.remove(&op.key);
+                    }
+                }
+                PatchOpKind::Remove => {
+                    self.attributes.remove(&op.key);
+                }
+            }
+        }
+    }
+
+    /// Return this persisted state with an ordinary update patch applied.
+    pub fn with_patch(mut self, patch: &UpdatePatch) -> Self {
+        self.apply_patch(patch);
+        self
+    }
+}
+
+impl UpdateRequest {
+    /// Build the provider's post-update persisted state by applying the patch
+    /// to a clone of `from`. Unchanged redacted secrets remain typed.
+    pub fn state_after_patch(&self) -> PersistedState {
+        self.from.clone().with_patch(&self.patch)
+    }
 }
 
 /// Per-operation request record for `delete`. Mirrors
@@ -791,6 +1068,188 @@ mod tests {
             let back: Value = serde_json::from_str(&json).unwrap();
             assert_eq!(value, back);
         }
+    }
+
+    #[test]
+    fn persisted_value_redacted_secret_uses_a_structural_json_tag() {
+        let digest = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0MTIzNA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let value = PersistedValue::RedactedSecret(digest.to_string());
+
+        let json = serde_json::to_value(&value).expect("serialize redacted secret");
+        assert_eq!(json, serde_json::json!({"$secret": digest}));
+        assert_eq!(
+            serde_json::from_value::<PersistedValue>(json).expect("deserialize redacted secret"),
+            value
+        );
+    }
+
+    #[test]
+    fn value_marker_shaped_strings_never_gain_secret_semantics() {
+        let marker = "_secret:$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0MTIzNA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        assert_eq!(
+            serde_json::from_value::<Value>(serde_json::json!(marker))
+                .expect("deserialize ordinary string"),
+            Value::String(marker.to_string())
+        );
+    }
+
+    #[test]
+    fn value_deserialization_preserves_legacy_null_and_wide_number_fallbacks() {
+        assert_eq!(
+            serde_json::from_value::<Value>(serde_json::Value::Null)
+                .expect("null retains its legacy empty-string decoding"),
+            Value::String(String::new())
+        );
+
+        let number = serde_json::Number::from(u64::MAX);
+        let expected = number.as_f64().unwrap_or(0.0);
+        assert_eq!(
+            Value::from_json(serde_json::Value::Number(number)),
+            Value::Float(expected)
+        );
+    }
+
+    #[test]
+    fn ordinary_value_treats_persisted_shapes_as_ordinary_maps() {
+        for json in [
+            serde_json::json!({"$secret": 42}),
+            serde_json::json!({"$secret": "digest", "extra": true}),
+            serde_json::json!({"$reserved": "value"}),
+        ] {
+            let value = serde_json::from_value::<Value>(json).expect("ordinary map");
+            assert!(matches!(value, Value::Map(_)));
+        }
+    }
+
+    #[test]
+    fn persisted_value_rejects_malformed_tags_and_unescaped_reserved_keys() {
+        for json in [
+            serde_json::json!({"$secret": 42}),
+            serde_json::json!({"$secret": "digest", "extra": true}),
+            serde_json::json!({"$reserved": "value"}),
+        ] {
+            assert!(
+                serde_json::from_value::<PersistedValue>(json).is_err(),
+                "malformed or unescaped persisted objects must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_value_maps_escape_dollar_keys_around_structural_secret_tags() {
+        let value = PersistedValue::Map(HashMap::from([
+            (
+                "$secret".to_string(),
+                PersistedValue::String("user".to_string()),
+            ),
+            (
+                "typed".to_string(),
+                PersistedValue::RedactedSecret("argon2-legacy:73616c74:aa".to_string()),
+            ),
+        ]));
+
+        let json = serde_json::to_value(&value).expect("serialize value map");
+        assert_eq!(json["$$secret"], "user");
+        assert_eq!(
+            json["typed"],
+            serde_json::json!({"$secret": "argon2-legacy:73616c74:aa"})
+        );
+        assert_eq!(
+            serde_json::from_value::<PersistedValue>(json).expect("deserialize value map"),
+            value
+        );
+    }
+
+    #[test]
+    fn persisted_to_ordinary_conversion_is_recursive_and_rejects_redacted_secrets() {
+        let ordinary = Value::Map(HashMap::from([(
+            "$secret".to_string(),
+            Value::List(vec![Value::String("user".to_string())]),
+        )]));
+        let persisted = PersistedValue::from(ordinary.clone());
+        assert_eq!(persisted.to_value().unwrap(), ordinary);
+
+        let secret =
+            PersistedValue::List(vec![PersistedValue::RedactedSecret("digest".to_string())]);
+        assert_eq!(secret.into_value(), Err(RedactedSecretValueError));
+    }
+
+    #[test]
+    fn update_request_builds_carried_forward_persisted_state() {
+        let id = ResourceId {
+            provider: "mock".into(),
+            resource_type: "test.resource".into(),
+            identity: "example".into(),
+        };
+        let request = UpdateRequest {
+            from: PersistedState {
+                id,
+                identifier: Some("mock-id".into()),
+                attributes: HashMap::from([
+                    (
+                        "token".into(),
+                        PersistedValue::RedactedSecret("digest".into()),
+                    ),
+                    ("color".into(), PersistedValue::String("red".into())),
+                ]),
+                exists: true,
+            },
+            patch: UpdatePatch {
+                ops: vec![PatchOp {
+                    kind: PatchOpKind::Replace,
+                    key: "color".into(),
+                    value: Some(Value::String("blue".into())),
+                }],
+            },
+        };
+
+        let state = request.state_after_patch();
+        assert_eq!(
+            state.attributes.get("token"),
+            Some(&PersistedValue::RedactedSecret("digest".into()))
+        );
+        assert_eq!(
+            state.attributes.get("color"),
+            Some(&PersistedValue::String("blue".into()))
+        );
+    }
+
+    #[test]
+    fn update_patch_without_a_value_removes_add_and_replace_targets() {
+        let mut state = PersistedState {
+            id: ResourceId {
+                provider: "mock".into(),
+                resource_type: "test.resource".into(),
+                identity: "example".into(),
+            },
+            identifier: Some("mock-id".into()),
+            attributes: HashMap::from([
+                ("add-target".into(), PersistedValue::String("old".into())),
+                (
+                    "replace-target".into(),
+                    PersistedValue::String("old".into()),
+                ),
+            ]),
+            exists: true,
+        };
+        state.apply_patch(&UpdatePatch {
+            ops: vec![
+                PatchOp {
+                    kind: PatchOpKind::Add,
+                    key: "add-target".into(),
+                    value: None,
+                },
+                PatchOp {
+                    kind: PatchOpKind::Replace,
+                    key: "replace-target".into(),
+                    value: None,
+                },
+            ],
+        });
+
+        assert!(!state.attributes.contains_key("add-target"));
+        assert!(!state.attributes.contains_key("replace-target"));
     }
 
     #[test]

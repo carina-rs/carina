@@ -217,16 +217,16 @@ pub trait CarinaProvider {
     /// Normalize read-back state (optional).
     fn normalize_state(
         &self,
-        states: HashMap<String, State>,
-    ) -> Result<HashMap<String, State>, ProviderError> {
+        states: HashMap<String, PersistedState>,
+    ) -> Result<HashMap<String, PersistedState>, ProviderError> {
         Ok(states)
     }
 
     /// Hydrate read state with saved attributes that APIs don't return.
     fn hydrate_read_state(
         &self,
-        states: &mut HashMap<String, State>,
-        saved_attrs: &HashMap<String, HashMap<String, Value>>,
+        states: &mut HashMap<String, PersistedState>,
+        saved_attrs: &HashMap<String, HashMap<String, PersistedValue>>,
     ) -> Result<(), ProviderError> {
         let _ = (states, saved_attrs);
         Ok(())

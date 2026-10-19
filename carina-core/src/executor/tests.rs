@@ -4400,16 +4400,10 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     to_resource.set_attr("master_password", secret_value.clone());
 
     let hash_json = crate::value::value_to_json(&secret_value).expect("secret hash must serialize");
-    let hash_str = hash_json
-        .as_str()
-        .expect("secret hash must serialize to a string")
-        .to_string();
-    let hash = crate::value::persisted_secret_hash(&hash_str)
-        .expect("state hash must use the persisted marker format");
-    let persisted_secret: Value = serde_json::from_value(serde_json::json!({
-        "RedactedSecret": { "hash": hash }
-    }))
-    .expect("deserialize persisted secret");
+    let persisted_secret = crate::value::PersistedValue::from_serialized_json(hash_json)
+        .expect("state hash must use the persisted structural format")
+        .decode()
+        .expect("structural secret decodes to a typed value");
 
     let mut from_attrs = HashMap::new();
     from_attrs.insert("master_password".to_string(), persisted_secret);
@@ -4466,16 +4460,13 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     );
 
     let hash_json = crate::value::value_to_json(&secret_value).expect("secret hash must serialize");
-    let hash_str = hash_json
-        .as_str()
-        .expect("secret hash must serialize to a string")
-        .to_string();
+    let typed_hash = crate::value::PersistedValue::from_serialized_json(hash_json)
+        .expect("structural secret must decode")
+        .decode()
+        .expect("structural secret is non-null");
 
     let mut from_attrs = HashMap::new();
-    from_attrs.insert(
-        "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str.into())),
-    );
+    from_attrs.insert("master_password".to_string(), typed_hash);
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
     let mut plan = Plan::new();

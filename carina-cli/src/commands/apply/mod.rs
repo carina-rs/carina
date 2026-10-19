@@ -2601,8 +2601,11 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 16 guarantees that
-    // unquoted wait RHS identifiers use the typed enum representation; v15
+    // Validate version compatibility. Plan-file version 17 guarantees that
+    // state-originated secret placeholders came from structural secret tags;
+    // v16 may contain marker-shaped user strings that were misclassified and
+    // must be regenerated. Version 16 guarantees that unquoted wait RHS
+    // identifiers use the typed enum representation; v15
     // encoded them as Strings indistinguishable from intentionally quoted
     // comparisons and must be regenerated. Version 15 guarantees that secret
     // placeholders carry self-contained salts and that resource placeholders

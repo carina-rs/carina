@@ -7,11 +7,10 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use carina_core::resource::{ConcreteValue, DeferredValue, Value as CoreValue};
-use carina_core::value::PersistedValue;
+use carina_core::resource::{ConcreteValue, DeferredValue, RedactedSecretHash, Value as CoreValue};
+use carina_core::value::{PERSISTED_SECRET_KEY, PersistedValue};
 
-const STATE_SECRET_PREFIX: &str = "_secret:";
-const V2_SECRET_PREFIX: &str = "_secret:$argon2id$";
+const V2_SECRET_PREFIX: &str = "$argon2id$";
 
 struct Scenario {
     _temp: TempDir,
@@ -181,6 +180,54 @@ fn count_redacted_secrets(value: &Value) -> usize {
     }
 }
 
+fn assert_saved_plan_has_no_untyped_secret_encoding(value: &Value) {
+    fn walk(value: &Value, path: &mut Vec<String>, digest_allowed: bool) {
+        match value {
+            Value::String(value) => {
+                assert!(
+                    !value.contains(V2_SECRET_PREFIX) || digest_allowed,
+                    "saved plan contains an Argon2id digest outside a typed RedactedSecret hash at {}",
+                    path.join("."),
+                );
+            }
+            Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    path.push(index.to_string());
+                    walk(value, path, false);
+                    path.pop();
+                }
+            }
+            Value::Object(values) => {
+                let is_persisted_secret_tag = values.len() == 1
+                    && values
+                        .get(PERSISTED_SECRET_KEY)
+                        .is_some_and(Value::is_string);
+                assert!(
+                    !is_persisted_secret_tag,
+                    "saved plan contains a persisted-state {PERSISTED_SECRET_KEY} tag at {}",
+                    path.join("."),
+                );
+                let inside_redacted_secret = path
+                    .last()
+                    .is_some_and(|segment| segment == "RedactedSecret");
+                for (key, value) in values {
+                    assert!(
+                        !key.contains(V2_SECRET_PREFIX),
+                        "saved plan contains an Argon2id digest in an object key at {}",
+                        path.join("."),
+                    );
+                    path.push(key.clone());
+                    walk(value, path, inside_redacted_secret && key == "hash");
+                    path.pop();
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+
+    walk(value, &mut Vec::new(), false);
+}
+
 fn assert_plan_is_redacted(scenario: &Scenario, plaintexts: &[&str]) {
     let text = scenario.plan_text();
     for plaintext in plaintexts {
@@ -189,11 +236,8 @@ fn assert_plan_is_redacted(scenario: &Scenario, plaintexts: &[&str]) {
             "saved plan leaked secret plaintext {plaintext:?}:\n{text}",
         );
     }
-    assert!(
-        !text.contains(STATE_SECRET_PREFIX),
-        "saved plan must not encode a secret hash as an ordinary string:\n{text}",
-    );
     let json: Value = serde_json::from_str(&text).expect("valid saved-plan JSON");
+    assert_saved_plan_has_no_untyped_secret_encoding(&json);
     assert!(
         count_redacted_secrets(&json) > 0,
         "saved plan must use a typed RedactedSecret placeholder:\n{text}",
@@ -291,10 +335,9 @@ fn contains_redacted_secret_hash(value: &Value, expected: &str) -> bool {
 
 fn state_comment_hash<'a>(state: &'a Value, name: &str) -> &'a str {
     state_resource_by_name(state, name)["attributes"]["comment"]
-        .as_str()
-        .expect("state secret hash")
-        .strip_prefix(STATE_SECRET_PREFIX)
-        .expect("state secret prefix")
+        .get(PERSISTED_SECRET_KEY)
+        .and_then(Value::as_str)
+        .expect("structural state secret hash")
 }
 
 fn current_state_comment_placeholder_hash<'a>(plan: &'a Value, identity: &str) -> &'a str {
@@ -314,15 +357,113 @@ fn current_state_comment_placeholder_hash<'a>(plan: &'a Value, identity: &str) -
 }
 
 fn assert_secret_hash(value: &Value) {
-    let hash = value.as_str().expect("secret state value is a string");
+    let object = value.as_object().expect("secret state value is an object");
+    assert_eq!(object.len(), 1, "secret tag must contain exactly one entry");
+    let hash = object
+        .get(PERSISTED_SECRET_KEY)
+        .and_then(Value::as_str)
+        .expect("secret tag must carry a digest");
     assert!(
         hash.starts_with(V2_SECRET_PREFIX),
         "state must contain a secret hash, got {hash:?}",
     );
     assert!(
-        carina_core::value::persisted_secret_hash(hash).is_some(),
+        RedactedSecretHash::from_encoded_digest(hash).is_some(),
         "state secret hash must be a validated persisted digest",
     );
+}
+
+fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
+    let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+        ConcreteValue::String(plaintext.into()),
+    ))));
+    let encoded = PersistedValue::encode_provider_value(&secret, None)
+        .expect("test secret must be persistable");
+    format!(
+        "_secret:{}",
+        encoded
+            .as_json()
+            .as_object()
+            .and_then(|tag| tag.get(PERSISTED_SECRET_KEY))
+            .and_then(Value::as_str)
+            .expect("structural test secret carries a digest")
+    )
+}
+
+#[test]
+fn marker_shaped_plaintext_stays_plain_through_state_and_saved_plan_apply() {
+    let marker = valid_legacy_marker_shaped_string("saved-plan-marker-collision");
+    let scenario = Scenario::new(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+mock.test.resource {{
+  name    = "marker-collision"
+  comment = "{marker}"
+  tags = {{
+    nested = "{marker}"
+  }}
+}}
+"#
+    ));
+
+    assert_success(
+        "initial marker-collision apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let provider = scenario.provider_json();
+    let provider_resource = provider_resource_by_name(&provider, "marker-collision");
+    assert_eq!(provider_resource["comment"], marker);
+    assert_eq!(provider_resource["tags"]["nested"], marker);
+    let state = scenario.state_json();
+    let state_resource = state_resource_by_name(&state, "marker-collision");
+    assert_eq!(state_resource["attributes"]["comment"], marker);
+    assert_eq!(state_resource["attributes"]["tags"]["nested"], marker);
+
+    assert_success("marker-collision plan --out", &scenario.plan());
+    let plan = read_json(&scenario.project.join("plan.json"));
+    let desired = plan_resource_by_name(&plan, "marker-collision");
+    assert_eq!(
+        desired.pointer("/attributes/comment/String"),
+        Some(&Value::String(marker.clone()))
+    );
+    assert_eq!(
+        desired.pointer("/attributes/tags/Map/nested/String"),
+        Some(&Value::String(marker.clone()))
+    );
+    let current = plan["current_states"]
+        .as_array()
+        .expect("saved plan current states")
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer("/state/attributes/name/String")
+                .and_then(Value::as_str)
+                == Some("marker-collision")
+        })
+        .unwrap_or_else(|| panic!("saved plan has no marker-collision current state: {plan:#}"));
+    assert_eq!(
+        current.pointer("/state/attributes/comment/String"),
+        Some(&Value::String(marker.clone()))
+    );
+    assert_eq!(
+        current.pointer("/state/attributes/tags/Map/nested/String"),
+        Some(&Value::String(marker.clone()))
+    );
+    assert!(
+        !contains_redacted_secret_hash(&plan, marker.strip_prefix("_secret:").unwrap()),
+        "marker-shaped plaintext must never appear as RedactedSecret: {plan:#}",
+    );
+
+    assert_success("marker-collision saved-plan apply", &scenario.apply_plan());
+    let provider = scenario.provider_json();
+    let provider_resource = provider_resource_by_name(&provider, "marker-collision");
+    assert_eq!(provider_resource["comment"], marker);
+    assert_eq!(provider_resource["tags"]["nested"], marker);
+    let state = scenario.state_json();
+    let state_resource = state_resource_by_name(&state, "marker-collision");
+    assert_eq!(state_resource["attributes"]["comment"], marker);
+    assert_eq!(state_resource["attributes"]["tags"]["nested"], marker);
 }
 
 #[test]
@@ -400,10 +541,9 @@ mock.test.resource {
         ("same-secret-b", second_plan_hash),
     ] {
         let state_hash = state_resource_by_name(&state, name)["attributes"]["comment"]
-            .as_str()
-            .expect("state secret hash")
-            .strip_prefix(STATE_SECRET_PREFIX)
-            .expect("state secret prefix");
+            .get(PERSISTED_SECRET_KEY)
+            .and_then(Value::as_str)
+            .expect("structural state secret hash");
         assert_eq!(
             plan_hash, state_hash,
             "state writeback must reuse the exact saved-plan digest for {name}",
@@ -1098,7 +1238,7 @@ let consumer = mock.test.resource {
 }
 
 #[test]
-fn pre_typed_secret_plan_format_requires_replan() {
+fn v16_saved_plan_requires_replan() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -1111,7 +1251,7 @@ mock.test.resource {
     assert_success("carina plan --out", &scenario.plan());
     let plan_path = scenario.project.join("plan.json");
     let mut plan = read_json(&plan_path);
-    plan["version"] = Value::from(11);
+    plan["version"] = Value::from(16);
     fs::write(
         &plan_path,
         serde_json::to_vec_pretty(&plan).expect("serialize legacy plan"),
@@ -1122,11 +1262,11 @@ mock.test.resource {
     let rendered = output_text(&apply);
     assert!(
         !apply.status.success(),
-        "v11 saved plan applied:\n{rendered}"
+        "v16 saved plan applied:\n{rendered}"
     );
     assert!(
-        rendered.contains("Unsupported plan file version: 11") && rendered.contains("plan --out"),
-        "legacy format must fail with replan guidance:\n{rendered}",
+        rendered.contains("Unsupported plan file version: 16") && rendered.contains("plan --out"),
+        "v16 format must fail with replan guidance:\n{rendered}",
     );
 }
 

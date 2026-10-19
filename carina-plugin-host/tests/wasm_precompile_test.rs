@@ -103,7 +103,7 @@ fn build_protocol_v2_component() -> Vec<u8> {
     let mut provider_wit =
         std::fs::read_to_string(current_wit.join("provider.wit")).expect("read provider WIT");
     let resource_result = ") -> result<list<resource-def>, provider-error>;";
-    let state_result = ") -> result<list<tuple<string, state>>, provider-error>;";
+    let state_result = ") -> result<list<tuple<string, persisted-state>>, provider-error>;";
     assert_eq!(
         provider_wit.matches(resource_result).count(),
         1,
@@ -116,7 +116,7 @@ fn build_protocol_v2_component() -> Vec<u8> {
     );
     provider_wit = provider_wit
         .replace(resource_result, ") -> list<resource-def>;")
-        .replace(state_result, ") -> list<tuple<string, state>>;");
+        .replace(state_result, ") -> list<tuple<string, persisted-state>>;");
     std::fs::write(wit_dir.join("provider.wit"), provider_wit).expect("write v2 provider WIT");
     std::fs::write(
         wit_dir.join("world.wit"),
@@ -401,10 +401,12 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
         matches!(error, WasmProviderLoadError::Other(_)),
         "protocol rejection must not be classified as typed instantiation failure: {rendered}"
     );
+    let expected = format!(
+        "provider 'old-v2' was built against protocol version 2 but this host requires at least version {}",
+        carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION,
+    );
     assert!(
-        rendered.contains(
-            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 6"
-        ),
+        rendered.contains(&expected),
         "the stable info preflight must report the protocol mismatch: {rendered}"
     );
     assert!(

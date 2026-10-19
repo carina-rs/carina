@@ -461,8 +461,8 @@ fn is_type_default(
 ///
 /// Two cases are handled:
 /// 1. **Typed persisted hash** (from state file, `--refresh=false`): the state
-///    decoder has already lifted the marker to `RedactedSecret`. We hash the
-///    inner value and compare hashes.
+///    decoder has already lifted the structural `$secret` tag to
+///    `RedactedSecret`. We hash the inner value and compare hashes.
 /// 2. **Plain-text string** (from provider read, `--refresh=true`): the state
 ///    value is the raw secret. We compare the inner value directly. This is the
 ///    fix for issue #1249 where secrets nested in Maps (e.g., tags) caused false
