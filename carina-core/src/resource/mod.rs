@@ -2516,11 +2516,11 @@ pub enum DeferredValue {
     /// An opaque secret hash loaded from persisted state or a serialized
     /// saved plan.
     ///
-    /// It is deliberately deferred (rather than an ordinary string) so no
-    /// redaction guide can mistake a state marker for plaintext. Desired-side
-    /// provider and state-write boundaries reject it; persisted-state
-    /// boundaries may preserve its original marker bytes for legacy provider
-    /// compatibility. The DSL parser has no syntax that can construct it.
+    /// It is deliberately deferred (rather than an ordinary string), so
+    /// sensitivity is carried by the type instead of inferred from content.
+    /// Desired and ordinary provider boundaries reject it; persisted-state
+    /// boundaries preserve it through structural tags and typed wire variants.
+    /// The DSL parser has no syntax that can construct it.
     RedactedSecret { hash: RedactedSecretHash },
     /// A value not known at plan time. RFC #2371.
     Unknown(UnknownReason),
@@ -2788,8 +2788,8 @@ impl fmt::Debug for DeferredValue {
 ///
 /// New digests retain a validated Argon2id PHC string verbatim. The PHC
 /// string embeds the salt, algorithm version, and m/t/p parameters needed for
-/// context-free verification. Legacy state markers are upgraded at state-file
-/// load to carry the row-derived historical salt bytes alongside the hash.
+/// context-free verification. Legacy string encodings are upgraded at
+/// state-file load to carry the row-derived historical salt bytes alongside the hash.
 /// The fixed historical fallback salt lives in code, so no representable
 /// legacy digest depends on row context.
 #[derive(Clone)]
@@ -2810,15 +2810,10 @@ impl RedactedSecretHash {
     const SALT_LEN: usize = 16;
     const MAX_EXPLICIT_LEGACY_SALT_LEN: usize = 4096;
     pub const HASH_LEN: usize = 32;
-    /// Complete prefix of every new state marker. The bytes after `_secret:`
-    /// are a standard PHC string, for example
-    /// `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`.
-    pub const V2_MARKER_PREFIX: &'static str = "_secret:$argon2id$";
-    /// Marker used after a pre-v12 legacy digest has been bound at state-file
-    /// load. Its exact format is
-    /// `_secret:argon2-legacy:<row-salt-hex>:<hash-hex>`.
-    pub const EXPLICIT_LEGACY_MARKER_PREFIX: &'static str = "_secret:argon2-legacy:";
-    pub const LEGACY_MARKER_PREFIX: &'static str = "_secret:argon2:";
+    /// Historical prefix retained only as stable identity and list-pairing hash
+    /// material. Current persisted state uses the structural `$secret` tag.
+    const V2_MARKER_PREFIX: &'static str = "_secret:$argon2id$";
+    const LEGACY_MARKER_PREFIX: &'static str = "_secret:argon2:";
     const STATE_MARKER_PREFIX: &'static str = "_secret:";
     const EXPLICIT_LEGACY_DIGEST_PREFIX: &'static str = "argon2-legacy:";
     const LEGACY_FALLBACK_SALT: &'static [u8] = b"carina-secret-v1";
@@ -2872,18 +2867,18 @@ impl RedactedSecretHash {
 
     /// Parse a self-contained state marker. Raw pre-v12 legacy markers
     /// deliberately fail; only the state-file row decoder may upgrade those.
-    pub(crate) fn parse_persisted_marker(marker: &str) -> Option<Self> {
+    fn parse_legacy_persisted_marker(marker: &str) -> Option<Self> {
         marker
             .strip_prefix(Self::STATE_MARKER_PREFIX)
-            .and_then(Self::parse_encoded_digest)
+            .and_then(Self::from_encoded_digest)
     }
 
-    pub(crate) fn upgrade_raw_legacy_marker_for_state_row(
+    fn upgrade_raw_legacy_marker_for_state_row(
         marker: &str,
         display_type: &str,
         identity: &str,
         top_level_attribute_key: &str,
-    ) -> Result<Option<Self>, ExplicitLegacySaltTooLong> {
+    ) -> Result<Option<Self>, legacy_secret_migration::LegacySecretMigrationError> {
         let Some(encoded) = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX) else {
             return Ok(None);
         };
@@ -2897,10 +2892,12 @@ impl RedactedSecretHash {
         )
         .into_bytes();
         if row_salt.len() > Self::MAX_EXPLICIT_LEGACY_SALT_LEN {
-            return Err(ExplicitLegacySaltTooLong {
-                actual: row_salt.len(),
-                maximum: Self::MAX_EXPLICIT_LEGACY_SALT_LEN,
-            });
+            return Err(
+                legacy_secret_migration::LegacySecretMigrationError::LegacySaltTooLong {
+                    actual: row_salt.len(),
+                    maximum: Self::MAX_EXPLICIT_LEGACY_SALT_LEN,
+                },
+            );
         }
         Ok(Some(Self(RedactedSecretHashKind::ExplicitSaltLegacy {
             // Pre-v12 write-only attributes could use a context-free fallback
@@ -2911,24 +2908,7 @@ impl RedactedSecretHash {
         })))
     }
 
-    pub(crate) fn is_persisted_marker(marker: &str) -> bool {
-        Self::parse_persisted_marker(marker).is_some()
-    }
-
-    /// Whether `marker` is the exact raw digest shape written before state v12.
-    ///
-    /// Prefix lookalikes with a malformed or non-32-byte hash are ordinary
-    /// strings. All persisted and plugin boundaries use this classifier so
-    /// they agree on that distinction.
-    pub fn is_raw_legacy_marker(marker: &str) -> bool {
-        let Some(encoded) = marker.strip_prefix(Self::LEGACY_MARKER_PREFIX) else {
-            return false;
-        };
-        let mut hash = [0_u8; Self::HASH_LEN];
-        hex::decode_to_slice(encoded, &mut hash).is_ok()
-    }
-
-    fn parse_encoded_digest(encoded: &str) -> Option<Self> {
+    pub fn from_encoded_digest(encoded: &str) -> Option<Self> {
         if encoded.starts_with("$argon2id$") {
             let parsed = PasswordHash::new(encoded).ok()?;
             if parsed.algorithm != argon2::ARGON2ID_IDENT
@@ -2994,9 +2974,442 @@ impl RedactedSecretHash {
             }
         }
     }
+}
 
-    pub fn persisted_marker(&self) -> String {
-        format!("{}{}", Self::STATE_MARKER_PREFIX, self.encoded_digest())
+pub(crate) fn legacy_secret_identity_material(hash: &RedactedSecretHash) -> String {
+    format!(
+        "{}{}",
+        RedactedSecretHash::STATE_MARKER_PREFIX,
+        hash.encoded_digest()
+    )
+}
+
+/// Parsers and rewrites for state formats that encoded secret identity in
+/// `_secret:...` strings. Current persisted/provider/WASM decoders do not use
+/// this module; only version-checked whole-document migrations are public.
+/// Bare JSON values cannot be submitted for marker classification:
+///
+/// ```compile_fail
+/// use carina_core::resource::legacy_secret_migration;
+///
+/// let mut value = serde_json::json!("_secret:argon2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+/// let _ = legacy_secret_migration::migrate_state_row_attribute(
+///     &mut value,
+///     "mock.test.resource",
+///     "example",
+///     "password",
+/// );
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::resource::legacy_secret_migration;
+///
+/// let mut value = serde_json::json!("_secret:argon2-legacy:73616c74:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+/// legacy_secret_migration::migrate_self_contained_markers(&mut value);
+/// ```
+pub mod legacy_secret_migration {
+    use super::RedactedSecretHash;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LegacySecretMigrationError {
+        InvalidDocument {
+            artifact: &'static str,
+            detail: &'static str,
+        },
+        UnsupportedVersion {
+            artifact: &'static str,
+            found: u64,
+            expected: &'static str,
+        },
+        LegacySaltTooLong {
+            actual: usize,
+            maximum: usize,
+        },
+        StateAttribute {
+            key: String,
+            source: Box<LegacySecretMigrationError>,
+        },
+    }
+
+    impl std::fmt::Display for LegacySecretMigrationError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::InvalidDocument { artifact, detail } => {
+                    write!(f, "invalid {artifact} migration document: {detail}")
+                }
+                Self::UnsupportedVersion {
+                    artifact,
+                    found,
+                    expected,
+                } => write!(
+                    f,
+                    "cannot apply {artifact} migration to version {found}; expected {expected}"
+                ),
+                Self::LegacySaltTooLong { actual, maximum } => write!(
+                    f,
+                    "pre-v12 legacy salt has {actual} bytes; the maximum is {maximum} bytes"
+                ),
+                Self::StateAttribute { key, source } => {
+                    write!(f, "failed to migrate state attribute {key:?}: {source}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for LegacySecretMigrationError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::StateAttribute { source, .. } => Some(source),
+                Self::InvalidDocument { .. }
+                | Self::UnsupportedVersion { .. }
+                | Self::LegacySaltTooLong { .. } => None,
+            }
+        }
+    }
+
+    fn structural_secret(hash: &RedactedSecretHash) -> serde_json::Value {
+        serde_json::json!({
+            crate::value::PERSISTED_SECRET_KEY: hash.encoded_digest(),
+        })
+    }
+
+    /// Migrate the self-contained marker strings understood by mock-state v1.
+    /// Raw row-bound markers remain strings because that format never carried
+    /// the resource-row inputs required to assign them secret semantics.
+    fn migrate_self_contained_markers(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(marker) => {
+                if let Some(hash) = RedactedSecretHash::parse_legacy_persisted_marker(marker) {
+                    *value = structural_secret(&hash);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    migrate_self_contained_markers(value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    migrate_self_contained_markers(value);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
+    /// Migrate one top-level resource attribute from state v13 or earlier.
+    /// The row metadata binds exact pre-v12 raw digests to their historical
+    /// salt; self-contained markers need no row context.
+    fn migrate_state_row_attribute(
+        value: &mut serde_json::Value,
+        display_type: &str,
+        identity: &str,
+        top_level_attribute_key: &str,
+    ) -> Result<(), LegacySecretMigrationError> {
+        match value {
+            serde_json::Value::String(marker) => {
+                if let Some(hash) = RedactedSecretHash::parse_legacy_persisted_marker(marker) {
+                    *value = structural_secret(&hash);
+                } else if let Some(hash) =
+                    RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
+                        marker,
+                        display_type,
+                        identity,
+                        top_level_attribute_key,
+                    )?
+                {
+                    *value = structural_secret(&hash);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    migrate_state_row_attribute(
+                        value,
+                        display_type,
+                        identity,
+                        top_level_attribute_key,
+                    )?;
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    migrate_state_row_attribute(
+                        value,
+                        display_type,
+                        identity,
+                        top_level_attribute_key,
+                    )?;
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+        Ok(())
+    }
+
+    fn document_version(
+        document: &serde_json::Value,
+        artifact: &'static str,
+    ) -> Result<u64, LegacySecretMigrationError> {
+        let object = document
+            .as_object()
+            .ok_or(LegacySecretMigrationError::InvalidDocument {
+                artifact,
+                detail: "root must be an object",
+            })?;
+        object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(LegacySecretMigrationError::InvalidDocument {
+                artifact,
+                detail: "version must be an unsigned integer",
+            })
+    }
+
+    /// Upgrade a complete Carina state document through the v13 secret-marker
+    /// migration. Only current and deposed resource attribute trees are
+    /// classified; exports and all host metadata remain untouched.
+    pub fn migrate_state_document_v13(
+        document: &mut serde_json::Value,
+    ) -> Result<(), LegacySecretMigrationError> {
+        const ARTIFACT: &str = "Carina state v13";
+        let version = document_version(document, ARTIFACT)?;
+        if version > 13 {
+            return Err(LegacySecretMigrationError::UnsupportedVersion {
+                artifact: ARTIFACT,
+                found: version,
+                expected: "version 13 or earlier",
+            });
+        }
+
+        let mut migrated = document.clone();
+        let resources = migrated
+            .get_mut("resources")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or(LegacySecretMigrationError::InvalidDocument {
+                artifact: ARTIFACT,
+                detail: "resources must be an array",
+            })?;
+        for resource in resources {
+            let provider = resource
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let resource_type = resource
+                .get("resource_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let identity = resource
+                .get("identity")
+                .or_else(|| resource.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let display_type = if provider.is_empty() {
+                resource_type
+            } else {
+                format!("{provider}.{resource_type}")
+            };
+
+            let migrate_attributes =
+                |attributes: &mut serde_json::Map<String, serde_json::Value>| {
+                    for (key, value) in attributes {
+                        migrate_state_row_attribute(value, &display_type, &identity, key).map_err(
+                            |source| LegacySecretMigrationError::StateAttribute {
+                                key: key.clone(),
+                                source: Box::new(source),
+                            },
+                        )?;
+                    }
+                    Ok::<(), LegacySecretMigrationError>(())
+                };
+
+            if let Some(attributes) = resource
+                .get_mut("attributes")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                migrate_attributes(attributes)?;
+            }
+            if let Some(deposed) = resource
+                .get_mut("deposed")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for generation in deposed {
+                    if let Some(attributes) = generation
+                        .get_mut("attributes")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        migrate_attributes(attributes)?;
+                    }
+                }
+            }
+        }
+        migrated["version"] = serde_json::json!(14);
+        *document = migrated;
+        Ok(())
+    }
+
+    /// Upgrade a complete mock-provider v1 state document. Only values below
+    /// `states.<resource>.<attribute>` are eligible for legacy marker
+    /// classification.
+    pub fn migrate_mock_state_document_v1(
+        document: &mut serde_json::Value,
+    ) -> Result<(), LegacySecretMigrationError> {
+        const ARTIFACT: &str = "mock-provider state v1";
+        let version = document_version(document, ARTIFACT)?;
+        if version != 1 {
+            return Err(LegacySecretMigrationError::UnsupportedVersion {
+                artifact: ARTIFACT,
+                found: version,
+                expected: "version 1",
+            });
+        }
+
+        let mut migrated = document.clone();
+        let states = migrated
+            .get_mut("states")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(LegacySecretMigrationError::InvalidDocument {
+                artifact: ARTIFACT,
+                detail: "states must be an object",
+            })?;
+        for attributes in states.values_mut() {
+            let attributes =
+                attributes
+                    .as_object_mut()
+                    .ok_or(LegacySecretMigrationError::InvalidDocument {
+                        artifact: ARTIFACT,
+                        detail: "each resource state must be an attribute object",
+                    })?;
+            for value in attributes.values_mut() {
+                migrate_self_contained_markers(value);
+            }
+        }
+        migrated["version"] = serde_json::json!(2);
+        *document = migrated;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn migrate_legacy_state_attribute_for_test(
+        value: serde_json::Value,
+        display_type: &str,
+        identity: &str,
+        key: &str,
+    ) -> Result<serde_json::Value, LegacySecretMigrationError> {
+        let mut attributes = serde_json::Map::new();
+        attributes.insert(key.to_string(), value);
+        let mut document = serde_json::json!({
+            "version": 13,
+            "resources": [{
+                "provider": "",
+                "resource_type": display_type,
+                "identity": identity,
+                "attributes": attributes,
+                "deposed": [],
+            }],
+        });
+        migrate_state_document_v13(&mut document)?;
+        Ok(document["resources"][0]["attributes"]
+            .as_object_mut()
+            .and_then(|attributes| attributes.remove(key))
+            .expect("migrated test document must retain its attribute"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn state_v13_migration_checks_version_and_only_walks_resource_attributes() {
+            let raw_marker = format!("_secret:argon2:{}", "ab".repeat(32));
+            let mut document = serde_json::json!({
+                "version": 13,
+                "exports": {"literal": raw_marker},
+                "resources": [{
+                    "provider": "mock",
+                    "resource_type": "test.resource",
+                    "identity": "example",
+                    "attributes": {"token": raw_marker},
+                    "deposed": [{"attributes": {"nested": [raw_marker]}}]
+                }]
+            });
+
+            migrate_state_document_v13(&mut document).expect("migrate v13 state document");
+
+            assert_eq!(document["version"], 14);
+            assert!(
+                document["resources"][0]["attributes"]["token"][crate::value::PERSISTED_SECRET_KEY]
+                    .as_str()
+                    .is_some_and(|digest| digest.starts_with("argon2-legacy:"))
+            );
+            assert!(
+                document["resources"][0]["deposed"][0]["attributes"]["nested"][0]
+                    [crate::value::PERSISTED_SECRET_KEY]
+                    .as_str()
+                    .is_some_and(|digest| digest.starts_with("argon2-legacy:"))
+            );
+            assert_eq!(
+                document["exports"]["literal"],
+                serde_json::Value::String(raw_marker)
+            );
+
+            let mut current = serde_json::json!({
+                "version": 14,
+                "resources": [{
+                    "provider": "mock",
+                    "resource_type": "test.resource",
+                    "identity": "example",
+                    "attributes": {"token": format!("_secret:argon2:{}", "cd".repeat(32))}
+                }]
+            });
+            let unchanged = current.clone();
+            assert!(migrate_state_document_v13(&mut current).is_err());
+            assert_eq!(current, unchanged);
+        }
+
+        #[test]
+        fn mock_v1_migration_checks_version_and_walks_only_states() {
+            let marker = format!("_secret:argon2-legacy:73616c74:{}", "ab".repeat(32));
+            let mut document = serde_json::json!({
+                "version": 1,
+                "metadata": marker,
+                "states": {
+                    "test.resource.example": {
+                        "token": marker,
+                        "nested": [marker]
+                    }
+                }
+            });
+
+            migrate_mock_state_document_v1(&mut document).expect("migrate mock v1 document");
+
+            assert_eq!(document["version"], 2);
+            assert!(
+                document["states"]["test.resource.example"]["token"]
+                    [crate::value::PERSISTED_SECRET_KEY]
+                    .is_string()
+            );
+            assert!(
+                document["states"]["test.resource.example"]["nested"][0]
+                    [crate::value::PERSISTED_SECRET_KEY]
+                    .is_string()
+            );
+            assert_eq!(document["metadata"], marker);
+
+            let mut current = serde_json::json!({
+                "version": 2,
+                "states": {
+                    "test.resource.example": {"token": marker}
+                }
+            });
+            let unchanged = current.clone();
+            assert!(migrate_mock_state_document_v1(&mut current).is_err());
+            assert_eq!(current, unchanged);
+        }
     }
 }
 
@@ -3013,12 +3426,6 @@ fn valid_legacy_salt_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExplicitLegacySaltTooLong {
-    pub(crate) actual: usize,
-    pub(crate) maximum: usize,
 }
 
 impl PartialEq for RedactedSecretHash {
@@ -3070,7 +3477,7 @@ impl Serialize for RedactedSecretHash {
 impl<'de> Deserialize<'de> for RedactedSecretHash {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        Self::parse_encoded_digest(&encoded)
+        Self::from_encoded_digest(&encoded)
             .ok_or_else(|| serde::de::Error::custom("invalid self-contained secret digest"))
     }
 }
@@ -4625,7 +5032,7 @@ fn pairing_hashes(
 }
 
 fn secret_state_pairing_hash() -> u64 {
-    pairing_component_hash(0x08, &crate::value::SECRET_PREFIX)
+    pairing_component_hash(0x08, &RedactedSecretHash::V2_MARKER_PREFIX)
 }
 
 fn append_schema_pairing_hashes(

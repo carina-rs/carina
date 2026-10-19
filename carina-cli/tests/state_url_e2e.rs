@@ -53,6 +53,45 @@ fn write_minimal_state(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+fn write_secret_display_state(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("carina.state.json");
+    let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
+    let state = json!({
+        "version": 14,
+        "serial": 1,
+        "lineage": "secret-display-e2e",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.resource",
+            "identity": "display",
+            "binding": "display",
+            "provider": "mock",
+            "identifier": "display-id",
+            "attributes": {
+                "stored_secret": {"$secret": digest},
+                "user_secret_map": {"$$secret": "user-visible"}
+            },
+            "protected": false,
+            "directives": {},
+            "prefixes": {},
+            "name_overrides": {},
+            "dependency_bindings": []
+        }],
+        "exports": {}
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    path
+}
+
+fn assert_command_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "command failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[test]
 fn state_lookup_state_url_and_path_conflict() {
     let tmp = TempDir::new().unwrap();
@@ -102,6 +141,69 @@ fn state_lookup_bare_path_url_returns_attribute() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "vpc-deadbeef");
+}
+
+#[test]
+fn state_lookup_redacts_secrets_without_colliding_with_user_secret_keys() {
+    let tmp = TempDir::new().unwrap();
+    let state = write_secret_display_state(tmp.path());
+    let state = state.to_str().unwrap();
+
+    let raw_secret = carina(&[
+        "state",
+        "lookup",
+        "display.stored_secret",
+        "--state-url",
+        state,
+    ]);
+    assert_command_success(&raw_secret);
+    assert_eq!(
+        String::from_utf8_lossy(&raw_secret.stdout).trim(),
+        "(secret)"
+    );
+
+    let json_secret = carina(&[
+        "state",
+        "lookup",
+        "display.stored_secret",
+        "--state-url",
+        state,
+        "--json",
+    ]);
+    assert_command_success(&json_secret);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&json_secret.stdout).unwrap(),
+        json!("(secret)")
+    );
+
+    for args in [
+        vec![
+            "state",
+            "lookup",
+            "display.user_secret_map",
+            "--state-url",
+            state,
+        ],
+        vec![
+            "state",
+            "lookup",
+            "display.user_secret_map",
+            "--state-url",
+            state,
+            "--json",
+        ],
+    ] {
+        let output = carina(&args);
+        assert_command_success(&output);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            json!({"$secret": "user-visible"})
+        );
+    }
+
+    let digest_fragment = "argon2-legacy:73616c74";
+    assert!(!String::from_utf8_lossy(&raw_secret.stdout).contains(digest_fragment));
+    assert!(!String::from_utf8_lossy(&json_secret.stdout).contains(digest_fragment));
 }
 
 #[test]

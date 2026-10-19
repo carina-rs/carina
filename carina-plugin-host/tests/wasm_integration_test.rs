@@ -10,7 +10,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, EnumValueResolver, RawEnumIdentifier,
-    ResolvedResource, Resource, ResourceId, State, UnknownReason, Value,
+    RedactedSecretHash, ResolvedResource, Resource, ResourceId, State, UnknownReason, Value,
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
@@ -21,6 +21,53 @@ fn lifted_saved_attrs(
 ) -> carina_core::provider::LiftedSavedAttrs {
     RawSavedAttrs::from_decoded_values_for_test(entries.into_iter().collect())
         .lift(&carina_core::schema::SchemaRegistry::new())
+}
+
+fn migrate_legacy_state_attribute(
+    value: serde_json::Value,
+    display_type: &str,
+    identity: &str,
+    key: &str,
+) -> serde_json::Value {
+    let mut attributes = serde_json::Map::new();
+    attributes.insert(key.to_string(), value);
+    let mut document = serde_json::json!({
+        "version": 13,
+        "resources": [{
+            "provider": "",
+            "resource_type": display_type,
+            "identity": identity,
+            "attributes": attributes,
+            "deposed": [],
+        }],
+    });
+    carina_core::resource::legacy_secret_migration::migrate_state_document_v13(&mut document)
+        .expect("migrate legacy test state document");
+    document["resources"][0]["attributes"]
+        .as_object_mut()
+        .and_then(|attributes| attributes.remove(key))
+        .expect("migrated test document must retain its attribute")
+}
+
+fn redacted_secret_and_legacy_marker(plaintext: &str) -> (Value, String) {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String(plaintext.into()),
+    ))));
+    let persisted = PersistedValue::encode_provider_value(&secret, None)
+        .expect("test secret must be persistable");
+    let encoded = persisted.as_json();
+    let digest = encoded
+        .as_object()
+        .and_then(|tag| tag.get(carina_core::value::PERSISTED_SECRET_KEY))
+        .and_then(serde_json::Value::as_str)
+        .expect("structural test secret tag")
+        .to_string();
+    let hash: RedactedSecretHash =
+        serde_json::from_value(serde_json::json!(digest)).expect("deserialize generated digest");
+    (
+        Value::Deferred(DeferredValue::RedactedSecret { hash }),
+        format!("_secret:{digest}"),
+    )
 }
 
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
@@ -357,6 +404,165 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .expect("read should not error");
     assert!(deleted_state.identifier.is_none());
     assert!(deleted_state.attributes.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-update", None);
+    let (persisted_secret, _) = redacted_secret_and_legacy_marker("stored-write-only-secret");
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([
+            (
+                "color".to_string(),
+                Value::Concrete(ConcreteValue::String("red".into())),
+            ),
+            ("persisted_token".to_string(), persisted_secret),
+        ]),
+    )
+    .with_identifier("mock-id");
+    let resource = Resource::with_provider("mock", "test.resource", "secret-update", None)
+        .with_attribute(
+            "color",
+            Value::Concrete(ConcreteValue::String("blue".into())),
+        );
+    let request = update_request_for_test(
+        resource,
+        from,
+        &["color".to_string(), "persisted_token".to_string()],
+    )
+    .await;
+
+    let updated = provider
+        .update(&id, "mock-id", request)
+        .await
+        .expect("persisted current-state secrets must cross the update boundary")
+        .into_state_for_writeback();
+
+    assert_eq!(
+        updated.attributes.get("color"),
+        Some(&Value::Concrete(ConcreteValue::String("blue".into())))
+    );
+    assert!(
+        !updated.attributes.contains_key("persisted_token"),
+        "the ordinary remove patch must still be applied"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-carry", None);
+    let (persisted_secret, _) = redacted_secret_and_legacy_marker("stored-write-only-secret");
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([
+            (
+                "color".to_string(),
+                Value::Concrete(ConcreteValue::String("red".into())),
+            ),
+            ("persisted_token".to_string(), persisted_secret.clone()),
+        ]),
+    )
+    .with_identifier("mock-id");
+    let resource = Resource::with_provider("mock", "test.resource", "secret-carry", None)
+        .with_attribute(
+            "color",
+            Value::Concrete(ConcreteValue::String("blue".into())),
+        );
+    let request = update_request_for_test(resource, from, &["color".to_string()]).await;
+
+    let updated = provider
+        .update(&id, "mock-id", request)
+        .await
+        .expect("unchanged persisted secrets must cross the update outcome boundary")
+        .into_state_for_writeback();
+
+    assert_eq!(
+        updated.attributes.get("color"),
+        Some(&Value::Concrete(ConcreteValue::String("blue".into())))
+    );
+    assert_eq!(
+        updated.attributes.get("persisted_token"),
+        Some(&persisted_secret),
+        "the provider must carry the typed stored secret forward unchanged",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_for_read() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "nested-secret", None);
+    let cloud_payload = Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+        "label".to_string() => Value::Concrete(ConcreteValue::String("kept".into())),
+        "token".to_string() => Value::Concrete(ConcreteValue::String("cloud-secret".into())),
+    }));
+    let mut resource = Resource::with_provider("mock", "test.resource", "nested-secret", None);
+    resource.attributes = indexmap::IndexMap::from([
+        (
+            "color".into(),
+            Value::Concrete(ConcreteValue::String("red".into())),
+        ),
+        ("payload".into(), cloud_payload.clone()),
+    ]);
+    provider
+        .create(&id, create_request_for_test(resource.clone()).await)
+        .await
+        .expect("create should seed the mock cloud store");
+
+    let (persisted_secret, _) = redacted_secret_and_legacy_marker("cloud-secret");
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([
+            (
+                "color".to_string(),
+                Value::Concrete(ConcreteValue::String("red".into())),
+            ),
+            (
+                "payload".to_string(),
+                Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+                    "label".to_string() => Value::Concrete(ConcreteValue::String("kept".into())),
+                    "token".to_string() => persisted_secret,
+                })),
+            ),
+        ]),
+    )
+    .with_identifier("mock-id");
+    resource.set_attr(
+        "color",
+        Value::Concrete(ConcreteValue::String("blue".into())),
+    );
+    let request = update_request_for_test(resource, from, &["color".to_string()]).await;
+    provider
+        .update(&id, "mock-id", request)
+        .await
+        .expect("update should preserve the unchanged persisted attribute");
+
+    let read = provider
+        .read(&id, Some("mock-id"), ReadRequest)
+        .await
+        .expect("read after update should succeed");
+    assert_eq!(read.attributes.get("payload"), Some(&cloud_payload));
+    assert_eq!(
+        read.attributes.get("color"),
+        Some(&Value::Concrete(ConcreteValue::String("blue".into())))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -909,7 +1115,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
+async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
@@ -919,14 +1125,16 @@ async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("wasm-wire-secret".into()),
     ))));
-    let marker = PersistedValue::encode_provider_value(&secret, None)
+    let persisted = PersistedValue::encode_provider_value(&secret, None)
         .expect("serialize test secret")
         .as_json()
+        .clone();
+    let digest = persisted[carina_core::value::PERSISTED_SECRET_KEY]
         .as_str()
-        .expect("secret marker string")
+        .expect("structural secret digest")
         .to_string();
-    let expected_hash =
-        carina_core::value::persisted_secret_hash(&marker).expect("parse generated v2 marker");
+    let expected_hash = RedactedSecretHash::from_encoded_digest(&digest)
+        .expect("parse generated redacted-secret digest");
     let persisted_secret = Value::Deferred(DeferredValue::RedactedSecret {
         hash: expected_hash.clone(),
     });
@@ -940,7 +1148,7 @@ async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
     normalizer
         .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
         .await
-        .expect("persisted secret must cross the legacy guest wire");
+        .expect("persisted secret must cross the typed guest wire");
 
     assert!(matches!(
         states[&id].attributes.get("__mock_hydrated_read_state__"),
@@ -950,9 +1158,85 @@ async fn test_wasm_hydrate_read_state_round_trips_v2_persisted_secret_marker() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_hydrate_keeps_marker_strings_plain_top_level_and_nested() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let (redacted, marker) = redacted_secret_and_legacy_marker("wasm-marker-collision");
+    let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
+    let top_plain_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "top-plain", None);
+    let top_secret_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "top-secret", None);
+    let nested_id = ResourceId::with_provider_identity("mock", "test.resource", "nested", None);
+    let mut states = HashMap::from([
+        (
+            top_plain_id.clone(),
+            State::existing(top_plain_id.clone(), HashMap::new()),
+        ),
+        (
+            top_secret_id.clone(),
+            State::existing(top_secret_id.clone(), HashMap::new()),
+        ),
+        (
+            nested_id.clone(),
+            State::existing(nested_id.clone(), HashMap::new()),
+        ),
+    ]);
+    let nested = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+        ("plain".to_string(), plain.clone()),
+        ("typed".to_string(), redacted.clone()),
+        (
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![plain.clone(), redacted.clone()])),
+        ),
+    ])));
+    let saved_attrs = lifted_saved_attrs([
+        (
+            top_plain_id.clone(),
+            HashMap::from([("__mock_hydrate_read_state__".to_string(), plain.clone())]),
+        ),
+        (
+            top_secret_id.clone(),
+            HashMap::from([("__mock_hydrate_read_state__".to_string(), redacted.clone())]),
+        ),
+        (
+            nested_id.clone(),
+            HashMap::from([("__mock_hydrate_read_state__".to_string(), nested.clone())]),
+        ),
+    ]);
+
+    normalizer
+        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
+        .await
+        .expect("hydrate persisted strings and typed secrets");
+
+    assert_eq!(
+        states[&top_plain_id]
+            .attributes
+            .get("__mock_hydrated_read_state__"),
+        Some(&plain),
+    );
+    assert_eq!(
+        states[&top_secret_id]
+            .attributes
+            .get("__mock_hydrated_read_state__"),
+        Some(&redacted),
+    );
+    assert_eq!(
+        states[&nested_id]
+            .attributes
+            .get("__mock_hydrated_read_state__"),
+        Some(&nested),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change() {
     use argon2::Argon2;
-    use carina_core::provider::EncodedStateRowAttributes;
 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -969,19 +1253,19 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
     Argon2::default()
         .hash_password_into(&material, salt, &mut output)
         .expect("hash legacy write-only fixture");
-    let marker = format!("_secret:argon2:{}", hex::encode(output));
-    let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "legacy-write-only",
-        "attributes": { "__mock_write_only_secret__": marker },
-    }))
-    .expect("decode test state row");
-    let (_, _, _, persisted) = encoded
-        .decode()
-        .expect("upgrade test state row")
-        .into_parts();
-    let saved_attrs = lifted_saved_attrs([(id.clone(), persisted.to_values())]);
+    let encoded = migrate_legacy_state_attribute(
+        serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
+        "mock.test.resource",
+        "legacy-write-only",
+        "__mock_write_only_secret__",
+    );
+    let persisted: PersistedValue =
+        serde_json::from_value(encoded).expect("migration emits valid persisted JSON");
+    let typed = persisted.decode().expect("migration emits a typed secret");
+    let saved_attrs = lifted_saved_attrs([(
+        id.clone(),
+        HashMap::from([("__mock_write_only_secret__".to_string(), typed)]),
+    )]);
     let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
 
     normalizer
@@ -992,11 +1276,11 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
     let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
         states[&id].attributes.get("__mock_write_only_secret__")
     else {
-        panic!("hydrated write-only legacy marker must remain typed")
+        panic!("hydrated write-only legacy secret must remain typed")
     };
     assert!(
         hash.verify(&material),
-        "the returned marker must retain the saved row's origin without a previous current-state leaf",
+        "the returned digest must retain the saved row's origin without a previous current-state leaf",
     );
 
     let desired = Resource::from_id(id.clone()).with_attribute(

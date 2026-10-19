@@ -1854,9 +1854,10 @@ pub(crate) mod version_checked_bindings {
         pub(super) async fn call_normalize_state(
             &self,
             store: &mut Store<HostState>,
-            states: &[(String, wit_types::State)],
-        ) -> wasmtime::Result<Result<Vec<(String, wit_types::State)>, wit_types::ProviderError>>
-        {
+            states: &[(String, wit_types::PersistedState)],
+        ) -> wasmtime::Result<
+            Result<Vec<(String, wit_types::PersistedState)>, wit_types::ProviderError>,
+        > {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
                     b.carina_provider_provider()
@@ -1874,10 +1875,11 @@ pub(crate) mod version_checked_bindings {
         pub(super) async fn call_hydrate_read_state(
             &self,
             store: &mut Store<HostState>,
-            states: &[(String, wit_types::State)],
-            saved_attrs: &[(String, Vec<(String, wit_types::Value)>)],
-        ) -> wasmtime::Result<Result<Vec<(String, wit_types::State)>, wit_types::ProviderError>>
-        {
+            states: &[(String, wit_types::PersistedState)],
+            saved_attrs: &[(String, Vec<(String, wit_types::PersistedValue)>)],
+        ) -> wasmtime::Result<
+            Result<Vec<(String, wit_types::PersistedState)>, wit_types::ProviderError>,
+        > {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
                     b.carina_provider_provider()
@@ -3265,12 +3267,12 @@ impl fmt::Display for WasmNormalizerResultCountError {
 
 impl std::error::Error for WasmNormalizerResultCountError {}
 
-type WitStateAttributeUpdate = (ResourceId, Vec<(String, wit_types::Value)>);
+type WitStateAttributeUpdate = (ResourceId, Vec<(String, wit_types::PersistedValue)>);
 
 fn validate_wit_state_result_keys(
     operation: &'static str,
     expected_ids_by_key: &HashMap<String, ResourceId>,
-    results: Vec<(String, wit_types::State)>,
+    results: Vec<(String, wit_types::PersistedState)>,
 ) -> ProviderResult<Vec<WitStateAttributeUpdate>> {
     let expected_keys = expected_ids_by_key.keys().cloned().collect::<BTreeSet<_>>();
     let mut returned = HashMap::with_capacity(results.len());
@@ -3312,7 +3314,7 @@ fn validate_wit_state_result_keys(
 fn take_single_wit_state_result(
     operation: &'static str,
     id: ResourceId,
-    results: Vec<(String, wit_types::State)>,
+    results: Vec<(String, wit_types::PersistedState)>,
 ) -> ProviderResult<WitStateAttributeUpdate> {
     if results.len() != 1 {
         return Err(ProviderError::internal_caused_by(
@@ -3533,7 +3535,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
             for (id, state) in current_states.iter() {
                 let key = wasm_convert::resource_id_wire_key(id);
-                let wit = wasm_convert::core_to_wit_state(state)
+                let wit = wasm_convert::core_to_wit_persisted_state(state)
                     .map_err(|error| wasm_value_encode_provider_error("normalize_state", error))?;
                 match id.identity_state() {
                     ResourceIdentityState::Pending(_) => {
@@ -3630,9 +3632,10 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
             for (id, state) in current_states.iter() {
                 let key = wasm_convert::resource_id_wire_key(id);
-                let wit_state = wasm_convert::core_to_wit_state(state).map_err(|error| {
-                    wasm_value_encode_provider_error("hydrate_read_state current state", error)
-                })?;
+                let wit_state =
+                    wasm_convert::core_to_wit_persisted_state(state).map_err(|error| {
+                        wasm_value_encode_provider_error("hydrate_read_state current state", error)
+                    })?;
                 let wit_saved =
                     wasm_convert::core_saved_attrs_to_wit(saved_attrs, id).map_err(|error| {
                         wasm_value_encode_provider_error(
@@ -3751,6 +3754,32 @@ mod tests {
 
     fn test_string_value(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
+    }
+
+    fn migrate_legacy_state_attribute(
+        value: serde_json::Value,
+        display_type: &str,
+        identity: &str,
+        key: &str,
+    ) -> serde_json::Value {
+        let mut attributes = serde_json::Map::new();
+        attributes.insert(key.to_string(), value);
+        let mut document = serde_json::json!({
+            "version": 13,
+            "resources": [{
+                "provider": "",
+                "resource_type": display_type,
+                "identity": identity,
+                "attributes": attributes,
+                "deposed": [],
+            }],
+        });
+        carina_core::resource::legacy_secret_migration::migrate_state_document_v13(&mut document)
+            .expect("migrate legacy test state document");
+        document["resources"][0]["attributes"]
+            .as_object_mut()
+            .and_then(|attributes| attributes.remove(key))
+            .expect("migrated test document must retain its attribute")
     }
 
     fn assert_value_structure_eq(actual: &Value, expected: &Value) {
@@ -4252,7 +4281,7 @@ mod tests {
             "mock.test.resource.malformed-boundary".to_string(),
             vec![(
                 "settings".to_string(),
-                wit_types::Value::ListVal("not-json".to_string()),
+                wit_types::PersistedValue::ListVal("not-json".to_string()),
             )],
         )];
         let mut locked = LockedStore::acquire(&instance, "hydrate_read_state")
@@ -4311,7 +4340,7 @@ mod tests {
 
     #[test]
     fn malformed_normalized_state_output_is_atomic() {
-        use wit_types::Value as WitValue;
+        use wit_types::PersistedValue as WitValue;
 
         let first_id = Resource::with_provider("mock", "test.resource", "first", None).id;
         let second_id = Resource::with_provider("mock", "test.resource", "second", None).id;
@@ -4368,8 +4397,7 @@ mod tests {
     #[test]
     fn normalized_state_roundtrip_preserves_self_contained_legacy_secret() {
         use argon2::Argon2;
-        use carina_core::provider::EncodedStateRowAttributes;
-        use wit_types::Value as WitValue;
+        use wit_types::PersistedValue as WitValue;
 
         let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
         let material = b"\"wire-legacy\"";
@@ -4378,24 +4406,22 @@ mod tests {
         Argon2::default()
             .hash_password_into(material, salt, &mut output)
             .expect("hash legacy state fixture");
-        let marker = format!("_secret:argon2:{}", hex::encode(output));
-        let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "legacy",
-            "attributes": { "comment": marker },
-        }))
-        .expect("decode test state row");
-        let (_, _, _, persisted) = encoded
-            .decode()
-            .expect("upgrade test state row")
-            .into_parts();
-        let upgraded_marker = persisted
-            .encoded_value("comment")
-            .and_then(|value| value.as_json().as_str())
-            .expect("state load upgrades the raw legacy marker")
+        let encoded = migrate_legacy_state_attribute(
+            serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
+            "mock.test.resource",
+            "legacy",
+            "comment",
+        );
+        let digest = encoded[carina_core::value::PERSISTED_SECRET_KEY]
+            .as_str()
+            .expect("migration produces a structural secret")
             .to_string();
-        let attributes = persisted.to_values();
+        let hash = carina_core::resource::RedactedSecretHash::from_encoded_digest(&digest)
+            .expect("migration produces a valid digest");
+        let attributes = HashMap::from([(
+            "comment".to_string(),
+            Value::Deferred(DeferredValue::RedactedSecret { hash }),
+        )]);
         let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
 
         apply_wit_state_attribute_updates(
@@ -4403,7 +4429,7 @@ mod tests {
             &mut states,
             vec![(
                 id.clone(),
-                vec![("comment".to_string(), WitValue::StrVal(upgraded_marker))],
+                vec![("comment".to_string(), WitValue::RedactedSecretVal(digest))],
             )],
         )
         .expect("apply normalized state");
@@ -4434,7 +4460,7 @@ mod tests {
     #[test]
     fn single_state_result_rejects_more_than_one_entry() {
         let id = Resource::with_provider("mock", "test.resource", "only", None).id;
-        let state = wit_types::State {
+        let state = wit_types::PersistedState {
             identifier: None,
             attributes: Vec::new(),
             exists: true,

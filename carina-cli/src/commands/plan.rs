@@ -156,7 +156,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 16;
+    pub const CURRENT_VERSION: u32 = 17;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.

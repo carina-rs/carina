@@ -178,11 +178,11 @@ impl CarinaProvider for MockProcessProvider {
         _identifier: &str,
         request: UpdateRequest,
     ) -> Result<UpdateOutcome, ProviderError> {
-        // Apply the patch on top of `from` to construct the post-update
-        // attribute map. Also echo the patch op kinds into a sentinel
-        // attribute so integration tests can assert the patch
-        // round-tripped through the WIT boundary.
-        let mut attributes = request.from.attributes.clone();
+        // Apply the patch on top of `from` while preserving typed persisted
+        // values that were not mentioned by the patch. Also echo the patch op
+        // kinds into a sentinel attribute so integration tests can assert the
+        // patch round-tripped through the WIT boundary.
+        let mut state = request.state_after_patch();
         let mut applied_op_kinds: Vec<Value> = Vec::with_capacity(request.patch.ops.len());
         for op in &request.patch.ops {
             applied_op_kinds.push(Value::String(format!(
@@ -194,32 +194,37 @@ impl CarinaProvider for MockProcessProvider {
                 },
                 op.key,
             )));
+        }
+        let patch_sentinel = Value::List(applied_op_kinds);
+        state.attributes.insert(
+            "__mock_patch_ops__".to_string(),
+            patch_sentinel.clone().into(),
+        );
+        state.identifier = Some("mock-id".into());
+        state.exists = true;
+
+        let mut states = self.states.lock().unwrap();
+        let cloud_attributes = states.entry(Self::resource_key(id)).or_default();
+        // The fake cloud retains its existing ordinary values and receives
+        // only the user's patch. Never rebuild it from persisted `from` state:
+        // that would either send redacted digests to the cloud or discard an
+        // entire nested attribute containing an unchanged stored secret.
+        for op in &request.patch.ops {
             match op.kind {
                 PatchOpKind::Add | PatchOpKind::Replace => {
-                    if let Some(value) = op.value.clone() {
-                        attributes.insert(op.key.clone(), value);
+                    if let Some(value) = &op.value {
+                        cloud_attributes.insert(op.key.clone(), value.clone());
+                    } else {
+                        cloud_attributes.remove(&op.key);
                     }
                 }
                 PatchOpKind::Remove => {
-                    attributes.remove(&op.key);
+                    cloud_attributes.remove(&op.key);
                 }
             }
         }
-        attributes.insert(
-            "__mock_patch_ops__".to_string(),
-            Value::List(applied_op_kinds),
-        );
+        cloud_attributes.insert("__mock_patch_ops__".to_string(), patch_sentinel);
 
-        let mut states = self.states.lock().unwrap();
-        let key = Self::resource_key(id);
-        states.insert(key, attributes.clone());
-
-        let state = State {
-            id: id.clone(),
-            identifier: Some("mock-id".into()),
-            attributes,
-            exists: true,
-        };
         Ok(UpdateOutcome::Success { state })
     }
 
@@ -273,8 +278,8 @@ impl CarinaProvider for MockProcessProvider {
 
     fn normalize_state(
         &self,
-        states: HashMap<String, State>,
-    ) -> Result<HashMap<String, State>, ProviderError> {
+        states: HashMap<String, PersistedState>,
+    ) -> Result<HashMap<String, PersistedState>, ProviderError> {
         let rekey_single_result = states
             .values()
             .any(|state| state.attributes.contains_key("__mock_rekey_state_result__"));
@@ -339,8 +344,8 @@ impl CarinaProvider for MockProcessProvider {
 
     fn hydrate_read_state(
         &self,
-        states: &mut HashMap<String, State>,
-        saved_attrs: &HashMap<String, HashMap<String, Value>>,
+        states: &mut HashMap<String, PersistedState>,
+        saved_attrs: &HashMap<String, HashMap<String, PersistedValue>>,
     ) -> Result<(), ProviderError> {
         let rekey_single_result = states
             .values()

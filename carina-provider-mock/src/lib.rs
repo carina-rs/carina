@@ -13,14 +13,16 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError,
     ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
 };
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
+};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
 use serde::{Deserialize, Serialize};
 
 pub const BUILTIN_PROVIDER_NAME: &str = "mock";
 
-const MOCK_STATE_VERSION: u32 = 1;
+const MOCK_STATE_VERSION: u32 = 2;
 
 type MockStates = HashMap<String, HashMap<String, PersistedValue>>;
 type RawMockStates = HashMap<String, HashMap<String, serde_json::Value>>;
@@ -277,37 +279,50 @@ impl MockProvider {
     }
 
     fn decode_state_file(content: &str) -> io::Result<MockStates> {
-        let encoded: serde_json::Value = serde_json::from_str(content)
+        let mut encoded: serde_json::Value = serde_json::from_str(content)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
         let is_versioned = encoded
             .as_object()
             .is_some_and(|object| object.contains_key("version") || object.contains_key("states"));
-        let (mut states, migrate_legacy) = if is_versioned {
-            let file: EncodedMockStateFile = serde_json::from_value(encoded)
+        if !is_versioned {
+            let mut states: RawMockStates = serde_json::from_value(encoded)
                 .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-            if file.version != MOCK_STATE_VERSION {
+            for attributes in states.values_mut() {
+                for value in attributes.values_mut() {
+                    migrate_legacy_persisted_json(value);
+                }
+            }
+            encoded = serde_json::json!({
+                "version": 1,
+                "states": states,
+            });
+        }
+
+        let file: EncodedMockStateFile = serde_json::from_value(encoded.clone())
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+        let mut states = match file.version {
+            MOCK_STATE_VERSION => file.states,
+            1 => {
+                legacy_secret_migration::migrate_mock_state_document_v1(&mut encoded)
+                    .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+                serde_json::from_value::<EncodedMockStateFile>(encoded)
+                    .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
+                    .states
+            }
+            version => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
-                        "unsupported mock state version {}; expected {}",
-                        file.version, MOCK_STATE_VERSION
+                        "unsupported mock state version {version}; expected {MOCK_STATE_VERSION}"
                     ),
                 ));
             }
-            (file.states, false)
-        } else {
-            let states: RawMockStates = serde_json::from_value(encoded)
-                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-            (states, true)
         };
 
         let mut decoded = HashMap::with_capacity(states.len());
         for (resource_key, attributes) in &mut states {
             let mut decoded_attributes = HashMap::with_capacity(attributes.len());
             for (attribute_key, value) in attributes {
-                if migrate_legacy {
-                    migrate_legacy_persisted_json(value);
-                }
                 let value = serde_json::from_value(value.take()).map_err(|source| {
                     io::Error::new(
                         ErrorKind::InvalidData,
@@ -932,6 +947,23 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.into()))
     }
 
+    fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
+        let secret = Value::Deferred(carina_core::resource::DeferredValue::Secret(Box::new(
+            string_value(plaintext),
+        )));
+        let encoded = PersistedValue::encode_provider_value(&secret, None)
+            .expect("test secret must be persistable");
+        let encoded = serde_json::to_value(encoded).expect("serialize persisted test secret");
+        format!(
+            "_secret:{}",
+            encoded
+                .as_object()
+                .and_then(|tag| tag.get(carina_core::value::PERSISTED_SECRET_KEY))
+                .and_then(serde_json::Value::as_str)
+                .expect("structural test secret carries a digest")
+        )
+    }
+
     fn mock_provider_config() -> ProviderConfig {
         carina_core::parser::parse(
             "provider mock {}\n",
@@ -1047,6 +1079,101 @@ mod tests {
     }
 
     #[test]
+    fn v1_state_migrates_self_contained_markers_to_structural_tags() {
+        let marker = valid_legacy_marker_shaped_string("mock-v1-secret");
+        let digest = marker
+            .strip_prefix("_secret:")
+            .expect("test marker has the old boundary prefix");
+        let content = serde_json::json!({
+            "version": 1,
+            "states": {
+                "test.resource.legacy": {
+                    "top": marker,
+                    "nested": {
+                        "items": [marker],
+                        "explicit": "_secret:argon2-legacy:73616c74:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    },
+                    "raw": "_secret:argon2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+            }
+        });
+
+        let states = MockProvider::decode_state_file(&content.to_string())
+            .expect("mock v1 state should migrate");
+        let attrs = &states["test.resource.legacy"];
+        let top = serde_json::to_value(&attrs["top"]).expect("serialize migrated top value");
+        let nested =
+            serde_json::to_value(&attrs["nested"]).expect("serialize migrated nested value");
+        assert_eq!(top, serde_json::json!({"$secret": digest}));
+        assert_eq!(nested["items"][0], serde_json::json!({"$secret": digest}));
+        assert!(
+            nested["explicit"]["$secret"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("argon2-legacy:"))
+        );
+        assert_eq!(
+            attrs["raw"].decode(),
+            Some(string_value(
+                "_secret:argon2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            )),
+            "mock v1 never assigned row-aware semantics to raw legacy strings",
+        );
+    }
+
+    #[test]
+    fn fresh_v2_state_round_trip_keeps_marker_shaped_plaintext_plain() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _op_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
+        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        let provider = MockProvider {
+            state_file: state_file.clone(),
+            partial_create: None,
+            partial_update: None,
+        };
+        let marker = valid_legacy_marker_shaped_string("mock-v2-collision");
+        let plain = string_value(marker.clone());
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "collision", None);
+        let resource = Resource::with_provider("mock", "test.resource", "collision", None)
+            .with_attribute("name", string_value("collision"))
+            .with_attribute("comment", plain.clone())
+            .with_attribute(
+                "tags",
+                Value::Concrete(ConcreteValue::Map(
+                    [("nested".to_string(), plain.clone())]
+                        .into_iter()
+                        .collect(),
+                )),
+            );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(provider.create_resource(id.clone(), resource))
+            .expect("create should save mock v2 state");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2);
+        assert_eq!(raw["states"]["test.resource.collision"]["comment"], marker);
+        assert_eq!(
+            raw["states"]["test.resource.collision"]["tags"]["nested"],
+            marker
+        );
+
+        let state = runtime
+            .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
+            .expect("fresh mock v2 state should reload");
+        assert_eq!(state.attributes.get("comment"), Some(&plain));
+        assert!(matches!(
+            state.attributes.get("tags"),
+            Some(Value::Concrete(ConcreteValue::Map(values)))
+                if values.get("nested") == Some(&plain)
+        ));
+    }
+
+    #[test]
     fn corrupt_or_invalid_state_file_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
@@ -1118,7 +1245,7 @@ mod tests {
             .expect("create should save versioned mock state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
-        assert_eq!(raw.get("version"), Some(&serde_json::json!(1)));
+        assert_eq!(raw.get("version"), Some(&serde_json::json!(2)));
         assert!(raw.get("states").is_some());
 
         let state = runtime

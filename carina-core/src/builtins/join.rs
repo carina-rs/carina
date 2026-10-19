@@ -99,7 +99,7 @@ mod tests {
     use crate::ValueDescription;
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::{ConcreteValue, DeferredValue, Value};
-    use crate::value::{SECRET_PREFIX, format_value, value_to_json};
+    use crate::value::{PERSISTED_SECRET_KEY, format_value, value_to_json};
 
     #[test]
     fn join_basic() {
@@ -196,9 +196,11 @@ mod tests {
         assert_eq!(format_value(&result), "(secret)");
         assert_eq!(ValueDescription::of(&result).to_string(), "secret");
         let state_value = value_to_json(&result).unwrap();
-        let state_value = state_value.as_str().expect("secret hash string");
-        assert!(state_value.starts_with(SECRET_PREFIX));
-        assert!(!state_value.contains("hunter2SECRET"));
+        let digest = state_value[PERSISTED_SECRET_KEY]
+            .as_str()
+            .expect("structural secret digest");
+        assert!(crate::resource::RedactedSecretHash::from_encoded_digest(digest).is_some());
+        assert!(!state_value.to_string().contains("hunter2SECRET"));
     }
 
     #[test]

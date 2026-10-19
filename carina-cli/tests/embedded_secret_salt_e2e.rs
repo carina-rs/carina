@@ -6,8 +6,11 @@ use argon2::Argon2;
 use serde_json::Value;
 use tempfile::TempDir;
 
-const V2_SECRET_PREFIX: &str = "_secret:$argon2id$";
-const SELF_CONTAINED_LEGACY_PREFIX: &str = "_secret:argon2-legacy:";
+use carina_core::resource::RedactedSecretHash;
+use carina_core::value::PERSISTED_SECRET_KEY;
+
+const V2_SECRET_PREFIX: &str = "$argon2id$";
+const SELF_CONTAINED_LEGACY_PREFIX: &str = "argon2-legacy:";
 
 struct Scenario {
     _temp: TempDir,
@@ -99,21 +102,27 @@ fn resource_by_identity<'a>(state: &'a Value, identity: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing state resource {identity:?}: {state:#}"))
 }
 
-fn comment_marker(state: &Value, identity: &str) -> String {
-    resource_by_identity(state, identity)["attributes"]["comment"]
-        .as_str()
-        .expect("comment marker")
-        .to_string()
+fn comment_digest(state: &Value, identity: &str) -> String {
+    secret_digest(&resource_by_identity(state, identity)["attributes"]["comment"]).to_string()
 }
 
-fn assert_marker_verifies(marker: &str, plaintext: &str) {
-    let digest = carina_core::value::persisted_secret_hash(marker)
-        .unwrap_or_else(|| panic!("invalid persisted secret marker: {marker}"));
+fn secret_digest(value: &Value) -> &str {
+    let object = value.as_object().expect("secret tag");
+    assert_eq!(object.len(), 1, "secret tag must contain exactly one entry");
+    object
+        .get(PERSISTED_SECRET_KEY)
+        .and_then(Value::as_str)
+        .expect("secret tag must carry a digest")
+}
+
+fn assert_digest_verifies(encoded_digest: &str, plaintext: &str) {
+    let digest = RedactedSecretHash::from_encoded_digest(encoded_digest)
+        .unwrap_or_else(|| panic!("invalid persisted secret digest: {encoded_digest}"));
     let material = serde_json::to_vec(&Value::String(plaintext.to_string()))
         .expect("serialize secret material");
     assert!(
         digest.verify(material),
-        "marker did not verify its plaintext"
+        "digest did not verify its plaintext"
     );
 }
 
@@ -137,7 +146,7 @@ fn legacy_marker(
 }
 
 #[test]
-fn equal_nested_secrets_get_distinct_map_and_list_markers() {
+fn equal_nested_secrets_get_distinct_map_and_list_digests() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -165,24 +174,18 @@ let listed = mock.example.consumer {
     );
     let state = scenario.state_json();
     let tags = &resource_by_identity(&state, "mapped")["attributes"]["tags"];
-    let map_x = tags["x"].as_str().expect("tags.x marker");
-    let map_y = tags["y"].as_str().expect("tags.y marker");
+    let map_x = secret_digest(&tags["x"]);
+    let map_y = secret_digest(&tags["y"]);
     assert_ne!(map_x, map_y, "equal map secrets leaked equality");
-    assert_marker_verifies(map_x, "NESTED_EQUAL_PLAIN");
-    assert_marker_verifies(map_y, "NESTED_EQUAL_PLAIN");
+    assert_digest_verifies(map_x, "NESTED_EQUAL_PLAIN");
+    assert_digest_verifies(map_y, "NESTED_EQUAL_PLAIN");
 
     let list = resource_by_identity(&state, "listed")["attributes"]["list"]
         .as_array()
-        .expect("list markers");
+        .expect("secret list");
     assert_ne!(list[0], list[1], "equal list secrets leaked equality");
-    assert_marker_verifies(
-        list[0].as_str().expect("list[0] marker"),
-        "NESTED_EQUAL_PLAIN",
-    );
-    assert_marker_verifies(
-        list[1].as_str().expect("list[1] marker"),
-        "NESTED_EQUAL_PLAIN",
-    );
+    assert_digest_verifies(secret_digest(&list[0]), "NESTED_EQUAL_PLAIN");
+    assert_digest_verifies(secret_digest(&list[1]), "NESTED_EQUAL_PLAIN");
 }
 
 #[test]
@@ -201,7 +204,7 @@ let old = mock.test.resource {
         "initial moved-secret apply",
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
-    let before_move = comment_marker(&scenario.state_json(), "old");
+    let before_move = comment_digest(&scenario.state_json(), "old");
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -225,7 +228,7 @@ let renamed = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     assert_eq!(
-        comment_marker(&scenario.state_json(), "renamed"),
+        comment_digest(&scenario.state_json(), "renamed"),
         before_move,
         "a pure move must reuse the source row's byte-identical digest",
     );
@@ -248,6 +251,7 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
         &Value::String("MOVED_LEGACY_PLAIN".to_string()),
         "mock.test.resource",
@@ -286,8 +290,8 @@ let renamed = mock.test.resource {
             "moved-legacy.json",
         ]),
     );
-    assert_marker_verifies(
-        &comment_marker(&scenario.state_json(), "renamed"),
+    assert_digest_verifies(
+        &comment_digest(&scenario.state_json(), "renamed"),
         "MOVED_LEGACY_PLAIN",
     );
 }
@@ -345,6 +349,7 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
         &Value::String("ORPHAN_REKEY_LEGACY_PLAIN".to_string()),
         "mock.test.resource",
@@ -409,6 +414,7 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
         &Value::String("ROUND_TWO_SAME_PLAIN".to_string()),
         "mock.test.resource",
@@ -449,10 +455,10 @@ let renamed = mock.test.resource {
             "remove-secret.json",
         ]),
     );
-    let carried = comment_marker(&scenario.state_json(), "renamed");
+    let carried = comment_digest(&scenario.state_json(), "renamed");
     assert!(
         carried.starts_with(SELF_CONTAINED_LEGACY_PREFIX),
-        "a copied legacy marker must carry its original salt: {carried}",
+        "a migrated legacy digest must carry its original salt: {carried}",
     );
 
     scenario.write_main(
@@ -486,6 +492,7 @@ mock.example.consumer {
     );
 
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     let old_identity = state["resources"][0]["identity"]
         .as_str()
         .expect("anonymous state identity")
@@ -527,7 +534,7 @@ mock.example.consumer {
 }
 
 #[test]
-fn repeated_apply_reuses_the_exact_secret_marker() {
+fn repeated_apply_reuses_the_exact_secret_digest() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -542,7 +549,7 @@ let stable = mock.test.resource {
         "first stable-secret apply",
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
-    let first = comment_marker(&scenario.state_json(), "stable");
+    let first = comment_digest(&scenario.state_json(), "stable");
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
 provider mock {}
@@ -559,8 +566,8 @@ let stable = mock.test.resource {
         "second stable-secret apply",
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
-    let second = comment_marker(&scenario.state_json(), "stable");
-    assert_eq!(first, second, "unchanged secret marker churned");
+    let second = comment_digest(&scenario.state_json(), "stable");
+    assert_eq!(first, second, "unchanged secret digest churned");
     assert_plan_counts(&scenario.carina(&["plan", "."]), 0, 0, 0);
 }
 
@@ -585,6 +592,7 @@ let legacy = mock.test.resource {
     );
 
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
@@ -630,14 +638,13 @@ let legacy = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let state = scenario.state_json();
-    let marker = comment_marker(&state, "legacy");
+    let digest = comment_digest(&state, "legacy");
     assert!(
-        marker.starts_with(V2_SECRET_PREFIX),
-        "legacy marker was not replaced with v2: {marker}",
+        digest.starts_with(V2_SECRET_PREFIX),
+        "legacy marker was not replaced with a v2 digest: {digest}",
     );
-    let nested = resource_by_identity(&state, "legacy")["attributes"]["tags"]["nested"]
-        .as_str()
-        .expect("nested v2 marker");
+    let nested =
+        secret_digest(&resource_by_identity(&state, "legacy")["attributes"]["tags"]["nested"]);
     assert!(
         nested.starts_with(V2_SECRET_PREFIX),
         "nested legacy marker was not replaced with v2: {nested}",
@@ -663,6 +670,7 @@ let legacy_plan = mock.test.resource {
     );
 
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
@@ -704,10 +712,10 @@ let legacy_plan = mock.test.resource {
         ]),
     );
 
-    let marker = comment_marker(&scenario.state_json(), "legacy_plan");
+    let digest = comment_digest(&scenario.state_json(), "legacy_plan");
     assert!(
-        marker.starts_with(V2_SECRET_PREFIX),
-        "saved-plan writeback did not upgrade legacy marker: {marker}",
+        digest.starts_with(V2_SECRET_PREFIX),
+        "saved-plan writeback did not upgrade the legacy marker to a v2 digest: {digest}",
     );
     assert_plan_counts(&scenario.carina(&["plan", "--refresh=false", "."]), 0, 0, 0);
 }
@@ -729,6 +737,7 @@ let legacy_changed = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
@@ -777,6 +786,7 @@ let legacy_role = mock.iam.Role {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
+    state["version"] = Value::from(13);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")

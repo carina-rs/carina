@@ -1377,11 +1377,19 @@ mod apply_state_save_tests {
         ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State, UnknownReason, Value,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    use carina_core::value::LEGACY_SECRET_PREFIX;
     use carina_state::{DeposedInstance, DeposedKey, NameOverride};
+
+    const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn structural_legacy_secret(hash_hex: &str) -> serde_json::Value {
+        serde_json::json!({
+            carina_core::value::PERSISTED_SECRET_KEY:
+                format!("argon2-legacy:73616c74:{hash_hex}"),
+        })
     }
 
     fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
@@ -2703,10 +2711,7 @@ mod apply_state_save_tests {
         let id = desired.id.clone();
         let existing = ResourceState::new("db.Instance", "main", "awscc")
             .with_identifier("db-1")
-            .with_attribute(
-                "password",
-                serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-            );
+            .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -2787,12 +2792,12 @@ mod apply_state_save_tests {
     }
 
     #[test]
-    fn apply_writeback_locates_plain_raw_legacy_marker_in_write_only_attribute() {
+    fn apply_writeback_keeps_plain_raw_legacy_marker_in_write_only_attribute() {
         let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
         let desired = Resource::with_provider("mock", "test.resource", "plain-marker", None)
             .with_attribute(
                 "password",
-                Value::Concrete(ConcreteValue::String(marker.into())),
+                Value::Concrete(ConcreteValue::String(marker.clone().into())),
             );
         let id = desired.id.clone();
         let applied_state =
@@ -2804,7 +2809,7 @@ mod apply_state_save_tests {
                 .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
         );
 
-        let error = build_state_after_apply(
+        let saved = build_state_after_apply(
             ApplyStateSave {
                 state_file: None,
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
@@ -2818,26 +2823,14 @@ mod apply_state_save_tests {
             },
             None,
         )
-        .expect_err("a marker-shaped plain string must fail closed without panicking");
+        .expect("a marker-shaped plain string must remain an ordinary string");
 
-        let AppError::ResourceStateEncoding(located) = &error else {
-            panic!("expected typed resource-state encoding error, got {error:?}")
-        };
-        assert_eq!(located.resource(), &id);
-        let carina_state::ResourceStateEncodingError::PersistedAttributes(attribute_error) =
-            located.encoding_error()
-        else {
-            panic!("expected persisted-attribute validation error")
-        };
-        assert_eq!(attribute_error.attribute_key(), "password");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains(&id.to_string()),
-            "error must name the resource: {rendered}",
-        );
-        assert!(
-            rendered.contains("password"),
-            "error must name the top-level attribute: {rendered}",
+        let row = saved
+            .find_resource("mock", "test.resource", "plain-marker")
+            .expect("applied row must be saved");
+        assert_eq!(
+            row.persisted_attributes().get("password"),
+            carina_core::value::json_to_dsl_value(&serde_json::json!(marker)),
         );
     }
 
@@ -2850,10 +2843,7 @@ mod apply_state_save_tests {
         let id = desired.id.clone();
         let existing = ResourceState::new("db.Instance", "main", "awscc")
             .with_identifier("db-1")
-            .with_attribute(
-                "password",
-                serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-            );
+            .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -3031,10 +3021,7 @@ mod apply_state_save_tests {
         .with_identifier("old-record-id");
         let existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
             .with_identifier("stale-record-id")
-            .with_attribute(
-                "password",
-                serde_json::json!(format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32))),
-            );
+            .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)

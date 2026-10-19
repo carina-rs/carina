@@ -4,6 +4,7 @@
 //! The `export_provider!` macro generates the wit-bindgen bindings and Guest trait
 //! implementation in the consumer crate.
 
+use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
 // -- JSON conversion helpers --
@@ -15,6 +16,7 @@ pub enum WitValueVariant {
     ListVal,
     MapVal,
     SecretVal,
+    RedactedSecretVal,
 }
 
 impl std::fmt::Display for WitValueVariant {
@@ -24,6 +26,7 @@ impl std::fmt::Display for WitValueVariant {
             Self::ListVal => "list-val",
             Self::MapVal => "map-val",
             Self::SecretVal => "secret-val",
+            Self::RedactedSecretVal => "redacted-secret-val",
         })
     }
 }
@@ -47,6 +50,8 @@ enum WasmValueDecodeErrorKind {
     ExpectedString { index: usize },
     Null,
     UnsupportedNumber,
+    MalformedPersistedSecret,
+    ReservedPersistedKey,
 }
 
 impl WasmValueDecodeError {
@@ -84,6 +89,12 @@ impl std::fmt::Display for WasmValueDecodeError {
             }
             WasmValueDecodeErrorKind::UnsupportedNumber => {
                 f.write_str(": JSON number cannot be represented by the value protocol")
+            }
+            WasmValueDecodeErrorKind::MalformedPersistedSecret => {
+                f.write_str(": malformed persisted redacted-secret tag")
+            }
+            WasmValueDecodeErrorKind::ReservedPersistedKey => {
+                f.write_str(": unescaped reserved persisted-state object key")
             }
         }
     }
@@ -127,6 +138,75 @@ fn json_to_proto_value_for_variant(
                 })
                 .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
             Ok(proto::Value::Map(entries))
+        }
+        serde_json::Value::Null => Err(WasmValueDecodeError::new(
+            wit_variant,
+            WasmValueDecodeErrorKind::Null,
+        )),
+    }
+}
+
+fn json_to_proto_persisted_value_for_variant(
+    v: serde_json::Value,
+    wit_variant: WitValueVariant,
+) -> Result<proto::PersistedValue, WasmValueDecodeError> {
+    match v {
+        serde_json::Value::Bool(value) => Ok(proto::PersistedValue::Bool(value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(proto::PersistedValue::Int(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(proto::PersistedValue::Float(value))
+            } else {
+                Err(WasmValueDecodeError::new(
+                    wit_variant,
+                    WasmValueDecodeErrorKind::UnsupportedNumber,
+                ))
+            }
+        }
+        serde_json::Value::String(value) => Ok(proto::PersistedValue::String(value)),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(|value| json_to_proto_persisted_value_for_variant(value, wit_variant))
+            .collect::<Result<Vec<_>, _>>()
+            .map(proto::PersistedValue::List),
+        serde_json::Value::Object(entries) => {
+            if entries.contains_key(PERSISTED_SECRET_KEY) {
+                if entries.len() != 1 {
+                    return Err(WasmValueDecodeError::new(
+                        wit_variant,
+                        WasmValueDecodeErrorKind::MalformedPersistedSecret,
+                    ));
+                }
+                let Some(serde_json::Value::String(digest)) = entries.get(PERSISTED_SECRET_KEY)
+                else {
+                    return Err(WasmValueDecodeError::new(
+                        wit_variant,
+                        WasmValueDecodeErrorKind::MalformedPersistedSecret,
+                    ));
+                };
+                return Ok(proto::PersistedValue::RedactedSecret(digest.clone()));
+            }
+            let entries = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let decoded_key = if let Some(key) = key.strip_prefix("$$") {
+                        format!("${key}")
+                    } else if key.starts_with('$') {
+                        return Err(WasmValueDecodeError::new(
+                            wit_variant,
+                            WasmValueDecodeErrorKind::ReservedPersistedKey,
+                        )
+                        .prepend_attribute(&key));
+                    } else {
+                        key.clone()
+                    };
+                    json_to_proto_persisted_value_for_variant(value, wit_variant)
+                        .map(|value| (decoded_key, value))
+                        .map_err(|error| error.prepend_attribute(&key))
+                })
+                .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+            Ok(proto::PersistedValue::Map(entries))
         }
         serde_json::Value::Null => Err(WasmValueDecodeError::new(
             wit_variant,
@@ -204,6 +284,50 @@ pub fn decode_secret_val(json: &str) -> Result<proto::Value, WasmValueDecodeErro
     json_to_proto_value_for_variant(inner, WitValueVariant::SecretVal)
 }
 
+pub fn decode_persisted_string_list_val(
+    json: &str,
+) -> Result<proto::PersistedValue, WasmValueDecodeError> {
+    decode_string_list_val(json).map(proto::PersistedValue::from)
+}
+
+pub fn decode_persisted_list_val(
+    json: &str,
+) -> Result<proto::PersistedValue, WasmValueDecodeError> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
+        WasmValueDecodeError::new(
+            WitValueVariant::ListVal,
+            WasmValueDecodeErrorKind::InvalidJson(source),
+        )
+    })?;
+    if !value.is_array() {
+        return Err(WasmValueDecodeError::new(
+            WitValueVariant::ListVal,
+            WasmValueDecodeErrorKind::ExpectedArray,
+        ));
+    }
+    json_to_proto_persisted_value_for_variant(value, WitValueVariant::ListVal)
+}
+
+pub fn decode_persisted_map_val(json: &str) -> Result<proto::PersistedValue, WasmValueDecodeError> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
+        WasmValueDecodeError::new(
+            WitValueVariant::MapVal,
+            WasmValueDecodeErrorKind::InvalidJson(source),
+        )
+    })?;
+    if !value.is_object() {
+        return Err(WasmValueDecodeError::new(
+            WitValueVariant::MapVal,
+            WasmValueDecodeErrorKind::ExpectedObject,
+        ));
+    }
+    json_to_proto_persisted_value_for_variant(value, WitValueVariant::MapVal)
+}
+
+pub fn decode_redacted_secret_val(digest: &str) -> proto::PersistedValue {
+    proto::PersistedValue::RedactedSecret(digest.to_string())
+}
+
 /// Render a decode error for boundaries that cannot transport a typed error.
 pub fn format_wasm_value_decode_error(error: &WasmValueDecodeError) -> String {
     error.to_string()
@@ -212,14 +336,19 @@ pub fn format_wasm_value_decode_error(error: &WasmValueDecodeError) -> String {
 /// Failure to encode a proto value into a JSON-backed WIT value.
 #[derive(Debug)]
 pub struct WasmValueEncodeError {
-    value: f64,
+    kind: WasmValueEncodeErrorKind,
     attribute_path: Vec<String>,
+}
+
+#[derive(Debug)]
+enum WasmValueEncodeErrorKind {
+    NonFiniteFloat(f64),
 }
 
 impl WasmValueEncodeError {
     fn non_finite_float(value: f64) -> Self {
         Self {
-            value,
+            kind: WasmValueEncodeErrorKind::NonFiniteFloat(value),
             attribute_path: Vec::new(),
         }
     }
@@ -236,7 +365,11 @@ impl std::fmt::Display for WasmValueEncodeError {
         if !self.attribute_path.is_empty() {
             write!(f, " at attribute '{}'", self.attribute_path.join("."))?;
         }
-        write!(f, ": non-finite float {} is not valid JSON", self.value)
+        match &self.kind {
+            WasmValueEncodeErrorKind::NonFiniteFloat(value) => {
+                write!(f, ": non-finite float {value} is not valid JSON")
+            }
+        }
     }
 }
 
@@ -276,6 +409,47 @@ pub fn proto_value_to_json(v: &proto::Value) -> Result<serde_json::Value, WasmVa
     }
 }
 
+pub fn proto_persisted_value_to_json(
+    v: &proto::PersistedValue,
+) -> Result<serde_json::Value, WasmValueEncodeError> {
+    match v {
+        proto::PersistedValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
+        proto::PersistedValue::Int(value) => Ok(serde_json::Value::Number((*value).into())),
+        proto::PersistedValue::Float(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| WasmValueEncodeError::non_finite_float(*value)),
+        proto::PersistedValue::String(value) => Ok(serde_json::Value::String(value.clone())),
+        proto::PersistedValue::RedactedSecret(digest) => Ok(serde_json::json!({
+            PERSISTED_SECRET_KEY: digest,
+        })),
+        proto::PersistedValue::StringList(values) => Ok(serde_json::Value::Array(
+            values
+                .iter()
+                .map(|value| serde_json::Value::String(value.clone()))
+                .collect(),
+        )),
+        proto::PersistedValue::List(values) => values
+            .iter()
+            .map(proto_persisted_value_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        proto::PersistedValue::Map(values) => values
+            .iter()
+            .map(|(key, value)| {
+                let encoded_key = if key.starts_with('$') {
+                    format!("${key}")
+                } else {
+                    key.clone()
+                };
+                proto_persisted_value_to_json(value)
+                    .map(|value| (encoded_key, value))
+                    .map_err(|error| error.prepend_attribute(key))
+            })
+            .collect::<Result<serde_json::Map<_, _>, _>>()
+            .map(serde_json::Value::Object),
+    }
+}
+
 /// Parse a ResourceId string (provider.resource_type.identity) into a proto::ResourceId.
 ///
 /// Delegates to `crate::parse_resource_id_string` which is available on all targets.
@@ -301,740 +475,29 @@ pub fn parse_resource_id_string(key: &str) -> crate::types::ResourceId {
 #[macro_export]
 macro_rules! export_provider {
     ($provider_type:ty) => {
-        $crate::export_provider!(@internal $provider_type, "carina-provider");
+        $crate::export_provider!(@internal $provider_type, {
+            path: "../carina-plugin-wit/wit",
+            world: "carina-provider",
+        });
     };
     ($provider_type:ty, http) => {
-        mod __carina_wasm_guest {
-            wit_bindgen::generate!({
-                path: "../carina-plugin-wit/wit",
-                world: "carina-provider-with-http",
-                with: {
-                    "wasi:io/poll@0.2.6": ::wasi::io::poll,
-                    "wasi:io/error@0.2.6": ::wasi::io::error,
-                    "wasi:io/streams@0.2.6": ::wasi::io::streams,
-                    "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
-                    "wasi:http/types@0.2.6": ::wasi::http::types,
-                    "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
-                },
-            });
-
-            use super::*;
-            use $crate::types as proto;
-            use $crate::wasm_guest as helpers;
-            use std::collections::HashMap;
-
-            use carina::provider::types as wit_types;
-
-            fn get_provider() -> &'static ::std::sync::Mutex<$provider_type> {
-                static PROVIDER: ::std::sync::OnceLock<::std::sync::Mutex<$provider_type>> =
-                    ::std::sync::OnceLock::new();
-                PROVIDER.get_or_init(|| ::std::sync::Mutex::new(<$provider_type>::default()))
-            }
-
-            fn wit_to_proto_resource_id(id: &wit_types::ResourceId) -> proto::ResourceId {
-                proto::ResourceId {
-                    provider: id.provider.clone(),
-                    resource_type: id.resource_type.clone(),
-                    identity: id.identity.clone(),
-                }
-            }
-
-            fn wit_to_proto_type_identity(
-                ty: &wit_types::TypeIdentity,
-            ) -> proto::TypeIdentity {
-                proto::TypeIdentity {
-                    provider: ty.provider.clone(),
-                    segments: ty.segments.clone(),
-                    kind: ty.kind.clone(),
-                }
-            }
-
-            fn proto_to_wit_resource_id(id: &proto::ResourceId) -> wit_types::ResourceId {
-                wit_types::ResourceId {
-                    provider: id.provider.clone(),
-                    resource_type: id.resource_type.clone(),
-                    identity: id.identity.clone(),
-                }
-            }
-
-            fn wit_to_proto_value(
-                v: &wit_types::Value,
-            ) -> Result<proto::Value, helpers::WasmValueDecodeError> {
-                match v {
-                    wit_types::Value::BoolVal(b) => Ok(proto::Value::Bool(*b)),
-                    wit_types::Value::IntVal(i) => Ok(proto::Value::Int(*i)),
-                    wit_types::Value::FloatVal(f) => Ok(proto::Value::Float(*f)),
-                    wit_types::Value::StrVal(s) => Ok(proto::Value::String(s.clone())),
-                    wit_types::Value::StringListVal(json) => helpers::decode_string_list_val(json),
-                    wit_types::Value::ListVal(json) => helpers::decode_list_val(json),
-                    wit_types::Value::MapVal(json) => helpers::decode_map_val(json),
-                    // Desired-state `normalize_desired` round trips are
-                    // host-sealed and never carry `SecretVal` (carina#3800).
-                    // CRUD inputs decode the inner JSON into an ordinary
-                    // provider value because
-                    // `proto::Value` has no `Secret` arm. Malformed or null
-                    // payloads remain boundary errors. Providers MUST NOT log
-                    // or persist the plaintext.
-                    wit_types::Value::SecretVal(json) => helpers::decode_secret_val(json),
-                }
-            }
-
-            fn proto_to_wit_value(
-                v: &proto::Value,
-            ) -> Result<wit_types::Value, helpers::WasmValueEncodeError> {
-                Ok(match v {
-                    proto::Value::Bool(b) => wit_types::Value::BoolVal(*b),
-                    proto::Value::Int(i) => wit_types::Value::IntVal(*i),
-                    proto::Value::Float(f) => wit_types::Value::FloatVal(*f),
-                    proto::Value::String(s) => wit_types::Value::StrVal(s.clone()),
-                    proto::Value::StringList(items) => {
-                        wit_types::Value::StringListVal(serde_json::to_string(items).unwrap())
-                    }
-                    proto::Value::List(_) => {
-                        let json = helpers::proto_value_to_json(v)?;
-                        wit_types::Value::ListVal(serde_json::to_string(&json).unwrap())
-                    }
-                    proto::Value::Map(_) => {
-                        let json = helpers::proto_value_to_json(v)?;
-                        wit_types::Value::MapVal(serde_json::to_string(&json).unwrap())
-                    }
-                })
-            }
-
-            fn wit_to_proto_value_map(
-                entries: &[(String, wit_types::Value)],
-            ) -> Result<HashMap<String, proto::Value>, helpers::WasmValueDecodeError> {
-                entries
-                    .iter()
-                    .map(|(key, value): &(String, wit_types::Value)| {
-                        wit_to_proto_value(value)
-                            .map(|value| (key.clone(), value))
-                            .map_err(|error| error.prepend_attribute(key))
-                    })
-                    .collect()
-            }
-
-            fn proto_to_wit_value_map(
-                map: &HashMap<String, proto::Value>,
-            ) -> Result<
-                Vec<(String, wit_types::Value)>,
-                helpers::WasmValueEncodeError,
-            > {
-                map.iter()
-                    .map(|(key, value)| {
-                        proto_to_wit_value(value)
-                            .map(|value| (key.clone(), value))
-                            .map_err(|error| error.prepend_attribute(key))
-                    })
-                    .collect()
-            }
-
-            fn wit_to_proto_state(
-                id: &proto::ResourceId,
-                state: &wit_types::State,
-            ) -> Result<proto::State, helpers::WasmValueDecodeError> {
-                Ok(proto::State {
-                    id: id.clone(),
-                    identifier: state.identifier.clone(),
-                    attributes: wit_to_proto_value_map(&state.attributes)?,
-                    exists: state.exists,
-                })
-            }
-
-            fn proto_to_wit_state(
-                state: &proto::State,
-            ) -> Result<wit_types::State, helpers::WasmValueEncodeError> {
-                Ok(wit_types::State {
-                    identifier: state.identifier.clone(),
-                    attributes: proto_to_wit_value_map(&state.attributes)?,
-                    exists: state.exists,
-                })
-            }
-
-            fn proto_to_wit_create_outcome(
-                outcome: &proto::CreateOutcome,
-            ) -> Result<wit_types::CreateOutcome, helpers::WasmValueEncodeError> {
-                Ok(match outcome {
-                    proto::CreateOutcome::Success { state } => {
-                        wit_types::CreateOutcome::Success(proto_to_wit_state(state)?)
-                    }
-                    proto::CreateOutcome::PartialSuccess { state, diagnostic } => {
-                        wit_types::CreateOutcome::PartialSuccess(
-                            wit_types::CreatePartialSuccess {
-                                state: proto_to_wit_state(state)?,
-                                diagnostic: wit_types::PartialReadDiagnostic {
-                                    reason: diagnostic.reason.clone(),
-                                    missing_attributes: diagnostic.missing_attributes.clone(),
-                                },
-                            },
-                        )
-                    }
-                })
-            }
-
-            fn proto_to_wit_update_outcome(
-                outcome: &proto::UpdateOutcome,
-            ) -> Result<wit_types::UpdateOutcome, helpers::WasmValueEncodeError> {
-                Ok(match outcome {
-                    proto::UpdateOutcome::Success { state } => {
-                        wit_types::UpdateOutcome::Success(proto_to_wit_state(state)?)
-                    }
-                    proto::UpdateOutcome::PartialSuccess { state, diagnostic } => {
-                        wit_types::UpdateOutcome::PartialSuccess(
-                            wit_types::UpdatePartialSuccess {
-                                state: proto_to_wit_state(state)?,
-                                diagnostic: wit_types::PartialReadDiagnostic {
-                                    reason: diagnostic.reason.clone(),
-                                    missing_attributes: diagnostic.missing_attributes.clone(),
-                                },
-                            },
-                        )
-                    }
-                })
-            }
-
-            fn wit_to_proto_resource(
-                res: &wit_types::ResourceDef,
-            ) -> Result<proto::Resource, helpers::WasmValueDecodeError> {
-                Ok(proto::Resource {
-                    id: wit_to_proto_resource_id(&res.id),
-                    attributes: wit_to_proto_value_map(&res.attributes)?,
-                    directives: proto::Directives::default(),
-                })
-            }
-
-            fn proto_to_wit_resource(
-                res: &proto::Resource,
-            ) -> Result<wit_types::ResourceDef, helpers::WasmValueEncodeError> {
-                Ok(wit_types::ResourceDef {
-                    id: proto_to_wit_resource_id(&res.id),
-                    attributes: proto_to_wit_value_map(&res.attributes)?,
-                })
-            }
-
-            // -- Guest trait implementation --
-
-            /// Trust-boundary encoder for a complete protocol error record.
-            ///
-            /// A core provider produces this exact record with
-            /// `ProviderError::to_wire`; guest implementations may also build
-            /// it directly. Its runtime message and flattened cause are
-            /// untrusted data and are passed through unchanged for the host's
-            /// sole sanctioned `ProviderError::from_wire` decode path.
-            fn proto_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
-                let detail = wit_types::ErrorDetail {
-                    message: err.message,
-                    resource_id: err.resource_id.as_ref().map(proto_to_wit_resource_id),
-                    cause: err.cause,
-                    provider_name: err.provider_name,
-                    operation: err.operation,
-                    status: err.status,
-                    code: err.code,
-                    request_id: err.request_id,
-                };
-                match err.kind {
-                    proto::ProviderErrorKind::InvalidInput => {
-                        wit_types::ProviderError::InvalidInput(detail)
-                    }
-                    proto::ProviderErrorKind::ApiError => {
-                        wit_types::ProviderError::ApiError(detail)
-                    }
-                    proto::ProviderErrorKind::NotFound => {
-                        wit_types::ProviderError::NotFound(detail)
-                    }
-                    proto::ProviderErrorKind::Timeout => {
-                        wit_types::ProviderError::Timeout(detail)
-                    }
-                    proto::ProviderErrorKind::Internal => {
-                        wit_types::ProviderError::Internal(detail)
-                    }
-                }
-            }
-
-            fn validate_string_to_provider_error(
-                msg: String,
-            ) -> wit_types::ProviderError {
-                wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
-                    message: msg,
-                    resource_id: None,
-                    cause: None,
-                    provider_name: None,
-                    operation: None,
-                    status: None,
-                    code: None,
-                    request_id: None,
-                })
-            }
-
-            fn boundary_decode_to_provider_error(
-                operation: &'static str,
-                part: Option<&'static str>,
-                error: helpers::WasmValueDecodeError,
-            ) -> wit_types::ProviderError {
-                let error = helpers::format_wasm_value_decode_error(&error);
-                let location = part.map_or_else(
-                    || operation.to_string(),
-                    |part| format!("{operation} {part}"),
-                );
-                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!("WASM boundary decode error in {location}: {error}"),
-                    resource_id: None,
-                    cause: None,
-                    provider_name: None,
-                    operation: Some(operation.to_string()),
-                    status: None,
-                    code: None,
-                    request_id: None,
-                })
-            }
-
-            fn boundary_encode_to_provider_error(
-                operation: &'static str,
-                part: Option<&'static str>,
-                error: helpers::WasmValueEncodeError,
-            ) -> wit_types::ProviderError {
-                let location = part.map_or_else(
-                    || operation.to_string(),
-                    |part| format!("{operation} {part}"),
-                );
-                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!("WASM boundary encode error in {location}: {error}"),
-                    resource_id: None,
-                    cause: None,
-                    provider_name: None,
-                    operation: Some(operation.to_string()),
-                    status: None,
-                    code: None,
-                    request_id: None,
-                })
-            }
-
-            fn provider_export_or_trap<T>(
-                operation: &'static str,
-                result: Result<T, proto::ProviderError>,
-            ) -> T {
-                result.unwrap_or_else(|error| {
-                    panic!("Provider export error in {operation}: {}", error.message)
-                })
-            }
-
-            fn wit_to_proto_patch_op_kind(k: wit_types::PatchOpKind) -> proto::PatchOpKind {
-                match k {
-                    wit_types::PatchOpKind::Add => proto::PatchOpKind::Add,
-                    wit_types::PatchOpKind::Replace => proto::PatchOpKind::Replace,
-                    wit_types::PatchOpKind::Remove => proto::PatchOpKind::Remove,
-                }
-            }
-
-            fn wit_to_proto_update_request(
-                req: wit_types::UpdateRequest,
-                proto_id: &proto::ResourceId,
-            ) -> Result<proto::UpdateRequest, helpers::WasmValueDecodeError> {
-                let from = wit_to_proto_state(proto_id, &req.current)?;
-                let ops = req
-                    .patch
-                    .ops
-                    .into_iter()
-                    .map(|op| {
-                        Ok(proto::PatchOp {
-                            kind: wit_to_proto_patch_op_kind(op.kind),
-                            key: op.key,
-                            value: op.value.as_ref().map(wit_to_proto_value).transpose()?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, helpers::WasmValueDecodeError>>()?;
-                Ok(proto::UpdateRequest {
-                    from,
-                    patch: proto::UpdatePatch { ops },
-                })
-            }
-
-            fn wit_to_proto_create_request(
-                req: wit_types::CreateRequest,
-            ) -> Result<proto::CreateRequest, helpers::WasmValueDecodeError> {
-                Ok(proto::CreateRequest {
-                    resource: wit_to_proto_resource(&req.res)?,
-                })
-            }
-
-            fn wit_to_proto_delete_request(
-                req: wit_types::DeleteRequest,
-            ) -> proto::DeleteRequest {
-                proto::DeleteRequest {
-                    directives: proto::Directives {
-                        force_delete: req.directives.force_delete,
-                        create_before_destroy: req.directives.create_before_destroy,
-                        prevent_destroy: req.directives.prevent_destroy,
-                    },
-                }
-            }
-
-            fn wit_to_sdk_plan_op(
-                op: exports::carina::provider::provider::PlanOp,
-            ) -> $crate::PlanOp {
-                match op {
-                    exports::carina::provider::provider::PlanOp::Create => $crate::PlanOp::Create,
-                    exports::carina::provider::provider::PlanOp::Read => $crate::PlanOp::Read,
-                    exports::carina::provider::provider::PlanOp::Update => $crate::PlanOp::Update,
-                    exports::carina::provider::provider::PlanOp::Delete => $crate::PlanOp::Delete,
-                }
-            }
-
-            fn sdk_to_wit_binding_pattern(
-                pattern: &$crate::BindingPattern,
-            ) -> wit_types::BindingPattern {
-                match pattern {
-                    $crate::BindingPattern::Exact(name) => {
-                        wit_types::BindingPattern::Exact(name.clone())
-                    }
-                    $crate::BindingPattern::ForLoopChildren { base } => {
-                        wit_types::BindingPattern::ForLoopChildren(base.clone())
-                    }
-                    $crate::BindingPattern::AttributeMatch {
-                        resource_type,
-                        attr,
-                        from,
-                    } => wit_types::BindingPattern::AttributeMatch(
-                        wit_types::AttributeMatchPattern {
-                            resource_type: resource_type.clone(),
-                            attr: attr.clone(),
-                            from: from.clone(),
-                        },
-                    ),
-                }
-            }
-
-            struct WasmGuest;
-
-            impl exports::carina::provider::provider::Guest for WasmGuest {
-                fn info() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let info = $crate::CarinaProvider::info(&*provider);
-                    let envelope = $crate::protocol::types::ProviderInfoEnvelope {
-                        info,
-                        protocol_version: $crate::protocol::PROTOCOL_VERSION,
-                    };
-                    serde_json::to_string(&envelope)
-                        .expect("provider info serialization is infallible")
-                }
-
-                fn schemas() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let schemas = $crate::CarinaProvider::schemas(&*provider);
-                    serde_json::to_string(&schemas)
-                        .expect("provider schemas serialization is infallible")
-                }
-
-                fn provider_config_attribute_types() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let types = $crate::CarinaProvider::provider_config_attribute_types(
-                        &*provider,
-                    );
-                    serde_json::to_string(&types)
-                        .expect("provider config attribute type serialization is infallible")
-                }
-
-                fn validate_config(
-                    attrs: Vec<(String, wit_types::Value)>,
-                ) -> Result<(), wit_types::ProviderError> {
-                    let map = wit_to_proto_value_map(&attrs).map_err(|error| {
-                        boundary_decode_to_provider_error("validate_config", None, error)
-                    })?;
-                    let provider = get_provider().lock().unwrap();
-                    $crate::CarinaProvider::validate_config(&*provider, &map)
-                        .map_err(validate_string_to_provider_error)
-                }
-
-                fn initialize(
-                    attrs: Vec<(String, wit_types::Value)>,
-                ) -> Result<(), wit_types::ProviderError> {
-                    let map = wit_to_proto_value_map(&attrs).map_err(|error| {
-                        boundary_decode_to_provider_error("initialize", None, error)
-                    })?;
-                    let mut provider = get_provider().lock().unwrap();
-                    $crate::CarinaProvider::initialize(&mut *provider, &map)
-                        .map_err(validate_string_to_provider_error)
-                }
-
-                fn read(
-                    id: wit_types::ResourceId,
-                    identifier: Option<String>,
-                    _request: wit_types::ReadRequest,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
-                    let proto_id = wit_to_proto_resource_id(&id);
-                    match $crate::CarinaProvider::read(
-                        &*provider,
-                        &proto_id,
-                        identifier.as_deref(),
-                        proto::ReadRequest,
-                    ) {
-                        Ok(state) => proto_to_wit_state(&state)
-                            .map_err(|error| {
-                                boundary_encode_to_provider_error("read", None, error)
-                            }),
-                        Err(e) => Err(proto_to_wit_provider_error(e)),
-                    }
-                }
-
-                fn read_data_source(
-                    res: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let proto_res = wit_to_proto_resource(&res).map_err(|error| {
-                        boundary_decode_to_provider_error("read_data_source", None, error)
-                    })?;
-                    let provider = get_provider().lock().unwrap();
-                    match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
-                        Ok(state) => proto_to_wit_state(&state).map_err(|error| {
-                            boundary_encode_to_provider_error("read_data_source", None, error)
-                        }),
-                        Err(e) => Err(proto_to_wit_provider_error(e)),
-                    }
-                }
-
-                fn create(
-                    id: wit_types::ResourceId,
-                    request: wit_types::CreateRequest,
-                ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
-                    let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_request = wit_to_proto_create_request(request)
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error("create", None, error)
-                        })?;
-                    let provider = get_provider().lock().unwrap();
-                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
-                        Ok(outcome) => proto_to_wit_create_outcome(&outcome)
-                            .map_err(|error| {
-                                boundary_encode_to_provider_error("create", None, error)
-                            }),
-                        Err(e) => Err(proto_to_wit_provider_error(e)),
-                    }
-                }
-
-                fn update(
-                    id: wit_types::ResourceId,
-                    identifier: String,
-                    request: wit_types::UpdateRequest,
-                ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
-                    let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_request = wit_to_proto_update_request(request, &proto_id)
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error("update", None, error)
-                        })?;
-                    let provider = get_provider().lock().unwrap();
-                    match $crate::CarinaProvider::update(
-                        &*provider,
-                        &proto_id,
-                        &identifier,
-                        proto_request,
-                    ) {
-                        Ok(outcome) => proto_to_wit_update_outcome(&outcome)
-                            .map_err(|error| {
-                                boundary_encode_to_provider_error("update", None, error)
-                            }),
-                        Err(e) => Err(proto_to_wit_provider_error(e)),
-                    }
-                }
-
-                fn delete(
-                    id: wit_types::ResourceId,
-                    identifier: String,
-                    request: wit_types::DeleteRequest,
-                ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
-                    let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_request = wit_to_proto_delete_request(request);
-                    match $crate::CarinaProvider::delete(
-                        &*provider,
-                        &proto_id,
-                        &identifier,
-                        proto_request,
-                    ) {
-                        Ok(()) => Ok(()),
-                        Err(e) => Err(proto_to_wit_provider_error(e)),
-                    }
-                }
-
-                fn required_permissions(
-                    id: wit_types::ResourceId,
-                    operation: exports::carina::provider::provider::PlanOp,
-                ) -> Vec<String> {
-                    let proto_id = wit_to_proto_resource_id(&id);
-                    let result = {
-                        let provider = get_provider().lock().unwrap();
-                        $crate::CarinaProvider::required_permissions(
-                            &*provider,
-                            &proto_id,
-                            wit_to_sdk_plan_op(operation),
-                        )
-                    };
-                    provider_export_or_trap("required_permissions", result)
-                }
-
-                fn satisfier_hint(
-                    target_id: wit_types::ResourceId,
-                    attr_path: Vec<String>,
-                ) -> Vec<wit_types::BindingPattern> {
-                    let proto_id = wit_to_proto_resource_id(&target_id);
-                    let result = {
-                        let provider = get_provider().lock().unwrap();
-                        $crate::CarinaProvider::satisfier_hint(&*provider, &proto_id, &attr_path)
-                    };
-                    provider_export_or_trap("satisfier_hint", result)
-                        .iter()
-                        .map(sdk_to_wit_binding_pattern)
-                        .collect()
-                }
-
-                fn provider_config_completions() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let completions = $crate::CarinaProvider::config_completions(&*provider);
-                    serde_json::to_string(&completions)
-                        .expect("provider config completion serialization is infallible")
-                }
-
-                fn identity_attributes() -> Vec<String> {
-                    let provider = get_provider().lock().unwrap();
-                    $crate::CarinaProvider::identity_attributes(&*provider)
-                }
-
-                fn validate_custom_type(
-                    ty: wit_types::TypeIdentity,
-                    value: String,
-                ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
-                    $crate::CarinaProvider::validate_custom_type(
-                        &*provider,
-                        &wit_to_proto_type_identity(&ty),
-                        &value,
-                    )
-                    .map_err(validate_string_to_provider_error)
-                }
-
-                fn normalize_desired(
-                    resources: Vec<wit_types::ResourceDef>,
-                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
-                    let proto_resources = resources
-                        .iter()
-                        .map(wit_to_proto_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error("normalize_desired", None, error)
-                        })?;
-                    // Keep the mutex guard's lexical scope limited to the
-                    // provider call; bridge result and encoding work does not
-                    // require access to the shared provider.
-                    let result = {
-                        let provider = get_provider().lock().unwrap();
-                        $crate::CarinaProvider::normalize_desired(&*provider, proto_resources)
-                    }
-                    .map_err(proto_to_wit_provider_error)?;
-                    result
-                        .iter()
-                        .map(proto_to_wit_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error("normalize_desired", None, error)
-                        })
-                }
-
-                fn normalize_state(
-                    states: Vec<(String, wit_types::State)>,
-                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
-                    let proto_states = states
-                        .iter()
-                        .map(|(key, state)| {
-                            let parsed_id = helpers::parse_resource_id_string(key);
-                            wit_to_proto_state(&parsed_id, state)
-                                .map(|state| (key.clone(), state))
-                        })
-                        .collect::<Result<HashMap<_, _>, _>>()
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error("normalize_state", None, error)
-                        })?;
-                    let result = {
-                        let provider = get_provider().lock().unwrap();
-                        $crate::CarinaProvider::normalize_state(&*provider, proto_states)
-                    }
-                    .map_err(proto_to_wit_provider_error)?;
-                    result
-                        .into_iter()
-                        .map(|(key, state)| {
-                            proto_to_wit_state(&state).map(|state| (key, state))
-                        })
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error("normalize_state", None, error)
-                        })
-                }
-
-                fn hydrate_read_state(
-                    states: Vec<(String, wit_types::State)>,
-                    saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
-                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
-                    let mut proto_states = states
-                        .iter()
-                        .map(|(key, state)| {
-                            let parsed_id = helpers::parse_resource_id_string(key);
-                            wit_to_proto_state(&parsed_id, state)
-                                .map(|state| (key.clone(), state))
-                        })
-                        .collect::<Result<HashMap<_, _>, _>>()
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error(
-                                "hydrate_read_state",
-                                Some("states"),
-                                error,
-                            )
-                        })?;
-                    let proto_saved = saved_attrs
-                        .iter()
-                        .map(|(key, attributes)| {
-                            wit_to_proto_value_map(attributes)
-                                .map(|attributes| (key.clone(), attributes))
-                        })
-                        .collect::<Result<HashMap<_, _>, _>>()
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error(
-                                "hydrate_read_state",
-                                Some("saved attributes"),
-                                error,
-                            )
-                        })?;
-                    let result = {
-                        let provider = get_provider().lock().unwrap();
-                        $crate::CarinaProvider::hydrate_read_state(
-                            &*provider,
-                            &mut proto_states,
-                            &proto_saved,
-                        )
-                    }
-                    .map_err(proto_to_wit_provider_error)?;
-                    proto_states
-                        .into_iter()
-                        .map(|(key, state)| {
-                            proto_to_wit_state(&state).map(|state| (key, state))
-                        })
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error(
-                                "hydrate_read_state",
-                                None,
-                                error,
-                            )
-                        })
-                }
-
-            }
-
-            export!(WasmGuest);
-        }
+        $crate::export_provider!(@internal $provider_type, {
+            path: "../carina-plugin-wit/wit",
+            world: "carina-provider-with-http",
+            with: {
+                "wasi:io/poll@0.2.6": ::wasi::io::poll,
+                "wasi:io/error@0.2.6": ::wasi::io::error,
+                "wasi:io/streams@0.2.6": ::wasi::io::streams,
+                "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
+                "wasi:http/types@0.2.6": ::wasi::http::types,
+                "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
+            },
+        });
     };
-    (@internal $provider_type:ty, $world:literal) => {
+    (@internal $provider_type:ty, { $($bindgen:tt)* }) => {
         mod __carina_wasm_guest {
             wit_bindgen::generate!({
-                path: "../carina-plugin-wit/wit",
-                world: $world,
+                $($bindgen)*
             });
 
             use super::*;
@@ -1103,6 +566,37 @@ macro_rules! export_provider {
                 }
             }
 
+            fn wit_to_proto_persisted_value(
+                v: &wit_types::PersistedValue,
+            ) -> Result<proto::PersistedValue, helpers::WasmValueDecodeError> {
+                match v {
+                    wit_types::PersistedValue::BoolVal(value) => {
+                        Ok(proto::PersistedValue::Bool(*value))
+                    }
+                    wit_types::PersistedValue::IntVal(value) => {
+                        Ok(proto::PersistedValue::Int(*value))
+                    }
+                    wit_types::PersistedValue::FloatVal(value) => {
+                        Ok(proto::PersistedValue::Float(*value))
+                    }
+                    wit_types::PersistedValue::StrVal(value) => {
+                        Ok(proto::PersistedValue::String(value.clone()))
+                    }
+                    wit_types::PersistedValue::RedactedSecretVal(digest) => {
+                        Ok(helpers::decode_redacted_secret_val(digest))
+                    }
+                    wit_types::PersistedValue::StringListVal(json) => {
+                        helpers::decode_persisted_string_list_val(json)
+                    }
+                    wit_types::PersistedValue::ListVal(json) => {
+                        helpers::decode_persisted_list_val(json)
+                    }
+                    wit_types::PersistedValue::MapVal(json) => {
+                        helpers::decode_persisted_map_val(json)
+                    }
+                }
+            }
+
             fn proto_to_wit_value(
                 v: &proto::Value,
             ) -> Result<wit_types::Value, helpers::WasmValueEncodeError> {
@@ -1125,6 +619,41 @@ macro_rules! export_provider {
                 })
             }
 
+            fn proto_to_wit_persisted_value(
+                v: &proto::PersistedValue,
+            ) -> Result<wit_types::PersistedValue, helpers::WasmValueEncodeError> {
+                Ok(match v {
+                    proto::PersistedValue::Bool(value) => {
+                        wit_types::PersistedValue::BoolVal(*value)
+                    }
+                    proto::PersistedValue::Int(value) => {
+                        wit_types::PersistedValue::IntVal(*value)
+                    }
+                    proto::PersistedValue::Float(value) => {
+                        wit_types::PersistedValue::FloatVal(*value)
+                    }
+                    proto::PersistedValue::String(value) => {
+                        wit_types::PersistedValue::StrVal(value.clone())
+                    }
+                    proto::PersistedValue::RedactedSecret(digest) => {
+                        wit_types::PersistedValue::RedactedSecretVal(digest.clone())
+                    }
+                    proto::PersistedValue::StringList(values) => {
+                        wit_types::PersistedValue::StringListVal(
+                            serde_json::to_string(values).unwrap(),
+                        )
+                    }
+                    proto::PersistedValue::List(_) => {
+                        let json = helpers::proto_persisted_value_to_json(v)?;
+                        wit_types::PersistedValue::ListVal(serde_json::to_string(&json).unwrap())
+                    }
+                    proto::PersistedValue::Map(_) => {
+                        let json = helpers::proto_persisted_value_to_json(v)?;
+                        wit_types::PersistedValue::MapVal(serde_json::to_string(&json).unwrap())
+                    }
+                })
+            }
+
             fn wit_to_proto_value_map(
                 entries: &[(String, wit_types::Value)],
             ) -> Result<HashMap<String, proto::Value>, helpers::WasmValueDecodeError> {
@@ -1132,6 +661,19 @@ macro_rules! export_provider {
                     .iter()
                     .map(|(key, value): &(String, wit_types::Value)| {
                         wit_to_proto_value(value)
+                            .map(|value| (key.clone(), value))
+                            .map_err(|error| error.prepend_attribute(key))
+                    })
+                    .collect()
+            }
+
+            fn wit_to_proto_persisted_value_map(
+                entries: &[(String, wit_types::PersistedValue)],
+            ) -> Result<HashMap<String, proto::PersistedValue>, helpers::WasmValueDecodeError> {
+                entries
+                    .iter()
+                    .map(|(key, value)| {
+                        wit_to_proto_persisted_value(value)
                             .map(|value| (key.clone(), value))
                             .map_err(|error| error.prepend_attribute(key))
                     })
@@ -1153,6 +695,21 @@ macro_rules! export_provider {
                     .collect()
             }
 
+            fn proto_to_wit_persisted_value_map(
+                map: &HashMap<String, proto::PersistedValue>,
+            ) -> Result<
+                Vec<(String, wit_types::PersistedValue)>,
+                helpers::WasmValueEncodeError,
+            > {
+                map.iter()
+                    .map(|(key, value)| {
+                        proto_to_wit_persisted_value(value)
+                            .map(|value| (key.clone(), value))
+                            .map_err(|error| error.prepend_attribute(key))
+                    })
+                    .collect()
+            }
+
             fn wit_to_proto_state(
                 id: &proto::ResourceId,
                 state: &wit_types::State,
@@ -1165,12 +722,34 @@ macro_rules! export_provider {
                 })
             }
 
+            fn wit_to_proto_persisted_state(
+                id: &proto::ResourceId,
+                state: &wit_types::PersistedState,
+            ) -> Result<proto::PersistedState, helpers::WasmValueDecodeError> {
+                Ok(proto::PersistedState {
+                    id: id.clone(),
+                    identifier: state.identifier.clone(),
+                    attributes: wit_to_proto_persisted_value_map(&state.attributes)?,
+                    exists: state.exists,
+                })
+            }
+
             fn proto_to_wit_state(
                 state: &proto::State,
             ) -> Result<wit_types::State, helpers::WasmValueEncodeError> {
                 Ok(wit_types::State {
                     identifier: state.identifier.clone(),
                     attributes: proto_to_wit_value_map(&state.attributes)?,
+                    exists: state.exists,
+                })
+            }
+
+            fn proto_to_wit_persisted_state(
+                state: &proto::PersistedState,
+            ) -> Result<wit_types::PersistedState, helpers::WasmValueEncodeError> {
+                Ok(wit_types::PersistedState {
+                    identifier: state.identifier.clone(),
+                    attributes: proto_to_wit_persisted_value_map(&state.attributes)?,
                     exists: state.exists,
                 })
             }
@@ -1201,12 +780,12 @@ macro_rules! export_provider {
             ) -> Result<wit_types::UpdateOutcome, helpers::WasmValueEncodeError> {
                 Ok(match outcome {
                     proto::UpdateOutcome::Success { state } => {
-                        wit_types::UpdateOutcome::Success(proto_to_wit_state(state)?)
+                        wit_types::UpdateOutcome::Success(proto_to_wit_persisted_state(state)?)
                     }
                     proto::UpdateOutcome::PartialSuccess { state, diagnostic } => {
                         wit_types::UpdateOutcome::PartialSuccess(
                             wit_types::UpdatePartialSuccess {
-                                state: proto_to_wit_state(state)?,
+                                state: proto_to_wit_persisted_state(state)?,
                                 diagnostic: wit_types::PartialReadDiagnostic {
                                     reason: diagnostic.reason.clone(),
                                     missing_attributes: diagnostic.missing_attributes.clone(),
@@ -1354,7 +933,7 @@ macro_rules! export_provider {
                 req: wit_types::UpdateRequest,
                 proto_id: &proto::ResourceId,
             ) -> Result<proto::UpdateRequest, helpers::WasmValueDecodeError> {
-                let from = wit_to_proto_state(proto_id, &req.current)?;
+                let from = wit_to_proto_persisted_state(proto_id, &req.current)?;
                 let ops = req
                     .patch
                     .ops
@@ -1663,13 +1242,13 @@ macro_rules! export_provider {
                 }
 
                 fn normalize_state(
-                    states: Vec<(String, wit_types::State)>,
-                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
+                    states: Vec<(String, wit_types::PersistedState)>,
+                ) -> Result<Vec<(String, wit_types::PersistedState)>, wit_types::ProviderError> {
                     let proto_states = states
                         .iter()
                         .map(|(key, state)| {
                             let parsed_id = helpers::parse_resource_id_string(key);
-                            wit_to_proto_state(&parsed_id, state)
+                            wit_to_proto_persisted_state(&parsed_id, state)
                                 .map(|state| (key.clone(), state))
                         })
                         .collect::<Result<HashMap<_, _>, _>>()
@@ -1684,7 +1263,7 @@ macro_rules! export_provider {
                     result
                         .into_iter()
                         .map(|(key, state)| {
-                            proto_to_wit_state(&state).map(|state| (key, state))
+                            proto_to_wit_persisted_state(&state).map(|state| (key, state))
                         })
                         .collect::<Result<_, _>>()
                         .map_err(|error| {
@@ -1693,14 +1272,14 @@ macro_rules! export_provider {
                 }
 
                 fn hydrate_read_state(
-                    states: Vec<(String, wit_types::State)>,
-                    saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
-                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
+                    states: Vec<(String, wit_types::PersistedState)>,
+                    saved_attrs: Vec<(String, Vec<(String, wit_types::PersistedValue)>)>,
+                ) -> Result<Vec<(String, wit_types::PersistedState)>, wit_types::ProviderError> {
                     let mut proto_states = states
                         .iter()
                         .map(|(key, state)| {
                             let parsed_id = helpers::parse_resource_id_string(key);
-                            wit_to_proto_state(&parsed_id, state)
+                            wit_to_proto_persisted_state(&parsed_id, state)
                                 .map(|state| (key.clone(), state))
                         })
                         .collect::<Result<HashMap<_, _>, _>>()
@@ -1714,7 +1293,7 @@ macro_rules! export_provider {
                     let proto_saved = saved_attrs
                         .iter()
                         .map(|(key, attributes)| {
-                            wit_to_proto_value_map(attributes)
+                            wit_to_proto_persisted_value_map(attributes)
                                 .map(|attributes| (key.clone(), attributes))
                         })
                         .collect::<Result<HashMap<_, _>, _>>()
@@ -1737,7 +1316,7 @@ macro_rules! export_provider {
                     proto_states
                         .into_iter()
                         .map(|(key, state)| {
-                            proto_to_wit_state(&state).map(|state| (key, state))
+                            proto_to_wit_persisted_state(&state).map(|state| (key, state))
                         })
                         .collect::<Result<_, _>>()
                         .map_err(|error| {
@@ -1832,5 +1411,74 @@ mod tests {
             .expect_err("nested non-finite floats must fail guest boundary encoding");
 
         assert!(error.to_string().contains("non-finite float"));
+    }
+
+    #[test]
+    fn persisted_json_policy_is_structural_and_restores_escaped_user_keys() {
+        let digest = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0MTIzNA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let marker = format!("_secret:{digest}");
+        let json = serde_json::json!([
+            marker,
+            {"$secret": digest},
+            {"$$secret": "user"}
+        ]);
+        let decoded = decode_persisted_list_val(&json.to_string()).expect("decode persisted list");
+
+        assert_eq!(
+            decoded,
+            proto::PersistedValue::List(vec![
+                proto::PersistedValue::String(marker),
+                proto::PersistedValue::RedactedSecret(digest.to_string()),
+                proto::PersistedValue::Map(std::collections::HashMap::from([(
+                    "$secret".to_string(),
+                    proto::PersistedValue::String("user".to_string()),
+                )])),
+            ])
+        );
+    }
+
+    #[test]
+    fn persisted_json_encoding_tags_only_typed_redacted_secrets() {
+        let digest = "argon2-legacy:73616c74:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let marker = format!("_secret:{digest}");
+        let value = proto::PersistedValue::Map(std::collections::HashMap::from([
+            (
+                "plain".to_string(),
+                proto::PersistedValue::String(marker.clone()),
+            ),
+            (
+                "typed".to_string(),
+                proto::PersistedValue::RedactedSecret(digest.to_string()),
+            ),
+            (
+                "$secret".to_string(),
+                proto::PersistedValue::String("user".to_string()),
+            ),
+        ]));
+        let encoded = proto_persisted_value_to_json(&value).expect("encode persisted value");
+
+        assert_eq!(encoded["plain"], marker);
+        assert_eq!(encoded["typed"], serde_json::json!({"$secret": digest}));
+        assert_eq!(encoded["$$secret"], "user");
+        let ordinary = proto::Value::Map(std::collections::HashMap::from([(
+            "$secret".to_string(),
+            proto::Value::String(digest.to_string()),
+        )]));
+        assert_eq!(
+            proto_value_to_json(&ordinary).expect("encode ordinary map"),
+            serde_json::json!({"$secret": digest}),
+            "the ordinary type treats a $secret key as user data",
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_json_tags_and_reserved_keys_are_rejected() {
+        for json in [
+            serde_json::json!([{"$secret": 42}]),
+            serde_json::json!([{"$secret": "digest", "extra": true}]),
+            serde_json::json!([{"$reserved": "value"}]),
+        ] {
+            assert!(decode_persisted_list_val(&json.to_string()).is_err());
+        }
     }
 }

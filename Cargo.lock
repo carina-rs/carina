@@ -1204,6 +1204,7 @@ dependencies = [
 name = "carina-state"
 version = "0.4.0"
 dependencies = [
+ "argon2",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -1211,6 +1212,7 @@ dependencies = [
  "aws-smithy-types",
  "carina-core",
  "chrono",
+ "hex",
  "hostname",
  "indexmap 2.13.0",
  "serde",

@@ -139,8 +139,8 @@ impl HistoricalDisplayAttributes {
         self.deletes.insert(key, masked);
     }
 
-    /// Decode a deposed generation directly from persisted JSON. Valid secret
-    /// markers become typed redacted values before reaching a renderer.
+    /// Decode a deposed generation directly from persisted JSON. Valid
+    /// `$secret` tags become typed redacted values before reaching a renderer.
     pub fn set_delete_from_persisted(
         &mut self,
         key: DeletedInstanceKey,

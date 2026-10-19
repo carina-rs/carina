@@ -13,20 +13,33 @@ By default, state is stored locally as `carina.state.json`. For team usage, conf
 
 ### State format upgrades
 
+State format v14 stores a redacted secret structurally as a single-key object:
+
+```json
+{"$secret":"$argon2id$..."}
+```
+
+Ordinary strings are always strings, even when their text starts with
+`_secret:` and otherwise looks like an older secret marker. User map keys such
+as `$secret` are stored as `$$secret` so they cannot be confused with the
+host-owned tag. Loading v13 or older state migrates legacy secret markers only
+inside current and deposed resource attributes; exported strings retain their
+literal value.
+
 State format v13 gives host-owned values a reserved `$` namespace. Canonical
 enums are stored under `$enum`; user map keys that begin with `$` are escaped
 with one additional `$` and restored when state is read. Loading an older state
 file migrates legacy enum objects and `$`-prefixed user keys automatically.
 
-State format v12 upgrades old raw secret markers when the state file is read.
+The v14 loader also preserves the v12 migration for old raw secret markers.
 An `_secret:argon2:<hash>` value from an earlier state version is bound to the
 provider, resource type, stored identity, and top-level attribute key from its
-own row, then represented as the self-contained
-`_secret:argon2-legacy:<row-salt-hex>:<hash-hex>` form. This load-time upgrade
-does not require the plaintext and does not create a resource change. The next
-state write that has the matching plaintext replaces the legacy form with a
-standard `_secret:$argon2id$...` PHC digest containing a fresh random salt and
-explicit Argon2 parameters.
+own row, then stored as a `$secret` object carrying an
+`argon2-legacy:<row-salt-hex>:<hash-hex>` digest. This load-time upgrade does
+not require the plaintext and does not create a resource change. The next state
+write that has the matching plaintext replaces the legacy digest with a
+standard `$argon2id$...` PHC digest containing a fresh random salt and explicit
+Argon2 parameters.
 
 ## Configuring the S3 backend
 

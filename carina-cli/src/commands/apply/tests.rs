@@ -6091,7 +6091,7 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported-version error, got: {error}");
         };
         assert_eq!(*found, 15);
-        assert_eq!(*expected, 16);
+        assert_eq!(*expected, 17);
         assert_eq!(
             replan_command.as_deref(),
             Some(format!("carina plan --out {} infra", plan_path.display()).as_str())

@@ -122,23 +122,23 @@ pub struct NormalizeDesiredResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NormalizeStateParams {
-    pub states: HashMap<String, State>,
+    pub states: HashMap<String, PersistedState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NormalizeStateResult {
-    pub states: HashMap<String, State>,
+    pub states: HashMap<String, PersistedState>,
 }
 
 // -- hydrate_read_state --
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HydrateReadStateParams {
-    pub states: HashMap<String, State>,
-    pub saved_attrs: HashMap<String, HashMap<String, Value>>,
+    pub states: HashMap<String, PersistedState>,
+    pub saved_attrs: HashMap<String, HashMap<String, PersistedValue>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HydrateReadStateResult {
-    pub states: HashMap<String, State>,
+    pub states: HashMap<String, PersistedState>,
 }

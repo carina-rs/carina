@@ -6,9 +6,7 @@ use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
 pub use carina_core::provider::PreviousSecretHashAuthority;
-use carina_core::provider::{
-    EncodedStateRowAttributes, PersistedAttributes, PersistedAttributesError, RawSavedAttrs,
-};
+use carina_core::provider::{PersistedAttributes, PersistedAttributesError, RawSavedAttrs};
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, Directives, PartialReadMarker, ResolvedResource, Resource, ResourceId,
@@ -22,22 +20,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::backend::{BackendError, InvalidResourceIdentityError};
 
 #[cfg(any(test, feature = "test-utils"))]
-fn persisted_attributes_for_test_state_row(
-    row_id: &ResourceId,
+fn persisted_attributes_from_test_json(
     attributes: HashMap<String, serde_json::Value>,
 ) -> PersistedAttributes {
-    let encoded: EncodedStateRowAttributes = serde_json::from_value(serde_json::json!({
-        "provider": row_id.provider,
-        "resource_type": row_id.resource_type,
-        "identity": row_id.identity_str().expect("test state row has a resolved identity"),
-        "attributes": attributes,
-    }))
-    .expect("test state row uses the encoded state shape");
-    let decoded = encoded
-        .decode()
-        .expect("test state row legacy salt is representable");
-    let (_, _, _, attributes) = decoded.into_parts();
-    attributes
+    PersistedAttributes::from_encoded(attributes)
+        .expect("test state row contains valid persisted JSON")
 }
 
 /// A provider or desired value could not be encoded into persisted state.
@@ -217,11 +204,13 @@ impl StateFile {
     ///      stored list value in the same resource row.
     /// v11: Removed legacy host-reserved `_`-prefixed keys from current and
     ///      deposed provider attributes and from the top-level explicit tree.
-    /// v12: Persisted secret markers carry their own salt. Raw v11 legacy
-    ///      markers are upgraded while each resource row is deserialized.
+    /// v12: Persisted secret strings carry their own salt. Raw v11 legacy
+    ///      strings are upgraded using their resource-row identity.
     /// v13: Persisted canonical enums use the host-reserved `$enum` tag and
     ///      user map keys beginning with `$` are escaped with one extra `$`.
-    pub const CURRENT_VERSION: u32 = 13;
+    /// v14: Redacted secrets use the host-reserved `$secret` tag. Legacy
+    ///      marker strings are migrated only in resource attribute trees.
+    pub const CURRENT_VERSION: u32 = 14;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -1054,12 +1043,18 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             });
             // v12 → v13: migrate every value tree before typed state
             // deserialization validates the reserved `$` namespace.
-            let migrated_persisted_json = if v <= 12 {
+            let migrated_v12 = if v <= 12 {
                 Some(migrate_v12_persisted_values(content)?)
             } else {
                 None
             };
-            let parse_content = migrated_persisted_json.as_deref().unwrap_or(content);
+            let pre_secret_migration = migrated_v12.as_deref().unwrap_or(content);
+            let migrated_v13 = if v <= 13 {
+                Some(migrate_v13_resource_secret_markers(pre_secret_migration)?)
+            } else {
+                None
+            };
+            let parse_content = migrated_v13.as_deref().unwrap_or(pre_secret_migration);
             let mut state = StateFile::from_json_str(parse_content)
                 .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
             // v5 → v6: lift the flat `desired_keys: Vec<String>` field
@@ -1095,10 +1090,10 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             if v <= 10 {
                 migrate_v10_reserved_attributes(&mut state);
             }
-            // v11 → v12 needs no additional tree walk. ResourceState's custom
-            // deserializer has already converted every current and deposed raw
-            // legacy marker using the row identity stored in the v11 file.
-            // v12 → v13 was applied to raw JSON before deserialization above.
+            // v11 → v12 secret strings and v13 → v14 structural secret tags
+            // were migrated in raw JSON before typed deserialization above.
+            // v12 → v13 key/tag migration ran first so a newly inserted
+            // `$secret` host tag could not be mistaken for a user key.
             state.version = StateFile::CURRENT_VERSION;
             state
         }
@@ -1153,8 +1148,8 @@ pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<MigratedStateFile, Backen
 /// Pre-replacement instance that still needs a successful Delete.
 ///
 /// Persisted attributes cannot be read as ordinary JSON values. Callers must
-/// use [`DeposedInstance::persisted_attributes`] so secret markers retain
-/// their typed meaning.
+/// use [`DeposedInstance::persisted_attributes`] so structural secret tags
+/// retain their typed meaning.
 ///
 /// ```compile_fail
 /// use carina_state::state::DeposedInstance;
@@ -1210,32 +1205,7 @@ impl DeposedInstance {
             key,
             identifier,
             provider_instance,
-            persisted_attributes_for_test_state_row(
-                &ResourceId::with_provider_identity("test", "test.resource", "fixture-row", None),
-                attributes,
-            ),
-            dependency_bindings,
-        )
-    }
-
-    /// Construct a deposed generation from raw state JSON that may contain
-    /// legacy secret markers. The containing resource row is mandatory so the
-    /// raw marker can be upgraded with its historical salt bytes immediately.
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn from_persisted_json_for_resource(
-        row_id: &ResourceId,
-        key: DeposedKey,
-        identifier: String,
-        provider_instance: Option<String>,
-        attributes: HashMap<String, serde_json::Value>,
-        dependency_bindings: BTreeSet<String>,
-    ) -> Self {
-        Self::from_persisted_attributes(
-            key,
-            identifier,
-            provider_instance,
-            persisted_attributes_for_test_state_row(row_id, attributes),
+            persisted_attributes_from_test_json(attributes),
             dependency_bindings,
         )
     }
@@ -1249,8 +1219,8 @@ impl DeposedInstance {
 /// State of a single managed resource.
 ///
 /// Persisted attributes cannot be read as ordinary JSON values. Callers must
-/// use [`ResourceState::persisted_attributes`] so secret markers retain their
-/// typed meaning.
+/// use [`ResourceState::persisted_attributes`] so structural secret tags retain
+/// their typed meaning.
 ///
 /// ```compile_fail
 /// use carina_state::state::ResourceState;
@@ -1337,8 +1307,11 @@ struct EncodedDeposedInstance {
 
 #[derive(Deserialize)]
 struct EncodedResourceState {
-    #[serde(flatten)]
-    persisted: EncodedStateRowAttributes,
+    resource_type: String,
+    #[serde(alias = "name")]
+    identity: ResourceIdentity,
+    provider: String,
+    attributes: HashMap<String, serde_json::Value>,
     #[serde(default)]
     identifier: Option<String>,
     #[serde(default)]
@@ -1366,9 +1339,7 @@ struct EncodedResourceState {
 impl<'de> Deserialize<'de> for ResourceState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = EncodedResourceState::deserialize(deserializer)?;
-        let persisted = encoded
-            .persisted
-            .decode()
+        let attributes = PersistedAttributes::from_encoded(encoded.attributes)
             .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?;
         let deposed = encoded
             .deposed
@@ -1378,18 +1349,16 @@ impl<'de> Deserialize<'de> for ResourceState {
                     key: instance.key,
                     identifier: instance.identifier,
                     provider_instance: instance.provider_instance,
-                    attributes: persisted
-                        .decode_related_attributes(instance.attributes)
+                    attributes: PersistedAttributes::from_encoded(instance.attributes)
                         .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
                     dependency_bindings: instance.dependency_bindings,
                 })
             })
             .collect::<Result<Vec<_>, D::Error>>()?;
-        let (provider, resource_type, identity, attributes) = persisted.into_parts();
         Ok(Self {
-            resource_type,
-            identity,
-            provider,
+            resource_type: encoded.resource_type,
+            identity: encoded.identity,
+            provider: encoded.provider,
             identifier: encoded.identifier,
             attributes,
             deposed,
@@ -1440,14 +1409,7 @@ impl ResourceState {
     #[doc(hidden)]
     pub fn set_persisted_attribute(&mut self, key: impl Into<String>, value: serde_json::Value) {
         let key = key.into();
-        let id = ResourceId::with_provider_identity(
-            self.provider.clone(),
-            self.resource_type.clone(),
-            self.identity.clone(),
-            self.directives.provider_instance.clone(),
-        );
-        let upgraded =
-            persisted_attributes_for_test_state_row(&id, HashMap::from([(key.clone(), value)]));
+        let upgraded = persisted_attributes_from_test_json(HashMap::from([(key.clone(), value)]));
         self.attributes.extend(upgraded);
     }
 
@@ -1897,6 +1859,28 @@ fn migrate_v12_persisted_values(content: &str) -> Result<String, BackendError> {
     serde_json::to_string(&raw).map_err(|error| {
         BackendError::InvalidState(format!(
             "Failed to serialize state file after v12 persisted-value migration: {error}"
+        ))
+    })
+}
+
+/// v13 → v14: migrate legacy secret strings only inside current and deposed
+/// resource attributes. Export strings never had resource-state marker
+/// semantics and deliberately remain literal.
+fn migrate_v13_resource_secret_markers(content: &str) -> Result<String, BackendError> {
+    let mut raw: serde_json::Value = serde_json::from_str(content).map_err(|error| {
+        BackendError::InvalidState(format!(
+            "Failed to re-parse state file for v13 secret migration: {error}"
+        ))
+    })?;
+    carina_core::resource::legacy_secret_migration::migrate_state_document_v13(&mut raw).map_err(
+        |error| {
+            BackendError::InvalidState(format!("Failed to migrate v13 resource secrets: {error}"))
+        },
+    )?;
+
+    serde_json::to_string(&raw).map_err(|error| {
+        BackendError::InvalidState(format!(
+            "Failed to serialize state file after v13 secret migration: {error}"
         ))
     })
 }
