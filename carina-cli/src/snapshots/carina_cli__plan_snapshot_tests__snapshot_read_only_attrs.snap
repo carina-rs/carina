@@ -5,13 +5,13 @@ expression: output
 Execution Plan:
 
   + awscc.ec2.Vpc vpc
-      cidr_block: "10.0.0.0/16"
+      cidr_block: '10.0.0.0/16'
       tags:
-        Name: "read-only-test"
+        Name: 'read-only-test'
         │
         └─ + awscc.ec2.Subnet awscc_ec2_subnet_29e1080d
-              availability_zone: "ap-northeast-1a"
-              cidr_block: "10.0.1.0/24"
+              availability_zone: 'ap-northeast-1a'
+              cidr_block: '10.0.1.0/24'
               vpc_id: vpc.vpc_id
 
 Plan: 2 to add, 0 to change, 0 to destroy.

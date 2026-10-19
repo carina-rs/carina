@@ -33,7 +33,7 @@ expression: output
 │~ ec2.Vpc new_vpc                                                                                                     │
 │                                                                                                                      │
 │  tags:                                                                                                               │
-│    + Name: "updated"                                                                                                 │
+│    + Name: 'updated'                                                                                                 │
 │  # (1 unchanged attribute hidden)                                                                                    │
 │                                                                                                                      │
 │                                                                                                                      │

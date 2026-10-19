@@ -63,7 +63,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("hello_world".into()))
         );
         assert_eq!(ValueDescription::of(&result).to_string(), "string");
-        assert_eq!(format_value(&result), r#""hello_world""#);
+        assert_eq!(format_value(&result), "'hello_world'");
         assert_eq!(
             value_to_json(&result).unwrap(),
             serde_json::json!("hello_world")

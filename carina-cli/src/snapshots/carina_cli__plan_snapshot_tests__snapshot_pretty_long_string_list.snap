@@ -6,10 +6,10 @@ Execution Plan:
 
   + awscc.iam.Role awscc_iam_role_a707aa80
       managed_policy_arns: [
-        "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
-        "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
-        "arn:aws:iam::aws:policy/IAMReadOnlyAccess",
+        'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess',
+        'arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess',
+        'arn:aws:iam::aws:policy/IAMReadOnlyAccess',
       ]
-      role_name: "test-role"
+      role_name: 'test-role'
 
 Plan: 1 to add, 0 to change, 0 to destroy.

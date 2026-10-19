@@ -806,7 +806,7 @@ fn snapshot_string_dot_suffix() {
         None,
     ));
     assert_eq!(
-        output.matches("name: \"A.json\"").count(),
+        output.matches("name: 'A.json'").count(),
         2,
         "literal and evaluated string values must both retain their dotted suffix:\n{output}"
     );
@@ -1443,7 +1443,7 @@ fn plan_snapshot_upstream_state_map_subscript() {
     // bug) would still satisfy the broad "contains the id" checks
     // above because the interpolation case would still substitute.
     assert!(
-        stripped.contains("DevAccount: \"222222222222\""),
+        stripped.contains("DevAccount: '222222222222'"),
         "expected bare `orgs.accounts['registry_dev']` attribute substituted, got:\n{stripped}"
     );
     insta::assert_snapshot!(stripped);
@@ -1488,7 +1488,7 @@ fn plan_snapshot_upstream_state_map_dot_notation() {
     // Pin that the bare-attribute form does not regress to the literal
     // `orgs.accounts.registry_dev` substring (the original #2447 bug).
     assert!(
-        stripped.contains("DevAccount: \"222222222222\""),
+        stripped.contains("DevAccount: '222222222222'"),
         "expected bare `orgs.accounts.registry_dev` attribute substituted, got:\n{stripped}"
     );
     assert!(
@@ -1933,7 +1933,7 @@ fn snapshot_list_diff_best_first_mid_insert() {
         None,
     ));
     assert!(
-        output.contains("sid: \"ECRRepository\""),
+        output.contains("sid: 'ECRRepository'"),
         "inserted statement must render as an added element: {output}"
     );
     assert!(
@@ -1941,7 +1941,7 @@ fn snapshot_list_diff_best_first_mid_insert() {
         "existing statement's added ARN must remain visible: {output}"
     );
     assert!(
-        !output.contains("\"ManagePublishStackRoles\" →"),
+        !output.contains("'ManagePublishStackRoles' →"),
         "best-first pairing must not render the existing SID as renamed: {output}"
     );
     insta::assert_snapshot!(output);

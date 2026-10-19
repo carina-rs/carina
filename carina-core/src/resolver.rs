@@ -992,7 +992,7 @@ mod tests {
         let err = result.expect_err("missing key in concrete upstream Secret(Map) must error");
         assert_eq!(
             err,
-            "h.creds[\"missing\"]: key not found; available keys: <redacted, 3 entries>"
+            "h.creds['missing']: key not found; available keys: <redacted, 3 entries>"
         );
         for k in ["db_pwd", "api_key", "slack_token"] {
             assert!(
@@ -1086,7 +1086,7 @@ mod tests {
             .expect_err("missing key in empty upstream Secret(Map) must error");
         assert_eq!(
             err,
-            "h.creds[\"missing\"]: key not found; available keys: <redacted, 0 entries>"
+            "h.creds['missing']: key not found; available keys: <redacted, 0 entries>"
         );
     }
 
@@ -1597,7 +1597,7 @@ mod tests {
         assert_eq!(postfix_access, resource_path);
 
         let expected =
-            Err("res.tags[\"missing\"]: key not found; available keys: \"present\"".to_string());
+            Err("res.tags['missing']: key not found; available keys: 'present'".to_string());
         assert_eq!(resolve_ref_value(&resource_path, &bindings), expected);
         assert_eq!(resolve_ref_value(&postfix_access, &bindings), expected);
     }

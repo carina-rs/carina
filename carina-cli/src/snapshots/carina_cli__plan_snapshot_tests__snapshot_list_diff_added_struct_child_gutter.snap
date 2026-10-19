@@ -5,26 +5,26 @@ expression: output
 Execution Plan:
 
   + awscc.iam.Role role
-      assume_role_policy_document: "{}"
-      role_name: "test-role"
+      assume_role_policy_document: '{}'
+      role_name: 'test-role'
         │
         ├─ ~ awscc.iam.RolePolicy policy
         │     statement:
-        │         {action: "s3:GetObject", effect: "Allow", resource: "arn:aws:s3:::example/*", sid: "AllowS3Read"}
+        │         {action: 's3:GetObject', effect: 'Allow', resource: 'arn:aws:s3:::example/*', sid: 'AllowS3Read'}
         │       + {
         │           action: [
-        │             "cloudformation:CancelResourceRequest",
-        │             "cloudformation:CreateResource",
-        │             "cloudformation:DeleteResource",
-        │             "cloudformation:GetResource",
+        │             'cloudformation:CancelResourceRequest',
+        │             'cloudformation:CreateResource',
+        │             'cloudformation:DeleteResource',
+        │             'cloudformation:GetResource',
         │           ]
-        │           effect: "Allow"
-        │           resource: ["*"]
-        │           sid: "CloudControl"
+        │           effect: 'Allow'
+        │           resource: ['*']
+        │           sid: 'CloudControl'
         │         }
         │     # (2 unchanged attributes hidden)
         │
         └─ + awscc.s3.Bucket awscc_s3_bucket_d937e049
-              bucket_name: "zzz-trailing-sibling"
+              bucket_name: 'zzz-trailing-sibling'
 
 Plan: 2 to add, 1 to change, 0 to destroy.

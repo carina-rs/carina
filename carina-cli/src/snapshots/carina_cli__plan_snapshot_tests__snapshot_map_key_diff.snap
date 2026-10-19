@@ -6,8 +6,8 @@ Execution Plan:
 
   ~ awscc.ec2.Vpc ec2_vpc_fb75c929
       tags:
-        ~ Environment: "staging" → "production"
-        - OldTag: "remove-me"
+        ~ Environment: 'staging' → 'production'
+        - OldTag: 'remove-me'
       # (3 unchanged attributes hidden)
 
 Plan: 0 to add, 1 to change, 0 to destroy.

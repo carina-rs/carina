@@ -4,22 +4,23 @@ use carina_core::detail_rows::{
     ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind, ListOfMapsDiffModified,
     MapDiffEntryIR, hidden_unchanged_summary,
 };
-use carina_core::value::{PrettyLayout, format_value_pretty, needs_trailing_separator};
+use carina_core::value::{PrettyLayout, RenderedValue};
 use ratatui::prelude::*;
 
 use super::push_annotation_span;
+use super::value_view::{ValueStyle, value_lines_styled, value_spans_styled};
 
 /// Render string-list diff entries (#2943) into TUI lines. Mirrors
 /// `carina-cli::display::render_string_list_diff_entries` — including
 /// the trailing-summary placement.
 pub(super) fn render_string_list_diff_entries(
     lines: &mut Vec<Line>,
-    unchanged: &[String],
-    added: &[String],
-    removed: &[String],
+    unchanged: &[RenderedValue],
+    added: &[RenderedValue],
+    removed: &[RenderedValue],
 ) {
     for s in removed {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::raw("    "),
             Span::styled(
                 "- ",
@@ -27,20 +28,17 @@ pub(super) fn render_string_list_diff_entries(
                     .fg(Color::Red)
                     .add_modifier(Modifier::CROSSED_OUT),
             ),
-            Span::styled(
-                format!("\"{}\"", s),
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::CROSSED_OUT),
-            ),
-        ]));
+        ];
+        spans.extend(value_spans_styled(s, ValueStyle::RedStrikethrough));
+        lines.push(Line::from(spans));
     }
     for s in added {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::raw("    "),
             Span::styled("+ ", Style::default().fg(Color::Green)),
-            Span::styled(format!("\"{}\"", s), Style::default().fg(Color::Green)),
-        ]));
+        ];
+        spans.extend(value_spans_styled(s, ValueStyle::Green));
+        lines.push(Line::from(spans));
     }
     if !unchanged.is_empty() {
         lines.push(Line::from(vec![
@@ -67,15 +65,10 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                     Span::raw("    "),
                     Span::styled("~ ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!("{}: ", key)),
-                    Span::styled(
-                        old.clone(),
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::CROSSED_OUT),
-                    ),
-                    Span::raw(" -> "),
-                    Span::styled(new.clone(), Style::default().fg(Color::Green)),
                 ];
+                spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
+                spans.push(Span::raw(" -> "));
+                spans.extend(value_spans_styled(new, ValueStyle::Green));
                 push_annotation_span(&mut spans, annotation.as_deref());
                 lines.push(Line::from(spans));
             }
@@ -88,13 +81,13 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                     Span::raw("    "),
                     Span::styled("+ ", Style::default().fg(Color::Green)),
                     Span::raw(format!("{}: ", key)),
-                    Span::styled(value.clone(), Style::default().fg(Color::Green)),
                 ];
+                spans.extend(value_spans_styled(value, ValueStyle::Green));
                 push_annotation_span(&mut spans, annotation.as_deref());
                 lines.push(Line::from(spans));
             }
             MapDiffEntryIR::Removed { key, value } => {
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::raw("    "),
                     Span::styled(
                         "- ",
@@ -108,13 +101,9 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                             .fg(Color::Red)
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
-                    Span::styled(
-                        value.clone(),
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::CROSSED_OUT),
-                    ),
-                ]));
+                ];
+                spans.extend(value_spans_styled(value, ValueStyle::RedStrikethrough));
+                lines.push(Line::from(spans));
             }
             MapDiffEntryIR::NestedMapDiff { key, entries } => {
                 lines.push(Line::from(vec![
@@ -133,7 +122,7 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                 let mut nested_lines = Vec::new();
                 render_list_of_maps_diff(
                     &mut nested_lines,
-                    key,
+                    key.plain(),
                     block.unchanged(),
                     block.modified(),
                     block.added(),
@@ -173,7 +162,7 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
 pub(super) fn render_list_of_maps_diff(
     lines: &mut Vec<Line>,
     key: &str,
-    unchanged: &[String],
+    unchanged: &[RenderedValue],
     modified: &[ListOfMapsDiffModified],
     added: &[ListOfMapsDiffItem],
     removed: &[ListOfMapsDiffItem],
@@ -185,10 +174,9 @@ pub(super) fn render_list_of_maps_diff(
     }
     lines.push(first_line);
     for item in unchanged {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", item),
-            Style::default().fg(Color::DarkGray),
-        )));
+        let mut spans = vec![Span::raw("    ")];
+        spans.extend(value_spans_styled(item, ValueStyle::DarkGray));
+        lines.push(Line::from(spans));
     }
     for m in modified {
         let mut spans = vec![Span::raw("    {")];
@@ -201,14 +189,9 @@ pub(super) fn render_list_of_maps_diff(
             match field {
                 ListOfMapsDiffField::Changed { key, old, new } => {
                     spans.push(Span::raw(format!("{}: ", key)));
-                    spans.push(Span::styled(
-                        old.clone(),
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::CROSSED_OUT),
-                    ));
+                    spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
                     spans.push(Span::raw(" -> "));
-                    spans.push(Span::styled(new.clone(), Style::default().fg(Color::Green)));
+                    spans.extend(value_spans_styled(new, ValueStyle::Green));
                 }
                 ListOfMapsDiffField::NestedMapChanged { key, entries } => {
                     // Flush current spans as a line, then render nested entries
@@ -284,7 +267,7 @@ pub(super) fn render_list_of_maps_diff(
 /// Render a wholly added or removed list-of-maps element as a multi-line
 /// `+ {` / `- {` block (#2877). Mirrors the CLI display in
 /// `carina-cli/src/display/mod.rs::render_added_removed_block`. Each
-/// field's value goes through `format_value_pretty` so nested long lists
+/// field's value goes through `PrettyValue::render` so nested long lists
 /// or maps wrap to multiple indented lines instead of dumping inline.
 fn push_added_removed_block(
     lines: &mut Vec<Line>,
@@ -316,19 +299,27 @@ fn push_added_removed_block(
         if prev_needs_separator {
             lines.push(Line::from(Span::raw("")));
         }
-        prev_needs_separator = needs_trailing_separator(value);
-        let layout = PrettyLayout {
-            parent_indent_cols: field_indent_cols,
-            key,
+        prev_needs_separator = value.needs_trailing_separator();
+        let layout = PrettyLayout::for_map_key(field_indent_cols, key);
+        let pretty = value.render(layout);
+        let value_style = match kind {
+            ListOfMapsDiffItemKind::Added => ValueStyle::Green,
+            ListOfMapsDiffItemKind::Removed => ValueStyle::RedStrikethrough,
         };
-        let pretty = format_value_pretty(value, layout);
-        for (i, vline) in pretty.split('\n').enumerate() {
-            let line = if i == 0 {
-                format!("{}{}: {}", field_indent, key, vline)
+        for (index, mut line) in value_lines_styled(&pretty, value_style)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                let mut spans = vec![
+                    Span::raw(field_indent.clone()),
+                    Span::styled(format!("{}: ", key), style),
+                ];
+                spans.append(&mut line.spans);
+                lines.push(Line::from(spans));
             } else {
-                vline.to_string()
-            };
-            lines.push(Line::from(Span::styled(line, style)));
+                lines.push(line);
+            }
         }
     }
 
@@ -341,6 +332,12 @@ fn push_added_removed_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::value::RenderedKey;
+
+    fn rendered_string(value: &str) -> RenderedValue {
+        carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(value.into())))
+    }
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -353,19 +350,19 @@ mod tests {
     fn map_diff_renders_annotations_on_added_and_changed_entries() {
         let entries = vec![
             MapDiffEntryIR::Added {
-                key: "Team".to_string(),
-                value: "\"x\"".to_string(),
+                key: RenderedKey::from_raw("Team"),
+                value: rendered_string("x"),
                 annotation: Some("# default_tags".to_string()),
             },
             MapDiffEntryIR::Changed {
-                key: "ManagedBy".to_string(),
-                old: "\"old\"".to_string(),
-                new: "\"carina\"".to_string(),
+                key: RenderedKey::from_raw("ManagedBy"),
+                old: rendered_string("old"),
+                new: rendered_string("carina"),
                 annotation: Some("# default_tags".to_string()),
             },
             MapDiffEntryIR::Removed {
-                key: "Legacy".to_string(),
-                value: "\"gone\"".to_string(),
+                key: RenderedKey::from_raw("Legacy"),
+                value: rendered_string("gone"),
             },
         ];
         let mut lines = Vec::new();
@@ -375,9 +372,9 @@ mod tests {
         assert_eq!(
             lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "    + Team: \"x\"  # default_tags",
-                "    ~ ManagedBy: \"old\" -> \"carina\"  # default_tags",
-                "    - Legacy: \"gone\"",
+                "    + Team: 'x'  # default_tags",
+                "    ~ ManagedBy: 'old' -> 'carina'  # default_tags",
+                "    - Legacy: 'gone'",
             ]
         );
     }

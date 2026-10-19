@@ -5,20 +5,20 @@ expression: output
 Execution Plan:
 
   + awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb
-      cidr_block: "10.0.0.0/16"
+      cidr_block: '10.0.0.0/16'
       config:
         statement: 
-          * action: ["sts:AssumeRoleWithWebIdentity"]
+          * action: ['sts:AssumeRoleWithWebIdentity']
             condition: 
               string_equals: 
-                token.actions.githubusercontent.com:aud: ["sts.amazonaws.com"]
+                'token.actions.githubusercontent.com:aud': ['sts.amazonaws.com']
               string_like: 
-                token.actions.githubusercontent.com:sub: [
-                  "repo:carina-rs/infra:ref:refs/heads/main",
-                  "repo:carina-rs/infra:pull_request",
+                'token.actions.githubusercontent.com:sub': [
+                  'repo:carina-rs/infra:ref:refs/heads/main',
+                  'repo:carina-rs/infra:pull_request',
                 ]
-            effect: "Allow"
-            sid: "AssumeRole"
-        version: "2012-10-17"
+            effect: 'Allow'
+            sid: 'AssumeRole'
+        version: '2012-10-17'
 
 Plan: 1 to add, 0 to change, 0 to destroy.

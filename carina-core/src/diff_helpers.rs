@@ -325,43 +325,42 @@ pub fn compute_map_diff(
     }
 }
 
-/// Diff result for two `Vec<String>` slices, partitioned by value
+/// Diff result for two slices, partitioned by value
 /// membership. `unchanged` follows new-list order; `added` and
 /// `removed` preserve their source order.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StringListDiff {
-    pub unchanged: Vec<String>,
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
+pub(crate) struct StringListDiff<T> {
+    pub unchanged: Vec<T>,
+    pub added: Vec<T>,
+    pub removed: Vec<T>,
 }
 
-/// Diff two `&[String]` slices into `unchanged` / `added` / `removed`.
-/// Set semantics: equality is by value, not position, and duplicate
-/// elements are conflated.
-pub fn compute_string_list_diff(old: &[String], new: &[String]) -> StringListDiff {
-    compute_string_list_diff_by(old, new, |left, right| left == right)
-}
-
-/// Diff two string slices with caller-provided set-membership equality while
-/// preserving the original spellings and ordering in the result.
-pub(crate) fn compute_string_list_diff_by(
-    old: &[String],
-    new: &[String],
-    equivalent: impl Fn(&str, &str) -> bool,
-) -> StringListDiff {
+/// Diff two element slices with caller-provided set-membership equality and a
+/// projection to the display values returned in [`StringListDiff`].
+///
+/// The element passed to `display` is always the element from the source side
+/// whose ordering the output preserves: `new` for unchanged/added and `old`
+/// for removed. Comparison keys therefore never have to be reconstructed into
+/// their originating display values after the set-diff.
+pub(crate) fn compute_string_list_diff_by<T, U>(
+    old: &[T],
+    new: &[T],
+    equivalent: impl Fn(&T, &T) -> bool,
+    display: impl Fn(&T) -> U,
+) -> StringListDiff<U> {
     let mut unchanged = Vec::new();
     let mut added = Vec::new();
-    for s in new {
-        if old.iter().any(|old| equivalent(old, s)) {
-            unchanged.push(s.clone());
+    for element in new {
+        if old.iter().any(|old| equivalent(old, element)) {
+            unchanged.push(display(element));
         } else {
-            added.push(s.clone());
+            added.push(display(element));
         }
     }
     let mut removed = Vec::new();
-    for s in old {
-        if !new.iter().any(|new| equivalent(s, new)) {
-            removed.push(s.clone());
+    for element in old {
+        if !new.iter().any(|new| equivalent(element, new)) {
+            removed.push(display(element));
         }
     }
     StringListDiff {
@@ -388,6 +387,44 @@ mod tests {
         } else {
             vec![list_member, struct_member]
         })
+    }
+
+    #[test]
+    fn generic_string_list_diff_emits_display_from_the_original_element() {
+        #[derive(Clone)]
+        struct Element {
+            comparison_key: &'static str,
+            display: &'static str,
+        }
+
+        let old = [Element {
+            comparison_key: "allow",
+            display: "'allow'",
+        }];
+        let new = [
+            Element {
+                comparison_key: "Allow",
+                display: "Mode.Allow",
+            },
+            Element {
+                comparison_key: "Deny",
+                display: "Mode.Deny",
+            },
+        ];
+
+        let diff = compute_string_list_diff_by(
+            &old,
+            &new,
+            |left, right| {
+                left.comparison_key
+                    .eq_ignore_ascii_case(right.comparison_key)
+            },
+            |element| element.display.to_string(),
+        );
+
+        assert_eq!(diff.unchanged, vec!["Mode.Allow"]);
+        assert_eq!(diff.added, vec!["Mode.Deny"]);
+        assert!(diff.removed.is_empty());
     }
 
     #[test]

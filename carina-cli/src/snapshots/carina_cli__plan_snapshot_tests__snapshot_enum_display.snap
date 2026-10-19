@@ -5,7 +5,7 @@ expression: output
 Execution Plan:
 
   + awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb
-      cidr_block: "10.0.0.0/16"
+      cidr_block: '10.0.0.0/16'
       instance_tenancy: dedicated
 
 Plan: 1 to add, 0 to change, 0 to destroy.

@@ -179,7 +179,7 @@ let valid = mock.test.resource { name = q.comment }
     assert_eq!(
         cli_access_errors,
         [
-            "cannot apply access [\"key\"] to String",
+            "cannot apply access ['key'] to String",
             "cannot apply access [0] to String",
             "cannot apply access [0] to String",
             "cannot apply access [1] to String",

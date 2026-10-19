@@ -42,7 +42,7 @@ Output groups attributes under each resource:
 
 ```
 # aws.s3.Bucket (my_bucket)
-  bucket = "my-bucket-name"
+  bucket = 'my-bucket-name'
 ```
 
 #### Flags

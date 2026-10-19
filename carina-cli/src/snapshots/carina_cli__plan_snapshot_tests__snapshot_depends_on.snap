@@ -5,10 +5,10 @@ expression: output
 Execution Plan:
 
   + aws.iam.Role role
-      assume_role_policy_document: "{}"
-      role_name: "my-role"
+      assume_role_policy_document: '{}'
+      role_name: 'my-role'
         │
         └─ + aws.s3.Bucket aws_s3_bucket_1e40c28e
-              bucket_name: "my-bucket"
+              bucket_name: 'my-bucket'
 
 Plan: 2 to add, 0 to change, 0 to destroy.

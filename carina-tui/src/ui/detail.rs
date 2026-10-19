@@ -11,7 +11,9 @@ use super::diff::{
 };
 use super::push_annotation_span;
 use super::style::effect_style;
-use super::value_view::{value_spans, value_spans_dimmed};
+use super::value_view::{
+    ValueStyle, has_semantic_color, value_spans, value_spans_dimmed, value_spans_styled,
+};
 
 /// Draw the detail panel showing attributes of the selected node
 pub(super) fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
@@ -95,7 +97,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
         } => {
             let is_navigable = ref_binding.is_some();
             let mut spans = vec![Span::raw(format!("  {}: ", key))];
-            spans.extend(value_spans(value, is_navigable));
+            spans.extend(value_spans(value));
             if is_navigable {
                 spans.push(Span::styled(
                     " \u{2192}",
@@ -112,13 +114,10 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
         DetailRow::PrettyAttribute { key, value } => {
             // TUI uses a fixed 2-col prefix instead of the CLI's dynamic
             // tree-indent string, so the layout is approximated.
-            let layout = carina_core::value::PrettyLayout {
-                parent_indent_cols: 2,
-                key,
-            };
-            let pretty = carina_core::value::format_value_pretty(value, layout);
+            let layout = carina_core::value::PrettyLayout::for_attribute(2, key);
+            let pretty = value.render(layout);
             let mut spans = vec![Span::raw(format!("  {}: ", key))];
-            spans.push(Span::raw(pretty));
+            spans.extend(value_spans(&pretty));
             let mut line = Line::from(spans);
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
@@ -141,33 +140,23 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 if prev_needs_separator {
                     lines.push(Line::from(""));
                 }
-                prev_needs_separator = carina_core::value::needs_trailing_separator(&entry.value);
-                let layout = carina_core::value::PrettyLayout {
-                    parent_indent_cols: 4,
-                    key: &entry.key,
-                };
-                let pretty = carina_core::value::format_value_pretty(&entry.value, layout);
+                prev_needs_separator = entry.value.needs_trailing_separator();
+                let layout = carina_core::value::PrettyLayout::for_map_key(4, &entry.key);
+                let pretty = entry.value.render(layout);
                 let mut spans = vec![Span::raw(format!("    {}: ", entry.key))];
-                spans.extend(value_spans(&pretty, false));
+                spans.extend(value_spans(&pretty));
                 push_annotation_span(&mut spans, entry.annotation.as_deref());
                 lines.push(Line::from(spans));
             }
         }
         DetailRow::Changed { key, old, new } => {
-            let mut spans = vec![
-                Span::raw(format!("  {}: ", key)),
-                Span::styled(
-                    old.clone(),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-                Span::raw(" -> "),
-            ];
-            let new_spans = value_spans(new, false);
-            if new_spans.iter().all(|s| s.style == Style::default()) {
+            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
+            spans.push(Span::raw(" -> "));
+            let new_spans = value_spans(new);
+            if !has_semantic_color(new) {
                 // No specific color detected, fall back to green for changed values
-                spans.push(Span::styled(new.clone(), Style::default().fg(Color::Green)));
+                spans.extend(value_spans_styled(new, ValueStyle::Green));
             } else {
                 spans.extend(new_spans);
             }
@@ -178,18 +167,15 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             lines.push(line);
         }
         DetailRow::ChangedForcesReplacement { key, old, new } => {
-            let mut line = Line::from(vec![
-                Span::raw(format!("  {}: ", key)),
-                Span::styled(
-                    old.clone(),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-                Span::raw(" -> "),
-                Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
-                Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
-            ]);
+            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
+            spans.push(Span::raw(" -> "));
+            spans.extend(value_spans_styled(new, ValueStyle::Yellow));
+            spans.push(Span::styled(
+                " (forces replacement)",
+                Style::default().fg(Color::Magenta),
+            ));
+            let mut line = Line::from(spans);
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
             }
@@ -285,20 +271,14 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             lines.push(line);
         }
         DetailRow::Removed { key, old } => {
-            let mut line = Line::from(vec![
-                Span::styled(
-                    format!("  {}: ", key),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-                Span::styled(
-                    old.clone(),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-            ]);
+            let mut spans = vec![Span::styled(
+                format!("  {}: ", key),
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            )];
+            spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
+            let mut line = Line::from(spans);
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
             }
@@ -335,14 +315,9 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             lines.push(line);
         }
         DetailRow::ReplaceRemoved { key, old } => {
-            let mut line = Line::from(vec![
-                Span::raw(format!("  {}: ", key)),
-                Span::styled(
-                    old.clone(),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
+            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
+            spans.extend([
                 Span::raw(" -> "),
                 Span::styled(
                     "(removed)",
@@ -351,23 +326,18 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                         .add_modifier(Modifier::CROSSED_OUT),
                 ),
             ]);
+            let mut line = Line::from(spans);
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
             }
             lines.push(line);
         }
         DetailRow::ReplaceCascade { key, old, new } => {
-            let mut line = Line::from(vec![
-                Span::raw(format!("  {}: ", key)),
-                Span::styled(
-                    old.clone(),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-                Span::raw(" -> "),
-                Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
-            ]);
+            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
+            spans.push(Span::raw(" -> "));
+            spans.extend(value_spans_styled(new, ValueStyle::Yellow));
+            let mut line = Line::from(spans);
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
             }
@@ -382,16 +352,16 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             let mut line = if *can_rename {
                 Line::from(Span::styled(
                     format!(
-                        "  # New resource created with {attribute} = \"{temporary_value}\", \
-                         then renamed to \"{original_value}\" after old resource is deleted"
+                        "  # New resource created with {attribute} = {temporary_value}, \
+                         then renamed to {original_value} after old resource is deleted"
                     ),
                     dim_style,
                 ))
             } else {
                 Line::from(Span::styled(
                     format!(
-                        "  # {attribute} = \"{temporary_value}\" (temporary); \
-                         original \"{original_value}\" reused after old resource deleted"
+                        "  # {attribute} = {temporary_value} (temporary); \
+                         original {original_value} reused after old resource deleted"
                     ),
                     dim_style,
                 ))
@@ -409,6 +379,7 @@ mod tests {
     use super::*;
     use carina_core::detail_rows::{ListOfMapsDiffItem, MapExpandedEntry, NonEmptyListOfMapsBlock};
     use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::value::{PrettyValue, RenderedKey};
     use indexmap::IndexMap;
 
     /// A multi-element list-of-maps entry inside a `MapExpanded` row
@@ -429,13 +400,18 @@ mod tests {
             key: "policy_document".to_string(),
             entries: vec![
                 MapExpandedEntry {
-                    key: "statement".to_string(),
-                    value: Value::Concrete(ConcreteValue::List(vec![stmt("A"), stmt("B")])),
+                    key: RenderedKey::from_raw("statement"),
+                    value: PrettyValue::new(Value::Concrete(ConcreteValue::List(vec![
+                        stmt("A"),
+                        stmt("B"),
+                    ]))),
                     annotation: None,
                 },
                 MapExpandedEntry {
-                    key: "version".to_string(),
-                    value: Value::Concrete(ConcreteValue::String("2012-10-17".into())),
+                    key: RenderedKey::from_raw("version"),
+                    value: PrettyValue::new(Value::Concrete(ConcreteValue::String(
+                        "2012-10-17".into(),
+                    ))),
                     annotation: None,
                 },
             ],
@@ -475,13 +451,18 @@ mod tests {
             key: "policy_document".to_string(),
             entries: vec![
                 MapExpandedEntry {
-                    key: "version".to_string(),
-                    value: Value::Concrete(ConcreteValue::String("2012-10-17".into())),
+                    key: RenderedKey::from_raw("version"),
+                    value: PrettyValue::new(Value::Concrete(ConcreteValue::String(
+                        "2012-10-17".into(),
+                    ))),
                     annotation: None,
                 },
                 MapExpandedEntry {
-                    key: "statement".to_string(),
-                    value: Value::Concrete(ConcreteValue::List(vec![stmt("A"), stmt("B")])),
+                    key: RenderedKey::from_raw("statement"),
+                    value: PrettyValue::new(Value::Concrete(ConcreteValue::List(vec![
+                        stmt("A"),
+                        stmt("B"),
+                    ]))),
                     annotation: None,
                 },
             ],
@@ -501,8 +482,12 @@ mod tests {
     fn forcing_changed_renders_new_value_yellow() {
         let row = DetailRow::ChangedForcesReplacement {
             key: "name".to_string(),
-            old: "\"old\"".to_string(),
-            new: "\"new\"".to_string(),
+            old: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+                "old".into(),
+            ))),
+            new: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+                "new".into(),
+            ))),
         };
 
         let mut lines: Vec<Line> = Vec::new();
@@ -512,7 +497,7 @@ mod tests {
         let new_span = line
             .spans
             .iter()
-            .find(|span| span.content.as_ref() == "\"new\"")
+            .find(|span| span.content.as_ref() == "'new'")
             .expect("new value span should be present");
         assert_eq!(
             new_span.style,
@@ -531,8 +516,8 @@ mod tests {
                 vec![],
                 vec![ListOfMapsDiffItem {
                     fields: vec![(
-                        "name".to_string(),
-                        Value::Concrete(ConcreteValue::String("legacy".into())),
+                        RenderedKey::from_raw("name"),
+                        PrettyValue::new(Value::Concrete(ConcreteValue::String("legacy".into()))),
                     )],
                 }],
             )

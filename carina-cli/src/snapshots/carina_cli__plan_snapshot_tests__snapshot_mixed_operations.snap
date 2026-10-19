@@ -6,14 +6,14 @@ Execution Plan:
 
   ~ awscc.ec2.Vpc vpc
       tags:
-        + Environment: "staging"
+        + Environment: 'staging'
       # (3 unchanged attributes hidden)
         │
         ├─ + awscc.ec2.SecurityGroup awscc_ec2_security_group_166e04b3
-        │     group_description: "Test security group"
+        │     group_description: 'Test security group'
         │     tags:
-        │       Name: "test-sg"
-        │     vpc_id: "vpc-0123456789abcdef0"
+        │       Name: 'test-sg'
+        │     vpc_id: 'vpc-0123456789abcdef0'
         │
         └─ - awscc.ec2.Subnet my_subnet
 

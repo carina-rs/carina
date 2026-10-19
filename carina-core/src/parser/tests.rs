@@ -4265,7 +4265,7 @@ fn parse_subscript_after_field_access_with_string_key() {
                     key: "alpha".into()
                 }]
             );
-            assert_eq!(path.to_dot_string(), "orgs.accounts[\"alpha\"]");
+            assert_eq!(path.to_dot_string(), "orgs.accounts['alpha']");
         }
         other => panic!("Expected ResourceRef with subscript, got {:?}", other),
     }
@@ -7483,7 +7483,7 @@ fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
 
     let value = parsed.resources[0].get_attr("name").unwrap();
     assert_eq!(crate::ValueDescription::of(value).to_string(), "string");
-    assert_eq!(crate::value::format_value(value), r#""hunter2SECRET""#);
+    assert_eq!(crate::value::format_value(value), "'hunter2SECRET'");
     assert_eq!(
         crate::value::value_to_json(value).unwrap(),
         serde_json::json!(plaintext)
@@ -13550,7 +13550,7 @@ mod loop_var_field_access_matrix {
             .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
             .expect_err("known missing keys must fail during deferred-for expansion");
         assert!(
-            error.to_string().contains("key \"missing\" not found"),
+            error.to_string().contains("key 'missing' not found"),
             "unexpected expansion error: {error}"
         );
     }
