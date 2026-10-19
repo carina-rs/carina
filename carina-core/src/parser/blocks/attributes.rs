@@ -14,8 +14,7 @@ use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{ConcreteValue, DeferredValue, Directives, Value};
-use indexmap::IndexMap;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 /// Parse arguments block. See `register_argument_binding` for the
 /// incremental scoping discipline that lets a later argument's default
@@ -65,6 +64,8 @@ pub(in crate::parser) fn parse_arguments_block(
                                     default = Some(parse_expression(expr_pair, ctx)?);
                                 }
                                 Rule::arg_validation_block => {
+                                    let source_span = parameter_source_span(&inner_attr);
+                                    let mut condition_source_span = None;
                                     let mut rule = None;
                                     let mut error_msg = None;
                                     for vattr in inner_attr.into_inner() {
@@ -81,8 +82,12 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         "validate_expr",
                                                         "validation_condition_attr",
                                                     )?;
-                                                    rule =
-                                                        Some(parse_validate_expr(validate_pair)?);
+                                                    condition_source_span =
+                                                        Some(parameter_source_span(&validate_pair));
+                                                    rule = Some(parse_validate_expr(
+                                                        validate_pair,
+                                                        ctx,
+                                                    )?);
                                                 }
                                                 Rule::validation_error_message_attr => {
                                                     let string_pair = first_inner(
@@ -104,10 +109,12 @@ pub(in crate::parser) fn parse_arguments_block(
                                         }
                                     }
                                     if let Some(condition) = rule {
-                                        validations.push(ValidationBlock {
-                                            condition,
-                                            error_message: error_msg,
-                                        });
+                                        validations.push(
+                                            ValidationBlock::new(condition, error_msg)
+                                                .with_source_span(
+                                                    condition_source_span.unwrap_or(source_span),
+                                                ),
+                                        );
                                     }
                                 }
                                 _ => {}
@@ -136,20 +143,23 @@ pub(in crate::parser) fn parse_arguments_block(
 
 /// Register an argument name as a lexical binding so subsequent expressions
 /// (later argument defaults, resource bodies, etc.) resolve it as a
-/// typed module-argument placeholder rather than a literal string. Without this
+/// module-argument placeholder rather than a literal string. Without this
 /// incremental registration, `${other_arg}` inside a default would have no
 /// in-scope binding and degrade to the literal string `"other_arg"` (#2393).
 ///
-/// An argument is a value binding whose placeholder is an explicitly typed
-/// unknown. It must not be a `BindingRef`: that variant denotes a structural
-/// resource address and postfix access canonicalizes it into a reference path.
-/// Module expansion substitutes this placeholder before applying any access.
+/// The caller's argument shape, not the annotation, decides whether this
+/// placeholder is substituted as a value or a structural handle. Keeping the
+/// body representation neutral avoids guessing before provider schemas are
+/// available; expansion later applies access to a value or a canonical handle
+/// base according to the typed call-site argument.
 fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
     ctx.set_variable(
         name.to_string(),
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument {
                 name: name.to_string(),
+                source_line: (0).into(),
+                diagnostic_name: None,
             },
         )),
     );
@@ -247,111 +257,5 @@ fn parameter_source_span(param: &pest::iterators::Pair<'_, Rule>) -> ModuleCallS
         start_column,
         end_line,
         end_column,
-    }
-}
-
-/// Extract Carina-side directives from a resource's attributes.
-///
-/// The parser parses `directives { ... }` as a nested block, which
-/// becomes a List of Maps in attributes. We extract it and convert to
-/// `Directives`.
-pub(in crate::parser) fn extract_directives(
-    attributes: &mut IndexMap<String, Value>,
-) -> Result<Directives, ParseError> {
-    if let Some(Value::Concrete(ConcreteValue::List(blocks))) =
-        attributes.shift_remove("directives")
-    {
-        // Take the first directives block (there should only be one)
-        if let Some(Value::Concrete(ConcreteValue::Map(map))) = blocks.into_iter().next() {
-            let force_delete = matches!(
-                map.get("force_delete"),
-                Some(Value::Concrete(ConcreteValue::Bool(true)))
-            );
-            let create_before_destroy = matches!(
-                map.get("create_before_destroy"),
-                Some(Value::Concrete(ConcreteValue::Bool(true)))
-            );
-            let prevent_destroy = matches!(
-                map.get("prevent_destroy"),
-                Some(Value::Concrete(ConcreteValue::Bool(true)))
-            );
-            let depends_on = match map.get("depends_on") {
-                None => Vec::new(),
-                Some(Value::Concrete(ConcreteValue::List(items))) => {
-                    let mut names = Vec::with_capacity(items.len());
-                    for item in items {
-                        names.push(value_as_binding_name(item, "depends_on: list elements")?);
-                    }
-                    names
-                }
-                Some(other) => {
-                    return Err(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "directives.depends_on: must be a list of binding identifiers, \
-                             got {:?}",
-                            other
-                        ),
-                    });
-                }
-            };
-            let provider_instance = match map.get("provider") {
-                None => None,
-                Some(value) => Some(value_as_binding_name(value, "provider: value")?),
-            };
-            return Ok(Directives {
-                force_delete,
-                create_before_destroy,
-                prevent_destroy,
-                depends_on,
-                provider_instance,
-            });
-        }
-    }
-    Ok(Directives::default())
-}
-
-/// Interpret a `Value` as a bare binding-name reference. Used by every
-/// `directives { ... }` slot whose value must be `<binding>` (currently
-/// `depends_on`'s list elements and `provider`).
-///
-/// `context` is rendered into the error message as the directives slot
-/// path (e.g. `"depends_on: list elements"` or `"provider: value"`) so a
-/// shared error message template stays readable.
-///
-/// Bare-string quoted literals like `"role"` and `"us"` are rejected
-/// upstream at the pest layer (see `check_directives_depends_on_elements`
-/// / `check_directives_provider_value`), because by the time the value
-/// reaches this helper a quoted string and a `${...}` indirection are
-/// indistinguishable.
-fn value_as_binding_name(value: &Value, context: &str) -> Result<String, ParseError> {
-    match value {
-        Value::Deferred(DeferredValue::BindingRef { binding }) => Ok(binding.clone()),
-        Value::Concrete(ConcreteValue::EnumIdentifier(name)) => Ok(name.to_string()),
-        Value::Concrete(ConcreteValue::String(name)) => {
-            let bare = name
-                .expose_plaintext()
-                .strip_prefix("${")
-                .and_then(|value| value.strip_suffix('}'))
-                .unwrap_or(name.expose_plaintext());
-            Ok(bare.to_string())
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            Err(ParseError::InvalidExpression {
-                line: 0,
-                message: format!(
-                    "directives.{context} must be a bare binding identifier, not an \
-                 attribute selector (got `{}`)",
-                    path.binding()
-                ),
-            })
-        }
-        other => Err(ParseError::InvalidExpression {
-            line: 0,
-            message: format!(
-                "directives.{context} must be a binding identifier, got {:?}",
-                other
-            ),
-        }),
     }
 }

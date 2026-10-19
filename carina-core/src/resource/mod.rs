@@ -6,6 +6,7 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -1338,9 +1339,9 @@ impl std::fmt::Display for ReferencePath {
 pub(crate) fn module_argument_reference_path(value: &Value) -> Option<ReferencePath> {
     fn collect(value: &Value) -> Option<(String, Vec<PathSegment>)> {
         match value {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name })) => {
-                Some((name.clone(), Vec::new()))
-            }
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+                name, ..
+            })) => Some((name.clone(), Vec::new())),
             Value::Deferred(DeferredValue::Access(access)) => {
                 let (binding, mut segments) = collect(access.base())?;
                 segments.push(access.step().clone());
@@ -2115,6 +2116,365 @@ pub enum ConcreteValue {
     Map(IndexMap<String, Value>),
 }
 
+/// Shared typed operand used while function and module arguments cross
+/// evaluation boundaries. A structural handle never becomes a public
+/// [`Value`]; only its canonical access base is exposed to reference walkers.
+///
+/// [`crate::eval_value::StructuralHandleMetadata`] is intentionally separate:
+/// it is a pre-classification tree for directory fixed-point parsing, whereas
+/// this enum represents one already-classified argument operand.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StructuralOperand {
+    Value {
+        value: Value,
+        access_base: Option<Value>,
+    },
+    Handle {
+        handle: crate::eval_value::StructuralHandle,
+        access_base: Value,
+    },
+    /// A bare module parameter forwarded across a nested argument boundary
+    /// before the outermost caller has determined whether it is a value or a
+    /// handle. Keeping this state beside `Value` and `Handle` prevents a
+    /// placeholder `Value` from prematurely deciding the classification.
+    Parameter { name: String, access_base: Value },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StructuralOperandRef<'a> {
+    Value(&'a Value),
+    Handle {
+        handle: &'a crate::eval_value::StructuralHandle,
+        access_base: &'a Value,
+    },
+    Parameter {
+        name: &'a str,
+        access_base: &'a Value,
+    },
+}
+
+impl StructuralOperand {
+    pub(crate) fn from_value(value: Value) -> Self {
+        if let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+            name, ..
+        })) = &value
+        {
+            return Self::Parameter {
+                name: name.to_string(),
+                access_base: value,
+            };
+        }
+        Self::Value {
+            value,
+            access_base: None,
+        }
+    }
+
+    pub(crate) fn from_value_with_access_base(value: Value, access_base: Option<Value>) -> Self {
+        if access_base.is_none()
+            && let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+                name,
+                ..
+            })) = &value
+        {
+            return Self::Parameter {
+                name: name.to_string(),
+                access_base: value,
+            };
+        }
+        Self::Value { value, access_base }
+    }
+
+    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+        let access_base = handle.access_base_value();
+        Self::Handle {
+            handle,
+            access_base,
+        }
+    }
+
+    pub(crate) fn from_handle_with_access_base(
+        handle: crate::eval_value::StructuralHandle,
+        access_base: Value,
+    ) -> Self {
+        Self::Handle {
+            handle,
+            access_base,
+        }
+    }
+
+    pub(crate) fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Value { value, .. } => Some(value),
+            Self::Handle { .. } | Self::Parameter { .. } => None,
+        }
+    }
+
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+        match self {
+            Self::Value { .. } | Self::Parameter { .. } => None,
+            Self::Handle { handle, .. } => Some(handle),
+        }
+    }
+
+    pub(crate) fn parameter(&self) -> Option<&str> {
+        match self {
+            Self::Parameter { name, .. } => Some(name),
+            Self::Value { .. } | Self::Handle { .. } => None,
+        }
+    }
+
+    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_> {
+        match self {
+            Self::Value { value, .. } => StructuralOperandRef::Value(value),
+            Self::Handle {
+                handle,
+                access_base,
+            } => StructuralOperandRef::Handle {
+                handle,
+                access_base,
+            },
+            Self::Parameter { name, access_base } => {
+                StructuralOperandRef::Parameter { name, access_base }
+            }
+        }
+    }
+
+    pub(crate) fn access_ref(&self) -> StructuralOperandRef<'_> {
+        match self {
+            Self::Value { value, access_base } => {
+                StructuralOperandRef::Value(access_base.as_ref().unwrap_or(value))
+            }
+            Self::Handle {
+                handle,
+                access_base,
+            } => StructuralOperandRef::Handle {
+                handle,
+                access_base,
+            },
+            Self::Parameter { name, access_base } => {
+                StructuralOperandRef::Parameter { name, access_base }
+            }
+        }
+    }
+
+    pub(crate) fn explicit_access_base(&self) -> Option<&Value> {
+        match self {
+            Self::Value { access_base, .. } => access_base.as_ref(),
+            Self::Handle { access_base, .. } => Some(access_base),
+            Self::Parameter { access_base, .. } => Some(access_base),
+        }
+    }
+
+    pub(crate) fn traversal_value(&self) -> &Value {
+        match self {
+            Self::Value { value, .. } => value,
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
+        }
+    }
+
+    pub(crate) fn traversal_value_mut(&mut self) -> &mut Value {
+        match self {
+            Self::Value { value, .. } => value,
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
+        }
+    }
+
+    pub(crate) fn try_map<E>(
+        &self,
+        mut map: impl FnMut(&Value) -> Result<Value, E>,
+    ) -> Result<Self, E> {
+        Ok(match self {
+            Self::Value { value, access_base } => Self::Value {
+                value: map(value)?,
+                access_base: access_base.as_ref().map(&mut map).transpose()?,
+            },
+            Self::Handle {
+                handle,
+                access_base,
+            } => Self::Handle {
+                handle: handle.clone(),
+                access_base: map(access_base)?,
+            },
+            Self::Parameter { name, access_base } => Self::Parameter {
+                name: name.clone(),
+                access_base: map(access_base)?,
+            },
+        })
+    }
+}
+
+impl<'a> StructuralOperandRef<'a> {
+    pub(crate) fn value(self) -> &'a Value {
+        match self {
+            Self::Value(value) => value,
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
+        }
+    }
+}
+
+/// One argument retained by a deferred function call.
+///
+/// Most arguments are ordinary values. The shared handle arm exists only so
+/// parsing can carry a structural argument across a sibling/forward function
+/// lookup without lowering it into the public value model. It is consumed by
+/// function resolution before plans or state are serialized.
+#[derive(Clone, PartialEq)]
+pub struct FunctionArgument {
+    operand: StructuralOperand,
+}
+
+impl FunctionArgument {
+    pub fn from_value(value: Value) -> Self {
+        Self {
+            operand: StructuralOperand::from_value(value),
+        }
+    }
+
+    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+        Self {
+            operand: StructuralOperand::from_handle(handle),
+        }
+    }
+
+    pub fn value(&self) -> Option<&Value> {
+        self.operand.value()
+    }
+
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+        self.operand.handle()
+    }
+
+    pub(crate) fn pending_parameter(&self) -> Option<&str> {
+        self.operand.parameter()
+    }
+
+    /// Value-shaped projection reserved for crate-internal dependency,
+    /// canonicalization, and diagnostic walkers. Semantic consumers must use
+    /// [`Self::value`] and [`Self::handle`] so a handle cannot accidentally be
+    /// treated as a value.
+    pub(crate) fn walker_value(&self) -> &Value {
+        self.operand.traversal_value()
+    }
+
+    pub(crate) fn walker_value_mut(&mut self) -> &mut Value {
+        self.operand.traversal_value_mut()
+    }
+
+    pub(crate) fn try_map_value<E>(
+        &self,
+        map: impl FnOnce(&Value) -> Result<Value, E>,
+    ) -> Result<Self, E> {
+        let operand = match &self.operand {
+            StructuralOperand::Value { value, .. } => StructuralOperand::from_value(map(value)?),
+            StructuralOperand::Handle {
+                handle,
+                access_base,
+            } => StructuralOperand::from_handle_with_access_base(handle.clone(), map(access_base)?),
+            StructuralOperand::Parameter { name, access_base } => StructuralOperand::Parameter {
+                name: name.clone(),
+                access_base: map(access_base)?,
+            },
+        };
+        Ok(Self { operand })
+    }
+}
+
+impl From<Value> for FunctionArgument {
+    fn from(value: Value) -> Self {
+        Self::from_value(value)
+    }
+}
+
+impl fmt::Debug for FunctionArgument {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.operand.value_ref() {
+            StructuralOperandRef::Value(value) => value.fmt(f),
+            StructuralOperandRef::Handle { handle, .. } => f
+                .debug_tuple("StructuralHandleArgument")
+                .field(handle)
+                .finish(),
+            StructuralOperandRef::Parameter { name, .. } => f
+                .debug_tuple("ForwardedParameterArgument")
+                .field(&name)
+                .finish(),
+        }
+    }
+}
+
+impl Serialize for FunctionArgument {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.operand.value_ref() {
+            StructuralOperandRef::Value(value) => value.serialize(serializer),
+            StructuralOperandRef::Handle { handle, .. } => Err(serde::ser::Error::custom(format!(
+                "unresolved structural handle argument '{}' cannot be serialized",
+                handle.canonical_binding_name()
+            ))),
+            StructuralOperandRef::Parameter { name, .. } => Err(serde::ser::Error::custom(
+                format!("unresolved forwarded parameter argument '{name}' cannot be serialized"),
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FunctionArgument {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::from_value)
+    }
+}
+
+/// Parser diagnostic metadata attached to a value-shaped node without
+/// becoming part of that node's semantic identity or serialized form.
+/// `None` represents a synthetic/deserialized node, so line zero is not a
+/// representable source location.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiagnosticSourceLine(Option<NonZeroUsize>);
+
+impl DiagnosticSourceLine {
+    pub const fn authored(line: usize) -> Self {
+        Self(NonZeroUsize::new(line))
+    }
+
+    pub const fn synthetic() -> Self {
+        Self(None)
+    }
+
+    pub const fn get(self) -> Option<usize> {
+        match self.0 {
+            Some(line) => Some(line.get()),
+            None => None,
+        }
+    }
+
+    pub const fn nonzero(self) -> Option<NonZeroUsize> {
+        self.0
+    }
+
+    pub const fn unwrap_or(self, fallback: usize) -> usize {
+        match self.get() {
+            Some(line) => line,
+            None => fallback,
+        }
+    }
+}
+
+impl From<usize> for DiagnosticSourceLine {
+    fn from(line: usize) -> Self {
+        Self::authored(line)
+    }
+}
+
+// Source positions are diagnostic metadata, not value identity. Keeping this
+// rule on the metadata type lets every containing value derive/use equality
+// without ad-hoc `source_line: _` patterns.
+impl PartialEq for DiagnosticSourceLine {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticSourceLine {}
+
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
@@ -2127,7 +2487,25 @@ pub enum DeferredValue {
     Interpolation(Vec<InterpolationPart>),
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
     /// `["a", "b"] |> join("-")`. Evaluated during reference resolution.
-    FunctionCall { name: String, args: Vec<Value> },
+    FunctionCall {
+        name: crate::builtins::BuiltinFunction,
+        args: Vec<FunctionArgument>,
+        /// One-based authored line, or `None` for a synthetic/deserialized
+        /// call. Diagnostic metadata is excluded from equality and serde by
+        /// [`DiagnosticSourceLine`].
+        source_line: DiagnosticSourceLine,
+    },
+    /// A deferred user-function call whose lexical definition has already
+    /// been resolved. Unlike `FunctionCall`, this node never consults the
+    /// function table of whichever later consumer happens to evaluate it.
+    ResolvedFunctionCall {
+        function: std::sync::Arc<crate::parser::UserFunction>,
+        /// Lexical function scope captured with `function`. Function bodies
+        /// may call sibling helpers after this outer call is deferred.
+        functions: std::sync::Arc<std::collections::HashMap<String, crate::parser::UserFunction>>,
+        args: Vec<FunctionArgument>,
+        source_line: DiagnosticSourceLine,
+    },
     /// Field/index access whose base is not concrete yet. Once `base`
     /// resolves, the resolver applies `step` through
     /// [`apply_value_path_segment`].
@@ -2251,7 +2629,7 @@ impl Serialize for DeferredValue {
             Interpolation(&'a [InterpolationPart]),
             FunctionCall {
                 name: &'a str,
-                args: &'a [Value],
+                args: &'a [FunctionArgument],
             },
             Access {
                 base: &'a Value,
@@ -2274,11 +2652,15 @@ impl Serialize for DeferredValue {
             Self::Interpolation(parts) => {
                 SerializableDeferredValue::Interpolation(parts).serialize(serializer)
             }
-            Self::FunctionCall { name, args } => SerializableDeferredValue::FunctionCall {
+            Self::FunctionCall { name, args, .. } => SerializableDeferredValue::FunctionCall {
                 name: name.as_str(),
                 args,
             }
             .serialize(serializer),
+            Self::ResolvedFunctionCall { function, .. } => Err(serde::ser::Error::custom(format!(
+                "deferred user-function call '{}' cannot be serialized before evaluation",
+                function.name
+            ))),
             Self::Access(access) => SerializableDeferredValue::Access {
                 base: access.base(),
                 step: access.step(),
@@ -2301,13 +2683,25 @@ impl<'de> Deserialize<'de> for DeferredValue {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         enum DeserializableDeferredValue {
-            ResourceRef { path: AccessPath },
-            BindingRef { binding: String },
+            ResourceRef {
+                path: AccessPath,
+            },
+            BindingRef {
+                binding: String,
+            },
             Interpolation(Vec<InterpolationPart>),
-            FunctionCall { name: String, args: Vec<Value> },
-            Access { base: Box<Value>, step: PathSegment },
+            FunctionCall {
+                name: String,
+                args: Vec<FunctionArgument>,
+            },
+            Access {
+                base: Box<Value>,
+                step: PathSegment,
+            },
             Secret(Box<Value>),
-            RedactedSecret { hash: RedactedSecretHash },
+            RedactedSecret {
+                hash: RedactedSecretHash,
+            },
             Unknown(UnknownReason),
         }
 
@@ -2315,8 +2709,15 @@ impl<'de> Deserialize<'de> for DeferredValue {
             DeserializableDeferredValue::ResourceRef { path } => Ok(Self::ResourceRef { path }),
             DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
             DeserializableDeferredValue::Interpolation(parts) => Ok(Self::Interpolation(parts)),
-            DeserializableDeferredValue::FunctionCall { name, args } => {
-                Ok(Self::FunctionCall { name, args })
+            DeserializableDeferredValue::FunctionCall { name, args, .. } => {
+                let name = crate::builtins::BuiltinFunction::from_name(&name).ok_or_else(|| {
+                    serde::de::Error::custom(format!("unknown built-in function '{name}'"))
+                })?;
+                Ok(Self::FunctionCall {
+                    name,
+                    args,
+                    source_line: DiagnosticSourceLine::synthetic(),
+                })
             }
             DeserializableDeferredValue::Access { base, step } => {
                 let canonical = apply_postfix_access(*base, step, 0, AccessMissPolicy::Error)
@@ -2348,10 +2749,26 @@ impl fmt::Debug for DeferredValue {
                 .field("binding", binding)
                 .finish(),
             Self::Interpolation(parts) => f.debug_tuple("Interpolation").field(parts).finish(),
-            Self::FunctionCall { name, args } => f
+            Self::FunctionCall {
+                name,
+                args,
+                source_line,
+            } => f
                 .debug_struct("FunctionCall")
                 .field("name", name)
                 .field("args", args)
+                .field("source_line", source_line)
+                .finish(),
+            Self::ResolvedFunctionCall {
+                function,
+                args,
+                source_line,
+                ..
+            } => f
+                .debug_struct("ResolvedFunctionCall")
+                .field("name", &function.name)
+                .field("args", args)
+                .field("source_line", source_line)
                 .finish(),
             Self::Access(access) => f
                 .debug_struct("Access")
@@ -2743,7 +3160,8 @@ pub enum DeferredValueRef<'a> {
     Interpolation(&'a [InterpolationPart]),
     FunctionCall {
         name: &'a str,
-        args: &'a [Value],
+        args: &'a [FunctionArgument],
+        source_line: Option<NonZeroUsize>,
     },
     Access {
         base: &'a Value,
@@ -2776,9 +3194,14 @@ impl Value {
                     InterpolationPart::Expr(value) => value.contains_diagnostic_sensitive_string(),
                 })
             }
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-                args.iter().any(Value::contains_diagnostic_sensitive_string)
-            }
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => args.iter().any(|argument| {
+                argument
+                    .walker_value()
+                    .contains_diagnostic_sensitive_string()
+            }),
             Value::Deferred(DeferredValue::Access(access)) => {
                 access.base().contains_diagnostic_sensitive_string()
                     || matches!(
@@ -2847,9 +3270,25 @@ impl Value {
                 DeferredValue::ResourceRef { path } => DeferredValueRef::ResourceRef { path },
                 DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
                 DeferredValue::Interpolation(parts) => DeferredValueRef::Interpolation(parts),
-                DeferredValue::FunctionCall { name, args } => {
-                    DeferredValueRef::FunctionCall { name, args }
-                }
+                DeferredValue::FunctionCall {
+                    name,
+                    args,
+                    source_line,
+                } => DeferredValueRef::FunctionCall {
+                    name,
+                    args,
+                    source_line: source_line.nonzero(),
+                },
+                DeferredValue::ResolvedFunctionCall {
+                    function,
+                    args,
+                    source_line,
+                    ..
+                } => DeferredValueRef::FunctionCall {
+                    name: &function.name,
+                    args,
+                    source_line: source_line.nonzero(),
+                },
                 DeferredValue::Access(access) => DeferredValueRef::Access {
                     base: access.base(),
                     step: access.step(),
@@ -2905,7 +3344,17 @@ pub enum UnknownReason {
     /// Module argument placeholder while parsing a module definition.
     /// This is a value slot, not a structural resource address; module
     /// expansion substitutes it before provider-facing validation.
-    ModuleArgument { name: String },
+    ModuleArgument {
+        name: String,
+        /// One-based line of this reference, absent on a neutral declaration
+        /// or seed placeholder. This parser metadata is never value data.
+        #[serde(skip, default)]
+        source_line: DiagnosticSourceLine,
+        /// Authored inner parameter name retained while a nested module
+        /// forwards this placeholder to an outer parameter.
+        #[serde(skip, default)]
+        diagnostic_name: Option<String>,
+    },
     /// Function-local let placeholder while parsing a user-defined
     /// function body. Substituted after local lets are evaluated for a
     /// call.
@@ -2942,8 +3391,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name: a })),
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name: b })),
+                Value::Deferred(DeferredValue::Unknown(a @ UnknownReason::ModuleArgument { .. })),
+                Value::Deferred(DeferredValue::Unknown(b @ UnknownReason::ModuleArgument { .. })),
             ) => a == b,
             // Constraint: Unknown is never equal to anything.
             (Value::Deferred(DeferredValue::Unknown(_)), _)
@@ -3011,9 +3460,31 @@ impl PartialEq for Value {
                 Value::Deferred(DeferredValue::Interpolation(b)),
             ) => a == b,
             (
-                Value::Deferred(DeferredValue::FunctionCall { name: an, args: aa }),
-                Value::Deferred(DeferredValue::FunctionCall { name: bn, args: ba }),
-            ) => an == bn && aa == ba,
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: an,
+                    args: aa,
+                    source_line: al,
+                }),
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: bn,
+                    args: ba,
+                    source_line: bl,
+                }),
+            ) => an == bn && aa == ba && al == bl,
+            (
+                Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                    function: af,
+                    args: aa,
+                    source_line: al,
+                    ..
+                }),
+                Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                    function: bf,
+                    args: ba,
+                    source_line: bl,
+                    ..
+                }),
+            ) => af.name == bf.name && aa == ba && al == bl,
             (
                 Value::Deferred(DeferredValue::Access(a)),
                 Value::Deferred(DeferredValue::Access(b)),
@@ -3143,9 +3614,12 @@ impl Value {
                 }
             }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.canonicalize_in_place(),
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
                 for arg in args {
-                    arg.canonicalize_in_place();
+                    arg.walker_value_mut().canonicalize_in_place();
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
@@ -3237,9 +3711,12 @@ impl Value {
                     }
                 }
             }
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
                 for arg in args {
-                    arg.visit_resource_refs(f);
+                    arg.walker_value().visit_resource_refs(f);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
@@ -3290,9 +3767,12 @@ impl Value {
                     }
                 }
             }
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
                 for arg in args {
-                    arg.visit_binding_refs(f);
+                    arg.walker_value().visit_binding_refs(f);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
@@ -3356,9 +3836,12 @@ pub fn value_contains_unknown(value: &Value) -> bool {
                 InterpolationPart::Expr(value) if value_contains_unknown(value)
             )
         }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter().any(value_contains_unknown)
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => args
+            .iter()
+            .any(|argument| value_contains_unknown(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => value_contains_unknown(access.base()),
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
         _ => false,
@@ -3468,11 +3951,18 @@ impl Value {
                     }
                 }
             }
-            Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
                 name.hash(hasher);
                 args.len().hash(hasher);
                 for arg in args {
-                    arg.hash_into(hasher);
+                    arg.walker_value().hash_into(hasher);
+                }
+            }
+            Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+                function.name.hash(hasher);
+                args.len().hash(hasher);
+                for arg in args {
+                    arg.walker_value().hash_into(hasher);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
@@ -3505,7 +3995,7 @@ impl Value {
                     UnknownReason::UpstreamAllExports { binding } => binding.hash(hasher),
                     UnknownReason::FnParam { name }
                     | UnknownReason::FnLocal { name }
-                    | UnknownReason::ModuleArgument { name } => {
+                    | UnknownReason::ModuleArgument { name, .. } => {
                         name.hash(hasher);
                     }
                     UnknownReason::PostCreateReadIncomplete { detail } => detail.hash(hasher),
@@ -5608,7 +6098,13 @@ pub(crate) fn assert_value_fully_resolved(
         }
         Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
             Err(crate::value::SerializationError::UnresolvedFunctionCall {
-                name: name.clone(),
+                name: name.to_string(),
+                context,
+            })
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
+            Err(crate::value::SerializationError::UnresolvedFunctionCall {
+                name: function.name.clone(),
                 context,
             })
         }

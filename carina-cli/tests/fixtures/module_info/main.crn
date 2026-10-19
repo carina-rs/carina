@@ -19,7 +19,7 @@ attributes {
 
 let web_sg = awscc.ec2.SecurityGroup {
   group_description = 'Web security group'
-  vpc_id            = vpc_id
+  vpc_id            = vpc_id.id
 }
 
 let web_instance = awscc.ec2.Instance {

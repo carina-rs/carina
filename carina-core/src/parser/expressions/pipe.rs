@@ -8,11 +8,112 @@
 
 use crate::eval_value::EvalValue;
 use crate::parser::expressions::primary::parse_postfix_eval;
+use crate::parser::functions::{
+    apply_parser_closure, evaluate_user_function_eval, lower_function_arguments,
+    record_deferred_function_type_check, reject_builtin_handle_arguments,
+};
 use crate::parser::{
-    ParseContext, ParseError, Rule, eval_type_name, evaluate_user_function, is_static_eval,
-    is_static_value, next_pair, parse_expression,
+    ParseContext, ParseError, Rule, eval_type_name, is_static_eval, next_pair,
+    parse_expression_eval,
 };
 use crate::resource::{DeferredValue, Value};
+
+/// Apply one `|> function(extra_args...)` step.
+///
+/// Both ordinary expressions and the extended top-level `let` parser use
+/// this exact desugaring path so closure handling, Ref-typed user-function
+/// arguments, and deferred calls cannot drift.
+pub(crate) fn apply_pipe_step(
+    value: EvalValue,
+    func_name: String,
+    extra_args: Vec<EvalValue>,
+    ctx: &ParseContext,
+    line: usize,
+    column: usize,
+) -> Result<EvalValue, ParseError> {
+    if let Some(EvalValue::Closure {
+        name: fn_name,
+        captured_args,
+        remaining_arity,
+    }) = ctx.get_variable(&func_name)
+    {
+        let mut all_args = extra_args.clone();
+        all_args.push(value.clone());
+        return apply_parser_closure(
+            fn_name,
+            captured_args,
+            *remaining_arity,
+            all_args,
+            ctx,
+            line,
+        );
+    }
+
+    let mut eval_args = extra_args;
+    eval_args.push(value);
+
+    if crate::builtins::builtin_arity(&func_name).is_some() {
+        reject_builtin_handle_arguments(&eval_args, line)?;
+    }
+
+    if let Some(user_fn) = ctx.resolved_user_function(&func_name) {
+        if !ctx.seeded_user_functions.contains(&func_name) && eval_args.iter().all(is_static_eval) {
+            return evaluate_user_function_eval(&user_fn, eval_args, ctx, line)
+                .map(EvalValue::from_value);
+        }
+        let args = lower_function_arguments(eval_args, line)?;
+        record_deferred_function_type_check(&user_fn, &args, ctx, line);
+        return Ok(EvalValue::from_value(Value::Deferred(
+            DeferredValue::ResolvedFunctionCall {
+                function: user_fn,
+                functions: ctx.shared_user_function_scope(),
+                args,
+                source_line: (line).into(),
+            },
+        )));
+    }
+
+    let args = lower_function_arguments(eval_args, line)?;
+    let builtin = crate::builtins::BuiltinFunction::from_name(&func_name).ok_or_else(|| {
+        ParseError::UnknownFunction {
+            name: func_name.clone(),
+            line,
+            column,
+        }
+    })?;
+
+    if let Some(arity) = crate::builtins::builtin_arity(&func_name)
+        && args.len() < arity
+        && args
+            .iter()
+            .all(|argument| argument.value().is_some_and(crate::parser::is_static_value))
+    {
+        let eval_args: Vec<EvalValue> = args
+            .iter()
+            .map(|argument| {
+                EvalValue::from_value(
+                    argument
+                        .value()
+                        .expect("static function argument is a value")
+                        .clone(),
+                )
+            })
+            .collect();
+        return crate::builtins::evaluate_builtin_with_config(&func_name, &eval_args, ctx.config)
+            .map_err(|message| ParseError::InvalidExpression {
+                line,
+                message: format!("{func_name}(): {message}"),
+            });
+    }
+
+    Ok(EvalValue::from_value(Value::Deferred(
+        DeferredValue::FunctionCall {
+            name: builtin,
+            args,
+            source_line: (line).into(),
+        },
+    )))
+}
 
 pub(crate) fn parse_coalesce_expr(
     pair: pest::iterators::Pair<Rule>,
@@ -98,103 +199,17 @@ pub(crate) fn parse_pipe_expr(
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
     for func_call_pair in inner {
+        let (line, column) = func_call_pair.line_col();
         let mut fc_inner = func_call_pair.into_inner();
         let func_name = next_pair(&mut fc_inner, "function name", "pipe function call")?
             .as_str()
             .to_string();
-        let extra_args: Result<Vec<Value>, ParseError> =
-            fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+        let extra_args: Result<Vec<EvalValue>, ParseError> = fc_inner
+            .map(|arg| parse_expression_eval(arg, ctx))
+            .collect();
         let extra_args = extra_args?;
 
-        // Check if the pipe target is a Closure variable. The pipe
-        // value (the running `value`) is appended last as an
-        // EvalValue, so a closure carried in the binding can finish
-        // applying through subsequent pipes.
-        if let Some(EvalValue::Closure {
-            name: fn_name,
-            captured_args,
-            remaining_arity,
-        }) = ctx.get_variable(&func_name)
-        {
-            let mut all_args: Vec<EvalValue> = extra_args
-                .iter()
-                .cloned()
-                .map(EvalValue::from_value)
-                .collect();
-            all_args.push(value.clone());
-            if all_args.iter().all(is_static_eval) {
-                value = crate::builtins::apply_closure_with_config(
-                    fn_name,
-                    captured_args,
-                    *remaining_arity,
-                    &all_args,
-                    ctx.config,
-                )
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: e,
-                })?;
-                continue;
-            }
-        }
-
-        // Build args for the non-closure dispatch path. The running
-        // pipe value must be a user-facing value here; a closure
-        // would mean the user piped a partial application into a
-        // non-closure-aware call, which we surface as a parse error.
-        let pipe_value = match value {
-            EvalValue::User(v) => v,
-            EvalValue::StructuralHandle(handle) => handle.into_value(),
-            EvalValue::ComputedWithStructuralHandles { value, .. } => value,
-            EvalValue::DeferredForValue { .. } => Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
-            )),
-            EvalValue::Closure {
-                ref name,
-                remaining_arity,
-                ..
-            } => {
-                return Err(ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!(
-                        "cannot pipe a closure '{}' (still needs {} arg(s)) into '{}' \
-                         — finish the partial application first",
-                        name, remaining_arity, func_name
-                    ),
-                });
-            }
-        };
-        let mut args = extra_args;
-        args.push(pipe_value);
-
-        // Try to eagerly evaluate user-defined function calls
-        if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
-            let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
-            value = EvalValue::from_value(evaluate_user_function(&user_fn, &args, ctx)?);
-        } else if let Some(arity) = crate::builtins::builtin_arity(&func_name) {
-            // Eagerly evaluate partial application for builtin pipe targets
-            if args.len() < arity && args.iter().all(is_static_value) {
-                let eval_args: Vec<EvalValue> =
-                    args.iter().cloned().map(EvalValue::from_value).collect();
-                value = crate::builtins::evaluate_builtin_with_config(
-                    &func_name, &eval_args, ctx.config,
-                )
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!("{}(): {}", func_name, e),
-                })?;
-            } else {
-                value = EvalValue::from_value(Value::Deferred(DeferredValue::FunctionCall {
-                    name: func_name,
-                    args,
-                }));
-            }
-        } else {
-            value = EvalValue::from_value(Value::Deferred(DeferredValue::FunctionCall {
-                name: func_name,
-                args,
-            }));
-        }
+        value = apply_pipe_step(value, func_name, extra_args, ctx, line, column)?;
     }
 
     Ok(value)

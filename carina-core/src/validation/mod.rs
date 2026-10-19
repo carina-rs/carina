@@ -257,7 +257,7 @@ pub(crate) fn visit_refs_with_sink<'a>(
             f(ReferencePathRef::Binding(binding), sink)
         }
         Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { name },
+            crate::resource::UnknownReason::ModuleArgument { name, .. },
         )) => f(ReferencePathRef::Binding(name), sink),
         Value::Concrete(ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
@@ -278,12 +278,15 @@ pub(crate) fn visit_refs_with_sink<'a>(
                 }
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
             // The enclosing sink constrains the function result, not its
             // inputs. Function parameter sites are walked separately with
             // BindingIndex's signature authority.
             for argument in args {
-                visit_refs_with_sink(argument, None, f);
+                visit_refs_with_sink(argument.walker_value(), None, f);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -356,9 +359,12 @@ fn visit_computed_accesses_with_sink<'a>(
                 }
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
             for argument in args {
-                visit_computed_accesses_with_sink(argument, None, f);
+                visit_computed_accesses_with_sink(argument.walker_value(), None, f);
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
@@ -627,7 +633,7 @@ fn validate_module_call_argument_ref_types_inner(
                 .map(|argument| &argument.type_expr);
 
             visit_refs_with_sink(
-                value.value(),
+                value.walker_value(),
                 declared_sink.map(RefSink::TypeExpr),
                 &mut |path, sink| {
                     let Some(kind) =
@@ -982,43 +988,76 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
         unknown_policy: UnknownReferencePolicy,
         errors: &mut Vec<String>,
     ) {
-        match value {
-            Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-                let function = bindings.user_function(name);
-                if let (Some(source), Some(sink), Some(context)) = (
-                    function.and_then(|function| function.return_type.as_ref()),
-                    result_sink,
-                    context,
-                ) && let Some((expected, actual)) = declared_result_mismatch(source, sink)
+        fn check_call(
+            name: &str,
+            args: &[crate::resource::FunctionArgument],
+            function: Option<&crate::parser::UserFunction>,
+            result_context: Option<(&TypeExpr, &str)>,
+            bindings: &BindingIndex<'_>,
+            unknown_policy: UnknownReferencePolicy,
+            errors: &mut Vec<String>,
+        ) {
+            if let (Some(source), Some((sink, context))) = (
+                function.and_then(|function| function.return_type.as_ref()),
+                result_context,
+            ) && let Some((expected, actual)) = declared_result_mismatch(source, sink)
+            {
+                errors.push(format!(
+                    "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
+                ));
+            }
+            for (index, argument) in args.iter().enumerate() {
+                let parameter_sink = function
+                    .and_then(|function| function.params.get(index))
+                    .and_then(|parameter| parameter.param_type.as_ref());
+                let argument_context = format!("function '{name}': argument {}", index + 1);
+                let awaits_module_substitution = argument.pending_parameter().is_some();
+                if let Some(sink) = parameter_sink
+                    && !awaits_module_substitution
                 {
-                    errors.push(format!(
-                        "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
-                    ));
-                }
-                for (index, argument) in args.iter().enumerate() {
-                    let parameter_sink = function
-                        .and_then(|function| function.params.get(index))
-                        .and_then(|parameter| parameter.param_type.as_ref());
-                    let argument_context = format!("function '{name}': argument {}", index + 1);
-                    if let Some(sink) = parameter_sink {
-                        check_refs(
-                            argument,
-                            Some(RefSink::TypeExpr(sink)),
-                            &argument_context,
-                            bindings,
-                            unknown_policy,
-                            errors,
-                        );
-                    }
-                    check_function_calls(
-                        argument,
-                        parameter_sink,
-                        Some(&argument_context),
+                    check_refs(
+                        argument.walker_value(),
+                        Some(RefSink::TypeExpr(sink)),
+                        &argument_context,
                         bindings,
                         unknown_policy,
                         errors,
                     );
                 }
+                check_function_calls(
+                    argument.walker_value(),
+                    parameter_sink,
+                    Some(&argument_context),
+                    bindings,
+                    unknown_policy,
+                    errors,
+                );
+            }
+        }
+
+        match value {
+            Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+                let function = bindings.user_function(name);
+                check_call(
+                    name,
+                    args,
+                    function,
+                    result_sink.zip(context),
+                    bindings,
+                    unknown_policy,
+                    errors,
+                );
+            }
+            Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+                check_call(
+                    &function.name,
+                    args,
+                    Some(function),
+                    result_sink.zip(context),
+                    bindings,
+                    unknown_policy,
+                    errors,
+                );
             }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for (index, item) in items.iter().enumerate() {
@@ -1107,7 +1146,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
             check_function_calls(
-                value.value(),
+                value.walker_value(),
                 None,
                 None,
                 bindings,
@@ -1206,11 +1245,11 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
                 );
             }
         }
-        for (_, value) in &function.local_lets {
+        for (_, value, _) in &function.local_lets {
             check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
         }
         check_refs(
-            &function.body.0,
+            &function.body.value,
             function.return_type.as_ref().map(RefSink::TypeExpr),
             &format!("function '{}': return value", function.name),
             bindings,
@@ -1219,7 +1258,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
         );
         let context = format!("function '{}': return value", function.name);
         check_function_calls(
-            &function.body.0,
+            &function.body.value,
             function.return_type.as_ref(),
             Some(&context),
             bindings,
@@ -2140,6 +2179,150 @@ pub fn resolve_type_expr(ty: &TypeExpr, config: &ProviderContext) -> Result<Type
     }
 }
 
+/// A parameter type after dotted names have been resolved against the
+/// provider registry. This classification is used only to check an argument;
+/// the argument itself decides whether a parameter is bound as a handle or a
+/// value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedParameterType {
+    Handle(crate::parser::ResourceTypePath),
+    Value(TypeExpr),
+}
+
+impl ResolvedParameterType {
+    pub fn is_handle(&self) -> bool {
+        matches!(self, Self::Handle(_))
+    }
+
+    pub fn handle_type(&self) -> Option<&crate::parser::ResourceTypePath> {
+        match self {
+            Self::Handle(path) => Some(path),
+            Self::Value(_) => None,
+        }
+    }
+
+    pub fn as_type_expr(&self) -> TypeExpr {
+        match self {
+            Self::Handle(path) => TypeExpr::Ref(path.clone()),
+            Self::Value(value) => value.clone(),
+        }
+    }
+}
+
+/// Canonical failure produced when a classified structural argument crosses a
+/// parameter boundary. Callers add only their function/module parameter
+/// context; the handle-kind and resource-type decision lives here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleSinkError {
+    message: String,
+    bare_value_sink: bool,
+}
+
+impl HandleSinkError {
+    pub fn is_bare_value_sink(&self) -> bool {
+        self.bare_value_sink
+    }
+}
+
+impl std::fmt::Display for HandleSinkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HandleSinkError {}
+
+/// Single authority for assigning a structural handle to a resolved function
+/// or module parameter type.
+pub(crate) fn check_handle_sink(
+    handle: &crate::eval_value::StructuralHandle,
+    resolved_parameter: &ResolvedParameterType,
+) -> Result<(), HandleSinkError> {
+    let ResolvedParameterType::Handle(expected) = resolved_parameter else {
+        return Err(HandleSinkError {
+            message: handle.bare_error().to_string(),
+            bare_value_sink: true,
+        });
+    };
+
+    let actual = match handle.kind() {
+        crate::eval_value::StructuralHandleKind::Resource(actual) => actual,
+        kind => {
+            let binding = handle
+                .alias_name()
+                .unwrap_or_else(|| handle.canonical_binding_name());
+            return Err(HandleSinkError {
+                message: format!(
+                    "'{binding}' is {}, not a resource of type {expected}",
+                    kind.description(),
+                ),
+                bare_value_sink: false,
+            });
+        }
+    };
+
+    let source =
+        AttributeType::resource_handle(actual.provider.clone(), actual.resource_type.clone());
+    let sink = lift_type_expr(&TypeExpr::Ref(expected.clone()))
+        .expect("TypeExpr::Ref always lifts to a resource handle");
+    if source
+        .in_schema(crate::schema::empty_defs_for_schema_walks())
+        .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
+    {
+        Ok(())
+    } else {
+        Err(HandleSinkError {
+            message: format!(
+                "expects resource type '{expected}', got {}.{}",
+                actual.provider, actual.resource_type,
+            ),
+            bare_value_sink: false,
+        })
+    }
+}
+
+/// Public bridge used by editor diagnostics without exposing the parser-only
+/// handle representation. `None` means the argument is a value; `Some` means
+/// the shared handle checker made the complete decision.
+pub fn check_module_argument_handle_sink(
+    argument: &crate::parser::ModuleArgument,
+    resolved_parameter: &ResolvedParameterType,
+) -> Option<Result<(), HandleSinkError>> {
+    argument
+        .handle()
+        .map(|handle| check_handle_sink(handle, resolved_parameter))
+}
+
+/// Resolve and classify a module or function parameter type.
+///
+/// Callers must not fall back to inspecting the raw [`TypeExpr`] on error:
+/// in particular, [`TypeExpr::DottedUnresolved`] can name either a resource
+/// handle or a provider-defined value type. Bootstrap parser paths may retain
+/// an explicitly provisional binding until an enriched parse is available.
+pub fn resolve_parameter_type(
+    ty: &TypeExpr,
+    config: &ProviderContext,
+) -> Result<ResolvedParameterType, String> {
+    match resolve_type_expr(ty, config)? {
+        TypeExpr::Ref(path) => Ok(ResolvedParameterType::Handle(path)),
+        resolved => Ok(ResolvedParameterType::Value(resolved)),
+    }
+}
+
+/// Resolve a parameter type when the provider catalog is authoritative.
+/// Bootstrap parsing deliberately defers an unresolved dotted annotation;
+/// the enriched validation pass repeats the check after schemas are loaded.
+pub fn resolve_parameter_type_for_check(
+    ty: &TypeExpr,
+    config: &ProviderContext,
+) -> Result<Option<ResolvedParameterType>, String> {
+    match resolve_parameter_type(ty, config) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(_) if !config.customs_loaded => Ok(None),
+        Err(message) => Err(message),
+    }
+}
+
 /// Resolve every module-boundary type declaration in place. Diagnostics
 /// include the declaration kind/name so callers can report the same surface
 /// as [`validate_argument_custom_types`].
@@ -2168,6 +2351,27 @@ pub fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
             match resolve_type_expr(ty, config) {
                 Ok(resolved) => *ty = resolved,
                 Err(e) => errors.push(format!("export '{export_name}': {e}")),
+            }
+        }
+    }
+    for function in parsed.user_functions.values_mut() {
+        for parameter in &mut function.params {
+            if let Some(ty) = &parameter.param_type {
+                match resolve_type_expr(ty, config) {
+                    Ok(resolved) => parameter.param_type = Some(resolved),
+                    Err(error) => errors.push(format!(
+                        "function '{}' parameter '{}': {error}",
+                        function.name, parameter.name
+                    )),
+                }
+            }
+        }
+        if let Some(ty) = &function.return_type {
+            match resolve_type_expr(ty, config) {
+                Ok(resolved) => function.return_type = Some(resolved),
+                Err(error) => {
+                    errors.push(format!("function '{}' return type: {error}", function.name))
+                }
             }
         }
     }
@@ -2356,6 +2560,7 @@ pub fn value_contains_unresolved_ref(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => true,
@@ -2420,18 +2625,50 @@ pub fn validate_module_calls(
         if let Some(signature) = imported_modules.get(&call.module_name) {
             let module_args = &signature.arguments;
             for (arg_name, arg_value) in &call.arguments {
-                if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name)
-                    && let Err(error) = typecheck::check_type_expr_value(
-                        &arg_param.type_expr,
-                        arg_value.value(),
+                if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name) {
+                    let line = call
+                        .argument_value_source_span(arg_name)
+                        .or_else(|| call.source_span())
+                        .map(|span| span.start_line);
+                    let source_file = call.diagnostic_source().map(|source| source.file);
+                    let context = match (source_file.as_deref(), line) {
+                        (Some(file), Some(line)) => format!(
+                            "module {} argument '{}' in {} at line {line}",
+                            call.module_name,
+                            arg_name,
+                            file.display(),
+                        ),
+                        (None, Some(line)) => format!(
+                            "module {} argument '{}' at line {line}",
+                            call.module_name, arg_name,
+                        ),
+                        _ => format!("module {} argument '{}'", call.module_name, arg_name),
+                    };
+                    let resolved_parameter =
+                        match resolve_parameter_type_for_check(&arg_param.type_expr, config) {
+                            Ok(Some(resolved)) => resolved,
+                            Ok(None) => continue,
+                            Err(error) => {
+                                errors.push(format!("{context}: {error}"));
+                                continue;
+                            }
+                        };
+                    if let Some(handle) = arg_value.handle() {
+                        if let Err(error) = check_handle_sink(handle, &resolved_parameter) {
+                            errors.push(format!("{context}: {error}"));
+                        }
+                    } else if arg_value.pending_parameter().is_some() {
+                        // A nested call can only classify a forwarded
+                        // parameter after its outermost caller is expanded.
+                        continue;
+                    } else if let Err(error) = typecheck::check_type_expr_value(
+                        &resolved_parameter.as_type_expr(),
+                        arg_value.value().expect("value module argument"),
                         config,
                         typecheck::TypecheckInference::Unavailable,
-                    )
-                {
-                    errors.push(format!(
-                        "module {} argument '{}': {}",
-                        call.module_name, arg_name, error
-                    ));
+                    ) {
+                        errors.push(format!("{context}: {error}"));
+                    }
                 }
             }
         }
@@ -2658,7 +2895,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
-            collect_dependencies(value.value(), &mut referenced);
+            collect_dependencies(value.walker_value(), &mut referenced);
         }
     }
     for attr_param in &parsed.attribute_params {
@@ -2758,6 +2995,7 @@ pub(crate) fn walk_type_expr_fields<'a, 'b>(
 pub(crate) fn narrow_type_expr(
     start: &TypeExpr,
     segments: &[crate::resource::PathSegment],
+    schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> Option<TypeExpr> {
     use crate::resource::{PathSegment, Subscript};
     let mut current = start.clone();
@@ -2768,6 +3006,24 @@ pub(crate) fn narrow_type_expr(
                 ty
             }
             (TypeExpr::Map(inner), PathSegment::Field { .. }) => *inner,
+            (TypeExpr::Ref(path), PathSegment::Field { name }) => {
+                let schemas = schemas?;
+                let schema = schemas
+                    .get(
+                        &path.provider,
+                        &path.resource_type,
+                        crate::schema::SchemaKind::Resource,
+                    )
+                    .or_else(|| {
+                        schemas.get(
+                            &path.provider,
+                            &path.resource_type,
+                            crate::schema::SchemaKind::DataSource,
+                        )
+                    })?;
+                let attribute = schema.attributes.get(name)?;
+                inference::attribute_type_to_type_expr(&attribute.attr_type)
+            }
             (
                 TypeExpr::List(inner),
                 PathSegment::Subscript {

@@ -2091,6 +2091,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::Unknown(_)) => {
             crate::resource::assert_value_fully_resolved(value)

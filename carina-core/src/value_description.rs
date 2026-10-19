@@ -39,7 +39,9 @@ impl ValueDescription {
             Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference".to_string(),
             Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation".to_string(),
-            Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call".to_string(),
+            Value::Deferred(
+                DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+            ) => "function call".to_string(),
             Value::Deferred(DeferredValue::Access(_)) => "access expression".to_string(),
             Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
                 "secret".to_string()

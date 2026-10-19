@@ -69,12 +69,48 @@ fn mark_secret_input_strings(value: Value) -> Value {
                     .collect(),
             ))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            Value::Deferred(DeferredValue::FunctionCall {
-                name,
-                args: args.into_iter().map(mark_secret_input_strings).collect(),
-            })
-        }
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| {
+                            Ok::<_, std::convert::Infallible>(mark_secret_input_strings(
+                                value.clone(),
+                            ))
+                        })
+                        .expect("infallible function-argument rewrite")
+                })
+                .collect(),
+            source_line,
+        }),
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| {
+                            Ok::<_, std::convert::Infallible>(mark_secret_input_strings(
+                                value.clone(),
+                            ))
+                        })
+                        .expect("infallible function-argument rewrite")
+                })
+                .collect(),
+            source_line,
+        }),
         Value::Deferred(DeferredValue::Access(access)) => {
             let original = Value::Deferred(DeferredValue::Access(access.clone()));
             let step = match access.step().clone() {
@@ -188,6 +224,70 @@ macro_rules! register_builtins {
             }
         ),* $(,)?
     ) => {
+        /// Stable, typed identity for a registered built-in function.
+        ///
+        /// Deferred built-in calls store this value rather than a free-form
+        /// string, so a user-function or unknown name cannot enter the
+        /// built-in-only runtime path.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[allow(non_camel_case_types)]
+        pub enum BuiltinFunction {
+            $( $name, )*
+        }
+
+        impl BuiltinFunction {
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $( stringify!($name) => Some(Self::$name), )*
+                    _ => None,
+                }
+            }
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$name => stringify!($name), )*
+                }
+            }
+
+            pub const fn arity(self) -> usize {
+                match self {
+                    $( Self::$name => $arity, )*
+                }
+            }
+        }
+
+        impl std::fmt::Display for BuiltinFunction {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl std::ops::Deref for BuiltinFunction {
+            type Target = str;
+
+            fn deref(&self) -> &Self::Target {
+                self.as_str()
+            }
+        }
+
+        impl AsRef<str> for BuiltinFunction {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl PartialEq<str> for BuiltinFunction {
+            fn eq(&self, other: &str) -> bool {
+                self.as_str() == other
+            }
+        }
+
+        impl PartialEq<&str> for BuiltinFunction {
+            fn eq(&self, other: &&str) -> bool {
+                self.as_str() == *other
+            }
+        }
+
         /// Return metadata for all built-in functions.
         pub fn builtin_functions() -> &'static [BuiltinFunctionInfo] {
             static FUNCTIONS: &[BuiltinFunctionInfo] = &[
@@ -207,10 +307,7 @@ macro_rules! register_builtins {
         ///
         /// Returns `None` if the function is unknown.
         pub fn builtin_arity(name: &str) -> Option<usize> {
-            match name {
-                $( stringify!($name) => Some($arity), )*
-                _ => None,
-            }
+            BuiltinFunction::from_name(name).map(BuiltinFunction::arity)
         }
 
         /// Evaluate a built-in function by name with the given arguments.
@@ -243,14 +340,7 @@ macro_rules! register_builtins {
                             .iter()
                             .cloned()
                             .map(|arg| {
-                                arg.into_value().map_err(|leak| {
-                                    format!(
-                                        "{}: closure '{}' (still needs {} arg(s)) cannot be \
-                                         used as a data argument; finish the partial \
-                                         application first",
-                                        name, leak.name, leak.remaining_arity
-                                    )
-                                })
+                                arg.into_value().map_err(|error| format!("{name}: {error}"))
                             })
                             .collect();
                         let (lowered, contained_secret) = peel_secret_arguments(lowered?);
@@ -274,12 +364,7 @@ macro_rules! register_builtins {
         ) -> Result<Value, String> {
             let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
             let result = evaluate_builtin(name, &eval_args)?;
-            result.into_value().map_err(|leak| {
-                format!(
-                    "{}: would return a closure ({} arg(s) still needed)",
-                    leak.name, leak.remaining_arity
-                )
-            })
+            result.into_value().map_err(|error| error.to_string())
         }
     };
 }
@@ -468,13 +553,8 @@ pub(crate) fn evaluate_builtin_with_config(
                 .iter()
                 .cloned()
                 .map(|arg| {
-                    arg.into_value().map_err(|leak| {
-                        format!(
-                            "decrypt: closure '{}' (still needs {} arg(s)) cannot be \
-                             used as a data argument; finish the partial application first",
-                            leak.name, leak.remaining_arity
-                        )
-                    })
+                    arg.into_value()
+                        .map_err(|error| format!("decrypt: {error}"))
                 })
                 .collect();
             let (lowered, contained_secret) = peel_secret_arguments(lowered?);
@@ -487,7 +567,7 @@ pub(crate) fn evaluate_builtin_with_config(
 
 /// Check if a function name is a known built-in function.
 pub fn is_known_builtin(name: &str) -> bool {
-    builtin_functions().iter().any(|f| f.name == name)
+    BuiltinFunction::from_name(name).is_some()
 }
 
 /// Test-only helper: dispatch a built-in by lifting `&[Value]` to
@@ -513,12 +593,7 @@ pub(crate) fn evaluate_builtin_with_config_to_value(
 ) -> Result<Value, String> {
     let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
     let result = evaluate_builtin_with_config(name, &eval_args, config)?;
-    result.into_value().map_err(|leak| {
-        format!(
-            "{}: would return a closure ({} arg(s) still needed)",
-            leak.name, leak.remaining_arity
-        )
-    })
+    result.into_value().map_err(|error| error.to_string())
 }
 
 /// Return a human-readable type name for a Value
@@ -537,7 +612,9 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "ResourceRef",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "BindingRef",
         Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
-        Value::Deferred(DeferredValue::FunctionCall { .. }) => "FunctionCall",
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        ) => "FunctionCall",
         Value::Deferred(DeferredValue::Access(_)) => "Access",
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret",

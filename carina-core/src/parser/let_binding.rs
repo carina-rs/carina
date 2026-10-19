@@ -16,13 +16,13 @@ use super::context::{ParseBindingRef, ParseContext, first_inner, next_pair};
 use super::error::ParseError;
 use super::expressions::for_expr::parse_for_expr;
 use super::expressions::if_expr::parse_if_expr;
+use super::expressions::pipe::apply_pipe_step;
 use super::expressions::primary::{apply_postfix_steps, parse_postfix_eval, parse_primary_eval};
 use super::expressions::wait_expr::parse_wait_expr;
-use super::parse_expression;
-use super::static_eval::is_static_value;
+use super::parse_expression_eval;
 use super::util::eval_type_name;
-use crate::eval_value::{EvalValue, StructuralHandle};
-use crate::resource::{DataSource, DeferredValue, Resource, Value};
+use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
+use crate::resource::{DataSource, Resource};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive
@@ -52,24 +52,56 @@ pub(crate) type LetBindingRhs = (
 /// assembled. Top-level parsing records the binding as `Structural` and drops
 /// this value, but using a typed reference here prevents a structural handle
 /// from ever masquerading as an ordinary string during nested parsing.
-pub(crate) fn structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::binding(binding_name))
+pub(crate) fn structural_handle(
+    binding_name: &str,
+    resource_type: super::ast::ResourceTypePath,
+) -> EvalValue {
+    EvalValue::structural_handle(StructuralHandle::new(
+        StructuralHandleKind::Resource(resource_type),
+        binding_name,
+    ))
 }
 
 pub(crate) fn for_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::for_binding(binding_name))
+    EvalValue::structural_handle(StructuralHandle::new(
+        StructuralHandleKind::For,
+        binding_name,
+    ))
 }
 
-fn side_channel_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::side_channel(binding_name))
+fn upstream_state_structural_handle(binding_name: &str) -> EvalValue {
+    EvalValue::structural_handle(StructuralHandle::new(
+        StructuralHandleKind::UpstreamState,
+        binding_name,
+    ))
+}
+
+fn provider_structural_handle(binding_name: &str) -> EvalValue {
+    EvalValue::structural_handle(StructuralHandle::new(
+        StructuralHandleKind::Provider,
+        binding_name,
+    ))
+}
+
+fn wait_structural_handle(binding_name: &str) -> EvalValue {
+    EvalValue::structural_handle(StructuralHandle::new(
+        StructuralHandleKind::Wait,
+        binding_name,
+    ))
 }
 
 pub(crate) fn if_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::if_binding(binding_name))
+    EvalValue::structural_handle(StructuralHandle::new(
+        StructuralHandleKind::If,
+        binding_name,
+    ))
 }
 
-pub(crate) fn module_structural_handle(binding_name: &str, module_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::module_binding(binding_name, module_name))
+pub(crate) fn module_structural_handle(binding_name: &str) -> EvalValue {
+    EvalValue::structural_handle(StructuralHandle::new(
+        StructuralHandleKind::Module,
+        binding_name,
+    ))
 }
 
 /// Extended parse_let_binding that also handles module calls, imports, and for expressions.
@@ -107,7 +139,7 @@ pub(super) fn parse_let_binding_extended(
     if rhs_pair.as_rule() == Rule::use_expr {
         let use_stmt = parse_use_expr(rhs_pair, &name, ctx)?;
         let value =
-            EvalValue::structural_handle(StructuralHandle::use_binding(&name, &use_stmt.path));
+            EvalValue::structural_handle(StructuralHandle::new(StructuralHandleKind::Use, &name));
         return Ok((
             name,
             value,
@@ -205,7 +237,7 @@ fn parse_pipe_expr_with_resource_or_module(
         "primary expression",
         "postfix expression",
     )?;
-    let (mut value, expanded_resources, data_sources, module_calls, maybe_import, binding_kind) =
+    let (mut value, expanded_resources, data_sources, module_calls, maybe_import, mut binding_kind) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
     if !postfix_inner.is_empty() {
         if matches!(
@@ -271,99 +303,18 @@ fn parse_pipe_expr_with_resource_or_module(
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
     for func_call_pair in inner {
+        let (line, column) = func_call_pair.line_col();
         let mut fc_inner = func_call_pair.into_inner();
         let func_name = next_pair(&mut fc_inner, "function name", "pipe function call")?
             .as_str()
             .to_string();
-        let extra_args: Result<Vec<Value>, ParseError> =
-            fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+        let extra_args: Result<Vec<EvalValue>, ParseError> = fc_inner
+            .map(|arg| parse_expression_eval(arg, ctx))
+            .collect();
         let extra_args = extra_args?;
 
-        // Lower the running pipe value to a `Value` for the builtin
-        // dispatch path (which expects fully-reduced data arguments).
-        // Closures are handled separately just below.
-        let pipe_value_for_args = match &value {
-            EvalValue::User(v) => Some(v.clone()),
-            EvalValue::StructuralHandle(handle) => Some(handle.clone().into_value()),
-            EvalValue::ComputedWithStructuralHandles { value, .. } => Some(value.clone()),
-            EvalValue::DeferredForValue { .. } => Some(Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
-            ))),
-            EvalValue::Closure { .. } => None,
-        };
-
-        // Check if the pipe target is a Closure variable
-        if let Some(EvalValue::Closure {
-            name: fn_name,
-            captured_args,
-            remaining_arity,
-        }) = ctx.get_variable(&func_name)
-        {
-            // Build closure-application args. The pipe value (`x` in
-            // `x |> f`) goes as the last argument; we keep it as
-            // EvalValue so a chained closure can pipe through.
-            let mut all_args: Vec<EvalValue> = extra_args
-                .iter()
-                .cloned()
-                .map(EvalValue::from_value)
-                .collect();
-            all_args.push(value.clone());
-            if extra_args.iter().all(is_static_value)
-                && pipe_value_for_args.as_ref().is_some_and(is_static_value)
-            {
-                value = crate::builtins::apply_closure_with_config(
-                    fn_name,
-                    captured_args,
-                    *remaining_arity,
-                    &all_args,
-                    ctx.config,
-                )
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: e,
-                })?;
-                continue;
-            }
-        }
-
-        // Build args for the non-closure dispatch path: at this point
-        // we need a `Vec<Value>`, so the running pipe value must be a
-        // user-facing value (not a closure).
-        let pipe_value = match pipe_value_for_args {
-            Some(v) => v,
-            None => {
-                return Err(ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!(
-                        "cannot pipe a closure into '{}' — finish the partial application first",
-                        func_name
-                    ),
-                });
-            }
-        };
-        let mut args = extra_args;
-        args.push(pipe_value);
-
-        // Eagerly evaluate partial application for builtin pipe targets
-        if let Some(arity) = crate::builtins::builtin_arity(&func_name)
-            && args.len() < arity
-            && args.iter().all(is_static_value)
-        {
-            let eval_args: Vec<EvalValue> =
-                args.iter().cloned().map(EvalValue::from_value).collect();
-            value =
-                crate::builtins::evaluate_builtin_with_config(&func_name, &eval_args, ctx.config)
-                    .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!("{}(): {}", func_name, e),
-                })?;
-            continue;
-        }
-
-        value = EvalValue::from_value(Value::Deferred(DeferredValue::FunctionCall {
-            name: func_name,
-            args,
-        }));
+        value = apply_pipe_step(value, func_name, extra_args, ctx, line, column)?;
+        binding_kind = LetBindingKind::Value;
     }
 
     Ok((
@@ -389,7 +340,7 @@ fn parse_primary_with_resource_or_module(
             && reference_parts.next().is_none()
             && matches!(
                 ctx.lookup_binding(identifier.as_str()),
-                ParseBindingRef::Structural { .. }
+                ParseBindingRef::Structural(_)
             )
         {
             let value = parse_primary_eval(inner, ctx)?;
@@ -407,8 +358,12 @@ fn parse_primary_with_resource_or_module(
     match inner.as_rule() {
         Rule::read_resource_expr => {
             let data_source = parse_read_resource_expr(inner, ctx, binding_name)?;
+            let resource_type = super::ast::ResourceTypePath::new(
+                data_source.id.provider.clone(),
+                data_source.id.resource_type.clone(),
+            );
             Ok((
-                structural_handle(binding_name),
+                structural_handle(binding_name, resource_type),
                 vec![],
                 vec![data_source],
                 vec![],
@@ -427,7 +382,7 @@ fn parse_primary_with_resource_or_module(
             }
             ctx.upstream_states.insert(us.binding.clone(), us);
             Ok((
-                side_channel_structural_handle(binding_name),
+                upstream_state_structural_handle(binding_name),
                 vec![],
                 vec![],
                 vec![],
@@ -450,7 +405,7 @@ fn parse_primary_with_resource_or_module(
             }
             ctx.named_provider_instances.push(config);
             Ok((
-                side_channel_structural_handle(binding_name),
+                provider_structural_handle(binding_name),
                 vec![],
                 vec![],
                 vec![],
@@ -470,7 +425,7 @@ fn parse_primary_with_resource_or_module(
             ctx.wait_bindings
                 .insert(wb.binding.as_str().to_string(), wb);
             Ok((
-                side_channel_structural_handle(binding_name),
+                wait_structural_handle(binding_name),
                 vec![],
                 vec![],
                 vec![],
@@ -480,8 +435,12 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
+            let resource_type = super::ast::ResourceTypePath::new(
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            );
             Ok((
-                structural_handle(binding_name),
+                structural_handle(binding_name, resource_type),
                 vec![resource],
                 vec![],
                 vec![],
@@ -514,9 +473,8 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
-            let module_name = call.module_name.clone();
             Ok((
-                module_structural_handle(binding_name, &module_name),
+                module_structural_handle(binding_name),
                 vec![],
                 vec![],
                 vec![call],

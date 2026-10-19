@@ -583,27 +583,20 @@ fn parse_for_iterable(
 ) -> Result<ParsedForIterable, ParseError> {
     // `for_iterable` is a restricted postfix wrapper whose base is a
     // function call, list, variable reference, or parenthesized expression.
+    let line = pair.line_col().0;
     let bare_unbound_identifier = syntactic_bare_unbound_identifier(&pair, ctx);
     let eval = parse_postfix_eval(pair, ctx)?;
     let structural_for_binding = eval
         .structural_handle_ref()
-        .and_then(|handle| handle.for_binding_name())
+        .filter(|handle| handle.is_for_binding())
+        .and_then(|handle| handle.addressable_binding())
         .map(str::to_string);
-    let provisional_binding = eval
-        .structural_handle_ref()
-        .and_then(|handle| handle.provisional_binding_name())
-        .map(str::to_string);
+    let provisional_binding = eval.provisional_reference_name().map(str::to_string);
     let structural_handle_metadata = eval.structural_handle_metadata().cloned();
     let value = eval
         .into_value()
-        .map_err(|leak| ParseError::InvalidExpression {
-            line: 0,
-            message: format!(
-                "for iterable evaluates to a closure '{}' (still needs {} arg(s)); \
-             closures cannot be iterated",
-                leak.name, leak.remaining_arity
-            ),
-        })?;
+        .map_err(|error| ParseError::from_eval_value(error, line))?;
+    let value = crate::parser::functions::try_evaluate_fn_value(value, ctx, line)?;
     Ok(ParsedForIterable {
         value: evaluate_static_value(value, ctx.config)?,
         bare_unbound_identifier,

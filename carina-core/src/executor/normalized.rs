@@ -160,6 +160,7 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             DeferredValue::BindingRef { .. } => false,
             DeferredValue::Interpolation(_) => false,
             DeferredValue::FunctionCall { .. } => false,
+            DeferredValue::ResolvedFunctionCall { .. } => false,
             DeferredValue::Access(_) => false,
             DeferredValue::Secret(inner) => is_value_fully_concrete_for_expansion(inner),
             DeferredValue::RedactedSecret { .. } => false,

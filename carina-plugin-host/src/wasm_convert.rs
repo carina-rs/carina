@@ -340,7 +340,13 @@ fn core_to_wit_value_from(
         }
         CoreValue::Deferred(DeferredValue::FunctionCall { name, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
-                name: name.clone(),
+                name: name.to_string(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: function.name.clone(),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -597,7 +603,13 @@ fn core_value_to_json_from(
         }
         CoreValue::Deferred(DeferredValue::FunctionCall { name, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
-                name: name.clone(),
+                name: name.to_string(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: function.name.clone(),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -2484,13 +2496,15 @@ mod tests {
     fn function_call_returns_err_in_core_to_wit_value() {
         use carina_core::resource::AccessPath;
         let v = CoreValue::Deferred(DeferredValue::FunctionCall {
-            name: "join".into(),
+            name: carina_core::builtins::BuiltinFunction::join,
             args: vec![
-                CoreValue::Concrete(ConcreteValue::String("-".into())),
+                CoreValue::Concrete(ConcreteValue::String("-".into())).into(),
                 CoreValue::Deferred(DeferredValue::ResourceRef {
                     path: AccessPath::new("vpc", "id"),
-                }),
+                })
+                .into(),
             ],
+            source_line: 0.into(),
         });
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
@@ -2510,8 +2524,9 @@ mod tests {
 
         let value = apply_postfix_access(
             CoreValue::Deferred(DeferredValue::FunctionCall {
-                name: "split".into(),
+                name: carina_core::builtins::BuiltinFunction::split,
                 args: vec![],
+                source_line: 0.into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 1 },

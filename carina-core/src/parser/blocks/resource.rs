@@ -5,13 +5,16 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use crate::eval_value::{EvalValue, StructuralHandleKind};
 use crate::parser::Rule;
-use crate::parser::blocks::attributes::extract_directives;
 use crate::parser::context::{ParseContext, extract_key_string, first_inner, next_pair};
 use crate::parser::error::ParseError;
-use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::resource::{ConcreteValue, DataSource, Resource, ResourceId, ResourceIdentity, Value};
+use crate::parser::{parse_expression, parse_expression_eval};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceIdentity,
+    Value,
+};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -36,17 +39,15 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let attributes = parse_block_contents_with_quoted(
+    let parsed_contents = parse_block_contents_with_quoted(
         iter,
         ctx,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
-
-    let mut attributes = attributes;
-    // Extract directives block from attributes (it's a meta-argument, not a real attribute)
-    let directives = extract_directives(&mut attributes)?;
+    let attributes = parsed_contents.attributes;
+    let directives = parsed_contents.directives.unwrap_or_default();
 
     let id = ResourceId::pending_with_provider(
         provider,
@@ -76,6 +77,12 @@ pub(crate) fn parse_block_contents(
     ctx: &ParseContext,
 ) -> Result<IndexMap<String, Value>, ParseError> {
     parse_block_contents_with_quoted(pairs, ctx, &mut None, ReservedAttributeNamePolicy::Allow)
+        .map(|contents| contents.attributes)
+}
+
+struct ParsedBlockContents {
+    attributes: IndexMap<String, Value>,
+    directives: Option<Directives>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,18 +96,19 @@ pub(in crate::parser) enum ReservedAttributeNamePolicy {
 /// string literal (`attr = "..."`). Used by resource-level callers to
 /// build `Resource.quoted_string_attrs` for enum-attribute diagnostics
 /// (#2094 / #2229) without re-walking the pest tree.
-pub(in crate::parser) fn parse_block_contents_with_quoted(
+fn parse_block_contents_with_quoted(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
     quoted_out: &mut Option<HashSet<String>>,
     reserved_attribute_names: ReservedAttributeNamePolicy,
-) -> Result<IndexMap<String, Value>, ParseError> {
+) -> Result<ParsedBlockContents, ParseError> {
     // `IndexMap` so the order in which the user wrote attributes in the
     // .crn file flows all the way to `Resource.attributes` and to
     // `Value::Concrete(ConcreteValue::Map)` payloads — anything that re-renders attributes
     // (formatter, plan display, diagnostics) sees a stable order.
     let mut attributes: IndexMap<String, Value> = IndexMap::new();
     let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
+    let mut directives = None;
 
     // Local scope extends the parent context with block-scoped let bindings
     let mut local_ctx = ctx.clone();
@@ -148,6 +156,8 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
                         if block_name == "directives" {
                             check_directives_depends_on_elements(block_inner.clone())?;
                             check_directives_provider_value(block_inner.clone())?;
+                            directives = Some(parse_directives(block_inner, &local_ctx)?);
+                            continue;
                         }
                         // Recursively parse nested block contents (supports arbitrary depth)
                         let block_attrs = parse_block_contents(block_inner, &local_ctx)?;
@@ -180,7 +190,10 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
         attributes.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
     }
 
-    Ok(attributes)
+    Ok(ParsedBlockContents {
+        attributes,
+        directives,
+    })
 }
 
 fn reject_reserved_resource_attribute(
@@ -239,19 +252,18 @@ pub(crate) fn parse_resource_expr(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let mut attributes = parse_block_contents_with_quoted(
+    let parsed_contents = parse_block_contents_with_quoted(
         inner,
         ctx,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
+    let attributes = parsed_contents.attributes;
+    let directives = parsed_contents.directives.unwrap_or_default();
 
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
-
-    // Extract directives block from attributes (it's a meta-argument, not a real attribute)
-    let directives = extract_directives(&mut attributes)?;
 
     let id = ResourceId::with_provider_identity(
         provider,
@@ -296,19 +308,18 @@ pub(crate) fn parse_read_resource_expr(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let mut attributes = parse_block_contents_with_quoted(
+    let parsed_contents = parse_block_contents_with_quoted(
         inner,
         ctx,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
+    let attributes = parsed_contents.attributes;
+    let directives = parsed_contents.directives.unwrap_or_default();
 
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
-
-    // Extract directives block from attributes (it's a meta-argument, not a real attribute)
-    let directives = extract_directives(&mut attributes)?;
 
     let id = ResourceId::with_provider_identity(
         provider,
@@ -326,6 +337,170 @@ pub(crate) fn parse_read_resource_expr(
         module_source: None,
         quoted_string_attrs,
     })
+}
+
+fn parse_directives(
+    pairs: pest::iterators::Pairs<Rule>,
+    ctx: &ParseContext,
+) -> Result<Directives, ParseError> {
+    let mut directives = Directives::default();
+
+    for content_pair in pairs {
+        let attr = match content_pair.as_rule() {
+            Rule::block_content => {
+                first_inner(content_pair, "block content item", "directives block")?
+            }
+            Rule::attribute => content_pair,
+            _ => continue,
+        };
+        if attr.as_rule() != Rule::attribute {
+            continue;
+        }
+
+        let mut attr_inner = attr.into_inner();
+        let key = next_pair(&mut attr_inner, "attribute name", "directives block")?
+            .as_str()
+            .to_string();
+        let value_pair = next_pair(&mut attr_inner, "attribute value", "directives block")?;
+        let line = value_pair.line_col().0;
+
+        match key.as_str() {
+            "depends_on" => {
+                let primary =
+                    crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
+                        ParseError::InvalidExpression {
+                            line,
+                            message: "directives.depends_on: must be a list of binding identifiers"
+                                .to_string(),
+                        }
+                    })?;
+                let list = first_inner(primary, "list", "directives.depends_on")?;
+                if list.as_rule() != Rule::list {
+                    return Err(ParseError::InvalidExpression {
+                        line,
+                        message: "directives.depends_on: must be a list of binding identifiers"
+                            .to_string(),
+                    });
+                }
+                let mut names = Vec::new();
+                for element in list.into_inner() {
+                    let element_line = element.line_col().0;
+                    let eval = parse_expression_eval(element, ctx)?;
+                    names.push(eval_as_binding_name(
+                        eval,
+                        "depends_on: list elements",
+                        element_line,
+                        BindingNameUse::Dependency,
+                    )?);
+                }
+                directives.depends_on = names;
+            }
+            "provider" => {
+                let eval = parse_expression_eval(value_pair, ctx)?;
+                directives.provider_instance = Some(eval_as_binding_name(
+                    eval,
+                    "provider: value",
+                    line,
+                    BindingNameUse::Provider,
+                )?);
+            }
+            "force_delete" => {
+                directives.force_delete = matches!(
+                    parse_expression(value_pair, ctx)?,
+                    Value::Concrete(ConcreteValue::Bool(true))
+                );
+            }
+            "create_before_destroy" => {
+                directives.create_before_destroy = matches!(
+                    parse_expression(value_pair, ctx)?,
+                    Value::Concrete(ConcreteValue::Bool(true))
+                );
+            }
+            "prevent_destroy" => {
+                directives.prevent_destroy = matches!(
+                    parse_expression(value_pair, ctx)?,
+                    Value::Concrete(ConcreteValue::Bool(true))
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(directives)
+}
+
+#[derive(Clone, Copy)]
+enum BindingNameUse {
+    Dependency,
+    Provider,
+}
+
+fn eval_as_binding_name(
+    eval: EvalValue,
+    context: &str,
+    line: usize,
+    usage: BindingNameUse,
+) -> Result<String, ParseError> {
+    match eval {
+        EvalValue::StructuralHandle(handle) => {
+            let accepted = match usage {
+                BindingNameUse::Dependency => handle.kind().is_dependency_target(),
+                BindingNameUse::Provider => {
+                    matches!(handle.kind(), StructuralHandleKind::Provider)
+                }
+            };
+            if accepted {
+                Ok(handle.canonical_binding_name().to_string())
+            } else {
+                let binding = handle
+                    .alias_name()
+                    .unwrap_or_else(|| handle.canonical_binding_name());
+                let description = handle.kind().description();
+                let message = match usage {
+                    BindingNameUse::Dependency => format!(
+                        "directives.depends_on: '{binding}' is {description} and cannot be used as a dependency target"
+                    ),
+                    BindingNameUse::Provider => format!(
+                        "directives.provider: '{binding}' is {description}, not a provider instance"
+                    ),
+                };
+                Err(ParseError::InvalidExpression { line, message })
+            }
+        }
+        EvalValue::User(Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ModuleArgument { name, .. },
+        ))) if matches!(usage, BindingNameUse::Dependency) => Ok(name),
+        EvalValue::User(Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ModuleArgument { name, .. },
+        ))) => Err(ParseError::InvalidExpression {
+            line,
+            message: format!(
+                "directives.provider: module parameter '{name}' cannot be used as a provider instance"
+            ),
+        }),
+        EvalValue::User(Value::Deferred(DeferredValue::BindingRef { binding })) => Ok(binding),
+        EvalValue::ProvisionalReference { binding } => Ok(binding),
+        EvalValue::User(Value::Concrete(ConcreteValue::EnumIdentifier(name))) => {
+            Ok(name.to_string())
+        }
+        EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { path })) => {
+            Err(ParseError::InvalidExpression {
+                line,
+                message: format!(
+                    "directives.{context} must be a bare binding identifier, not an attribute \
+                     selector (got `{}`)",
+                    path.binding(),
+                ),
+            })
+        }
+        other => Err(ParseError::InvalidExpression {
+            line,
+            message: format!(
+                "directives.{context} must be a binding identifier, got {}",
+                crate::parser::util::eval_type_name(&other),
+            ),
+        }),
+    }
 }
 
 /// Walk the contents of a `directives { ... }` block at the pest layer and
@@ -381,10 +556,8 @@ fn check_directives_depends_on_elements(
     Ok(())
 }
 
-/// Reject `provider = "<string>"` at the pest layer. By the time
-/// `extract_directives` sees the value, a quoted literal and a `${...}`
-/// indirection marker have collapsed to the same `ConcreteValue::String`,
-/// so the distinction can only be made before lowering.
+/// Reject `provider = "<string>"` at the pest layer, where a quoted literal
+/// remains distinguishable from a bare binding identifier.
 fn check_directives_provider_value(
     directives_inner: pest::iterators::Pairs<Rule>,
 ) -> Result<(), ParseError> {

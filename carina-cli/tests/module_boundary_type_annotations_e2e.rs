@@ -1187,7 +1187,7 @@ let instance = consumer {
 }
 
 #[test]
-fn ref_typed_module_argument_stays_unchecked_but_inner_resource_rejects_composition_type() {
+fn ref_typed_module_argument_binds_value_arguments_as_values() {
     let module = issue_module("aws.ec2.Vpc", "");
     let module = borrowed(&module);
     let fixture = Fixture::module(&module, &[("main.crn", root_with_two_calls())]);
@@ -1195,18 +1195,17 @@ fn ref_typed_module_argument_stays_unchecked_but_inner_resource_rejects_composit
     let diagnostics = fixture.validate();
 
     assert!(
-        diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("aws.ec2.SecurityGroup.web2.web_sg")
-                && diagnostic.contains("cannot assign aws.ec2.SecurityGroup.Id to 'vpc_id'")
-                && diagnostic.contains("from web.security_group_id")
-        }),
-        "expected the expanded inner resource to reject the inferred type, got: {diagnostics:#?}",
-    );
-    assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| !diagnostic.contains("module call 'web2': argument 'vpc_id'")),
-        "Ref annotations remain unchecked until carina#3803: {diagnostics:#?}",
+            .all(|diagnostic| !diagnostic.contains("resource handle, not a value")),
+        "a value argument stays value-shaped even under a Ref annotation: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+        }),
+        "the independent second-call identity mismatch must remain visible: {diagnostics:#?}",
     );
 }
 

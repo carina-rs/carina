@@ -4322,8 +4322,12 @@ fn validate_rejects_empty_interpolation_inside_function_call() {
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
     let fn_call = Value::Deferred(DeferredValue::FunctionCall {
-        name: "join".to_string(),
-        args: vec![Value::Concrete(ConcreteValue::String("-".into())), bad],
+        name: carina_core::builtins::BuiltinFunction::join,
+        args: vec![
+            Value::Concrete(ConcreteValue::String("-".into())).into(),
+            bad.into(),
+        ],
+        source_line: 0.into(),
     });
     let parsed = parsed_with_attr("name", fn_call);
 

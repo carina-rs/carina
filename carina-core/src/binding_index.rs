@@ -1212,6 +1212,16 @@ impl BindingNameSet {
                 .entry(structural.clone())
                 .or_insert(BindingNameKind::Structural);
         }
+        // Parser-classified structural handles include aliases such as
+        // `let network = vpc`. Aliases do not have their own resource row and
+        // deliberately stay out of `parsed.variables`, so the parser metadata
+        // is their declaration authority. This metadata is merged across all
+        // sibling files by the directory loader.
+        for structural in parsed.parser_binding_metadata.structural_handles().keys() {
+            by_name
+                .entry(structural.clone())
+                .or_insert(BindingNameKind::Structural);
+        }
         for var_name in parsed.variables.keys() {
             by_name
                 .entry(var_name.clone())

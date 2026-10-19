@@ -8,8 +8,8 @@ use crate::parser::{
     ArgumentParameter, CompareOp, RequireBlock, ValidateExpr, display_string_literal,
 };
 use crate::resource::{
-    Composition, ConcreteValue, DeferredValue, ModuleConstraintId, PendingModuleConstraint,
-    ResourceId, Value,
+    AccessMissPolicy, Composition, ConcreteValue, DeferredValue, ModuleConstraintId,
+    PendingModuleConstraint, ResourceId, Value, apply_value_path_segment,
 };
 
 use super::ModuleError;
@@ -333,7 +333,11 @@ pub fn evaluate_module_constraints(
                 ModuleConstraintKind::ArgumentValidation { argument } => vec![argument.clone()],
                 ModuleConstraintKind::Require => referenced_arguments.clone(),
             };
-            let actuals = constraint_actuals(&arguments, argument_values);
+            let actuals = constraint_actuals_for_expression(
+                constraint.expression(),
+                &arguments,
+                argument_values,
+            );
             let unknown_argument = referenced_arguments
                 .iter()
                 .find(|argument| !declared_arguments.contains(*argument));
@@ -408,13 +412,8 @@ fn evaluate_constraint_inner(
     message: String,
 ) -> Result<ConstraintEvaluation, String> {
     let referenced = referenced_constraint_arguments(expr);
-    for name in &referenced {
-        let value = arguments
-            .get(name)
-            .ok_or_else(|| format!("unknown variable '{name}' in constraint expression"))?;
-        if !is_recursively_concrete(value) {
-            return Ok(ConstraintEvaluation::Pending);
-        }
+    if !constraint_inputs_are_concrete(expr, arguments)? {
+        return Ok(ConstraintEvaluation::Pending);
     }
 
     let result = eval_expr(expr, arguments)?;
@@ -428,15 +427,7 @@ fn evaluate_constraint_inner(
         return Ok(ConstraintEvaluation::Satisfied);
     }
 
-    let actuals = referenced
-        .iter()
-        .map(|name| {
-            let value = arguments
-                .get(name)
-                .expect("referenced variables were checked above");
-            (name.clone(), format_constraint_actual(value))
-        })
-        .collect();
+    let actuals = constraint_actuals_for_expression(expr, &referenced, arguments);
     Ok(ConstraintEvaluation::Violated(ModuleConstraintViolation {
         arguments: referenced,
         message,
@@ -450,6 +441,10 @@ pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
         match expr {
             ValidateExpr::Var(name) => {
                 names.insert(name.clone());
+            }
+            ValidateExpr::Access { argument, .. }
+            | ValidateExpr::BoundArgument { argument, .. } => {
+                names.insert(argument.clone());
             }
             ValidateExpr::Compare { lhs, rhs, .. }
             | ValidateExpr::And(lhs, rhs)
@@ -497,22 +492,44 @@ pub fn evaluate_pending_constraints(
     let mut failures = Vec::new();
 
     for composition in compositions {
-        let mut resolved_arguments = HashMap::new();
         let mut resolution_errors = HashMap::new();
+        let resolved_constraints = composition
+            .signature
+            .pending_constraints
+            .iter()
+            .map(|constraint| PendingModuleConstraint {
+                id: constraint.id.clone(),
+                expression: resolve_bound_constraint_values(
+                    constraint.expression(),
+                    bindings,
+                    &mut resolution_errors,
+                ),
+                message: constraint.message.clone(),
+            })
+            .collect::<Vec<_>>();
+        let raw_arguments = resolved_constraints
+            .iter()
+            .flat_map(|constraint| raw_constraint_arguments(constraint.expression()))
+            .collect::<BTreeSet<_>>();
+        let mut resolved_arguments = HashMap::new();
         for (name, argument) in &composition.signature.arguments {
-            match crate::resolver::resolve_ref_value(argument.value(), bindings) {
-                Ok(value) => {
-                    resolved_arguments.insert(name.clone(), value);
+            if raw_arguments.contains(name) {
+                match crate::resolver::resolve_ref_value(argument.value(), bindings) {
+                    Ok(value) => {
+                        resolved_arguments.insert(name.clone(), value);
+                    }
+                    Err(error) => {
+                        resolution_errors.insert(name.clone(), error);
+                        resolved_arguments.insert(name.clone(), argument.value().clone());
+                    }
                 }
-                Err(error) => {
-                    resolution_errors.insert(name.clone(), error);
-                    resolved_arguments.insert(name.clone(), argument.value().clone());
-                }
+            } else {
+                resolved_arguments.insert(name.clone(), argument.value().clone());
             }
         }
 
         for evaluated in evaluate_module_constraints(
-            ModuleConstraints::pending(&composition.signature.pending_constraints),
+            ModuleConstraints::pending(&resolved_constraints),
             &resolved_arguments,
         ) {
             let constraint = evaluated.constraint();
@@ -577,6 +594,94 @@ pub fn evaluate_pending_constraints(
     failures
 }
 
+fn resolve_bound_constraint_values(
+    expression: &ValidateExpr,
+    bindings: &ResolvedBindings,
+    errors: &mut HashMap<String, String>,
+) -> ValidateExpr {
+    match expression {
+        ValidateExpr::BoundArgument {
+            argument,
+            operand,
+            value,
+        } => match crate::resolver::resolve_ref_value(value, bindings) {
+            Ok(value) => ValidateExpr::BoundArgument {
+                argument: argument.clone(),
+                operand: operand.clone(),
+                value,
+            },
+            Err(error) => {
+                errors.insert(argument.clone(), error);
+                expression.clone()
+            }
+        },
+        ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
+            lhs: Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
+            op: op.clone(),
+            rhs: Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+        },
+        ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
+            Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
+            Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+        ),
+        ValidateExpr::Or(lhs, rhs) => ValidateExpr::Or(
+            Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
+            Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+        ),
+        ValidateExpr::Not(inner) => ValidateExpr::Not(Box::new(resolve_bound_constraint_values(
+            inner, bindings, errors,
+        ))),
+        ValidateExpr::FunctionCall { name, args } => ValidateExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|argument| resolve_bound_constraint_values(argument, bindings, errors))
+                .collect(),
+        },
+        ValidateExpr::Bool(_)
+        | ValidateExpr::Int(_)
+        | ValidateExpr::Float(_)
+        | ValidateExpr::Duration(_)
+        | ValidateExpr::String(_)
+        | ValidateExpr::Var(_)
+        | ValidateExpr::Access { .. }
+        | ValidateExpr::Null => expression.clone(),
+    }
+}
+
+fn raw_constraint_arguments(expression: &ValidateExpr) -> BTreeSet<String> {
+    fn collect(expression: &ValidateExpr, out: &mut BTreeSet<String>) {
+        match expression {
+            ValidateExpr::Var(argument) | ValidateExpr::Access { argument, .. } => {
+                out.insert(argument.clone());
+            }
+            ValidateExpr::Compare { lhs, rhs, .. }
+            | ValidateExpr::And(lhs, rhs)
+            | ValidateExpr::Or(lhs, rhs) => {
+                collect(lhs, out);
+                collect(rhs, out);
+            }
+            ValidateExpr::Not(inner) => collect(inner, out),
+            ValidateExpr::FunctionCall { args, .. } => {
+                for argument in args {
+                    collect(argument, out);
+                }
+            }
+            ValidateExpr::Bool(_)
+            | ValidateExpr::Int(_)
+            | ValidateExpr::Float(_)
+            | ValidateExpr::Duration(_)
+            | ValidateExpr::String(_)
+            | ValidateExpr::BoundArgument { .. }
+            | ValidateExpr::Null => {}
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    collect(expression, &mut out);
+    out
+}
+
 fn constraint_actuals(
     arguments: &[String],
     values: &HashMap<String, Value>,
@@ -591,6 +696,60 @@ fn constraint_actuals(
             (name.clone(), rendered)
         })
         .collect()
+}
+
+fn constraint_actuals_for_expression(
+    expression: &ValidateExpr,
+    arguments: &[String],
+    values: &HashMap<String, Value>,
+) -> Vec<(String, String)> {
+    fn collect(
+        expression: &ValidateExpr,
+        actuals: &mut std::collections::BTreeMap<String, String>,
+    ) {
+        match expression {
+            ValidateExpr::BoundArgument {
+                argument,
+                operand,
+                value,
+            } => {
+                let operand = if operand.is_empty() {
+                    argument
+                } else {
+                    operand
+                };
+                actuals.insert(operand.clone(), format_constraint_actual(value));
+            }
+            ValidateExpr::Compare { lhs, rhs, .. }
+            | ValidateExpr::And(lhs, rhs)
+            | ValidateExpr::Or(lhs, rhs) => {
+                collect(lhs, actuals);
+                collect(rhs, actuals);
+            }
+            ValidateExpr::Not(inner) => collect(inner, actuals),
+            ValidateExpr::FunctionCall { args, .. } => {
+                for argument in args {
+                    collect(argument, actuals);
+                }
+            }
+            ValidateExpr::Bool(_)
+            | ValidateExpr::Int(_)
+            | ValidateExpr::Float(_)
+            | ValidateExpr::Duration(_)
+            | ValidateExpr::String(_)
+            | ValidateExpr::Var(_)
+            | ValidateExpr::Access { .. }
+            | ValidateExpr::Null => {}
+        }
+    }
+
+    let mut actuals = std::collections::BTreeMap::new();
+    collect(expression, &mut actuals);
+    if actuals.is_empty() {
+        constraint_actuals(arguments, values)
+    } else {
+        actuals.into_iter().collect()
+    }
 }
 
 fn format_constraint_actual(value: &Value) -> String {
@@ -672,6 +831,9 @@ impl EvalValue {
             Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
             Self::Value(Value::Deferred(DeferredValue::Interpolation(_))) => "interpolation",
             Self::Value(Value::Deferred(DeferredValue::FunctionCall { .. })) => "function call",
+            Self::Value(Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })) => {
+                "function call"
+            }
             Self::Value(Value::Deferred(DeferredValue::Access(_))) => "access expression",
             Self::Value(Value::Deferred(DeferredValue::Unknown(_))) => "unknown",
         }
@@ -700,6 +862,14 @@ fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<
             .get(name)
             .map(value_for_evaluation)
             .ok_or_else(|| format!("unknown variable '{name}' in constraint expression")),
+        ValidateExpr::Access { argument, path } => {
+            let base = arguments
+                .get(argument)
+                .cloned()
+                .ok_or_else(|| format!("unknown variable '{argument}' in constraint expression"))?;
+            apply_constraint_path(base, path).map(|value| value_for_evaluation(&value))
+        }
+        ValidateExpr::BoundArgument { value, .. } => Ok(value_for_evaluation(value)),
         ValidateExpr::Compare { lhs, op, rhs } => {
             let left = eval_expr(lhs, arguments)?;
             let right = eval_expr(rhs, arguments)?;
@@ -726,6 +896,57 @@ fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<
             Ok(value_from(ConcreteValue::Bool(!value)))
         }
         ValidateExpr::FunctionCall { name, args } => eval_function(name, args, arguments),
+    }
+}
+
+fn apply_constraint_path(
+    mut value: Value,
+    path: &[crate::resource::PathSegment],
+) -> Result<Value, String> {
+    for step in path {
+        value = apply_value_path_segment(value, step.clone(), 0, AccessMissPolicy::Error)
+            .and_then(crate::resource::ValuePathSegmentResult::into_value)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(value)
+}
+
+fn constraint_inputs_are_concrete(
+    expr: &ValidateExpr,
+    arguments: &HashMap<String, Value>,
+) -> Result<bool, String> {
+    match expr {
+        ValidateExpr::Var(name) => arguments
+            .get(name)
+            .map(is_recursively_concrete)
+            .ok_or_else(|| format!("unknown variable '{name}' in constraint expression")),
+        ValidateExpr::Access { argument, path } => {
+            let base = arguments
+                .get(argument)
+                .cloned()
+                .ok_or_else(|| format!("unknown variable '{argument}' in constraint expression"))?;
+            Ok(is_recursively_concrete(&apply_constraint_path(base, path)?))
+        }
+        ValidateExpr::BoundArgument { value, .. } => Ok(is_recursively_concrete(value)),
+        ValidateExpr::Compare { lhs, rhs, .. }
+        | ValidateExpr::And(lhs, rhs)
+        | ValidateExpr::Or(lhs, rhs) => Ok(constraint_inputs_are_concrete(lhs, arguments)?
+            && constraint_inputs_are_concrete(rhs, arguments)?),
+        ValidateExpr::Not(inner) => constraint_inputs_are_concrete(inner, arguments),
+        ValidateExpr::FunctionCall { args, .. } => {
+            for argument in args {
+                if !constraint_inputs_are_concrete(argument, arguments)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ValidateExpr::Bool(_)
+        | ValidateExpr::Int(_)
+        | ValidateExpr::Float(_)
+        | ValidateExpr::Duration(_)
+        | ValidateExpr::String(_)
+        | ValidateExpr::Null => Ok(true),
     }
 }
 
@@ -1042,14 +1263,14 @@ mod tests {
                 type_expr: TypeExpr::Int,
                 default: None,
                 description: None,
-                validations: vec![ValidationBlock {
-                    condition: ValidateExpr::Compare {
+                validations: vec![ValidationBlock::new(
+                    ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("y".to_string())),
                         op: CompareOp::Gt,
                         rhs: Box::new(ValidateExpr::Int(0)),
                     },
-                    error_message: Some("x must be valid".to_string()),
-                }],
+                    Some("x must be valid".to_string()),
+                )],
             },
             ArgumentParameter {
                 name: "y".to_string(),
@@ -1088,14 +1309,14 @@ mod tests {
             type_expr: TypeExpr::String,
             default: None,
             description: None,
-            validations: vec![ValidationBlock {
-                condition: ValidateExpr::Compare {
+            validations: vec![ValidationBlock::new(
+                ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::Var("name".to_string())),
                     op: CompareOp::Gt,
                     rhs: Box::new(ValidateExpr::Int(5)),
                 },
-                error_message: Some("bad name".to_string()),
-            }],
+                Some("bad name".to_string()),
+            )],
         }];
         let values = HashMap::from([(
             "name".to_string(),

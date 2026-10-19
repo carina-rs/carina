@@ -5,7 +5,7 @@
 //! lives in `parser/mod.rs` (it moves in part 2 of #2262); only the
 //! parser logic and the [`CompareOp`] enum live here.
 
-use crate::parser::{ParseError, Rule, ValidateExpr, first_inner, next_pair};
+use crate::parser::{ParseContext, ParseError, Rule, ValidateExpr, first_inner, next_pair};
 
 /// Comparison operator used inside [`ValidateExpr::Compare`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -20,18 +20,19 @@ pub enum CompareOp {
 
 pub(crate) fn parse_validate_expr(
     pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
 ) -> Result<ValidateExpr, ParseError> {
     match pair.as_rule() {
         Rule::validate_expr => {
             let inner = first_inner(pair, "validate_or_expr", "validate_expr")?;
-            parse_validate_expr(inner)
+            parse_validate_expr(inner, ctx)
         }
         Rule::validate_or_expr => {
             let mut inner = pair.into_inner();
             let first = next_pair(&mut inner, "validate_and_expr", "validate_or_expr")?;
-            let mut result = parse_validate_expr(first)?;
+            let mut result = parse_validate_expr(first, ctx)?;
             for next in inner {
-                let right = parse_validate_expr(next)?;
+                let right = parse_validate_expr(next, ctx)?;
                 result = ValidateExpr::Or(Box::new(result), Box::new(right));
             }
             Ok(result)
@@ -39,9 +40,9 @@ pub(crate) fn parse_validate_expr(
         Rule::validate_and_expr => {
             let mut inner = pair.into_inner();
             let first = next_pair(&mut inner, "validate_not_expr", "validate_and_expr")?;
-            let mut result = parse_validate_expr(first)?;
+            let mut result = parse_validate_expr(first, ctx)?;
             for next in inner {
-                let right = parse_validate_expr(next)?;
+                let right = parse_validate_expr(next, ctx)?;
                 result = ValidateExpr::And(Box::new(result), Box::new(right));
             }
             Ok(result)
@@ -51,17 +52,17 @@ pub(crate) fn parse_validate_expr(
             let first = next_pair(&mut inner, "operand", "validate_not_expr")?;
             if first.as_rule() == Rule::validate_not_expr {
                 // This is the "!" ~ validate_not_expr branch
-                let operand = parse_validate_expr(first)?;
+                let operand = parse_validate_expr(first, ctx)?;
                 Ok(ValidateExpr::Not(Box::new(operand)))
             } else {
                 // This is the validate_comparison branch
-                parse_validate_expr(first)
+                parse_validate_expr(first, ctx)
             }
         }
         Rule::validate_comparison => {
             let mut inner = pair.into_inner();
             let lhs_pair = next_pair(&mut inner, "validate_primary", "validate_comparison")?;
-            let lhs = parse_validate_expr(lhs_pair)?;
+            let lhs = parse_validate_expr(lhs_pair, ctx)?;
             if let Some(op_pair) = inner.next() {
                 let op = match op_pair.as_str() {
                     ">=" => CompareOp::Gte,
@@ -79,7 +80,7 @@ pub(crate) fn parse_validate_expr(
                 };
                 let rhs_pair =
                     next_pair(&mut inner, "validate_primary", "validate_comparison rhs")?;
-                let rhs = parse_validate_expr(rhs_pair)?;
+                let rhs = parse_validate_expr(rhs_pair, ctx)?;
                 Ok(ValidateExpr::Compare {
                     lhs: Box::new(lhs),
                     op,
@@ -91,7 +92,7 @@ pub(crate) fn parse_validate_expr(
         }
         Rule::validate_primary => {
             let inner = first_inner(pair, "value", "validate_primary")?;
-            parse_validate_expr(inner)
+            parse_validate_expr(inner, ctx)
         }
         Rule::validate_function_call => {
             let mut inner = pair.into_inner();
@@ -100,7 +101,7 @@ pub(crate) fn parse_validate_expr(
                 .to_string();
             let mut args = Vec::new();
             for arg_pair in inner {
-                args.push(parse_validate_expr(arg_pair)?);
+                args.push(parse_validate_expr(arg_pair, ctx)?);
             }
             Ok(ValidateExpr::FunctionCall { name, args })
         }
@@ -139,10 +140,19 @@ pub(crate) fn parse_validate_expr(
             Ok(ValidateExpr::String(s.to_string()))
         }
         Rule::variable_ref => {
-            // Variable reference - just the identifier name
-            // For validate expressions, we only support simple variable names
-            let inner = first_inner(pair, "identifier", "variable_ref")?;
-            Ok(ValidateExpr::Var(inner.as_str().to_string()))
+            let mut parts = pair.into_inner();
+            let argument = next_pair(&mut parts, "identifier", "variable_ref")?
+                .as_str()
+                .to_string();
+            let mut path = Vec::new();
+            for part in parts {
+                path.push(super::primary::parse_postfix_path_segment(part, ctx)?);
+            }
+            if path.is_empty() {
+                Ok(ValidateExpr::Var(argument))
+            } else {
+                Ok(ValidateExpr::Access { argument, path })
+            }
         }
         other => Err(ParseError::InvalidExpression {
             line: 0,

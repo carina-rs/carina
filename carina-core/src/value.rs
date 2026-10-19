@@ -225,7 +225,7 @@ impl std::fmt::Display for UnknownReason {
             UnknownReason::ForIndex => write!(f, "deferred for-binding index"),
             UnknownReason::ForValue => write!(f, "deferred for-binding value"),
             UnknownReason::FnParam { name } => write!(f, "function parameter {name}"),
-            UnknownReason::ModuleArgument { name } => write!(f, "module argument {name}"),
+            UnknownReason::ModuleArgument { name, .. } => write!(f, "module argument {name}"),
             UnknownReason::FnLocal { name } => write!(f, "function local {name}"),
             UnknownReason::EmptyInterpolation => write!(f, "empty interpolation"),
             UnknownReason::PostCreateReadIncomplete { detail } => {
@@ -248,7 +248,7 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
         UnknownReason::ForIndex => "(known after upstream apply: index)".to_string(),
         UnknownReason::ForValue => "(known after upstream apply)".to_string(),
         UnknownReason::FnParam { name } => format!("(unresolved function parameter: {name})"),
-        UnknownReason::ModuleArgument { name } => {
+        UnknownReason::ModuleArgument { name, .. } => {
             format!("(unresolved module argument: {name})")
         }
         UnknownReason::FnLocal { name } => format!("(unresolved function local: {name})"),
@@ -373,7 +373,13 @@ fn value_to_json_inner(
         }
         Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
-                name: name.clone(),
+                name: name.to_string(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: function.name.clone(),
                 context: ctx,
             })
         }
@@ -1008,14 +1014,29 @@ fn format_value_into_context(
             }
             sink.write_token(ValueSpanKind::StringLiteral, "\"")
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line: _,
+        }) => {
             sink.write_token(ValueSpanKind::Other, name)?;
             sink.write_token(ValueSpanKind::Structure, "(")?;
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
                     sink.write_token(ValueSpanKind::Structure, ", ")?;
                 }
-                format_value_into_context(arg, sink, context)?;
+                format_value_into_context(arg.walker_value(), sink, context)?;
+            }
+            sink.write_token(ValueSpanKind::Structure, ")")
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+            sink.write_token(ValueSpanKind::Other, &function.name)?;
+            sink.write_token(ValueSpanKind::Structure, "(")?;
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    sink.write_token(ValueSpanKind::Structure, ", ")?;
+                }
+                format_value_into_context(arg.walker_value(), sink, context)?;
             }
             sink.write_token(ValueSpanKind::Structure, ")")
         }
@@ -1191,9 +1212,12 @@ pub fn contains_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts
             .iter()
             .any(|part| matches!(part, InterpolationPart::Expr(value) if contains_secret(value))),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter().any(contains_secret)
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => args
+            .iter()
+            .any(|argument| contains_secret(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => contains_secret(access.base()),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -1233,8 +1257,12 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(part, InterpolationPart::Expr(value) if contains_unredacted_secret(value))
         }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter().any(contains_unredacted_secret)
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
+            args.iter()
+                .any(|argument| contains_unredacted_secret(argument.walker_value()))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_unredacted_secret(access.base())
@@ -1392,11 +1420,36 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
                 .collect();
             Ok(Value::Deferred(DeferredValue::Interpolation(redacted?)))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            let redacted: Result<Vec<Value>, _> = args.iter().map(redact_secrets_only).collect();
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_secrets_only))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Deferred(DeferredValue::FunctionCall {
-                name: name.clone(),
-                args: redacted?,
+                name: *name,
+                args: redacted,
+                source_line: *source_line,
+            }))
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_secrets_only))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function: function.clone(),
+                functions: functions.clone(),
+                args: redacted,
+                source_line: *source_line,
             }))
         }
         Value::Deferred(DeferredValue::Access(access)) => access
@@ -1532,14 +1585,27 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
                     .collect::<Result<_, SerializationError>>()?,
             ),
         ),
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             let mut call = Map::new();
-            call.insert("name".to_string(), JsonValue::String(name.clone()));
+            call.insert("name".to_string(), JsonValue::String(name.to_string()));
             call.insert(
                 "args".to_string(),
                 JsonValue::Array(
                     args.iter()
-                        .map(canonical_secret_template)
+                        .map(|argument| canonical_secret_template(argument.walker_value()))
+                        .collect::<Result<_, _>>()?,
+                ),
+            );
+            tagged("function_call", JsonValue::Object(call))
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+            let mut call = Map::new();
+            call.insert("name".to_string(), JsonValue::String(function.name.clone()));
+            call.insert(
+                "args".to_string(),
+                JsonValue::Array(
+                    args.iter()
+                        .map(|argument| canonical_secret_template(argument.walker_value()))
                         .collect::<Result<_, _>>()?,
                 ),
             );
@@ -1583,9 +1649,12 @@ pub fn contains_redacted_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(part, InterpolationPart::Expr(value) if contains_redacted_secret(value))
         }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter().any(contains_redacted_secret)
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => args
+            .iter()
+            .any(|argument| contains_redacted_secret(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_redacted_secret(access.base())
         }
@@ -2139,7 +2208,11 @@ fn rehydrate_redacted_secrets_impl(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Deferred(DeferredValue::Interpolation(parts)))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args: saved }) => {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args: saved,
+            source_line,
+        }) => {
             let Value::Deferred(DeferredValue::FunctionCall {
                 args: candidate, ..
             }) = candidate
@@ -2150,18 +2223,23 @@ fn rehydrate_redacted_secrets_impl(
                 .iter()
                 .enumerate()
                 .map(|(index, saved)| {
-                    if !contains_redacted_secret(saved) {
+                    if !contains_redacted_secret(saved.walker_value()) {
                         return Ok(saved.clone());
                     }
                     let candidate = candidate
                         .get(index)
                         .ok_or(SecretRehydrationError::ShapeMismatch)?;
+                    let (Some(saved), Some(candidate)) = (saved.value(), candidate.value()) else {
+                        return Err(SecretRehydrationError::ShapeMismatch);
+                    };
                     rehydrate_redacted_secrets_impl(saved, candidate, candidate_is_secret)
+                        .map(crate::resource::FunctionArgument::from_value)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Deferred(DeferredValue::FunctionCall {
-                name: name.clone(),
+                name: *name,
                 args,
+                source_line: *source_line,
             }))
         }
         Value::Deferred(DeferredValue::Access(saved_access)) => {
@@ -2189,6 +2267,7 @@ fn secret_candidate_evaluation_is_unavailable(value: &Value) -> bool {
         Value::Deferred(
             DeferredValue::Unknown(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_),
         ) => true,
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
@@ -2306,11 +2385,36 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
         // Sibling shape: a deferred function-call carries `Value` args
         // that could equally hide a `Secret`. Same Unknown-tolerant
         // recursion via `redact_secrets_only`.
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            let redacted: Result<Vec<Value>, _> = args.iter().map(redact_secrets_only).collect();
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_secrets_only))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Deferred(DeferredValue::FunctionCall {
-                name: name.clone(),
-                args: redacted?,
+                name: *name,
+                args: redacted,
+                source_line: *source_line,
+            }))
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_secrets_only))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function: function.clone(),
+                functions: functions.clone(),
+                args: redacted,
+                source_line: *source_line,
             }))
         }
         Value::Deferred(DeferredValue::Access(access)) => access
@@ -4095,6 +4199,7 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
@@ -4522,6 +4627,7 @@ fn first_enum_identifier_inner(
         | Value::Deferred(
             DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
@@ -5283,8 +5389,9 @@ mod tests {
         // serialization is a resolver bug — the function should have
         // been evaluated by this point.
         let v = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".into(),
+            name: crate::builtins::BuiltinFunction::join,
             args: vec![],
+            source_line: (0).into(),
         });
         let err = value_to_json(&v).unwrap_err();
         assert!(
@@ -5305,8 +5412,9 @@ mod tests {
 
         let value = apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".into(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 1 },
@@ -6717,11 +6825,12 @@ mod tests {
         let runtime_ref = || Value::resource_ref("source", "suffix", Vec::new());
         let runtime = [
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "join".to_string(),
+                name: crate::builtins::BuiltinFunction::join,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("".into())),
-                    Value::Concrete(ConcreteValue::List(vec![raw(), runtime_ref()])),
+                    Value::Concrete(ConcreteValue::String("".into())).into(),
+                    Value::Concrete(ConcreteValue::List(vec![raw(), runtime_ref()])).into(),
                 ],
+                source_line: (0).into(),
             }),
             Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Expr(raw()),
@@ -6730,14 +6839,16 @@ mod tests {
         ];
         let static_values = [
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "join".to_string(),
+                name: crate::builtins::BuiltinFunction::join,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("".into())),
+                    Value::Concrete(ConcreteValue::String("".into())).into(),
                     Value::Concrete(ConcreteValue::List(vec![
                         raw(),
                         Value::Concrete(ConcreteValue::String("-suffix".into())),
-                    ])),
+                    ]))
+                    .into(),
                 ],
+                source_line: (0).into(),
             }),
             Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Expr(raw()),
@@ -7078,11 +7189,12 @@ mod tests {
 
         let value = apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())),
-                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 1 },
@@ -7762,8 +7874,9 @@ mod tests {
             "decrypted-plaintext-must-not-leak".into(),
         ));
         let source = Value::Deferred(DeferredValue::FunctionCall {
-            name: "decrypt".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String("ciphertext".into()))],
+            name: crate::builtins::BuiltinFunction::decrypt,
+            args: vec![Value::Concrete(ConcreteValue::String("ciphertext".into())).into()],
+            source_line: (0).into(),
         });
         let evaluated = Value::Deferred(DeferredValue::Secret(Box::new(plaintext)));
 
@@ -7860,8 +7973,9 @@ mod tests {
             InterpolationPart::Expr(secret),
         ]));
         let function_call = Value::Deferred(DeferredValue::FunctionCall {
-            name: "format".to_string(),
-            args: vec![interpolation],
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![interpolation.into()],
+            source_line: (0).into(),
         });
 
         assert!(contains_secret(&function_call));
@@ -8153,13 +8267,15 @@ mod tests {
 
         let access = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())),
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
                     Value::Deferred(DeferredValue::BindingRef {
                         binding: "x".to_string(),
-                    }),
+                    })
+                    .into(),
                 ],
+                source_line: (1).into(),
             }),
             crate::resource::PathSegment::Subscript {
                 index: crate::resource::Subscript::Int { index: 1 },
@@ -8868,11 +8984,12 @@ mod tests {
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef { path })),
             ])),
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "concat".to_string(),
+                name: crate::builtins::BuiltinFunction::concat,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("a".into())),
-                    Value::Concrete(ConcreteValue::String("b".into())),
+                    Value::Concrete(ConcreteValue::String("a".into())).into(),
+                    Value::Concrete(ConcreteValue::String("b".into())).into(),
                 ],
+                source_line: (0).into(),
             }),
         ];
 

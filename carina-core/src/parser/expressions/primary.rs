@@ -9,9 +9,10 @@ use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::parser::context::ParseBindingRef;
 use crate::parser::expressions::if_expr::parse_if_value_expr;
 use crate::parser::expressions::string_literal::parse_string_value;
+use crate::parser::functions::{evaluate_user_function_eval, reject_builtin_handle_arguments};
 use crate::parser::{
-    ParseContext, ParseError, Rule, evaluate_user_function, extract_key_string, first_inner,
-    is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
+    ParseContext, ParseError, Rule, extract_key_string, first_inner, is_static_eval, next_pair,
+    parse_block_contents, parse_expression, parse_expression_eval,
 };
 use crate::resource::{
     AccessMissPolicy, AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, Value,
@@ -74,7 +75,7 @@ pub(crate) fn parse_duration_literal(src: &str, line: usize) -> Result<Value, Pa
 /// than at validate time because the DSL has no `[-1]` "from end"
 /// semantic — accepting them would let the validator pass and the
 /// resolver silently fall back to the unresolved ref.
-fn subscript_from_value(value: Value, line: usize) -> Result<Subscript, ParseError> {
+pub(crate) fn subscript_from_value(value: Value, line: usize) -> Result<Subscript, ParseError> {
     match value {
         Value::Concrete(ConcreteValue::Int(n)) if n < 0 => Err(ParseError::InvalidExpression {
             line,
@@ -92,7 +93,7 @@ fn subscript_from_value(value: Value, line: usize) -> Result<Subscript, ParseErr
     }
 }
 
-fn parse_postfix_path_segment(
+pub(crate) fn parse_postfix_path_segment(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<PathSegment, ParseError> {
@@ -125,20 +126,7 @@ pub(crate) fn apply_postfix_path_segment(
     let base = match value {
         EvalValue::User(base) => base,
         EvalValue::StructuralHandle(handle) => {
-            let Some(binding) = handle.addressable_binding() else {
-                let alias = handle.alias_name().unwrap_or("<structural alias>");
-                return Err(ParseError::InvalidExpression {
-                    line,
-                    message: match &step {
-                        PathSegment::Field { name } => {
-                            format!("'{alias}' is not a resource, cannot access attribute '{name}'")
-                        }
-                        PathSegment::Subscript { .. } => {
-                            format!("'{alias}' is not a resource, cannot index it")
-                        }
-                    },
-                });
-            };
+            let binding = handle.canonical_binding_name();
             if let PathSegment::Subscript { index } = &step {
                 let binding = match index {
                     Subscript::Int { index } => format!("{binding}[{index}]"),
@@ -150,9 +138,10 @@ pub(crate) fn apply_postfix_path_segment(
                     DeferredValue::BindingRef { binding },
                 )));
             }
-            Value::Deferred(DeferredValue::BindingRef {
-                binding: binding.to_string(),
-            })
+            handle.access_base_value()
+        }
+        EvalValue::ProvisionalReference { binding } => {
+            Value::Deferred(DeferredValue::BindingRef { binding })
         }
         EvalValue::ComputedWithStructuralHandles {
             value: base,
@@ -281,14 +270,21 @@ fn parse_namespaced_id_value(
             return Ok(as_resource_ref(trailing_segments));
         }
         ParseBindingRef::Structural(handle) => {
-            return Err(ParseError::InvalidExpression {
-                line,
-                message: format!(
-                    "'{}' is not a resource, cannot access attribute '{}'",
-                    handle.alias_name().unwrap_or(parts[0]),
-                    parts[1]
-                ),
-            });
+            let mut segments: Vec<PathSegment> = parts[2..]
+                .iter()
+                .map(|s| PathSegment::Field {
+                    name: (*s).to_string(),
+                })
+                .collect();
+            segments.extend(trailing_segments);
+            let path = AccessPath::with_segments(
+                handle.canonical_binding_name().to_string(),
+                parts[1].to_string(),
+                segments,
+            );
+            return Ok(EvalValue::from_value(Value::Deferred(
+                DeferredValue::ResourceRef { path },
+            )));
         }
         ParseBindingRef::Value(bound) => {
             // A dotted name whose head is an ordinary bound variable is value
@@ -375,16 +371,11 @@ pub(crate) fn parse_primary_eval(
             let mut items = Vec::new();
             let mut item_metadata = Vec::new();
             for item in inner.into_inner() {
+                let line = item.line_col().0;
                 let eval = parse_expression_eval(item, ctx)?;
-                let (value, metadata) = eval.into_collection_element().map_err(|leak| {
-                    ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "list element evaluates to a closure '{}' (still needs {} arg(s))",
-                            leak.name, leak.remaining_arity
-                        ),
-                    }
-                })?;
+                let (value, metadata) = eval
+                    .into_collection_element()
+                    .map_err(|error| ParseError::from_eval_value(error, line))?;
                 items.push(value);
                 item_metadata.push(metadata);
             }
@@ -407,19 +398,12 @@ pub(crate) fn parse_primary_eval(
                         let mut entry_inner = entry.into_inner();
                         let key_pair = next_pair(&mut entry_inner, "map key", "map entry")?;
                         let key = extract_key_string(key_pair)?;
-                        let value = parse_expression_eval(
-                            next_pair(&mut entry_inner, "map value", "map entry")?,
-                            ctx,
-                        )?;
-                        let (value, metadata) = value.into_collection_element().map_err(
-                            |leak| ParseError::InvalidExpression {
-                                line: 0,
-                                message: format!(
-                                    "map value evaluates to a closure '{}' (still needs {} arg(s))",
-                                    leak.name, leak.remaining_arity
-                                ),
-                            },
-                        )?;
+                        let value_pair = next_pair(&mut entry_inner, "map value", "map entry")?;
+                        let line = value_pair.line_col().0;
+                        let value = parse_expression_eval(value_pair, ctx)?;
+                        let (value, metadata) = value
+                            .into_collection_element()
+                            .map_err(|error| ParseError::from_eval_value(error, line))?;
                         if let Some(metadata) = metadata {
                             structural_handles.insert(key.clone(), metadata);
                         }
@@ -521,63 +505,90 @@ pub(crate) fn parse_primary_eval(
         }
         Rule::string => parse_string_value(inner, ctx).map(EvalValue::from_value),
         Rule::function_call => {
+            let (line, column) = inner.line_col();
             let mut fc_inner = inner.into_inner();
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
                 .as_str()
                 .to_string();
-            let args: Result<Vec<Value>, ParseError> =
-                fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
-            let args = args?;
+            let eval_args: Result<Vec<EvalValue>, ParseError> = fc_inner
+                .map(|arg| parse_expression_eval(arg, ctx))
+                .collect();
+            let eval_args = eval_args?;
 
-            // Check if the name refers to a Closure variable (direct call on closure)
+            // Check if the name refers to a Closure variable (direct call on closure).
+            // The shared helper preserves the underlying typed builtin when
+            // an argument is deferred.
             if let Some(EvalValue::Closure {
                 name: fn_name,
                 captured_args,
                 remaining_arity,
             }) = ctx.get_variable(&func_name)
-                && args.iter().all(is_static_value)
             {
-                let eval_args: Vec<EvalValue> =
-                    args.iter().cloned().map(EvalValue::from_value).collect();
-                return crate::builtins::apply_closure_with_config(
+                return crate::parser::functions::apply_parser_closure(
                     fn_name,
                     captured_args,
                     *remaining_arity,
-                    &eval_args,
-                    ctx.config,
-                )
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: e,
-                });
+                    eval_args,
+                    ctx,
+                    line,
+                );
             }
 
-            // Try to eagerly evaluate user-defined function calls
-            if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
-                let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
-                return evaluate_user_function(&user_fn, &args, ctx).map(EvalValue::from_value);
+            let builtin = crate::builtins::BuiltinFunction::from_name(&func_name);
+            if builtin.is_some() {
+                reject_builtin_handle_arguments(&eval_args, line)?;
+            }
+
+            // User functions own the lowering contract for their parameters:
+            // Ref-typed arguments retain canonical handle bases even when a
+            // different argument keeps the call deferred.
+            if let Some(user_fn) = ctx.resolved_user_function(&func_name) {
+                if !ctx.seeded_user_functions.contains(&func_name)
+                    && eval_args.iter().all(is_static_eval)
+                {
+                    return evaluate_user_function_eval(&user_fn, eval_args, ctx, line)
+                        .map(EvalValue::from_value);
+                }
+                let args = crate::parser::functions::lower_function_arguments(eval_args, line)?;
+                crate::parser::functions::record_deferred_function_type_check(
+                    &user_fn, &args, ctx, line,
+                );
+                return Ok(EvalValue::from_value(Value::Deferred(
+                    DeferredValue::ResolvedFunctionCall {
+                        function: user_fn,
+                        functions: ctx.shared_user_function_scope(),
+                        args,
+                        source_line: (line).into(),
+                    },
+                )));
             }
 
             // Eagerly evaluate partial application (fewer args than arity → Closure)
             if let Some(arity) = crate::builtins::builtin_arity(&func_name)
-                && args.len() < arity
-                && args.iter().all(is_static_value)
+                && eval_args.len() < arity
+                && eval_args.iter().all(is_static_eval)
             {
-                let eval_args: Vec<EvalValue> =
-                    args.iter().cloned().map(EvalValue::from_value).collect();
                 return crate::builtins::evaluate_builtin_with_config(
                     &func_name, &eval_args, ctx.config,
                 )
                 .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
+                    line,
                     message: format!("{}(): {}", func_name, e),
                 });
             }
 
+            let args = crate::parser::functions::lower_function_arguments(eval_args, line)?;
+            let builtin = builtin.ok_or(ParseError::UnknownFunction {
+                name: func_name,
+                line,
+                column,
+            })?;
+
             Ok(EvalValue::from_value(Value::Deferred(
                 DeferredValue::FunctionCall {
-                    name: func_name,
+                    name: builtin,
                     args,
+                    source_line: (line).into(),
                 },
             )))
         }
@@ -606,7 +617,9 @@ pub(crate) fn parse_primary_eval(
                 // above — we only reach the `None` branch when the parser
                 // has no in-scope variable / let-binding for this name.
                 match ctx.lookup_binding(first_ident) {
-                    ParseBindingRef::Value(value) => Ok(value.clone()),
+                    ParseBindingRef::Value(value) => {
+                        Ok(value.clone().with_reference_source_line(line))
+                    }
                     ParseBindingRef::Structural(handle) => {
                         Ok(EvalValue::structural_handle(handle.clone()))
                     }
@@ -617,29 +630,20 @@ pub(crate) fn parse_primary_eval(
             } else {
                 match ctx.lookup_binding(first_ident) {
                     ParseBindingRef::Value(bound) => {
-                        return apply_postfix_steps(bound.clone(), access_steps, ctx);
+                        return apply_postfix_steps(
+                            bound.clone().with_reference_source_line(line),
+                            access_steps,
+                            ctx,
+                        );
                     }
                     ParseBindingRef::Structural(handle)
-                        if handle.addressable_binding().is_none() =>
+                        if handle.is_parameter_handle() || handle.alias_name().is_some() =>
                     {
-                        let attribute = access_steps.iter().find_map(|step| {
-                            (step.as_rule() == Rule::field_access)
-                                .then(|| step.clone().into_inner().next())
-                                .flatten()
-                                .map(|identifier| identifier.as_str().to_string())
-                        });
-                        return Err(ParseError::InvalidExpression {
-                            line,
-                            message: attribute.map_or_else(
-                                || format!("'{first_ident}' is not a resource, cannot index it"),
-                                |attribute| {
-                                    format!(
-                                        "'{}' is not a resource, cannot access attribute '{attribute}'",
-                                        handle.alias_name().unwrap_or(first_ident)
-                                    )
-                                },
-                            ),
-                        });
+                        return apply_postfix_steps(
+                            EvalValue::structural_handle(handle.clone()),
+                            access_steps,
+                            ctx,
+                        );
                     }
                     ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => {}
                 }

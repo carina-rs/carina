@@ -361,7 +361,7 @@ where
         let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
         for (arg_name, value) in call.arguments.iter() {
             f(
-                value.value(),
+                value.walker_value(),
                 &format!("module `{}` argument `{}`", caller, arg_name),
             );
         }

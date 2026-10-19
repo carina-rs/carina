@@ -75,12 +75,9 @@ fn empty_parsed() -> ParsedFile {
 #[test]
 fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     let value = Value::Deferred(DeferredValue::FunctionCall {
-        name: "identity".to_string(),
-        args: vec![Value::resource_ref(
-            "source".to_string(),
-            "value".to_string(),
-            vec![],
-        )],
+        name: crate::builtins::BuiltinFunction::upper,
+        args: vec![Value::resource_ref("source".to_string(), "value".to_string(), vec![]).into()],
+        source_line: (0).into(),
     });
     let result_type = TypeExpr::String;
     let mut visited = Vec::new();
@@ -184,12 +181,19 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
         .expect("function declarations must parse");
         parsed.variables.insert(
             "result".to_string(),
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: "f".to_string(),
-                args: vec![Value::Deferred(DeferredValue::FunctionCall {
-                    name: "g".to_string(),
-                    args: vec![Value::Concrete(ConcreteValue::Int(1))],
-                })],
+            Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function: std::sync::Arc::new(parsed.user_functions["f"].clone()),
+                functions: std::sync::Arc::new(parsed.user_functions.clone()),
+                args: vec![
+                    Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                        function: std::sync::Arc::new(parsed.user_functions["g"].clone()),
+                        functions: std::sync::Arc::new(parsed.user_functions.clone()),
+                        args: vec![Value::Concrete(ConcreteValue::Int(1)).into()],
+                        source_line: (0).into(),
+                    })
+                    .into(),
+                ],
+                source_line: (0).into(),
             }),
         );
         parsed
@@ -499,7 +503,7 @@ fn binding_referenced_in_function_call_arg_is_not_unused() {
             assume_role_policy_document = "{}"
         }
         let _ = aws.s3.Bucket {
-            bucket_name = sibling_fn(role.arn)
+            bucket_name = upper(role.arn)
         }
     "#;
     let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
@@ -554,7 +558,7 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
 }
 
 #[test]
-fn bare_binding_ref_is_not_unused() {
+fn seeded_bare_structural_binding_is_rejected_as_a_value() {
     let src = r#"
         let _ = aws.s3.Bucket {
             bucket_name = role
@@ -564,16 +568,27 @@ fn bare_binding_ref_is_not_unused() {
             assume_role_policy_document = "{}"
         }
     "#;
-    // Seeded structural bindings are the directory-loader path that keeps
-    // a bare sibling reference as `Deferred(BindingRef)` in the parsed file.
-    let parsed = crate::parser::parse_with_seeded_bindings(
+    let handle = crate::eval_value::StructuralHandle::new(
+        crate::eval_value::StructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
+            "aws", "iam.Role",
+        )),
+        "role",
+    );
+    let error = crate::parser::parse_with_seeded_bindings(
         src,
         &crate::parser::ProviderContext::default(),
-        &[crate::parser::BindingSeed::structural("role")],
+        &[crate::parser::BindingSeed::typed_structural(
+            "role", &handle,
+        )],
     )
-    .unwrap();
+    .expect_err("a seeded structural handle is not a value");
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(
+        error
+            .to_string()
+            .contains("'role' is a resource, not a value"),
+        "unexpected error: {error}",
+    );
 }
 
 #[test]
@@ -1186,11 +1201,12 @@ fn postfix_access_rejects_steps_that_do_not_fit_known_base_types() {
     let cases = [
         apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())),
-                    Value::resource_ref("q", "identifier", vec![]),
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    Value::resource_ref("q", "identifier", vec![]).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Str { key: "bad".into() },
@@ -1201,8 +1217,9 @@ fn postfix_access_rejects_steps_that_do_not_fit_known_base_types() {
         .expect("computed access remains deferred"),
         apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "upper".to_string(),
-                args: vec![Value::resource_ref("q", "identifier", vec![])],
+                name: crate::builtins::BuiltinFunction::upper,
+                args: vec![Value::resource_ref("q", "identifier", vec![]).into()],
+                source_line: (0).into(),
             }),
             PathSegment::Field {
                 name: "foo".to_string(),
@@ -1231,11 +1248,12 @@ fn postfix_function_result_type_is_checked_against_resource_attribute_type() {
     let split_element = || {
         apply_postfix_access(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "split".to_string(),
+                name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())),
-                    Value::resource_ref("q", "identifier", vec![]),
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    Value::resource_ref("q", "identifier", vec![]).into(),
                 ],
+                source_line: (0).into(),
             }),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 0 },
@@ -6449,5 +6467,25 @@ fn resolve_type_expr_accepts_registered_resource_ref() {
         resolved,
         TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
         "registered resource refs such as aws.vpc must keep resolving as Ref"
+    );
+}
+
+#[test]
+fn parameter_handle_classification_requires_a_resolved_type() {
+    use crate::parser::{ResourceTypePath, TypeExpr};
+
+    let unresolved = TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc"));
+    assert!(
+        resolve_parameter_type(&unresolved, &ProviderContext::default()).is_err(),
+        "a bootstrap context must preserve uncertainty instead of guessing value vs handle",
+    );
+
+    let mut enriched = ProviderContext::default();
+    enriched
+        .resource_types
+        .insert(("aws".to_string(), "ec2.Vpc".to_string()));
+    assert_eq!(
+        resolve_parameter_type(&unresolved, &enriched).unwrap(),
+        ResolvedParameterType::Handle(ResourceTypePath::new("aws", "ec2.Vpc")),
     );
 }

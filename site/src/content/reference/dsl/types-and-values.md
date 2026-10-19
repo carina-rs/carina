@@ -199,6 +199,59 @@ let subnet = awscc.ec2.Subnet {
 }
 ```
 
+The binding `vpc` is a structural handle, not a value. A bare handle is
+therefore invalid anywhere a value is required:
+
+```crn
+# Invalid: choose an attribute from vpc instead.
+let subnet = awscc.ec2.Subnet {
+  vpc_id = vpc
+}
+
+# Also invalid in collections, exports, and interpolation.
+let handles = [vpc]
+exports { network = vpc }
+let label = "network-${vpc}"
+```
+
+Use an attribute such as `vpc.vpc_id`. The same rule applies to bindings
+created by `for`, `if`, `use`, module calls, and `wait`. For a module call,
+select an output such as `network.vpc_id`.
+
+A handle may be given another name with `let`. The alias is itself a handle,
+so attribute access works through it, but using the alias bare in a value
+position is still rejected:
+
+```crn
+let network = vpc
+
+let subnet = awscc.ec2.Subnet {
+  vpc_id = network.vpc_id # Valid: selects an attribute.
+  name   = network.name   # Valid: selects an attribute.
+  parent = network        # Invalid: network is still a bare handle.
+}
+```
+
+Only syntax that explicitly transports a handle accepts one directly. Examples
+are `directives.depends_on`, `directives.provider`, and function or module
+arguments. The argument itself decides what is transported: passing `vpc`
+binds the parameter as a handle, while passing `vpc.vpc_id` binds it as a
+value. A resource type annotation checks that a passed handle has the expected
+resource type; it does not turn values into handles. An untyped function
+parameter can also receive a handle:
+
+```crn
+fn id_of(resource) {
+  resource.vpc_id
+}
+
+let id = id_of(vpc)
+```
+
+Inside the function or module, the parameter follows the same rule as the
+original argument: select an attribute from a handle before using it as a
+value. A bare `resource` in the example above is therefore invalid.
+
 ### Chained Access
 
 Dot notation can be chained for nested access:

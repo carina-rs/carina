@@ -1301,13 +1301,15 @@ fn colored_value_keeps_interpolation_with_quoted_argument_as_one_list_element() 
     let interpolation =
         Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
             Value::Deferred(DeferredValue::FunctionCall {
-                name: "join".to_string(),
+                name: carina_core::builtins::BuiltinFunction::join,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("it's".into())),
+                    Value::Concrete(ConcreteValue::String("it's".into())).into(),
                     Value::Deferred(DeferredValue::BindingRef {
                         binding: "x".to_string(),
-                    }),
+                    })
+                    .into(),
                 ],
+                source_line: (1).into(),
             }),
         )]));
     let value = Value::Concrete(ConcreteValue::List(vec![
