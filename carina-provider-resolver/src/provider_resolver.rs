@@ -9534,6 +9534,38 @@ transparency_log_present = true
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_all_verifies_signed_provider_inside_current_thread_runtime() {
+        assert_resolve_all_verifies_signed_provider_inside_tokio_runtime();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_all_verifies_signed_provider_inside_multi_thread_runtime() {
+        assert_resolve_all_verifies_signed_provider_inside_tokio_runtime();
+    }
+
+    fn assert_resolve_all_verifies_signed_provider_inside_tokio_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = provider_config("carina-rs/aws", None);
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+
+        let resolved = resolve_all_with_http(dir.path(), &[config], LockMode::Normal, &http)
+            .expect("signed provider resolution should succeed inside a Tokio runtime");
+
+        assert_eq!(
+            fs::read(resolved.get("awscc").unwrap()).unwrap(),
+            SIGNED_FIXTURE_ARTIFACT
+        );
+        let lock_contents = saved_lock_contents(dir.path());
+        assert!(lock_contents.contains("[[provider]]"), "{lock_contents}");
+        assert!(
+            lock_contents.contains(&format!(
+                "certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}"
+            )),
+            "{lock_contents}"
+        );
+    }
+
     #[test]
     fn deleting_registry_entry_drops_the_security_baseline() {
         let dir = tempfile::tempdir().unwrap();
