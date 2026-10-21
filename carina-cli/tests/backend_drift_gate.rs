@@ -536,8 +536,8 @@ mod backend_drift_gate {
     fn force_unlock_targets_locked_backend_on_drift() {
         let tmp = write_drift_fixture(false);
         let project = tmp.path();
-        let lock = LockInfo::new("migrate-state");
-        let lock_id = lock.id.clone();
+        let lock = LockInfo::for_test("migrate-state");
+        let lock_id = lock.id().to_owned();
         let old_lock_path = project.join("legacy/state.lock");
         let new_lock_path = project.join("state.lock");
         fs::write(&old_lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();

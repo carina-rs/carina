@@ -1,9 +1,12 @@
 use carina_core::parser::ProviderContext;
 use carina_core::shutdown::ShutdownToken;
 use carina_state::{LocalBackend, ResourceState, StateFile};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::commands::shared::cancellation_test_support::{
-    CancellationFixtureBase, RefreshDrainBarrier, ScopedEnv, install_refresh_drain_barrier,
+    CancellationFixtureBase, LockLossBackend, RefreshDrainBarrier, ScopedEnv,
+    install_refresh_drain_barrier,
 };
 
 pub(super) struct DestroyCancellationFixture {
@@ -119,6 +122,17 @@ impl DestroyCancellationFixture {
             ScopedEnv::set("CARINA_MOCK_DELETE_READY_PATH", &ready_path),
         ];
         self.provider_ready_path = Some(ready_path);
+        self
+    }
+
+    pub(super) fn with_delayed_delete(mut self, name: &str, delay: Duration) -> Self {
+        self._provider_env = vec![
+            ScopedEnv::set(
+                "CARINA_MOCK_DELETE_DELAY_MS_FOR",
+                format!("test.resource.{name}"),
+            ),
+            ScopedEnv::set("CARINA_MOCK_DELETE_DELAY_MS", delay.as_millis().to_string()),
+        ];
         self
     }
 
@@ -269,6 +283,10 @@ impl DestroyCancellationFixture {
 
     pub(super) fn backend(&self) -> &LocalBackend {
         self.base.backend()
+    }
+
+    pub(super) fn lock_loss_backend_handle(&self) -> Arc<LockLossBackend> {
+        self.base.lock_loss_backend_handle()
     }
 }
 

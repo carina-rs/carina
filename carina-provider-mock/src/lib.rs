@@ -467,6 +467,18 @@ impl MockProvider {
         )))
     }
 
+    fn delete_timeout_error_for(id: &ResourceId) -> Option<ProviderError> {
+        let target = env::var("CARINA_MOCK_DELETE_TIMEOUT_FOR").ok()?;
+        let identity = id.identity_str()?;
+        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
+        let key = Self::resource_key(id)?;
+        (target == "*" || target == full || target == key).then(|| {
+            ProviderError::timeout(format!(
+                "Operation timed out: CARINA_MOCK_DELETE_TIMEOUT_FOR matched {key}"
+            ))
+        })
+    }
+
     fn test_resource_identifier(id: &ResourceId, name: Option<&str>) -> Option<String> {
         if id.resource_type != "test.resource" {
             return None;
@@ -863,6 +875,9 @@ impl Provider for MockProvider {
         Box::pin(async move {
             let key = Self::resolved_resource_key(&id)?;
             if let Some(err) = Self::delete_fail_error_for(&id, &identifier) {
+                return Err(err);
+            }
+            if let Some(err) = Self::delete_timeout_error_for(&id) {
                 return Err(err);
             }
 

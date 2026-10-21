@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::parser::ProviderContext;
@@ -8,7 +9,9 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_state::LocalBackend;
 
-use crate::commands::shared::cancellation_test_support::{CancellationFixtureBase, ScopedEnv};
+use crate::commands::shared::cancellation_test_support::{
+    CancellationFixtureBase, LockLossBackend, ScopedEnv,
+};
 use crate::commands::shared::observer::CliObserver;
 
 struct CancellingObserver {
@@ -115,6 +118,17 @@ impl ApplyCancellationFixture {
         self
     }
 
+    pub(super) fn with_delayed_create(mut self, name: &str, delay: Duration) -> Self {
+        self._provider_env = vec![
+            ScopedEnv::set(
+                "CARINA_MOCK_CREATE_DELAY_MS_FOR",
+                format!("test.resource.{name}"),
+            ),
+            ScopedEnv::set("CARINA_MOCK_CREATE_DELAY_MS", delay.as_millis().to_string()),
+        ];
+        self
+    }
+
     pub(super) async fn wait_for_blocked_create(&self) {
         let ready_path = self
             .provider_ready_path
@@ -155,6 +169,14 @@ impl ApplyCancellationFixture {
 
     pub(super) fn backend(&self) -> &LocalBackend {
         self.base.backend()
+    }
+
+    pub(super) fn backend_handle(&self) -> Arc<dyn carina_state::StateBackend> {
+        self.base.backend_handle()
+    }
+
+    pub(super) fn lock_loss_backend_handle(&self) -> Arc<LockLossBackend> {
+        self.base.lock_loss_backend_handle()
     }
 
     pub(super) fn observer_factory(&self) -> impl Fn(&Plan) -> Box<dyn ExecutionObserver> + '_ {

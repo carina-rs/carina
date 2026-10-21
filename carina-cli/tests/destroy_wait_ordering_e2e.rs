@@ -227,6 +227,23 @@ let lst = mock.test.resource {{
             .expect("failed to execute carina destroy")
     }
 
+    fn destroy_with_timed_out_dependency(&self) -> Output {
+        carina(&self.project)
+            .args([
+                "destroy",
+                "--auto-approve",
+                ".",
+                "--lock=false",
+                "--parallelism",
+                "8",
+            ])
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
+            .env("CARINA_MOCK_DELETE_LOG", &self.delete_log_path)
+            .env("CARINA_MOCK_DELETE_TIMEOUT_FOR", "test.resource.lst")
+            .output()
+            .expect("failed to execute carina destroy")
+    }
+
     fn delete_log(&self) -> Vec<String> {
         fs::read_to_string(&self.delete_log_path)
             .unwrap()
@@ -320,6 +337,32 @@ fn destroy_wait_ordering_deletes_dependent_before_wait_target() {
     assert!(
         lst_pos < cert_pos,
         "destroy must delete lst before cert when lst depends on wait binding cert_issued; delete log: {delete_log:?}"
+    );
+}
+
+#[test]
+fn destroy_timeout_fails_and_skips_dependency_as_dependent_failed() {
+    let scenario = Scenario::new();
+    scenario.write_config();
+    scenario.init();
+    scenario.seed_carina_state();
+    scenario.seed_mock_provider_state();
+
+    let output = scenario.destroy_with_timed_out_dependency();
+    assert_failure("carina destroy", &output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Operation timed out"),
+        "timed-out delete should be reported as a failure; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("skipped (dependent lst failed)"),
+        "the timed-out resource's dependency should be skipped; stderr:\n{stderr}"
+    );
+    assert!(
+        !scenario.delete_log_path.exists(),
+        "neither the timed-out delete nor its skipped dependency should be logged"
     );
 }
 

@@ -170,7 +170,7 @@ impl S3Backend {
                     .await
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 let bytes = body.into_bytes();
-                let lock: LockInfo = serde_json::from_slice(&bytes)
+                let lock = LockInfo::from_json_slice(&bytes)
                     .map_err(|e| BackendError::Serialization(e.to_string()))?;
                 Ok(Some((lock, etag)))
             }
@@ -219,7 +219,7 @@ impl S3Backend {
                         .collect()
                         .await
                         .map_err(|e| BackendError::Io(e.to_string()))?;
-                    let lock = serde_json::from_slice(&body.into_bytes())
+                    let lock = LockInfo::from_json_slice(&body.into_bytes())
                         .map_err(|e| BackendError::Serialization(e.to_string()))?;
                     Ok(Some((lock, etag)))
                 }
@@ -535,10 +535,11 @@ impl StateBackend for S3Backend {
             ));
         };
 
-        if existing_lock.id != lock.id {
+        if existing_lock.id() != lock.id() {
             return Err(BackendError::LockNotHeld(format!(
                 "lock {} was replaced by {}",
-                lock.id, existing_lock.id
+                lock.id(),
+                existing_lock.id()
             )));
         }
 
@@ -561,10 +562,11 @@ impl StateBackend for S3Backend {
             ));
         };
 
-        if existing_lock.id != lock.id {
+        if existing_lock.id() != lock.id() {
             return Err(BackendError::LockNotHeld(format!(
                 "lock {} was replaced by {}",
-                lock.id, existing_lock.id
+                lock.id(),
+                existing_lock.id()
             )));
         }
 
@@ -593,10 +595,11 @@ impl StateBackend for S3Backend {
             ));
         };
 
-        if existing_lock.id != lock.id {
+        if existing_lock.id() != lock.id() {
             return Err(BackendError::LockNotHeld(format!(
                 "lock {} was replaced by {}",
-                lock.id, existing_lock.id
+                lock.id(),
+                existing_lock.id()
             )));
         }
 
@@ -616,14 +619,14 @@ impl StateBackend for S3Backend {
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
         // Verify the lock exists and matches
         if let Some(existing_lock) = self.read_lock().await? {
-            if existing_lock.id != lock.id {
+            if existing_lock.id() != lock.id() {
                 return Err(BackendError::LockMismatch {
-                    expected: lock.id.clone(),
-                    actual: existing_lock.id,
+                    expected: lock.id().to_owned(),
+                    actual: existing_lock.id().to_owned(),
                 });
             }
         } else {
-            return Err(BackendError::LockNotFound(lock.id.clone()));
+            return Err(BackendError::LockNotFound(lock.id().to_owned()));
         }
 
         self.delete_lock().await
@@ -631,13 +634,13 @@ impl StateBackend for S3Backend {
 
     async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
         let Some((existing_lock, _etag)) = self.read_lock_with_etag_for_cleanup().await? else {
-            return Err(BackendError::LockNotFound(lock.id.clone()));
+            return Err(BackendError::LockNotFound(lock.id().to_owned()));
         };
 
-        if existing_lock.id != lock.id {
+        if existing_lock.id() != lock.id() {
             return Err(BackendError::LockMismatch {
-                expected: lock.id.clone(),
-                actual: existing_lock.id,
+                expected: lock.id().to_owned(),
+                actual: existing_lock.id().to_owned(),
             });
         }
 
@@ -647,10 +650,10 @@ impl StateBackend for S3Backend {
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
         // Verify a lock exists
         if let Some(existing_lock) = self.read_lock().await? {
-            if existing_lock.id != lock_id {
+            if existing_lock.id() != lock_id {
                 return Err(BackendError::LockMismatch {
                     expected: lock_id.to_string(),
-                    actual: existing_lock.id,
+                    actual: existing_lock.id().to_owned(),
                 });
             }
         } else {

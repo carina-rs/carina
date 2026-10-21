@@ -25,10 +25,12 @@ use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
 use carina_core::value::format_value;
+#[cfg(test)]
+use carina_state::LockInfo;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LockInfo,
-    ResourceState, StateBackend, StateFile, StateUrl, create_backend, create_remote_backend,
-    load_state_from_url, resolve_backend_for_read,
+    BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, ResourceState,
+    StateBackend, StateFile, StateUrl, create_backend, create_remote_backend, load_state_from_url,
+    resolve_backend_for_read,
 };
 
 use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
@@ -37,6 +39,7 @@ use crate::commands::plan::{
     load_and_resolve_provider_configs,
 };
 use crate::commands::shared::finalize::release_lock_after_execute;
+use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
@@ -1017,14 +1020,14 @@ pub async fn run_state_refresh(
         .map_err(AppError::Backend)?;
 
     // Acquire lock (unless --lock=false)
-    let lock_info: Option<LockInfo> = if lock {
+    let state_lock = if lock {
         println!("{}", "Acquiring state lock...".cyan());
         let li = backend
             .acquire_lock("refresh")
             .await
             .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
-        Some(li)
+        StateLock::held(li)
     } else {
         println!(
             "{}",
@@ -1032,38 +1035,35 @@ pub async fn run_state_refresh(
                 .yellow()
                 .bold()
         );
-        None
+        StateLock::disabled_by_cli_flag()
     };
 
     let op_result = run_state_refresh_locked(
         &mut parsed,
         backend.as_ref(),
-        lock_info.as_ref(),
+        state_lock.as_ref(),
         base_dir,
         provider_context,
         cancel.clone(),
     )
     .await;
 
-    // Always release lock if it was acquired
-    if let Some(ref li) = lock_info {
-        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
-
-        if release_result.is_ok() && matches!(op_result, Err(AppError::Interrupted)) {
-            println!("  {} Lock released", "✓".green());
-        }
-
-        op_result?;
-        release_result
-    } else {
-        op_result
+    let release_result =
+        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
+    if state_lock.is_held()
+        && release_result.is_ok()
+        && matches!(op_result, Err(AppError::Interrupted))
+    {
+        println!("  {} Lock released", "✓".green());
     }
+    op_result?;
+    release_result
 }
 
 pub(crate) async fn run_state_refresh_locked(
     parsed: &mut carina_core::parser::InferredFile,
     backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    lock: StateLockRef<'_>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
@@ -1088,7 +1088,7 @@ pub(crate) async fn run_state_refresh_locked(
 async fn run_state_refresh_locked_with_ctx(
     parsed: &mut carina_core::parser::InferredFile,
     backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    lock: StateLockRef<'_>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
@@ -1482,10 +1482,13 @@ async fn run_state_refresh_locked_with_ctx(
     };
 
     // Save state (with or without lock validation)
-    if let Some(lock) = lock {
-        crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
-    } else {
-        crate::commands::apply::save_state_unlocked(backend, &mut state).await?;
+    match lock {
+        StateLockRef::Held(lock) => {
+            crate::commands::apply::save_state_locked(backend, lock, &mut state).await?
+        }
+        StateLockRef::Disabled(disabled) => {
+            crate::commands::apply::save_state_unlocked(backend, disabled, &mut state).await?
+        }
     }
 
     // Summary
@@ -2157,7 +2160,7 @@ mod tests {
         }
 
         async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
-            Ok(LockInfo::new(operation))
+            Ok(LockInfo::for_test(operation))
         }
 
         async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
@@ -2165,7 +2168,7 @@ mod tests {
         }
 
         async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
-            Ok(lock.renewed())
+            Ok(lock.renewed_for_test())
         }
 
         async fn write_state_locked(
@@ -2220,7 +2223,7 @@ mod tests {
         run_state_refresh_locked_with_ctx(
             &mut parsed,
             &backend,
-            None,
+            StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
@@ -2262,7 +2265,7 @@ mod tests {
         run_state_refresh_locked_with_ctx(
             &mut parsed,
             &backend,
-            None,
+            StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
@@ -2293,7 +2296,7 @@ mod tests {
         let error = match run_state_refresh_locked_with_ctx(
             &mut parsed,
             &backend,
-            None,
+            StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
@@ -2339,7 +2342,7 @@ mod tests {
         run_state_refresh_locked(
             &mut parsed,
             &backend,
-            None,
+            StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
@@ -2356,7 +2359,7 @@ mod tests {
         run_state_refresh_locked(
             &mut parsed,
             &backend,
-            None,
+            StateLock::disabled_for_test().as_ref(),
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
@@ -2373,7 +2376,7 @@ mod tests {
         run_state_refresh_locked(
             &mut parsed,
             &backend,
-            None,
+            StateLock::disabled_for_test().as_ref(),
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
@@ -2686,7 +2689,7 @@ mod tests {
         let error = run_state_refresh_locked_with_ctx(
             &mut parsed,
             &backend,
-            None,
+            StateLock::disabled_for_test().as_ref(),
             temp.path(),
             &ProviderContext::default(),
             ShutdownToken::running(),

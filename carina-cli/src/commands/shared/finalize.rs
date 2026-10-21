@@ -1,7 +1,19 @@
 use crate::error::AppError;
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
-use carina_state::{LockInfo, StateBackend};
+use carina_state::StateBackend;
+use colored::Colorize;
 use std::future::Future;
+
+use super::lock_heartbeat::{StateLock, StateLockRef};
+
+/// Result of a command that consumed its heartbeat outcome.
+///
+/// Pre-heartbeat failures keep the lock so the command can release it. A
+/// heartbeat loss carries only the terminal command error.
+pub(crate) enum LockCommandOutcome<T> {
+    Kept { result: T, lock: StateLock },
+    Lost(AppError),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StatePersistence {
@@ -33,9 +45,12 @@ impl CleanupStageMode {
 
 pub(crate) async fn release_lock_after_execute(
     backend: &dyn StateBackend,
-    lock: &LockInfo,
+    lock: StateLockRef<'_>,
     shutdown: &ShutdownToken,
 ) -> Result<(), AppError> {
+    let StateLockRef::Held(lock) = lock else {
+        return Ok(());
+    };
     let release = match shutdown.phase() {
         ShutdownPhase::CleanupPriority | ShutdownPhase::Graceful => {
             backend.release_lock_for_cleanup(lock)
@@ -52,6 +67,30 @@ pub(crate) async fn release_lock_after_execute(
     )
     .await
     .map_err(AppError::Backend)
+}
+
+/// Finish a lock-owning command, releasing only when ownership survived.
+pub(crate) async fn finish_lock_command<T>(
+    backend: &dyn StateBackend,
+    outcome: LockCommandOutcome<Result<T, AppError>>,
+    shutdown: &ShutdownToken,
+) -> Result<T, AppError> {
+    let (result, lock) = match outcome {
+        LockCommandOutcome::Kept { result, lock } => (result, lock),
+        LockCommandOutcome::Lost(error) => return Err(error),
+    };
+
+    let release_result = release_lock_after_execute(backend, lock.as_ref(), shutdown).await;
+    if lock.is_held()
+        && release_result.is_ok()
+        && (result.is_ok() || matches!(result, Err(AppError::Interrupted)))
+    {
+        println!("  {} Lock released", "✓".green());
+    }
+
+    let value = result?;
+    release_result?;
+    Ok(value)
 }
 
 /// Handle state finalization after a mutating command has observed execution.
@@ -207,7 +246,7 @@ mod tests {
     use super::*;
     use carina_core::shutdown::CLEANUP_DEADLINE;
     use carina_core::shutdown::testing::shutdown_channel;
-    use carina_state::{BackendResult, LoadedState, StateFile};
+    use carina_state::{BackendResult, LoadedState, LockInfo, StateFile};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -229,7 +268,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn slow_bounded_cleanup_operations_finish_inside_the_hard_deadline() {
         let backend = LatencyBackend::new(Duration::from_millis(250));
-        let lock = LockInfo::new("apply");
+        let lock = LockInfo::for_test("apply");
         let mut state = StateFile::new();
         let (trigger, shutdown) = shutdown_channel();
         trigger.prioritize_cleanup();
@@ -247,7 +286,7 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&backend, &lock, &shutdown)
+            release_lock_after_execute(&backend, StateLockRef::Held(&lock), &shutdown)
                 .await
                 .unwrap();
         })
@@ -272,7 +311,7 @@ mod tests {
     async fn slow_state_flush_cannot_starve_cleanup_lock_release() {
         let backend =
             LatencyBackend::with_latencies(Duration::from_secs(5), Duration::from_millis(250));
-        let lock = LockInfo::new("destroy");
+        let lock = LockInfo::for_test("destroy");
         let mut state = StateFile::new();
         let (trigger, shutdown) = shutdown_channel();
         trigger.prioritize_cleanup();
@@ -290,7 +329,7 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&backend, &lock, &shutdown)
+            release_lock_after_execute(&backend, StateLockRef::Held(&lock), &shutdown)
                 .await
                 .unwrap();
         })
@@ -359,7 +398,7 @@ mod tests {
         }
 
         async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
-            Ok(LockInfo::new(operation))
+            Ok(LockInfo::for_test(operation))
         }
 
         async fn release_lock(&self, _lock: &LockInfo) -> BackendResult<()> {

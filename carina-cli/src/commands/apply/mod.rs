@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
@@ -44,7 +45,10 @@ use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
 use crate::commands::shared::finalize::{
-    StatePersistence, finalize_after_execute, release_lock_after_execute,
+    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
+};
+use crate::commands::shared::lock_heartbeat::{
+    HeartbeatOutcome, LockingDisabled, StateLock, StateLockRef, with_lock_heartbeat,
 };
 use crate::commands::shared::observer::CliObserver;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
@@ -722,8 +726,8 @@ pub async fn refresh_pending_states(
 
 /// Save state after apply. Does NOT release the lock -- caller is responsible.
 ///
-/// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
-/// validation via `save_state_unlocked`.
+/// When locking is explicitly disabled, state is written without lock
+/// validation via `save_state_unlocked` and its required witness.
 ///
 /// Returns the [`SkippedExports`] summary after state is saved. Callers must fold
 /// unresolved exports into the command's exit status (carina#3710).
@@ -781,10 +785,14 @@ pub(crate) async fn finalize_apply(
     // secondary concern, so an export error must not prevent durable resource
     // writeback. Save the resource state first, then return the original
     // export error to the caller.
-    if let Some(lock) = input.lock {
-        save_state_locked_after_execute(input.backend, lock, &mut state, persistence).await?;
-    } else {
-        save_state_unlocked_after_execute(input.backend, &mut state, persistence).await?;
+    match input.lock {
+        StateLockRef::Held(lock) => {
+            save_state_locked_after_execute(input.backend, lock, &mut state, persistence).await?;
+        }
+        StateLockRef::Disabled(disabled) => {
+            save_state_unlocked_after_execute(input.backend, disabled, &mut state, persistence)
+                .await?;
+        }
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
@@ -796,7 +804,7 @@ pub(crate) async fn finalize_apply(
 /// This ensures that the lock is still held before writing state, preventing
 /// silent state corruption when a lock has expired and been acquired by another
 /// process during a long-running operation.
-pub async fn save_state_locked(
+pub(crate) async fn save_state_locked(
     backend: &dyn StateBackend,
     lock: &LockInfo,
     state: &mut StateFile,
@@ -831,8 +839,9 @@ pub(crate) async fn save_state_locked_after_execute(
 ///
 /// Used when `--lock=false` is specified. Increments the serial number and
 /// writes using `write_state` (no lock check).
-pub async fn save_state_unlocked(
+pub(crate) async fn save_state_unlocked(
     backend: &dyn StateBackend,
+    _disabled: &LockingDisabled,
     state: &mut StateFile,
 ) -> Result<(), AppError> {
     state.increment_serial();
@@ -841,11 +850,12 @@ pub async fn save_state_unlocked(
 
 pub(crate) async fn save_state_unlocked_after_execute(
     backend: &dyn StateBackend,
+    disabled: &LockingDisabled,
     state: &mut StateFile,
     persistence: StatePersistence,
 ) -> Result<(), AppError> {
     match persistence {
-        StatePersistence::Normal => save_state_unlocked(backend, state).await,
+        StatePersistence::Normal => save_state_unlocked(backend, disabled, state).await,
         StatePersistence::CancellationCleanup => {
             state.increment_serial();
             backend
@@ -874,18 +884,19 @@ pub(crate) async fn save_state_unlocked_after_execute(
 /// version matches `StateFile::CURRENT_VERSION`, so subsequent
 /// `read_state` calls produce a pristine `LoadedState` and this
 /// helper is a no-op write-wise.
-pub async fn load_state_persist_if_migrated(
+pub(crate) async fn load_state_persist_if_migrated(
     backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    lock: StateLockRef<'_>,
 ) -> Result<Option<StateFile>, AppError> {
     match backend.read_state().await.map_err(AppError::Backend)? {
         None => Ok(None),
         Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
         Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
-            if let Some(lk) = lock {
-                save_state_locked(backend, lk, &mut state).await?;
-            } else {
-                save_state_unlocked(backend, &mut state).await?;
+            match lock {
+                StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
+                StateLockRef::Disabled(disabled) => {
+                    save_state_unlocked(backend, disabled, &mut state).await?
+                }
             }
             Ok(Some(state))
         }
@@ -907,7 +918,7 @@ pub async fn load_state_persist_if_migrated(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    lock: StateLockRef<'_>,
     state_file: Option<StateFile>,
     sorted_resources: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
@@ -934,10 +945,11 @@ pub(crate) async fn persist_exports_only(
     })?;
     let resolution = materialize_exports(&values)?;
     let skipped_exports = resolution.write_into(&mut state);
-    if let Some(lk) = lock {
-        save_state_locked(backend, lk, &mut state).await?;
-    } else {
-        save_state_unlocked(backend, &mut state).await?;
+    match lock {
+        StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
+        StateLockRef::Disabled(disabled) => {
+            save_state_unlocked(backend, disabled, &mut state).await?
+        }
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
     if skipped_exports.is_empty() {
@@ -1194,15 +1206,13 @@ async fn run_apply_with_observer_factory(
     let verified_backend = verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::Apply)?;
 
     // Check for backend configuration - use local backend by default
-    let backend: Box<dyn StateBackend> = verified_backend
+    let backend: Arc<dyn StateBackend> = verified_backend
         .resolve()
         .await
-        .map_err(AppError::Backend)?;
+        .map_err(AppError::Backend)?
+        .into();
 
     // Handle bootstrap if S3 backend is configured
-    #[allow(unused_assignments)]
-    let mut lock_info: Option<LockInfo> = None;
-
     let s3_bootstrap = verified_backend
         .s3_settings()
         .map(|settings| (settings.bucket().to_owned(), settings.auto_create()));
@@ -1363,15 +1373,14 @@ async fn run_apply_with_observer_factory(
     }
 
     // Acquire lock (unless --lock=false)
-    if lock {
+    let state_lock = if lock {
         println!("{}", "Acquiring state lock...".cyan());
-        lock_info = Some(
-            backend
-                .acquire_lock("apply")
-                .await
-                .map_err(|error| map_lock_error(error, path))?,
-        );
+        let acquired = backend
+            .acquire_lock("apply")
+            .await
+            .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
+        StateLock::held(acquired)
     } else {
         println!(
             "{}",
@@ -1379,17 +1388,19 @@ async fn run_apply_with_observer_factory(
                 .yellow()
                 .bold()
         );
-    }
+        StateLock::disabled_by_cli_flag()
+    };
 
-    // All code after lock acquisition observes the shared cancellation token
-    // so lock release is guaranteed after SIGINT/SIGTERM cancellation.
-    let op_result = run_apply_locked(
+    // All code after lock acquisition observes the shared cancellation token.
+    // A lock that survives execution is released after cancellation; proven
+    // heartbeat loss returns without a capability that could be released.
+    let outcome = run_apply_locked_owned(
         &ctx,
         &mut parsed,
         &unresolved_parsed,
         auto_approve,
-        backend.as_ref(),
-        lock_info.as_ref(),
+        Arc::clone(&backend),
+        state_lock,
         path,
         provider_context,
         cancel.clone(),
@@ -1398,26 +1409,9 @@ async fn run_apply_with_observer_factory(
         accept_legacy_name_overrides,
     )
     .await;
-
-    // Always release lock if it was acquired
-    if let Some(ref li) = lock_info {
-        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
-
-        if release_result.is_ok()
-            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-        {
-            println!("  {} Lock released", "✓".green());
-        }
-
-        let timing = op_result?;
-        release_result?;
-        if let Some(elapsed) = timing {
-            println!("{}", format_total_apply_line(elapsed));
-        }
-    } else {
-        if let Some(timing) = op_result? {
-            println!("{}", format_total_apply_line(timing));
-        }
+    let timing = finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
+    if let Some(elapsed) = timing {
+        println!("{}", format_total_apply_line(elapsed));
     }
 
     Ok(())
@@ -1480,14 +1474,958 @@ async fn create_state_bucket_bootstrap_provider(
     Ok((provider, normalizer))
 }
 
+type CheckedApplyExports =
+    carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>;
+
+enum SourceApplyAfterHeartbeat {
+    Done(Option<Duration>),
+    PersistExports(Box<SourceApplyPersistExports>),
+    Executed(Box<SourceApplyExecuted>),
+}
+
+struct SourceApplyPersistExports {
+    state_file: Option<StateFile>,
+    resources: Vec<Resource>,
+    data_sources: Vec<DataSource>,
+    compositions: Vec<carina_core::resource::Composition>,
+    checked_exports: CheckedApplyExports,
+    wait_aliases: Vec<WaitAliasSpec>,
+    current_states: HashMap<ResourceId, State>,
+}
+
+struct SourceApplyExecuted {
+    result: ExecutionResult,
+    cancelled: bool,
+    resources_finished: Instant,
+    apply_phase_started: Instant,
+    state_file: Option<StateFile>,
+    resolved_resources: Vec<ResolvedResource>,
+    data_sources: Vec<DataSource>,
+    current_states: HashMap<ResourceId, State>,
+    plan: Plan,
+    checked_exports: CheckedApplyExports,
+    wait_aliases: Vec<WaitAliasSpec>,
+    pre_resolve_compositions: Vec<carina_core::resource::Composition>,
+    cancel: ShutdownToken,
+}
+
+enum SavedPlanApplyAfterHeartbeat {
+    Done(Option<Duration>),
+    Executed(Box<SavedPlanApplyExecuted>),
+}
+
+struct SavedPlanApplyExecuted {
+    result: ExecutionResult,
+    cancelled: bool,
+    resources_finished: Instant,
+    apply_phase_started: Instant,
+    state_file: Option<StateFile>,
+    resolved_resources: Vec<ResolvedResource>,
+    current_states: HashMap<ResourceId, State>,
+    rehydrated_plan: RehydratedPlanFile,
+    wait_aliases: Vec<WaitAliasSpec>,
+    ctx: WiringContext,
+    cancel: ShutdownToken,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_locked_owned(
+    ctx: &WiringContext,
+    parsed: &mut carina_core::parser::InferredFile,
+    unresolved_parsed: &carina_core::parser::ParsedFile,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    lock: StateLock,
+    project_dir: &Path,
+    provider_context: &ProviderContext,
+    cancel: ShutdownToken,
+    observer_factory: &ObserverFactory<'_>,
+    parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
+) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
+    // Read current state from backend. carina#3315: if `check_and_migrate`
+    // lifted an older on-disk schema in memory, persist the upgrade
+    // under the current lock before any short-circuit path can return
+    // — otherwise the carina#3283 warning text ("Disk state will be
+    // rewritten during the next apply or state refresh of that project.")
+    // becomes a lie.
+    let mut state_file = match load_state_persist_if_migrated(backend.as_ref(), lock.as_ref()).await
+    {
+        Ok(state) => state,
+        Err(error) => {
+            return LockCommandOutcome::Kept {
+                result: Err(error),
+                lock,
+            };
+        }
+    };
+    let heartbeat_outcome =
+        with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
+            if let Some(state) = state_file.as_ref() {
+                check_legacy_name_overrides(
+                    state,
+                    accept_legacy_name_overrides,
+                    ApplyTarget::Project(project_dir),
+                )?;
+            }
+
+            reconcile_prefixed_names(&mut parsed.resources, &state_file);
+            let crate::wiring::StateBlockResolution {
+                claims: state_block_claims,
+                targets: resolved_state_block_targets,
+            } = crate::wiring::resolve_state_blocks(
+                &parsed.state_blocks,
+                &state_file,
+                &parsed.resources,
+                ctx.schemas(),
+            );
+            if let Some(sf) = state_file.as_ref() {
+                carina_core::module_resolver::reconcile_anonymous_module_instances(
+                    &mut parsed.resources,
+                    &mut parsed.compositions,
+                    &|provider, resource_type| {
+                        sf.resources_by_type(provider, resource_type)
+                            .into_iter()
+                            .map(|r| r.identity.to_string())
+                            .collect()
+                    },
+                    &state_block_claims,
+                );
+            }
+            if let Some(sf) = state_file.as_mut() {
+                reconcile_anonymous_identifiers_with_ctx(
+                    ctx,
+                    &mut parsed.resources,
+                    sf,
+                    &state_block_claims,
+                )?;
+            }
+            let provider_inputs =
+                load_apply_provider_inputs(parsed, project_dir, provider_context).await?;
+            let provider_configs = provider_inputs.configs();
+            let raw_provider_configs = provider_configs.as_provider_configs();
+            let remote_bindings = provider_inputs.remote_bindings();
+            // Select appropriate Provider based on configuration
+            let provider = get_provider_with_ctx(ctx, provider_configs, project_dir).await?;
+
+            // carina#3132: `sorted_resources` is `mut` because deferred-for
+            // expansion now runs post-refresh (after phase-2, below) via the
+            // shared `expand_same_config_deferred_for` and re-sorts the
+            // augmented set in place — same timing/view as the plan path so
+            // plan and apply cannot diverge on same-config read iterables.
+            // Until then it is the pre-expansion set; the loop's iterable
+            // source (e.g. `let cert`) is a normal top-level resource already
+            // here and refreshed by phase 1, only the loop's generated children
+            // are added later.
+            // carina#3181: `parsed.resources` is managed-only and
+            // `parsed.data_sources` holds the `read`-keyword resources. Only
+            // managed resources are dependency-sorted; data sources are
+            // refreshed in a later phase against the populated `current_states`.
+            let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+            let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
+
+            // Build state-file-derived maps up front so anonymous → let-bound
+            // rename transfer (#1685) can run between refresh phases 1 and 2.
+
+            // awscc#251: lift pre-Enum-migration state (`ConcreteValue::
+            // String` at a now-`Enum` position) before the differ /
+            // `hydrate_read_state` consume it, so apply does not diff lifted
+            // desired against un-lifted saved state. Same seam as the plan path.
+            let mut saved_attrs = state_file
+                .as_ref()
+                .map(|sf| sf.build_saved_attrs())
+                .unwrap_or_default()
+                .lift(ctx.schemas());
+            let mut prev_explicit = state_file
+                .as_ref()
+                .map(|sf| sf.build_explicit())
+                .unwrap_or_default();
+
+            // Read states for all resources using identifier from state
+            // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
+            // Skip composition resources (module attribute containers) — they have no infrastructure.
+            RefreshProgress::start_header();
+            let multi = refresh_multi_progress();
+            let provider_ref = &provider;
+            let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+            // Pre-build dependency_bindings from state file so we can restore them
+            // after refresh. Provider.read() doesn't know about this metadata (#1565).
+            let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
+                .as_ref()
+                .map(|sf| {
+                    sorted_resources
+                        .iter()
+                        .filter_map(|r| {
+                            let identity = r.id.identity_str()?;
+                            let rs =
+                                sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
+                            if rs.dependency_bindings.is_empty() {
+                                None
+                            } else {
+                                Some((r.id.clone(), rs.dependency_bindings.clone()))
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Phase 1: refresh managed resources in parallel. carina#3181:
+            // `sorted_resources` is managed-only — data sources are refreshed in
+            // phase 2 below.
+            let phase1_results: Vec<Result<(ResourceId, State), AppError>> =
+                stream::iter(sorted_resources.iter())
+                    .map(|resource| {
+                        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                        let identifier = state_file
+                            .as_ref()
+                            .and_then(|sf| sf.get_identifier_for_resource(resource));
+                        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                        async move {
+                            let mut state =
+                                read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                                    .await
+                                    .map_err(AppError::Provider)?;
+                            if let Some(deps) = dep_bindings {
+                                state.dependency_bindings = deps;
+                            }
+                            progress.finish();
+                            Ok((resource.id.clone(), state))
+                        }
+                    })
+                    .buffer_unordered(5)
+                    .collect()
+                    .await;
+            for result in phase1_results {
+                let (id, state) = result?;
+                current_states.insert(id, state);
+            }
+
+            // Refresh orphaned resources (#844, #1685). Must run before the
+            // rename transfer below so old-name entries are present for
+            // `apply_anonymous_to_named_renames` to transfer.
+            let mut orphans = Orphans::new();
+            // Ids the orphan pass already live-read this run. A for-loop child
+            // applied previously is in state but not yet a desired resource at
+            // orphan time (expansion is post-refresh); the orphan pass live-reads
+            // it under the same state name the child resolves to.
+            // `expand_same_config_deferred_for` excludes these from the
+            // post-expansion child refresh so the same address is not read twice
+            // (carina#3145). Mirrors the plan path in `wiring/mod.rs`.
+            let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
+            if let Some(sf) = state_file.as_ref() {
+                let desired_ids: HashSet<ResourceId> =
+                    sorted_resources.iter().map(|r| r.id.clone()).collect();
+                orphans = sf.build_orphans(&desired_ids);
+                let orphan_results: Vec<
+                    Result<(ResourceId, carina_core::differ::Orphan), AppError>,
+                > = stream::iter(std::mem::take(&mut orphans))
+                    .map(|(id, orphan)| async move {
+                        let refreshed = read_with_retry(
+                            provider_ref,
+                            &id,
+                            orphan.state().identifier.as_deref(),
+                        )
+                        .await
+                        .map_err(AppError::Provider)?;
+                        Ok((id, orphan.with_refreshed_state(refreshed)))
+                    })
+                    .buffer_unordered(5)
+                    .collect()
+                    .await;
+                for result in orphan_results {
+                    let (id, orphan) = result?;
+                    if orphan.state().exists {
+                        orphan_refreshed_ids.insert(id.clone());
+                    }
+                    orphans.insert(orphan);
+                }
+            }
+
+            // Hydrate, transfer state for moved blocks and anonymous → let-bound
+            // renames (#1685), then run phase 2 against the consolidated state.
+            crate::wiring::hydrate_prior_states(
+                &mut current_states,
+                &mut orphans,
+                &provider,
+                &saved_attrs,
+                state_file.as_ref(),
+            )
+            .await?;
+            let moved_pairs = {
+                let mut pairs = crate::wiring::materialize_moved_states(
+                    &mut current_states,
+                    &mut orphans,
+                    &mut prev_explicit,
+                    &mut saved_attrs,
+                    &parsed.state_blocks,
+                    &state_file,
+                );
+                pairs.extend(crate::wiring::apply_anonymous_to_named_renames(
+                    ctx,
+                    &sorted_resources,
+                    raw_provider_configs,
+                    &mut current_states,
+                    &mut orphans,
+                    &mut prev_explicit,
+                    &mut saved_attrs,
+                    &state_file,
+                    &state_block_claims,
+                )?);
+                pairs
+            };
+            // Wait bindings become passthrough aliases to their targets
+            // (carina#3085). Built once here so every resolution phase below
+            // (data-source refresh, initial bindings, ref resolution, exports)
+            // applies the same passthrough.
+            let wait_aliases: Vec<WaitAliasSpec> = parsed
+                .wait_bindings
+                .iter()
+                .map(WaitAliasSpec::from)
+                .collect();
+
+            // Phase 2: resolve data source inputs against the consolidated state
+            // and refresh them via `read_data_source` (#1683, #1685).
+            let data_source_bindings = data_source_refresh_bindings(
+                &sorted_resources,
+                &parsed.compositions,
+                &data_sources,
+                &current_states,
+                remote_bindings,
+                ctx.schemas(),
+                &wait_aliases,
+            );
+            let module_gate =
+                carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+            let data_source_refreshes = resolve_data_source_refs_for_refresh(
+                &sorted_resources,
+                &parsed.compositions,
+                &data_sources,
+                &current_states,
+                remote_bindings,
+                ctx.schemas(),
+                &wait_aliases,
+            )?;
+            let mut deferred_data_source_reads = DeferredDataSourceReads::none();
+            let mut resolved_data_sources = Vec::new();
+            for resolution in data_source_refreshes {
+                match resolution {
+                    DataSourceRefreshResolution::Resolved(resource) => {
+                        resolved_data_sources.push(resource);
+                    }
+                    DataSourceRefreshResolution::DeferredToApply {
+                        resource,
+                        unresolved,
+                    } => {
+                        deferred_data_source_reads.insert(resource.id.clone(), unresolved);
+                    }
+                }
+            }
+            let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
+                stream::iter(resolved_data_sources.iter())
+                    .map(|resource| {
+                        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                        let data_source_bindings = &data_source_bindings;
+                        let module_gate = &module_gate;
+                        async move {
+                            let mut state = read_data_source_with_retry(
+                                provider_ref,
+                                resource,
+                                data_source_bindings,
+                                module_gate,
+                                ctx.factories(),
+                                ctx.schemas(),
+                            )
+                            .await?;
+                            if let Some(deps) = dep_bindings {
+                                state.dependency_bindings = deps;
+                            }
+                            progress.finish();
+                            Ok((resource.id.clone(), state))
+                        }
+                    })
+                    .buffer_unordered(5)
+                    .collect()
+                    .await;
+            for result in phase2_results {
+                let (id, state) = result?;
+                current_states.insert(id, state);
+            }
+
+            // carina#3132: expand same-config deferred-for loops post-refresh
+            // via the *same* `expand_same_config_deferred_for` the plan path
+            // calls (one resolution timing; plan/apply parity). Then
+            // targeted-refresh the materialized children through the same
+            // `refresh_resource_set` helper phase 1 used, so a re-apply after
+            // they were created sees their live state instead of a phantom
+            // Create. The #1844 sort constraint (expanded resources must be in
+            // the sorted/refreshed/diffed set) is honored by the re-sort
+            // inside `expand_same_config_deferred_for`.
+            //
+            // carina#3278: the expand → child-refresh → hydrate(2nd) → lift
+            // quartet runs through `expand_refresh_and_lift_states` so the
+            // apply and refresh paths cannot diverge on these phases. The
+            // constructor is the only way to obtain an `ExpandedRefreshState`
+            // — leaving a phase out becomes a compile error.
+            let moved_targets: HashSet<ResourceId> = moved_pairs
+                .iter()
+                .map(|(_, to)| to.as_inner().clone())
+                .collect();
+            let crate::wiring::ExpandedRefreshState {
+                sorted_resources: resorted,
+                residual_deferred_for,
+                deferred_create_targets,
+                new_child_ids: _,
+                refreshable_child_ids: _,
+                // `printed_warnings` drives the plan path's spinner-bar-region
+                // close (#3150); the apply path's post-refresh bar handling is
+                // tracked separately in #3151 and does not consume it here.
+                printed_warnings: _,
+            } = crate::wiring::expand_refresh_and_lift_states(
+                crate::wiring::ExpandRefreshAndLiftInputs {
+                    parsed,
+                    provider: &provider,
+                    sorted_resources: &sorted_resources,
+                    current_states: &mut current_states,
+                    orphans: &mut orphans,
+                    remote_bindings,
+                    wait_aliases: &wait_aliases,
+                    moved_targets: &moved_targets,
+                    already_refreshed: &orphan_refreshed_ids,
+                    state_file: &state_file,
+                    saved_dep_bindings: &HashMap::new(),
+                    saved_attrs: &saved_attrs,
+                    multi: &multi,
+                    schemas: ctx.schemas(),
+                },
+            )
+            .await?;
+            sorted_resources = resorted;
+            // Expansion borrows `parsed` immutably (expands a clone), so
+            // `parsed.deferred_for_expressions` is NOT drained of resolved
+            // loops the way the old `&mut self` call drained it. `print_plan`
+            // must therefore receive this *residual* (still-unresolvable) list,
+            // not `parsed.deferred_for_expressions` — otherwise a resolved loop
+            // renders as both its materialized children AND a phantom
+            // "deferred" entry. Mirrors the plan path's `ctx.residual_deferred_for`
+            // (`commands/plan.rs`).
+
+            // Data-source lifting stays inline: it operates on
+            // `parsed.data_sources` (not `sorted_resources`), so it is
+            // independent of the deferred-for expansion sequence the helper
+            // above pins.
+            carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
+                &mut current_states,
+                &data_sources,
+                ctx.schemas(),
+            );
+
+            // Snapshot each composition resource's *pre-resolve* attributes
+            // (still carrying `ResourceRef`s) before the head-of-pipeline
+            // resolver call below replaces them with pre-apply concrete
+            // values. `finalize_apply`'s export resolution needs this
+            // snapshot to re-resolve compositions against the post-apply state —
+            // see #3169 / #3177. Without it, every composition ref is frozen at
+            // the pre-apply value and `state.exports` captures stale data
+            // after any Replace on a referenced managed resource.
+            // carina#3181: composition resources live in `parsed.compositions`
+            // as their own typed slice.
+            let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
+                parsed.compositions.clone();
+
+            let pre_apply_input_states = carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                ctx.schemas(),
+                &sorted_resources,
+            );
+            let mut override_aware_resources = OverrideAwareResources::build(
+                sorted_resources,
+                state_file.as_ref(),
+                carina_core::binding_index::PreApplyInputs {
+                    managed: &[],
+                    compositions: &pre_resolve_compositions,
+                    data_sources: &data_sources,
+                    current_states: &pre_apply_input_states,
+                    remote_bindings,
+                    wait_aliases: &wait_aliases,
+                },
+            )?;
+            crate::legacy_name_overrides::emit_legacy_override_warnings(
+                &override_aware_resources,
+                state_file.as_ref(),
+            );
+            let unresolved_override_aware_resources = OverrideAwareResources::build(
+                unresolved_parsed.resources.clone(), // allow: direct — parser-internal, pre-expansion
+                state_file.as_ref(),
+                carina_core::binding_index::PreApplyInputs {
+                    managed: &[],
+                    compositions: &pre_resolve_compositions,
+                    data_sources: &data_sources,
+                    current_states: &pre_apply_input_states,
+                    remote_bindings,
+                    wait_aliases: &wait_aliases,
+                },
+            )?;
+            // Resolve and canonicalize only refresh-time data sources. Deferred
+            // reads keep their original input refs so the plan/executor dependency
+            // graph still contains the upstream create edge.
+            let deferred_data_source_ids: HashSet<ResourceId> = data_sources
+                .iter()
+                .filter(|resource| deferred_data_source_reads.contains(&resource.id))
+                .map(|resource| resource.id.clone())
+                .collect();
+            let mut data_sources_for_plan = prepare_data_sources_for_plan(
+                &data_sources,
+                &deferred_data_source_ids,
+                override_aware_resources.bindings(),
+                None,
+            )?;
+            let constraint_origin_resources = override_aware_resources
+                .paired_unresolved_resources_with_binding_sources(
+                    &unresolved_override_aware_resources,
+                );
+            // Run the normalization pipeline (same as plan path in wiring.rs).
+            // `create_plan` resolves typed wait RHS values against target schemas.
+            let wait_bindings = parsed.wait_bindings.clone();
+            let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
+            let preparation = preprocessor
+                .prepare(
+                    &mut override_aware_resources,
+                    &constraint_origin_resources,
+                    &module_gate,
+                    &mut current_states,
+                    &mut orphans,
+                    raw_provider_configs,
+                    &mut data_sources_for_plan,
+                    &data_sources,
+                )
+                .await;
+            if let Err(error) = preparation {
+                let errors = match error {
+                    crate::wiring::PlanPreparationError::Plan(errors) => errors,
+                    crate::wiring::PlanPreparationError::Provider(error) => {
+                        return Err(AppError::Provider(error));
+                    }
+                };
+                let mut plan = Plan::new();
+                for error in errors {
+                    plan.add_error(error);
+                }
+                render_plan_errors_and_abort(&plan)?;
+                unreachable!("render_plan_errors_and_abort returns an error for an invalid plan");
+            }
+            let resolved_desired_ids = reconcile_late_anonymous_identities(
+                ctx,
+                LateAnonymousIdentityInputs {
+                    resources: &mut override_aware_resources,
+                    state_file: state_file.as_ref(),
+                    state_block_claims: &state_block_claims,
+                    providers: raw_provider_configs,
+                },
+            )?;
+            crate::wiring::validate_plan_time_state_block_collisions(
+                &resolved_desired_ids,
+                &moved_pairs,
+                &resolved_state_block_targets,
+                &state_file,
+            )?;
+            let reconciled_provider_states = provider_states_for(
+                &current_states,
+                &orphans,
+                override_aware_resources.resources(),
+            );
+            let reconciled_input_states = carina_core::resource::into_plan_input_map(
+                reconciled_provider_states,
+                ctx.schemas(),
+                override_aware_resources.resources(),
+            );
+            override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+                RebuildBindingsInputs {
+                    compositions: &pre_resolve_compositions,
+                    data_sources: &data_sources,
+                    current_states: &reconciled_input_states,
+                    remote_bindings,
+                    wait_aliases: &wait_aliases,
+                },
+            );
+            let paired_unresolved_resources = override_aware_resources
+                .paired_unresolved_resources_with_binding_sources(
+                    &unresolved_override_aware_resources,
+                );
+            let resolved_resources = ResolvedResource::collect_resolved(
+                override_aware_resources.resources().iter().cloned(),
+            )?;
+            let resolved_unresolved_resources =
+                ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
+            let plan_input_states = carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                ctx.schemas(),
+                override_aware_resources.resources(),
+            );
+            let directives_map = state_file
+                .as_ref()
+                .map(|sf| sf.build_directives())
+                .unwrap_or_default();
+            let schemas = ctx.schemas();
+            let mut plan = create_plan_with_cascades(
+                &resolved_resources,
+                &resolved_unresolved_resources,
+                &data_sources_for_plan,
+                &provider,
+                PlanPriorStates::new(&plan_input_states, &orphans),
+                &directives_map,
+                schemas,
+                &saved_attrs,
+                &prev_explicit,
+                &wait_bindings,
+            )?;
+            crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
+            block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
+
+            // Add state block effects (import/removed/moved) to the plan.
+            // carina#3329: resolve `import { id = "${…}|…" }` interpolations
+            // against the same binding view the resource-attribute resolver
+            // uses. The empty `unresolved_upstream_bindings` set here just
+            // skips the plan-time "stamp upstream refs as
+            // `(known after upstream apply: …)`" pass — apply does not need
+            // that display marker. The hard-fail on a still-deferred
+            // identifier is enforced one layer down in
+            // `execute_import_effects` via [`carina_core::effect::resolve_import_identifier`],
+            // which rejects any non-Concrete `Value` before it can reach the
+            // provider's `read()`.
+            let no_unresolved_upstreams: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            crate::wiring::add_state_block_effects(
+                &mut plan,
+                &parsed.state_blocks,
+                &state_file,
+                &moved_pairs,
+                override_aware_resources.resources(),
+                override_aware_resources.bindings(),
+                &no_unresolved_upstreams,
+            );
+            crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
+            current_states = into_all_prior_states(orphans, current_states);
+
+            let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+                .iter()
+                .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
+                .collect();
+
+            render_plan_errors_and_abort(&plan)?;
+
+            if can_use_export_only_fast_path(&plan, &deferred_data_source_reads) {
+                // No mutating effects — the plan only holds `Read` (data-source
+                // reads) or `Wait` effects, or is entirely empty. Either way no
+                // resource apply pipeline needs to run; route through the
+                // export-only fast path. Without this, a plan whose only
+                // difference from state is an export expression that reads a
+                // data source (a `Read` effect lands in the plan, but no
+                // mutation does) silently falls through into the
+                // resource-apply pipeline and the `Persisting N export
+                // change(s) to state.` banner never prints (carina#3270).
+                finalize_module_constraints(
+                    &pre_resolve_compositions,
+                    override_aware_resources.bindings(),
+                )?;
+                let checked_exports_pre_apply =
+                    crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
+                        export_params: &parsed.export_params,
+                        resources: &paired_unresolved_resources,
+                        compositions: &parsed.compositions,
+                        data_sources: &parsed.data_sources,
+                        current_states: &current_states,
+                        state_file: state_file.as_ref(),
+                        plan: &plan,
+                        schemas: ctx.schemas(),
+                        wait_aliases: &wait_aliases,
+                        provider_context,
+                    })
+                    .map_err(AppError::Validation)?;
+                let empty_exports = HashMap::new();
+                let current_exports = state_file
+                    .as_ref()
+                    .map(|s| &s.exports)
+                    .unwrap_or(&empty_exports);
+                let export_changes = crate::commands::plan::compute_export_diffs(
+                    &checked_exports_pre_apply,
+                    current_exports,
+                );
+
+                if export_changes.is_empty() {
+                    println!("{}", "No changes needed.".green());
+                    return Ok(SourceApplyAfterHeartbeat::Done(None));
+                }
+
+                let historical_display =
+                    carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+                print_plan(
+                    &plan,
+                    DetailLevel::Full,
+                    &historical_display,
+                    Some(ctx.schemas()),
+                    &HashMap::new(),
+                    &export_changes,
+                    &residual_deferred_for,
+                    None,
+                    None,
+                );
+
+                let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+                if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+                    == ApplyConfirmation::Cancelled
+                {
+                    return Ok(SourceApplyAfterHeartbeat::Done(None));
+                }
+
+                println!(
+                    "{}",
+                    format!(
+                        "Persisting {} export change(s) to state.",
+                        export_changes.len()
+                    )
+                    .cyan()
+                );
+                // No-op apply path: compositions were never resolved (no head-of-
+                // pipeline pass ran). carina#3181: compositions live in
+                // `parsed.compositions` and still carry the authored
+                // `ResourceRef` snapshots — the shape post-apply export resolution expects
+                // from the post-apply path.
+                let pre_resolve_compositions_noop: Vec<carina_core::resource::Composition> =
+                    parsed.compositions.clone();
+                return Ok(SourceApplyAfterHeartbeat::PersistExports(Box::new(
+                    SourceApplyPersistExports {
+                        state_file,
+                        resources: paired_unresolved_resources,
+                        data_sources,
+                        compositions: pre_resolve_compositions_noop,
+                        checked_exports: checked_exports_pre_apply,
+                        wait_aliases,
+                        current_states,
+                    },
+                )));
+            }
+
+            // Build display-safe historical attributes from current and persisted state.
+            let historical_display =
+                collect_historical_display_attributes(&plan, &current_states, state_file.as_ref());
+
+            let checked_exports_pre_apply =
+                crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
+                    export_params: &parsed.export_params,
+                    resources: &paired_unresolved_resources,
+                    compositions: &parsed.compositions,
+                    data_sources: &parsed.data_sources,
+                    current_states: &current_states,
+                    state_file: state_file.as_ref(),
+                    plan: &plan,
+                    schemas: ctx.schemas(),
+                    wait_aliases: &wait_aliases,
+                    provider_context,
+                })
+                .map_err(AppError::Validation)?;
+            let current_exports = state_file
+                .as_ref()
+                .map(|s| s.exports.clone())
+                .unwrap_or_default();
+            let export_changes = crate::commands::plan::compute_export_diffs(
+                &checked_exports_pre_apply,
+                &current_exports,
+            );
+            print_plan(
+                &plan,
+                DetailLevel::Full,
+                &historical_display,
+                Some(ctx.schemas()),
+                &moved_origins,
+                &export_changes,
+                &residual_deferred_for,
+                Some(&prev_explicit),
+                None,
+            );
+
+            let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+                == ApplyConfirmation::Cancelled
+            {
+                return Ok(SourceApplyAfterHeartbeat::Done(None));
+            }
+
+            let apply_phase_started = Instant::now();
+            println!("{}", "Applying changes...".cyan().bold());
+            println!();
+
+            // Build unresolved resource map for re-resolution at apply time
+            let unresolved_resources = override_aware_resources
+                .unresolved_by_resolved_id_with_binding_sources(
+                    &unresolved_override_aware_resources,
+                )?;
+            let mut bindings = override_aware_resources.bindings().clone();
+            // `provider` is a `ProviderRouter`, which impls both `Provider` and
+            // `ProviderNormalizer`; the same object is passed in both positions
+            // so apply re-normalizes with exactly the plan-time normalizer
+            // (carina#3060). They must stay the same object.
+            let observer = observer_factory(&plan);
+            let outcome = execute_effects_with_observer(
+                &plan,
+                &provider,
+                &provider,
+                raw_provider_configs,
+                ctx.factories(),
+                ctx.schemas(),
+                &mut bindings,
+                &mut current_states,
+                &unresolved_resources,
+                &data_sources,
+                &pre_resolve_compositions,
+                deferred_data_source_reads,
+                cancel.clone(),
+                parallelism,
+                observer,
+            )
+            .await;
+            let (mut result, cancelled) = split_execution_outcome(outcome);
+
+            // Execute import effects: read imported resources from the provider
+            execute_import_effects(&plan, &provider, &mut result, &cancel).await;
+
+            // Execute remove and move effects (state-only, logged for user feedback)
+            execute_state_only_effects(&plan, &mut result);
+            let resources_finished = Instant::now();
+
+            Ok(SourceApplyAfterHeartbeat::Executed(Box::new(
+                SourceApplyExecuted {
+                    result,
+                    cancelled,
+                    resources_finished,
+                    apply_phase_started,
+                    state_file,
+                    resolved_resources,
+                    data_sources: data_sources_for_plan,
+                    current_states,
+                    plan,
+                    checked_exports: checked_exports_pre_apply,
+                    wait_aliases,
+                    pre_resolve_compositions,
+                    cancel,
+                },
+            )))
+        })
+        .await;
+    let (heartbeat_result, lock) = match heartbeat_outcome {
+        HeartbeatOutcome::Kept { result, lock } => (result, lock),
+        HeartbeatOutcome::Lost {
+            result: _result,
+            lost,
+        } => {
+            return LockCommandOutcome::Lost(AppError::StateLockLost {
+                error: lost.into_error(),
+            });
+        }
+    };
+
+    let op_result = async {
+        match heartbeat_result? {
+            SourceApplyAfterHeartbeat::Done(result) => Ok(result),
+            SourceApplyAfterHeartbeat::PersistExports(context) => {
+                let SourceApplyPersistExports {
+                    state_file,
+                    resources,
+                    data_sources,
+                    compositions,
+                    checked_exports,
+                    wait_aliases,
+                    current_states,
+                } = *context;
+                persist_exports_only(
+                    backend.as_ref(),
+                    lock.as_ref(),
+                    state_file,
+                    &resources,
+                    &data_sources,
+                    &compositions,
+                    &checked_exports,
+                    ctx.schemas(),
+                    &wait_aliases,
+                    &current_states,
+                    provider_context,
+                )
+                .await?;
+                Ok(None)
+            }
+            SourceApplyAfterHeartbeat::Executed(context) => {
+                let SourceApplyExecuted {
+                    result,
+                    cancelled,
+                    resources_finished,
+                    apply_phase_started,
+                    state_file,
+                    resolved_resources,
+                    data_sources,
+                    current_states,
+                    plan,
+                    checked_exports,
+                    wait_aliases,
+                    pre_resolve_compositions,
+                    cancel,
+                } = *context;
+                // Use override-aware resources (post-default_tags merge, post-canonicalize)
+                // for state writeback so the per-resource `explicit` tree includes
+                // provider-level default tags. Otherwise the next plan projects the
+                // tags out of `current` and surfaces a spurious `tags: (none) → ...`
+                // diff (refs awscc#206).
+                let skipped_exports = finalize_after_execute(
+                    |persistence| {
+                        finalize_apply(
+                            FinalizeApplyInput {
+                                result: &result,
+                                state_file,
+                                sorted_resources: &resolved_resources,
+                                data_sources: &data_sources,
+                                current_states: &current_states,
+                                plan: &plan,
+                                backend: backend.as_ref(),
+                                lock: lock.as_ref(),
+                                schemas: ctx.schemas(),
+                                export_params: Some(&checked_exports),
+                                provider_context,
+                                wait_aliases: &wait_aliases,
+                                pre_resolve_compositions: &pre_resolve_compositions,
+                            },
+                            persistence,
+                            None,
+                        )
+                    },
+                    cancelled,
+                    &cancel,
+                )
+                .await?;
+
+                finish_apply(
+                    &result,
+                    skipped_exports,
+                    resources_finished.duration_since(apply_phase_started),
+                )
+            }
+        }
+    }
+    .await;
+
+    LockCommandOutcome::Kept {
+        result: op_result,
+        lock,
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_locked(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::InferredFile,
     unresolved_parsed: &carina_core::parser::ParsedFile,
     auto_approve: bool,
-    backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    backend: Arc<dyn StateBackend>,
+    lock: StateLock,
     project_dir: &Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
@@ -1495,765 +2433,22 @@ async fn run_apply_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
-    // Read current state from backend. carina#3315: if `check_and_migrate`
-    // lifted an older on-disk schema in memory, persist the upgrade
-    // under the current lock before any short-circuit path can return
-    // — otherwise the carina#3283 warning text ("Disk state will be
-    // rewritten during the next apply or state refresh of that project.")
-    // becomes a lie.
-    let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
-    if let Some(state) = state_file.as_ref() {
-        check_legacy_name_overrides(
-            state,
-            accept_legacy_name_overrides,
-            ApplyTarget::Project(project_dir),
-        )?;
-    }
-
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let crate::wiring::StateBlockResolution {
-        claims: state_block_claims,
-        targets: resolved_state_block_targets,
-    } = crate::wiring::resolve_state_blocks(
-        &parsed.state_blocks,
-        &state_file,
-        &parsed.resources,
-        ctx.schemas(),
-    );
-    if let Some(sf) = state_file.as_ref() {
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut parsed.resources,
-            &mut parsed.compositions,
-            &|provider, resource_type| {
-                sf.resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|r| r.identity.to_string())
-                    .collect()
-            },
-            &state_block_claims,
-        );
-    }
-    if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
-            ctx,
-            &mut parsed.resources,
-            sf,
-            &state_block_claims,
-        )?;
-    }
-    let provider_inputs = load_apply_provider_inputs(parsed, project_dir, provider_context).await?;
-    let provider_configs = provider_inputs.configs();
-    let raw_provider_configs = provider_configs.as_provider_configs();
-    let remote_bindings = provider_inputs.remote_bindings();
-    // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, provider_configs, project_dir).await?;
-
-    // carina#3132: `sorted_resources` is `mut` because deferred-for
-    // expansion now runs post-refresh (after phase-2, below) via the
-    // shared `expand_same_config_deferred_for` and re-sorts the
-    // augmented set in place — same timing/view as the plan path so
-    // plan and apply cannot diverge on same-config read iterables.
-    // Until then it is the pre-expansion set; the loop's iterable
-    // source (e.g. `let cert`) is a normal top-level resource already
-    // here and refreshed by phase 1, only the loop's generated children
-    // are added later.
-    // carina#3181: `parsed.resources` is managed-only and
-    // `parsed.data_sources` holds the `read`-keyword resources. Only
-    // managed resources are dependency-sorted; data sources are
-    // refreshed in a later phase against the populated `current_states`.
-    let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
-    let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
-
-    // Build state-file-derived maps up front so anonymous → let-bound
-    // rename transfer (#1685) can run between refresh phases 1 and 2.
-
-    // awscc#251: lift pre-Enum-migration state (`ConcreteValue::
-    // String` at a now-`Enum` position) before the differ /
-    // `hydrate_read_state` consume it, so apply does not diff lifted
-    // desired against un-lifted saved state. Same seam as the plan path.
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default()
-        .lift(ctx.schemas());
-    let mut prev_explicit = state_file
-        .as_ref()
-        .map(|sf| sf.build_explicit())
-        .unwrap_or_default();
-
-    // Read states for all resources using identifier from state
-    // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
-    // Skip composition resources (module attribute containers) — they have no infrastructure.
-    RefreshProgress::start_header();
-    let multi = refresh_multi_progress();
-    let provider_ref = &provider;
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    // Pre-build dependency_bindings from state file so we can restore them
-    // after refresh. Provider.read() doesn't know about this metadata (#1565).
-    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
-        .as_ref()
-        .map(|sf| {
-            sorted_resources
-                .iter()
-                .filter_map(|r| {
-                    let identity = r.id.identity_str()?;
-                    let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
-                    if rs.dependency_bindings.is_empty() {
-                        None
-                    } else {
-                        Some((r.id.clone(), rs.dependency_bindings.clone()))
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Phase 1: refresh managed resources in parallel. carina#3181:
-    // `sorted_resources` is managed-only — data sources are refreshed in
-    // phase 2 below.
-    let phase1_results: Vec<Result<(ResourceId, State), AppError>> =
-        stream::iter(sorted_resources.iter())
-            .map(|resource| {
-                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                let identifier = state_file
-                    .as_ref()
-                    .and_then(|sf| sf.get_identifier_for_resource(resource));
-                let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                async move {
-                    let mut state =
-                        read_with_retry(provider_ref, &resource.id, identifier.as_deref())
-                            .await
-                            .map_err(AppError::Provider)?;
-                    if let Some(deps) = dep_bindings {
-                        state.dependency_bindings = deps;
-                    }
-                    progress.finish();
-                    Ok((resource.id.clone(), state))
-                }
-            })
-            .buffer_unordered(5)
-            .collect()
-            .await;
-    for result in phase1_results {
-        let (id, state) = result?;
-        current_states.insert(id, state);
-    }
-
-    // Refresh orphaned resources (#844, #1685). Must run before the
-    // rename transfer below so old-name entries are present for
-    // `apply_anonymous_to_named_renames` to transfer.
-    let mut orphans = Orphans::new();
-    // Ids the orphan pass already live-read this run. A for-loop child
-    // applied previously is in state but not yet a desired resource at
-    // orphan time (expansion is post-refresh); the orphan pass live-reads
-    // it under the same state name the child resolves to.
-    // `expand_same_config_deferred_for` excludes these from the
-    // post-expansion child refresh so the same address is not read twice
-    // (carina#3145). Mirrors the plan path in `wiring/mod.rs`.
-    let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
-    if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> =
-            sorted_resources.iter().map(|r| r.id.clone()).collect();
-        orphans = sf.build_orphans(&desired_ids);
-        let orphan_results: Vec<Result<(ResourceId, carina_core::differ::Orphan), AppError>> =
-            stream::iter(std::mem::take(&mut orphans))
-                .map(|(id, orphan)| async move {
-                    let refreshed =
-                        read_with_retry(provider_ref, &id, orphan.state().identifier.as_deref())
-                            .await
-                            .map_err(AppError::Provider)?;
-                    Ok((id, orphan.with_refreshed_state(refreshed)))
-                })
-                .buffer_unordered(5)
-                .collect()
-                .await;
-        for result in orphan_results {
-            let (id, orphan) = result?;
-            if orphan.state().exists {
-                orphan_refreshed_ids.insert(id.clone());
-            }
-            orphans.insert(orphan);
-        }
-    }
-
-    // Hydrate, transfer state for moved blocks and anonymous → let-bound
-    // renames (#1685), then run phase 2 against the consolidated state.
-    crate::wiring::hydrate_prior_states(
-        &mut current_states,
-        &mut orphans,
-        &provider,
-        &saved_attrs,
-        state_file.as_ref(),
-    )
-    .await?;
-    let moved_pairs = {
-        let mut pairs = crate::wiring::materialize_moved_states(
-            &mut current_states,
-            &mut orphans,
-            &mut prev_explicit,
-            &mut saved_attrs,
-            &parsed.state_blocks,
-            &state_file,
-        );
-        pairs.extend(crate::wiring::apply_anonymous_to_named_renames(
-            ctx,
-            &sorted_resources,
-            raw_provider_configs,
-            &mut current_states,
-            &mut orphans,
-            &mut prev_explicit,
-            &mut saved_attrs,
-            &state_file,
-            &state_block_claims,
-        )?);
-        pairs
-    };
-    // Wait bindings become passthrough aliases to their targets
-    // (carina#3085). Built once here so every resolution phase below
-    // (data-source refresh, initial bindings, ref resolution, exports)
-    // applies the same passthrough.
-    let wait_aliases: Vec<WaitAliasSpec> = parsed
-        .wait_bindings
-        .iter()
-        .map(WaitAliasSpec::from)
-        .collect();
-
-    // Phase 2: resolve data source inputs against the consolidated state
-    // and refresh them via `read_data_source` (#1683, #1685).
-    let data_source_bindings = data_source_refresh_bindings(
-        &sorted_resources,
-        &parsed.compositions,
-        &data_sources,
-        &current_states,
-        remote_bindings,
-        ctx.schemas(),
-        &wait_aliases,
-    );
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
-    let data_source_refreshes = resolve_data_source_refs_for_refresh(
-        &sorted_resources,
-        &parsed.compositions,
-        &data_sources,
-        &current_states,
-        remote_bindings,
-        ctx.schemas(),
-        &wait_aliases,
-    )?;
-    let mut deferred_data_source_reads = DeferredDataSourceReads::none();
-    let mut resolved_data_sources = Vec::new();
-    for resolution in data_source_refreshes {
-        match resolution {
-            DataSourceRefreshResolution::Resolved(resource) => {
-                resolved_data_sources.push(resource);
-            }
-            DataSourceRefreshResolution::DeferredToApply {
-                resource,
-                unresolved,
-            } => {
-                deferred_data_source_reads.insert(resource.id.clone(), unresolved);
-            }
-        }
-    }
-    let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
-        stream::iter(resolved_data_sources.iter())
-            .map(|resource| {
-                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                let data_source_bindings = &data_source_bindings;
-                let module_gate = &module_gate;
-                async move {
-                    let mut state = read_data_source_with_retry(
-                        provider_ref,
-                        resource,
-                        data_source_bindings,
-                        module_gate,
-                        ctx.factories(),
-                        ctx.schemas(),
-                    )
-                    .await?;
-                    if let Some(deps) = dep_bindings {
-                        state.dependency_bindings = deps;
-                    }
-                    progress.finish();
-                    Ok((resource.id.clone(), state))
-                }
-            })
-            .buffer_unordered(5)
-            .collect()
-            .await;
-    for result in phase2_results {
-        let (id, state) = result?;
-        current_states.insert(id, state);
-    }
-
-    // carina#3132: expand same-config deferred-for loops post-refresh
-    // via the *same* `expand_same_config_deferred_for` the plan path
-    // calls (one resolution timing; plan/apply parity). Then
-    // targeted-refresh the materialized children through the same
-    // `refresh_resource_set` helper phase 1 used, so a re-apply after
-    // they were created sees their live state instead of a phantom
-    // Create. The #1844 sort constraint (expanded resources must be in
-    // the sorted/refreshed/diffed set) is honored by the re-sort
-    // inside `expand_same_config_deferred_for`.
-    //
-    // carina#3278: the expand → child-refresh → hydrate(2nd) → lift
-    // quartet runs through `expand_refresh_and_lift_states` so the
-    // apply and refresh paths cannot diverge on these phases. The
-    // constructor is the only way to obtain an `ExpandedRefreshState`
-    // — leaving a phase out becomes a compile error.
-    let moved_targets: HashSet<ResourceId> = moved_pairs
-        .iter()
-        .map(|(_, to)| to.as_inner().clone())
-        .collect();
-    let crate::wiring::ExpandedRefreshState {
-        sorted_resources: resorted,
-        residual_deferred_for,
-        deferred_create_targets,
-        new_child_ids: _,
-        refreshable_child_ids: _,
-        // `printed_warnings` drives the plan path's spinner-bar-region
-        // close (#3150); the apply path's post-refresh bar handling is
-        // tracked separately in #3151 and does not consume it here.
-        printed_warnings: _,
-    } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
-        parsed,
-        provider: &provider,
-        sorted_resources: &sorted_resources,
-        current_states: &mut current_states,
-        orphans: &mut orphans,
-        remote_bindings,
-        wait_aliases: &wait_aliases,
-        moved_targets: &moved_targets,
-        already_refreshed: &orphan_refreshed_ids,
-        state_file: &state_file,
-        saved_dep_bindings: &HashMap::new(),
-        saved_attrs: &saved_attrs,
-        multi: &multi,
-        schemas: ctx.schemas(),
-    })
-    .await?;
-    sorted_resources = resorted;
-    // Expansion borrows `parsed` immutably (expands a clone), so
-    // `parsed.deferred_for_expressions` is NOT drained of resolved
-    // loops the way the old `&mut self` call drained it. `print_plan`
-    // must therefore receive this *residual* (still-unresolvable) list,
-    // not `parsed.deferred_for_expressions` — otherwise a resolved loop
-    // renders as both its materialized children AND a phantom
-    // "deferred" entry. Mirrors the plan path's `ctx.residual_deferred_for`
-    // (`commands/plan.rs`).
-
-    // Data-source lifting stays inline: it operates on
-    // `parsed.data_sources` (not `sorted_resources`), so it is
-    // independent of the deferred-for expansion sequence the helper
-    // above pins.
-    carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
-        &mut current_states,
-        &data_sources,
-        ctx.schemas(),
-    );
-
-    // Snapshot each composition resource's *pre-resolve* attributes
-    // (still carrying `ResourceRef`s) before the head-of-pipeline
-    // resolver call below replaces them with pre-apply concrete
-    // values. `finalize_apply`'s export resolution needs this
-    // snapshot to re-resolve compositions against the post-apply state —
-    // see #3169 / #3177. Without it, every composition ref is frozen at
-    // the pre-apply value and `state.exports` captures stale data
-    // after any Replace on a referenced managed resource.
-    // carina#3181: composition resources live in `parsed.compositions`
-    // as their own typed slice.
-    let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
-        parsed.compositions.clone();
-
-    let pre_apply_input_states = carina_core::resource::into_plan_input_map(
-        current_states.clone(),
-        ctx.schemas(),
-        &sorted_resources,
-    );
-    let mut override_aware_resources = OverrideAwareResources::build(
-        sorted_resources,
-        state_file.as_ref(),
-        carina_core::binding_index::PreApplyInputs {
-            managed: &[],
-            compositions: &pre_resolve_compositions,
-            data_sources: &data_sources,
-            current_states: &pre_apply_input_states,
-            remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-    )?;
-    crate::legacy_name_overrides::emit_legacy_override_warnings(
-        &override_aware_resources,
-        state_file.as_ref(),
-    );
-    let unresolved_override_aware_resources = OverrideAwareResources::build(
-        unresolved_parsed.resources.clone(), // allow: direct — parser-internal, pre-expansion
-        state_file.as_ref(),
-        carina_core::binding_index::PreApplyInputs {
-            managed: &[],
-            compositions: &pre_resolve_compositions,
-            data_sources: &data_sources,
-            current_states: &pre_apply_input_states,
-            remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-    )?;
-    // Resolve and canonicalize only refresh-time data sources. Deferred
-    // reads keep their original input refs so the plan/executor dependency
-    // graph still contains the upstream create edge.
-    let deferred_data_source_ids: HashSet<ResourceId> = data_sources
-        .iter()
-        .filter(|resource| deferred_data_source_reads.contains(&resource.id))
-        .map(|resource| resource.id.clone())
-        .collect();
-    let mut data_sources_for_plan = prepare_data_sources_for_plan(
-        &data_sources,
-        &deferred_data_source_ids,
-        override_aware_resources.bindings(),
-        None,
-    )?;
-    let constraint_origin_resources = override_aware_resources
-        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    // Run the normalization pipeline (same as plan path in wiring.rs).
-    // `create_plan` resolves typed wait RHS values against target schemas.
-    let wait_bindings = parsed.wait_bindings.clone();
-    let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
-    let preparation = preprocessor
-        .prepare(
-            &mut override_aware_resources,
-            &constraint_origin_resources,
-            &module_gate,
-            &mut current_states,
-            &mut orphans,
-            raw_provider_configs,
-            &mut data_sources_for_plan,
-            &data_sources,
-        )
-        .await;
-    if let Err(error) = preparation {
-        let errors = match error {
-            crate::wiring::PlanPreparationError::Plan(errors) => errors,
-            crate::wiring::PlanPreparationError::Provider(error) => {
-                return Err(AppError::Provider(error));
-            }
-        };
-        let mut plan = Plan::new();
-        for error in errors {
-            plan.add_error(error);
-        }
-        render_plan_errors_and_abort(&plan)?;
-        unreachable!("render_plan_errors_and_abort returns an error for an invalid plan");
-    }
-    let resolved_desired_ids = reconcile_late_anonymous_identities(
+    let outcome = run_apply_locked_owned(
         ctx,
-        LateAnonymousIdentityInputs {
-            resources: &mut override_aware_resources,
-            state_file: state_file.as_ref(),
-            state_block_claims: &state_block_claims,
-            providers: raw_provider_configs,
-        },
-    )?;
-    crate::wiring::validate_plan_time_state_block_collisions(
-        &resolved_desired_ids,
-        &moved_pairs,
-        &resolved_state_block_targets,
-        &state_file,
-    )?;
-    let reconciled_provider_states = provider_states_for(
-        &current_states,
-        &orphans,
-        override_aware_resources.resources(),
-    );
-    let reconciled_input_states = carina_core::resource::into_plan_input_map(
-        reconciled_provider_states,
-        ctx.schemas(),
-        override_aware_resources.resources(),
-    );
-    override_aware_resources.rebuild_bindings_after_identity_reconciliation(
-        RebuildBindingsInputs {
-            compositions: &pre_resolve_compositions,
-            data_sources: &data_sources,
-            current_states: &reconciled_input_states,
-            remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-    );
-    let paired_unresolved_resources = override_aware_resources
-        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let resolved_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
-    let resolved_unresolved_resources =
-        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
-    let plan_input_states = carina_core::resource::into_plan_input_map(
-        current_states.clone(),
-        ctx.schemas(),
-        override_aware_resources.resources(),
-    );
-    let directives_map = state_file
-        .as_ref()
-        .map(|sf| sf.build_directives())
-        .unwrap_or_default();
-    let schemas = ctx.schemas();
-    let mut plan = create_plan_with_cascades(
-        &resolved_resources,
-        &resolved_unresolved_resources,
-        &data_sources_for_plan,
-        &provider,
-        PlanPriorStates::new(&plan_input_states, &orphans),
-        &directives_map,
-        schemas,
-        &saved_attrs,
-        &prev_explicit,
-        &wait_bindings,
-    )?;
-    crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
-    block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
-
-    // Add state block effects (import/removed/moved) to the plan.
-    // carina#3329: resolve `import { id = "${…}|…" }` interpolations
-    // against the same binding view the resource-attribute resolver
-    // uses. The empty `unresolved_upstream_bindings` set here just
-    // skips the plan-time "stamp upstream refs as
-    // `(known after upstream apply: …)`" pass — apply does not need
-    // that display marker. The hard-fail on a still-deferred
-    // identifier is enforced one layer down in
-    // `execute_import_effects` via [`carina_core::effect::resolve_import_identifier`],
-    // which rejects any non-Concrete `Value` before it can reach the
-    // provider's `read()`.
-    let no_unresolved_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    crate::wiring::add_state_block_effects(
-        &mut plan,
-        &parsed.state_blocks,
-        &state_file,
-        &moved_pairs,
-        override_aware_resources.resources(),
-        override_aware_resources.bindings(),
-        &no_unresolved_upstreams,
-    );
-    crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
-    current_states = into_all_prior_states(orphans, current_states);
-
-    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
-        .iter()
-        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
-        .collect();
-
-    render_plan_errors_and_abort(&plan)?;
-
-    if can_use_export_only_fast_path(&plan, &deferred_data_source_reads) {
-        // No mutating effects — the plan only holds `Read` (data-source
-        // reads) or `Wait` effects, or is entirely empty. Either way no
-        // resource apply pipeline needs to run; route through the
-        // export-only fast path. Without this, a plan whose only
-        // difference from state is an export expression that reads a
-        // data source (a `Read` effect lands in the plan, but no
-        // mutation does) silently falls through into the
-        // resource-apply pipeline and the `Persisting N export
-        // change(s) to state.` banner never prints (carina#3270).
-        finalize_module_constraints(
-            &pre_resolve_compositions,
-            override_aware_resources.bindings(),
-        )?;
-        let checked_exports_pre_apply =
-            crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
-                export_params: &parsed.export_params,
-                resources: &paired_unresolved_resources,
-                compositions: &parsed.compositions,
-                data_sources: &parsed.data_sources,
-                current_states: &current_states,
-                state_file: state_file.as_ref(),
-                plan: &plan,
-                schemas: ctx.schemas(),
-                wait_aliases: &wait_aliases,
-                provider_context,
-            })
-            .map_err(AppError::Validation)?;
-        let empty_exports = HashMap::new();
-        let current_exports = state_file
-            .as_ref()
-            .map(|s| &s.exports)
-            .unwrap_or(&empty_exports);
-        let export_changes = crate::commands::plan::compute_export_diffs(
-            &checked_exports_pre_apply,
-            current_exports,
-        );
-
-        if export_changes.is_empty() {
-            println!("{}", "No changes needed.".green());
-            return Ok(None);
-        }
-
-        let historical_display =
-            carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
-        print_plan(
-            &plan,
-            DetailLevel::Full,
-            &historical_display,
-            Some(ctx.schemas()),
-            &HashMap::new(),
-            &export_changes,
-            &residual_deferred_for,
-            None,
-            None,
-        );
-
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        if confirm_apply(stdin, cancel.clone(), auto_approve).await? == ApplyConfirmation::Cancelled
-        {
-            return Ok(None);
-        }
-
-        println!(
-            "{}",
-            format!(
-                "Persisting {} export change(s) to state.",
-                export_changes.len()
-            )
-            .cyan()
-        );
-        // No-op apply path: compositions were never resolved (no head-of-
-        // pipeline pass ran). carina#3181: compositions live in
-        // `parsed.compositions` and still carry the authored
-        // `ResourceRef` snapshots — the shape post-apply export resolution expects
-        // from the post-apply path.
-        let pre_resolve_compositions_noop: Vec<carina_core::resource::Composition> =
-            parsed.compositions.clone();
-        persist_exports_only(
-            backend,
-            lock,
-            state_file,
-            &paired_unresolved_resources,
-            &data_sources,
-            &pre_resolve_compositions_noop,
-            &checked_exports_pre_apply,
-            ctx.schemas(),
-            &wait_aliases,
-            &current_states,
-            provider_context,
-        )
-        .await?;
-        return Ok(None);
-    }
-
-    // Build display-safe historical attributes from current and persisted state.
-    let historical_display =
-        collect_historical_display_attributes(&plan, &current_states, state_file.as_ref());
-
-    let checked_exports_pre_apply =
-        crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
-            export_params: &parsed.export_params,
-            resources: &paired_unresolved_resources,
-            compositions: &parsed.compositions,
-            data_sources: &parsed.data_sources,
-            current_states: &current_states,
-            state_file: state_file.as_ref(),
-            plan: &plan,
-            schemas: ctx.schemas(),
-            wait_aliases: &wait_aliases,
-            provider_context,
-        })
-        .map_err(AppError::Validation)?;
-    let current_exports = state_file
-        .as_ref()
-        .map(|s| s.exports.clone())
-        .unwrap_or_default();
-    let export_changes =
-        crate::commands::plan::compute_export_diffs(&checked_exports_pre_apply, &current_exports);
-    print_plan(
-        &plan,
-        DetailLevel::Full,
-        &historical_display,
-        Some(ctx.schemas()),
-        &moved_origins,
-        &export_changes,
-        &residual_deferred_for,
-        Some(&prev_explicit),
-        None,
-    );
-
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    if confirm_apply(stdin, cancel.clone(), auto_approve).await? == ApplyConfirmation::Cancelled {
-        return Ok(None);
-    }
-
-    let apply_phase_started = Instant::now();
-    println!("{}", "Applying changes...".cyan().bold());
-    println!();
-
-    // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources = override_aware_resources
-        .unresolved_by_resolved_id_with_binding_sources(&unresolved_override_aware_resources)?;
-    let mut bindings = override_aware_resources.bindings().clone();
-
-    // `provider` is a `ProviderRouter`, which impls both `Provider` and
-    // `ProviderNormalizer`; the same object is passed in both positions
-    // so apply re-normalizes with exactly the plan-time normalizer
-    // (carina#3060). They must stay the same object.
-    let observer = observer_factory(&plan);
-    let outcome = execute_effects_with_observer(
-        &plan,
-        &provider,
-        &provider,
-        raw_provider_configs,
-        ctx.factories(),
-        ctx.schemas(),
-        &mut bindings,
-        &mut current_states,
-        &unresolved_resources,
-        &data_sources,
-        &pre_resolve_compositions,
-        deferred_data_source_reads,
+        parsed,
+        unresolved_parsed,
+        auto_approve,
+        Arc::clone(&backend),
+        lock,
+        project_dir,
+        provider_context,
         cancel.clone(),
+        observer_factory,
         parallelism,
-        observer,
+        accept_legacy_name_overrides,
     )
     .await;
-    let (mut result, cancelled) = split_execution_outcome(outcome);
-
-    // Execute import effects: read imported resources from the provider
-    execute_import_effects(&plan, &provider, &mut result, &cancel).await;
-
-    // Execute remove and move effects (state-only, logged for user feedback)
-    execute_state_only_effects(&plan, &mut result);
-    let resources_finished = Instant::now();
-
-    // Use override-aware resources (post-default_tags merge, post-canonicalize)
-    // for state writeback so the per-resource `explicit` tree includes
-    // provider-level default tags. Otherwise the next plan projects the
-    // tags out of `current` and surfaces a spurious `tags: (none) → ...`
-    // diff (refs awscc#206).
-    let skipped_exports = finalize_after_execute(
-        |persistence| {
-            finalize_apply(
-                FinalizeApplyInput {
-                    result: &result,
-                    state_file,
-                    sorted_resources: &resolved_resources,
-                    data_sources: &data_sources_for_plan,
-                    current_states: &current_states,
-                    plan: &plan,
-                    backend,
-                    lock,
-                    schemas,
-                    export_params: Some(&checked_exports_pre_apply),
-                    provider_context,
-                    wait_aliases: &wait_aliases,
-                    pre_resolve_compositions: &pre_resolve_compositions,
-                },
-                persistence,
-                None,
-            )
-        },
-        cancelled,
-        &cancel,
-    )
-    .await?;
-
-    finish_apply(
-        &result,
-        skipped_exports,
-        resources_finished.duration_since(apply_phase_started),
-    )
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
 }
 
 fn ensure_saved_plan_backend_matches_current(
@@ -2767,20 +2962,21 @@ async fn run_apply_from_plan_with_observer_factory(
     }
 
     // Set up backend
-    let backend: Box<dyn StateBackend> = verified_backend
+    let backend: Arc<dyn StateBackend> = verified_backend
         .resolve()
         .await
-        .map_err(AppError::Backend)?;
+        .map_err(AppError::Backend)?
+        .into();
 
     // Acquire lock (unless --lock=false)
-    let lock_info: Option<LockInfo> = if lock {
+    let state_lock = if lock {
         println!("{}", "Acquiring state lock...".cyan());
         let li = backend
             .acquire_lock("apply")
             .await
             .map_err(|error| map_lock_error(error, &source_path))?;
         println!("  {} Lock acquired", "✓".green());
-        Some(li)
+        StateLock::held(li)
     } else {
         println!(
             "{}",
@@ -2788,63 +2984,61 @@ async fn run_apply_from_plan_with_observer_factory(
                 .yellow()
                 .bold()
         );
-        None
+        StateLock::disabled_by_cli_flag()
     };
 
-    let op_result = run_apply_from_plan_locked(
+    let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
         current_parsed.as_mut(),
         provider_context,
         auto_approve,
-        backend.as_ref(),
-        lock_info.as_ref(),
+        Arc::clone(&backend),
+        state_lock,
         apply_target,
         cancel.clone(),
         observer_factory,
         parallelism,
         accept_legacy_name_overrides,
     )
-    .await
-    .map_err(|error| error.with_project_dir(&source_path));
-
-    // Always release lock if it was acquired
-    if let Some(ref li) = lock_info {
-        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
-
-        if release_result.is_ok()
-            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-        {
-            println!("  {} Lock released", "✓".green());
-        }
-
-        let timing = op_result?;
-        release_result?;
-        if let Some(elapsed) = timing {
-            println!("{}", format_total_apply_line(elapsed));
-        }
-    } else {
-        if let Some(timing) = op_result? {
-            println!("{}", format_total_apply_line(timing));
-        }
+    .await;
+    let timing = finish_lock_command(backend.as_ref(), outcome, &cancel)
+        .await
+        .map_err(|error| error.with_project_dir(&source_path))?;
+    if let Some(elapsed) = timing {
+        println!("{}", format_total_apply_line(elapsed));
     }
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_apply_from_plan_locked(
+async fn run_apply_from_plan_locked_owned(
     inspected_plan: InspectedPlanFile,
     current_parsed: Option<&mut carina_core::parser::InferredFile>,
     provider_context: &ProviderContext,
     auto_approve: bool,
-    backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    backend: Arc<dyn StateBackend>,
+    lock: StateLock,
     apply_target: ApplyTarget<'_>,
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
-) -> Result<Option<Duration>, AppError> {
+) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
+    macro_rules! try_with_lock {
+        ($expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => {
+                    return LockCommandOutcome::Kept {
+                        result: Err(error),
+                        lock,
+                    };
+                }
+            }
+        };
+    }
+
     let project_dir = apply_target.source_dir();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
@@ -2854,13 +3048,17 @@ async fn run_apply_from_plan_locked(
     // on-disk serial (the one the saved plan was diffed against)
     // rather than a +1 bump caused by our own migration persist.
     let (mut state_file, pending_migration) =
-        match backend.read_state().await.map_err(AppError::Backend)? {
+        match try_with_lock!(backend.read_state().await.map_err(AppError::Backend)) {
             None => (None, None),
             Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
             Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
         };
     if let Some(state) = state_file.as_ref() {
-        check_legacy_name_overrides(state, accept_legacy_name_overrides, apply_target)?;
+        try_with_lock!(check_legacy_name_overrides(
+            state,
+            accept_legacy_name_overrides,
+            apply_target,
+        ));
     }
 
     if let Some(ref state) = state_file {
@@ -2868,10 +3066,13 @@ async fn run_apply_from_plan_locked(
         if let Some(plan_lineage) = inspected_plan.state_lineage()
             && state.lineage != plan_lineage
         {
-            return Err(AppError::Config(format!(
-                "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
-                plan_lineage, state.lineage
-            )));
+            return LockCommandOutcome::Kept {
+                result: Err(AppError::Config(format!(
+                    "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
+                    plan_lineage, state.lineage
+                ))),
+                lock,
+            };
         }
 
         // Warn on serial mismatch (state may have drifted)
@@ -2897,320 +3098,421 @@ async fn run_apply_from_plan_locked(
     if pending_migration.is_some()
         && let Some(state) = state_file.as_mut()
     {
-        if let Some(lk) = lock {
-            save_state_locked(backend, lk, state).await?;
-        } else {
-            save_state_unlocked(backend, state).await?;
+        match lock.as_ref() {
+            StateLockRef::Held(held) => {
+                try_with_lock!(save_state_locked(backend.as_ref(), held, state).await);
+            }
+            StateLockRef::Disabled(disabled) => {
+                try_with_lock!(save_state_unlocked(backend.as_ref(), disabled, state).await);
+            }
         }
     }
 
-    let (desired_plan, prepared_wiring) = match inspected_plan {
-        InspectedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), None),
-        InspectedPlanFile::NeedsSecretVerification(plan) => {
-            let parsed = current_parsed.ok_or_else(|| {
-                saved_plan_secret_evaluation_error(
-                    AppError::Config("the current configuration was unavailable".to_string()),
-                    apply_target,
-                )
-            })?;
-            let (provider_inputs, wiring) = prepare_saved_plan_secret_candidates(
-                parsed,
-                &state_file,
+    let heartbeat_outcome =
+        with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
+            let (desired_plan, prepared_wiring) = match inspected_plan {
+                InspectedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), None),
+                InspectedPlanFile::NeedsSecretVerification(plan) => {
+                    let parsed = current_parsed.ok_or_else(|| {
+                        saved_plan_secret_evaluation_error(
+                            AppError::Config(
+                                "the current configuration was unavailable".to_string(),
+                            ),
+                            apply_target,
+                        )
+                    })?;
+                    let (provider_inputs, wiring) = prepare_saved_plan_secret_candidates(
+                        parsed,
+                        &state_file,
+                        project_dir,
+                        provider_context,
+                    )
+                    .await
+                    .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
+                    (
+                        plan.verify_desired(parsed, &provider_inputs, apply_target)?,
+                        Some(wiring),
+                    )
+                }
+            };
+
+            let resolved_provider_configs =
+                ResolvedProviderConfigs::try_from(desired_plan.provider_configs().clone())
+                    .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
+            let raw_provider_configs = resolved_provider_configs.as_provider_configs();
+
+            // Desired/config secret verification is complete before a CRUD-capable
+            // provider is constructed. Historical placeholders are verified by the
+            // drift reads below before the executor gate is minted.
+            let ctx = match prepared_wiring {
+                Some(wiring) => wiring,
+                None => {
+                    let (factories, _) =
+                        build_factories_from_providers(raw_provider_configs, project_dir)?;
+                    WiringContext::new(factories, raw_provider_configs)
+                }
+            };
+            let provider = create_providers_from_configs_with_ctx(
+                &ctx,
+                &resolved_provider_configs,
                 project_dir,
-                provider_context,
             )
-            .await
-            .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-            (
-                plan.verify_desired(parsed, &provider_inputs, apply_target)?,
-                Some(wiring),
-            )
-        }
-    };
-
-    let resolved_provider_configs =
-        ResolvedProviderConfigs::try_from(desired_plan.provider_configs().clone())
-            .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
-    let raw_provider_configs = resolved_provider_configs.as_provider_configs();
-
-    // Desired/config secret verification is complete before a CRUD-capable
-    // provider is constructed. Historical placeholders are verified by the
-    // drift reads below before the executor gate is minted.
-    let ctx = match prepared_wiring {
-        Some(wiring) => wiring,
-        None => {
-            let (factories, _) = build_factories_from_providers(raw_provider_configs, project_dir)?;
-            WiringContext::new(factories, raw_provider_configs)
-        }
-    };
-    let provider =
-        create_providers_from_configs_with_ctx(&ctx, &resolved_provider_configs, project_dir)
             .await?;
 
-    // Drift detection: re-read actual infrastructure state and compare against planned states
-    println!("{}", "Checking for infrastructure drift...".cyan());
-    let historical_addresses = desired_plan.historical_resource_addresses();
-    let drift_check = detect_drift(
-        desired_plan.sorted_resources(),
-        desired_plan.current_states(),
-        &historical_addresses,
-        &provider,
-        apply_target,
-    )
-    .await?;
+            // Drift detection: re-read actual infrastructure state and compare against planned states
+            println!("{}", "Checking for infrastructure drift...".cyan());
+            let historical_addresses = desired_plan.historical_resource_addresses();
+            let drift_check = detect_drift(
+                desired_plan.sorted_resources(),
+                desired_plan.current_states(),
+                &historical_addresses,
+                &provider,
+                apply_target,
+            )
+            .await?;
 
-    if let Some(drift_messages) = drift_check.drift_messages() {
-        println!();
-        println!("{}", "Error: Infrastructure drift detected!".red().bold());
-        println!(
-            "{}",
-            "The following resources have changed since the plan was created:".red()
-        );
-        println!();
-        for msg in drift_messages {
-            println!("{}", msg);
-        }
-        println!();
-        println!("{}", drift_replan_hint(apply_target).yellow());
-        return Err(AppError::Config(
-            "Apply aborted due to infrastructure drift.".to_string(),
-        ));
-    }
+            if let Some(drift_messages) = drift_check.drift_messages() {
+                println!();
+                println!("{}", "Error: Infrastructure drift detected!".red().bold());
+                println!(
+                    "{}",
+                    "The following resources have changed since the plan was created:".red()
+                );
+                println!();
+                for msg in drift_messages {
+                    println!("{}", msg);
+                }
+                println!();
+                println!("{}", drift_replan_hint(apply_target).yellow());
+                return Err(AppError::Config(
+                    "Apply aborted due to infrastructure drift.".to_string(),
+                ));
+            }
 
-    println!("  {} No drift detected.", "✓".green());
+            println!("  {} No drift detected.", "✓".green());
 
-    let (mut actual_states, mut verified_planned_states) = drift_check.into_verified_states();
+            let (mut actual_states, mut verified_planned_states) =
+                drift_check.into_verified_states();
 
-    let rehydrated_plan_file = desired_plan
-        .verify_historical(
-            &provider,
-            &mut actual_states,
-            &mut verified_planned_states,
-            &historical_addresses,
-            apply_target,
-        )
-        .await?;
+            let rehydrated_plan_file = desired_plan
+                .verify_historical(
+                    &provider,
+                    &mut actual_states,
+                    &mut verified_planned_states,
+                    &historical_addresses,
+                    apply_target,
+                )
+                .await?;
 
-    let plan = rehydrated_plan_file.plan();
-    let sorted_resources = rehydrated_plan_file.sorted_resources();
-    let resolved_sorted_resources =
-        ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
-    let plan_compositions = rehydrated_plan_file.compositions();
-    let plan_data_sources = rehydrated_plan_file.data_sources();
-    let plan_data_source_origins: &[carina_core::resource::DataSource] =
-        rehydrated_plan_file.data_source_origins();
+            let plan = rehydrated_plan_file.plan();
+            let sorted_resources = rehydrated_plan_file.sorted_resources();
+            let resolved_sorted_resources =
+                ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+            let plan_compositions = rehydrated_plan_file.compositions();
+            let plan_data_sources = rehydrated_plan_file.data_sources();
+            let plan_data_source_origins: &[carina_core::resource::DataSource] =
+                rehydrated_plan_file.data_source_origins();
 
-    let planned_states: HashMap<ResourceId, State> = rehydrated_plan_file
-        .current_states()
-        .iter()
-        .map(|entry| (entry.id.clone(), entry.state.clone()))
-        .collect();
-    let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
-        plan_data_source_origins,
-        sorted_resources,
-        &planned_states,
-    );
+            let planned_states: HashMap<ResourceId, State> = rehydrated_plan_file
+                .current_states()
+                .iter()
+                .map(|entry| (entry.id.clone(), entry.state.clone()))
+                .collect();
+            let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
+                plan_data_source_origins,
+                sorted_resources,
+                &planned_states,
+            );
 
-    // Use the actual states (freshly read) as current_states for apply
-    let mut current_states = planned_states;
+            // Use the actual states (freshly read) as current_states for apply
+            let mut current_states = planned_states;
 
-    render_plan_errors_and_abort(plan)?;
+            render_plan_errors_and_abort(plan)?;
 
-    if can_use_export_only_fast_path(plan, &deferred_data_source_reads) {
-        // Saved plans serialize every `Effect::Read` produced by the
-        // differ; gating on `is_empty()` would skip this branch for
-        // any data-source-bearing config, even when no managed
-        // resource needs work, and fall through into the
-        // resource-apply pipeline. Mirrors the source-driven apply
-        // path's gate (carina#3270 → run_apply_locked).
-        // carina#3275.
-        let terminal_wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
-            .wait_bindings()
-            .iter()
-            .map(|wb| WaitAliasSpec {
-                binding: carina_core::parser::BindingName::new(wb.binding.clone()),
-                target: carina_core::parser::BindingName::new(wb.target.clone()),
-            })
-            .collect();
-        let terminal_input_states = carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            ctx.schemas(),
-            sorted_resources,
-        );
-        let terminal_bindings =
-            ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-                managed: sorted_resources,
-                compositions: plan_compositions,
-                data_sources: plan_data_sources,
-                current_states: &terminal_input_states,
-                remote_bindings: rehydrated_plan_file.upstream_snapshot(),
-                wait_aliases: &terminal_wait_aliases,
-            });
-        finalize_module_constraints(plan_compositions, &terminal_bindings)?;
-        println!("{}", "No changes needed.".green());
-        return Ok(None);
-    }
+            if can_use_export_only_fast_path(plan, &deferred_data_source_reads) {
+                // Saved plans serialize every `Effect::Read` produced by the
+                // differ; gating on `is_empty()` would skip this branch for
+                // any data-source-bearing config, even when no managed
+                // resource needs work, and fall through into the
+                // resource-apply pipeline. Mirrors the source-driven apply
+                // path's gate (carina#3270 → run_apply_locked).
+                // carina#3275.
+                let terminal_wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
+                    .wait_bindings()
+                    .iter()
+                    .map(|wb| WaitAliasSpec {
+                        binding: carina_core::parser::BindingName::new(wb.binding.clone()),
+                        target: carina_core::parser::BindingName::new(wb.target.clone()),
+                    })
+                    .collect();
+                let terminal_input_states = carina_core::resource::into_plan_input_map(
+                    current_states.clone(),
+                    ctx.schemas(),
+                    sorted_resources,
+                );
+                let terminal_bindings =
+                    ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+                        managed: sorted_resources,
+                        compositions: plan_compositions,
+                        data_sources: plan_data_sources,
+                        current_states: &terminal_input_states,
+                        remote_bindings: rehydrated_plan_file.upstream_snapshot(),
+                        wait_aliases: &terminal_wait_aliases,
+                    });
+                finalize_module_constraints(plan_compositions, &terminal_bindings)?;
+                println!("{}", "No changes needed.".green());
+                return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
+            }
 
-    // Build display-safe historical attributes from current and persisted state.
-    let historical_display =
-        collect_historical_display_attributes(plan, &current_states, state_file.as_ref());
+            // Build display-safe historical attributes from current and persisted state.
+            let historical_display =
+                collect_historical_display_attributes(plan, &current_states, state_file.as_ref());
 
-    print_plan(
-        plan,
-        DetailLevel::Full,
-        &historical_display,
-        None,
-        &HashMap::new(),
-        &[],
-        &[],
-        None,
-        None,
-    );
+            print_plan(
+                plan,
+                DetailLevel::Full,
+                &historical_display,
+                None,
+                &HashMap::new(),
+                &[],
+                &[],
+                None,
+                None,
+            );
 
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    if confirm_apply(stdin, cancel.clone(), auto_approve).await? == ApplyConfirmation::Cancelled {
-        return Ok(None);
-    }
+            let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+                == ApplyConfirmation::Cancelled
+            {
+                return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
+            }
 
-    // Verify upstream-state bindings have not drifted since `carina
-    // plan` ran (#2303). Re-load each upstream the plan declared and
-    // compare against the persisted snapshot; if any binding's
-    // attribute map disagrees, fail rather than silently mixing
-    // plan-time and apply-time values during cascade re-resolution.
-    let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
-    if !rehydrated_plan_file.upstream_sources().is_empty() {
-        verify_upstream_snapshot(
-            rehydrated_plan_file.upstream_sources(),
-            &upstream_snapshot,
-            apply_target,
-        )
-        .await?;
-    }
-    // Rebuild the wait passthrough aliases from the persisted
-    // `(binding, target)` pairs so `apply --plan`'s cascade
-    // re-resolution resolves `<wait-binding>.<attr>` exactly as the
-    // plan path did (carina#3085). `PlanWaitBinding` (String) →
-    // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
-    // is not serializable so it is reconstructed here, not deserialized.
-    let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
-        .wait_bindings()
-        .iter()
-        .map(|wb| WaitAliasSpec {
-            binding: carina_core::parser::BindingName::new(wb.binding.clone()),
-            target: carina_core::parser::BindingName::new(wb.target.clone()),
+            // Verify upstream-state bindings have not drifted since `carina
+            // plan` ran (#2303). Re-load each upstream the plan declared and
+            // compare against the persisted snapshot; if any binding's
+            // attribute map disagrees, fail rather than silently mixing
+            // plan-time and apply-time values during cascade re-resolution.
+            let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
+            if !rehydrated_plan_file.upstream_sources().is_empty() {
+                verify_upstream_snapshot(
+                    rehydrated_plan_file.upstream_sources(),
+                    &upstream_snapshot,
+                    apply_target,
+                )
+                .await?;
+            }
+            // Rebuild the wait passthrough aliases from the persisted
+            // `(binding, target)` pairs so `apply --plan`'s cascade
+            // re-resolution resolves `<wait-binding>.<attr>` exactly as the
+            // plan path did (carina#3085). `PlanWaitBinding` (String) →
+            // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
+            // is not serializable so it is reconstructed here, not deserialized.
+            let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
+                .wait_bindings()
+                .iter()
+                .map(|wb| WaitAliasSpec {
+                    binding: carina_core::parser::BindingName::new(wb.binding.clone()),
+                    target: carina_core::parser::BindingName::new(wb.target.clone()),
+                })
+                .collect();
+            // carina#3248: saved plans (version 4) persist both
+            // `compositions` and `data_sources`, so the saved-plan apply
+            // path builds the same unified pre-apply bindings view as the
+            // live-apply path. The view includes compositions so a managed
+            // attribute referencing `<module_instance>.<attr>` chains through
+            // to the managed sibling literal (carina#3246), and includes data
+            // sources so a managed attribute referencing `<read_binding>.<attr>`
+            // resolves through the data source's attribute map.
+            let pre_apply_input_states = carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                ctx.schemas(),
+                sorted_resources,
+            );
+            let mut bindings =
+                ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+                    managed: sorted_resources,
+                    compositions: plan_compositions,
+                    data_sources: plan_data_sources,
+                    current_states: &pre_apply_input_states,
+                    remote_bindings: &upstream_snapshot,
+                    wait_aliases: &wait_aliases,
+                });
+
+            let apply_phase_started = Instant::now();
+            println!("{}", "Applying changes...".cyan().bold());
+            println!();
+
+            // Build unresolved resource map for re-resolution at apply time from
+            // the saved pre-resolution snapshot, keyed by the paired sorted
+            // resource IDs rather than the unresolved snapshot's own identity.
+            let unresolved_resources = saved_plan_unresolved_by_resolved_id(
+                sorted_resources,
+                rehydrated_plan_file.unresolved_resources(),
+                apply_target,
+            )?;
+            // Same object in both positions: `ProviderRouter` is both the
+            // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
+            // with the plan-time normalizer (carina#3060).
+            let observer = observer_factory(plan);
+            let outcome = execute_rehydrated_saved_plan(
+                &rehydrated_plan_file,
+                &provider,
+                &provider,
+                raw_provider_configs,
+                ctx.factories(),
+                ctx.schemas(),
+                &mut bindings,
+                &mut current_states,
+                &unresolved_resources,
+                plan_data_source_origins,
+                plan_compositions,
+                deferred_data_source_reads,
+                cancel.clone(),
+                parallelism,
+                observer,
+            )
+            .await;
+            let (mut result, cancelled) = split_execution_outcome(outcome);
+
+            // Execute import effects: read imported resources from the provider
+            execute_import_effects(plan, &provider, &mut result, &cancel).await;
+
+            // Execute remove and move effects (state-only, logged for user feedback)
+            execute_state_only_effects(plan, &mut result);
+
+            Ok(SavedPlanApplyAfterHeartbeat::Executed(Box::new(
+                SavedPlanApplyExecuted {
+                    result,
+                    cancelled,
+                    resources_finished: Instant::now(),
+                    apply_phase_started,
+                    state_file,
+                    resolved_resources: resolved_sorted_resources,
+                    current_states,
+                    rehydrated_plan: rehydrated_plan_file,
+                    wait_aliases,
+                    ctx,
+                    cancel,
+                },
+            )))
         })
-        .collect();
-    // carina#3248: saved plans (version 4) persist both
-    // `compositions` and `data_sources`, so the saved-plan apply
-    // path builds the same unified pre-apply bindings view as the
-    // live-apply path. The view includes compositions so a managed
-    // attribute referencing `<module_instance>.<attr>` chains through
-    // to the managed sibling literal (carina#3246), and includes data
-    // sources so a managed attribute referencing `<read_binding>.<attr>`
-    // resolves through the data source's attribute map.
-    let pre_apply_input_states = carina_core::resource::into_plan_input_map(
-        current_states.clone(),
-        ctx.schemas(),
-        sorted_resources,
-    );
-    let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-        managed: sorted_resources,
-        compositions: plan_compositions,
-        data_sources: plan_data_sources,
-        current_states: &pre_apply_input_states,
-        remote_bindings: &upstream_snapshot,
-        wait_aliases: &wait_aliases,
-    });
+        .await;
+    let (heartbeat_result, lock) = match heartbeat_outcome {
+        HeartbeatOutcome::Kept { result, lock } => (result, lock),
+        HeartbeatOutcome::Lost {
+            result: _result,
+            lost,
+        } => {
+            return LockCommandOutcome::Lost(AppError::StateLockLost {
+                error: lost.into_error(),
+            });
+        }
+    };
 
-    let apply_phase_started = Instant::now();
-    println!("{}", "Applying changes...".cyan().bold());
-    println!();
+    let op_result = async {
+        match heartbeat_result? {
+            SavedPlanApplyAfterHeartbeat::Done(result) => Ok(result),
+            SavedPlanApplyAfterHeartbeat::Executed(context) => {
+                let SavedPlanApplyExecuted {
+                    result,
+                    cancelled,
+                    resources_finished,
+                    apply_phase_started,
+                    state_file,
+                    resolved_resources,
+                    current_states,
+                    rehydrated_plan,
+                    wait_aliases,
+                    ctx,
+                    cancel,
+                } = *context;
+                // Reuse the exact factory/schema context that prepared and executed the
+                // saved plan for write-only attribute persistence.
+                let provider_context = ProviderContext::default();
 
-    // Build unresolved resource map for re-resolution at apply time from
-    // the saved pre-resolution snapshot, keyed by the paired sorted
-    // resource IDs rather than the unresolved snapshot's own identity.
-    let unresolved_resources = saved_plan_unresolved_by_resolved_id(
-        sorted_resources,
-        rehydrated_plan_file.unresolved_resources(),
+                let skipped_exports = finalize_after_execute(
+                    |persistence| {
+                        finalize_apply(
+                            FinalizeApplyInput {
+                                result: &result,
+                                state_file,
+                                sorted_resources: &resolved_resources,
+                                data_sources: rehydrated_plan.data_sources(),
+                                current_states: &current_states,
+                                plan: rehydrated_plan.plan(),
+                                backend: backend.as_ref(),
+                                lock: lock.as_ref(),
+                                schemas: ctx.schemas(),
+                                // Saved plan files do not persist `export_params` today, so
+                                // pass `None` to preserve `state.exports` rather than wipe it.
+                                // Source-driven `carina apply` reconciles exports from the
+                                // `.crn` directly (#2932).
+                                export_params: None,
+                                provider_context: &provider_context,
+                                // No export resolution runs here (export_params is None), but
+                                // the field is required; pass the reconstructed aliases so the
+                                // value is correct if a future plan file persists export_params.
+                                wait_aliases: &wait_aliases,
+                                // Same rationale as `export_params: None`: no export
+                                // resolution runs from the `apply --plan` path, so no
+                                // pre-resolve composition snapshot is needed.
+                                pre_resolve_compositions: &[],
+                            },
+                            persistence,
+                            Some(rehydrated_plan.planned_secret_hashes()),
+                        )
+                    },
+                    cancelled,
+                    &cancel,
+                )
+                .await?;
+
+                finish_apply(
+                    &result,
+                    skipped_exports,
+                    resources_finished.duration_since(apply_phase_started),
+                )
+            }
+        }
+    }
+    .await;
+
+    LockCommandOutcome::Kept {
+        result: op_result,
+        lock,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_from_plan_locked(
+    inspected_plan: InspectedPlanFile,
+    current_parsed: Option<&mut carina_core::parser::InferredFile>,
+    provider_context: &ProviderContext,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    lock: StateLock,
+    apply_target: ApplyTarget<'_>,
+    cancel: ShutdownToken,
+    observer_factory: &ObserverFactory<'_>,
+    parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
+) -> Result<Option<Duration>, AppError> {
+    let outcome = run_apply_from_plan_locked_owned(
+        inspected_plan,
+        current_parsed,
+        provider_context,
+        auto_approve,
+        Arc::clone(&backend),
+        lock,
         apply_target,
-    )?;
-    // Same object in both positions: `ProviderRouter` is both the
-    // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
-    // with the plan-time normalizer (carina#3060).
-    let observer = observer_factory(plan);
-    let outcome = execute_rehydrated_saved_plan(
-        &rehydrated_plan_file,
-        &provider,
-        &provider,
-        raw_provider_configs,
-        ctx.factories(),
-        ctx.schemas(),
-        &mut bindings,
-        &mut current_states,
-        &unresolved_resources,
-        plan_data_source_origins,
-        plan_compositions,
-        deferred_data_source_reads,
         cancel.clone(),
+        observer_factory,
         parallelism,
-        observer,
+        accept_legacy_name_overrides,
     )
     .await;
-    let (mut result, cancelled) = split_execution_outcome(outcome);
-
-    // Execute import effects: read imported resources from the provider
-    execute_import_effects(plan, &provider, &mut result, &cancel).await;
-
-    // Execute remove and move effects (state-only, logged for user feedback)
-    execute_state_only_effects(plan, &mut result);
-    let resources_finished = Instant::now();
-
-    // Reuse the exact factory/schema context that prepared and executed the
-    // saved plan for write-only attribute persistence.
-    let provider_context = ProviderContext::default();
-
-    let skipped_exports = finalize_after_execute(
-        |persistence| {
-            finalize_apply(
-                FinalizeApplyInput {
-                    result: &result,
-                    state_file,
-                    sorted_resources: &resolved_sorted_resources,
-                    data_sources: plan_data_sources,
-                    current_states: &current_states,
-                    plan,
-                    backend,
-                    lock,
-                    schemas: ctx.schemas(),
-                    // Saved plan files do not persist `export_params` today, so
-                    // pass `None` to preserve `state.exports` rather than wipe it.
-                    // Source-driven `carina apply` reconciles exports from the
-                    // `.crn` directly (#2932).
-                    export_params: None,
-                    provider_context: &provider_context,
-                    // No export resolution runs here (export_params is None), but
-                    // the field is required; pass the reconstructed aliases so the
-                    // value is correct if a future plan file persists export_params.
-                    wait_aliases: &wait_aliases,
-                    // Same rationale as `export_params: None`: no export
-                    // resolution runs from the `apply --plan` path, so no
-                    // pre-resolve composition snapshot is needed.
-                    pre_resolve_compositions: &[],
-                },
-                persistence,
-                Some(rehydrated_plan_file.planned_secret_hashes()),
-            )
-        },
-        cancelled,
-        &cancel,
-    )
-    .await?;
-
-    finish_apply(
-        &result,
-        skipped_exports,
-        resources_finished.duration_since(apply_phase_started),
-    )
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
 }
 
 #[derive(Debug, PartialEq, Eq)]

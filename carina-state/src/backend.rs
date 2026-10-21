@@ -447,9 +447,9 @@ impl BackendError {
     /// Create a Locked error from a LockInfo
     pub fn locked(lock: &LockInfo) -> Self {
         Self::Locked {
-            lock_id: lock.id.clone(),
-            who: lock.who.clone(),
-            operation: lock.operation.clone(),
+            lock_id: lock.id().to_owned(),
+            who: lock.who().to_owned(),
+            operation: lock.operation().to_owned(),
         }
     }
 
@@ -613,8 +613,8 @@ mod tests {
                 who,
                 operation,
             } => {
-                assert_eq!(lock_id, lock.id);
-                assert_eq!(who, lock.who);
+                assert_eq!(lock_id, lock.id());
+                assert_eq!(who, lock.who());
                 assert_eq!(operation, "apply");
             }
             _ => panic!("Expected Locked error"),

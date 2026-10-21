@@ -16,7 +16,9 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use carina_state::backends::S3Backend;
-use carina_state::{BackendError, LockInfo, StateBackend, StateFile};
+use carina_state::{BackendError, StateBackend, StateFile};
+use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
 use winterbaume_core::MockAws;
 use winterbaume_s3::S3Service;
 
@@ -63,6 +65,36 @@ async fn mock_backend_with_client() -> (S3Backend, Client) {
 /// the lock object out-of-band.
 fn lock_key() -> String {
     format!("{TEST_KEY}.lock")
+}
+
+#[derive(Serialize)]
+struct TestLockFile {
+    id: String,
+    operation: String,
+    who: &'static str,
+    created: DateTime<Utc>,
+    expires: DateTime<Utc>,
+}
+
+impl TestLockFile {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn is_expired(&self) -> bool {
+        Utc::now() > self.expires
+    }
+}
+
+fn test_lock(operation: &str, timeout_secs: i64) -> TestLockFile {
+    let now = Utc::now();
+    TestLockFile {
+        id: uuid::Uuid::new_v4().to_string(),
+        operation: operation.to_string(),
+        who: "test@localhost",
+        created: now,
+        expires: now + Duration::seconds(timeout_secs),
+    }
 }
 
 #[tokio::test]
@@ -353,7 +385,8 @@ async fn acquire_lock_conflicts_with_held_lock() {
             lock_id, operation, ..
         } => {
             assert_eq!(
-                lock_id, first.id,
+                lock_id,
+                first.id(),
                 "Locked error must report the holder's id"
             );
             assert_eq!(
@@ -378,7 +411,7 @@ async fn acquire_lock_takes_over_expired_lock() {
     backend.init().await.unwrap();
 
     // Plant an expired lock under the same key the backend uses.
-    let expired = LockInfo::with_timeout("apply", -60);
+    let expired = test_lock("apply", -60);
     assert!(
         expired.is_expired(),
         "precondition: planted lock is expired"
@@ -397,10 +430,11 @@ async fn acquire_lock_takes_over_expired_lock() {
     // acquire_lock sees the expired lock and replaces it with a fresh one.
     let taken_over = backend.acquire_lock("plan").await.unwrap();
     assert_ne!(
-        taken_over.id, expired.id,
+        taken_over.id(),
+        expired.id(),
         "takeover must mint a new lock id, not reuse the expired holder's",
     );
-    assert_eq!(taken_over.operation, "plan");
+    assert_eq!(taken_over.operation(), "plan");
     assert!(
         !taken_over.is_expired(),
         "the taken-over lock must have a fresh, non-expired TTL",
@@ -422,8 +456,8 @@ async fn renew_lock_rejects_when_lock_was_replaced() {
     let original = backend.acquire_lock("apply").await.unwrap();
 
     // Replace the lock object out-of-band with a different lock id.
-    let usurper = LockInfo::new("plan");
-    assert_ne!(usurper.id, original.id);
+    let usurper = test_lock("plan", 3600);
+    assert_ne!(usurper.id(), original.id());
     let body = serde_json::to_vec(&usurper).unwrap();
     client
         .put_object()

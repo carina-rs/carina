@@ -119,6 +119,16 @@ pub struct ShutdownToken {
     test_channel_identity: Arc<()>,
 }
 
+/// Write capability for an operation-local graceful-shutdown child.
+///
+/// Requesting this trigger does not advance the command supervisor or its
+/// parent token. It only asks work using the derived token to stop dispatching
+/// new operations and drain work already in flight.
+#[derive(Clone, Debug)]
+pub struct GracefulShutdownTrigger {
+    graceful: CancellationToken,
+}
+
 /// Private write capability owned only by [`supervise_shutdown_events`].
 #[derive(Clone, Debug)]
 struct ShutdownTrigger {
@@ -173,6 +183,24 @@ impl ShutdownToken {
         shutdown_channel().1
     }
 
+    /// Derive a token that observes this command's shutdown phases and also
+    /// has one operation-local graceful-shutdown trigger.
+    pub fn with_graceful_shutdown_trigger(&self) -> (GracefulShutdownTrigger, Self) {
+        let graceful = self.graceful.child_token();
+        (
+            GracefulShutdownTrigger {
+                graceful: graceful.clone(),
+            },
+            Self {
+                graceful,
+                cleanup_priority: self.cleanup_priority.clone(),
+                state_flush_budget_expired: self.state_flush_budget_expired.clone(),
+                #[cfg(any(test, feature = "test-shutdown"))]
+                test_channel_identity: Arc::clone(&self.test_channel_identity),
+            },
+        )
+    }
+
     /// Inspect the current shutdown phase as one exhaustive state.
     pub fn phase(&self) -> ShutdownPhase {
         if self.cleanup_priority.is_cancelled() {
@@ -197,6 +225,13 @@ impl ShutdownToken {
     /// Wait until state flushing must yield the remaining budget to lock release.
     pub async fn state_flush_budget_expired(&self) {
         self.state_flush_budget_expired.cancelled().await;
+    }
+}
+
+impl GracefulShutdownTrigger {
+    /// Ask users of the derived token to stop new dispatch and drain in-flight work.
+    pub fn request_graceful_shutdown(&self) {
+        self.graceful.cancel();
     }
 }
 
@@ -426,6 +461,17 @@ mod tests {
             "cleanup must finish before GitHub Actions sends SIGKILL 2.5s after SIGTERM"
         );
         assert_eq!(duration_for_log(CLEANUP_DEADLINE), "2 seconds");
+    }
+
+    #[test]
+    fn operation_local_trigger_cancels_only_the_derived_token() {
+        let root = ShutdownToken::running();
+        let (trigger, derived) = root.with_graceful_shutdown_trigger();
+
+        trigger.request_graceful_shutdown();
+
+        assert_eq!(derived.phase(), ShutdownPhase::Graceful);
+        assert_eq!(root.phase(), ShutdownPhase::Running);
     }
 
     #[tokio::test]

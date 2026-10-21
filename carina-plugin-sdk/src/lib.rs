@@ -55,7 +55,11 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
 
 use carina_provider_protocol::jsonrpc::{Notification, Request, Response};
 use carina_provider_protocol::methods;
-use carina_provider_protocol::types::*;
+use carina_provider_protocol::types::{
+    AttributeType, CompletionValue, CreateRequest, DeleteRequest, OperationConfig, PersistedState,
+    PersistedValue, ProviderError, ProviderErrorKind, ProviderInfo, ReadRequest, Resource,
+    ResourceId, ResourceSchema, State, TypeIdentity, UpdateRequest, Value,
+};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
@@ -80,9 +84,71 @@ pub enum BindingPattern {
     },
 }
 
+/// Provider-owned continuation for an operation that has not settled yet.
+///
+/// A create, update, delete, or poll call is one short step that must finish
+/// well under the host's per-call hard timeout; providers must never run an
+/// in-call waiter. A poll may return another `Pending`. The host supplies the
+/// original request on every poll, so `token` must contain only opaque
+/// continuation metadata and must never contain request or secret data.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Pending<T> {
+    pub token: T,
+    pub poll_after_secs: u32,
+}
+
+/// SDK result of one create step.
+#[derive(Debug)]
+pub enum CreateOutcome<T> {
+    Done(carina_provider_protocol::CreateOutcome),
+    Pending(Pending<T>),
+}
+
+/// SDK result of one update step.
+#[derive(Debug)]
+pub enum UpdateOutcome<T> {
+    Done(carina_provider_protocol::UpdateOutcome),
+    Pending(Pending<T>),
+}
+
+/// SDK result of one delete step.
+#[derive(Debug)]
+pub enum DeleteOutcome<T> {
+    Deleted,
+    Pending(Pending<T>),
+}
+
+/// Token type for an operation kind that this provider can never defer.
+#[derive(Debug)]
+pub enum Never {}
+
+impl serde::Serialize for Never {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match *self {}
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Never {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Err(serde::de::Error::custom(
+            "Never is uninhabited and cannot be deserialized",
+        ))
+    }
+}
+
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
+    type CreateToken: serde::Serialize + serde::de::DeserializeOwned;
+    type UpdateToken: serde::Serialize + serde::de::DeserializeOwned;
+    type DeleteToken: serde::Serialize + serde::de::DeserializeOwned;
+
     /// Return provider name and display name.
     fn info(&self) -> ProviderInfo;
 
@@ -142,32 +208,81 @@ pub trait CarinaProvider {
     /// delegate to a state-only read against `resource.id`.
     fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError>;
 
-    /// Create a new resource.
+    /// Perform one short create step.
+    ///
+    /// Return [`CreateOutcome::Pending`] when the external operation has not
+    /// settled. Do not wait or poll inside this call; it must finish well under
+    /// the host's per-call hard timeout.
     fn create(
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> Result<CreateOutcome, ProviderError>;
+    ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError>;
 
-    /// Update an existing resource.
+    /// Perform one short poll step for a pending create operation.
+    ///
+    /// The host passes the original request on every poll. This method may
+    /// return [`CreateOutcome::Pending`] again and must not wait in-call.
+    fn poll_create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+        pending: Pending<Self::CreateToken>,
+    ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError>;
+
+    /// Perform one short update step.
     ///
     /// Providers MUST NOT modify any attribute that is not represented in
     /// `request.patch.ops`. The patch is the sole source of truth for the
     /// update payload.
+    ///
+    /// Return [`UpdateOutcome::Pending`] when the external operation has not
+    /// settled. Do not wait or poll inside this call; it must finish well under
+    /// the host's per-call hard timeout.
     fn update(
         &self,
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> Result<UpdateOutcome, ProviderError>;
+    ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
 
-    /// Delete an existing resource.
+    /// Perform one short poll step for a pending update operation.
+    ///
+    /// The host passes the original request and identifier on every poll. This
+    /// method may return [`UpdateOutcome::Pending`] again and must not wait
+    /// in-call.
+    fn poll_update(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        request: UpdateRequest,
+        pending: Pending<Self::UpdateToken>,
+    ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
+
+    /// Perform one short delete step.
+    ///
+    /// Return [`DeleteOutcome::Pending`] when the external operation has not
+    /// settled. Do not wait or poll inside this call; it must finish well under
+    /// the host's per-call hard timeout.
     fn delete(
         &self,
         id: &ResourceId,
         identifier: &str,
         request: DeleteRequest,
-    ) -> Result<(), ProviderError>;
+    ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError>;
+
+    /// Perform one short poll step for a pending delete operation.
+    ///
+    /// The host passes the original request and identifier on every poll. This
+    /// method may return [`DeleteOutcome::Pending`] again and must not wait
+    /// in-call.
+    fn poll_delete(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        request: DeleteRequest,
+        pending: Pending<Self::DeleteToken>,
+    ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError>;
 
     /// Permissions this provider needs to perform `op` on `id`.
     /// Empty vec means the provider declares no permissions for this resource/op pair.
@@ -245,6 +360,7 @@ pub trait CarinaProvider {
 /// }
 /// ```
 pub fn run(mut provider: impl CarinaProvider) {
+    let operation_configs = operation_config_map(provider.schemas());
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = stdin.lock();
@@ -281,7 +397,7 @@ pub fn run(mut provider: impl CarinaProvider) {
             }
         };
 
-        let response = dispatch(&mut provider, &request);
+        let response = dispatch(&mut provider, &operation_configs, &request);
 
         let resp_json = serde_json::to_string(&response).expect("Failed to serialize response");
         writeln!(writer, "{resp_json}").expect("Failed to write response");
@@ -294,7 +410,148 @@ pub fn run(mut provider: impl CarinaProvider) {
     }
 }
 
-fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
+fn operation_config_map(schemas: Vec<ResourceSchema>) -> HashMap<String, OperationConfig> {
+    schemas
+        .into_iter()
+        .map(|schema| {
+            (
+                schema.resource_type,
+                schema.operation_config.unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn operation_budget(
+    operation_configs: &HashMap<String, OperationConfig>,
+    id: &ResourceId,
+    kind: carina_provider_protocol::OperationKind,
+) -> std::time::Duration {
+    operation_configs.get(&id.resource_type).map_or(
+        carina_provider_protocol::DEFAULT_OPERATION_BUDGET,
+        |config| config.budget(kind),
+    )
+}
+
+fn operation_timeout(id: &ResourceId, operation: &'static str) -> ProviderError {
+    ProviderError {
+        kind: ProviderErrorKind::Timeout,
+        message: format!("provider {operation} operation exceeded its schema budget"),
+        resource_id: Some(id.clone()),
+        cause: None,
+        provider_name: None,
+        operation: Some(operation.to_string()),
+        status: None,
+        code: None,
+        request_id: None,
+    }
+}
+
+trait DrivenOutcome {
+    type Output;
+    type PendingState;
+
+    fn into_step(self)
+    -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState>;
+}
+
+impl<T> DrivenOutcome for CreateOutcome<T> {
+    type Output = carina_provider_protocol::CreateOutcome;
+    type PendingState = Pending<T>;
+
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
+        match self {
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(outcome),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.poll_after_secs,
+                pending,
+            },
+        }
+    }
+}
+
+impl<T> DrivenOutcome for UpdateOutcome<T> {
+    type Output = carina_provider_protocol::UpdateOutcome;
+    type PendingState = Pending<T>;
+
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
+        match self {
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(outcome),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.poll_after_secs,
+                pending,
+            },
+        }
+    }
+}
+
+impl<T> DrivenOutcome for DeleteOutcome<T> {
+    type Output = ();
+    type PendingState = Pending<T>;
+
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
+        match self {
+            Self::Deleted => carina_provider_protocol::OperationStep::Done(()),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.poll_after_secs,
+                pending,
+            },
+        }
+    }
+}
+
+fn block_on_ready<F: std::future::Future>(future: F) -> F::Output {
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    let mut future = std::pin::pin!(future);
+    match std::future::Future::poll(future.as_mut(), &mut context) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => {
+            unreachable!("the blocking JSON-RPC driver only supplies ready futures")
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn drive_operation<Outcome, Initial, Poll>(
+    id: &ResourceId,
+    operation: &'static str,
+    budget: std::time::Duration,
+    initial: Initial,
+    mut poll: Poll,
+) -> Result<Outcome::Output, ProviderError>
+where
+    Outcome: DrivenOutcome,
+    Initial: FnOnce() -> Result<Outcome, ProviderError>,
+    Poll: FnMut(Outcome::PendingState) -> Result<Outcome, ProviderError>,
+{
+    let outcome = block_on_ready(carina_provider_protocol::drive_pending(
+        budget,
+        async move { initial().map(DrivenOutcome::into_step) },
+        |pending| std::future::ready(poll(pending).map(DrivenOutcome::into_step)),
+        |delay| {
+            std::thread::sleep(delay);
+            std::future::ready(())
+        },
+    ))?;
+    match outcome {
+        carina_provider_protocol::DriveOutcome::Done(output) => Ok(output),
+        carina_provider_protocol::DriveOutcome::OverBudget => Err(operation_timeout(id, operation)),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn dispatch(
+    provider: &mut impl CarinaProvider,
+    operation_configs: &HashMap<String, OperationConfig>,
+    request: &Request,
+) -> Response {
     let id = request.id;
 
     match request.method.as_str() {
@@ -345,7 +602,18 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.create(&params.id, params.request) {
+            let budget = operation_budget(
+                operation_configs,
+                &params.id,
+                carina_provider_protocol::OperationKind::Create,
+            );
+            match drive_operation(
+                &params.id,
+                "create",
+                budget,
+                || provider.create(&params.id, params.request.clone()),
+                |pending| provider.poll_create(&params.id, params.request.clone(), pending),
+            ) {
                 Ok(outcome) => Response::success(id, methods::CreateResult { outcome }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -356,7 +624,25 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.update(&params.id, &params.identifier, params.request) {
+            let budget = operation_budget(
+                operation_configs,
+                &params.id,
+                carina_provider_protocol::OperationKind::Update,
+            );
+            match drive_operation(
+                &params.id,
+                "update",
+                budget,
+                || provider.update(&params.id, &params.identifier, params.request.clone()),
+                |pending| {
+                    provider.poll_update(
+                        &params.id,
+                        &params.identifier,
+                        params.request.clone(),
+                        pending,
+                    )
+                },
+            ) {
                 Ok(outcome) => Response::success(id, methods::UpdateResult { outcome }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -367,7 +653,25 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.delete(&params.id, &params.identifier, params.request) {
+            let budget = operation_budget(
+                operation_configs,
+                &params.id,
+                carina_provider_protocol::OperationKind::Delete,
+            );
+            match drive_operation(
+                &params.id,
+                "delete",
+                budget,
+                || provider.delete(&params.id, &params.identifier, params.request.clone()),
+                |pending| {
+                    provider.poll_delete(
+                        &params.id,
+                        &params.identifier,
+                        params.request.clone(),
+                        pending,
+                    )
+                },
+            ) {
                 Ok(()) => Response::success(id, methods::DeleteResult { ok: true }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -428,6 +732,347 @@ fn parse_params<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn never_token_decode_always_fails() {
+        for encoded in ["null", "{}", "0", "\"token\""] {
+            assert!(serde_json::from_str::<Never>(encoded).is_err());
+        }
+        assert!(
+            serde_json::from_str::<Pending<Never>>(r#"{"token":null,"poll_after_secs":1}"#,)
+                .is_err()
+        );
+    }
+
+    struct PendingDispatchProvider {
+        create_polls: std::cell::Cell<usize>,
+        create_pending_polls: u8,
+        schemas: Vec<ResourceSchema>,
+    }
+
+    impl Default for PendingDispatchProvider {
+        fn default() -> Self {
+            Self {
+                create_polls: std::cell::Cell::new(0),
+                create_pending_polls: 1,
+                schemas: Vec::new(),
+            }
+        }
+    }
+
+    impl PendingDispatchProvider {
+        fn with_pending_polls_and_schemas(
+            create_pending_polls: u8,
+            schemas: Vec<ResourceSchema>,
+        ) -> Self {
+            Self {
+                create_polls: std::cell::Cell::new(0),
+                create_pending_polls,
+                schemas,
+            }
+        }
+
+        fn completed_create(id: &ResourceId) -> CreateOutcome<u8> {
+            CreateOutcome::Done(protocol::CreateOutcome::Success {
+                state: State {
+                    id: id.clone(),
+                    identifier: Some("created".to_string()),
+                    attributes: HashMap::new(),
+                    exists: true,
+                },
+            })
+        }
+    }
+
+    impl CarinaProvider for PendingDispatchProvider {
+        type CreateToken = u8;
+        type UpdateToken = Never;
+        type DeleteToken = Never;
+
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                name: "pending-dispatch".to_string(),
+                display_name: "Pending Dispatch".to_string(),
+                capabilities: Vec::new(),
+                version: "0.0.0".to_string(),
+            }
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            self.schemas.clone()
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attrs: &HashMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn read(
+            &self,
+            _id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> Result<State, ProviderError> {
+            unreachable!("read is not used by this test")
+        }
+
+        fn read_data_source(&self, _resource: &Resource) -> Result<State, ProviderError> {
+            unreachable!("read_data_source is not used by this test")
+        }
+
+        fn create(
+            &self,
+            id: &ResourceId,
+            _request: CreateRequest,
+        ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError> {
+            if self.create_pending_polls == 0 {
+                return Ok(Self::completed_create(id));
+            }
+            Ok(CreateOutcome::Pending(Pending {
+                token: self.create_pending_polls,
+                poll_after_secs: 1,
+            }))
+        }
+
+        fn poll_create(
+            &self,
+            id: &ResourceId,
+            _request: CreateRequest,
+            pending: Pending<Self::CreateToken>,
+        ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError> {
+            self.create_polls.set(self.create_polls.get() + 1);
+            if pending.token > 1 {
+                return Ok(CreateOutcome::Pending(Pending {
+                    token: pending.token - 1,
+                    poll_after_secs: 1,
+                }));
+            }
+            Ok(Self::completed_create(id))
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
+            unreachable!("update is not used by this test")
+        }
+
+        fn poll_update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+            pending: Pending<Self::UpdateToken>,
+        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
+            match pending.token {}
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
+            unreachable!("delete is not used by this test")
+        }
+
+        fn poll_delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+            pending: Pending<Self::DeleteToken>,
+        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
+            match pending.token {}
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn operation_schema(resource_type: &str, create_timeout_secs: u64) -> ResourceSchema {
+        ResourceSchema {
+            resource_type: resource_type.to_string(),
+            attributes: HashMap::new(),
+            description: None,
+            kind: types::SchemaKind::Managed,
+            unique_name: types::UniqueNameSpec::default(),
+            operation_config: Some(OperationConfig {
+                create_timeout_secs: Some(create_timeout_secs),
+                ..OperationConfig::default()
+            }),
+            validators: Vec::new(),
+            exclusive_required: Vec::new(),
+            defs: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn json_rpc_dispatch_drives_pending_create_to_settled_wire_outcome() {
+        let mut provider = PendingDispatchProvider::default();
+        let operation_configs = operation_config_map(provider.schemas());
+        let id = ResourceId {
+            provider: "mock".to_string(),
+            resource_type: "test.resource".to_string(),
+            identity: "one".to_string(),
+        };
+        let request = Request::new(
+            7,
+            "create",
+            methods::CreateParams {
+                id: id.clone(),
+                request: CreateRequest {
+                    resource: Resource {
+                        id,
+                        attributes: HashMap::new(),
+                        directives: protocol::Directives::default(),
+                    },
+                },
+            },
+        );
+
+        let response = dispatch(&mut provider, &operation_configs, &request);
+
+        assert!(response.error.is_none(), "{response:?}");
+        let result: methods::CreateResult = serde_json::from_value(
+            response
+                .result
+                .expect("successful response must have a result"),
+        )
+        .expect("JSON-RPC create result must retain the settled wire shape");
+        assert!(matches!(
+            result.outcome,
+            protocol::CreateOutcome::Success { .. }
+        ));
+        assert_eq!(provider.create_polls.get(), 1);
+    }
+
+    #[test]
+    fn json_rpc_dispatch_allows_create_to_settle_on_final_poll_at_deadline() {
+        let resource_type = "test.short_budget";
+        let mut provider = PendingDispatchProvider::with_pending_polls_and_schemas(
+            2,
+            vec![operation_schema(resource_type, 2)],
+        );
+        let operation_configs = operation_config_map(provider.schemas());
+        let id = ResourceId {
+            provider: "mock".to_string(),
+            resource_type: resource_type.to_string(),
+            identity: "final-deadline-poll".to_string(),
+        };
+        let request = Request::new(
+            8,
+            "create",
+            methods::CreateParams {
+                id: id.clone(),
+                request: CreateRequest {
+                    resource: Resource {
+                        id,
+                        attributes: HashMap::new(),
+                        directives: protocol::Directives::default(),
+                    },
+                },
+            },
+        );
+
+        let response = dispatch(&mut provider, &operation_configs, &request);
+
+        assert!(response.error.is_none(), "{response:?}");
+        let result: methods::CreateResult = serde_json::from_value(
+            response
+                .result
+                .expect("successful response must have a result"),
+        )
+        .expect("JSON-RPC create result must retain the settled wire shape");
+        assert!(matches!(
+            result.outcome,
+            protocol::CreateOutcome::Success { .. }
+        ));
+        assert_eq!(provider.create_polls.get(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn schemas_configure_operation_budget_lookup_for_resource_type() {
+        let resource_type = "test.short_budget";
+        let provider = PendingDispatchProvider::with_pending_polls_and_schemas(
+            2,
+            vec![operation_schema(resource_type, 1)],
+        );
+        let operation_configs = operation_config_map(provider.schemas());
+        let id = ResourceId {
+            provider: "mock".to_string(),
+            resource_type: resource_type.to_string(),
+            identity: "over-budget".to_string(),
+        };
+        let request = CreateRequest {
+            resource: Resource {
+                id: id.clone(),
+                attributes: HashMap::new(),
+                directives: protocol::Directives::default(),
+            },
+        };
+        let budget = operation_budget(
+            &operation_configs,
+            &id,
+            carina_provider_protocol::OperationKind::Create,
+        );
+
+        assert_eq!(budget, std::time::Duration::from_secs(1));
+        let error = drive_operation::<CreateOutcome<u8>, _, _>(
+            &id,
+            "create",
+            budget,
+            || provider.create(&id, request.clone()),
+            |pending| provider.poll_create(&id, request.clone(), pending),
+        )
+        .expect_err("the schema-configured budget should expire before the second poll");
+
+        assert_eq!(error.kind, ProviderErrorKind::Timeout);
+        assert_eq!(provider.create_polls.get(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn json_rpc_operation_budget_includes_initial_call() {
+        let id = ResourceId {
+            provider: "mock".to_string(),
+            resource_type: "test.resource".to_string(),
+            identity: "slow-initial-call".to_string(),
+        };
+        let polls = std::cell::Cell::new(0);
+
+        let error = drive_operation::<CreateOutcome<u8>, _, _>(
+            &id,
+            "create",
+            std::time::Duration::from_millis(1),
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                Ok(CreateOutcome::Pending(Pending {
+                    token: 1,
+                    poll_after_secs: 0,
+                }))
+            },
+            |pending| {
+                polls.set(polls.get() + 1);
+                Ok(CreateOutcome::Pending(pending))
+            },
+        )
+        .expect_err("the initial call should consume the whole operation budget");
+
+        assert_eq!(error.kind, ProviderErrorKind::Timeout);
+        assert_eq!(polls.get(), 0, "an over-budget operation must not poll");
+    }
 
     #[test]
     fn parse_resource_id_standard() {

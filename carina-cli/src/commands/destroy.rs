@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,9 @@ use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
-use carina_state::{LockInfo, StateBackend, StateFile};
+#[cfg(test)]
+use carina_state::LockInfo;
+use carina_state::{StateBackend, StateFile};
 
 use carina_core::parser::ProviderContext;
 
@@ -38,12 +41,15 @@ use crate::commands::plan::{
     ProviderUpstreamScope, UpstreamMissingStatePolicy, load_and_resolve_provider_configs,
 };
 use crate::commands::shared::finalize::{
-    StatePersistence, finalize_after_execute, release_lock_after_execute,
+    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
+};
+use crate::commands::shared::lock_heartbeat::{
+    HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
 };
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
-use crate::commands::shared::retry::{WaitResult, is_retryable_delete_error, wait_for_deletion};
+use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
     DestroyedInstance, apply_destroy_to_state, apply_name_overrides, build_orphan_resource,
 };
@@ -92,10 +98,11 @@ pub async fn run_destroy(
     // state file may still need to be destroyed.
 
     // Check for backend configuration - use local backend by default
-    let backend: Box<dyn StateBackend> = verified_backend
+    let backend: Arc<dyn StateBackend> = verified_backend
         .resolve()
         .await
-        .map_err(AppError::Backend)?;
+        .map_err(AppError::Backend)?
+        .into();
 
     // Get the state bucket name for protection check (S3 backend only)
     let protected_bucket = verified_backend
@@ -103,14 +110,14 @@ pub async fn run_destroy(
         .map(|settings| settings.bucket().to_owned());
 
     // Acquire lock (unless --lock=false)
-    let lock_info: Option<LockInfo> = if lock {
+    let state_lock = if lock {
         println!("{}", "Acquiring state lock...".cyan());
         let li = backend
             .acquire_lock("destroy")
             .await
             .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
-        Some(li)
+        StateLock::held(li)
     } else {
         println!(
             "{}",
@@ -118,15 +125,15 @@ pub async fn run_destroy(
                 .yellow()
                 .bold()
         );
-        None
+        StateLock::disabled_by_cli_flag()
     };
 
-    let op_result = run_destroy_locked(
+    let outcome = run_destroy_locked_owned(
         &mut parsed,
         auto_approve,
-        backend.as_ref(),
+        Arc::clone(&backend),
         protected_bucket,
-        lock_info.as_ref(),
+        state_lock,
         refresh,
         force,
         base_dir,
@@ -135,46 +142,39 @@ pub async fn run_destroy(
         cancel.clone(),
     )
     .await;
-
-    // Always release lock if it was acquired
-    if let Some(ref li) = lock_info {
-        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
-
-        if release_result.is_ok()
-            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-        {
-            println!("  {} Lock released", "✓".green());
-        }
-
-        op_result?;
-        release_result?;
-    } else {
-        op_result?;
-    }
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked(
+async fn run_destroy_locked_owned(
     parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
-    backend: &dyn StateBackend,
+    backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
-    lock: Option<&LockInfo>,
+    lock: StateLock,
     refresh: bool,
     force: bool,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
-) -> Result<(), AppError> {
+) -> LockCommandOutcome<Result<(), AppError>> {
     // Provider declaration metadata is sufficient for schema/factory wiring;
     // construction attributes are resolved after state reconciliation below.
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (factories, _) = match build_factories_from_providers(&parsed.providers, base_dir) {
+        Ok(factories) => factories,
+        Err(error) => {
+            return LockCommandOutcome::Kept {
+                result: Err(error),
+                lock,
+            };
+        }
+    };
     let ctx = WiringContext::new(factories, &parsed.providers);
 
-    run_destroy_locked_with_ctx(
+    run_destroy_locked_with_ctx_owned(
         parsed,
         auto_approve,
         backend,
@@ -191,13 +191,28 @@ async fn run_destroy_locked(
     .await
 }
 
+enum DestroyAfterHeartbeat {
+    Done,
+    Executed(Box<DestroyExecuted>),
+}
+
+struct DestroyExecuted {
+    state_file: Option<StateFile>,
+    destroyed_instances: Vec<DestroyedInstance>,
+    success_count: usize,
+    failure_count: usize,
+    skip_count: usize,
+    cancelled: bool,
+    cancel: ShutdownToken,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_with_ctx(
+async fn run_destroy_locked_with_ctx_owned(
     parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
-    backend: &dyn StateBackend,
+    backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
-    lock: Option<&LockInfo>,
+    lock: StateLock,
     refresh: bool,
     force: bool,
     base_dir: &std::path::Path,
@@ -205,13 +220,30 @@ async fn run_destroy_locked_with_ctx(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
     ctx: &WiringContext,
-) -> Result<(), AppError> {
+) -> LockCommandOutcome<Result<(), AppError>> {
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
     // `apply::load_state_persist_if_migrated`.
-    let mut state_file =
-        crate::commands::apply::load_state_persist_if_migrated(backend, lock).await?;
+    let mut state_file = match crate::commands::apply::load_state_persist_if_migrated(
+        backend.as_ref(),
+        lock.as_ref(),
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => {
+            return LockCommandOutcome::Kept {
+                result: Err(error),
+                lock,
+            };
+        }
+    };
+    let heartbeat = with_lock_heartbeat(
+        Arc::clone(&backend),
+        lock,
+        cancel,
+        async |cancel| {
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     let state_block_claims = crate::wiring::resolve_state_block_claims(
@@ -587,7 +619,7 @@ async fn run_destroy_locked_with_ctx(
         && prevent_destroy_resources.is_empty()
     {
         println!("{}", "No resources to destroy.".green());
-        return Ok(());
+        return Ok(DestroyAfterHeartbeat::Done);
     }
 
     // Build a Plan from the delete effects for tree display
@@ -668,7 +700,7 @@ async fn run_destroy_locked_with_ctx(
             "{}",
             "All resources are protected. Nothing to destroy.".yellow()
         );
-        return Ok(());
+        return Ok(DestroyAfterHeartbeat::Done);
     }
 
     // Confirmation prompt
@@ -700,7 +732,7 @@ async fn run_destroy_locked_with_ctx(
         if input.trim() != "yes" {
             println!();
             println!("{}", "Destroy cancelled.".yellow());
-            return Ok(());
+            return Ok(DestroyAfterHeartbeat::Done);
         }
         println!();
     }
@@ -723,9 +755,6 @@ async fn run_destroy_locked_with_ctx(
     let mut destroyed_instances: Vec<DestroyedInstance> = Vec::new();
     let mut failed_indices: HashSet<usize> = HashSet::new();
     let mut cancelled = false;
-    // timed_out_resources: delete index -> (resolved id, identifier, generation)
-    let mut timed_out_resources: HashMap<usize, (ResolvedResourceId, String, EffectGeneration)> =
-        HashMap::new();
 
     let destroy_total = delete_effects.len();
     let completed_counter = AtomicUsize::new(0);
@@ -807,7 +836,7 @@ async fn run_destroy_locked_with_ctx(
 
                 let (_binding, effect) = &resource_info[idx];
 
-                // Check if any dependent has actually failed (non-timeout)
+                // Check if any dependent has failed.
                 if let Some(failed_dep_idx) = delete_dependency_in_set(
                     idx,
                     &dependency_analysis,
@@ -822,110 +851,6 @@ async fn run_destroy_locked_with_ctx(
                         "⊘".yellow(),
                         format_effect(effect),
                         failed_dep,
-                        counter
-                    );
-                    if let Some(pb) = spinners.remove(&idx) {
-                        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                        pb.finish_with_message(msg);
-                    } else {
-                        eprintln!("  {}", msg);
-                    }
-                    skip_count += 1;
-                    failed_indices.insert(idx);
-                    completed_indices.insert(idx);
-                    continue;
-                }
-
-                // Check if any dependent timed out -- wait for it to complete
-                let timed_out_deps = delete_dependencies_in_set(
-                    idx,
-                    &dependency_analysis,
-                    delete_count,
-                    timed_out_resources.keys().copied().collect(),
-                );
-
-                let mut wait_failed = false;
-                for dep_idx in &timed_out_deps {
-                    if let Some((dep_id, dep_identifier, dep_generation)) =
-                        timed_out_resources.remove(dep_idx)
-                    {
-                        multi
-                            .println(format!(
-                                "  {} Waiting for {} to be deleted...",
-                                "⏳".yellow(),
-                                dep_id
-                            ))
-                            .ok();
-
-                        let wait_result = wait_for_deletion(
-                            &cleanup_loop,
-                            &provider,
-                            &dep_id,
-                            &dep_identifier,
-                            180,
-                            std::time::Duration::from_secs(10),
-                        )
-                        .await;
-                        match wait_result {
-                            WaitResult::Abandoned => {
-                                cancelled = true;
-                                break 'destroy;
-                            }
-                            WaitResult::Deleted => {
-                                multi
-                                    .println(format!(
-                                        "  {} Delete {} (completed after extended wait)",
-                                        "✓".green(),
-                                        dep_id
-                                    ))
-                                    .ok();
-                                destroyed_instances.push(DestroyedInstance {
-                                    id: dep_id.clone(),
-                                    generation: dep_generation,
-                                });
-                                success_count += 1;
-                            }
-                            WaitResult::ReadError(msg) => {
-                                multi
-                                    .println(format!("  {} Delete {}", "✗".red(), dep_id))
-                                    .ok();
-                                multi
-                                    .println(format!(
-                                        "      {} {}",
-                                        "→".red(),
-                                        format!("read error during wait: {}", msg).red()
-                                    ))
-                                    .ok();
-                                failed_indices.insert(*dep_idx);
-                                failure_count += 1;
-                                wait_failed = true;
-                            }
-                            WaitResult::TimedOut => {
-                                multi
-                                    .println(format!("  {} Delete {}", "✗".red(), dep_id))
-                                    .ok();
-                                multi
-                                    .println(format!(
-                                        "      {} {}",
-                                        "→".red(),
-                                        "still exists after extended wait".red()
-                                    ))
-                                    .ok();
-                                failed_indices.insert(*dep_idx);
-                                failure_count += 1;
-                                wait_failed = true;
-                            }
-                        }
-                    }
-                }
-
-                if wait_failed {
-                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    let counter = format!("{}/{}", c, destroy_total).dimmed();
-                    let msg = format!(
-                        "{} {} - skipped (dependent deletion did not complete) {}",
-                        "⊘".yellow(),
-                        format_effect(effect),
                         counter
                     );
                     if let Some(pb) = spinners.remove(&idx) {
@@ -977,14 +902,7 @@ async fn run_destroy_locked_with_ctx(
                         )
                         .await;
                     observe_destroy_result_ready_for_tests(result_shutdown).await;
-                    (
-                        idx,
-                        resource_id,
-                        identifier,
-                        generation,
-                        started,
-                        delete_result,
-                    )
+                    (idx, resource_id, generation, started, delete_result)
                 });
             }
         }
@@ -1068,8 +986,7 @@ async fn run_destroy_locked_with_ctx(
             cancelled = true;
             continue;
         };
-        let (finished_idx, resource_id, identifier, generation, started, delete_result) = match next
-        {
+        let (finished_idx, resource_id, generation, started, delete_result) = match next {
             CleanupInterrupted::Completed(Some(finished)) => finished,
             CleanupInterrupted::Completed(None) => break 'destroy,
             CleanupInterrupted::Abandoned => {
@@ -1122,15 +1039,6 @@ async fn run_destroy_locked_with_ctx(
                     generation,
                 });
             }
-            Err(carina_core::provider::ProviderError::Timeout(_)) => {
-                let msg = format!(
-                    "{} {} - Operation timed out, waiting for completion...",
-                    "⏳".yellow(),
-                    format_effect(effect)
-                );
-                finish_spinner(&mut spinners, finished_idx, msg);
-                timed_out_resources.insert(finished_idx, (resource_id, identifier, generation));
-            }
             Err(e) => {
                 let retries = retry_counts.get(&finished_idx).copied().unwrap_or(0);
                 let has_pending_or_in_flight = !in_flight.is_empty()
@@ -1175,128 +1083,157 @@ async fn run_destroy_locked_with_ctx(
     }
     drop(in_flight);
 
-    // Handle any remaining timed-out resources that no parent waited on.
-    if !cancelled {
-        for (dep_idx, (dep_id, dep_identifier, dep_generation)) in &timed_out_resources {
-            let cleanup_wait = match cleanup_loop.step() {
-                LoopStep::Continue(wait) => wait,
-                LoopStep::Abandon => {
-                    cancelled = true;
-                    break;
-                }
-            };
-            match cleanup_wait.phase() {
-                LoopShutdownPhase::Running => {}
-                LoopShutdownPhase::Graceful => {
-                    cancelled = true;
-                    break;
-                }
-            }
+    Ok(DestroyAfterHeartbeat::Executed(Box::new(DestroyExecuted {
+        state_file,
+        destroyed_instances,
+        success_count,
+        failure_count,
+        skip_count,
+        cancelled,
+        cancel,
+    })))
+        },
+    )
+    .await;
+    let (heartbeat_result, lock) = match heartbeat {
+        HeartbeatOutcome::Kept { result, lock } => (result, lock),
+        HeartbeatOutcome::Lost {
+            result: _result,
+            lost,
+        } => {
+            return LockCommandOutcome::Lost(AppError::StateLockLost {
+                error: lost.into_error(),
+            });
+        }
+    };
 
-            eprintln!(
-                "  {} Waiting for {} to be deleted...",
-                "⏳".yellow(),
-                dep_id
-            );
+    let op_result = async {
+        match heartbeat_result? {
+            DestroyAfterHeartbeat::Done => Ok(()),
+            DestroyAfterHeartbeat::Executed(context) => {
+                let DestroyExecuted {
+                    state_file,
+                    destroyed_instances,
+                    success_count,
+                    failure_count,
+                    skip_count,
+                    cancelled,
+                    cancel,
+                } = *context;
+                if cancelled && destroyed_instances.is_empty() {
+                    return Err(AppError::Interrupted);
+                }
 
-            let outcome = wait_for_deletion(
-                &cleanup_loop,
-                &provider,
-                dep_id,
-                dep_identifier,
-                180,
-                std::time::Duration::from_secs(10),
-            );
-            tokio::pin!(outcome);
-            let outcome = tokio::select! {
-                biased;
-                outcome = &mut outcome => outcome,
-                _ = cancel.cancelled() => {
-                    cancelled = true;
-                    break;
-                }
-            };
+                println!();
+                println!("{}", "Saving state...".cyan());
 
-            match outcome {
-                WaitResult::Abandoned => {
-                    cancelled = true;
-                    break;
-                }
-                WaitResult::Deleted => {
-                    eprintln!(
-                        "  {} Delete {} (completed after extended wait)",
-                        "✓".green(),
-                        dep_id
+                finalize_after_execute(
+                    |persistence| {
+                        finalize_destroy(
+                            FinalizeDestroyInput {
+                                backend: backend.as_ref(),
+                                lock: lock.as_ref(),
+                                state_file,
+                                destroyed_instances: &destroyed_instances,
+                            },
+                            persistence,
+                        )
+                    },
+                    cancelled,
+                    &cancel,
+                )
+                .await?;
+
+                println!();
+                if failure_count == 0 && skip_count == 0 {
+                    println!(
+                        "{}",
+                        format!("Destroy complete! {} resources destroyed.", success_count)
+                            .green()
+                            .bold()
                     );
-                    destroyed_instances.push(DestroyedInstance {
-                        id: dep_id.clone(),
-                        generation: dep_generation.clone(),
-                    });
-                    success_count += 1;
-                }
-                WaitResult::ReadError(msg) => {
-                    eprintln!("  {} Delete {}", "✗".red(), dep_id);
-                    eprintln!(
-                        "      {} {}",
-                        "→".red(),
-                        format!("read error during wait: {}", msg).red()
-                    );
-                    failed_indices.insert(*dep_idx);
-                    failure_count += 1;
-                }
-                WaitResult::TimedOut => {
-                    eprintln!("  {} Delete {}", "✗".red(), dep_id);
-                    eprintln!(
-                        "      {} {}",
-                        "→".red(),
-                        "still exists after extended wait".red()
-                    );
-                    failed_indices.insert(*dep_idx);
-                    failure_count += 1;
+                    Ok(())
+                } else {
+                    Err(AppError::Config(format!(
+                        "Destroy failed. {} succeeded, {} failed, {} skipped.",
+                        success_count, failure_count, skip_count
+                    )))
                 }
             }
         }
     }
+    .await;
 
-    if cancelled && destroyed_instances.is_empty() {
-        return Err(AppError::Interrupted);
+    LockCommandOutcome::Kept {
+        result: op_result,
+        lock,
     }
+}
 
-    println!();
-    println!("{}", "Saving state...".cyan());
-
-    finalize_after_execute(
-        |persistence| {
-            finalize_destroy(
-                FinalizeDestroyInput {
-                    backend,
-                    lock,
-                    state_file,
-                    destroyed_instances: &destroyed_instances,
-                },
-                persistence,
-            )
-        },
-        cancelled,
-        &cancel,
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_destroy_locked(
+    parsed: &mut carina_core::parser::InferredFile,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    protected_bucket: Option<String>,
+    lock: StateLock,
+    refresh: bool,
+    force: bool,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+    parallelism: NonZeroUsize,
+    cancel: ShutdownToken,
+) -> Result<(), AppError> {
+    let outcome = run_destroy_locked_owned(
+        parsed,
+        auto_approve,
+        Arc::clone(&backend),
+        protected_bucket,
+        lock,
+        refresh,
+        force,
+        base_dir,
+        provider_context,
+        parallelism,
+        cancel.clone(),
     )
-    .await?;
+    .await;
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
+}
 
-    println!();
-    if failure_count == 0 && skip_count == 0 {
-        println!(
-            "{}",
-            format!("Destroy complete! {} resources destroyed.", success_count)
-                .green()
-                .bold()
-        );
-        Ok(())
-    } else {
-        Err(AppError::Config(format!(
-            "Destroy failed. {} succeeded, {} failed, {} skipped.",
-            success_count, failure_count, skip_count
-        )))
-    }
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_destroy_locked_with_ctx(
+    parsed: &mut carina_core::parser::InferredFile,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    protected_bucket: Option<String>,
+    lock: StateLock,
+    refresh: bool,
+    force: bool,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+    parallelism: NonZeroUsize,
+    cancel: ShutdownToken,
+    ctx: &WiringContext,
+) -> Result<(), AppError> {
+    let outcome = run_destroy_locked_with_ctx_owned(
+        parsed,
+        auto_approve,
+        Arc::clone(&backend),
+        protected_bucket,
+        lock,
+        refresh,
+        force,
+        base_dir,
+        provider_context,
+        parallelism,
+        cancel.clone(),
+        ctx,
+    )
+    .await;
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
 }
 
 #[cfg(test)]
@@ -1737,22 +1674,6 @@ fn delete_dependency_in_set(
     })
 }
 
-fn delete_dependencies_in_set(
-    idx: usize,
-    analysis: &DependencyAnalysis,
-    delete_count: usize,
-    candidates: HashSet<usize>,
-) -> Vec<usize> {
-    let mut deps: Vec<_> = candidates
-        .into_iter()
-        .filter(|candidate| {
-            *candidate < delete_count && graph_reaches_delete_idx(*candidate, idx, analysis)
-        })
-        .collect();
-    deps.sort_unstable();
-    deps
-}
-
 fn graph_reaches_delete_idx(start: usize, target: usize, analysis: &DependencyAnalysis) -> bool {
     let mut stack = vec![start];
     let mut seen = HashSet::new();
@@ -1774,7 +1695,7 @@ fn graph_reaches_delete_idx(start: usize, target: usize, analysis: &DependencyAn
 
 pub(crate) struct FinalizeDestroyInput<'a> {
     pub backend: &'a dyn StateBackend,
-    pub lock: Option<&'a LockInfo>,
+    pub lock: StateLockRef<'a>,
     pub state_file: Option<StateFile>,
     pub destroyed_instances: &'a [DestroyedInstance],
 }
@@ -1791,21 +1712,25 @@ pub(crate) async fn finalize_destroy(
     // re-derive exports from a fresh plan. See carina-cli/src/commands/shared/state_writeback.rs.
     apply_destroy_to_state(&mut state, input.destroyed_instances);
 
-    if let Some(lock) = input.lock {
-        crate::commands::apply::save_state_locked_after_execute(
-            input.backend,
-            lock,
-            &mut state,
-            persistence,
-        )
-        .await?;
-    } else {
-        crate::commands::apply::save_state_unlocked_after_execute(
-            input.backend,
-            &mut state,
-            persistence,
-        )
-        .await?;
+    match input.lock {
+        StateLockRef::Held(lock) => {
+            crate::commands::apply::save_state_locked_after_execute(
+                input.backend,
+                lock,
+                &mut state,
+                persistence,
+            )
+            .await?;
+        }
+        StateLockRef::Disabled(disabled) => {
+            crate::commands::apply::save_state_unlocked_after_execute(
+                input.backend,
+                disabled,
+                &mut state,
+                persistence,
+            )
+            .await?;
+        }
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
     Ok(())
@@ -1818,8 +1743,7 @@ mod tests {
         ProviderConfigCaptureFactory, provider_default_tags_local_resource_fixture,
         provider_default_tags_missing_upstream_fixture, provider_upstream_fixture,
     };
-    use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use carina_core::provider::ProviderError;
     use std::sync::{Arc, Mutex};
 
     #[path = "cancellation_fixture.rs"]
@@ -1855,9 +1779,9 @@ mod tests {
         run_destroy_locked_with_ctx(
             &mut parsed,
             true,
-            &backend,
+            std::sync::Arc::new(backend),
             None,
-            None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &downstream,
@@ -1899,9 +1823,9 @@ mod tests {
         run_destroy_locked(
             &mut parsed,
             true,
-            &backend,
+            std::sync::Arc::new(backend),
             None,
-            None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &downstream,
@@ -1930,9 +1854,9 @@ mod tests {
         let error = match run_destroy_locked(
             &mut parsed,
             true,
-            &backend,
+            std::sync::Arc::new(backend),
             None,
-            None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &downstream,
@@ -1962,9 +1886,9 @@ mod tests {
         run_destroy_locked(
             &mut parsed,
             true,
-            &backend,
+            std::sync::Arc::new(backend),
             None,
-            None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &base_dir,
@@ -1984,9 +1908,9 @@ mod tests {
         run_destroy_locked(
             &mut parsed,
             true,
-            &backend,
+            std::sync::Arc::new(backend),
             None,
-            None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &base_dir,
@@ -2103,6 +2027,59 @@ mod tests {
             state.exports.is_empty(),
             "exports must be cleared on partial destroy"
         );
+    }
+
+    #[tokio::test]
+    async fn destroy_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
+        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
+            .lock()
+            .await;
+        let fixture = DestroyCancellationFixture::new()
+            .with_existing_resources(["slow"])
+            .with_delayed_delete("slow", Duration::from_millis(75));
+        let loaded = load_configuration_with_config(
+            fixture.config_path(),
+            fixture.provider_context(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("fixture must load");
+        let mut parsed = loaded.parsed;
+        let base_dir = get_base_dir(fixture.config_path());
+        crate::commands::validate_and_resolve_with_config(
+            &mut parsed,
+            base_dir,
+            true,
+            &loaded.inference_errors,
+            &loaded.duplicate_declarations,
+        )
+        .expect("fixture must validate");
+        let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
+            .expect("mock factory must load");
+        let ctx = WiringContext::new(factories, &parsed.providers);
+        let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
+        let backend = fixture.lock_loss_backend_handle();
+
+        let error = run_destroy_locked_with_ctx(
+            &mut parsed,
+            true,
+            backend.clone(),
+            None,
+            StateLock::held(lock),
+            false,
+            false,
+            base_dir,
+            fixture.provider_context(),
+            NonZeroUsize::new(1).unwrap(),
+            fixture.cancel_token(),
+            &ctx,
+        )
+        .await
+        .expect_err("heartbeat lock loss must fail destroy");
+
+        assert!(matches!(error, AppError::StateLockLost { .. }));
+        assert!(error.to_string().contains("state may be behind the cloud"));
+        assert_eq!(backend.locked_writes(), 0, "lost lock must not save state");
+        assert_eq!(backend.releases(), 0, "lost lock must not be released");
     }
 
     #[tokio::test]
@@ -2309,91 +2286,6 @@ mod tests {
             "a deletion result that was already ready must be harvested before shutdown"
         );
         assert!(!fixture.lock_path().exists(), "lock must be released");
-    }
-
-    /// A mock provider whose `read()` returns a sequence of results.
-    struct SequenceProvider {
-        /// Each call to `read()` pops the next result from this list.
-        /// When exhausted, returns `State::not_found`.
-        call_count: AtomicUsize,
-        responses: Vec<ProviderResult<State>>,
-    }
-
-    impl SequenceProvider {
-        fn new(responses: Vec<ProviderResult<State>>) -> Self {
-            Self {
-                call_count: AtomicUsize::new(0),
-                responses,
-            }
-        }
-    }
-
-    impl Provider for SequenceProvider {
-        fn name(&self) -> &str {
-            "sequence-mock"
-        }
-
-        fn read(
-            &self,
-            id: &ResourceId,
-            _identifier: Option<&str>,
-            _request: carina_core::provider::ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
-            let id = id.clone();
-            Box::pin(async move {
-                if idx < self.responses.len() {
-                    // Recreate the result since ProviderResult is not Clone
-                    match &self.responses[idx] {
-                        Ok(state) => Ok(state.clone()),
-                        Err(e) => Err(ProviderError::api_error(e.to_string())),
-                    }
-                } else {
-                    Ok(State::not_found(id))
-                }
-            })
-        }
-
-        fn read_data_source(
-            &self,
-            resource: &carina_core::provider::ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None, carina_core::provider::ReadRequest)
-        }
-
-        fn create(
-            &self,
-            _id: &ResourceId,
-            _request: carina_core::provider::CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-            Box::pin(async { unreachable!() })
-        }
-
-        fn update(
-            &self,
-            _id: &ResourceId,
-            _identifier: &str,
-            _request: carina_core::provider::UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
-            Box::pin(async { unreachable!() })
-        }
-
-        fn delete(
-            &self,
-            _id: &ResourceId,
-            _identifier: &str,
-            _request: carina_core::provider::DeleteRequest,
-        ) -> BoxFuture<'_, ProviderResult<()>> {
-            Box::pin(async { unreachable!() })
-        }
-
-        fn required_permissions(
-            &self,
-            _id: &ResourceId,
-            _op: carina_core::effect::PlanOp,
-        ) -> ProviderResult<Vec<String>> {
-            Ok(Vec::new())
-        }
     }
 
     #[test]
@@ -2808,217 +2700,5 @@ mod tests {
             state.find_resource("awscc", "ec2.Vpc", "main").is_none(),
             "row should drop only after both current and deposed generations are removed"
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_for_deletion_abandons_when_cleanup_is_prioritized() {
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let existing_state = State::existing(id.clone(), HashMap::new());
-        let provider = SequenceProvider::new(vec![Ok(existing_state)]);
-        let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
-        let cleanup_loop = shutdown.cleanup_aware_loop();
-        let poll_interval = std::time::Duration::from_secs(30);
-
-        let wait = wait_for_deletion(
-            &cleanup_loop,
-            &provider,
-            &id,
-            "some-identifier",
-            100,
-            poll_interval,
-        );
-        tokio::pin!(wait);
-
-        // Poll once to enter the first cleanup-aware wait and register its
-        // sleep without allowing paused time to advance.
-        std::future::poll_fn(|cx| {
-            assert!(
-                std::future::Future::poll(wait.as_mut(), cx).is_pending(),
-                "wait_for_deletion returned before its first poll was in flight"
-            );
-            std::task::Poll::Ready(())
-        })
-        .await;
-        assert_eq!(
-            provider.call_count.load(Ordering::SeqCst),
-            0,
-            "the first provider read must still be waiting on poll_interval"
-        );
-
-        let cleanup_requested_at = tokio::time::Instant::now();
-        trigger.prioritize_cleanup();
-        let result = wait.await;
-        let cleanup_elapsed = cleanup_requested_at.elapsed();
-
-        assert_eq!(result, WaitResult::Abandoned);
-        assert!(
-            cleanup_elapsed < poll_interval,
-            "cleanup priority waited for the full poll interval: {cleanup_elapsed:?}"
-        );
-        assert_eq!(
-            provider.call_count.load(Ordering::SeqCst),
-            0,
-            "cleanup priority must abandon the in-flight sleep before provider.read"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_for_deletion_abandons_before_polling_when_cleanup_is_already_prioritized() {
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let provider = SequenceProvider::new(Vec::new());
-        let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
-        let cleanup_loop = shutdown.cleanup_aware_loop();
-        trigger.prioritize_cleanup();
-
-        let started_at = tokio::time::Instant::now();
-        let result = wait_for_deletion(
-            &cleanup_loop,
-            &provider,
-            &id,
-            "some-identifier",
-            180,
-            std::time::Duration::from_secs(10),
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            WaitResult::Abandoned,
-            "already-active cleanup must abandon before entering the poll loop"
-        );
-        assert_eq!(
-            started_at.elapsed(),
-            std::time::Duration::ZERO,
-            "an already-abandoned wait must return without advancing poll time"
-        );
-        assert_eq!(
-            provider.call_count.load(Ordering::SeqCst),
-            0,
-            "an already-abandoned wait must not call provider.read"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_deletion_running_token_polls_to_completion() {
-        // Resource exists on first poll, then disappears on second.
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let existing_state = State::existing(id.clone(), HashMap::new());
-        let provider =
-            SequenceProvider::new(vec![Ok(existing_state), Ok(State::not_found(id.clone()))]);
-        let shutdown = ShutdownToken::running();
-        let cleanup_loop = shutdown.cleanup_aware_loop();
-
-        let result = wait_for_deletion(
-            &cleanup_loop,
-            &provider,
-            &id,
-            "some-identifier",
-            3,
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-
-        assert_eq!(result, WaitResult::Deleted);
-        assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn wait_for_deletion_succeeds_when_resource_disappears() {
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let provider = SequenceProvider::new(vec![Ok(State::not_found(id.clone()))]);
-        let shutdown = ShutdownToken::running();
-        let cleanup_loop = shutdown.cleanup_aware_loop();
-
-        let result = wait_for_deletion(
-            &cleanup_loop,
-            &provider,
-            &id,
-            "some-identifier",
-            3,
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-
-        assert_eq!(result, WaitResult::Deleted);
-    }
-
-    #[tokio::test]
-    async fn wait_for_deletion_returns_read_error_on_provider_error() {
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let provider = SequenceProvider::new(vec![Err(ProviderError::api_error("auth expired"))]);
-        let shutdown = ShutdownToken::running();
-        let cleanup_loop = shutdown.cleanup_aware_loop();
-
-        let result = wait_for_deletion(
-            &cleanup_loop,
-            &provider,
-            &id,
-            "some-identifier",
-            3,
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-
-        match result {
-            WaitResult::ReadError(msg) => assert!(
-                msg.contains("auth expired"),
-                "Expected error message to contain 'auth expired', got: {}",
-                msg
-            ),
-            other => panic!("Expected ReadError, got: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn wait_for_deletion_does_not_treat_read_error_as_success() {
-        // This is the core regression test for issue #843.
-        // Previously, Err(_) from provider.read() was treated as successful
-        // deletion, causing live infrastructure to be orphaned while the user
-        // was told it was destroyed.
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let provider = SequenceProvider::new(vec![Err(ProviderError::timeout("network timeout"))]);
-        let shutdown = ShutdownToken::running();
-        let cleanup_loop = shutdown.cleanup_aware_loop();
-
-        let result = wait_for_deletion(
-            &cleanup_loop,
-            &provider,
-            &id,
-            "some-identifier",
-            3,
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-
-        // Must NOT be Deleted -- that was the old (buggy) behavior
-        assert!(
-            matches!(&result, WaitResult::ReadError(_)),
-            "Expected ReadError, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_deletion_times_out_when_resource_keeps_existing() {
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let existing_state = State::existing(id.clone(), HashMap::new());
-        let provider = SequenceProvider::new(vec![
-            Ok(existing_state.clone()),
-            Ok(existing_state.clone()),
-            Ok(existing_state),
-        ]);
-        let shutdown = ShutdownToken::running();
-        let cleanup_loop = shutdown.cleanup_aware_loop();
-
-        let result = wait_for_deletion(
-            &cleanup_loop,
-            &provider,
-            &id,
-            "some-identifier",
-            3,
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-
-        assert_eq!(result, WaitResult::TimedOut);
     }
 }

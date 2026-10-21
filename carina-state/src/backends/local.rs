@@ -115,12 +115,12 @@ impl LocalBackend {
             }
         };
 
-        let existing_lock = match serde_json::from_str::<LockInfo>(&content) {
+        let existing_lock = match LockInfo::from_json_str(&content) {
             Ok(lock) => lock,
             Err(_) => return Ok(()),
         };
 
-        if existing_lock.id == lock_id {
+        if existing_lock.id() == lock_id {
             match tokio::fs::remove_file(&self.lock_path).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -166,7 +166,7 @@ impl LocalBackend {
                 }
             };
 
-            let claim_is_stale = match serde_json::from_str::<LockInfo>(&claim_content) {
+            let claim_is_stale = match LockInfo::from_json_str(&claim_content) {
                 Ok(claim) => claim.is_expired(),
                 Err(_) if Self::file_written_recently(&claim_path) => {
                     async_sleep(Duration::from_millis(1)).await;
@@ -205,7 +205,7 @@ impl LocalBackend {
             }
         };
 
-        let claim_is_active = match serde_json::from_str::<LockInfo>(&claim_content) {
+        let claim_is_active = match LockInfo::from_json_str(&claim_content) {
             Ok(claim) => !claim.is_expired(),
             Err(_) if Self::file_written_recently(&claim_path) => return Ok(true),
             Err(_) => false,
@@ -310,7 +310,7 @@ impl StateBackend for LocalBackend {
             match Self::create_lock_file(&self.lock_path, &content) {
                 Ok(()) => {
                     if self.has_active_recovery_claim().await? {
-                        self.remove_lock_if_matches(&lock.id).await?;
+                        self.remove_lock_if_matches(lock.id()).await?;
                         async_sleep(Duration::from_millis(1)).await;
                         continue;
                     }
@@ -336,7 +336,7 @@ impl StateBackend for LocalBackend {
                 }
             };
 
-            match serde_json::from_str::<LockInfo>(&current_content) {
+            match LockInfo::from_json_str(&current_content) {
                 Ok(existing_lock) if !existing_lock.is_expired() => {
                     return Err(BackendError::locked(&existing_lock));
                 }
@@ -363,7 +363,7 @@ impl StateBackend for LocalBackend {
                 }
             };
 
-            match serde_json::from_str::<LockInfo>(&current_content) {
+            match LockInfo::from_json_str(&current_content) {
                 Ok(existing_lock) if !existing_lock.is_expired() => {
                     return Err(BackendError::locked(&existing_lock));
                 }
@@ -400,17 +400,28 @@ impl StateBackend for LocalBackend {
 
     async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
         // Read the current lock file and verify it still belongs to us
-        let content = tokio::fs::read_to_string(&self.lock_path)
-            .await
-            .map_err(|e| BackendError::Io(format!("Failed to read lock file: {}", e)))?;
+        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackendError::LockNotHeld(
+                    "lock file no longer exists".to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read lock file: {error}"
+                )));
+            }
+        };
 
-        let existing_lock: LockInfo = serde_json::from_str(&content)
+        let existing_lock = LockInfo::from_json_str(&content)
             .map_err(|e| BackendError::InvalidState(format!("Failed to parse lock file: {}", e)))?;
 
-        if existing_lock.id != lock.id {
+        if existing_lock.id() != lock.id() {
             return Err(BackendError::LockNotHeld(format!(
                 "lock {} was replaced by {}",
-                lock.id, existing_lock.id
+                lock.id(),
+                existing_lock.id()
             )));
         }
 
@@ -442,13 +453,14 @@ impl StateBackend for LocalBackend {
         let verify_content = tokio::fs::read_to_string(&self.lock_path)
             .await
             .map_err(|e| BackendError::Io(format!("Failed to verify lock after renewal: {}", e)))?;
-        let verify_lock: LockInfo = serde_json::from_str(&verify_content).map_err(|e| {
+        let verify_lock = LockInfo::from_json_str(&verify_content).map_err(|e| {
             BackendError::InvalidState(format!("Failed to parse lock after renewal: {}", e))
         })?;
-        if verify_lock.id != renewed.id {
+        if verify_lock.id() != renewed.id() {
             return Err(BackendError::LockNotHeld(format!(
                 "lock was replaced during renewal: expected {}, found {}",
-                renewed.id, verify_lock.id
+                renewed.id(),
+                verify_lock.id()
             )));
         }
 
@@ -472,13 +484,14 @@ impl StateBackend for LocalBackend {
             }
         };
 
-        let existing_lock: LockInfo = serde_json::from_str(&content)
+        let existing_lock = LockInfo::from_json_str(&content)
             .map_err(|e| BackendError::InvalidState(format!("Failed to parse lock file: {}", e)))?;
 
-        if existing_lock.id != lock.id {
+        if existing_lock.id() != lock.id() {
             return Err(BackendError::LockNotHeld(format!(
                 "lock {} was replaced by {}",
-                lock.id, existing_lock.id
+                lock.id(),
+                existing_lock.id()
             )));
         }
 
@@ -489,7 +502,7 @@ impl StateBackend for LocalBackend {
         let content = match tokio::fs::read_to_string(&self.lock_path).await {
             Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(BackendError::LockNotFound(lock.id.clone()));
+                return Err(BackendError::LockNotFound(lock.id().to_owned()));
             }
             Err(err) => {
                 return Err(BackendError::Io(format!(
@@ -499,13 +512,13 @@ impl StateBackend for LocalBackend {
             }
         };
 
-        let existing_lock: LockInfo = serde_json::from_str(&content)
+        let existing_lock = LockInfo::from_json_str(&content)
             .map_err(|e| BackendError::InvalidState(format!("Failed to parse lock file: {}", e)))?;
 
-        if existing_lock.id != lock.id {
+        if existing_lock.id() != lock.id() {
             return Err(BackendError::LockMismatch {
-                expected: lock.id.clone(),
-                actual: existing_lock.id,
+                expected: lock.id().to_owned(),
+                actual: existing_lock.id().to_owned(),
             });
         }
 
@@ -530,12 +543,12 @@ impl StateBackend for LocalBackend {
             }
         };
 
-        if let Ok(existing_lock) = serde_json::from_str::<LockInfo>(&content)
-            && existing_lock.id != lock_id
+        if let Ok(existing_lock) = LockInfo::from_json_str(&content)
+            && existing_lock.id() != lock_id
         {
             return Err(BackendError::LockMismatch {
                 expected: lock_id.to_string(),
-                actual: existing_lock.id,
+                actual: existing_lock.id().to_owned(),
             });
         }
 
@@ -665,7 +678,7 @@ mod tests {
 
         // Acquire lock
         let lock = backend.acquire_lock("apply").await.unwrap();
-        assert_eq!(lock.operation, "apply");
+        assert_eq!(lock.operation(), "apply");
 
         // Try to acquire again - should fail
         let result = backend.acquire_lock("plan").await;
@@ -676,7 +689,7 @@ mod tests {
 
         // Now can acquire again
         let lock2 = backend.acquire_lock("destroy").await.unwrap();
-        assert_eq!(lock2.operation, "destroy");
+        assert_eq!(lock2.operation(), "destroy");
         backend.release_lock(&lock2).await.unwrap();
     }
 
@@ -872,9 +885,9 @@ mod tests {
         let lock = backend.acquire_lock("apply").await.unwrap();
         let renewed = backend.renew_lock(&lock).await.unwrap();
 
-        assert_eq!(renewed.id, lock.id);
-        assert_eq!(renewed.operation, lock.operation);
-        assert!(renewed.expires > lock.created);
+        assert_eq!(renewed.id(), lock.id());
+        assert_eq!(renewed.operation(), lock.operation());
+        assert!(renewed.expires() > lock.created());
         assert!(!renewed.is_expired());
 
         backend.release_lock(&renewed).await.unwrap();
@@ -892,6 +905,19 @@ mod tests {
         let thief_lock = LockInfo::new("destroy");
         let thief_content = serde_json::to_string_pretty(&thief_lock).unwrap();
         std::fs::write(state_path.with_extension("lock"), thief_content).unwrap();
+
+        let result = backend.renew_lock(&lock).await;
+        assert!(matches!(result, Err(BackendError::LockNotHeld(_))));
+    }
+
+    #[tokio::test]
+    async fn test_renew_lock_fails_with_lock_not_held_when_lock_file_is_missing() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        std::fs::remove_file(state_path.with_extension("lock")).unwrap();
 
         let result = backend.renew_lock(&lock).await;
         assert!(matches!(result, Err(BackendError::LockNotHeld(_))));

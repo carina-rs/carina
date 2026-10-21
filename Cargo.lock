@@ -1099,6 +1099,7 @@ version = "0.4.0"
 dependencies = [
  "argon2",
  "carina-core",
+ "carina-plugin-host",
  "carina-provider-protocol",
  "dirs",
  "hex",
@@ -1217,6 +1218,7 @@ dependencies = [
  "hex",
  "hostname",
  "indexmap 2.13.0",
+ "log",
  "serde",
  "serde_json",
  "tempfile",

@@ -1005,18 +1005,118 @@ pub(crate) fn wit_to_core_state(
     Ok(core_state)
 }
 
+struct PendingToken(String);
+
+impl fmt::Debug for PendingToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted pending token>")
+    }
+}
+
+#[derive(Debug)]
+struct PendingOperation {
+    token: PendingToken,
+    poll_after_secs: u32,
+}
+
+impl PendingOperation {
+    fn from_wit(pending: wit::PendingOperation) -> Self {
+        let wit::PendingOperation {
+            token,
+            poll_after_secs,
+        } = pending;
+        Self {
+            token: PendingToken(token),
+            poll_after_secs,
+        }
+    }
+
+    fn poll_after_secs(&self) -> u32 {
+        self.poll_after_secs
+    }
+
+    fn into_wit(self) -> wit::PendingOperation {
+        let Self {
+            token: PendingToken(token),
+            poll_after_secs,
+        } = self;
+        wit::PendingOperation {
+            token,
+            poll_after_secs,
+        }
+    }
+}
+
+pub(crate) struct CreatePendingOperation(PendingOperation);
+
+impl CreatePendingOperation {
+    pub(crate) fn poll_after_secs(&self) -> u32 {
+        self.0.poll_after_secs()
+    }
+
+    pub(crate) fn into_wit(self) -> wit::PendingOperation {
+        self.0.into_wit()
+    }
+}
+
+pub(crate) struct UpdatePendingOperation(PendingOperation);
+
+impl UpdatePendingOperation {
+    pub(crate) fn poll_after_secs(&self) -> u32 {
+        self.0.poll_after_secs()
+    }
+
+    pub(crate) fn into_wit(self) -> wit::PendingOperation {
+        self.0.into_wit()
+    }
+}
+
+pub(crate) struct DeletePendingOperation(PendingOperation);
+
+impl DeletePendingOperation {
+    pub(crate) fn poll_after_secs(&self) -> u32 {
+        self.0.poll_after_secs()
+    }
+
+    pub(crate) fn into_wit(self) -> wit::PendingOperation {
+        self.0.into_wit()
+    }
+}
+
+pub(crate) enum WasmCreateOutcome {
+    Done(Box<CoreCreateOutcome>),
+    Pending(CreatePendingOperation),
+}
+
+pub(crate) enum WasmUpdateOutcome {
+    Done(Box<CoreUpdateOutcome>),
+    Pending(UpdatePendingOperation),
+}
+
+pub(crate) enum WasmDeleteOutcome {
+    Deleted,
+    Pending(DeletePendingOperation),
+}
+
 pub(crate) fn wit_to_core_create_outcome(
     outcome: wit::CreateOutcome,
     id: &CoreResourceId,
-) -> Result<CoreCreateOutcome, WasmValueDecodeError> {
+) -> Result<WasmCreateOutcome, WasmValueDecodeError> {
     match outcome {
-        wit::CreateOutcome::Success(state) => Ok(CoreCreateOutcome::Success {
-            state: wit_to_core_state(&state, id)?,
-        }),
-        wit::CreateOutcome::PartialSuccess(partial) => Ok(CoreCreateOutcome::partial_success(
-            wit_to_core_state(&partial.state, id)?,
-            partial.diagnostic.reason,
-            partial.diagnostic.missing_attributes,
+        wit::CreateOutcome::Success(state) => Ok(WasmCreateOutcome::Done(Box::new(
+            CoreCreateOutcome::Success {
+                state: wit_to_core_state(&state, id)?,
+            },
+        ))),
+        wit::CreateOutcome::PartialSuccess(partial) => Ok(WasmCreateOutcome::Done(Box::new(
+            CoreCreateOutcome::partial_success(
+                wit_to_core_state(&partial.state, id)?,
+                partial.diagnostic.reason,
+                partial.diagnostic.missing_attributes,
+            ),
+        ))),
+        wit::CreateOutcome::Pending(pending) => Ok(WasmCreateOutcome::Pending(
+            CreatePendingOperation(PendingOperation::from_wit(pending)),
         )),
     }
 }
@@ -1024,16 +1124,32 @@ pub(crate) fn wit_to_core_create_outcome(
 pub(crate) fn wit_to_core_update_outcome(
     outcome: wit::UpdateOutcome,
     id: &CoreResourceId,
-) -> Result<CoreUpdateOutcome, WasmValueDecodeError> {
+) -> Result<WasmUpdateOutcome, WasmValueDecodeError> {
     match outcome {
-        wit::UpdateOutcome::Success(state) => Ok(CoreUpdateOutcome::Success {
-            state: wit_to_core_persisted_state(&state, id)?,
-        }),
-        wit::UpdateOutcome::PartialSuccess(partial) => Ok(CoreUpdateOutcome::partial_success(
-            wit_to_core_persisted_state(&partial.state, id)?,
-            partial.diagnostic.reason,
-            partial.diagnostic.missing_attributes,
+        wit::UpdateOutcome::Success(state) => Ok(WasmUpdateOutcome::Done(Box::new(
+            CoreUpdateOutcome::Success {
+                state: wit_to_core_persisted_state(&state, id)?,
+            },
+        ))),
+        wit::UpdateOutcome::PartialSuccess(partial) => Ok(WasmUpdateOutcome::Done(Box::new(
+            CoreUpdateOutcome::partial_success(
+                wit_to_core_persisted_state(&partial.state, id)?,
+                partial.diagnostic.reason,
+                partial.diagnostic.missing_attributes,
+            ),
+        ))),
+        wit::UpdateOutcome::Pending(pending) => Ok(WasmUpdateOutcome::Pending(
+            UpdatePendingOperation(PendingOperation::from_wit(pending)),
         )),
+    }
+}
+
+pub(crate) fn wit_to_core_delete_outcome(outcome: wit::DeleteOutcome) -> WasmDeleteOutcome {
+    match outcome {
+        wit::DeleteOutcome::Deleted => WasmDeleteOutcome::Deleted,
+        wit::DeleteOutcome::Pending(pending) => {
+            WasmDeleteOutcome::Pending(DeletePendingOperation(PendingOperation::from_wit(pending)))
+        }
     }
 }
 
@@ -1349,9 +1465,7 @@ fn proto_schema_to_core(
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
         },
         unique_name: proto_unique_name_to_core(unique_name),
-        operation_config: operation_config
-            .as_ref()
-            .map(proto_operation_config_to_core),
+        operation_config: operation_config.clone(),
         exclusive_required: exclusive_required.clone(),
         // Wait defaults are not (yet) carried across the WASM plugin
         // boundary — providers fall back to the carina-core constants
@@ -1372,26 +1486,6 @@ fn proto_schema_to_core(
             })
             .collect::<Result<_, _>>()?,
     })
-}
-
-fn proto_operation_config_to_core(
-    config: &proto::OperationConfig,
-) -> carina_core::schema::OperationConfig {
-    // Keep the protocol record exhaustive for the same reason as its parent
-    // ResourceSchema conversion.
-    let proto::OperationConfig {
-        delete_timeout_secs,
-        delete_max_retries,
-        create_timeout_secs,
-        create_max_retries,
-    } = config;
-
-    carina_core::schema::OperationConfig {
-        delete_timeout_secs: *delete_timeout_secs,
-        delete_max_retries: *delete_max_retries,
-        create_timeout_secs: *create_timeout_secs,
-        create_max_retries: *create_max_retries,
-    }
 }
 
 fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
@@ -1750,6 +1844,13 @@ fn proto_input_mode_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_token_debug_is_redacted() {
+        let debug = format!("{:?}", PendingToken("do-not-log-this".to_string()));
+        assert_eq!(debug, "<redacted pending token>");
+        assert!(!debug.contains("do-not-log-this"));
+    }
 
     #[derive(Debug)]
     struct TestOperationError {
@@ -3449,9 +3550,9 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v7_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 7);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 7);
+    fn test_protocol_version_range_is_v8_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 8);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 8);
     }
 
     #[test]

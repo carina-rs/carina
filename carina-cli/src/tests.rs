@@ -26,6 +26,7 @@ use crate::commands::apply::{
 };
 use crate::commands::plan::{CurrentStateEntry, MovedOrigins, PlanFile};
 use crate::commands::shared::finalize::StatePersistence;
+use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::state_writeback::{
     ApplyStateSave, FinalizeApplyInput, PostApplyStates, build_state_after_apply,
     queue_state_refresh,
@@ -1424,14 +1425,14 @@ impl StateBackend for MockBackend {
         }
     }
     async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
-        Ok(LockInfo::new(operation))
+        Ok(LockInfo::for_test(operation))
     }
     async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
         self.lock_released.store(true, Ordering::SeqCst);
         Ok(())
     }
     async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
-        Ok(lock.renewed())
+        Ok(lock.renewed_for_test())
     }
     async fn write_state_locked(
         &self,
@@ -1471,7 +1472,7 @@ async fn lock_released_on_write_state_failure() {
         write_state_fails: true,
         lock_released: lock_released.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     let result = ApplyResult {
         success_count: 0,
@@ -1499,7 +1500,7 @@ async fn lock_released_on_write_state_failure() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -1552,14 +1553,14 @@ impl StateBackend for LockTrackingBackend {
         Ok(())
     }
     async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
-        Ok(LockInfo::new(operation))
+        Ok(LockInfo::for_test(operation))
     }
     async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
         Ok(())
     }
     async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
         self.renew_lock_called.store(true, Ordering::SeqCst);
-        Ok(lock.renewed())
+        Ok(lock.renewed_for_test())
     }
     async fn write_state_locked(
         &self,
@@ -1595,7 +1596,7 @@ impl StateBackend for LockTrackingBackend {
 #[tokio::test]
 async fn save_state_locked_calls_renew_lock_and_write_state_locked() {
     let backend = LockTrackingBackend::new();
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
     let mut state = StateFile::new();
 
     let result = save_state_locked(&backend, &lock, &mut state).await;
@@ -1618,7 +1619,7 @@ async fn save_state_locked_calls_renew_lock_and_write_state_locked() {
 #[tokio::test]
 async fn finalize_apply_uses_write_state_locked() {
     let backend = LockTrackingBackend::new();
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     let result = ApplyResult {
         success_count: 0,
@@ -1644,7 +1645,7 @@ async fn finalize_apply_uses_write_state_locked() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -1696,13 +1697,13 @@ impl StateBackend for RefreshTestBackend {
         Ok(())
     }
     async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
-        Ok(LockInfo::new(operation))
+        Ok(LockInfo::for_test(operation))
     }
     async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
         Ok(())
     }
     async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
-        Ok(lock.renewed())
+        Ok(lock.renewed_for_test())
     }
     async fn write_state_locked(
         &self,
@@ -1767,11 +1768,11 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     };
 
     // MockProvider returns not_found for both resources (simulates external deletion)
-    let lock = LockInfo::new("state-refresh");
+    let lock = LockInfo::for_test("state-refresh");
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
@@ -1811,12 +1812,12 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
 
     let backend = RefreshTestBackend::new(state);
     let mut parsed = carina_core::parser::InferredFile::default();
-    let lock = LockInfo::new("state-refresh");
+    let lock = LockInfo::for_test("state-refresh");
 
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
@@ -1874,12 +1875,12 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
 
     let backend = RefreshTestBackend::new(state);
     let mut parsed = carina_core::parser::InferredFile::default();
-    let lock = LockInfo::new("state-refresh");
+    let lock = LockInfo::for_test("state-refresh");
 
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
@@ -1915,8 +1916,12 @@ async fn save_state_unlocked_uses_write_state_without_lock() {
 
     let backend = LockTrackingBackend::new();
     let mut state = StateFile::new();
+    let state_lock = StateLock::disabled_for_test();
+    let StateLockRef::Disabled(disabled) = state_lock.as_ref() else {
+        unreachable!("test lock must be disabled");
+    };
 
-    let result = save_state_unlocked(&backend, &mut state).await;
+    let result = save_state_unlocked(&backend, disabled, &mut state).await;
     assert!(result.is_ok(), "save_state_unlocked should succeed");
 
     assert!(
@@ -1937,6 +1942,7 @@ async fn save_state_unlocked_uses_write_state_without_lock() {
 #[tokio::test]
 async fn finalize_apply_without_lock_uses_write_state() {
     let backend = LockTrackingBackend::new();
+    let state_lock = StateLock::disabled_for_test();
 
     let result = ApplyResult {
         success_count: 0,
@@ -1962,7 +1968,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: None, // No lock
+            lock: state_lock.as_ref(),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -2832,13 +2838,13 @@ impl StateBackend for CapturingBackend {
         Ok(())
     }
     async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
-        Ok(LockInfo::new(operation))
+        Ok(LockInfo::for_test(operation))
     }
     async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
         Ok(())
     }
     async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
-        Ok(lock.renewed())
+        Ok(lock.renewed_for_test())
     }
     async fn write_state_locked(
         &self,
@@ -2876,7 +2882,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
     let backend = CapturingBackend {
         captured: captured.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     // Pre-existing state with stale exports
     let mut state_in = StateFile::new();
@@ -2884,7 +2890,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         Some(state_in),
         &[],
         &[],
@@ -2917,7 +2923,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     let backend = CapturingBackend {
         captured: captured.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     let export_params = vec![InferredExportParam {
         name: "account_id".to_string(),
@@ -2929,7 +2935,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         Some(StateFile::new()),
         &[],
         &[],
@@ -2965,7 +2971,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
     let backend = CapturingBackend {
         captured: captured.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
     let mut state_in = StateFile::new();
     state_in.insert_export_json_for_test("role_arn", serde_json::json!("prior-arn"));
     let export_params = vec![InferredExportParam {
@@ -2978,7 +2984,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         Some(state_in),
         &[],
         &[],
@@ -3021,7 +3027,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
     let backend = CapturingBackend {
         captured: captured.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     // Pre-existing state with exports left over from a previous
     // apply whose `exports {}` block has since been removed.
@@ -3059,7 +3065,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -3095,7 +3101,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
     let backend = CapturingBackend {
         captured: captured.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     let mut state_in = StateFile::new();
     state_in.insert_export_json_for_test("vpc_id", serde_json::json!("vpc-0abc123"));
@@ -3124,7 +3130,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: None,
             provider_context: &ProviderContext::default(),
@@ -3160,7 +3166,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let backend = CapturingBackend {
         captured: captured.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     let mut resource_a = Resource::with_provider("mock", "test.resource", "a", None);
     resource_a.binding = Some("a".to_string());
@@ -3217,7 +3223,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             current_states: &result.current_states,
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&export_params)),
             provider_context: &ProviderContext::default(),
@@ -3276,7 +3282,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let backend = CapturingBackend {
         captured: captured.clone(),
     };
-    let lock = LockInfo::new("apply");
+    let lock = LockInfo::for_test("apply");
 
     let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
     resource.binding = Some("created".to_string());
@@ -3319,7 +3325,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
             current_states: &result.current_states,
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&export_params)),
             provider_context: &ProviderContext::default(),

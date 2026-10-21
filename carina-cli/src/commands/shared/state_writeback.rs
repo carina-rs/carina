@@ -19,12 +19,13 @@ use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_state::{
-    DeposedInstance, DeposedKey, LockInfo, PreviousSecretHashAuthority, ResourceState,
-    StateBackend, StateFile,
+    DeposedInstance, DeposedKey, PreviousSecretHashAuthority, ResourceState, StateBackend,
+    StateFile,
 };
 use colored::Colorize;
 
 use crate::commands::plan::MovedOrigins;
+use crate::commands::shared::lock_heartbeat::StateLockRef;
 use crate::error::AppError;
 
 /// Apply permanent name overrides from state to desired resources.
@@ -160,7 +161,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
     pub current_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
     pub backend: &'a dyn StateBackend,
-    pub lock: Option<&'a LockInfo>,
+    pub lock: StateLockRef<'a>,
     pub schemas: &'a SchemaRegistry,
     /// `Some(params)` rebuilds `state.exports` from the source
     /// configuration's `exports {}` block — empty `params` clears the

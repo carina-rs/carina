@@ -25,6 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 thiserror = "2"
 hostname = "0.4"
+log = "0.4"
 
 [dev-dependencies]
 argon2 = "0.5"
