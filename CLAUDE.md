@@ -502,8 +502,9 @@ A struct type represents a nested object with typed fields.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export, decoded
   by `carina-plugin-host/src/wasm_convert.rs`. The `ResourceSchema`,
-  `OperationConfig`, `AttributeSchema`, and `StructField` conversions
-  destructure protocol records exhaustively, and `AttributeType` conversion
+  `AttributeSchema`, and `StructField` conversions destructure protocol
+  records exhaustively (`OperationConfig` needs no conversion: carina-core
+  re-exports the protocol type, carina#3907), and `AttributeType` conversion
   patterns name every variant field. Adding a protocol field must break
   compilation until it is consciously carried across or explicitly bound and
   documented as unavailable on the destination side. Never use a catch-all
