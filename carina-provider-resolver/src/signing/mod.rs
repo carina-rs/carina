@@ -124,6 +124,20 @@ mod tests {
 
     #[test]
     fn verifies_conformance_fixture_end_to_end() {
+        assert_conformance_fixture_verifies();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verifies_conformance_fixture_inside_current_thread_runtime() {
+        assert_conformance_fixture_verifies();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verifies_conformance_fixture_inside_multi_thread_runtime() {
+        assert_conformance_fixture_verifies();
+    }
+
+    fn assert_conformance_fixture_verifies() {
         let verified = verify(
             digest_for(FIXTURE_ARTIFACT),
             FIXTURE_BUNDLE,

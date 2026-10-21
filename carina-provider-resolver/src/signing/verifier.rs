@@ -1,6 +1,7 @@
+use futures::executor::block_on;
 use sha2::Sha256;
 use sigstore::bundle::Bundle;
-use sigstore::bundle::verify::blocking::Verifier;
+use sigstore::bundle::verify::Verifier;
 use sigstore::bundle::verify::policy::Identity;
 use sigstore_protobuf_specs::dev::sigstore::bundle::v1::bundle::Content;
 
@@ -53,14 +54,16 @@ fn verify_inner(
     })?;
     let (identity, issuer) = expected.values();
     let policy = Identity::new(identity, issuer);
-    verifier
-        .verify_digest(artifact_digest, bundle, &policy, true)
-        .map_err(|error| {
-            format!(
-                "certificate, identity, artifact signature, or hashedrekord verification failed: {}; {TRUST_ROOT_STALENESS_HINT}",
-                error_chain(&error),
-            )
-        })
+
+    // blocking::Verifier nests its own Tokio runtime and panics inside one. With
+    // offline=true, async verify_digest does no I/O (no awaits), so block_on
+    // completes it without any runtime.
+    block_on(verifier.verify_digest(artifact_digest, bundle, &policy, true)).map_err(|error| {
+        format!(
+            "certificate, identity, artifact signature, or hashedrekord verification failed: {}; {TRUST_ROOT_STALENESS_HINT}",
+            error_chain(&error),
+        )
+    })
 }
 
 fn ensure_message_signature_bundle(bundle: &Bundle) -> Result<(), String> {

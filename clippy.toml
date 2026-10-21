@@ -1,0 +1,3 @@
+disallowed-types = [
+  { path = "sigstore::bundle::verify::blocking::Verifier", reason = "owns a Tokio runtime and panics inside one (#3904); use the async Verifier with futures::executor::block_on" },
+]
