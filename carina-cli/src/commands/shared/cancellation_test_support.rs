@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use carina_core::shutdown::ShutdownToken;
@@ -19,11 +20,25 @@ pub(crate) static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> =
 /// the lock as soon as the heartbeat attempts its first renewal.
 pub(crate) struct LockLossBackend {
     inner: Arc<LocalBackend>,
+    locked_writes: AtomicUsize,
+    releases: AtomicUsize,
 }
 
 impl LockLossBackend {
     fn new(inner: Arc<LocalBackend>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            locked_writes: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn locked_writes(&self) -> usize {
+        self.locked_writes.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn releases(&self) -> usize {
+        self.releases.load(Ordering::SeqCst)
     }
 }
 
@@ -42,6 +57,7 @@ impl StateBackend for LockLossBackend {
     }
 
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
+        self.releases.fetch_add(1, Ordering::SeqCst);
         self.inner.release_lock(lock).await
     }
 
@@ -52,7 +68,17 @@ impl StateBackend for LockLossBackend {
     }
 
     async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
+        self.locked_writes.fetch_add(1, Ordering::SeqCst);
         self.inner.write_state_locked(state, lock).await
+    }
+
+    async fn write_state_locked_for_cleanup(
+        &self,
+        state: &StateFile,
+        lock: &LockInfo,
+    ) -> BackendResult<()> {
+        self.locked_writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.write_state_locked_for_cleanup(state, lock).await
     }
 
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
@@ -240,7 +266,7 @@ impl CancellationFixtureBase {
         self.backend.clone()
     }
 
-    pub(crate) fn lock_loss_backend_handle(&self) -> Arc<dyn StateBackend> {
+    pub(crate) fn lock_loss_backend_handle(&self) -> Arc<LockLossBackend> {
         Arc::new(LockLossBackend::new(Arc::clone(&self.backend)))
     }
 

@@ -2664,6 +2664,10 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
         .with_delayed_create("slow", Duration::from_millis(75));
+    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
+        "CARINA_MOCK_STATE_FILE",
+        fixture.config_path().join("source-apply-mock-state.json"),
+    );
     let loaded = load_configuration_with_config(
         fixture.config_path(),
         fixture.provider_context(),
@@ -2686,13 +2690,14 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let ctx = WiringContext::new(factories, &parsed.providers);
     let observer_factory = fixture.observer_factory();
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
+    let backend = fixture.lock_loss_backend_handle();
 
     let error = run_apply_locked(
         &ctx,
         &mut parsed,
         &unresolved_parsed,
         true,
-        fixture.lock_loss_backend_handle(),
+        backend.clone(),
         StateLock::held(lock),
         base_dir,
         fixture.provider_context(),
@@ -2705,7 +2710,94 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     .expect_err("heartbeat lock loss must fail apply");
 
     assert!(matches!(error, AppError::StateLockLost { .. }));
-    assert!(error.to_string().contains("state may be behind the cloud"));
+    let rendered = error.to_string();
+    assert!(rendered.contains("state may be behind the cloud"));
+    assert_eq!(
+        rendered.matches("test heartbeat lock was replaced").count(),
+        1,
+        "{rendered}"
+    );
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(backend.locked_writes(), 0, "lost lock must not save state");
+    assert_eq!(backend.releases(), 0, "lost lock must not be released");
+}
+
+#[tokio::test]
+async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new()
+        .with_resources(["slow"])
+        .with_delayed_create("slow", Duration::from_millis(75));
+    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
+        "CARINA_MOCK_STATE_FILE",
+        fixture.config_path().join("saved-plan-mock-state.json"),
+    );
+    let mut resource = Resource::with_provider("mock", "test.resource", "slow", None);
+    resource.binding = Some("slow".to_string());
+    resource.set_attr("name", string_value("slow"));
+    let resource_id = resource.id.clone();
+    let mut plan = Plan::new();
+    plan.add(carina_core::effect::Effect::Create(resolved(
+        resource.clone(),
+    )));
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-21T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan,
+        sorted_resources: vec![resource.clone()],
+        unresolved_resources: vec![resource],
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: vec![crate::commands::plan::CurrentStateEntry {
+            id: resource_id.clone(),
+            state: State::not_found(resource_id),
+        }],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let observer_factory = fixture.observer_factory();
+    let backend = fixture.lock_loss_backend_handle();
+    let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
+
+    let error = run_apply_from_plan_locked(
+        inspected_saved_plan(plan_file),
+        None,
+        fixture.provider_context(),
+        true,
+        backend.clone(),
+        StateLock::held(lock),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: fixture.config_path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("heartbeat lock loss must fail saved-plan apply");
+
+    assert!(matches!(error, AppError::StateLockLost { .. }));
+    assert_eq!(backend.locked_writes(), 0, "lost lock must not save state");
+    assert_eq!(backend.releases(), 0, "lost lock must not be released");
 }
 
 #[tokio::test]

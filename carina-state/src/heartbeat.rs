@@ -23,35 +23,30 @@ pub struct HeartbeatGuard {
 /// A heartbeat renewal proved that this process no longer owns the state lock.
 #[derive(Debug)]
 pub struct LockLost {
-    lock: LockInfo,
-    source: BackendError,
+    error: BackendError,
 }
 
 impl LockLost {
-    /// Recover the last lock capability and the backend's loss diagnostic.
-    pub fn into_parts(self) -> (LockInfo, BackendError) {
-        (self.lock, self.source)
+    /// Consume the terminal diagnostic and return its backend detail.
+    pub fn into_error(self) -> BackendError {
+        self.error
     }
 }
 
 impl std::fmt::Display for LockLost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "state lock heartbeat lost ownership: {}", self.source)
+        write!(f, "state lock heartbeat lost ownership: {}", self.error)
     }
 }
 
-impl std::error::Error for LockLost {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
+impl std::error::Error for LockLost {}
 
 impl LockHeartbeat {
     /// Start renewing `lock` every third of its TTL.
     pub fn start(
         backend: Arc<dyn StateBackend>,
         lock: LockInfo,
-        on_lost: impl FnOnce(String) + Send + 'static,
+        on_lost: impl FnOnce() + Send + 'static,
     ) -> HeartbeatGuard {
         let interval = (lock.renewal_ttl() / 3).max(Duration::from_millis(1));
         let (stop_tx, mut stop_rx) = oneshot::channel();
@@ -59,6 +54,7 @@ impl LockHeartbeat {
         let task_lock = Arc::clone(&lock);
         let task = tokio::spawn(async move {
             let mut on_lost = Some(on_lost);
+            let mut warned_for_failure_streak = false;
             loop {
                 tokio::select! {
                     biased;
@@ -71,18 +67,26 @@ impl LockHeartbeat {
                     .as_ref()
                     .expect("heartbeat lock must exist until the guard stops");
                 match backend.renew_lock(current).await {
-                    Ok(renewed) => *lock = Some(renewed),
+                    Ok(renewed) => {
+                        *lock = Some(renewed);
+                        warned_for_failure_streak = false;
+                    }
                     Err(error @ BackendError::LockNotHeld(_)) => {
-                        on_lost
+                        let on_lost = on_lost
                             .take()
-                            .expect("lock-loss callback must only run once")(
-                            error.to_string()
-                        );
+                            .expect("lock-loss callback must only run once");
+                        on_lost();
                         return Err(error);
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // A transient backend failure leaves the current lock
                         // capability intact. Retry on the next tick.
+                        if !warned_for_failure_streak {
+                            log::warn!(
+                                "State lock heartbeat renewal failed; retrying on the next tick: {error}"
+                            );
+                            warned_for_failure_streak = true;
+                        }
                     }
                 }
             }
@@ -147,7 +151,10 @@ impl HeartbeatGuard {
         let lock = self.take_lock().await;
         match outcome {
             Ok(()) => Ok(lock),
-            Err(source) => Err(LockLost { lock, source }),
+            Err(error) => {
+                drop(lock);
+                Err(LockLost { error })
+            }
         }
     }
 }
@@ -164,6 +171,7 @@ impl Drop for HeartbeatGuard {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, Once};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -171,6 +179,52 @@ mod tests {
 
     use super::LockHeartbeat;
     use crate::{BackendError, BackendResult, LoadedState, LockInfo, StateBackend, StateFile};
+
+    struct WarningLogger {
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl log::Log for WarningLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() == log::Level::Warn && metadata.target() == "carina_state::heartbeat"
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages
+                    .lock()
+                    .expect("warning logger lock")
+                    .push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static WARNING_LOGGER: WarningLogger = WarningLogger {
+        messages: Mutex::new(Vec::new()),
+    };
+    static INIT_WARNING_LOGGER: Once = Once::new();
+
+    fn clear_captured_warnings() {
+        INIT_WARNING_LOGGER.call_once(|| {
+            log::set_logger(&WARNING_LOGGER).expect("install warning logger");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        WARNING_LOGGER
+            .messages
+            .lock()
+            .expect("warning logger lock")
+            .clear();
+    }
+
+    fn captured_warnings() -> Vec<String> {
+        WARNING_LOGGER
+            .messages
+            .lock()
+            .expect("warning logger lock")
+            .clone()
+    }
 
     struct RecordingBackend {
         renewals: AtomicUsize,
@@ -278,7 +332,7 @@ mod tests {
         let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(60));
         let original_expiry = lock.expires();
         let guard =
-            LockHeartbeat::start(backend.clone(), lock, |_| panic!("lock should not be lost"));
+            LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
 
         tokio::time::sleep(Duration::from_millis(75)).await;
         let renewed = guard.stop().await.expect("lock should remain held");
@@ -292,7 +346,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::new(Duration::from_millis(50)));
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(30));
         let guard =
-            LockHeartbeat::start(backend.clone(), lock, |_| panic!("lock should not be lost"));
+            LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
 
         backend.renewal_started.notified().await;
         let lock = guard.stop().await.expect("lock should remain held");
@@ -313,7 +367,7 @@ mod tests {
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(30));
         let lock_id = lock.id().to_owned();
         let guard =
-            LockHeartbeat::start(backend.clone(), lock, |_| panic!("lock should not be lost"));
+            LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
 
         renewal_started.await;
         let returned = tokio::time::timeout(Duration::from_millis(100), guard.stop_for_cleanup())
@@ -325,18 +379,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_renewal_failure_is_retried_on_the_next_tick() {
+    async fn transient_renewal_failure_warns_once_per_failure_streak() {
+        clear_captured_warnings();
         let backend = Arc::new(RecordingBackend::new(Duration::ZERO));
-        backend.transient_failures.store(1, Ordering::SeqCst);
+        backend.transient_failures.store(2, Ordering::SeqCst);
         let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(30));
         let guard =
-            LockHeartbeat::start(backend.clone(), lock, |_| panic!("lock should not be lost"));
+            LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
 
-        tokio::time::sleep(Duration::from_millis(45)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.renewals.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("heartbeat should recover from the first failure streak");
+        backend.transient_failures.store(2, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.renewals.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("heartbeat should recover from the second failure streak");
         let _lock = guard.stop().await.expect("lock should remain held");
 
         assert_eq!(backend.transient_failures.load(Ordering::SeqCst), 0);
-        assert!(backend.renewals.load(Ordering::SeqCst) >= 1);
+        let warnings = captured_warnings();
+        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("I/O error: temporary test failure")),
+            "warnings must preserve the backend diagnostic: {warnings:?}"
+        );
     }
 
     #[tokio::test]
@@ -345,14 +421,19 @@ mod tests {
         backend.lose_lock.store(true, Ordering::SeqCst);
         let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(30));
         let (lost_tx, lost_rx) = oneshot::channel();
-        let guard = LockHeartbeat::start(backend, lock, move |error| {
-            let _ = lost_tx.send(error);
+        let guard = LockHeartbeat::start(backend, lock, move || {
+            let _ = lost_tx.send(());
         });
 
-        let error = lost_rx.await.expect("LockNotHeld should be observable");
-        assert!(error.contains("test lock was replaced"));
+        lost_rx.await.expect("LockNotHeld should be observable");
         let lost = guard.stop().await.expect_err("guard must report lock loss");
-        let (_lock, source) = lost.into_parts();
-        assert!(matches!(source, BackendError::LockNotHeld(_)));
+        let rendered = lost.to_string();
+        assert!(rendered.contains("test lock was replaced"));
+        assert_eq!(rendered.matches("test lock was replaced").count(), 1);
+        assert!(
+            std::error::Error::source(&lost).is_none(),
+            "LockLost is a terminal diagnostic"
+        );
+        assert!(matches!(lost.into_error(), BackendError::LockNotHeld(_)));
     }
 }

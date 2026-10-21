@@ -1215,6 +1215,7 @@ dependencies = [
  "hex",
  "hostname",
  "indexmap 2.13.0",
+ "log",
  "serde",
  "serde_json",
  "tempfile",

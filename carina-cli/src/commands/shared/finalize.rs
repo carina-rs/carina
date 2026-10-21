@@ -1,9 +1,19 @@
 use crate::error::AppError;
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_state::StateBackend;
+use colored::Colorize;
 use std::future::Future;
 
-use super::lock_heartbeat::StateLockRef;
+use super::lock_heartbeat::{StateLock, StateLockRef};
+
+/// Result of a command that consumed its heartbeat outcome.
+///
+/// Pre-heartbeat failures keep the lock so the command can release it. A
+/// heartbeat loss carries only the terminal command error.
+pub(crate) enum LockCommandOutcome<T> {
+    Kept { result: T, lock: StateLock },
+    Lost(AppError),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StatePersistence {
@@ -57,6 +67,30 @@ pub(crate) async fn release_lock_after_execute(
     )
     .await
     .map_err(AppError::Backend)
+}
+
+/// Finish a lock-owning command, releasing only when ownership survived.
+pub(crate) async fn finish_lock_command<T>(
+    backend: &dyn StateBackend,
+    outcome: LockCommandOutcome<Result<T, AppError>>,
+    shutdown: &ShutdownToken,
+) -> Result<T, AppError> {
+    let (result, lock) = match outcome {
+        LockCommandOutcome::Kept { result, lock } => (result, lock),
+        LockCommandOutcome::Lost(error) => return Err(error),
+    };
+
+    let release_result = release_lock_after_execute(backend, lock.as_ref(), shutdown).await;
+    if lock.is_held()
+        && release_result.is_ok()
+        && (result.is_ok() || matches!(result, Err(AppError::Interrupted)))
+    {
+        println!("  {} Lock released", "✓".green());
+    }
+
+    let value = result?;
+    release_result?;
+    Ok(value)
 }
 
 /// Handle state finalization after a mutating command has observed execution.

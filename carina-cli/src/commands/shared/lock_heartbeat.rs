@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
-use carina_state::{BackendError, LockHeartbeat, LockInfo, StateBackend};
+use carina_state::{LockHeartbeat, LockInfo, LockLost, StateBackend};
 
 /// Proof that the CLI flag explicitly disabled state locking.
 ///
@@ -24,6 +24,15 @@ pub(crate) enum StateLock {
 pub(crate) enum StateLockRef<'a> {
     Disabled(&'a LockingDisabled),
     Held(&'a LockInfo),
+}
+
+/// Result of a phase run under the optional state-lock heartbeat.
+///
+/// The lost variant intentionally carries no lock capability, so callers
+/// cannot save state or release a lock that another process may now own.
+pub(crate) enum HeartbeatOutcome<T> {
+    Kept { result: T, lock: StateLock },
+    Lost { result: T, lost: LockLost },
 }
 
 impl StateLock {
@@ -60,12 +69,11 @@ pub(crate) async fn with_lock_heartbeat<T>(
     lock: StateLock,
     shutdown: ShutdownToken,
     operation: impl AsyncFnOnce(ShutdownToken) -> T,
-) -> (T, StateLock, Option<BackendError>) {
+) -> HeartbeatOutcome<T> {
     match lock {
         StateLock::Held(lock) => {
             let (trigger, run_shutdown) = shutdown.with_graceful_shutdown_trigger();
-            let heartbeat = LockHeartbeat::start(backend, lock, move |error| {
-                eprintln!("State lock heartbeat lost ownership: {error}");
+            let heartbeat = LockHeartbeat::start(backend, lock, move || {
                 trigger.request_graceful_shutdown();
             });
             let result = operation(run_shutdown).await;
@@ -74,16 +82,19 @@ pub(crate) async fn with_lock_heartbeat<T>(
                 ShutdownPhase::Running | ShutdownPhase::Graceful => heartbeat.stop().await,
             };
             match stopped {
-                Ok(lock) => (result, StateLock::Held(lock), None),
-                Err(lost) => {
-                    let (lock, error) = lost.into_parts();
-                    (result, StateLock::Held(lock), Some(error))
-                }
+                Ok(lock) => HeartbeatOutcome::Kept {
+                    result,
+                    lock: StateLock::Held(lock),
+                },
+                Err(lost) => HeartbeatOutcome::Lost { result, lost },
             }
         }
         StateLock::Disabled(disabled) => {
             let result = operation(shutdown).await;
-            (result, StateLock::Disabled(disabled), None)
+            HeartbeatOutcome::Kept {
+                result,
+                lock: StateLock::Disabled(disabled),
+            }
         }
     }
 }
@@ -100,7 +111,7 @@ mod tests {
     };
     use tokio::sync::{Notify, oneshot};
 
-    use super::{StateLock, with_lock_heartbeat};
+    use super::{HeartbeatOutcome, StateLock, with_lock_heartbeat};
 
     struct LostLockBackend {
         renewal_started: Notify,
@@ -217,16 +228,21 @@ mod tests {
             .expect("LockNotHeld should cancel the run");
         finish_first.notify_one();
 
-        let ((dispatch_count, phase), returned_lock, lock_loss) =
-            tokio::time::timeout(Duration::from_secs(1), simulated_run)
-                .await
-                .expect("LockNotHeld should cancel the run")
-                .expect("simulated run task should not panic");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), simulated_run)
+            .await
+            .expect("LockNotHeld should cancel the run")
+            .expect("simulated run task should not panic");
+        let HeartbeatOutcome::Lost {
+            result: (dispatch_count, phase),
+            lost,
+        } = outcome
+        else {
+            panic!("LockNotHeld must return the lost-lock variant");
+        };
 
         assert_eq!(phase, ShutdownPhase::Graceful);
         assert_eq!(dispatch_count, 1, "no new effect may be dispatched");
-        assert!(returned_lock.is_held());
-        assert!(matches!(lock_loss, Some(BackendError::LockNotHeld(_))));
+        assert!(matches!(lost.into_error(), BackendError::LockNotHeld(_)));
     }
 
     #[tokio::test]
@@ -236,7 +252,7 @@ mod tests {
         let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
         let run_backend = backend.clone();
 
-        let ((), returned_lock, lock_loss) = tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_millis(100),
             with_lock_heartbeat(backend, StateLock::held(lock), shutdown, async move |_| {
                 run_backend.renewal_started.notified().await;
@@ -245,8 +261,14 @@ mod tests {
         )
         .await
         .expect("cleanup priority must abort a hung heartbeat renewal");
+        let HeartbeatOutcome::Kept {
+            result: (),
+            lock: returned_lock,
+        } = outcome
+        else {
+            panic!("aborting an in-flight renewal must not report lock loss");
+        };
 
         assert!(returned_lock.is_held());
-        assert!(lock_loss.is_none());
     }
 }

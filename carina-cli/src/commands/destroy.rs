@@ -41,9 +41,11 @@ use crate::commands::plan::{
     ProviderUpstreamScope, UpstreamMissingStatePolicy, load_and_resolve_provider_configs,
 };
 use crate::commands::shared::finalize::{
-    StatePersistence, finalize_after_execute, release_lock_after_execute,
+    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
 };
-use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef, with_lock_heartbeat};
+use crate::commands::shared::lock_heartbeat::{
+    HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
+};
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
@@ -126,7 +128,7 @@ pub async fn run_destroy(
         StateLock::disabled_by_cli_flag()
     };
 
-    let (op_result, state_lock) = run_destroy_locked_owned(
+    let outcome = run_destroy_locked_owned(
         &mut parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -140,17 +142,7 @@ pub async fn run_destroy(
         cancel.clone(),
     )
     .await;
-
-    let release_result =
-        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
-    if state_lock.is_held()
-        && release_result.is_ok()
-        && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-    {
-        println!("  {} Lock released", "✓".green());
-    }
-    op_result?;
-    release_result?;
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
 
     Ok(())
 }
@@ -168,12 +160,17 @@ async fn run_destroy_locked_owned(
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
-) -> (Result<(), AppError>, StateLock) {
+) -> LockCommandOutcome<Result<(), AppError>> {
     // Provider declaration metadata is sufficient for schema/factory wiring;
     // construction attributes are resolved after state reconciliation below.
     let (factories, _) = match build_factories_from_providers(&parsed.providers, base_dir) {
         Ok(factories) => factories,
-        Err(error) => return (Err(error), lock),
+        Err(error) => {
+            return LockCommandOutcome::Kept {
+                result: Err(error),
+                lock,
+            };
+        }
     };
     let ctx = WiringContext::new(factories, &parsed.providers);
 
@@ -223,7 +220,7 @@ async fn run_destroy_locked_with_ctx_owned(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
     ctx: &WiringContext,
-) -> (Result<(), AppError>, StateLock) {
+) -> LockCommandOutcome<Result<(), AppError>> {
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
@@ -235,9 +232,14 @@ async fn run_destroy_locked_with_ctx_owned(
     .await
     {
         Ok(state) => state,
-        Err(error) => return (Err(error), lock),
+        Err(error) => {
+            return LockCommandOutcome::Kept {
+                result: Err(error),
+                lock,
+            };
+        }
     };
-    let (heartbeat_result, lock, lock_loss) = with_lock_heartbeat(
+    let heartbeat = with_lock_heartbeat(
         Arc::clone(&backend),
         lock,
         cancel,
@@ -1093,12 +1095,19 @@ async fn run_destroy_locked_with_ctx_owned(
         },
     )
     .await;
+    let (heartbeat_result, lock) = match heartbeat {
+        HeartbeatOutcome::Kept { result, lock } => (result, lock),
+        HeartbeatOutcome::Lost {
+            result: _result,
+            lost,
+        } => {
+            return LockCommandOutcome::Lost(AppError::StateLockLost {
+                error: lost.into_error(),
+            });
+        }
+    };
 
     let op_result = async {
-        if let Some(error) = lock_loss {
-            return Err(AppError::StateLockLost { error });
-        }
-
         match heartbeat_result? {
             DestroyAfterHeartbeat::Done => Ok(()),
             DestroyAfterHeartbeat::Executed(context) => {
@@ -1155,7 +1164,10 @@ async fn run_destroy_locked_with_ctx_owned(
     }
     .await;
 
-    (op_result, lock)
+    LockCommandOutcome::Kept {
+        result: op_result,
+        lock,
+    }
 }
 
 #[cfg(test)]
@@ -1173,10 +1185,10 @@ async fn run_destroy_locked(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    run_destroy_locked_owned(
+    let outcome = run_destroy_locked_owned(
         parsed,
         auto_approve,
-        backend,
+        Arc::clone(&backend),
         protected_bucket,
         lock,
         refresh,
@@ -1184,10 +1196,10 @@ async fn run_destroy_locked(
         base_dir,
         provider_context,
         parallelism,
-        cancel,
+        cancel.clone(),
     )
-    .await
-    .0
+    .await;
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
 }
 
 #[cfg(test)]
@@ -1206,10 +1218,10 @@ async fn run_destroy_locked_with_ctx(
     cancel: ShutdownToken,
     ctx: &WiringContext,
 ) -> Result<(), AppError> {
-    run_destroy_locked_with_ctx_owned(
+    let outcome = run_destroy_locked_with_ctx_owned(
         parsed,
         auto_approve,
-        backend,
+        Arc::clone(&backend),
         protected_bucket,
         lock,
         refresh,
@@ -1217,11 +1229,11 @@ async fn run_destroy_locked_with_ctx(
         base_dir,
         provider_context,
         parallelism,
-        cancel,
+        cancel.clone(),
         ctx,
     )
-    .await
-    .0
+    .await;
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
 }
 
 #[cfg(test)]
@@ -2045,11 +2057,12 @@ mod tests {
             .expect("mock factory must load");
         let ctx = WiringContext::new(factories, &parsed.providers);
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
+        let backend = fixture.lock_loss_backend_handle();
 
         let error = run_destroy_locked_with_ctx(
             &mut parsed,
             true,
-            fixture.lock_loss_backend_handle(),
+            backend.clone(),
             None,
             StateLock::held(lock),
             false,
@@ -2065,6 +2078,8 @@ mod tests {
 
         assert!(matches!(error, AppError::StateLockLost { .. }));
         assert!(error.to_string().contains("state may be behind the cloud"));
+        assert_eq!(backend.locked_writes(), 0, "lost lock must not save state");
+        assert_eq!(backend.releases(), 0, "lost lock must not be released");
     }
 
     #[tokio::test]

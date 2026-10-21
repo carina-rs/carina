@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::commands::shared::cancellation_test_support::{
-    CancellationFixtureBase, RefreshDrainBarrier, ScopedEnv, install_refresh_drain_barrier,
+    CancellationFixtureBase, LockLossBackend, RefreshDrainBarrier, ScopedEnv,
+    install_refresh_drain_barrier,
 };
 
 pub(super) struct DestroyCancellationFixture {
@@ -284,7 +285,7 @@ impl DestroyCancellationFixture {
         self.base.backend()
     }
 
-    pub(super) fn lock_loss_backend_handle(&self) -> Arc<dyn carina_state::StateBackend> {
+    pub(super) fn lock_loss_backend_handle(&self) -> Arc<LockLossBackend> {
         self.base.lock_loss_backend_handle()
     }
 }

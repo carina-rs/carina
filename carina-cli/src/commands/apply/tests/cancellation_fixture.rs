@@ -9,7 +9,9 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_state::LocalBackend;
 
-use crate::commands::shared::cancellation_test_support::{CancellationFixtureBase, ScopedEnv};
+use crate::commands::shared::cancellation_test_support::{
+    CancellationFixtureBase, LockLossBackend, ScopedEnv,
+};
 use crate::commands::shared::observer::CliObserver;
 
 struct CancellingObserver {
@@ -173,7 +175,7 @@ impl ApplyCancellationFixture {
         self.base.backend_handle()
     }
 
-    pub(super) fn lock_loss_backend_handle(&self) -> Arc<dyn carina_state::StateBackend> {
+    pub(super) fn lock_loss_backend_handle(&self) -> Arc<LockLossBackend> {
         self.base.lock_loss_backend_handle()
     }
 

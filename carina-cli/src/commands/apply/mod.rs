@@ -45,10 +45,10 @@ use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
 use crate::commands::shared::finalize::{
-    StatePersistence, finalize_after_execute, release_lock_after_execute,
+    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
 };
 use crate::commands::shared::lock_heartbeat::{
-    LockingDisabled, StateLock, StateLockRef, with_lock_heartbeat,
+    HeartbeatOutcome, LockingDisabled, StateLock, StateLockRef, with_lock_heartbeat,
 };
 use crate::commands::shared::observer::CliObserver;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
@@ -1391,9 +1391,10 @@ async fn run_apply_with_observer_factory(
         StateLock::disabled_by_cli_flag()
     };
 
-    // All code after lock acquisition observes the shared cancellation token
-    // so lock release is guaranteed after SIGINT/SIGTERM cancellation.
-    let (op_result, state_lock) = run_apply_locked_owned(
+    // All code after lock acquisition observes the shared cancellation token.
+    // A lock that survives execution is released after cancellation; proven
+    // heartbeat loss returns without a capability that could be released.
+    let outcome = run_apply_locked_owned(
         &ctx,
         &mut parsed,
         &unresolved_parsed,
@@ -1408,18 +1409,7 @@ async fn run_apply_with_observer_factory(
         accept_legacy_name_overrides,
     )
     .await;
-
-    let release_result =
-        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
-    if state_lock.is_held()
-        && release_result.is_ok()
-        && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-    {
-        println!("  {} Lock released", "✓".green());
-    }
-
-    let timing = op_result?;
-    release_result?;
+    let timing = finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
     if let Some(elapsed) = timing {
         println!("{}", format_total_apply_line(elapsed));
     }
@@ -1552,7 +1542,7 @@ async fn run_apply_locked_owned(
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
-) -> (Result<Option<Duration>, AppError>, StateLock) {
+) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
     // Read current state from backend. carina#3315: if `check_and_migrate`
     // lifted an older on-disk schema in memory, persist the upgrade
     // under the current lock before any short-circuit path can return
@@ -1562,9 +1552,14 @@ async fn run_apply_locked_owned(
     let mut state_file = match load_state_persist_if_migrated(backend.as_ref(), lock.as_ref()).await
     {
         Ok(state) => state,
-        Err(error) => return (Err(error), lock),
+        Err(error) => {
+            return LockCommandOutcome::Kept {
+                result: Err(error),
+                lock,
+            };
+        }
     };
-    let (heartbeat_result, lock, lock_loss) =
+    let heartbeat_outcome =
         with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
             if let Some(state) = state_file.as_ref() {
                 check_legacy_name_overrides(
@@ -2317,12 +2312,19 @@ async fn run_apply_locked_owned(
             )))
         })
         .await;
+    let (heartbeat_result, lock) = match heartbeat_outcome {
+        HeartbeatOutcome::Kept { result, lock } => (result, lock),
+        HeartbeatOutcome::Lost {
+            result: _result,
+            lost,
+        } => {
+            return LockCommandOutcome::Lost(AppError::StateLockLost {
+                error: lost.into_error(),
+            });
+        }
+    };
 
     let op_result = async {
-        if let Some(error) = lock_loss {
-            return Err(AppError::StateLockLost { error });
-        }
-
         match heartbeat_result? {
             SourceApplyAfterHeartbeat::Done(result) => Ok(result),
             SourceApplyAfterHeartbeat::PersistExports(context) => {
@@ -2409,7 +2411,10 @@ async fn run_apply_locked_owned(
     }
     .await;
 
-    (op_result, lock)
+    LockCommandOutcome::Kept {
+        result: op_result,
+        lock,
+    }
 }
 
 #[cfg(test)]
@@ -2428,22 +2433,22 @@ async fn run_apply_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
-    run_apply_locked_owned(
+    let outcome = run_apply_locked_owned(
         ctx,
         parsed,
         unresolved_parsed,
         auto_approve,
-        backend,
+        Arc::clone(&backend),
         lock,
         project_dir,
         provider_context,
-        cancel,
+        cancel.clone(),
         observer_factory,
         parallelism,
         accept_legacy_name_overrides,
     )
-    .await
-    .0
+    .await;
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
 }
 
 fn ensure_saved_plan_backend_matches_current(
@@ -2982,7 +2987,7 @@ async fn run_apply_from_plan_with_observer_factory(
         StateLock::disabled_by_cli_flag()
     };
 
-    let (op_result, state_lock) = run_apply_from_plan_locked_owned(
+    let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
         current_parsed.as_mut(),
         provider_context,
@@ -2996,19 +3001,9 @@ async fn run_apply_from_plan_with_observer_factory(
         accept_legacy_name_overrides,
     )
     .await;
-    let op_result = op_result.map_err(|error| error.with_project_dir(&source_path));
-
-    let release_result =
-        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
-    if state_lock.is_held()
-        && release_result.is_ok()
-        && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-    {
-        println!("  {} Lock released", "✓".green());
-    }
-
-    let timing = op_result?;
-    release_result?;
+    let timing = finish_lock_command(backend.as_ref(), outcome, &cancel)
+        .await
+        .map_err(|error| error.with_project_dir(&source_path))?;
     if let Some(elapsed) = timing {
         println!("{}", format_total_apply_line(elapsed));
     }
@@ -3029,12 +3024,17 @@ async fn run_apply_from_plan_locked_owned(
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
-) -> (Result<Option<Duration>, AppError>, StateLock) {
+) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
     macro_rules! try_with_lock {
         ($expression:expr) => {
             match $expression {
                 Ok(value) => value,
-                Err(error) => return (Err(error), lock),
+                Err(error) => {
+                    return LockCommandOutcome::Kept {
+                        result: Err(error),
+                        lock,
+                    };
+                }
             }
         };
     }
@@ -3066,13 +3066,13 @@ async fn run_apply_from_plan_locked_owned(
         if let Some(plan_lineage) = inspected_plan.state_lineage()
             && state.lineage != plan_lineage
         {
-            return (
-                Err(AppError::Config(format!(
+            return LockCommandOutcome::Kept {
+                result: Err(AppError::Config(format!(
                     "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
                     plan_lineage, state.lineage
                 ))),
                 lock,
-            );
+            };
         }
 
         // Warn on serial mismatch (state may have drifted)
@@ -3108,7 +3108,7 @@ async fn run_apply_from_plan_locked_owned(
         }
     }
 
-    let (heartbeat_result, lock, lock_loss) =
+    let heartbeat_outcome =
         with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
             let (desired_plan, prepared_wiring) = match inspected_plan {
                 InspectedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), None),
@@ -3397,12 +3397,19 @@ async fn run_apply_from_plan_locked_owned(
             )))
         })
         .await;
+    let (heartbeat_result, lock) = match heartbeat_outcome {
+        HeartbeatOutcome::Kept { result, lock } => (result, lock),
+        HeartbeatOutcome::Lost {
+            result: _result,
+            lost,
+        } => {
+            return LockCommandOutcome::Lost(AppError::StateLockLost {
+                error: lost.into_error(),
+            });
+        }
+    };
 
     let op_result = async {
-        if let Some(error) = lock_loss {
-            return Err(AppError::StateLockLost { error });
-        }
-
         match heartbeat_result? {
             SavedPlanApplyAfterHeartbeat::Done(result) => Ok(result),
             SavedPlanApplyAfterHeartbeat::Executed(context) => {
@@ -3470,7 +3477,10 @@ async fn run_apply_from_plan_locked_owned(
     }
     .await;
 
-    (op_result, lock)
+    LockCommandOutcome::Kept {
+        result: op_result,
+        lock,
+    }
 }
 
 #[cfg(test)]
@@ -3488,21 +3498,21 @@ async fn run_apply_from_plan_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
-    run_apply_from_plan_locked_owned(
+    let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
         current_parsed,
         provider_context,
         auto_approve,
-        backend,
+        Arc::clone(&backend),
         lock,
         apply_target,
-        cancel,
+        cancel.clone(),
         observer_factory,
         parallelism,
         accept_legacy_name_overrides,
     )
-    .await
-    .0
+    .await;
+    finish_lock_command(backend.as_ref(), outcome, &cancel).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
