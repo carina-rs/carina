@@ -253,7 +253,7 @@ mod tests {
         let run_backend = backend.clone();
 
         let outcome = tokio::time::timeout(
-            Duration::from_millis(100),
+            Duration::from_secs(5),
             with_lock_heartbeat(backend, StateLock::held(lock), shutdown, async move |_| {
                 run_backend.renewal_started.notified().await;
                 trigger.prioritize_cleanup();

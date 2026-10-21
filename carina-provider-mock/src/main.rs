@@ -10,11 +10,13 @@ use std::sync::Mutex;
 #[derive(Debug, Serialize, Deserialize)]
 struct CreateToken {
     remaining: u32,
+    polls_served: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UpdateToken {
     remaining: u32,
+    polls_served: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,8 +116,15 @@ impl MockProcessProvider {
     fn create_done(
         &self,
         id: &ResourceId,
-        request: CreateRequest,
+        mut request: CreateRequest,
+        polls_served: Option<u32>,
     ) -> carina_provider_protocol::CreateOutcome {
+        if let Some(polls_served) = polls_served {
+            request.resource.attributes.insert(
+                "__mock_create_polls_served__".to_string(),
+                Value::Int(i64::from(polls_served)),
+            );
+        }
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
         let resource = request.resource;
@@ -134,6 +143,7 @@ impl MockProcessProvider {
         &self,
         id: &ResourceId,
         request: UpdateRequest,
+        polls_served: Option<u32>,
     ) -> carina_provider_protocol::UpdateOutcome {
         // Apply the patch on top of `from` while preserving typed persisted
         // values that were not mentioned by the patch. Also echo the patch op
@@ -157,6 +167,12 @@ impl MockProcessProvider {
             "__mock_patch_ops__".to_string(),
             patch_sentinel.clone().into(),
         );
+        if let Some(polls_served) = polls_served {
+            state.attributes.insert(
+                "__mock_update_polls_served__".to_string(),
+                Value::Int(i64::from(polls_served)).into(),
+            );
+        }
         state.identifier = Some("mock-id".into());
         state.exists = true;
 
@@ -181,6 +197,12 @@ impl MockProcessProvider {
             }
         }
         cloud_attributes.insert("__mock_patch_ops__".to_string(), patch_sentinel);
+        if let Some(polls_served) = polls_served {
+            cloud_attributes.insert(
+                "__mock_update_polls_served__".to_string(),
+                Value::Int(i64::from(polls_served)),
+            );
+        }
 
         carina_provider_protocol::UpdateOutcome::Success { state }
     }
@@ -325,12 +347,13 @@ impl CarinaProvider for MockProcessProvider {
             return Ok(CreateOutcome::Pending(Pending {
                 token: CreateToken {
                     remaining: pending_polls - 1,
+                    polls_served: 0,
                 },
                 poll_after_secs: 1,
             }));
         }
 
-        Ok(CreateOutcome::Done(self.create_done(id, request)))
+        Ok(CreateOutcome::Done(self.create_done(id, request, None)))
     }
 
     fn poll_create(
@@ -343,11 +366,16 @@ impl CarinaProvider for MockProcessProvider {
             return Ok(CreateOutcome::Pending(Pending {
                 token: CreateToken {
                     remaining: pending.token.remaining - 1,
+                    polls_served: pending.token.polls_served + 1,
                 },
                 poll_after_secs: 1,
             }));
         }
-        Ok(CreateOutcome::Done(self.create_done(id, request)))
+        Ok(CreateOutcome::Done(self.create_done(
+            id,
+            request,
+            Some(pending.token.polls_served + 1),
+        )))
     }
 
     fn update(
@@ -361,11 +389,12 @@ impl CarinaProvider for MockProcessProvider {
             return Ok(UpdateOutcome::Pending(Pending {
                 token: UpdateToken {
                     remaining: pending_polls - 1,
+                    polls_served: 0,
                 },
                 poll_after_secs: 1,
             }));
         }
-        Ok(UpdateOutcome::Done(self.update_done(id, request)))
+        Ok(UpdateOutcome::Done(self.update_done(id, request, None)))
     }
 
     fn poll_update(
@@ -379,11 +408,16 @@ impl CarinaProvider for MockProcessProvider {
             return Ok(UpdateOutcome::Pending(Pending {
                 token: UpdateToken {
                     remaining: pending.token.remaining - 1,
+                    polls_served: pending.token.polls_served + 1,
                 },
                 poll_after_secs: 1,
             }));
         }
-        Ok(UpdateOutcome::Done(self.update_done(id, request)))
+        Ok(UpdateOutcome::Done(self.update_done(
+            id,
+            request,
+            Some(pending.token.polls_served + 1),
+        )))
     }
 
     fn delete(

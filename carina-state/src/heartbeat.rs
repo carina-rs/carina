@@ -169,13 +169,14 @@ impl Drop for HeartbeatGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, Once};
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tokio::sync::{Notify, oneshot};
+    use tokio::sync::{Notify, Semaphore, oneshot};
 
     use super::LockHeartbeat;
     use crate::{BackendError, BackendResult, LoadedState, LockInfo, StateBackend, StateFile};
@@ -231,10 +232,11 @@ mod tests {
         renewing: AtomicBool,
         save_overlapped_renewal: AtomicBool,
         renewal_started: Notify,
+        renewal_completed: Semaphore,
         renewal_delay: Duration,
         renewal_never_completes: bool,
         lose_lock: AtomicBool,
-        transient_failures: AtomicUsize,
+        transient_failure_script: Mutex<VecDeque<bool>>,
     }
 
     impl RecordingBackend {
@@ -244,16 +246,24 @@ mod tests {
                 renewing: AtomicBool::new(false),
                 save_overlapped_renewal: AtomicBool::new(false),
                 renewal_started: Notify::new(),
+                renewal_completed: Semaphore::new(0),
                 renewal_delay,
                 renewal_never_completes: false,
                 lose_lock: AtomicBool::new(false),
-                transient_failures: AtomicUsize::new(0),
+                transient_failure_script: Mutex::new(VecDeque::new()),
             }
         }
 
         fn with_never_completing_renewal() -> Self {
             Self {
                 renewal_never_completes: true,
+                ..Self::new(Duration::ZERO)
+            }
+        }
+
+        fn with_transient_failure_script(script: impl IntoIterator<Item = bool>) -> Self {
+            Self {
+                transient_failure_script: Mutex::new(script.into_iter().collect()),
                 ..Self::new(Duration::ZERO)
             }
         }
@@ -283,8 +293,13 @@ mod tests {
                     "test lock was replaced".to_string(),
                 ));
             }
-            if self.transient_failures.load(Ordering::SeqCst) > 0 {
-                self.transient_failures.fetch_sub(1, Ordering::SeqCst);
+            if self
+                .transient_failure_script
+                .lock()
+                .expect("transient failure script lock")
+                .pop_front()
+                .unwrap_or(false)
+            {
                 return Err(BackendError::Io("temporary test failure".to_string()));
             }
             self.renewing.store(true, Ordering::SeqCst);
@@ -294,6 +309,7 @@ mod tests {
             }
             tokio::time::sleep(self.renewal_delay).await;
             self.renewals.fetch_add(1, Ordering::SeqCst);
+            self.renewal_completed.add_permits(1);
             self.renewing.store(false, Ordering::SeqCst);
             Ok(lock.renewed_for_test())
         }
@@ -334,7 +350,14 @@ mod tests {
         let guard =
             LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
 
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.renewal_completed.acquire_many(2),
+        )
+        .await
+        .expect("heartbeat should complete two renewals")
+        .expect("renewal completion semaphore must remain open")
+        .forget();
         let renewed = guard.stop().await.expect("lock should remain held");
 
         assert!(backend.renewals.load(Ordering::SeqCst) >= 2);
@@ -381,30 +404,31 @@ mod tests {
     #[tokio::test]
     async fn transient_renewal_failure_warns_once_per_failure_streak() {
         clear_captured_warnings();
-        let backend = Arc::new(RecordingBackend::new(Duration::ZERO));
-        backend.transient_failures.store(2, Ordering::SeqCst);
+        let backend = Arc::new(RecordingBackend::with_transient_failure_script([
+            true, true, false, true, true, false,
+        ]));
         let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(30));
         let guard =
             LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.renewals.load(Ordering::SeqCst) < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.renewal_completed.acquire_many(2),
+        )
         .await
-        .expect("heartbeat should recover from the first failure streak");
-        backend.transient_failures.store(2, Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.renewals.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("heartbeat should recover from the second failure streak");
+        .expect("heartbeat should recover from both scripted failure streaks")
+        .expect("renewal completion semaphore must remain open")
+        .forget();
         let _lock = guard.stop().await.expect("lock should remain held");
 
-        assert_eq!(backend.transient_failures.load(Ordering::SeqCst), 0);
+        assert!(
+            backend
+                .transient_failure_script
+                .lock()
+                .expect("transient failure script lock")
+                .is_empty(),
+            "heartbeat must consume every scripted renewal outcome"
+        );
         let warnings = captured_warnings();
         assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
         assert!(
