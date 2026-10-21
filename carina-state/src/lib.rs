@@ -53,6 +53,7 @@ pub mod backend;
 mod backend_config;
 pub mod backend_lock;
 pub mod backends;
+mod heartbeat;
 pub mod lock;
 pub mod state;
 
@@ -70,6 +71,7 @@ pub use backends::{
     LocalBackend, StateUrl, anchored_local_path, create_backend, create_remote_backend,
     load_state_from_url, resolve_backend_for_read,
 };
+pub use heartbeat::{HeartbeatGuard, LockHeartbeat};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, DeposedInstance, DeposedKey, LoadedState, MigratedStateFile, MigrationInfo,

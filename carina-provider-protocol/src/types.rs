@@ -762,6 +762,22 @@ pub struct OperationConfig {
     pub create_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_timeout_secs: Option<u64>,
+}
+
+impl OperationConfig {
+    /// Return the configured budget for `kind`, or the protocol default.
+    pub fn budget(&self, kind: crate::OperationKind) -> std::time::Duration {
+        let timeout_secs = match kind {
+            crate::OperationKind::Create => self.create_timeout_secs,
+            crate::OperationKind::Update => self.update_timeout_secs,
+            crate::OperationKind::Delete => self.delete_timeout_secs,
+        };
+        timeout_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(crate::DEFAULT_OPERATION_BUDGET)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1772,14 +1788,44 @@ mod tests {
             delete_max_retries: Some(24),
             create_timeout_secs: None,
             create_max_retries: None,
+            update_timeout_secs: Some(900),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"delete_timeout_secs\":1800"));
+        assert!(json.contains("\"update_timeout_secs\":900"));
         assert!(!json.contains("create_timeout_secs"));
 
         let back: OperationConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.delete_timeout_secs, Some(1800));
         assert_eq!(back.create_timeout_secs, None);
+        assert_eq!(back.update_timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn operation_config_budget_uses_kind_specific_timeout_or_default() {
+        let config = OperationConfig {
+            create_timeout_secs: Some(10),
+            update_timeout_secs: Some(20),
+            delete_timeout_secs: Some(30),
+            ..OperationConfig::default()
+        };
+
+        assert_eq!(
+            config.budget(crate::OperationKind::Create),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.budget(crate::OperationKind::Update),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            config.budget(crate::OperationKind::Delete),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            OperationConfig::default().budget(crate::OperationKind::Create),
+            crate::DEFAULT_OPERATION_BUDGET
+        );
     }
 
     #[test]

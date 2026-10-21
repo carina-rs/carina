@@ -100,7 +100,7 @@ pub(crate) struct CancellationFixtureBase {
     crn_path: PathBuf,
     state_path: PathBuf,
     lock_path: PathBuf,
-    backend: LocalBackend,
+    backend: std::sync::Arc<LocalBackend>,
     shutdown_trigger: TestShutdownTrigger,
     shutdown: ShutdownToken,
 }
@@ -112,7 +112,7 @@ impl CancellationFixtureBase {
         let crn_path = dir.path().join("main.crn");
         let state_path = dir.path().join("carina.state.json");
         let lock_path = state_path.with_extension("lock");
-        let backend = LocalBackend::with_path(state_path.clone());
+        let backend = std::sync::Arc::new(LocalBackend::with_path(state_path.clone()));
 
         let (shutdown_trigger, shutdown) = shutdown_channel();
         Self {
@@ -173,6 +173,10 @@ impl CancellationFixtureBase {
 
     pub(crate) fn backend(&self) -> &LocalBackend {
         &self.backend
+    }
+
+    pub(crate) fn backend_handle(&self) -> std::sync::Arc<dyn StateBackend> {
+        self.backend.clone()
     }
 
     pub(crate) fn readiness_path(&self, name: &str) -> PathBuf {

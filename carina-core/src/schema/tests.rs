@@ -3701,6 +3701,7 @@ fn test_resource_schema_with_operation_config() {
     assert_eq!(config.delete_timeout_secs, Some(1800));
     assert_eq!(config.delete_max_retries, Some(24));
     assert_eq!(config.create_timeout_secs, None);
+    assert_eq!(config.update_timeout_secs, None);
 }
 
 #[test]

@@ -240,8 +240,15 @@ async fn test_from_file_cached_uses_cache() {
     assert_eq!(factory2.name(), "mock");
 
     // Both factories should report correct schemas (empty for mock provider)
-    assert!(factory1.schemas().is_empty());
-    assert!(factory2.schemas().is_empty());
+    for factory in [&factory1, &factory2] {
+        assert!(
+            factory
+                .schemas()
+                .iter()
+                .any(|schema| schema.resource_type == "test.short_budget"),
+            "cached and uncached factories must retain mock schema metadata"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

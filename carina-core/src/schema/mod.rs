@@ -6123,6 +6123,9 @@ pub struct OperationConfig {
     /// Maximum retry attempts for retryable create errors.
     /// Default: provider-specific (e.g., 12 for CloudControl).
     pub create_max_retries: Option<u32>,
+    /// Polling timeout for update operations in seconds.
+    /// Default: the shared provider-operation budget.
+    pub update_timeout_secs: Option<u64>,
 }
 
 /// Classification of a resource schema: managed (full CRUD lifecycle) vs

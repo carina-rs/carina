@@ -229,7 +229,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn slow_bounded_cleanup_operations_finish_inside_the_hard_deadline() {
         let backend = LatencyBackend::new(Duration::from_millis(250));
-        let lock = LockInfo::new("apply");
+        let lock = LockInfo::for_test("apply");
         let mut state = StateFile::new();
         let (trigger, shutdown) = shutdown_channel();
         trigger.prioritize_cleanup();
@@ -272,7 +272,7 @@ mod tests {
     async fn slow_state_flush_cannot_starve_cleanup_lock_release() {
         let backend =
             LatencyBackend::with_latencies(Duration::from_secs(5), Duration::from_millis(250));
-        let lock = LockInfo::new("destroy");
+        let lock = LockInfo::for_test("destroy");
         let mut state = StateFile::new();
         let (trigger, shutdown) = shutdown_channel();
         trigger.prioritize_cleanup();
@@ -359,7 +359,7 @@ mod tests {
         }
 
         async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
-            Ok(LockInfo::new(operation))
+            Ok(LockInfo::for_test(operation))
         }
 
         async fn release_lock(&self, _lock: &LockInfo) -> BackendResult<()> {

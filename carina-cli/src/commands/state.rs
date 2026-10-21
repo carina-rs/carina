@@ -2157,7 +2157,7 @@ mod tests {
         }
 
         async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
-            Ok(LockInfo::new(operation))
+            Ok(LockInfo::for_test(operation))
         }
 
         async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
@@ -2165,7 +2165,7 @@ mod tests {
         }
 
         async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
-            Ok(lock.renewed())
+            Ok(lock.renewed_for_test())
         }
 
         async fn write_state_locked(

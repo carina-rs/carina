@@ -21,7 +21,7 @@ wasmtime = { version = "43", features = ["component-model"] }
 wasmtime-wasi = "43"
 wasmtime-wasi-http = "43"
 hyper = "1"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "time"] }
 # Used by the local phase-instrumented copy of `default_send_request_handler`.
 # Versions track wasmtime-wasi-http 43.x so we share the rustls/hyper stack
 # instead of forking the TLS/HTTP wire path.

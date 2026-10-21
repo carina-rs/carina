@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
@@ -150,6 +151,21 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
     (factory, cache)
 }
 
+fn resource_with_int_attribute(
+    resource_type: &str,
+    identity: &str,
+    attribute: &str,
+    value: i64,
+) -> Resource {
+    let identity = carina_core::resource::ResourceIdentity::try_from(identity.to_string())
+        .expect("test identity must be non-empty");
+    let mut resource = Resource::with_provider("mock", resource_type, identity, None);
+    resource
+        .attributes
+        .insert(attribute.into(), Value::Concrete(ConcreteValue::Int(value)));
+    resource
+}
+
 fn ready_config(
     factory: &dyn ProviderFactory,
     attributes: &indexmap::IndexMap<String, Value>,
@@ -196,9 +212,259 @@ async fn test_wasm_mock_provider_factory() {
     assert_eq!(factory.name(), "mock");
     assert_eq!(factory.display_name(), "Mock Provider (Process)");
 
-    // schemas() should return an empty vec for the mock provider
     let schemas = factory.schemas();
-    assert!(schemas.is_empty(), "Mock provider should have no schemas");
+    let short_budget = schemas
+        .iter()
+        .find(|schema| schema.resource_type == "test.short_budget")
+        .and_then(|schema| schema.operation_config.as_ref())
+        .expect("mock provider should expose the short-budget schema");
+    assert_eq!(short_budget.create_timeout_secs, Some(2));
+    assert_eq!(short_budget.update_timeout_secs, Some(2));
+    assert_eq!(short_budget.delete_timeout_secs, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_pending_create_polls_until_success() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-create", None);
+    let resource =
+        resource_with_int_attribute("test.resource", "pending-create", "create_pending_polls", 2);
+
+    let state = provider
+        .create(&id, create_request_for_test(resource).await)
+        .await
+        .expect("pending create should settle")
+        .into_state_for_writeback();
+
+    assert_eq!(state.identifier.as_deref(), Some("mock-id"));
+    assert!(state.exists);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_pending_update_polls_until_success() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-update", None);
+    let mut resource = resource_with_int_attribute("test.resource", "pending-update", "value", 1);
+    let created = provider
+        .create(&id, create_request_for_test(resource.clone()).await)
+        .await
+        .expect("setup create should succeed")
+        .into_state_for_writeback();
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_pending_polls",
+        Value::Concrete(ConcreteValue::Int(2)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &["value".to_string(), "update_pending_polls".to_string()],
+    )
+    .await;
+
+    let state = provider
+        .update(&id, "mock-id", request)
+        .await
+        .expect("pending update should settle")
+        .into_state_for_writeback();
+
+    assert_eq!(
+        state.attributes.get("value"),
+        Some(&Value::Concrete(ConcreteValue::Int(2)))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_pending_delete_polls_until_success() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-delete", None);
+    let resource =
+        resource_with_int_attribute("test.resource", "pending-delete", "delete_pending_polls", 2);
+    provider
+        .create(&id, create_request_for_test(resource).await)
+        .await
+        .expect("setup create should succeed");
+
+    provider
+        .delete(&id, "mock-id", DeleteRequest::default())
+        .await
+        .expect("pending delete should settle");
+
+    let state = provider
+        .read(&id, Some("mock-id"), ReadRequest)
+        .await
+        .expect("provider should remain usable");
+    assert!(!state.exists);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.short_budget", "over-budget", None);
+    let resource = resource_with_int_attribute(
+        "test.short_budget",
+        "over-budget",
+        "create_pending_polls",
+        100,
+    );
+
+    let error = provider
+        .create(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("pending create should exhaust its schema budget");
+    assert!(matches!(
+        error,
+        carina_core::provider::ProviderError::Timeout(_)
+    ));
+
+    let healthy_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "after-timeout", None);
+    let healthy = resource_with_int_attribute("test.resource", "after-timeout", "value", 1);
+    provider
+        .create(&healthy_id, create_request_for_test(healthy).await)
+        .await
+        .expect("budget exhaustion must not poison the WASM instance");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_operation_budget_includes_initial_guest_call() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id =
+        ResourceId::with_provider_identity("mock", "test.short_budget", "slow-initial-call", None);
+    let mut resource = resource_with_int_attribute(
+        "test.short_budget",
+        "slow-initial-call",
+        "call_delay_millis",
+        2_100,
+    );
+    resource.set_attr(
+        "create_pending_polls",
+        Value::Concrete(ConcreteValue::Int(1)),
+    );
+
+    let error = provider
+        .create(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the slow initial guest call should exhaust the schema budget");
+
+    assert!(matches!(
+        error,
+        carina_core::provider::ProviderError::Timeout(_)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let pending_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "sleeping-poll", None);
+    let resource =
+        resource_with_int_attribute("test.resource", "sleeping-poll", "create_pending_polls", 1);
+    let request = create_request_for_test(resource).await;
+    let sibling_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "sibling-read", None);
+
+    let pending_operation = provider.create(&pending_id, request);
+    let sibling_operation = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            provider.read(&sibling_id, None, ReadRequest),
+        )
+        .await
+        .expect("sibling read must not wait for the provider's poll sleep")
+        .expect("sibling read should succeed")
+    };
+
+    let (pending_result, sibling_state) = tokio::join!(pending_operation, sibling_operation);
+    pending_result.expect("pending create should settle");
+    assert!(!sibling_state.exists);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_operation_hard_timeout(Duration::from_millis(500));
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let first_id = ResourceId::with_provider_identity("mock", "test.resource", "slow-one", None);
+    let second_id = ResourceId::with_provider_identity("mock", "test.resource", "slow-two", None);
+    let fast_id = ResourceId::with_provider_identity("mock", "test.resource", "queued-fast", None);
+    let first = create_request_for_test(resource_with_int_attribute(
+        "test.resource",
+        "slow-one",
+        "call_delay_millis",
+        350,
+    ))
+    .await;
+    let second = create_request_for_test(resource_with_int_attribute(
+        "test.resource",
+        "slow-two",
+        "call_delay_millis",
+        350,
+    ))
+    .await;
+    let fast = create_request_for_test(resource_with_int_attribute(
+        "test.resource",
+        "queued-fast",
+        "value",
+        1,
+    ))
+    .await;
+
+    let started = Instant::now();
+    let first_operation = provider.create(&first_id, first);
+    let second_operation = async {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        provider.create(&second_id, second).await
+    };
+    let fast_operation = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        provider.create(&fast_id, fast).await
+    };
+    let (first_result, second_result, fast_result) =
+        tokio::join!(first_operation, second_operation, fast_operation);
+
+    first_result.expect("first slow guest call should stay within the injected timeout");
+    second_result.expect("second slow guest call should stay within the injected timeout");
+    fast_result.expect("queued lock time must not consume the guest-call timeout");
+    assert!(
+        started.elapsed() > Duration::from_millis(500),
+        "the fast call must have spent longer than the injected timeout queued behind siblings"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

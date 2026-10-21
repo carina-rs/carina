@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use indexmap::IndexMap;
 #[cfg(test)]
@@ -833,7 +836,7 @@ impl Drop for EpochTicker {
     }
 }
 
-/// Wall-clock backstop for a single WASM provider operation.
+/// Wall-clock backstop for one WASM guest call.
 ///
 /// Epoch interruption ([`WASM_OPERATION_TIMEOUT_SECS`] via
 /// `store.set_epoch_deadline`) can only trap WASM *computation* — it does
@@ -845,31 +848,19 @@ impl Drop for EpochTicker {
 /// `Ctrl+C` cannot unwind a future parked inside a `wasmtime` call
 /// (carina#3106).
 ///
-/// This wraps the whole operation — both acquiring the store lock and the
-/// guest call — in a `tokio::time::timeout` so a stuck host-side wait is
-/// converted into a [`ProviderError::timeout`] instead of hanging
-/// indefinitely.
+/// This wraps only the guest call, after the shared store lock has been
+/// acquired. Time queued behind a sibling call is not execution time for this
+/// call and must not consume its backstop.
 ///
 /// # Sizing — why this is 20 minutes, not the ~30s epoch budget
 ///
-/// This is a wall-clock bound on a *whole provider operation*, not a
-/// single API call. A provider `create`/`delete` legitimately embeds its
-/// own multi-minute poll-until-ready loop inside one WASM call (e.g. the
-/// AWS provider's NAT Gateway delete waits ~7.5 min and Organizations
-/// account creation waits up to 10 min — host-side `sleep` + HTTP that
-/// the 30s epoch budget deliberately does not count because epochs only
-/// tick on WASM compute). A backstop sized near the epoch budget would
-/// falsely time out — and then poison (see [`SharedWasmInstance`]) — the
-/// entire provider on every such resource.
-///
-/// 20 min is ~2× the longest known legitimate single-call provider
-/// waiter, so it never trips a healthy operation, while still converting
-/// the carina#3106 *unbounded* hang into a bounded, recoverable error.
-///
-/// **Provider contract:** a single provider operation must complete
-/// within this budget. A waiter that needs longer must be expressed as
-/// the carina `wait` construct (separate short reads the executor drives)
-/// rather than a blocking loop inside one `create`/`delete` call.
+/// Provider operations may span many calls through the typed pending protocol;
+/// their total budget is independent and comes from the resource schema.
+/// Therefore this value only needs to exceed the longest legitimate *single
+/// step* (one API request or one status check), while remaining a finite
+/// backstop for carina#3106's unbounded host-side I/O hang. It stays at 20
+/// minutes for compatibility while providers migrate their former in-call
+/// waiters to pending steps.
 const WASM_OPERATION_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// If `poisoned` is set, return the fail-fast error a poisoned instance
@@ -922,34 +913,26 @@ fn poison_after_trap(
     poisoned.store(true, Ordering::Release);
 }
 
-/// Run `op` against `instance` under [`WASM_OPERATION_HARD_TIMEOUT`].
+/// Run one already-locked guest call under its wall-clock backstop.
 ///
 /// `operation` names the call for the error message (e.g. `"create"`).
 ///
-/// Three outcomes:
-/// - `instance` already poisoned by a prior timeout/cancellation or component
-///   trap → fail fast without touching the store (either leaves the shared
-///   component instance unreusable; see [`SharedWasmInstance::poisoned`]).
-/// - `op` completes within budget → its result, untouched.
-/// - the deadline elapses → `op` is dropped; the poisoning is done by
-///   [`LockedStore`]'s drop while it still holds the store lock (not
-///   here), so a waiter cannot acquire the freed-but-not-yet-flagged
-///   lock. Returns [`ProviderError::timeout`].
+/// If the deadline elapses, `op` is dropped; the poisoning is done by
+/// [`LockedStore`]'s drop while it still holds the store lock (not here), so a
+/// waiter cannot acquire the freed-but-not-yet-flagged lock. Returns
+/// [`ProviderError::timeout`].
 async fn with_operation_timeout<T>(
-    instance: &SharedWasmInstance,
     operation: &str,
-    op: impl std::future::Future<Output = ProviderResult<T>>,
+    hard_timeout: std::time::Duration,
+    op: impl std::future::Future<Output = T>,
 ) -> ProviderResult<T> {
-    if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation) {
-        return Err(err);
-    }
-    match tokio::time::timeout(WASM_OPERATION_HARD_TIMEOUT, op).await {
-        Ok(result) => result,
+    match tokio::time::timeout(hard_timeout, op).await {
+        Ok(result) => Ok(result),
         Err(_elapsed) => Err(ProviderError::timeout(format!(
             "WASM plugin operation '{operation}' exceeded {}s (host-side I/O \
              wait that epoch interruption cannot reach; check network/AWS \
              connectivity)",
-            WASM_OPERATION_HARD_TIMEOUT.as_secs()
+            hard_timeout.as_secs_f64()
         ))),
     }
 }
@@ -962,10 +945,13 @@ async fn with_operation_timeout<T>(
 /// `MutexGuard`). When `tokio::time::timeout` cancels the in-flight
 /// operation it drops this whole value; the flag is therefore set
 /// **while the store `Mutex` is still held**, closing the window where a
-/// sibling operation already queued on the lock could otherwise acquire
-/// the freed-but-not-yet-flagged store and call into the unusable
-/// wasmtime `Store` (carina#3106). A returned guest call is disarmed; returned
-/// component traps are then poisoned explicitly with their origin preserved.
+/// sibling operation already queued on the lock could otherwise acquire the
+/// freed-but-not-yet-flagged store and call into the unusable wasmtime `Store`
+/// (carina#3106). On timeout the caller immediately propagates the error while
+/// this guard remains armed, so the same drop-order guarantee applies even
+/// though lock acquisition is now outside the timeout. A returned guest call
+/// is disarmed; returned component traps are then poisoned explicitly with
+/// their origin preserved.
 struct LockedStore<'a> {
     poison: PoisonOnDrop<'a>,
     store: tokio::sync::MutexGuard<'a, Store<HostState>>,
@@ -995,6 +981,10 @@ impl<'a> LockedStore<'a> {
         instance: &'a SharedWasmInstance,
         operation: &str,
     ) -> ProviderResult<LockedStore<'a>> {
+        if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation)
+        {
+            return Err(err);
+        }
         let mut store = instance.store.lock().await;
         if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation)
         {
@@ -1724,6 +1714,27 @@ pub(crate) mod version_checked_bindings {
             }
         }
 
+        pub(super) async fn call_poll_create(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            request: &wit_types::CreateRequest,
+            pending: &wit_types::PendingOperation,
+        ) -> wasmtime::Result<Result<wit_types::CreateOutcome, wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_poll_create(store, id, request, pending)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_poll_create(store, id, request, pending)
+                        .await
+                }
+            }
+        }
+
         pub(super) async fn call_update(
             &self,
             store: &mut Store<HostState>,
@@ -1745,13 +1756,35 @@ pub(crate) mod version_checked_bindings {
             }
         }
 
+        pub(super) async fn call_poll_update(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            identifier: &str,
+            request: &wit_types::UpdateRequest,
+            pending: &wit_types::PendingOperation,
+        ) -> wasmtime::Result<Result<wit_types::UpdateOutcome, wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_poll_update(store, id, identifier, request, pending)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_poll_update(store, id, identifier, request, pending)
+                        .await
+                }
+            }
+        }
+
         pub(super) async fn call_delete(
             &self,
             store: &mut Store<HostState>,
             id: &wit_types::ResourceId,
             identifier: &str,
             request: wit_types::DeleteRequest,
-        ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
+        ) -> wasmtime::Result<Result<wit_types::DeleteOutcome, wit_types::ProviderError>> {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
                     b.carina_provider_provider()
@@ -1761,6 +1794,28 @@ pub(crate) mod version_checked_bindings {
                 RawWasmBindings::Http(b) => {
                     b.carina_provider_provider()
                         .call_delete(store, id, identifier, request)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_poll_delete(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            identifier: &str,
+            request: wit_types::DeleteRequest,
+            pending: &wit_types::PendingOperation,
+        ) -> wasmtime::Result<Result<wit_types::DeleteOutcome, wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_poll_delete(store, id, identifier, request, pending)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_poll_delete(store, id, identifier, request, pending)
                         .await
                 }
             }
@@ -2274,6 +2329,8 @@ pub struct WasmProviderFactory {
     display_name: String,
     version: String,
     schemas: Vec<ResourceSchema>,
+    operation_configs: Arc<HashMap<String, carina_provider_protocol::OperationConfig>>,
+    operation_hard_timeout: std::time::Duration,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
     /// Provider config attribute types (e.g., `region` → `AttributeType::Enum`).
@@ -2549,8 +2606,9 @@ impl WasmProviderFactory {
             .map_err(|source| {
                 WasmProviderLoadError::metadata("Failed to decode provider info", source)
             })?;
-        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json)
-            .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
+        let (schemas, operation_configs) =
+            wasm_convert::json_to_schemas_with_operation_configs(&schemas_json)
+                .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
 
         let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
             Self::load_metadata(&bindings, &mut store, &name, &version).await?;
@@ -2563,6 +2621,8 @@ impl WasmProviderFactory {
             display_name,
             version,
             schemas,
+            operation_configs: Arc::new(operation_configs),
+            operation_hard_timeout: WASM_OPERATION_HARD_TIMEOUT,
             cached_config_completions,
             cached_identity_attributes,
             cached_provider_config_types,
@@ -2787,6 +2847,16 @@ impl WasmProviderFactory {
         self
     }
 
+    /// Override the per-guest-call wall-clock backstop.
+    ///
+    /// Production callers use the default. Integration tests inject a short
+    /// duration to prove that time queued for the store lock is excluded.
+    #[doc(hidden)]
+    pub fn with_operation_hard_timeout(mut self, hard_timeout: std::time::Duration) -> Self {
+        self.operation_hard_timeout = hard_timeout;
+        self
+    }
+
     pub fn version(&self) -> &str {
         &self.version
     }
@@ -2904,6 +2974,8 @@ impl ProviderFactory for WasmProviderFactory {
             Ok(Box::new(WasmProvider {
                 instance,
                 name: self.name.clone(),
+                operation_configs: Arc::clone(&self.operation_configs),
+                operation_hard_timeout: self.operation_hard_timeout,
             }) as Box<dyn Provider>)
         })
     }
@@ -2936,12 +3008,469 @@ impl ProviderFactory for WasmProviderFactory {
 pub struct WasmProvider {
     instance: Arc<SharedWasmInstance>,
     name: String,
+    operation_configs: Arc<HashMap<String, carina_provider_protocol::OperationConfig>>,
+    operation_hard_timeout: std::time::Duration,
 }
 
 // Safety: SharedWasmInstance.store is behind a Mutex, so concurrent access is
 // serialized. The bindings are only used while the store mutex is held.
 unsafe impl Send for WasmProvider {}
 unsafe impl Sync for WasmProvider {}
+
+struct PendingCreate {
+    id: ResourceId,
+    wit_id: wit_types::ResourceId,
+    wit_request: wit_types::CreateRequest,
+    operation: wasm_convert::CreatePendingOperation,
+}
+
+struct PendingUpdate {
+    id: ResourceId,
+    wit_id: wit_types::ResourceId,
+    identifier: String,
+    wit_request: wit_types::UpdateRequest,
+    operation: wasm_convert::UpdatePendingOperation,
+}
+
+struct PendingDelete {
+    id: ResourceId,
+    wit_id: wit_types::ResourceId,
+    identifier: String,
+    wit_request: wit_types::DeleteRequest,
+    operation: wasm_convert::DeletePendingOperation,
+}
+
+enum CreateProgress {
+    Done(Box<CreateOutcome>),
+    Pending(Box<PendingCreate>),
+}
+
+enum UpdateProgress {
+    Done(Box<UpdateOutcome>),
+    Pending(Box<PendingUpdate>),
+}
+
+enum DeleteProgress {
+    Deleted,
+    Pending(Box<PendingDelete>),
+}
+
+trait OperationProgress {
+    type Output;
+    type PendingState;
+
+    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState>;
+    fn poll_after_secs(pending: &Self::PendingState) -> u32;
+}
+
+impl OperationProgress for CreateProgress {
+    type Output = CreateOutcome;
+    type PendingState = Box<PendingCreate>;
+
+    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+        match self {
+            Self::Done(outcome) => ControlFlow::Break(*outcome),
+            Self::Pending(pending) => ControlFlow::Continue(pending),
+        }
+    }
+
+    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
+        pending.operation.poll_after_secs()
+    }
+}
+
+impl OperationProgress for UpdateProgress {
+    type Output = UpdateOutcome;
+    type PendingState = Box<PendingUpdate>;
+
+    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+        match self {
+            Self::Done(outcome) => ControlFlow::Break(*outcome),
+            Self::Pending(pending) => ControlFlow::Continue(pending),
+        }
+    }
+
+    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
+        pending.operation.poll_after_secs()
+    }
+}
+
+impl OperationProgress for DeleteProgress {
+    type Output = ();
+    type PendingState = Box<PendingDelete>;
+
+    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+        match self {
+            Self::Deleted => ControlFlow::Break(()),
+            Self::Pending(pending) => ControlFlow::Continue(pending),
+        }
+    }
+
+    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
+        pending.operation.poll_after_secs()
+    }
+}
+
+type GuestOperationFuture<'a, T> = Pin<
+    Box<dyn Future<Output = wasmtime::Result<Result<T, wit_types::ProviderError>>> + Send + 'a>,
+>;
+
+impl WasmProvider {
+    fn operation_budget(
+        &self,
+        id: &ResourceId,
+        kind: carina_provider_protocol::OperationKind,
+    ) -> std::time::Duration {
+        self.operation_configs.get(&id.resource_type).map_or(
+            carina_provider_protocol::DEFAULT_OPERATION_BUDGET,
+            |config| config.budget(kind),
+        )
+    }
+
+    fn over_budget(operation: &'static str, id: ResourceId) -> ProviderError {
+        ProviderError::timeout(format!(
+            "WASM provider {operation} operation exceeded its schema budget"
+        ))
+        .for_resource(id)
+    }
+
+    async fn call_operation<WitOutcome, Progress, DecodeError, GuestCall, Decode>(
+        &self,
+        operation: &'static str,
+        id: ResourceId,
+        guest_call: GuestCall,
+        decode: Decode,
+    ) -> ProviderResult<Progress>
+    where
+        GuestCall: for<'a> FnOnce(&'a mut Store<HostState>) -> GuestOperationFuture<'a, WitOutcome>,
+        Decode: FnOnce(WitOutcome, ResourceId) -> Result<Progress, DecodeError>,
+        DecodeError: std::error::Error + Send + Sync + 'static,
+    {
+        let mut locked = LockedStore::acquire(&self.instance, operation).await?;
+        let call = with_operation_timeout(
+            operation,
+            self.operation_hard_timeout,
+            guest_call(locked.store()),
+        )
+        .await?;
+        let outcome = finish_guest_call(
+            &self.instance,
+            operation,
+            WasmTrapContext::ProviderOperation,
+            &mut locked,
+            call,
+        )?;
+        match outcome {
+            Ok(outcome) => decode(outcome, id.clone()).map_err(|error| {
+                wasm_value_decode_provider_error(operation, error).for_resource(id)
+            }),
+            Err(error) => Err(wasm_convert::wit_to_core_provider_error(error)),
+        }
+    }
+
+    async fn drive_operation<Progress, Initial, Poll, PollFuture>(
+        operation: &'static str,
+        id: ResourceId,
+        budget: std::time::Duration,
+        initial: Initial,
+        mut poll: Poll,
+    ) -> ProviderResult<Progress::Output>
+    where
+        Progress: OperationProgress,
+        Initial: Future<Output = ProviderResult<Progress>>,
+        Poll: FnMut(Progress::PendingState) -> PollFuture,
+        PollFuture: Future<Output = ProviderResult<Progress>>,
+    {
+        let operation_started = std::time::Instant::now();
+        let mut progress = initial.await?;
+        loop {
+            let pending = match progress.into_control_flow() {
+                ControlFlow::Break(output) => return Ok(output),
+                ControlFlow::Continue(pending) => pending,
+            };
+            let remaining = budget.saturating_sub(operation_started.elapsed());
+            match carina_provider_protocol::next_poll(
+                Progress::poll_after_secs(&pending),
+                remaining,
+            ) {
+                carina_provider_protocol::NextPoll::OverBudget => {
+                    return Err(Self::over_budget(operation, id));
+                }
+                carina_provider_protocol::NextPoll::Sleep(delay) => {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            progress = poll(pending).await?;
+        }
+    }
+
+    async fn call_create(
+        &self,
+        id: ResourceId,
+        request: CreateRequest,
+    ) -> ProviderResult<CreateProgress> {
+        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+        let wit_request = wasm_convert::core_to_wit_create_request(&request).map_err(|error| {
+            wasm_value_encode_provider_error("create", error).for_resource(id.clone())
+        })?;
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = wit_id.clone();
+        let call_request = wit_request.clone();
+        self.call_operation(
+            "create",
+            id,
+            move |store| {
+                Box::pin(async move {
+                    call_instance
+                        .bindings
+                        .call_create(store, &call_id, &call_request)
+                        .await
+                })
+            },
+            move |outcome, id| {
+                let outcome = wasm_convert::wit_to_core_create_outcome(outcome, &id)?;
+                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                    wasm_convert::WasmCreateOutcome::Done(outcome) => CreateProgress::Done(outcome),
+                    wasm_convert::WasmCreateOutcome::Pending(operation) => {
+                        CreateProgress::Pending(Box::new(PendingCreate {
+                            id,
+                            wit_id,
+                            wit_request,
+                            operation,
+                        }))
+                    }
+                })
+            },
+        )
+        .await
+    }
+
+    async fn call_poll_create(&self, pending: PendingCreate) -> ProviderResult<CreateProgress> {
+        let PendingCreate {
+            id,
+            wit_id,
+            wit_request,
+            operation,
+        } = pending;
+        let wit_pending = operation.into_wit();
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = wit_id.clone();
+        let call_request = wit_request.clone();
+        self.call_operation(
+            "poll_create",
+            id,
+            move |store| {
+                Box::pin(async move {
+                    call_instance
+                        .bindings
+                        .call_poll_create(store, &call_id, &call_request, &wit_pending)
+                        .await
+                })
+            },
+            move |outcome, id| {
+                let outcome = wasm_convert::wit_to_core_create_outcome(outcome, &id)?;
+                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                    wasm_convert::WasmCreateOutcome::Done(outcome) => CreateProgress::Done(outcome),
+                    wasm_convert::WasmCreateOutcome::Pending(operation) => {
+                        CreateProgress::Pending(Box::new(PendingCreate {
+                            id,
+                            wit_id,
+                            wit_request,
+                            operation,
+                        }))
+                    }
+                })
+            },
+        )
+        .await
+    }
+
+    async fn call_update(
+        &self,
+        id: ResourceId,
+        identifier: String,
+        request: UpdateRequest,
+    ) -> ProviderResult<UpdateProgress> {
+        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+        let wit_request = wasm_convert::core_to_wit_update_request(&request).map_err(|error| {
+            wasm_value_encode_provider_error("update", error).for_resource(id.clone())
+        })?;
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = wit_id.clone();
+        let call_identifier = identifier.clone();
+        let call_request = wit_request.clone();
+        self.call_operation(
+            "update",
+            id,
+            move |store| {
+                Box::pin(async move {
+                    call_instance
+                        .bindings
+                        .call_update(store, &call_id, &call_identifier, &call_request)
+                        .await
+                })
+            },
+            move |outcome, id| {
+                let outcome = wasm_convert::wit_to_core_update_outcome(outcome, &id)?;
+                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                    wasm_convert::WasmUpdateOutcome::Done(outcome) => UpdateProgress::Done(outcome),
+                    wasm_convert::WasmUpdateOutcome::Pending(operation) => {
+                        UpdateProgress::Pending(Box::new(PendingUpdate {
+                            id,
+                            wit_id,
+                            identifier,
+                            wit_request,
+                            operation,
+                        }))
+                    }
+                })
+            },
+        )
+        .await
+    }
+
+    async fn call_poll_update(&self, pending: PendingUpdate) -> ProviderResult<UpdateProgress> {
+        let PendingUpdate {
+            id,
+            wit_id,
+            identifier,
+            wit_request,
+            operation,
+        } = pending;
+        let wit_pending = operation.into_wit();
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = wit_id.clone();
+        let call_identifier = identifier.clone();
+        let call_request = wit_request.clone();
+        self.call_operation(
+            "poll_update",
+            id,
+            move |store| {
+                Box::pin(async move {
+                    call_instance
+                        .bindings
+                        .call_poll_update(
+                            store,
+                            &call_id,
+                            &call_identifier,
+                            &call_request,
+                            &wit_pending,
+                        )
+                        .await
+                })
+            },
+            move |outcome, id| {
+                let outcome = wasm_convert::wit_to_core_update_outcome(outcome, &id)?;
+                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                    wasm_convert::WasmUpdateOutcome::Done(outcome) => UpdateProgress::Done(outcome),
+                    wasm_convert::WasmUpdateOutcome::Pending(operation) => {
+                        UpdateProgress::Pending(Box::new(PendingUpdate {
+                            id,
+                            wit_id,
+                            identifier,
+                            wit_request,
+                            operation,
+                        }))
+                    }
+                })
+            },
+        )
+        .await
+    }
+
+    async fn call_delete(
+        &self,
+        id: ResourceId,
+        identifier: String,
+        request: DeleteRequest,
+    ) -> ProviderResult<DeleteProgress> {
+        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+        let wit_request = wasm_convert::core_to_wit_delete_request(&request);
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = wit_id.clone();
+        let call_identifier = identifier.clone();
+        let call_request = wit_request;
+        self.call_operation(
+            "delete",
+            id,
+            move |store| {
+                Box::pin(async move {
+                    call_instance
+                        .bindings
+                        .call_delete(store, &call_id, &call_identifier, call_request)
+                        .await
+                })
+            },
+            move |outcome, id| {
+                Ok::<_, std::convert::Infallible>(
+                    match wasm_convert::wit_to_core_delete_outcome(outcome) {
+                        wasm_convert::WasmDeleteOutcome::Deleted => DeleteProgress::Deleted,
+                        wasm_convert::WasmDeleteOutcome::Pending(operation) => {
+                            DeleteProgress::Pending(Box::new(PendingDelete {
+                                id,
+                                wit_id,
+                                identifier,
+                                wit_request,
+                                operation,
+                            }))
+                        }
+                    },
+                )
+            },
+        )
+        .await
+    }
+
+    async fn call_poll_delete(&self, pending: PendingDelete) -> ProviderResult<DeleteProgress> {
+        let PendingDelete {
+            id,
+            wit_id,
+            identifier,
+            wit_request,
+            operation,
+        } = pending;
+        let wit_pending = operation.into_wit();
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = wit_id.clone();
+        let call_identifier = identifier.clone();
+        let call_request = wit_request;
+        self.call_operation(
+            "poll_delete",
+            id,
+            move |store| {
+                Box::pin(async move {
+                    call_instance
+                        .bindings
+                        .call_poll_delete(
+                            store,
+                            &call_id,
+                            &call_identifier,
+                            call_request,
+                            &wit_pending,
+                        )
+                        .await
+                })
+            },
+            move |outcome, id| {
+                Ok::<_, std::convert::Infallible>(
+                    match wasm_convert::wit_to_core_delete_outcome(outcome) {
+                        wasm_convert::WasmDeleteOutcome::Deleted => DeleteProgress::Deleted,
+                        wasm_convert::WasmDeleteOutcome::Pending(operation) => {
+                            DeleteProgress::Pending(Box::new(PendingDelete {
+                                id,
+                                wit_id,
+                                identifier,
+                                wit_request,
+                                operation,
+                            }))
+                        }
+                    },
+                )
+            },
+        )
+        .await
+    }
+}
 
 impl Provider for WasmProvider {
     fn name(&self) -> &str {
@@ -2958,13 +3487,19 @@ impl Provider for WasmProvider {
         let wit_request = wasm_convert::core_to_wit_read_request(&request);
         let identifier = identifier.map(|s| s.to_string());
         let id = id.clone();
-        Box::pin(with_operation_timeout(&self.instance, "read", async move {
+        Box::pin(async move {
             let mut locked = LockedStore::acquire(&self.instance, "read").await?;
-            let call = self
-                .instance
-                .bindings
-                .call_read(locked.store(), &wit_id, identifier.as_deref(), wit_request)
-                .await;
+            let call = with_operation_timeout(
+                "read",
+                self.operation_hard_timeout,
+                self.instance.bindings.call_read(
+                    locked.store(),
+                    &wit_id,
+                    identifier.as_deref(),
+                    wit_request,
+                ),
+            )
+            .await?;
             let result = finish_guest_call(
                 &self.instance,
                 "read",
@@ -2980,7 +3515,7 @@ impl Provider for WasmProvider {
                 }
                 Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
-        }))
+        })
     }
 
     fn read_data_source(
@@ -2992,34 +3527,33 @@ impl Provider for WasmProvider {
             Err(e) => return early_provider_err("read_data_source", e),
         };
         let id = resource.id.clone();
-        Box::pin(with_operation_timeout(
-            &self.instance,
-            "read_data_source",
-            async move {
-                let mut locked = LockedStore::acquire(&self.instance, "read_data_source").await?;
-                let call = self
-                    .instance
+        Box::pin(async move {
+            let mut locked = LockedStore::acquire(&self.instance, "read_data_source").await?;
+            let call = with_operation_timeout(
+                "read_data_source",
+                self.operation_hard_timeout,
+                self.instance
                     .bindings
-                    .call_read_data_source(locked.store(), &wit_resource)
-                    .await;
-                let result = finish_guest_call(
-                    &self.instance,
-                    "read_data_source",
-                    WasmTrapContext::ProviderOperation,
-                    &mut locked,
-                    call,
-                )?;
-                match result {
-                    Ok(wit_state) => {
-                        wasm_convert::wit_to_core_state(&wit_state, &id).map_err(|error| {
-                            wasm_value_decode_provider_error("read_data_source", error)
-                                .for_resource(id.clone())
-                        })
-                    }
-                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
+                    .call_read_data_source(locked.store(), &wit_resource),
+            )
+            .await?;
+            let result = finish_guest_call(
+                &self.instance,
+                "read_data_source",
+                WasmTrapContext::ProviderOperation,
+                &mut locked,
+                call,
+            )?;
+            match result {
+                Ok(wit_state) => {
+                    wasm_convert::wit_to_core_state(&wit_state, &id).map_err(|error| {
+                        wasm_value_decode_provider_error("read_data_source", error)
+                            .for_resource(id.clone())
+                    })
                 }
-            },
-        ))
+                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
+            }
+        })
     }
 
     fn create(
@@ -3027,39 +3561,15 @@ impl Provider for WasmProvider {
         id: &ResourceId,
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
-        let wit_id = wasm_convert::core_to_wit_resource_id(id);
-        let wit_request = match wasm_convert::core_to_wit_create_request(&request) {
-            Ok(v) => v,
-            Err(e) => return early_provider_err("create", e),
-        };
         let id = id.clone();
-        Box::pin(with_operation_timeout(
-            &self.instance,
-            "create",
-            async move {
-                let mut locked = LockedStore::acquire(&self.instance, "create").await?;
-                let call = self
-                    .instance
-                    .bindings
-                    .call_create(locked.store(), &wit_id, &wit_request)
-                    .await;
-                let result = finish_guest_call(
-                    &self.instance,
-                    "create",
-                    WasmTrapContext::ProviderOperation,
-                    &mut locked,
-                    call,
-                )?;
-                match result {
-                    Ok(wit_outcome) => wasm_convert::wit_to_core_create_outcome(wit_outcome, &id)
-                        .map_err(|error| {
-                            wasm_value_decode_provider_error("create", error)
-                                .for_resource(id.clone())
-                        }),
-                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
-                }
-            },
-        ))
+        let budget = self.operation_budget(&id, carina_provider_protocol::OperationKind::Create);
+        Box::pin(async move {
+            let initial = self.call_create(id.clone(), request);
+            Self::drive_operation("create", id, budget, initial, |pending| {
+                self.call_poll_create(*pending)
+            })
+            .await
+        })
     }
 
     fn update(
@@ -3068,40 +3578,16 @@ impl Provider for WasmProvider {
         identifier: &str,
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-        let wit_id = wasm_convert::core_to_wit_resource_id(id);
-        let identifier = identifier.to_string();
-        let wit_request = match wasm_convert::core_to_wit_update_request(&request) {
-            Ok(v) => v,
-            Err(e) => return early_provider_err("update", e),
-        };
         let id = id.clone();
-        Box::pin(with_operation_timeout(
-            &self.instance,
-            "update",
-            async move {
-                let mut locked = LockedStore::acquire(&self.instance, "update").await?;
-                let call = self
-                    .instance
-                    .bindings
-                    .call_update(locked.store(), &wit_id, &identifier, &wit_request)
-                    .await;
-                let result = finish_guest_call(
-                    &self.instance,
-                    "update",
-                    WasmTrapContext::ProviderOperation,
-                    &mut locked,
-                    call,
-                )?;
-                match result {
-                    Ok(wit_outcome) => wasm_convert::wit_to_core_update_outcome(wit_outcome, &id)
-                        .map_err(|error| {
-                            wasm_value_decode_provider_error("update", error)
-                                .for_resource(id.clone())
-                        }),
-                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
-                }
-            },
-        ))
+        let identifier = identifier.to_string();
+        let budget = self.operation_budget(&id, carina_provider_protocol::OperationKind::Update);
+        Box::pin(async move {
+            let initial = self.call_update(id.clone(), identifier, request);
+            Self::drive_operation("update", id, budget, initial, |pending| {
+                self.call_poll_update(*pending)
+            })
+            .await
+        })
     }
 
     fn delete(
@@ -3110,32 +3596,16 @@ impl Provider for WasmProvider {
         identifier: &str,
         request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        let wit_id = wasm_convert::core_to_wit_resource_id(id);
+        let id = id.clone();
         let identifier = identifier.to_string();
-        let wit_request = wasm_convert::core_to_wit_delete_request(&request);
-        Box::pin(with_operation_timeout(
-            &self.instance,
-            "delete",
-            async move {
-                let mut locked = LockedStore::acquire(&self.instance, "delete").await?;
-                let call = self
-                    .instance
-                    .bindings
-                    .call_delete(locked.store(), &wit_id, &identifier, wit_request)
-                    .await;
-                let result = finish_guest_call(
-                    &self.instance,
-                    "delete",
-                    WasmTrapContext::ProviderOperation,
-                    &mut locked,
-                    call,
-                )?;
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
-                }
-            },
-        ))
+        let budget = self.operation_budget(&id, carina_provider_protocol::OperationKind::Delete);
+        Box::pin(async move {
+            let initial = self.call_delete(id.clone(), identifier, request);
+            Self::drive_operation("delete", id, budget, initial, |pending| {
+                self.call_poll_delete(*pending)
+            })
+            .await
+        })
     }
 
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
@@ -5556,29 +6026,24 @@ mod tests {
         );
     }
 
-    /// The hard timeout must outlast the epoch budget (so genuine
-    /// WASM-computation overruns surface as the more specific epoch-trap
-    /// message) and, more importantly, must be far longer than the
-    /// longest *legitimate* single-call provider waiter — a provider
-    /// `create`/`delete` can embed a multi-minute poll-until-ready loop
-    /// (the AWS provider's Organizations account waiter is ~10 min). A
-    /// backstop near the epoch budget would falsely time out and poison
-    /// the provider on every such resource.
+    /// The hard timeout bounds one guest call, not the complete operation.
+    /// It must outlast the epoch budget (so genuine WASM-computation overruns
+    /// surface as the more specific epoch trap) and leave margin for the
+    /// longest legitimate single-step API retry sequence. Multi-step waiters
+    /// use pending outcomes and the independent schema operation budget.
     #[test]
-    fn hard_timeout_outlasts_epoch_budget_and_longest_legitimate_waiter() {
+    fn hard_timeout_outlasts_epoch_budget_and_longest_legitimate_guest_step() {
         assert!(
             WASM_OPERATION_HARD_TIMEOUT.as_secs() > WASM_OPERATION_TIMEOUT_SECS,
             "hard timeout must outlast the epoch budget so epoch traps win the race"
         );
-        // Longest known legitimate single-call provider waiter is ~10 min
-        // (AWS Organizations account creation). The backstop must clear it
-        // with margin so a healthy long operation is never poisoned.
-        const LONGEST_LEGITIMATE_WAITER_SECS: u64 = 10 * 60;
+        // In-call API retries remain deliberately bounded below the pending
+        // protocol; their current worst case is about 6.6 minutes.
+        const LONGEST_LEGITIMATE_GUEST_STEP_SECS: u64 = 7 * 60;
         assert!(
-            WASM_OPERATION_HARD_TIMEOUT.as_secs() >= 2 * LONGEST_LEGITIMATE_WAITER_SECS,
-            "hard timeout must be >= 2x the longest legitimate single-call \
-             provider waiter so a healthy long operation is never falsely \
-             timed out and poisoned"
+            WASM_OPERATION_HARD_TIMEOUT.as_secs() >= 2 * LONGEST_LEGITIMATE_GUEST_STEP_SECS,
+            "hard timeout must be >= 2x the longest legitimate single guest \
+             step; whole-operation waits belong to the pending-operation budget"
         );
     }
 }

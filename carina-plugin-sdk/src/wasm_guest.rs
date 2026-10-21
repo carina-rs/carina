@@ -796,6 +796,74 @@ macro_rules! export_provider {
                 })
             }
 
+            fn sdk_to_wit_pending<T: serde::Serialize>(
+                pending: &$crate::Pending<T>,
+            ) -> Result<wit_types::PendingOperation, serde_json::Error> {
+                Ok(wit_types::PendingOperation {
+                    token: serde_json::to_string(&pending.token)?,
+                    poll_after_secs: pending.poll_after_secs,
+                })
+            }
+
+            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned>(
+                pending: wit_types::PendingOperation,
+            ) -> Result<$crate::Pending<T>, serde_json::Error> {
+                Ok($crate::Pending {
+                    token: serde_json::from_str(&pending.token)?,
+                    poll_after_secs: pending.poll_after_secs,
+                })
+            }
+
+            fn sdk_to_wit_create_outcome<T: serde::Serialize>(
+                outcome: &$crate::CreateOutcome<T>,
+                operation: &'static str,
+            ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
+                match outcome {
+                    $crate::CreateOutcome::Done(outcome) => {
+                        proto_to_wit_create_outcome(outcome).map_err(|error| {
+                            boundary_encode_to_provider_error(operation, None, error)
+                        })
+                    }
+                    $crate::CreateOutcome::Pending(pending) => sdk_to_wit_pending(pending)
+                        .map(wit_types::CreateOutcome::Pending)
+                        .map_err(|error| {
+                            boundary_token_encode_to_provider_error(operation, error)
+                        }),
+                }
+            }
+
+            fn sdk_to_wit_update_outcome<T: serde::Serialize>(
+                outcome: &$crate::UpdateOutcome<T>,
+                operation: &'static str,
+            ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
+                match outcome {
+                    $crate::UpdateOutcome::Done(outcome) => {
+                        proto_to_wit_update_outcome(outcome).map_err(|error| {
+                            boundary_encode_to_provider_error(operation, None, error)
+                        })
+                    }
+                    $crate::UpdateOutcome::Pending(pending) => sdk_to_wit_pending(pending)
+                        .map(wit_types::UpdateOutcome::Pending)
+                        .map_err(|error| {
+                            boundary_token_encode_to_provider_error(operation, error)
+                        }),
+                }
+            }
+
+            fn sdk_to_wit_delete_outcome<T: serde::Serialize>(
+                outcome: &$crate::DeleteOutcome<T>,
+                operation: &'static str,
+            ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
+                match outcome {
+                    $crate::DeleteOutcome::Deleted => Ok(wit_types::DeleteOutcome::Deleted),
+                    $crate::DeleteOutcome::Pending(pending) => sdk_to_wit_pending(pending)
+                        .map(wit_types::DeleteOutcome::Pending)
+                        .map_err(|error| {
+                            boundary_token_encode_to_provider_error(operation, error)
+                        }),
+                }
+            }
+
             fn wit_to_proto_resource(
                 res: &wit_types::ResourceDef,
             ) -> Result<proto::Resource, helpers::WasmValueDecodeError> {
@@ -904,6 +972,48 @@ macro_rules! export_provider {
                     message: format!("WASM boundary encode error in {location}: {error}"),
                     resource_id: None,
                     cause: None,
+                    provider_name: None,
+                    operation: Some(operation.to_string()),
+                    status: None,
+                    code: None,
+                    request_id: None,
+                })
+            }
+
+            fn boundary_token_decode_to_provider_error(
+                operation: &'static str,
+                error: serde_json::Error,
+            ) -> wit_types::ProviderError {
+                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                    message: format!("WASM boundary decode error in {operation} pending token"),
+                    resource_id: None,
+                    cause: Some(format!(
+                        "serde_json {:?} error at line {}, column {}",
+                        error.classify(),
+                        error.line(),
+                        error.column()
+                    )),
+                    provider_name: None,
+                    operation: Some(operation.to_string()),
+                    status: None,
+                    code: None,
+                    request_id: None,
+                })
+            }
+
+            fn boundary_token_encode_to_provider_error(
+                operation: &'static str,
+                error: serde_json::Error,
+            ) -> wit_types::ProviderError {
+                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                    message: format!("WASM boundary encode error in {operation} pending token"),
+                    resource_id: None,
+                    cause: Some(format!(
+                        "serde_json {:?} error at line {}, column {}",
+                        error.classify(),
+                        error.line(),
+                        error.column()
+                    )),
                     provider_name: None,
                     operation: Some(operation.to_string()),
                     status: None,
@@ -1106,10 +1216,35 @@ macro_rules! export_provider {
                         })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
-                        Ok(outcome) => proto_to_wit_create_outcome(&outcome)
-                            .map_err(|error| {
-                                boundary_encode_to_provider_error("create", None, error)
-                            }),
+                        Ok(outcome) => sdk_to_wit_create_outcome(&outcome, "create"),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
+                    }
+                }
+
+                fn poll_create(
+                    id: wit_types::ResourceId,
+                    request: wit_types::CreateRequest,
+                    pending: wit_types::PendingOperation,
+                ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    let proto_request = wit_to_proto_create_request(request)
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("poll_create", None, error)
+                        })?;
+                    let pending = wit_to_sdk_pending::<
+                        <$provider_type as $crate::CarinaProvider>::CreateToken,
+                    >(pending)
+                    .map_err(|error| {
+                        boundary_token_decode_to_provider_error("poll_create", error)
+                    })?;
+                    let provider = get_provider().lock().unwrap();
+                    match $crate::CarinaProvider::poll_create(
+                        &*provider,
+                        &proto_id,
+                        proto_request,
+                        pending,
+                    ) {
+                        Ok(outcome) => sdk_to_wit_create_outcome(&outcome, "poll_create"),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -1131,10 +1266,37 @@ macro_rules! export_provider {
                         &identifier,
                         proto_request,
                     ) {
-                        Ok(outcome) => proto_to_wit_update_outcome(&outcome)
-                            .map_err(|error| {
-                                boundary_encode_to_provider_error("update", None, error)
-                            }),
+                        Ok(outcome) => sdk_to_wit_update_outcome(&outcome, "update"),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
+                    }
+                }
+
+                fn poll_update(
+                    id: wit_types::ResourceId,
+                    identifier: String,
+                    request: wit_types::UpdateRequest,
+                    pending: wit_types::PendingOperation,
+                ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    let proto_request = wit_to_proto_update_request(request, &proto_id)
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("poll_update", None, error)
+                        })?;
+                    let pending = wit_to_sdk_pending::<
+                        <$provider_type as $crate::CarinaProvider>::UpdateToken,
+                    >(pending)
+                    .map_err(|error| {
+                        boundary_token_decode_to_provider_error("poll_update", error)
+                    })?;
+                    let provider = get_provider().lock().unwrap();
+                    match $crate::CarinaProvider::poll_update(
+                        &*provider,
+                        &proto_id,
+                        &identifier,
+                        proto_request,
+                        pending,
+                    ) {
+                        Ok(outcome) => sdk_to_wit_update_outcome(&outcome, "poll_update"),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -1143,7 +1305,7 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::DeleteRequest,
-                ) -> Result<(), wit_types::ProviderError> {
+                ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_delete_request(request);
@@ -1153,7 +1315,34 @@ macro_rules! export_provider {
                         &identifier,
                         proto_request,
                     ) {
-                        Ok(()) => Ok(()),
+                        Ok(outcome) => sdk_to_wit_delete_outcome(&outcome, "delete"),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
+                    }
+                }
+
+                fn poll_delete(
+                    id: wit_types::ResourceId,
+                    identifier: String,
+                    request: wit_types::DeleteRequest,
+                    pending: wit_types::PendingOperation,
+                ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    let proto_request = wit_to_proto_delete_request(request);
+                    let pending = wit_to_sdk_pending::<
+                        <$provider_type as $crate::CarinaProvider>::DeleteToken,
+                    >(pending)
+                    .map_err(|error| {
+                        boundary_token_decode_to_provider_error("poll_delete", error)
+                    })?;
+                    let provider = get_provider().lock().unwrap();
+                    match $crate::CarinaProvider::poll_delete(
+                        &*provider,
+                        &proto_id,
+                        &identifier,
+                        proto_request,
+                        pending,
+                    ) {
+                        Ok(outcome) => sdk_to_wit_delete_outcome(&outcome, "poll_delete"),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }

@@ -157,6 +157,10 @@ impl ApplyCancellationFixture {
         self.base.backend()
     }
 
+    pub(super) fn backend_handle(&self) -> Arc<dyn carina_state::StateBackend> {
+        self.base.backend_handle()
+    }
+
     pub(super) fn observer_factory(&self) -> impl Fn(&Plan) -> Box<dyn ExecutionObserver> + '_ {
         move |plan| {
             if let Some(threshold) = self.cancel_after_successes {
