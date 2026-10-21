@@ -28,7 +28,9 @@ use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
-use carina_state::{LockInfo, StateBackend, StateFile};
+#[cfg(test)]
+use carina_state::LockInfo;
+use carina_state::{StateBackend, StateFile};
 
 use carina_core::parser::ProviderContext;
 
@@ -41,7 +43,7 @@ use crate::commands::plan::{
 use crate::commands::shared::finalize::{
     StatePersistence, finalize_after_execute, release_lock_after_execute,
 };
-use crate::commands::shared::lock_heartbeat::with_lock_heartbeat;
+use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef, with_lock_heartbeat};
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
@@ -106,14 +108,14 @@ pub async fn run_destroy(
         .map(|settings| settings.bucket().to_owned());
 
     // Acquire lock (unless --lock=false)
-    let mut lock_info: Option<LockInfo> = if lock {
+    let state_lock = if lock {
         println!("{}", "Acquiring state lock...".cyan());
         let li = backend
             .acquire_lock("destroy")
             .await
             .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
-        Some(li)
+        StateLock::held(li)
     } else {
         println!(
             "{}",
@@ -121,15 +123,15 @@ pub async fn run_destroy(
                 .yellow()
                 .bold()
         );
-        None
+        StateLock::disabled_by_cli_flag()
     };
 
-    let op_result = run_destroy_locked(
+    let (op_result, state_lock) = run_destroy_locked_owned(
         &mut parsed,
         auto_approve,
         Arc::clone(&backend),
         protected_bucket,
-        &mut lock_info,
+        state_lock,
         refresh,
         force,
         base_dir,
@@ -139,45 +141,43 @@ pub async fn run_destroy(
     )
     .await;
 
-    // Always release lock if it was acquired
-    if let Some(ref li) = lock_info {
-        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
-
-        if release_result.is_ok()
-            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-        {
-            println!("  {} Lock released", "✓".green());
-        }
-
-        op_result?;
-        release_result?;
-    } else {
-        op_result?;
+    let release_result =
+        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
+    if state_lock.is_held()
+        && release_result.is_ok()
+        && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
+    {
+        println!("  {} Lock released", "✓".green());
     }
+    op_result?;
+    release_result?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked(
+async fn run_destroy_locked_owned(
     parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
-    lock: &mut Option<LockInfo>,
+    lock: StateLock,
     refresh: bool,
     force: bool,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
-) -> Result<(), AppError> {
+) -> (Result<(), AppError>, StateLock) {
     // Provider declaration metadata is sufficient for schema/factory wiring;
     // construction attributes are resolved after state reconciliation below.
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (factories, _) = match build_factories_from_providers(&parsed.providers, base_dir) {
+        Ok(factories) => factories,
+        Err(error) => return (Err(error), lock),
+    };
     let ctx = WiringContext::new(factories, &parsed.providers);
 
-    run_destroy_locked_with_ctx(
+    run_destroy_locked_with_ctx_owned(
         parsed,
         auto_approve,
         backend,
@@ -210,12 +210,12 @@ struct DestroyExecuted {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_with_ctx(
+async fn run_destroy_locked_with_ctx_owned(
     parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
-    lock: &mut Option<LockInfo>,
+    lock: StateLock,
     refresh: bool,
     force: bool,
     base_dir: &std::path::Path,
@@ -223,17 +223,23 @@ async fn run_destroy_locked_with_ctx(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
     ctx: &WiringContext,
-) -> Result<(), AppError> {
+) -> (Result<(), AppError>, StateLock) {
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
     // `apply::load_state_persist_if_migrated`.
-    let mut state_file =
-        crate::commands::apply::load_state_persist_if_migrated(backend.as_ref(), lock.as_ref())
-            .await?;
-    let (heartbeat_result, returned_lock) = with_lock_heartbeat(
+    let mut state_file = match crate::commands::apply::load_state_persist_if_migrated(
+        backend.as_ref(),
+        lock.as_ref(),
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => return (Err(error), lock),
+    };
+    let (heartbeat_result, lock, lock_loss) = with_lock_heartbeat(
         Arc::clone(&backend),
-        lock.take(),
+        lock,
         cancel,
         async |cancel| {
 
@@ -1087,61 +1093,135 @@ async fn run_destroy_locked_with_ctx(
         },
     )
     .await;
-    *lock = returned_lock;
 
-    match heartbeat_result? {
-        DestroyAfterHeartbeat::Done => Ok(()),
-        DestroyAfterHeartbeat::Executed(context) => {
-            let DestroyExecuted {
-                state_file,
-                destroyed_instances,
-                success_count,
-                failure_count,
-                skip_count,
-                cancelled,
-                cancel,
-            } = *context;
-            if cancelled && destroyed_instances.is_empty() {
-                return Err(AppError::Interrupted);
-            }
+    let op_result = async {
+        if let Some(error) = lock_loss {
+            return Err(AppError::StateLockLost { error });
+        }
 
-            println!();
-            println!("{}", "Saving state...".cyan());
+        match heartbeat_result? {
+            DestroyAfterHeartbeat::Done => Ok(()),
+            DestroyAfterHeartbeat::Executed(context) => {
+                let DestroyExecuted {
+                    state_file,
+                    destroyed_instances,
+                    success_count,
+                    failure_count,
+                    skip_count,
+                    cancelled,
+                    cancel,
+                } = *context;
+                if cancelled && destroyed_instances.is_empty() {
+                    return Err(AppError::Interrupted);
+                }
 
-            finalize_after_execute(
-                |persistence| {
-                    finalize_destroy(
-                        FinalizeDestroyInput {
-                            backend: backend.as_ref(),
-                            lock: lock.as_ref(),
-                            state_file,
-                            destroyed_instances: &destroyed_instances,
-                        },
-                        persistence,
-                    )
-                },
-                cancelled,
-                &cancel,
-            )
-            .await?;
+                println!();
+                println!("{}", "Saving state...".cyan());
 
-            println!();
-            if failure_count == 0 && skip_count == 0 {
-                println!(
-                    "{}",
-                    format!("Destroy complete! {} resources destroyed.", success_count)
-                        .green()
-                        .bold()
-                );
-                Ok(())
-            } else {
-                Err(AppError::Config(format!(
-                    "Destroy failed. {} succeeded, {} failed, {} skipped.",
-                    success_count, failure_count, skip_count
-                )))
+                finalize_after_execute(
+                    |persistence| {
+                        finalize_destroy(
+                            FinalizeDestroyInput {
+                                backend: backend.as_ref(),
+                                lock: lock.as_ref(),
+                                state_file,
+                                destroyed_instances: &destroyed_instances,
+                            },
+                            persistence,
+                        )
+                    },
+                    cancelled,
+                    &cancel,
+                )
+                .await?;
+
+                println!();
+                if failure_count == 0 && skip_count == 0 {
+                    println!(
+                        "{}",
+                        format!("Destroy complete! {} resources destroyed.", success_count)
+                            .green()
+                            .bold()
+                    );
+                    Ok(())
+                } else {
+                    Err(AppError::Config(format!(
+                        "Destroy failed. {} succeeded, {} failed, {} skipped.",
+                        success_count, failure_count, skip_count
+                    )))
+                }
             }
         }
     }
+    .await;
+
+    (op_result, lock)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_destroy_locked(
+    parsed: &mut carina_core::parser::InferredFile,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    protected_bucket: Option<String>,
+    lock: StateLock,
+    refresh: bool,
+    force: bool,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+    parallelism: NonZeroUsize,
+    cancel: ShutdownToken,
+) -> Result<(), AppError> {
+    run_destroy_locked_owned(
+        parsed,
+        auto_approve,
+        backend,
+        protected_bucket,
+        lock,
+        refresh,
+        force,
+        base_dir,
+        provider_context,
+        parallelism,
+        cancel,
+    )
+    .await
+    .0
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_destroy_locked_with_ctx(
+    parsed: &mut carina_core::parser::InferredFile,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    protected_bucket: Option<String>,
+    lock: StateLock,
+    refresh: bool,
+    force: bool,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+    parallelism: NonZeroUsize,
+    cancel: ShutdownToken,
+    ctx: &WiringContext,
+) -> Result<(), AppError> {
+    run_destroy_locked_with_ctx_owned(
+        parsed,
+        auto_approve,
+        backend,
+        protected_bucket,
+        lock,
+        refresh,
+        force,
+        base_dir,
+        provider_context,
+        parallelism,
+        cancel,
+        ctx,
+    )
+    .await
+    .0
 }
 
 #[cfg(test)]
@@ -1603,7 +1683,7 @@ fn graph_reaches_delete_idx(start: usize, target: usize, analysis: &DependencyAn
 
 pub(crate) struct FinalizeDestroyInput<'a> {
     pub backend: &'a dyn StateBackend,
-    pub lock: Option<&'a LockInfo>,
+    pub lock: StateLockRef<'a>,
     pub state_file: Option<StateFile>,
     pub destroyed_instances: &'a [DestroyedInstance],
 }
@@ -1620,21 +1700,25 @@ pub(crate) async fn finalize_destroy(
     // re-derive exports from a fresh plan. See carina-cli/src/commands/shared/state_writeback.rs.
     apply_destroy_to_state(&mut state, input.destroyed_instances);
 
-    if let Some(lock) = input.lock {
-        crate::commands::apply::save_state_locked_after_execute(
-            input.backend,
-            lock,
-            &mut state,
-            persistence,
-        )
-        .await?;
-    } else {
-        crate::commands::apply::save_state_unlocked_after_execute(
-            input.backend,
-            &mut state,
-            persistence,
-        )
-        .await?;
+    match input.lock {
+        StateLockRef::Held(lock) => {
+            crate::commands::apply::save_state_locked_after_execute(
+                input.backend,
+                lock,
+                &mut state,
+                persistence,
+            )
+            .await?;
+        }
+        StateLockRef::Disabled(disabled) => {
+            crate::commands::apply::save_state_unlocked_after_execute(
+                input.backend,
+                disabled,
+                &mut state,
+                persistence,
+            )
+            .await?;
+        }
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
     Ok(())
@@ -1685,7 +1769,7 @@ mod tests {
             true,
             std::sync::Arc::new(backend),
             None,
-            &mut None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &downstream,
@@ -1729,7 +1813,7 @@ mod tests {
             true,
             std::sync::Arc::new(backend),
             None,
-            &mut None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &downstream,
@@ -1760,7 +1844,7 @@ mod tests {
             true,
             std::sync::Arc::new(backend),
             None,
-            &mut None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &downstream,
@@ -1792,7 +1876,7 @@ mod tests {
             true,
             std::sync::Arc::new(backend),
             None,
-            &mut None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &base_dir,
@@ -1814,7 +1898,7 @@ mod tests {
             true,
             std::sync::Arc::new(backend),
             None,
-            &mut None,
+            StateLock::disabled_for_test(),
             false,
             true,
             &base_dir,
@@ -1931,6 +2015,56 @@ mod tests {
             state.exports.is_empty(),
             "exports must be cleared on partial destroy"
         );
+    }
+
+    #[tokio::test]
+    async fn destroy_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
+        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
+            .lock()
+            .await;
+        let fixture = DestroyCancellationFixture::new()
+            .with_existing_resources(["slow"])
+            .with_delayed_delete("slow", Duration::from_millis(75));
+        let loaded = load_configuration_with_config(
+            fixture.config_path(),
+            fixture.provider_context(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("fixture must load");
+        let mut parsed = loaded.parsed;
+        let base_dir = get_base_dir(fixture.config_path());
+        crate::commands::validate_and_resolve_with_config(
+            &mut parsed,
+            base_dir,
+            true,
+            &loaded.inference_errors,
+            &loaded.duplicate_declarations,
+        )
+        .expect("fixture must validate");
+        let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
+            .expect("mock factory must load");
+        let ctx = WiringContext::new(factories, &parsed.providers);
+        let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
+
+        let error = run_destroy_locked_with_ctx(
+            &mut parsed,
+            true,
+            fixture.lock_loss_backend_handle(),
+            None,
+            StateLock::held(lock),
+            false,
+            false,
+            base_dir,
+            fixture.provider_context(),
+            NonZeroUsize::new(1).unwrap(),
+            fixture.cancel_token(),
+            &ctx,
+        )
+        .await
+        .expect_err("heartbeat lock loss must fail destroy");
+
+        assert!(matches!(error, AppError::StateLockLost { .. }));
+        assert!(error.to_string().contains("state may be behind the cloud"));
     }
 
     #[tokio::test]

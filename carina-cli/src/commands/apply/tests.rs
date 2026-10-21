@@ -442,7 +442,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         &ProviderContext::default(),
         true,
         backend,
-        &mut None,
+        StateLock::disabled_for_test(),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -693,7 +693,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &unresolved_parsed,
         true,
         backend,
-        &mut None,
+        StateLock::disabled_for_test(),
         &downstream,
         &ProviderContext::default(),
         ShutdownToken::running(),
@@ -1391,7 +1391,7 @@ async fn run_apply_cascade_fixture(
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -1779,7 +1779,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         fixture.config_path(),
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -2028,7 +2028,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -2143,7 +2143,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -2201,7 +2201,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -2282,7 +2282,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         ApplyTarget::SavedPlan {
             plan_file: &plan_path,
             source_dir: tmp.path(),
@@ -2381,7 +2381,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         ApplyTarget::SavedPlan {
             plan_file: &plan_path,
             source_dir: tmp.path(),
@@ -2415,7 +2415,7 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         get_base_dir(fixture.config_path()),
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -2659,6 +2659,56 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
 }
 
 #[tokio::test]
+async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new()
+        .with_resources(["slow"])
+        .with_delayed_create("slow", Duration::from_millis(75));
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    crate::commands::validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        false,
+        &loaded.inference_errors,
+        &loaded.duplicate_declarations,
+    )
+    .expect("fixture must validate");
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
+        .expect("mock factory must load");
+    let ctx = WiringContext::new(factories, &parsed.providers);
+    let observer_factory = fixture.observer_factory();
+    let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
+
+    let error = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.lock_loss_backend_handle(),
+        StateLock::held(lock),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("heartbeat lock loss must fail apply");
+
+    assert!(matches!(error, AppError::StateLockLost { .. }));
+    assert!(error.to_string().contains("state may be behind the cloud"));
+}
+
+#[tokio::test]
 async fn apply_cancel_token_integration_persists_completed_state_releases_lock_and_returns_interrupted()
  {
     // Regression test for #3498: a cancelled apply must persist completed
@@ -2792,7 +2842,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -2877,7 +2927,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -2968,7 +3018,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -3038,7 +3088,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -3269,7 +3319,7 @@ awscc.ec2.Subnet {{
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -3337,7 +3387,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),
@@ -3490,7 +3540,7 @@ let consumer = mock.iam.Role {{
         &unresolved_parsed,
         true,
         fixture.backend_handle(),
-        &mut None,
+        StateLock::disabled_for_test(),
         base_dir,
         fixture.provider_context(),
         fixture.cancel_token(),

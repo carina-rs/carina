@@ -513,6 +513,10 @@ pub enum AppError {
     /// Operation interrupted by user (Ctrl+C / SIGINT)
     #[error("Operation cancelled by user")]
     Interrupted,
+
+    /// Heartbeat renewal proved that another process can now own the state lock.
+    #[error("State lock was lost; state may be behind the cloud. Cause: {error}")]
+    StateLockLost { error: BackendError },
 }
 
 impl AppError {

@@ -1,7 +1,9 @@
 use crate::error::AppError;
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
-use carina_state::{LockInfo, StateBackend};
+use carina_state::StateBackend;
 use std::future::Future;
+
+use super::lock_heartbeat::StateLockRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StatePersistence {
@@ -33,9 +35,12 @@ impl CleanupStageMode {
 
 pub(crate) async fn release_lock_after_execute(
     backend: &dyn StateBackend,
-    lock: &LockInfo,
+    lock: StateLockRef<'_>,
     shutdown: &ShutdownToken,
 ) -> Result<(), AppError> {
+    let StateLockRef::Held(lock) = lock else {
+        return Ok(());
+    };
     let release = match shutdown.phase() {
         ShutdownPhase::CleanupPriority | ShutdownPhase::Graceful => {
             backend.release_lock_for_cleanup(lock)
@@ -207,7 +212,7 @@ mod tests {
     use super::*;
     use carina_core::shutdown::CLEANUP_DEADLINE;
     use carina_core::shutdown::testing::shutdown_channel;
-    use carina_state::{BackendResult, LoadedState, StateFile};
+    use carina_state::{BackendResult, LoadedState, LockInfo, StateFile};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -247,7 +252,7 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&backend, &lock, &shutdown)
+            release_lock_after_execute(&backend, StateLockRef::Held(&lock), &shutdown)
                 .await
                 .unwrap();
         })
@@ -290,7 +295,7 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&backend, &lock, &shutdown)
+            release_lock_after_execute(&backend, StateLockRef::Held(&lock), &shutdown)
                 .await
                 .unwrap();
         })

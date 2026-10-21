@@ -126,10 +126,10 @@ fn apply_persists_v6_to_current_under_no_lock_flag() {
     // Same scenario as `apply_persists_v6_to_current_with_no_resource_diff`
     // but with `--lock=false`. The dispatch in
     // `load_state_persist_if_migrated` must pick the unlocked writer
-    // (`save_state_unlocked`) when no `LockInfo` is held, and the
+    // (`save_state_unlocked`) when the locking-disabled witness is supplied, and the
     // disk still has to advance to the current schema. Caught the
     // round-2 review gap that the locked-mode tests alone did not
-    // exercise the `lock: None` branch of the helper.
+    // exercise the explicit locking-disabled witness branch of the helper.
     let dir = TempDir::new().unwrap();
     write_v6_state(dir.path());
 

@@ -412,6 +412,7 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
 async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;

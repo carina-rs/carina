@@ -1,15 +1,76 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use carina_core::shutdown::ShutdownToken;
 use carina_core::shutdown::testing::{
     TestShutdownTrigger, same_shutdown_channel, shutdown_channel,
 };
-use carina_state::{LocalBackend, StateBackend, StateFile};
+use carina_state::{
+    BackendError, BackendResult, LoadedState, LocalBackend, LockInfo, StateBackend, StateFile,
+};
 use tempfile::TempDir;
 
 pub(crate) static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
+
+/// Delegates state I/O to a local backend but simulates another process taking
+/// the lock as soon as the heartbeat attempts its first renewal.
+pub(crate) struct LockLossBackend {
+    inner: Arc<LocalBackend>,
+}
+
+impl LockLossBackend {
+    fn new(inner: Arc<LocalBackend>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl StateBackend for LockLossBackend {
+    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+        self.inner.read_state().await
+    }
+
+    async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
+        self.inner.write_state(state).await
+    }
+
+    async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
+        self.inner.acquire_lock(operation).await
+    }
+
+    async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
+        self.inner.release_lock(lock).await
+    }
+
+    async fn renew_lock(&self, _lock: &LockInfo) -> BackendResult<LockInfo> {
+        Err(BackendError::LockNotHeld(
+            "test heartbeat lock was replaced".to_string(),
+        ))
+    }
+
+    async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
+        self.inner.write_state_locked(state, lock).await
+    }
+
+    async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
+        self.inner.force_unlock(lock_id).await
+    }
+
+    async fn init(&self) -> BackendResult<()> {
+        self.inner.init().await
+    }
+
+    async fn bucket_exists(&self) -> BackendResult<bool> {
+        self.inner.bucket_exists().await
+    }
+
+    async fn create_bucket(&self) -> BackendResult<()> {
+        self.inner.create_bucket().await
+    }
+}
 
 static REFRESH_DRAIN_BARRIER: std::sync::Mutex<Option<RefreshDrainBarrier>> =
     std::sync::Mutex::new(None);
@@ -177,6 +238,10 @@ impl CancellationFixtureBase {
 
     pub(crate) fn backend_handle(&self) -> std::sync::Arc<dyn StateBackend> {
         self.backend.clone()
+    }
+
+    pub(crate) fn lock_loss_backend_handle(&self) -> Arc<dyn StateBackend> {
+        Arc::new(LockLossBackend::new(Arc::clone(&self.backend)))
     }
 
     pub(crate) fn readiness_path(&self, name: &str) -> PathBuf {

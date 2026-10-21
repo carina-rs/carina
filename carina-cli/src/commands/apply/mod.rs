@@ -47,7 +47,9 @@ use crate::commands::shared::effect_execution::{
 use crate::commands::shared::finalize::{
     StatePersistence, finalize_after_execute, release_lock_after_execute,
 };
-use crate::commands::shared::lock_heartbeat::with_lock_heartbeat;
+use crate::commands::shared::lock_heartbeat::{
+    LockingDisabled, StateLock, StateLockRef, with_lock_heartbeat,
+};
 use crate::commands::shared::observer::CliObserver;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
@@ -724,8 +726,8 @@ pub async fn refresh_pending_states(
 
 /// Save state after apply. Does NOT release the lock -- caller is responsible.
 ///
-/// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
-/// validation via `save_state_unlocked`.
+/// When locking is explicitly disabled, state is written without lock
+/// validation via `save_state_unlocked` and its required witness.
 ///
 /// Returns the [`SkippedExports`] summary after state is saved. Callers must fold
 /// unresolved exports into the command's exit status (carina#3710).
@@ -783,10 +785,14 @@ pub(crate) async fn finalize_apply(
     // secondary concern, so an export error must not prevent durable resource
     // writeback. Save the resource state first, then return the original
     // export error to the caller.
-    if let Some(lock) = input.lock {
-        save_state_locked_after_execute(input.backend, lock, &mut state, persistence).await?;
-    } else {
-        save_state_unlocked_after_execute(input.backend, &mut state, persistence).await?;
+    match input.lock {
+        StateLockRef::Held(lock) => {
+            save_state_locked_after_execute(input.backend, lock, &mut state, persistence).await?;
+        }
+        StateLockRef::Disabled(disabled) => {
+            save_state_unlocked_after_execute(input.backend, disabled, &mut state, persistence)
+                .await?;
+        }
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
@@ -798,7 +804,7 @@ pub(crate) async fn finalize_apply(
 /// This ensures that the lock is still held before writing state, preventing
 /// silent state corruption when a lock has expired and been acquired by another
 /// process during a long-running operation.
-pub async fn save_state_locked(
+pub(crate) async fn save_state_locked(
     backend: &dyn StateBackend,
     lock: &LockInfo,
     state: &mut StateFile,
@@ -833,8 +839,9 @@ pub(crate) async fn save_state_locked_after_execute(
 ///
 /// Used when `--lock=false` is specified. Increments the serial number and
 /// writes using `write_state` (no lock check).
-pub async fn save_state_unlocked(
+pub(crate) async fn save_state_unlocked(
     backend: &dyn StateBackend,
+    _disabled: &LockingDisabled,
     state: &mut StateFile,
 ) -> Result<(), AppError> {
     state.increment_serial();
@@ -843,11 +850,12 @@ pub async fn save_state_unlocked(
 
 pub(crate) async fn save_state_unlocked_after_execute(
     backend: &dyn StateBackend,
+    disabled: &LockingDisabled,
     state: &mut StateFile,
     persistence: StatePersistence,
 ) -> Result<(), AppError> {
     match persistence {
-        StatePersistence::Normal => save_state_unlocked(backend, state).await,
+        StatePersistence::Normal => save_state_unlocked(backend, disabled, state).await,
         StatePersistence::CancellationCleanup => {
             state.increment_serial();
             backend
@@ -876,18 +884,19 @@ pub(crate) async fn save_state_unlocked_after_execute(
 /// version matches `StateFile::CURRENT_VERSION`, so subsequent
 /// `read_state` calls produce a pristine `LoadedState` and this
 /// helper is a no-op write-wise.
-pub async fn load_state_persist_if_migrated(
+pub(crate) async fn load_state_persist_if_migrated(
     backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    lock: StateLockRef<'_>,
 ) -> Result<Option<StateFile>, AppError> {
     match backend.read_state().await.map_err(AppError::Backend)? {
         None => Ok(None),
         Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
         Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
-            if let Some(lk) = lock {
-                save_state_locked(backend, lk, &mut state).await?;
-            } else {
-                save_state_unlocked(backend, &mut state).await?;
+            match lock {
+                StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
+                StateLockRef::Disabled(disabled) => {
+                    save_state_unlocked(backend, disabled, &mut state).await?
+                }
             }
             Ok(Some(state))
         }
@@ -909,7 +918,7 @@ pub async fn load_state_persist_if_migrated(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
+    lock: StateLockRef<'_>,
     state_file: Option<StateFile>,
     sorted_resources: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
@@ -936,10 +945,11 @@ pub(crate) async fn persist_exports_only(
     })?;
     let resolution = materialize_exports(&values)?;
     let skipped_exports = resolution.write_into(&mut state);
-    if let Some(lk) = lock {
-        save_state_locked(backend, lk, &mut state).await?;
-    } else {
-        save_state_unlocked(backend, &mut state).await?;
+    match lock {
+        StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
+        StateLockRef::Disabled(disabled) => {
+            save_state_unlocked(backend, disabled, &mut state).await?
+        }
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
     if skipped_exports.is_empty() {
@@ -1203,9 +1213,6 @@ async fn run_apply_with_observer_factory(
         .into();
 
     // Handle bootstrap if S3 backend is configured
-    #[allow(unused_assignments)]
-    let mut lock_info: Option<LockInfo> = None;
-
     let s3_bootstrap = verified_backend
         .s3_settings()
         .map(|settings| (settings.bucket().to_owned(), settings.auto_create()));
@@ -1366,15 +1373,14 @@ async fn run_apply_with_observer_factory(
     }
 
     // Acquire lock (unless --lock=false)
-    if lock {
+    let state_lock = if lock {
         println!("{}", "Acquiring state lock...".cyan());
-        lock_info = Some(
-            backend
-                .acquire_lock("apply")
-                .await
-                .map_err(|error| map_lock_error(error, path))?,
-        );
+        let acquired = backend
+            .acquire_lock("apply")
+            .await
+            .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
+        StateLock::held(acquired)
     } else {
         println!(
             "{}",
@@ -1382,17 +1388,18 @@ async fn run_apply_with_observer_factory(
                 .yellow()
                 .bold()
         );
-    }
+        StateLock::disabled_by_cli_flag()
+    };
 
     // All code after lock acquisition observes the shared cancellation token
     // so lock release is guaranteed after SIGINT/SIGTERM cancellation.
-    let op_result = run_apply_locked(
+    let (op_result, state_lock) = run_apply_locked_owned(
         &ctx,
         &mut parsed,
         &unresolved_parsed,
         auto_approve,
         Arc::clone(&backend),
-        &mut lock_info,
+        state_lock,
         path,
         provider_context,
         cancel.clone(),
@@ -1402,25 +1409,19 @@ async fn run_apply_with_observer_factory(
     )
     .await;
 
-    // Always release lock if it was acquired
-    if let Some(ref li) = lock_info {
-        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
+    let release_result =
+        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
+    if state_lock.is_held()
+        && release_result.is_ok()
+        && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
+    {
+        println!("  {} Lock released", "✓".green());
+    }
 
-        if release_result.is_ok()
-            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-        {
-            println!("  {} Lock released", "✓".green());
-        }
-
-        let timing = op_result?;
-        release_result?;
-        if let Some(elapsed) = timing {
-            println!("{}", format_total_apply_line(elapsed));
-        }
-    } else {
-        if let Some(timing) = op_result? {
-            println!("{}", format_total_apply_line(timing));
-        }
+    let timing = op_result?;
+    release_result?;
+    if let Some(elapsed) = timing {
+        println!("{}", format_total_apply_line(elapsed));
     }
 
     Ok(())
@@ -1538,29 +1539,33 @@ struct SavedPlanApplyExecuted {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_apply_locked(
+async fn run_apply_locked_owned(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::InferredFile,
     unresolved_parsed: &carina_core::parser::ParsedFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
-    lock: &mut Option<LockInfo>,
+    lock: StateLock,
     project_dir: &Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
-) -> Result<Option<Duration>, AppError> {
+) -> (Result<Option<Duration>, AppError>, StateLock) {
     // Read current state from backend. carina#3315: if `check_and_migrate`
     // lifted an older on-disk schema in memory, persist the upgrade
     // under the current lock before any short-circuit path can return
     // — otherwise the carina#3283 warning text ("Disk state will be
     // rewritten during the next apply or state refresh of that project.")
     // becomes a lie.
-    let mut state_file = load_state_persist_if_migrated(backend.as_ref(), lock.as_ref()).await?;
-    let (heartbeat_result, returned_lock) =
-        with_lock_heartbeat(Arc::clone(&backend), lock.take(), cancel, async |cancel| {
+    let mut state_file = match load_state_persist_if_migrated(backend.as_ref(), lock.as_ref()).await
+    {
+        Ok(state) => state,
+        Err(error) => return (Err(error), lock),
+    };
+    let (heartbeat_result, lock, lock_loss) =
+        with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
             if let Some(state) = state_file.as_ref() {
                 check_legacy_name_overrides(
                     state,
@@ -2312,91 +2317,133 @@ async fn run_apply_locked(
             )))
         })
         .await;
-    *lock = returned_lock;
 
-    match heartbeat_result? {
-        SourceApplyAfterHeartbeat::Done(result) => Ok(result),
-        SourceApplyAfterHeartbeat::PersistExports(context) => {
-            let SourceApplyPersistExports {
-                state_file,
-                resources,
-                data_sources,
-                compositions,
-                checked_exports,
-                wait_aliases,
-                current_states,
-            } = *context;
-            persist_exports_only(
-                backend.as_ref(),
-                lock.as_ref(),
-                state_file,
-                &resources,
-                &data_sources,
-                &compositions,
-                &checked_exports,
-                ctx.schemas(),
-                &wait_aliases,
-                &current_states,
-                provider_context,
-            )
-            .await?;
-            Ok(None)
+    let op_result = async {
+        if let Some(error) = lock_loss {
+            return Err(AppError::StateLockLost { error });
         }
-        SourceApplyAfterHeartbeat::Executed(context) => {
-            let SourceApplyExecuted {
-                result,
-                cancelled,
-                resources_finished,
-                apply_phase_started,
-                state_file,
-                resolved_resources,
-                data_sources,
-                current_states,
-                plan,
-                checked_exports,
-                wait_aliases,
-                pre_resolve_compositions,
-                cancel,
-            } = *context;
-            // Use override-aware resources (post-default_tags merge, post-canonicalize)
-            // for state writeback so the per-resource `explicit` tree includes
-            // provider-level default tags. Otherwise the next plan projects the
-            // tags out of `current` and surfaces a spurious `tags: (none) → ...`
-            // diff (refs awscc#206).
-            let skipped_exports = finalize_after_execute(
-                |persistence| {
-                    finalize_apply(
-                        FinalizeApplyInput {
-                            result: &result,
-                            state_file,
-                            sorted_resources: &resolved_resources,
-                            data_sources: &data_sources,
-                            current_states: &current_states,
-                            plan: &plan,
-                            backend: backend.as_ref(),
-                            lock: lock.as_ref(),
-                            schemas: ctx.schemas(),
-                            export_params: Some(&checked_exports),
-                            provider_context,
-                            wait_aliases: &wait_aliases,
-                            pre_resolve_compositions: &pre_resolve_compositions,
-                        },
-                        persistence,
-                        None,
-                    )
-                },
-                cancelled,
-                &cancel,
-            )
-            .await?;
 
-            finish_apply(
-                &result,
-                skipped_exports,
-                resources_finished.duration_since(apply_phase_started),
-            )
+        match heartbeat_result? {
+            SourceApplyAfterHeartbeat::Done(result) => Ok(result),
+            SourceApplyAfterHeartbeat::PersistExports(context) => {
+                let SourceApplyPersistExports {
+                    state_file,
+                    resources,
+                    data_sources,
+                    compositions,
+                    checked_exports,
+                    wait_aliases,
+                    current_states,
+                } = *context;
+                persist_exports_only(
+                    backend.as_ref(),
+                    lock.as_ref(),
+                    state_file,
+                    &resources,
+                    &data_sources,
+                    &compositions,
+                    &checked_exports,
+                    ctx.schemas(),
+                    &wait_aliases,
+                    &current_states,
+                    provider_context,
+                )
+                .await?;
+                Ok(None)
+            }
+            SourceApplyAfterHeartbeat::Executed(context) => {
+                let SourceApplyExecuted {
+                    result,
+                    cancelled,
+                    resources_finished,
+                    apply_phase_started,
+                    state_file,
+                    resolved_resources,
+                    data_sources,
+                    current_states,
+                    plan,
+                    checked_exports,
+                    wait_aliases,
+                    pre_resolve_compositions,
+                    cancel,
+                } = *context;
+                // Use override-aware resources (post-default_tags merge, post-canonicalize)
+                // for state writeback so the per-resource `explicit` tree includes
+                // provider-level default tags. Otherwise the next plan projects the
+                // tags out of `current` and surfaces a spurious `tags: (none) → ...`
+                // diff (refs awscc#206).
+                let skipped_exports = finalize_after_execute(
+                    |persistence| {
+                        finalize_apply(
+                            FinalizeApplyInput {
+                                result: &result,
+                                state_file,
+                                sorted_resources: &resolved_resources,
+                                data_sources: &data_sources,
+                                current_states: &current_states,
+                                plan: &plan,
+                                backend: backend.as_ref(),
+                                lock: lock.as_ref(),
+                                schemas: ctx.schemas(),
+                                export_params: Some(&checked_exports),
+                                provider_context,
+                                wait_aliases: &wait_aliases,
+                                pre_resolve_compositions: &pre_resolve_compositions,
+                            },
+                            persistence,
+                            None,
+                        )
+                    },
+                    cancelled,
+                    &cancel,
+                )
+                .await?;
+
+                finish_apply(
+                    &result,
+                    skipped_exports,
+                    resources_finished.duration_since(apply_phase_started),
+                )
+            }
         }
     }
+    .await;
+
+    (op_result, lock)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_locked(
+    ctx: &WiringContext,
+    parsed: &mut carina_core::parser::InferredFile,
+    unresolved_parsed: &carina_core::parser::ParsedFile,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    lock: StateLock,
+    project_dir: &Path,
+    provider_context: &ProviderContext,
+    cancel: ShutdownToken,
+    observer_factory: &ObserverFactory<'_>,
+    parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
+) -> Result<Option<Duration>, AppError> {
+    run_apply_locked_owned(
+        ctx,
+        parsed,
+        unresolved_parsed,
+        auto_approve,
+        backend,
+        lock,
+        project_dir,
+        provider_context,
+        cancel,
+        observer_factory,
+        parallelism,
+        accept_legacy_name_overrides,
+    )
+    .await
+    .0
 }
 
 fn ensure_saved_plan_backend_matches_current(
@@ -2917,14 +2964,14 @@ async fn run_apply_from_plan_with_observer_factory(
         .into();
 
     // Acquire lock (unless --lock=false)
-    let mut lock_info: Option<LockInfo> = if lock {
+    let state_lock = if lock {
         println!("{}", "Acquiring state lock...".cyan());
         let li = backend
             .acquire_lock("apply")
             .await
             .map_err(|error| map_lock_error(error, &source_path))?;
         println!("  {} Lock acquired", "✓".green());
-        Some(li)
+        StateLock::held(li)
     } else {
         println!(
             "{}",
@@ -2932,63 +2979,66 @@ async fn run_apply_from_plan_with_observer_factory(
                 .yellow()
                 .bold()
         );
-        None
+        StateLock::disabled_by_cli_flag()
     };
 
-    let op_result = run_apply_from_plan_locked(
+    let (op_result, state_lock) = run_apply_from_plan_locked_owned(
         inspected_plan,
         current_parsed.as_mut(),
         provider_context,
         auto_approve,
         Arc::clone(&backend),
-        &mut lock_info,
+        state_lock,
         apply_target,
         cancel.clone(),
         observer_factory,
         parallelism,
         accept_legacy_name_overrides,
     )
-    .await
-    .map_err(|error| error.with_project_dir(&source_path));
+    .await;
+    let op_result = op_result.map_err(|error| error.with_project_dir(&source_path));
 
-    // Always release lock if it was acquired
-    if let Some(ref li) = lock_info {
-        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
+    let release_result =
+        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
+    if state_lock.is_held()
+        && release_result.is_ok()
+        && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
+    {
+        println!("  {} Lock released", "✓".green());
+    }
 
-        if release_result.is_ok()
-            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
-        {
-            println!("  {} Lock released", "✓".green());
-        }
-
-        let timing = op_result?;
-        release_result?;
-        if let Some(elapsed) = timing {
-            println!("{}", format_total_apply_line(elapsed));
-        }
-    } else {
-        if let Some(timing) = op_result? {
-            println!("{}", format_total_apply_line(timing));
-        }
+    let timing = op_result?;
+    release_result?;
+    if let Some(elapsed) = timing {
+        println!("{}", format_total_apply_line(elapsed));
     }
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_apply_from_plan_locked(
+async fn run_apply_from_plan_locked_owned(
     inspected_plan: InspectedPlanFile,
     current_parsed: Option<&mut carina_core::parser::InferredFile>,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
-    lock: &mut Option<LockInfo>,
+    lock: StateLock,
     apply_target: ApplyTarget<'_>,
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
-) -> Result<Option<Duration>, AppError> {
+) -> (Result<Option<Duration>, AppError>, StateLock) {
+    macro_rules! try_with_lock {
+        ($expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => return (Err(error), lock),
+            }
+        };
+    }
+
     let project_dir = apply_target.source_dir();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
@@ -2998,13 +3048,17 @@ async fn run_apply_from_plan_locked(
     // on-disk serial (the one the saved plan was diffed against)
     // rather than a +1 bump caused by our own migration persist.
     let (mut state_file, pending_migration) =
-        match backend.read_state().await.map_err(AppError::Backend)? {
+        match try_with_lock!(backend.read_state().await.map_err(AppError::Backend)) {
             None => (None, None),
             Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
             Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
         };
     if let Some(state) = state_file.as_ref() {
-        check_legacy_name_overrides(state, accept_legacy_name_overrides, apply_target)?;
+        try_with_lock!(check_legacy_name_overrides(
+            state,
+            accept_legacy_name_overrides,
+            apply_target,
+        ));
     }
 
     if let Some(ref state) = state_file {
@@ -3012,10 +3066,13 @@ async fn run_apply_from_plan_locked(
         if let Some(plan_lineage) = inspected_plan.state_lineage()
             && state.lineage != plan_lineage
         {
-            return Err(AppError::Config(format!(
-                "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
-                plan_lineage, state.lineage
-            )));
+            return (
+                Err(AppError::Config(format!(
+                    "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
+                    plan_lineage, state.lineage
+                ))),
+                lock,
+            );
         }
 
         // Warn on serial mismatch (state may have drifted)
@@ -3041,15 +3098,18 @@ async fn run_apply_from_plan_locked(
     if pending_migration.is_some()
         && let Some(state) = state_file.as_mut()
     {
-        if let Some(lk) = lock.as_ref() {
-            save_state_locked(backend.as_ref(), lk, state).await?;
-        } else {
-            save_state_unlocked(backend.as_ref(), state).await?;
+        match lock.as_ref() {
+            StateLockRef::Held(held) => {
+                try_with_lock!(save_state_locked(backend.as_ref(), held, state).await);
+            }
+            StateLockRef::Disabled(disabled) => {
+                try_with_lock!(save_state_unlocked(backend.as_ref(), disabled, state).await);
+            }
         }
     }
 
-    let (heartbeat_result, returned_lock) =
-        with_lock_heartbeat(Arc::clone(&backend), lock.take(), cancel, async |cancel| {
+    let (heartbeat_result, lock, lock_loss) =
+        with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
             let (desired_plan, prepared_wiring) = match inspected_plan {
                 InspectedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), None),
                 InspectedPlanFile::NeedsSecretVerification(plan) => {
@@ -3337,72 +3397,112 @@ async fn run_apply_from_plan_locked(
             )))
         })
         .await;
-    *lock = returned_lock;
 
-    match heartbeat_result? {
-        SavedPlanApplyAfterHeartbeat::Done(result) => Ok(result),
-        SavedPlanApplyAfterHeartbeat::Executed(context) => {
-            let SavedPlanApplyExecuted {
-                result,
-                cancelled,
-                resources_finished,
-                apply_phase_started,
-                state_file,
-                resolved_resources,
-                current_states,
-                rehydrated_plan,
-                wait_aliases,
-                ctx,
-                cancel,
-            } = *context;
-            // Reuse the exact factory/schema context that prepared and executed the
-            // saved plan for write-only attribute persistence.
-            let provider_context = ProviderContext::default();
+    let op_result = async {
+        if let Some(error) = lock_loss {
+            return Err(AppError::StateLockLost { error });
+        }
 
-            let skipped_exports = finalize_after_execute(
-                |persistence| {
-                    finalize_apply(
-                        FinalizeApplyInput {
-                            result: &result,
-                            state_file,
-                            sorted_resources: &resolved_resources,
-                            data_sources: rehydrated_plan.data_sources(),
-                            current_states: &current_states,
-                            plan: rehydrated_plan.plan(),
-                            backend: backend.as_ref(),
-                            lock: lock.as_ref(),
-                            schemas: ctx.schemas(),
-                            // Saved plan files do not persist `export_params` today, so
-                            // pass `None` to preserve `state.exports` rather than wipe it.
-                            // Source-driven `carina apply` reconciles exports from the
-                            // `.crn` directly (#2932).
-                            export_params: None,
-                            provider_context: &provider_context,
-                            // No export resolution runs here (export_params is None), but
-                            // the field is required; pass the reconstructed aliases so the
-                            // value is correct if a future plan file persists export_params.
-                            wait_aliases: &wait_aliases,
-                            // Same rationale as `export_params: None`: no export
-                            // resolution runs from the `apply --plan` path, so no
-                            // pre-resolve composition snapshot is needed.
-                            pre_resolve_compositions: &[],
-                        },
-                        persistence,
-                        Some(rehydrated_plan.planned_secret_hashes()),
-                    )
-                },
-                cancelled,
-                &cancel,
-            )
-            .await?;
+        match heartbeat_result? {
+            SavedPlanApplyAfterHeartbeat::Done(result) => Ok(result),
+            SavedPlanApplyAfterHeartbeat::Executed(context) => {
+                let SavedPlanApplyExecuted {
+                    result,
+                    cancelled,
+                    resources_finished,
+                    apply_phase_started,
+                    state_file,
+                    resolved_resources,
+                    current_states,
+                    rehydrated_plan,
+                    wait_aliases,
+                    ctx,
+                    cancel,
+                } = *context;
+                // Reuse the exact factory/schema context that prepared and executed the
+                // saved plan for write-only attribute persistence.
+                let provider_context = ProviderContext::default();
 
-            finish_apply(
-                &result,
-                skipped_exports,
-                resources_finished.duration_since(apply_phase_started),
-            )
+                let skipped_exports = finalize_after_execute(
+                    |persistence| {
+                        finalize_apply(
+                            FinalizeApplyInput {
+                                result: &result,
+                                state_file,
+                                sorted_resources: &resolved_resources,
+                                data_sources: rehydrated_plan.data_sources(),
+                                current_states: &current_states,
+                                plan: rehydrated_plan.plan(),
+                                backend: backend.as_ref(),
+                                lock: lock.as_ref(),
+                                schemas: ctx.schemas(),
+                                // Saved plan files do not persist `export_params` today, so
+                                // pass `None` to preserve `state.exports` rather than wipe it.
+                                // Source-driven `carina apply` reconciles exports from the
+                                // `.crn` directly (#2932).
+                                export_params: None,
+                                provider_context: &provider_context,
+                                // No export resolution runs here (export_params is None), but
+                                // the field is required; pass the reconstructed aliases so the
+                                // value is correct if a future plan file persists export_params.
+                                wait_aliases: &wait_aliases,
+                                // Same rationale as `export_params: None`: no export
+                                // resolution runs from the `apply --plan` path, so no
+                                // pre-resolve composition snapshot is needed.
+                                pre_resolve_compositions: &[],
+                            },
+                            persistence,
+                            Some(rehydrated_plan.planned_secret_hashes()),
+                        )
+                    },
+                    cancelled,
+                    &cancel,
+                )
+                .await?;
+
+                finish_apply(
+                    &result,
+                    skipped_exports,
+                    resources_finished.duration_since(apply_phase_started),
+                )
+            }
         }
     }
+    .await;
+
+    (op_result, lock)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_from_plan_locked(
+    inspected_plan: InspectedPlanFile,
+    current_parsed: Option<&mut carina_core::parser::InferredFile>,
+    provider_context: &ProviderContext,
+    auto_approve: bool,
+    backend: Arc<dyn StateBackend>,
+    lock: StateLock,
+    apply_target: ApplyTarget<'_>,
+    cancel: ShutdownToken,
+    observer_factory: &ObserverFactory<'_>,
+    parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
+) -> Result<Option<Duration>, AppError> {
+    run_apply_from_plan_locked_owned(
+        inspected_plan,
+        current_parsed,
+        provider_context,
+        auto_approve,
+        backend,
+        lock,
+        apply_target,
+        cancel,
+        observer_factory,
+        parallelism,
+        accept_legacy_name_overrides,
+    )
+    .await
+    .0
 }
 
 #[derive(Debug, PartialEq, Eq)]

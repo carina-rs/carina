@@ -71,7 +71,7 @@ pub use backends::{
     LocalBackend, StateUrl, anchored_local_path, create_backend, create_remote_backend,
     load_state_from_url, resolve_backend_for_read,
 };
-pub use heartbeat::{HeartbeatGuard, LockHeartbeat};
+pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, DeposedInstance, DeposedKey, LoadedState, MigratedStateFile, MigrationInfo,

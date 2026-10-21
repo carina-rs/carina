@@ -26,6 +26,7 @@ use crate::commands::apply::{
 };
 use crate::commands::plan::{CurrentStateEntry, MovedOrigins, PlanFile};
 use crate::commands::shared::finalize::StatePersistence;
+use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::state_writeback::{
     ApplyStateSave, FinalizeApplyInput, PostApplyStates, build_state_after_apply,
     queue_state_refresh,
@@ -1499,7 +1500,7 @@ async fn lock_released_on_write_state_failure() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -1644,7 +1645,7 @@ async fn finalize_apply_uses_write_state_locked() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -1771,7 +1772,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
@@ -1816,7 +1817,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
@@ -1879,7 +1880,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
@@ -1915,8 +1916,12 @@ async fn save_state_unlocked_uses_write_state_without_lock() {
 
     let backend = LockTrackingBackend::new();
     let mut state = StateFile::new();
+    let state_lock = StateLock::disabled_for_test();
+    let StateLockRef::Disabled(disabled) = state_lock.as_ref() else {
+        unreachable!("test lock must be disabled");
+    };
 
-    let result = save_state_unlocked(&backend, &mut state).await;
+    let result = save_state_unlocked(&backend, disabled, &mut state).await;
     assert!(result.is_ok(), "save_state_unlocked should succeed");
 
     assert!(
@@ -1937,6 +1942,7 @@ async fn save_state_unlocked_uses_write_state_without_lock() {
 #[tokio::test]
 async fn finalize_apply_without_lock_uses_write_state() {
     let backend = LockTrackingBackend::new();
+    let state_lock = StateLock::disabled_for_test();
 
     let result = ApplyResult {
         success_count: 0,
@@ -1962,7 +1968,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: None, // No lock
+            lock: state_lock.as_ref(),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -2884,7 +2890,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         Some(state_in),
         &[],
         &[],
@@ -2929,7 +2935,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         Some(StateFile::new()),
         &[],
         &[],
@@ -2978,7 +2984,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
-        Some(&lock),
+        StateLockRef::Held(&lock),
         Some(state_in),
         &[],
         &[],
@@ -3059,7 +3065,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
@@ -3124,7 +3130,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             current_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: None,
             provider_context: &ProviderContext::default(),
@@ -3217,7 +3223,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             current_states: &result.current_states,
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&export_params)),
             provider_context: &ProviderContext::default(),
@@ -3319,7 +3325,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
             current_states: &result.current_states,
             plan: &Plan::new(),
             backend: &backend,
-            lock: Some(&lock),
+            lock: StateLockRef::Held(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&export_params)),
             provider_context: &ProviderContext::default(),

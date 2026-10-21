@@ -2851,7 +2851,7 @@ impl WasmProviderFactory {
     ///
     /// Production callers use the default. Integration tests inject a short
     /// duration to prove that time queued for the store lock is excluded.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn with_operation_hard_timeout(mut self, hard_timeout: std::time::Duration) -> Self {
         self.operation_hard_timeout = hard_timeout;
         self
