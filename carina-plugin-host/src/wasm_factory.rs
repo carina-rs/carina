@@ -3,7 +3,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
-use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
@@ -2328,8 +2327,7 @@ pub struct WasmProviderFactory {
     name: String,
     display_name: String,
     version: String,
-    schemas: Vec<ResourceSchema>,
-    operation_configs: Arc<HashMap<String, carina_provider_protocol::OperationConfig>>,
+    schemas: Arc<Vec<ResourceSchema>>,
     operation_hard_timeout: std::time::Duration,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
@@ -2606,9 +2604,8 @@ impl WasmProviderFactory {
             .map_err(|source| {
                 WasmProviderLoadError::metadata("Failed to decode provider info", source)
             })?;
-        let (schemas, operation_configs) =
-            wasm_convert::json_to_schemas_with_operation_configs(&schemas_json)
-                .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
+        let schemas = wasm_convert::json_to_schemas(&schemas_json)
+            .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
 
         let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
             Self::load_metadata(&bindings, &mut store, &name, &version).await?;
@@ -2620,8 +2617,7 @@ impl WasmProviderFactory {
             name,
             display_name,
             version,
-            schemas,
-            operation_configs: Arc::new(operation_configs),
+            schemas: Arc::new(schemas),
             operation_hard_timeout: WASM_OPERATION_HARD_TIMEOUT,
             cached_config_completions,
             cached_identity_attributes,
@@ -2974,7 +2970,7 @@ impl ProviderFactory for WasmProviderFactory {
             Ok(Box::new(WasmProvider {
                 instance,
                 name: self.name.clone(),
-                operation_configs: Arc::clone(&self.operation_configs),
+                schemas: Arc::clone(&self.schemas),
                 operation_hard_timeout: self.operation_hard_timeout,
             }) as Box<dyn Provider>)
         })
@@ -2999,7 +2995,7 @@ impl ProviderFactory for WasmProviderFactory {
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
-        self.schemas.clone()
+        self.schemas.as_ref().clone()
     }
 }
 
@@ -3008,7 +3004,7 @@ impl ProviderFactory for WasmProviderFactory {
 pub struct WasmProvider {
     instance: Arc<SharedWasmInstance>,
     name: String,
-    operation_configs: Arc<HashMap<String, carina_provider_protocol::OperationConfig>>,
+    schemas: Arc<Vec<ResourceSchema>>,
     operation_hard_timeout: std::time::Duration,
 }
 
@@ -3059,23 +3055,24 @@ trait OperationProgress {
     type Output;
     type PendingState;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState>;
-    fn poll_after_secs(pending: &Self::PendingState) -> u32;
+    fn into_step(self)
+    -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState>;
 }
 
 impl OperationProgress for CreateProgress {
     type Output = CreateOutcome;
     type PendingState = Box<PendingCreate>;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
         match self {
-            Self::Done(outcome) => ControlFlow::Break(*outcome),
-            Self::Pending(pending) => ControlFlow::Continue(pending),
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(*outcome),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.operation.poll_after_secs(),
+                pending,
+            },
         }
-    }
-
-    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
-        pending.operation.poll_after_secs()
     }
 }
 
@@ -3083,15 +3080,16 @@ impl OperationProgress for UpdateProgress {
     type Output = UpdateOutcome;
     type PendingState = Box<PendingUpdate>;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
         match self {
-            Self::Done(outcome) => ControlFlow::Break(*outcome),
-            Self::Pending(pending) => ControlFlow::Continue(pending),
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(*outcome),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.operation.poll_after_secs(),
+                pending,
+            },
         }
-    }
-
-    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
-        pending.operation.poll_after_secs()
     }
 }
 
@@ -3099,15 +3097,16 @@ impl OperationProgress for DeleteProgress {
     type Output = ();
     type PendingState = Box<PendingDelete>;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
         match self {
-            Self::Deleted => ControlFlow::Break(()),
-            Self::Pending(pending) => ControlFlow::Continue(pending),
+            Self::Deleted => carina_provider_protocol::OperationStep::Done(()),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.operation.poll_after_secs(),
+                pending,
+            },
         }
-    }
-
-    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
-        pending.operation.poll_after_secs()
     }
 }
 
@@ -3121,10 +3120,14 @@ impl WasmProvider {
         id: &ResourceId,
         kind: carina_provider_protocol::OperationKind,
     ) -> std::time::Duration {
-        self.operation_configs.get(&id.resource_type).map_or(
-            carina_provider_protocol::DEFAULT_OPERATION_BUDGET,
-            |config| config.budget(kind),
-        )
+        self.schemas
+            .iter()
+            .find(|schema| schema.resource_type == id.resource_type)
+            .and_then(|schema| schema.operation_config.as_ref())
+            .map_or(
+                carina_provider_protocol::DEFAULT_OPERATION_BUDGET,
+                |config| config.budget(kind),
+            )
     }
 
     fn over_budget(operation: &'static str, id: ResourceId) -> ProviderError {
@@ -3181,26 +3184,21 @@ impl WasmProvider {
         Poll: FnMut(Progress::PendingState) -> PollFuture,
         PollFuture: Future<Output = ProviderResult<Progress>>,
     {
-        let operation_started = std::time::Instant::now();
-        let mut progress = initial.await?;
-        loop {
-            let pending = match progress.into_control_flow() {
-                ControlFlow::Break(output) => return Ok(output),
-                ControlFlow::Continue(pending) => pending,
-            };
-            let remaining = budget.saturating_sub(operation_started.elapsed());
-            match carina_provider_protocol::next_poll(
-                Progress::poll_after_secs(&pending),
-                remaining,
-            ) {
-                carina_provider_protocol::NextPoll::OverBudget => {
-                    return Err(Self::over_budget(operation, id));
-                }
-                carina_provider_protocol::NextPoll::Sleep(delay) => {
-                    tokio::time::sleep(delay).await;
-                }
+        let outcome = carina_provider_protocol::drive_pending(
+            budget,
+            async move { initial.await.map(OperationProgress::into_step) },
+            |pending| {
+                let next = poll(pending);
+                async move { next.await.map(OperationProgress::into_step) }
+            },
+            tokio::time::sleep,
+        )
+        .await?;
+        match outcome {
+            carina_provider_protocol::DriveOutcome::Done(output) => Ok(output),
+            carina_provider_protocol::DriveOutcome::OverBudget => {
+                Err(Self::over_budget(operation, id))
             }
-            progress = poll(pending).await?;
         }
     }
 

@@ -752,7 +752,7 @@ pub struct ResourceSchema {
 }
 
 /// Per-resource operational configuration for timeouts and retries.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct OperationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_timeout_secs: Option<u64>,

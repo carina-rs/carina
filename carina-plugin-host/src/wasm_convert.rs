@@ -1411,36 +1411,9 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
 
 /// Deserialize JSON to a Vec of core ResourceSchemas.
 pub fn json_to_schemas(json: &str) -> Result<Vec<CoreResourceSchema>, SchemaDecodeError> {
-    json_to_schemas_with_operation_configs(json).map(|(schemas, _operation_configs)| schemas)
-}
-
-/// Deserialize schemas while retaining their protocol operation configs for
-/// the host-owned pending-operation loop.
-pub(crate) fn json_to_schemas_with_operation_configs(
-    json: &str,
-) -> Result<
-    (
-        Vec<CoreResourceSchema>,
-        HashMap<String, proto::OperationConfig>,
-    ),
-    SchemaDecodeError,
-> {
     let proto_schemas: Vec<proto::ResourceSchema> =
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    let operation_configs = proto_schemas
-        .iter()
-        .map(|schema| {
-            (
-                schema.resource_type.clone(),
-                schema.operation_config.clone().unwrap_or_default(),
-            )
-        })
-        .collect();
-    let schemas = proto_schemas
-        .iter()
-        .map(proto_schema_to_core)
-        .collect::<Result<_, _>>()?;
-    Ok((schemas, operation_configs))
+    proto_schemas.iter().map(proto_schema_to_core).collect()
 }
 
 /// Deserialize a JSON-encoded `HashMap<String, AttributeType>` from a WASM
@@ -1492,9 +1465,7 @@ fn proto_schema_to_core(
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
         },
         unique_name: proto_unique_name_to_core(unique_name),
-        operation_config: operation_config
-            .as_ref()
-            .map(proto_operation_config_to_core),
+        operation_config: operation_config.clone(),
         exclusive_required: exclusive_required.clone(),
         // Wait defaults are not (yet) carried across the WASM plugin
         // boundary — providers fall back to the carina-core constants
@@ -1515,28 +1486,6 @@ fn proto_schema_to_core(
             })
             .collect::<Result<_, _>>()?,
     })
-}
-
-fn proto_operation_config_to_core(
-    config: &proto::OperationConfig,
-) -> carina_core::schema::OperationConfig {
-    // Keep the protocol record exhaustive for the same reason as its parent
-    // ResourceSchema conversion.
-    let proto::OperationConfig {
-        delete_timeout_secs,
-        delete_max_retries,
-        create_timeout_secs,
-        create_max_retries,
-        update_timeout_secs,
-    } = config;
-
-    carina_core::schema::OperationConfig {
-        delete_timeout_secs: *delete_timeout_secs,
-        delete_max_retries: *delete_max_retries,
-        create_timeout_secs: *create_timeout_secs,
-        create_max_retries: *create_max_retries,
-        update_timeout_secs: *update_timeout_secs,
-    }
 }
 
 fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
@@ -2291,32 +2240,6 @@ mod tests {
             Some(CoreValue::Concrete(ConcreteValue::String(value)))
                 if value == "us-east-1"
         ));
-    }
-
-    #[test]
-    fn operation_config_transport_carries_update_timeout() {
-        let protocol = proto::OperationConfig {
-            delete_timeout_secs: Some(11),
-            delete_max_retries: Some(12),
-            create_timeout_secs: Some(13),
-            create_max_retries: Some(14),
-            update_timeout_secs: Some(15),
-        };
-
-        let core = proto_operation_config_to_core(&protocol);
-        let carina_core::schema::OperationConfig {
-            delete_timeout_secs,
-            delete_max_retries,
-            create_timeout_secs,
-            create_max_retries,
-            update_timeout_secs,
-        } = core;
-
-        assert_eq!(delete_timeout_secs, Some(11));
-        assert_eq!(delete_max_retries, Some(12));
-        assert_eq!(create_timeout_secs, Some(13));
-        assert_eq!(create_max_retries, Some(14));
-        assert_eq!(update_timeout_secs, Some(15));
     }
 
     #[test]

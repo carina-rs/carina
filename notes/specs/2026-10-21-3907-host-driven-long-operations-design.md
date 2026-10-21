@@ -113,8 +113,8 @@ yet", so no operation needs to block, and the host owns the wait.
 /// An operation the provider started but has not finished.
 record pending-operation {
   /// Opaque to the host; only this provider's matching poll export
-  /// interprets it. Must not carry request payloads: the host passes the
-  /// original request back on every poll.
+  /// interprets it. Must not carry request or secret data: the host passes
+  /// the original request back on every poll.
   token: string,
   /// When the provider wants the next poll. The host clamps it to [1, 300].
   poll-after-secs: u32,
@@ -170,16 +170,22 @@ outcomes, with no pending arm. Pending exists only on the WIT boundary and in
 the SDK's own generic types, so the JSON-RPC wire (`methods::CreateResult`
 etc.) cannot carry a pending value at all.
 
-The protocol crate also gets the one shared poll schedule, so no loop
-re-derives the clamp, the deadline or the default budget:
+The protocol crate owns the one shared pending-operation driver, so no caller
+re-derives the clock start, clamp, deadline or final-poll rule:
 
 ```rust
 pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(15 * 60);
-pub enum NextPoll { Sleep(Duration), OverBudget }
-pub fn next_poll(poll_after_secs: u32, remaining: Duration) -> NextPoll;
-// Sleep(min(clamp(poll_after_secs, 1, 300) s, remaining)), or OverBudget when
-// remaining is zero. A sleep that reaches the deadline is followed by one
-// final poll.
+pub enum OperationStep<D, P> {
+    Done(D),
+    Pending { pending: P, poll_after_secs: u32 },
+}
+pub enum DriveOutcome<D> { Done(D), OverBudget }
+pub async fn drive_pending<D, P, E, ...>(
+    budget: Duration,
+    initial: impl Future<Output = Result<OperationStep<D, P>, E>>,
+    poll: impl FnMut(P) -> impl Future<Output = Result<OperationStep<D, P>, E>>,
+    sleep: impl FnMut(Duration) -> impl Future<Output = ()>,
+) -> Result<DriveOutcome<D>, E>;
 
 pub enum OperationKind { Create, Update, Delete }
 impl OperationConfig {
@@ -189,9 +195,15 @@ impl OperationConfig {
 }
 ```
 
-Every loop gets its budget through `OperationConfig::budget` (with
+`drive_pending` starts its `Instant` before polling `initial`, clamps each
+requested delay to 1–300 seconds and to the remaining budget, and performs one
+final poll after a sleep that reaches the deadline. Sleep is injected, so the
+protocol crate has no async-runtime dependency. Every caller gets its budget
+through `OperationConfig::budget` (with
 `DEFAULT_OPERATION_BUDGET` when the resource type has no config), so no loop
-picks a timeout field itself.
+picks a timeout field itself. `OperationConfig` itself is defined once in
+`carina-provider-protocol`; `carina-core::schema` publicly re-exports that
+same type so native core providers have `budget(kind)` directly.
 
 The SDK trait is generic over each kind's token, chosen per provider. Rust has
 no defaults for associated types, so the compiler forces the choice:
@@ -230,31 +242,30 @@ pub trait CarinaProvider {
   returns to the resource that issued it.
 - **JSON-RPC dispatch.** The native `run`/`dispatch` transport is sync and
   serves one request at a time over stdio. It drives a pending operation to a
-  settled outcome itself, using `next_poll` and `std::thread::sleep`, so its
-  wire methods (including `DeleteResult { ok }`) stay unchanged. Its budget
-  comes from a resource type → `OperationConfig` map that `run` builds once
-  from `provider.schemas()` at startup, falling back to
-  `DEFAULT_OPERATION_BUDGET`.
+  settled outcome by running the shared async `drive_pending` with a trivial
+  ready-only, dependency-free `block_on`; its injected sleep calls
+  `std::thread::sleep` and returns a ready future. Its wire methods (including
+  `DeleteResult { ok }`) stay unchanged. Its budget comes from a resource type
+  → `OperationConfig` map that `run` builds once from `provider.schemas()` at
+  startup, falling back to `DEFAULT_OPERATION_BUDGET`.
 
-Loops over pending therefore exist in three places, each a different
-runtime: the host adapter (tokio), the SDK's JSON-RPC dispatch (blocking),
-and each provider's native core `Provider` impl (below). All three take the
-schedule from `next_poll` and differ only in the sleep primitive.
+The driver is invoked in three runtime contexts: the host adapter injects
+`tokio::time::sleep`, the SDK JSON-RPC transport injects blocking sleep, and
+the Phase 2 native core provider impls inject `tokio::time::sleep`. The loop
+rules and clock live only in the protocol driver.
 
 ### Host (`carina-plugin-host`)
 
 `WasmProvider` keeps implementing the core `Provider` trait, whose signatures
 do not change; the polling loop lives in the adapter:
 
-```text
-outcome = call_delete(id, identifier, request)              // one WASM call
-deadline = now + budget(id.resource_type, Delete)
-while outcome is Pending(p):
-    match next_poll(p.poll_after_secs, deadline - now):
-        OverBudget => return ProviderError::Timeout
-        Sleep(d)   => tokio::time::sleep(d)                 // no store lock held
-    outcome = call_poll_delete(p)                           // one WASM call
-return outcome
+```rust
+drive_pending(
+    budget(id.resource_type, OperationKind::Delete),
+    call_delete(id, identifier, request),       // one WASM call
+    call_poll_delete,                           // one WASM call per poll
+    tokio::time::sleep,                         // no store lock held
+).await
 ```
 
 The loop sleeps at most until the deadline and then makes one final poll; if
@@ -281,17 +292,15 @@ reported as an ordinary provider error.
   for hung calls. Each create/update/delete/poll call takes and releases the
   store lock on its own, so the sleep between polls never blocks other
   operations on the same provider.
-- **Budget source.** `WasmProvider` holds only the instance and name today.
-  `create_provider` passes it a map from resource type to `OperationConfig`,
-  keyed by the same resource-type string `ResourceId.resource_type` carries at
-  the call site (the factory's `ResourceSchema.resource_type`), built from the
-  protocol `OperationConfig` before it is converted to core. The budget is
-  `OperationConfig::budget(kind)` for that entry (`update_timeout_secs` is
-  new). A missing entry or field means `DEFAULT_OPERATION_BUDGET` (15 min),
-  which covers every existing in-call waiter (longest: aws Organizations account
-  create, 10 min). The budget spans all of an operation's polls and
-  re-issues, so awscc's `delete_max_retries` / `create_max_retries` are capped
-  by it.
+- **Budget source.** The factory and each `WasmProvider` share one
+  `Arc<Vec<carina_core::schema::ResourceSchema>>`. Budget lookup finds the core
+  schema whose `resource_type` matches `ResourceId.resource_type`, then calls
+  its re-exported `OperationConfig::budget(kind)`. There is no parallel
+  protocol-config map or second config copy. A missing schema, config or field
+  means `DEFAULT_OPERATION_BUDGET` (15 min), which covers every existing
+  in-call waiter (longest: aws Organizations account create, 10 min). The
+  budget spans all of an operation's polls and re-issues, so awscc's
+  `delete_max_retries` / `create_max_retries` are capped by it.
 
 ### Destroy (`carina-cli`)
 
@@ -333,34 +342,44 @@ fails that save with `LockNotHeld`; local renew uses one fixed temp path), so:
   (there are no incremental saves mid-run), so the heartbeat never needs to
   pause;
 - "stopped before any save or release" is enforced by ownership:
-  `LockHeartbeat::start(lock: LockInfo) -> HeartbeatGuard` moves the
-  `LockInfo` in, and `guard.stop().await -> LockInfo` joins the task and
-  returns the most recently renewed `LockInfo` (renewal updates `expires`).
-  Save and release take `&LockInfo`, so they cannot be reached while the
-  guard holds it. For this to hold, `LockInfo` loses `Clone` and its public
-  fields and constructor: only `acquire_lock`, `renew_lock` and
-  `guard.stop()` produce one. Production code only borrows it today (`as_ref`
-  at the apply, destroy and state call sites), so the cost is test and mock
-  churn. `Drop` aborts the task on `?` and panic paths;
-- a renewal failing with `LockNotHeld` triggers graceful cancellation (no new
-  dispatch) and is reported; a transient error is retried on the next tick.
-  In-flight operations still run to their budget, and the final save then
-  fails with `LockNotHeld`, so their results are not recorded. This is the
-  same outcome as a lock that expires today and is accepted: the error
-  states that the lock was lost and state may be behind the cloud;
-- no heartbeat runs under `--lock=false`;
-- the TTL and renewal interval become injectable so tests can run the
-  heartbeat in seconds.
+  `LockHeartbeat::start(backend, lock, on_lost) -> HeartbeatGuard` moves the
+  `LockInfo` in. `guard.stop().await -> Result<LockInfo, LockLost>` joins any
+  renewal in progress and returns the most recently renewed lock only when
+  ownership was kept. `guard.stop_for_cleanup().await -> Result<LockInfo,
+  LockLost>` aborts a possibly hung in-flight renewal and returns the last
+  completed lock unless loss was already proven.
+  Save and release take `&LockInfo`, so they cannot be reached while the guard
+  holds it. For this to hold, `LockInfo` loses `Clone` and its public fields
+  and constructor: only `acquire_lock`, `renew_lock` and a successful stop
+  produce one. `Drop` aborts the task on `?` and panic paths;
+- CLI lock flow uses `StateLock::Disabled(LockingDisabled)` and
+  `StateLock::Held(LockInfo)` as witnesses, so `--lock=false` is explicit and
+  cannot be confused with an accidentally missing lock. No heartbeat runs for
+  `Disabled`;
+- `with_lock_heartbeat` returns `HeartbeatOutcome::Kept { result, lock }` or
+  `HeartbeatOutcome::Lost { result, lost }`. A renewal failing with
+  `LockNotHeld` invokes `on_lost` to request graceful cancellation and yields
+  `Lost`, which deliberately carries no lock capability. Apply/destroy map it
+  to `AppError::StateLockLost`; they neither save state nor release the lock on
+  that path because another process may own it. A transient renewal error is
+  warned once per failure streak and retried on the next tick;
+- test-only `LockInfo` construction accepts a short TTL, from which the
+  heartbeat derives its TTL/3 interval, so tests run in milliseconds.
 
 ### `OperationConfig` transport
 
 `OperationConfig` crosses the WASM boundary inside the `schemas()` JSON, not
-in WIT. Adding `update_timeout_secs` touches `carina-provider-protocol`
-(`types.rs`), the exhaustive `proto_operation_config_to_core` in
-`carina-plugin-host/src/wasm_convert.rs` (adding the field breaks compilation
-until it is carried), core `OperationConfig`, and in awscc `convert.rs` plus
-codegen's `CodegenOperationConfig` / `emit_option_field`. Codegen changes
-regenerate both `generate-schemas.sh` and `generate-docs.sh` output.
+in WIT. The canonical serde/`Default`/`PartialEq`/`Eq` type lives in
+`carina-provider-protocol` (`types.rs`), and `carina-core::schema` re-exports
+it. The host's exhaustive `ResourceSchema` conversion clones that same type;
+there is no `proto_operation_config_to_core` conversion.
+
+Adding `update_timeout_secs` intentionally leaves Phase 2 compile breakage in
+the provider repositories: aws's `convert.rs` `ProtoOperationConfig` literal
+must carry the field, and awscc codegen's `CodegenOperationConfig` plus
+`emit_option_field` must emit it. Regeneration then updates
+`schemas/generated/ec2/*.rs` (as well as the normal `generate-schemas.sh` and
+`generate-docs.sh` outputs).
 
 ### awscc provider
 
@@ -404,9 +423,9 @@ enum CcDeleteToken {
   back into the SDK trait. So the provider exposes async inherent step
   functions (`create_step`, `poll_create_step`, and so on, returning
   `sdk::CreateOutcome<CcCreateToken>` etc.). The SDK trait impl calls exactly
-  one step per WIT call. The native core impl drives the steps with its own
-  async loop using `next_poll` and `tokio::time::sleep`, with the budget from
-  its own `schemas()` through `OperationConfig::budget`, so the
+  one step per WIT call. The native core impl drives the steps with the
+  protocol's shared `drive_pending` and `tokio::time::sleep`, using the budget
+  from its own `schemas()` through `OperationConfig::budget`, so the
   CloudControl/winterbaume round-trip tests keep calling a blocking-to-done
   `create`/`delete` under the same budgets (3600 s for an IPAM pool delete).
 
@@ -421,7 +440,7 @@ enums over those phases; `UpdateToken` is `Never`, since no update waits.
 Their budgets stay within `DEFAULT_OPERATION_BUDGET` (15 min), so aws needs no
 `OperationConfig` entries. The layering matches awscc: async inherent step
 functions, one step per SDK trait call, and the native core `Provider` impl
-(`provider.rs`) drives them with `next_poll` and `tokio::time::sleep`.
+(`provider.rs`) drives them with `drive_pending` and `tokio::time::sleep`.
 
 ## Phases
 
@@ -429,17 +448,18 @@ Each phase is its own PR, landed in order, using the usual rev-bump flow
 (carina-plugin-wit → carina → aws → awscc pinned to aws).
 
 1. **carina-plugin-wit + carina (protocol v8).** WIT types and exports;
-   `next_poll`, `DEFAULT_OPERATION_BUDGET` and `OperationConfig::budget` in
-   the protocol crate; `LockInfo` made non-`Clone` with the heartbeat guard; SDK
+   `drive_pending`, `DEFAULT_OPERATION_BUDGET` and the single
+   `OperationConfig` type with `budget` in the protocol crate; `LockInfo` made
+   non-`Clone` with the heartbeat guard; SDK
    trait with associated token types, `Never` and generic outcomes; JSON-RPC
-   dispatch driving pending to settled; host polling loop with typed pending
-   kinds, token newtype and budget map; `update_timeout_secs`; hard timeout
+   dispatch driving pending to settled; host adapter with typed pending kinds,
+   token newtype and core-schema budget lookup; `update_timeout_secs`; hard timeout
    scoped to the guest call (made injectable for tests, and the existing
    `HARD_TIMEOUT >= 2 * LONGEST_LEGITIMATE_WAITER_SECS` assertion revisited);
    destroy extended wait removed; lock heartbeat; WASM mock provider updated.
    Tests:
-   - `next_poll` unit tests: clamp bounds, never past the deadline, final poll
-     at the deadline;
+   - shared-driver unit tests: budget starts before the initial call, clamp
+     bounds, never sleep past the deadline, and one final poll at the deadline;
    - in `carina-plugin-host/tests` with the WASM mock fixture: an operation
      that returns `pending` N times, then succeeds, for each of create, update
      and delete. The WASM mock gets no env vars (the env allowlist passes none
@@ -459,8 +479,12 @@ Each phase is its own PR, landed in order, using the usual rev-bump flow
      longer than the renewal interval, cannot overlap a save, and cancels the
      run on `LockNotHeld`.
 2. **aws + awscc rev bump.** Both providers move to v8 as described above.
-   Acceptance: `ec2_subnet/with_ipam` full (apply, plan-verify, destroy)
-   passes; the full awscc and aws suites and multi-step tests pass.
+   Expected compile breakage includes aws `convert.rs`'s
+   `ProtoOperationConfig` literal and awscc's regenerated
+   `schemas/generated/ec2/*.rs`; update the latter through codegen
+   `emit_option_field`, not by hand. Acceptance: `ec2_subnet/with_ipam` full
+   (apply, plan-verify, destroy) passes; the full awscc and aws suites and
+   multi-step tests pass.
 
 ## Alternatives considered
 

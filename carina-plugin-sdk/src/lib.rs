@@ -62,7 +62,6 @@ use carina_provider_protocol::types::{
 };
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanOp {
@@ -86,6 +85,12 @@ pub enum BindingPattern {
 }
 
 /// Provider-owned continuation for an operation that has not settled yet.
+///
+/// A create, update, delete, or poll call is one short step that must finish
+/// well under the host's per-call hard timeout; providers must never run an
+/// in-call waiter. A poll may return another `Pending`. The host supplies the
+/// original request on every poll, so `token` must contain only opaque
+/// continuation metadata and must never contain request or secret data.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pending<T> {
     pub token: T,
@@ -203,14 +208,21 @@ pub trait CarinaProvider {
     /// delegate to a state-only read against `resource.id`.
     fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError>;
 
-    /// Create a new resource.
+    /// Perform one short create step.
+    ///
+    /// Return [`CreateOutcome::Pending`] when the external operation has not
+    /// settled. Do not wait or poll inside this call; it must finish well under
+    /// the host's per-call hard timeout.
     fn create(
         &self,
         id: &ResourceId,
         request: CreateRequest,
     ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError>;
 
-    /// Continue a create operation previously returned as pending.
+    /// Perform one short poll step for a pending create operation.
+    ///
+    /// The host passes the original request on every poll. This method may
+    /// return [`CreateOutcome::Pending`] again and must not wait in-call.
     fn poll_create(
         &self,
         id: &ResourceId,
@@ -218,11 +230,15 @@ pub trait CarinaProvider {
         pending: Pending<Self::CreateToken>,
     ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError>;
 
-    /// Update an existing resource.
+    /// Perform one short update step.
     ///
     /// Providers MUST NOT modify any attribute that is not represented in
     /// `request.patch.ops`. The patch is the sole source of truth for the
     /// update payload.
+    ///
+    /// Return [`UpdateOutcome::Pending`] when the external operation has not
+    /// settled. Do not wait or poll inside this call; it must finish well under
+    /// the host's per-call hard timeout.
     fn update(
         &self,
         id: &ResourceId,
@@ -230,7 +246,11 @@ pub trait CarinaProvider {
         request: UpdateRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
 
-    /// Continue an update operation previously returned as pending.
+    /// Perform one short poll step for a pending update operation.
+    ///
+    /// The host passes the original request and identifier on every poll. This
+    /// method may return [`UpdateOutcome::Pending`] again and must not wait
+    /// in-call.
     fn poll_update(
         &self,
         id: &ResourceId,
@@ -239,7 +259,11 @@ pub trait CarinaProvider {
         pending: Pending<Self::UpdateToken>,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
 
-    /// Delete an existing resource.
+    /// Perform one short delete step.
+    ///
+    /// Return [`DeleteOutcome::Pending`] when the external operation has not
+    /// settled. Do not wait or poll inside this call; it must finish well under
+    /// the host's per-call hard timeout.
     fn delete(
         &self,
         id: &ResourceId,
@@ -247,7 +271,11 @@ pub trait CarinaProvider {
         request: DeleteRequest,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError>;
 
-    /// Continue a delete operation previously returned as pending.
+    /// Perform one short poll step for a pending delete operation.
+    ///
+    /// The host passes the original request and identifier on every poll. This
+    /// method may return [`DeleteOutcome::Pending`] again and must not wait
+    /// in-call.
     fn poll_delete(
         &self,
         id: &ResourceId,
@@ -423,23 +451,24 @@ trait DrivenOutcome {
     type Output;
     type PendingState;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState>;
-    fn poll_after_secs(pending: &Self::PendingState) -> u32;
+    fn into_step(self)
+    -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState>;
 }
 
 impl<T> DrivenOutcome for CreateOutcome<T> {
     type Output = carina_provider_protocol::CreateOutcome;
     type PendingState = Pending<T>;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
         match self {
-            Self::Done(outcome) => ControlFlow::Break(outcome),
-            Self::Pending(pending) => ControlFlow::Continue(pending),
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(outcome),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.poll_after_secs,
+                pending,
+            },
         }
-    }
-
-    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
-        pending.poll_after_secs
     }
 }
 
@@ -447,15 +476,16 @@ impl<T> DrivenOutcome for UpdateOutcome<T> {
     type Output = carina_provider_protocol::UpdateOutcome;
     type PendingState = Pending<T>;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
         match self {
-            Self::Done(outcome) => ControlFlow::Break(outcome),
-            Self::Pending(pending) => ControlFlow::Continue(pending),
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(outcome),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.poll_after_secs,
+                pending,
+            },
         }
-    }
-
-    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
-        pending.poll_after_secs
     }
 }
 
@@ -463,15 +493,28 @@ impl<T> DrivenOutcome for DeleteOutcome<T> {
     type Output = ();
     type PendingState = Pending<T>;
 
-    fn into_control_flow(self) -> ControlFlow<Self::Output, Self::PendingState> {
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
         match self {
-            Self::Deleted => ControlFlow::Break(()),
-            Self::Pending(pending) => ControlFlow::Continue(pending),
+            Self::Deleted => carina_provider_protocol::OperationStep::Done(()),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.poll_after_secs,
+                pending,
+            },
         }
     }
+}
 
-    fn poll_after_secs(pending: &Self::PendingState) -> u32 {
-        pending.poll_after_secs
+fn block_on_ready<F: std::future::Future>(future: F) -> F::Output {
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    let mut future = std::pin::pin!(future);
+    match std::future::Future::poll(future.as_mut(), &mut context) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => {
+            unreachable!("the blocking JSON-RPC driver only supplies ready futures")
+        }
     }
 }
 
@@ -488,21 +531,18 @@ where
     Initial: FnOnce() -> Result<Outcome, ProviderError>,
     Poll: FnMut(Outcome::PendingState) -> Result<Outcome, ProviderError>,
 {
-    let operation_started = std::time::Instant::now();
-    let mut outcome = initial()?;
-    loop {
-        let pending = match outcome.into_control_flow() {
-            ControlFlow::Break(output) => return Ok(output),
-            ControlFlow::Continue(pending) => pending,
-        };
-        let remaining = budget.saturating_sub(operation_started.elapsed());
-        match carina_provider_protocol::next_poll(Outcome::poll_after_secs(&pending), remaining) {
-            carina_provider_protocol::NextPoll::OverBudget => {
-                return Err(operation_timeout(id, operation));
-            }
-            carina_provider_protocol::NextPoll::Sleep(delay) => std::thread::sleep(delay),
-        }
-        outcome = poll(pending)?;
+    let outcome = block_on_ready(carina_provider_protocol::drive_pending(
+        budget,
+        async move { initial().map(DrivenOutcome::into_step) },
+        |pending| std::future::ready(poll(pending).map(DrivenOutcome::into_step)),
+        |delay| {
+            std::thread::sleep(delay);
+            std::future::ready(())
+        },
+    ))?;
+    match outcome {
+        carina_provider_protocol::DriveOutcome::Done(output) => Ok(output),
+        carina_provider_protocol::DriveOutcome::OverBudget => Err(operation_timeout(id, operation)),
     }
 }
 

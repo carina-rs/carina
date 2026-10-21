@@ -239,7 +239,7 @@ async fn test_from_file_cached_uses_cache() {
         .expect("second from_file_cached (cache hit) should succeed");
     assert_eq!(factory2.name(), "mock");
 
-    // Both factories should report correct schemas (empty for mock provider)
+    // Both factories should report the mock provider's schemas.
     for factory in [&factory1, &factory2] {
         assert!(
             factory

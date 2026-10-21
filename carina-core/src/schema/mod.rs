@@ -22,6 +22,8 @@ mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 
+/// Per-resource operational configuration for provider timeouts and retries.
+pub use carina_provider_protocol::OperationConfig;
 pub use carina_provider_protocol::types::DslTransform;
 pub use resolved_attr_type::ResolvedAttrType;
 use resolved_union_members::UnionMemberTypes;
@@ -6102,30 +6104,6 @@ impl AttributeSchema {
         self.block_name = Some(name.into());
         self
     }
-}
-
-/// Per-resource operational configuration for provider-specific timeouts and retries.
-///
-/// Providers can set these on individual resource schemas to override default
-/// polling/retry behavior. This avoids hardcoding resource-type string matches
-/// in provider implementations.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OperationConfig {
-    /// Polling timeout for delete operations in seconds.
-    /// Default: provider-specific (e.g., 600s for CloudControl).
-    pub delete_timeout_secs: Option<u64>,
-    /// Maximum retry attempts for retryable delete errors.
-    /// Default: provider-specific (e.g., 12 for CloudControl).
-    pub delete_max_retries: Option<u32>,
-    /// Polling timeout for create operations in seconds.
-    /// Default: provider-specific (e.g., 600s for CloudControl).
-    pub create_timeout_secs: Option<u64>,
-    /// Maximum retry attempts for retryable create errors.
-    /// Default: provider-specific (e.g., 12 for CloudControl).
-    pub create_max_retries: Option<u32>,
-    /// Polling timeout for update operations in seconds.
-    /// Default: the shared provider-operation budget.
-    pub update_timeout_secs: Option<u64>,
 }
 
 /// Classification of a resource schema: managed (full CRUD lifecycle) vs
