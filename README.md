@@ -348,7 +348,7 @@ DSL File (.crn)
 
 - **Resource**: Desired state declared in DSL
 - **State**: Current state fetched from infrastructure
-- **Effect**: Represents a side effect (Create, Update, Delete, Read)
+- **Effect**: Represents a side effect (Create, Update, Delete, Read) as an inspectable value, in the "effects as values" sense of the IO monad. It is not an effect system: Carina does not track effects in its type system.
 - **Plan**: Collection of Effects to be executed
 - **Provider**: Abstraction for infrastructure operations
 
