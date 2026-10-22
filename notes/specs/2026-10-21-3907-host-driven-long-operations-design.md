@@ -383,34 +383,46 @@ must carry the field, and awscc codegen's `CodegenOperationConfig` plus
 
 ### awscc provider
 
-Token types are enums:
+Every CloudControl request goes through one phase type, and the tokens are
+built from it:
 
 ```rust
-enum CcCreateToken {
-    NotIssued { attempt: u32 },                      // initial send hit a retryable SDK error
+enum CcRequestPhase {
+    NotIssued { attempt: u32 },                      // (re-)send is due
     InFlight { request: RequestToken, attempt: u32 },
 }
+// CcCreateToken and CcUpdateToken are CcRequestPhase.
 enum CcDeleteToken {
-    DetachIgw { request: Option<RequestToken>, attempt: u32 },  // IGW pre-step
-    NotIssued { attempt: u32 },
-    InFlight { request: RequestToken, attempt: u32 },
+    DetachIgw(CcRequestPhase),  // IGW pre-step (an update request)
+    Delete(CcRequestPhase),
 }
-// CcUpdateToken: same shape as CcCreateToken
 ```
 
+A delete poll on the `Delete` arm takes only the inner phase, so an IGW
+detach cannot reach the delete step by construction.
+
 - `create`/`update`/`delete` send the CloudControl request once and return
-  `pending(InFlight)`. A retryable SDK error on the initial send returns
-  `pending(NotIssued { attempt + 1 })` with the backoff as `poll-after-secs`,
-  instead of sleeping inside the call.
+  `pending(InFlight)` with `poll-after-secs = 1` (the host's clamp floor),
+  so the first status check is not delayed. A retryable SDK error on the
+  initial send returns `pending(NotIssued { attempt + 1 })` with the backoff
+  as `poll-after-secs`, instead of sleeping inside the call.
 - `poll_*` does one step. `NotIssued` re-sends the request built from the
   request the host passed back, applying the same desired-state
   normalization `create` applies before sending. `InFlight` calls
-  `GetResourceRequestStatus` once:
+  `GetResourceRequestStatus` once and classifies the progress event first:
   - `IN_PROGRESS`/`PENDING` → same token, `poll-after-secs = 5`;
   - `SUCCESS` → the existing success handling (read-back for create/update);
-  - `FAILED` with a retryable error and attempts left → re-issue, new
-    `InFlight` token, backoff (up to 120 s) as `poll-after-secs`;
-  - `FAILED` otherwise → the existing `PartialOrFailed` / error handling.
+  - `FAILED`/`CANCEL_COMPLETE` with an identifier → the existing
+    `PartialOrFailed` handling, never a re-issue (the resource exists, and a
+    second create would orphan it);
+  - `FAILED`/`CANCEL_COMPLETE` without an identifier, with a retryable
+    status message and attempts left → `NotIssued { attempt + 1 }` with the
+    backoff (up to 120 s) as `poll-after-secs`. The backoff runs before the
+    re-send, as the old in-call loop slept before re-issuing, so eventual
+    consistency (IPAM source resources, detaching TGW attachments) can
+    settle first;
+  - otherwise → the existing error. When retries are exhausted the last real
+    error (SDK error or operation failure) is returned with its source.
 - The IGW pre-delete detach (`special_cases.rs`) becomes the `DetachIgw` phase
   of the delete token instead of a nested blocking update.
 - `wait_for_operation_with_attempts` and `default_polling_attempts` are
