@@ -7,6 +7,14 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Decode a plain WIT managed-resource identifier into the protocol's
+/// validated representation before a guest provider can observe the request.
+pub fn wit_to_proto_applied_identifier(
+    identifier: String,
+) -> Result<proto::AppliedIdentifier, proto::EmptyAppliedIdentifier> {
+    proto::AppliedIdentifier::new(identifier)
+}
+
 // -- JSON conversion helpers --
 
 /// JSON-backed WIT value variant being decoded.
@@ -754,17 +762,58 @@ macro_rules! export_provider {
                 })
             }
 
+            fn proto_to_wit_applied_state(
+                state: &proto::AppliedState,
+            ) -> Result<wit_types::AppliedState, helpers::WasmValueEncodeError> {
+                let proto::AppliedState {
+                    id: _protocol_id,
+                    identifier,
+                    attributes,
+                } = state;
+                Ok(wit_types::AppliedState {
+                    identifier: identifier.as_str().to_string(),
+                    attributes: proto_to_wit_value_map(attributes)?,
+                })
+            }
+
+            fn proto_to_wit_read_outcome(
+                outcome: &proto::ReadOutcome,
+            ) -> Result<wit_types::ReadOutcome, helpers::WasmValueEncodeError> {
+                Ok(match outcome {
+                    proto::ReadOutcome::NotFound { id: _protocol_id } => {
+                        wit_types::ReadOutcome::NotFound
+                    }
+                    proto::ReadOutcome::Found { state } => {
+                        wit_types::ReadOutcome::Found(proto_to_wit_applied_state(state)?)
+                    }
+                })
+            }
+
+            fn proto_to_wit_applied_persisted_state(
+                state: &proto::AppliedPersistedState,
+            ) -> Result<wit_types::AppliedPersistedState, helpers::WasmValueEncodeError> {
+                let proto::AppliedPersistedState {
+                    id: _protocol_id,
+                    identifier,
+                    attributes,
+                } = state;
+                Ok(wit_types::AppliedPersistedState {
+                    identifier: identifier.as_str().to_string(),
+                    attributes: proto_to_wit_persisted_value_map(attributes)?,
+                })
+            }
+
             fn proto_to_wit_create_outcome(
                 outcome: &proto::CreateOutcome,
             ) -> Result<wit_types::CreateOutcome, helpers::WasmValueEncodeError> {
                 Ok(match outcome {
                     proto::CreateOutcome::Success { state } => {
-                        wit_types::CreateOutcome::Success(proto_to_wit_state(state)?)
+                        wit_types::CreateOutcome::Success(proto_to_wit_applied_state(state)?)
                     }
                     proto::CreateOutcome::PartialSuccess { state, diagnostic } => {
                         wit_types::CreateOutcome::PartialSuccess(
                             wit_types::CreatePartialSuccess {
-                                state: proto_to_wit_state(state)?,
+                                state: proto_to_wit_applied_state(state)?,
                                 diagnostic: wit_types::PartialReadDiagnostic {
                                     reason: diagnostic.reason.clone(),
                                     missing_attributes: diagnostic.missing_attributes.clone(),
@@ -780,12 +829,14 @@ macro_rules! export_provider {
             ) -> Result<wit_types::UpdateOutcome, helpers::WasmValueEncodeError> {
                 Ok(match outcome {
                     proto::UpdateOutcome::Success { state } => {
-                        wit_types::UpdateOutcome::Success(proto_to_wit_persisted_state(state)?)
+                        wit_types::UpdateOutcome::Success(proto_to_wit_applied_persisted_state(
+                            state,
+                        )?)
                     }
                     proto::UpdateOutcome::PartialSuccess { state, diagnostic } => {
                         wit_types::UpdateOutcome::PartialSuccess(
                             wit_types::UpdatePartialSuccess {
-                                state: proto_to_wit_persisted_state(state)?,
+                                state: proto_to_wit_applied_persisted_state(state)?,
                                 diagnostic: wit_types::PartialReadDiagnostic {
                                     reason: diagnostic.reason.clone(),
                                     missing_attributes: diagnostic.missing_attributes.clone(),
@@ -949,6 +1000,24 @@ macro_rules! export_provider {
                 );
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
                     message: format!("WASM boundary decode error in {location}: {error}"),
+                    resource_id: None,
+                    cause: None,
+                    provider_name: None,
+                    operation: Some(operation.to_string()),
+                    status: None,
+                    code: None,
+                    request_id: None,
+                })
+            }
+
+            fn boundary_applied_identifier_decode_to_provider_error(
+                operation: &'static str,
+                error: proto::EmptyAppliedIdentifier,
+            ) -> wit_types::ProviderError {
+                wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
+                    message: format!(
+                        "WASM boundary decode error in {operation} identifier: {error}"
+                    ),
                     resource_id: None,
                     cause: None,
                     provider_name: None,
@@ -1171,18 +1240,21 @@ macro_rules! export_provider {
 
                 fn read(
                     id: wit_types::ResourceId,
-                    identifier: Option<String>,
+                    identifier: String,
                     _request: wit_types::ReadRequest,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::ReadOutcome, wit_types::ProviderError> {
+                    let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
+                        boundary_applied_identifier_decode_to_provider_error("read", error)
+                    })?;
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     match $crate::CarinaProvider::read(
                         &*provider,
                         &proto_id,
-                        identifier.as_deref(),
+                        &identifier,
                         proto::ReadRequest,
                     ) {
-                        Ok(state) => proto_to_wit_state(&state)
+                        Ok(outcome) => proto_to_wit_read_outcome(&outcome)
                             .map_err(|error| {
                                 boundary_encode_to_provider_error("read", None, error)
                             }),
@@ -1255,6 +1327,9 @@ macro_rules! export_provider {
                     request: wit_types::UpdateRequest,
                 ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
+                    let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
+                        boundary_applied_identifier_decode_to_provider_error("update", error)
+                    })?;
                     let proto_request = wit_to_proto_update_request(request, &proto_id)
                         .map_err(|error| {
                             boundary_decode_to_provider_error("update", None, error)
@@ -1278,6 +1353,9 @@ macro_rules! export_provider {
                     pending: wit_types::PendingOperation,
                 ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
+                    let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
+                        boundary_applied_identifier_decode_to_provider_error("poll_update", error)
+                    })?;
                     let proto_request = wit_to_proto_update_request(request, &proto_id)
                         .map_err(|error| {
                             boundary_decode_to_provider_error("poll_update", None, error)
@@ -1306,9 +1384,12 @@ macro_rules! export_provider {
                     identifier: String,
                     request: wit_types::DeleteRequest,
                 ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
+                    let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
+                        boundary_applied_identifier_decode_to_provider_error("delete", error)
+                    })?;
                     let proto_request = wit_to_proto_delete_request(request);
+                    let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::delete(
                         &*provider,
                         &proto_id,
@@ -1327,6 +1408,9 @@ macro_rules! export_provider {
                     pending: wit_types::PendingOperation,
                 ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
+                    let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
+                        boundary_applied_identifier_decode_to_provider_error("poll_delete", error)
+                    })?;
                     let proto_request = wit_to_proto_delete_request(request);
                     let pending = wit_to_sdk_pending::<
                         <$provider_type as $crate::CarinaProvider>::DeleteToken,
@@ -1527,6 +1611,14 @@ macro_rules! export_provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_identifier_decode_rejects_empty_wit_string() {
+        assert!(matches!(
+            wit_to_proto_applied_identifier(String::new()),
+            Err(proto::EmptyAppliedIdentifier)
+        ));
+    }
 
     #[test]
     fn malformed_wit_json_container_values_are_rejected() {

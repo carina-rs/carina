@@ -253,25 +253,29 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // sorted.
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
     let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
+    if let Some(sf) = state_file.as_mut() {
+        sf.remove_legacy_data_source_rows(&data_sources);
+    }
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     let mut orphans = Orphans::new();
     if let Some(sf) = state_file.as_ref() {
         for resource in &sorted_resources {
-            let state = sf.build_state_for_resource(&resource.id);
+            let state = sf.build_state_for_resource(&resource.id).into_state();
             current_states.insert(resource.id.clone(), state);
         }
-        for ds in &data_sources {
-            let state = sf.build_state_for_resource(&ds.id);
-            current_states.insert(ds.id.clone(), state);
-        }
+        current_states.extend(
+            data_sources
+                .iter()
+                .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
+        );
 
         let desired_ids: HashSet<ResourceId> = sorted_resources
             .iter()
             .map(|r| r.id.clone())
             .chain(data_sources.iter().map(|d| d.id.clone()))
             .collect();
-        orphans = sf.build_orphans(&desired_ids);
+        orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
     } else {
         for resource in &sorted_resources {
             current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
@@ -572,6 +576,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     .expect("fixture providers must return valid satisfier hints");
     crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
 
+    // Keep this after both identifier-error producers. The
+    // `removed_missing_identifier` fixture pins the fixture planner's copy of
+    // the same recovery ordering used by plan and live apply.
     crate::wiring::add_state_block_effects(
         &mut plan,
         &parsed.state_blocks,

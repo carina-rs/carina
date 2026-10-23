@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
+pub use carina_provider_protocol::types::{AppliedIdentifier, EmptyAppliedIdentifier};
 use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
 };
@@ -33,6 +34,14 @@ pub use crate::executor::provider_ready::{
     CanonicalProviderConfigAttributes, ProviderReady, ProviderReadyConfig, ProviderReadyDataSource,
     ProviderReadyResource,
 };
+
+/// Construct a validated provider identifier for fixtures shared by workspace
+/// crates.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn fixture_applied_identifier(identifier: impl Into<String>) -> AppliedIdentifier {
+    AppliedIdentifier::new(identifier).expect("fixture provider identifier must be non-empty")
+}
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
 ///
@@ -1534,14 +1543,144 @@ impl LiftedSavedAttrs {
     }
 }
 
+/// State known to identify an existing provider-side resource.
+///
+/// Successful reads and mutations always represent an existing resource and
+/// carry a non-empty provider-assigned identifier. Conversion to generic
+/// [`State`] is centralized in [`AppliedState::into_state_for_writeback`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedState {
+    id: ResourceId,
+    identifier: AppliedIdentifier,
+    attributes: HashMap<String, Value>,
+}
+
+impl AppliedState {
+    pub fn new(
+        id: ResourceId,
+        identifier: impl Into<String>,
+        attributes: HashMap<String, Value>,
+    ) -> Result<Self, EmptyAppliedIdentifier> {
+        Ok(Self {
+            id,
+            identifier: AppliedIdentifier::new(identifier)?,
+            attributes,
+        })
+    }
+
+    pub fn from_identifier(
+        id: ResourceId,
+        identifier: AppliedIdentifier,
+        attributes: HashMap<String, Value>,
+    ) -> Self {
+        Self {
+            id,
+            identifier,
+            attributes,
+        }
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        &self.identifier
+    }
+
+    pub fn attributes(&self) -> &HashMap<String, Value> {
+        &self.attributes
+    }
+
+    /// Convert a successful managed-resource observation to the generic state
+    /// persisted by the executor. This is the sole applied-state to read-state
+    /// conversion seam.
+    pub fn into_state_for_writeback(self) -> State {
+        let Self {
+            id,
+            identifier,
+            attributes,
+        } = self;
+        State::existing(id, attributes).with_identifier(identifier.into_inner())
+    }
+}
+
+/// Result of reading a managed resource by its non-empty provider identifier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReadOutcome {
+    /// The provider identifier no longer resolves to a resource.
+    NotFound { id: ResourceId },
+    /// The provider observed an existing resource with a non-empty identifier.
+    Found { state: AppliedState },
+}
+
+impl ReadOutcome {
+    pub fn not_found(id: ResourceId) -> Self {
+        Self::NotFound { id }
+    }
+
+    pub fn found(state: AppliedState) -> Self {
+        Self::Found { state }
+    }
+
+    /// Convert the typed provider observation to the generic state consumed by
+    /// refresh, planning, and persistence. This is the only read-result seam
+    /// that constructs generic managed state.
+    pub fn into_state(self) -> State {
+        match self {
+            Self::NotFound { id } => State::not_found(id),
+            Self::Found { state } => state.into_state_for_writeback(),
+        }
+    }
+}
+
+/// Convert a generic state fixture into the typed managed-read outcome.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn fixture_read_outcome(state: State) -> ReadOutcome {
+    if !state.exists {
+        return ReadOutcome::not_found(state.id);
+    }
+    let identifier = state
+        .identifier
+        .expect("existing read fixture must carry a provider identifier");
+    ReadOutcome::found(
+        AppliedState::new(state.id, identifier, state.attributes)
+            .expect("existing read fixture identifier must be non-empty"),
+    )
+}
+
+/// Convert a generic state fixture into a managed-read outcome, using the
+/// provider identifier supplied to the read when the fixture omits one.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn fixture_read_outcome_for_identifier(
+    state: State,
+    identifier: &AppliedIdentifier,
+) -> ReadOutcome {
+    if !state.exists {
+        return ReadOutcome::not_found(state.id);
+    }
+    let identifier = match state.identifier {
+        Some(identifier) => AppliedIdentifier::new(identifier)
+            .expect("existing read fixture identifier must be non-empty"),
+        None => identifier.clone(),
+    };
+    ReadOutcome::found(AppliedState::from_identifier(
+        state.id,
+        identifier,
+        state.attributes,
+    ))
+}
+
 /// Result of a provider create operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CreateOutcome {
     /// Create completed and the returned state is complete.
-    Success { state: State },
+    Success { state: AppliedState },
     /// Create completed but the provider could not fully observe state.
     PartialSuccess {
-        state: State,
+        state: AppliedState,
         diagnostic: PartialReadDiagnostic,
     },
 }
@@ -1550,10 +1689,10 @@ pub enum CreateOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UpdateOutcome {
     /// Update completed and the returned state is complete.
-    Success { state: State },
+    Success { state: AppliedState },
     /// Update completed but the provider could not fully observe state.
     PartialSuccess {
-        state: State,
+        state: AppliedState,
         diagnostic: PartialReadDiagnostic,
     },
 }
@@ -1566,7 +1705,11 @@ pub struct PartialReadDiagnostic {
 }
 
 impl CreateOutcome {
-    pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
+    pub fn partial_success(
+        state: AppliedState,
+        reason: String,
+        missing_attributes: Vec<String>,
+    ) -> Self {
         match PartialReadDiagnostic::new(reason, missing_attributes) {
             Some(diagnostic) => CreateOutcome::PartialSuccess { state, diagnostic },
             None => CreateOutcome::Success { state },
@@ -1576,9 +1719,9 @@ impl CreateOutcome {
     /// Consume the outcome and produce a State ready for writeback.
     pub fn into_state_for_writeback(self) -> State {
         match self {
-            CreateOutcome::Success { state } => state,
+            CreateOutcome::Success { state } => state.into_state_for_writeback(),
             CreateOutcome::PartialSuccess { state, diagnostic } => {
-                diagnostic.into_state_for_writeback(state)
+                diagnostic.into_state_for_writeback(state.into_state_for_writeback())
             }
         }
     }
@@ -1592,7 +1735,11 @@ impl CreateOutcome {
 }
 
 impl UpdateOutcome {
-    pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
+    pub fn partial_success(
+        state: AppliedState,
+        reason: String,
+        missing_attributes: Vec<String>,
+    ) -> Self {
         match PartialReadDiagnostic::new(reason, missing_attributes) {
             Some(diagnostic) => UpdateOutcome::PartialSuccess { state, diagnostic },
             None => UpdateOutcome::Success { state },
@@ -1602,9 +1749,9 @@ impl UpdateOutcome {
     /// Consume the outcome and produce a State ready for writeback.
     pub fn into_state_for_writeback(self) -> State {
         match self {
-            UpdateOutcome::Success { state } => state,
+            UpdateOutcome::Success { state } => state.into_state_for_writeback(),
             UpdateOutcome::PartialSuccess { state, diagnostic } => {
-                diagnostic.into_state_for_writeback(state)
+                diagnostic.into_state_for_writeback(state.into_state_for_writeback())
             }
         }
     }
@@ -1693,15 +1840,10 @@ pub trait Provider: Send + Sync {
 
     /// Read the current provider-side state of an existing resource.
     ///
-    /// `identifier` is the cloud-side identifier (e.g. `vpc-0abc...`),
-    /// or `None` when no prior identifier exists for this resource —
-    /// typically because the saved state has no entry for it yet (a
-    /// fresh component or a newly added resource). When `identifier`
-    /// is `None` the provider MUST return [`State::not_found`]
-    /// without contacting any external API. Encoding presence in the
-    /// type lets the compiler enforce that contract on every
-    /// implementation, replacing the earlier `&str` shape that used
-    /// `""` as a sentinel and produced carina-rs/carina#2594.
+    /// `identifier` is the validated, non-empty cloud-side identifier (e.g.
+    /// `vpc-0abc...`). Resources without saved state do not cross this
+    /// boundary. The result distinguishes absence from a present observation,
+    /// which itself also carries a validated identifier.
     ///
     /// `request` carries no operationally meaningful fields today; it
     /// exists so future fields (e.g. a freshness hint or an attribute
@@ -1709,9 +1851,9 @@ pub trait Provider: Send + Sync {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>>;
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>>;
 
     /// Read a data source resource.
     ///
@@ -1720,9 +1862,11 @@ pub trait Provider: Send + Sync {
     /// `identity_store_id` + `user_name` that `aws.identitystore.user`
     /// needs to resolve itself via the AWS SDK).
     ///
-    /// Each provider must implement this explicitly. For zero-input data
-    /// sources (e.g. `aws.sts.caller_identity`), the implementation can
-    /// simply delegate to a state-only read against `resource.id`.
+    /// Each provider must implement this explicitly, including zero-input data
+    /// sources (e.g. `aws.sts.caller_identity`). Data sources have no managed
+    /// provider identifier, so they must not be routed through
+    /// [`Provider::read`]. Their generic [`State`] may therefore omit an
+    /// identifier without weakening the managed-resource read boundary.
     ///
     /// # `State.exists` contract
     ///
@@ -1782,7 +1926,7 @@ pub trait Provider: Send + Sync {
     fn update(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>>;
 
@@ -1794,7 +1938,7 @@ pub trait Provider: Send + Sync {
     fn delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>>;
 
@@ -2195,9 +2339,9 @@ impl Provider for ProviderRouter {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.read(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
@@ -2228,7 +2372,7 @@ impl Provider for ProviderRouter {
     fn update(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         match self.get_provider_or_error(id) {
@@ -2240,7 +2384,7 @@ impl Provider for ProviderRouter {
     fn delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         match self.get_provider_or_error(id) {
@@ -2768,9 +2912,9 @@ impl Provider for Box<dyn Provider> {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         (**self).read(id, identifier, request)
     }
 
@@ -2792,7 +2936,7 @@ impl Provider for Box<dyn Provider> {
     fn update(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         (**self).update(id, identifier, request)
@@ -2801,7 +2945,7 @@ impl Provider for Box<dyn Provider> {
     fn delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         (**self).delete(id, identifier, request)
@@ -3644,11 +3788,11 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(async move { Ok(ReadOutcome::not_found(id)) })
         }
 
         fn read_data_source(
@@ -3667,8 +3811,9 @@ mod tests {
             let id = id.clone();
             let attrs = request.resource().as_resource().attributes.clone();
             Box::pin(async move {
-                let state = State::existing(id, crate::resource::attrs_to_hashmap(&attrs))
-                    .with_identifier("mock-id-123");
+                let state =
+                    AppliedState::new(id, "mock-id-123", crate::resource::attrs_to_hashmap(&attrs))
+                        .expect("fixture identifier is non-empty");
                 Ok(CreateOutcome::Success { state })
             })
         }
@@ -3676,10 +3821,11 @@ mod tests {
         fn update(
             &self,
             id: &ResourceId,
-            _identifier: &str,
+            identifier: &AppliedIdentifier,
             request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             let id = id.clone();
+            let identifier = identifier.to_string();
             // Apply the patch on top of `from` so the test sees the
             // user-specified changes round-tripped into State.
             let mut attrs = request.from().attributes.clone();
@@ -3697,7 +3843,8 @@ mod tests {
             }
             Box::pin(async move {
                 Ok(UpdateOutcome::Success {
-                    state: State::existing(id, attrs),
+                    state: AppliedState::new(id, identifier, attrs)
+                        .expect("provider input identifier is non-empty"),
                 })
             })
         }
@@ -3705,7 +3852,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
@@ -3724,14 +3871,21 @@ mod tests {
     async fn mock_provider_read_returns_not_found() {
         let provider = MockProvider;
         let id = ResourceId::with_identity("test", "example");
-        let state = provider.read(&id, None, ReadRequest).await.unwrap();
+        let identifier = fixture_applied_identifier("mock-id");
+        let state = provider
+            .read(&id, &identifier, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
         assert!(!state.exists);
     }
 
     #[test]
     fn create_outcome_exposes_state_and_diagnostic() {
         let id = ResourceId::with_identity("test", "example");
-        let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
+        let state = AppliedState::new(id.clone(), "mock-id", HashMap::new())
+            .expect("fixture identifier is non-empty");
+        let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),
             vec!["dns_name".to_string()],
@@ -3742,7 +3896,7 @@ mod tests {
             state: state.clone(),
         };
         assert_eq!(success.diagnostic(), None);
-        assert_eq!(success.into_state_for_writeback(), state.clone());
+        assert_eq!(success.into_state_for_writeback(), expected);
 
         let partial = CreateOutcome::partial_success(
             state.clone(),
@@ -3758,7 +3912,9 @@ mod tests {
     #[test]
     fn create_outcome_empty_partial_diagnostic_becomes_success() {
         let id = ResourceId::with_identity("test", "example");
-        let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
+        let state = AppliedState::new(id.clone(), "mock-id", HashMap::new())
+            .expect("fixture identifier is non-empty");
+        let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
 
         let outcome = CreateOutcome::partial_success(
             state.clone(),
@@ -3767,7 +3923,23 @@ mod tests {
         );
 
         assert_eq!(outcome.diagnostic(), None);
-        assert_eq!(outcome.into_state_for_writeback(), state);
+        assert_eq!(outcome.into_state_for_writeback(), expected);
+    }
+
+    #[test]
+    fn applied_state_rejects_empty_identifier() {
+        let id = ResourceId::with_identity("test", "example");
+        assert_eq!(
+            AppliedState::new(id, "", HashMap::new()),
+            Err(EmptyAppliedIdentifier)
+        );
+    }
+
+    #[test]
+    fn applied_identifier_deserialization_rejects_empty_string() {
+        let error = serde_json::from_str::<AppliedIdentifier>("\"\"")
+            .expect_err("deserialization must preserve the non-empty invariant");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
     }
 
     #[test]
@@ -3832,9 +4004,9 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
             let id = id.clone();
             // Intentionally fails if the data source path doesn't deliver
             // the full Resource — the regular `read` route has no access
@@ -3871,7 +4043,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
@@ -3880,7 +4052,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
@@ -3896,9 +4068,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_data_source_delegates_to_read_for_zero_input() {
-        // MockProvider's read_data_source delegates to read(&resource.id, None).
-        // For MockProvider this returns not_found.
+    async fn read_data_source_handles_zero_input_without_managed_identifier() {
+        // Data-source reads have their own boundary and do not manufacture a
+        // managed-resource identifier merely to call `read`.
         let provider = MockProvider;
         let resource = ready_data_source_for_test(DataSource::new("test", "example"));
         let state = provider.read_data_source(&resource).await.unwrap();
@@ -4001,7 +4173,12 @@ mod tests {
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
-        let state = router.read(&id, None, ReadRequest).await.unwrap();
+        let identifier = fixture_applied_identifier("mock-id");
+        let state = router
+            .read(&id, &identifier, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
         assert!(!state.exists);
     }
 
@@ -4548,8 +4725,10 @@ mod tests {
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
         let request = UpdateRequest::checked(from, &[], &ready);
+        let identifier =
+            AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
         let state = router
-            .update(&id, "mock-id-123", request)
+            .update(&id, &identifier, request)
             .await
             .unwrap()
             .into_state_for_writeback();
@@ -4563,7 +4742,9 @@ mod tests {
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let request = DeleteRequest::default();
-        let result = router.delete(&id, "mock-id-123", request).await;
+        let identifier =
+            AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
+        let result = router.delete(&id, &identifier, request).await;
         assert!(result.is_ok());
     }
 
@@ -4571,7 +4752,8 @@ mod tests {
     async fn provider_router_returns_error_for_unknown_provider() {
         let router = ProviderRouter::new();
         let id = ResourceId::with_provider_identity("nonexistent", "test", "example", None);
-        let result = router.read(&id, None, ReadRequest).await;
+        let identifier = fixture_applied_identifier("mock-id");
+        let result = router.read(&id, &identifier, ReadRequest).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ProviderError::Internal(_)));
@@ -4590,16 +4772,17 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
             let mut attrs = HashMap::new();
             attrs.insert(
                 "tag".to_string(),
                 Value::Concrete(ConcreteValue::String(self.tag.to_string().into())),
             );
-            let state = State::existing(id.clone(), attrs);
-            Box::pin(async move { Ok(state) })
+            let state = AppliedState::new(id.clone(), identifier.as_str(), attrs)
+                .expect("typed read identifier is non-empty");
+            Box::pin(async move { Ok(ReadOutcome::found(state)) })
         }
         fn read_data_source(
             &self,
@@ -4617,7 +4800,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
@@ -4625,7 +4808,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
@@ -4661,7 +4844,12 @@ mod tests {
         router.add_provider_config(&named_config, Box::new(TaggedProvider { tag: "us" }));
 
         let default_id = ResourceId::with_provider_identity("mock", "test", "a", None);
-        let state = router.read(&default_id, None, ReadRequest).await.unwrap();
+        let identifier = fixture_applied_identifier("mock-id");
+        let state = router
+            .read(&default_id, &identifier, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
         assert_eq!(
             state.attributes.get("tag"),
             Some(&Value::Concrete(ConcreteValue::String("default".into()))),
@@ -4669,7 +4857,11 @@ mod tests {
         );
 
         let us_id = ResourceId::with_provider_identity("mock", "test", "b", Some("us".to_string()));
-        let state = router.read(&us_id, None, ReadRequest).await.unwrap();
+        let state = router
+            .read(&us_id, &identifier, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
         assert_eq!(
             state.attributes.get("tag"),
             Some(&Value::Concrete(ConcreteValue::String("us".into()))),
@@ -4684,7 +4876,11 @@ mod tests {
 
         let id =
             ResourceId::with_provider_identity("mock", "test", "x", Some("missing".to_string()));
-        let err = router.read(&id, None, ReadRequest).await.unwrap_err();
+        let identifier = fixture_applied_identifier("mock-id");
+        let err = router
+            .read(&id, &identifier, ReadRequest)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("missing") && msg.contains("mock"),
@@ -4952,11 +5148,11 @@ mod tests {
             fn read(
                 &self,
                 id: &ResourceId,
-                _identifier: Option<&str>,
+                _identifier: &AppliedIdentifier,
                 _request: ReadRequest,
-            ) -> BoxFuture<'_, ProviderResult<State>> {
+            ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
                 let id = id.clone();
-                Box::pin(async move { Ok(State::not_found(id)) })
+                Box::pin(async move { Ok(ReadOutcome::not_found(id)) })
             }
 
             fn read_data_source(
@@ -4975,7 +5171,8 @@ mod tests {
                 let id = id.clone();
                 Box::pin(async move {
                     Ok(CreateOutcome::Success {
-                        state: State::not_found(id),
+                        state: AppliedState::new(id, "normalizing-id", HashMap::new())
+                            .expect("fixture identifier is non-empty"),
                     })
                 })
             }
@@ -4983,13 +5180,15 @@ mod tests {
             fn update(
                 &self,
                 id: &ResourceId,
-                _identifier: &str,
+                identifier: &AppliedIdentifier,
                 _request: UpdateRequest,
             ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
                 let id = id.clone();
+                let identifier = identifier.to_string();
                 Box::pin(async move {
                     Ok(UpdateOutcome::Success {
-                        state: State::not_found(id),
+                        state: AppliedState::new(id, identifier, HashMap::new())
+                            .expect("provider input identifier is non-empty"),
                     })
                 })
             }
@@ -4997,7 +5196,7 @@ mod tests {
             fn delete(
                 &self,
                 _id: &ResourceId,
-                _identifier: &str,
+                _identifier: &AppliedIdentifier,
                 _request: DeleteRequest,
             ) -> BoxFuture<'_, ProviderResult<()>> {
                 Box::pin(async { Ok(()) })

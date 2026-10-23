@@ -295,6 +295,42 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
 }
 
 #[test]
+fn cascade_replace_keeps_new_create_only_consumer_as_create() {
+    let schemas = base_schemas(true);
+    let (managed_vpc, unresolved_vpc) = vpc_resources(true);
+    let (managed_subnet, unresolved_subnet) = subnet_resources(true, false);
+    let vpc_id = managed_vpc.id.clone();
+    let subnet_id = managed_subnet.id.clone();
+    let mut states = standard_states();
+    states.insert(subnet_id.clone(), State::not_found(subnet_id.clone()));
+
+    let plan = plan_for(
+        vec![managed_vpc, managed_subnet],
+        vec![unresolved_vpc, unresolved_subnet],
+        states,
+        &schemas,
+    );
+
+    assert!(
+        plan.errors().is_empty(),
+        "unexpected errors: {:?}",
+        plan.errors()
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Create(resource) if resource.id == subnet_id)),
+        "the new consumer must remain a Create: {:?}",
+        plan.effects(),
+    );
+    assert_eq!(plan.replace_display.len(), 1);
+    assert_eq!(
+        plan.effects()[replacement_metadata(&plan, &vpc_id).create_idx].resource_id(),
+        &vpc_id,
+    );
+}
+
+#[test]
 fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     let schemas = base_schemas(true);
     let (managed_vpc, unresolved_vpc) = vpc_resources(true);

@@ -92,15 +92,19 @@ fn build_all_create_plan() -> Plan {
 fn build_mixed_operations_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-            [(
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            )]
-            .into_iter()
-            .collect(),
-        )),
+        identifier: crate::fixture_applied_identifier("my-vpc-id"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+                [(
+                    "cidr_block".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .with_identifier("my-vpc-id"),
+        ),
         to: resolved(
             Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
@@ -132,7 +136,7 @@ fn build_mixed_operations_plan() -> Plan {
             "ec2.Subnet",
             "old-subnet",
         )),
-        identifier: "subnet-12345678".to_string(),
+        identifier: crate::fixture_applied_identifier("subnet-12345678"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("old_subnet".to_string()),
@@ -149,7 +153,7 @@ fn build_deposed_delete_plan() -> Plan {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "ec2.Vpc", "main",
         )),
-        identifier: "vpc-old".to_string(),
+        identifier: crate::fixture_applied_identifier("vpc-old"),
         generation: carina_core::effect::EffectGeneration::Deposed(
             carina_core::resource::DeposedKey::new_unique(),
         ),
@@ -201,21 +205,25 @@ fn build_map_key_diff_plan() -> Plan {
     .collect();
 
     plan.add(Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-            [
-                (
-                    "cidr_block".to_string(),
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                ),
-                (
-                    "tags".to_string(),
-                    Value::Concrete(ConcreteValue::Map(old_tags)),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )),
+        identifier: crate::fixture_applied_identifier("my-vpc-id"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+                [
+                    (
+                        "cidr_block".to_string(),
+                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                    ),
+                    (
+                        "tags".to_string(),
+                        Value::Concrete(ConcreteValue::Map(old_tags)),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .with_identifier("my-vpc-id"),
+        ),
         to: resolved(
             Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
@@ -311,7 +319,7 @@ fn build_deferred_replace_plan() -> Plan {
                 "route53.Record",
                 "old-record-0",
             )),
-            identifier: "record-0".to_string(),
+            identifier: crate::fixture_applied_identifier("record-0"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
@@ -549,15 +557,19 @@ fn build_moved_with_changes_plan() -> Plan {
         )),
     });
     plan.add(Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("ec2.Vpc", "new_vpc"),
-            [(
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            )]
-            .into_iter()
-            .collect(),
-        )),
+        identifier: crate::fixture_applied_identifier("new-vpc-id"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("ec2.Vpc", "new_vpc"),
+                [(
+                    "cidr_block".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .with_identifier("new-vpc-id"),
+        ),
         to: resolved(
             Resource::new("ec2.Vpc", "new_vpc")
                 .with_binding("new_vpc")

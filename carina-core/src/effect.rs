@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::non_empty::NonEmptyVec;
 use crate::parser::DeferredForExpression;
+use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::{DataSource, Resource};
 use crate::resource::{
@@ -25,6 +26,9 @@ use crate::resource::{
     ResourceIdentity, State,
 };
 use crate::wait::predicate::WaitPredicate;
+
+#[cfg(test)]
+pub(crate) use crate::provider::fixture_applied_identifier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanOp {
@@ -161,7 +165,7 @@ pub struct TemporaryName {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeferredReplaceDelete {
     pub id: ResolvedResourceId,
-    pub identifier: String,
+    pub identifier: AppliedIdentifier,
     #[serde(default)]
     pub directives: Directives,
     #[serde(default)]
@@ -354,6 +358,8 @@ pub enum Effect {
     /// Update an existing resource
     Update {
         from: Box<State>,
+        /// Non-empty provider identifier validated while constructing the plan.
+        identifier: AppliedIdentifier,
         to: ResolvedResource,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
@@ -362,7 +368,7 @@ pub enum Effect {
     /// Delete a resource
     Delete {
         id: ResolvedResourceId,
-        identifier: String,
+        identifier: AppliedIdentifier,
         #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
         generation: EffectGeneration,
         #[serde(default)]
@@ -513,13 +519,14 @@ pub enum BasicEffect<'a> {
     Update {
         effect: &'a Effect,
         from: &'a State,
+        identifier: &'a AppliedIdentifier,
         to: &'a ResolvedResource,
         changed_attributes: &'a [String],
     },
     Delete {
         effect: &'a Effect,
         id: &'a ResourceId,
-        identifier: &'a str,
+        identifier: &'a AppliedIdentifier,
         generation: &'a EffectGeneration,
         directives: &'a Directives,
     },
@@ -595,7 +602,10 @@ impl Effect {
             ),
             (
                 Effect::Update {
-                    from: Box::new(State::not_found(id.clone())),
+                    from: Box::new(
+                        State::existing(id.clone(), Default::default()).with_identifier("x-1"),
+                    ),
+                    identifier: fixture_applied_identifier("x-1"),
                     to: ResolvedResource::new(Resource::new("test", "x")),
                     changed_attributes: vec![],
                 },
@@ -604,7 +614,7 @@ impl Effect {
             (
                 Effect::Delete {
                     id: crate::resource::ResolvedResourceId::new(id.clone()),
-                    identifier: "x-1".to_string(),
+                    identifier: fixture_applied_identifier("x-1"),
                     generation: EffectGeneration::Current,
                     directives: Directives::default(),
                     binding: None,
@@ -681,7 +691,7 @@ impl Effect {
                             "route53.Record",
                             "validation_records[0]"
                         )),
-                        identifier: "record-0".to_string(),
+                        identifier: fixture_applied_identifier("record-0"),
                         directives: Directives::default(),
                         binding: Some("validation_records[0]".to_string()),
                         dependencies: HashSet::new(),
@@ -766,11 +776,13 @@ impl Effect {
             }),
             Effect::Update {
                 from,
+                identifier,
                 to,
                 changed_attributes,
             } => Some(BasicEffect::Update {
                 effect: self,
                 from,
+                identifier,
                 to,
                 changed_attributes,
             }),
@@ -989,7 +1001,7 @@ impl Effect {
             } => {
                 if successfully_deleted.contains(&DeletedInstanceKey::current(
                     id.clone().into_inner(),
-                    identifier.clone(),
+                    identifier.to_string(),
                 )) {
                     vec![id.clone()]
                 } else {
@@ -1029,7 +1041,7 @@ impl Effect {
                 vec![DeletedInstanceKey::new(
                     id.clone().into_inner(),
                     generation.clone(),
-                    identifier.clone(),
+                    identifier.to_string(),
                 )]
             }
             Effect::Import { .. } => Vec::new(),
@@ -1044,7 +1056,7 @@ impl Effect {
                     DeletedInstanceKey::new(
                         delete.id.clone().into_inner(),
                         EffectGeneration::Current,
-                        delete.identifier.clone(),
+                        delete.identifier.to_string(),
                     )
                 })
                 .collect(),
@@ -1324,7 +1336,7 @@ mod tests {
                     "route53.Record",
                     "validation_records[0]",
                 )),
-                identifier: "old-record-id".to_string(),
+                identifier: fixture_applied_identifier("old-record-id"),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::from(["cert".to_string()]),
@@ -1361,7 +1373,10 @@ mod tests {
             (
                 "Update",
                 Effect::Update {
-                    from: Box::new(State::not_found(rid.clone())),
+                    from: Box::new(
+                        State::existing(rid.clone(), Default::default()).with_identifier("x-1"),
+                    ),
+                    identifier: fixture_applied_identifier("x-1"),
                     to: ResolvedResource::new(Resource::new("test", "x")),
                     changed_attributes: vec![],
                 },
@@ -1370,7 +1385,7 @@ mod tests {
                 "Delete",
                 Effect::Delete {
                     id: crate::resource::ResolvedResourceId::new(rid.clone()),
-                    identifier: "x-1".to_string(),
+                    identifier: fixture_applied_identifier("x-1"),
                     generation: EffectGeneration::Current,
                     directives: Directives::default(),
                     binding: None,
@@ -1532,7 +1547,7 @@ mod tests {
                     "route53.Record",
                     "validation_records[0]",
                 )),
-                identifier: "old-record-id".to_string(),
+                identifier: fixture_applied_identifier("old-record-id"),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::from(["foo".to_string()]),
@@ -1565,7 +1580,7 @@ mod tests {
                     "route53.Record",
                     "validation_records[0]",
                 )),
-                identifier: "old-record-id".to_string(),
+                identifier: fixture_applied_identifier("old-record-id"),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
@@ -1636,7 +1651,7 @@ mod tests {
                 "s3.Bucket",
                 "old-bucket",
             )),
-            identifier: "old-bucket".to_string(),
+            identifier: fixture_applied_identifier("old-bucket"),
             generation: EffectGeneration::Deposed(DeposedKey::new_unique()),
             directives: Directives::default(),
             binding: Some("bucket".to_string()),
@@ -1733,7 +1748,7 @@ mod tests {
     fn resource_returns_none_for_delete() {
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "a")),
-            identifier: "id-123".to_string(),
+            identifier: fixture_applied_identifier("id-123"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: None,
@@ -1776,13 +1791,17 @@ mod tests {
                 resource: ResolvedDataSource::new(DataSource::new("s3.Bucket", "existing")),
             },
             Effect::Update {
-                from: Box::new(State::existing(
-                    ResourceId::with_identity("s3.Bucket", "my-bucket"),
-                    HashMap::from([(
-                        "versioning".to_string(),
-                        Value::Concrete(ConcreteValue::String("Disabled".into())),
-                    )]),
-                )),
+                from: Box::new(
+                    State::existing(
+                        ResourceId::with_identity("s3.Bucket", "my-bucket"),
+                        HashMap::from([(
+                            "versioning".to_string(),
+                            Value::Concrete(ConcreteValue::String("Disabled".into())),
+                        )]),
+                    )
+                    .with_identifier("my-bucket"),
+                ),
+                identifier: fixture_applied_identifier("my-bucket"),
                 to: ResolvedResource::new(Resource::new("s3.Bucket", "my-bucket").with_attribute(
                     "versioning",
                     Value::Concrete(ConcreteValue::String("Enabled".into())),
@@ -1794,7 +1813,7 @@ mod tests {
                     "s3.Bucket",
                     "old-bucket",
                 )),
-                identifier: "old-bucket".to_string(),
+                identifier: fixture_applied_identifier("old-bucket"),
                 generation: EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: None,
@@ -1850,7 +1869,7 @@ mod tests {
                 "s3.Bucket",
                 "b",
             )),
-            identifier: "x".to_string(),
+            identifier: fixture_applied_identifier("x"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("bucket".to_string()),
@@ -2057,7 +2076,10 @@ mod tests {
         ));
 
         let update = Effect::Update {
-            from: Box::new(ResState::not_found(rid.clone())),
+            from: Box::new(
+                ResState::existing(rid.clone(), Default::default()).with_identifier("x-1"),
+            ),
+            identifier: fixture_applied_identifier("x-1"),
             to: ResolvedResource::new(Resource::new("test", "x")),
             changed_attributes: vec![],
         };
@@ -2068,7 +2090,7 @@ mod tests {
 
         let delete = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(rid.clone()),
-            identifier: "x-1".to_string(),
+            identifier: fixture_applied_identifier("x-1"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: None,

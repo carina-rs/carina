@@ -18,7 +18,7 @@ use carina_core::effect::deps::{
 };
 use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::parser::WaitBinding;
-use carina_core::plan::Plan;
+use carina_core::plan::{Plan, PlanError};
 use carina_core::provider::Provider;
 use carina_core::resource::{
     ConcreteValue, ResolvedResourceId, Resource, ResourceId, State, Value,
@@ -30,7 +30,7 @@ use carina_core::shutdown::{
 };
 #[cfg(test)]
 use carina_state::LockInfo;
-use carina_state::{StateBackend, StateFile};
+use carina_state::{ResourceStateLoad, StateBackend, StateFile};
 
 use carina_core::parser::ProviderContext;
 
@@ -46,6 +46,7 @@ use crate::commands::shared::finalize::{
 use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
 };
+use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
@@ -58,8 +59,9 @@ use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, get_provider_with_ctx, read_with_retry,
+    WiringContext, build_factories_from_providers, get_provider_with_ctx,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -239,6 +241,19 @@ async fn run_destroy_locked_with_ctx_owned(
             };
         }
     };
+    if let Err(error) = crate::commands::apply::prune_legacy_data_source_rows_persist_if_changed(
+        backend.as_ref(),
+        lock.as_ref(),
+        &mut state_file,
+        &parsed.data_sources,
+    )
+    .await
+    {
+        return LockCommandOutcome::Kept {
+            result: Err(error),
+            lock,
+        };
+    }
     let heartbeat = with_lock_heartbeat(
         Arc::clone(&backend),
         lock,
@@ -339,11 +354,12 @@ async fn run_destroy_locked_with_ctx_owned(
                     break;
                 };
                 let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                let identifier = state_file
+                let loaded = state_file
                     .as_ref()
-                    .and_then(|sf| sf.get_identifier_for_resource(resource));
+                    .map(|sf| sf.build_state_for_resource(&resource.id))
+                    .unwrap_or_else(|| ResourceStateLoad::absent(resource.id.clone()));
                 refresh_in_flight.push(async move {
-                    let state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                    let state = refresh_loaded_resource_with_retry(provider_ref, loaded)
                         .await
                         .map_err(AppError::Provider)?;
                     progress.finish();
@@ -410,7 +426,8 @@ async fn run_destroy_locked_with_ctx_owned(
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
                 all_resources.iter().map(|r| r.id.clone()).collect();
-            let orphan_entries: Vec<_> = sf.build_orphans(&desired_ids).into_iter().collect();
+            let loaded_orphans = sf.build_orphans(&desired_ids);
+            let orphan_entries: Vec<_> = loaded_orphans.into_iter().collect();
             let mut refresh_cancelled = false;
             let mut orphan_iter = orphan_entries.into_iter();
             let mut orphan_in_flight = FuturesUnordered::new();
@@ -434,15 +451,11 @@ async fn run_destroy_locked_with_ctx_owned(
                     };
                     let progress = RefreshProgress::begin_multi(&multi, &id);
                     orphan_in_flight.push(async move {
-                        let refreshed = read_with_retry(
-                            provider_ref,
-                            &id,
-                            orphan.state().identifier.as_deref(),
-                        )
-                        .await
-                        .map_err(AppError::Provider)?;
+                        let refreshed = refresh_loaded_orphan_with_retry(provider_ref, orphan)
+                            .await
+                            .map_err(AppError::Provider)?;
                         progress.finish();
-                        Ok((id, orphan.with_refreshed_state(refreshed)))
+                        Ok((id, refreshed))
                     });
                 }
 
@@ -479,7 +492,7 @@ async fn run_destroy_locked_with_ctx_owned(
                         }
                     }
                 };
-                let result: Result<(ResourceId, carina_core::differ::Orphan), AppError> = match next
+                let result: Result<(ResourceId, carina_state::OrphanStateLoad), AppError> = match next
                 {
                     CleanupInterrupted::Completed(Some(result)) => result,
                     CleanupInterrupted::Completed(None) => break,
@@ -492,14 +505,14 @@ async fn run_destroy_locked_with_ctx_owned(
                 if refresh_cancelled {
                     continue;
                 }
-                let (id, orphan) = result?;
-                if orphan.state().exists
+                let (id, loaded) = result?;
+                if loaded.state().exists
                     && let Some(resolved_id) = ResolvedResourceId::try_new(id.clone())
                 {
                     let orphan_resource = build_orphan_resource(sf, &resolved_id);
                     all_resources.push(orphan_resource);
                 }
-                current_states.insert(id, orphan.into_state());
+                current_states.insert(id, loaded.state().clone());
             }
             if refresh_cancelled {
                 return Err(AppError::Interrupted);
@@ -509,18 +522,18 @@ async fn run_destroy_locked_with_ctx_owned(
         // --refresh=false: build states from state file without AWS calls.
         // carina#3181: `all_resources` is managed-only.
         for resource in &all_resources {
-            let state = sf.build_state_for_resource(&resource.id);
+            let state = sf.build_state_for_resource(&resource.id).into_state();
             current_states.insert(resource.id.clone(), state);
         }
 
         // Include orphaned resources (in state but not in .crn)
         let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
-        for (id, orphan) in sf.build_orphans(&desired_ids) {
+        for (id, loaded) in sf.build_orphans(&desired_ids) {
             if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
                 let orphan_resource = build_orphan_resource(sf, &resolved_id);
                 all_resources.push(orphan_resource);
             }
-            current_states.insert(id, orphan.into_state());
+            current_states.insert(id, loaded.state().clone());
         }
     }
 
@@ -579,12 +592,19 @@ async fn run_destroy_locked_with_ctx_owned(
         .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
         .map(|id| state_row_key_from_id(&id))
         .collect();
-    let delete_effects = build_destroy_delete_effects(
+    let (delete_effects, identifier_errors) = build_destroy_delete_effects(
         &resources_to_destroy,
         &current_states,
         state_file.as_ref(),
         &protected_row_keys,
     );
+    if !identifier_errors.is_empty() {
+        let mut error_plan = Plan::new();
+        for error in identifier_errors {
+            error_plan.add_error(error);
+        }
+        render_plan_errors_and_abort(&error_plan)?;
+    }
 
     let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
     let dependency_analysis = build_effect_dependency_analysis(
@@ -1426,13 +1446,22 @@ fn build_destroy_delete_effects(
     current_states: &HashMap<ResourceId, State>,
     state_file: Option<&StateFile>,
     protected_row_keys: &HashSet<StateRowKey>,
-) -> Vec<Effect> {
+) -> (Vec<Effect>, Vec<PlanError>) {
     let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
+    let mut errors = Vec::new();
     for resource in resources_to_destroy {
-        let identifier = current_states
-            .get(&resource.id)
-            .and_then(|s| s.identifier.clone())
-            .unwrap_or_default();
+        let identifier = match PlanError::require_provider_identifier(
+            &resource.id,
+            current_states
+                .get(&resource.id)
+                .and_then(|state| state.identifier.as_deref()),
+        ) {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                errors.push(*error);
+                continue;
+            }
+        };
         let dependencies = get_resource_dependencies(resource);
         let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
         delete_effects.push(Effect::Delete {
@@ -1455,10 +1484,12 @@ fn build_destroy_delete_effects(
             )) {
                 continue;
             }
-            delete_effects.extend(crate::wiring::deposed_delete_effects_for_row(row));
+            let (effects, row_errors) = crate::wiring::deposed_delete_effects_for_row(row);
+            delete_effects.extend(effects);
+            errors.extend(row_errors);
         }
     }
-    delete_effects
+    (delete_effects, errors)
 }
 
 type StateRowKey = (String, String, String);
@@ -1750,6 +1781,15 @@ mod tests {
     mod cancellation_fixture;
 
     use cancellation_fixture::DestroyCancellationFixture;
+
+    fn expect_valid_destroy_effects(result: (Vec<Effect>, Vec<PlanError>)) -> Vec<Effect> {
+        let (effects, errors) = result;
+        assert!(
+            errors.is_empty(),
+            "unexpected destroy plan errors: {errors:?}"
+        );
+        effects
+    }
 
     #[tokio::test]
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
@@ -2341,12 +2381,12 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let effects = build_destroy_delete_effects(
+        let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
             &[&resource],
             &current_states,
             Some(&state_file),
             &HashSet::new(),
-        );
+        ));
 
         assert_eq!(effects.len(), 2);
         assert!(matches!(
@@ -2355,7 +2395,7 @@ mod tests {
                 identifier,
                 generation: EffectGeneration::Current,
                 ..
-            } if identifier == "vpc-new"
+            } if identifier.as_str() == "vpc-new"
         ));
         assert!(matches!(
             &effects[1],
@@ -2366,10 +2406,56 @@ mod tests {
                 dependencies,
                 ..
             } if id.as_inner().provider_instance.as_deref() == Some("deposed")
-                && identifier == "vpc-old"
+                && identifier.as_str() == "vpc-old"
                 && key == &deposed_key
                 && dependencies == &HashSet::from(["subnet".to_string()])
         ));
+    }
+
+    #[test]
+    fn destroy_plan_rejects_identifier_less_row_loaded_from_state_json() {
+        let resource = Resource::with_provider("mock", "test.Widget", "broken", None);
+        let state_file = carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": carina_state::StateFile::CURRENT_VERSION,
+                "serial": 1,
+                "lineage": "destroy-loader-test",
+                "carina_version": env!("CARGO_PKG_VERSION"),
+                "resources": [{
+                    "provider": "mock",
+                    "resource_type": "test.Widget",
+                    "identity": "broken",
+                    "identifier": null,
+                    "attributes": {}
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("malformed legacy row must remain loadable")
+        .into_state();
+        let loaded = state_file.build_state_for_resource(&resource.id);
+        assert!(matches!(
+            &loaded,
+            ResourceStateLoad::MissingProviderIdentifier(_)
+        ));
+        let current_states = HashMap::from([(resource.id.clone(), loaded.into_state())]);
+
+        let (effects, errors) =
+            build_destroy_delete_effects(&[&resource], &current_states, None, &HashSet::new());
+        assert!(effects.is_empty());
+        let error = errors
+            .first()
+            .expect("destroy must reject a broken state row before provider dispatch");
+
+        assert_eq!(
+            error.kind,
+            carina_core::plan::PlanErrorKind::MissingProviderIdentifier
+        );
+        let message = error.to_string();
+        assert!(message.contains(&resource.id.to_string()), "{message}");
+        assert!(message.contains("`removed` block"), "{message}");
+        assert!(message.contains("`import` block"), "{message}");
     }
 
     #[test]
@@ -2391,28 +2477,28 @@ mod tests {
         state_file.upsert_resource(child).unwrap();
         let orphan_entries = state_file.build_orphans(&HashSet::new());
         let mut resources = orphan_entries
-            .keys()
-            .cloned()
-            .map(|id| {
+            .iter()
+            .map(|(id, _loaded)| {
                 build_orphan_resource(
                     &state_file,
-                    &ResolvedResourceId::try_new(id).expect("test orphan id must be resolved"),
+                    &ResolvedResourceId::try_new(id.clone())
+                        .expect("test orphan id must be resolved"),
                 )
             })
             .collect::<Vec<_>>();
         resources.sort_by_key(|resource| resource.binding.clone());
         let current_states = orphan_entries
             .into_iter()
-            .map(|(id, orphan)| (id, orphan.into_state()))
+            .map(|(id, loaded)| (id, loaded.state().clone()))
             .collect();
         let resource_refs = resources.iter().collect::<Vec<_>>();
 
-        let effects = build_destroy_delete_effects(
+        let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
             &resource_refs,
             &current_states,
             Some(&state_file),
             &HashSet::new(),
-        );
+        ));
         let child_delete = effects
             .iter()
             .find(|effect| effect.binding_name().as_deref() == Some("child"))
@@ -2474,8 +2560,12 @@ mod tests {
             resource.id.clone(),
         ))]);
 
-        let effects =
-            build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &protected);
+        let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
+            &[],
+            &HashMap::new(),
+            Some(&state_file),
+            &protected,
+        ));
 
         assert!(
             effects.is_empty(),
@@ -2504,8 +2594,12 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let effects =
-            build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &HashSet::new());
+        let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
+            &[],
+            &HashMap::new(),
+            Some(&state_file),
+            &HashSet::new(),
+        ));
 
         assert_eq!(effects.len(), 1);
         assert!(matches!(
@@ -2514,7 +2608,7 @@ mod tests {
                 identifier,
                 generation: EffectGeneration::Deposed(key),
                 ..
-            } if identifier == "vpc-old" && key == &deposed_key
+            } if identifier.as_str() == "vpc-old" && key == &deposed_key
         ));
     }
 
@@ -2536,8 +2630,12 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let effects =
-            build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &HashSet::new());
+        let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
+            &[],
+            &HashMap::new(),
+            Some(&state_file),
+            &HashSet::new(),
+        ));
 
         assert_eq!(effects.len(), 1);
         assert!(

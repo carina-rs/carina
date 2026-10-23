@@ -272,11 +272,11 @@ mod tests {
         let mut s = StateFile::new();
         s.lineage = lineage.to_string();
         for i in 0..n_resources {
-            // Identifier is mandatory for any row that should survive a
-            // round-trip through `check_and_migrate` (carina#3266): the
-            // read path prunes identifier=None rows as historical
-            // artifacts. Production-shaped `state.resources` rows always
-            // carry an identifier from the provider's apply result.
+            // A current managed instance carries the identifier returned by
+            // its provider mutation. `check_and_migrate` preserves malformed
+            // identifier-less rows so the typed plan boundary can fail closed;
+            // historical data-source artifacts are removed only after parsing
+            // supplies their exact typed `read` addresses (carina#3266).
             s.upsert_resource(
                 ResourceState::new(
                     "s3.Bucket",

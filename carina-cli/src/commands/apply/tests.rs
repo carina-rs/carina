@@ -2,8 +2,9 @@ use super::*;
 use carina_core::binding_index::PreApplyInputs;
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
-    BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, Provider, ProviderError,
-    ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
+    Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult, ReadOutcome,
+    ReadRequest, UpdateRequest, fixture_read_outcome,
 };
 use carina_core::resource::{
     Composition, CompositionArgument, DataSource, DeferredValue, ModuleConstraintId, ModuleSource,
@@ -132,7 +133,7 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
     let resource = Resource::with_provider("mock", "test.Resource", "legacy", None)
         .with_attribute("name", string_value("kept"));
     let id = resource.id.clone();
-    let planned_state = state_file.build_state_for_resource(&id);
+    let planned_state = state_file.build_state_for_resource(&id).into_state();
     assert_eq!(
         planned_state.attributes.keys().collect::<Vec<_>>(),
         vec![&"name".to_string()]
@@ -833,11 +834,11 @@ impl Provider for FailBCreateProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
-        Box::pin(async move { Ok(State::not_found(id)) })
+        Box::pin(async move { Ok(ReadOutcome::not_found(id)) })
     }
 
     fn read_data_source(
@@ -860,8 +861,8 @@ impl Provider for FailBCreateProvider {
             }
             let resource = request.resource().as_resource().clone();
             Ok(carina_core::provider::CreateOutcome::Success {
-                state: State::existing(id, resource.resolved_attributes())
-                    .with_identifier("mock-id"),
+                state: AppliedState::new(id, "mock-id", resource.resolved_attributes())
+                    .expect("fixture identifier is non-empty"),
             })
         })
     }
@@ -869,7 +870,7 @@ impl Provider for FailBCreateProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
@@ -879,7 +880,7 @@ impl Provider for FailBCreateProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
@@ -1080,33 +1081,30 @@ impl Provider for ApplyCascadeProvider {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
-        let identifier = identifier.map(ToOwned::to_owned);
+        let identifier = identifier.as_str().to_string();
         Box::pin(async move {
-            match (id.resource_type.as_str(), identifier.as_deref()) {
-                ("ec2.Vpc", Some("vpc-new")) => Ok(State::existing(
+            let state = match (id.resource_type.as_str(), identifier.as_str()) {
+                ("ec2.Vpc", "vpc-new") => State::existing(
                     id,
                     HashMap::from([
                         ("cidr_block".to_string(), string_value("10.221.0.0/16")),
                         ("vpc_id".to_string(), string_value("vpc-new")),
                     ]),
                 )
-                .with_identifier("vpc-new")),
-                ("ec2.Vpc", Some("vpc-old" | "vpc-older" | "vpc-oldest")) => Ok(State::existing(
+                .with_identifier("vpc-new"),
+                ("ec2.Vpc", "vpc-old" | "vpc-older" | "vpc-oldest") => State::existing(
                     id,
                     HashMap::from([
                         ("cidr_block".to_string(), string_value("10.220.0.0/16")),
-                        (
-                            "vpc_id".to_string(),
-                            string_value(identifier.as_deref().unwrap()),
-                        ),
+                        ("vpc_id".to_string(), string_value(identifier.as_str())),
                     ]),
                 )
-                .with_identifier(identifier.as_deref().unwrap())),
-                ("ec2.Subnet", Some("subnet-old")) => Ok(State::existing(
+                .with_identifier(identifier.as_str()),
+                ("ec2.Subnet", "subnet-old") => State::existing(
                     id,
                     HashMap::from([
                         ("vpc_id".to_string(), string_value("vpc-old")),
@@ -1117,9 +1115,10 @@ impl Provider for ApplyCascadeProvider {
                         ),
                     ]),
                 )
-                .with_identifier("subnet-old")),
-                _ => Ok(State::not_found(id)),
-            }
+                .with_identifier("subnet-old"),
+                _ => State::not_found(id),
+            };
+            Ok(fixture_read_outcome(state))
         })
     }
 
@@ -1147,18 +1146,20 @@ impl Provider for ApplyCascadeProvider {
         Box::pin(async move {
             match id.resource_type.as_str() {
                 "ec2.Vpc" => Ok(carina_core::provider::CreateOutcome::Success {
-                    state: State::existing(
+                    state: AppliedState::new(
                         id,
+                        "vpc-new",
                         HashMap::from([("vpc_id".to_string(), string_value("vpc-new"))]),
                     )
-                    .with_identifier("vpc-new"),
+                    .expect("fixture identifier is non-empty"),
                 }),
                 "ec2.Subnet" => Ok(carina_core::provider::CreateOutcome::Success {
-                    state: State::existing(
+                    state: AppliedState::new(
                         id,
+                        "subnet-new",
                         HashMap::from([("subnet_id".to_string(), string_value("subnet-new"))]),
                     )
-                    .with_identifier("subnet-new"),
+                    .expect("fixture identifier is non-empty"),
                 }),
                 _ => Err(ProviderError::internal(format!("unexpected create {id}"))),
             }
@@ -1168,7 +1169,7 @@ impl Provider for ApplyCascadeProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
@@ -1178,7 +1179,7 @@ impl Provider for ApplyCascadeProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &carina_core::provider::AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
@@ -1442,17 +1443,19 @@ impl Provider for ApplyTimeReadProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
             let roles = shared.created_roles.lock().unwrap();
             if let Some(attrs) = roles.get(id.identity_str().expect("resolved identity")) {
-                Ok(State::existing(id, attrs.clone()).with_identifier("mock-id"))
+                Ok(fixture_read_outcome(
+                    State::existing(id, attrs.clone()).with_identifier("mock-id"),
+                ))
             } else {
-                Ok(State::not_found(id))
+                Ok(ReadOutcome::not_found(id))
             }
         })
     }
@@ -1528,7 +1531,8 @@ impl Provider for ApplyTimeReadProvider {
             ));
 
             Ok(carina_core::provider::CreateOutcome::Success {
-                state: State::existing(id, attrs).with_identifier("mock-id"),
+                state: AppliedState::new(id, "mock-id", attrs)
+                    .expect("fixture identifier is non-empty"),
             })
         })
     }
@@ -1536,7 +1540,7 @@ impl Provider for ApplyTimeReadProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
@@ -1546,7 +1550,7 @@ impl Provider for ApplyTimeReadProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
@@ -3705,11 +3709,11 @@ impl Provider for BootstrapRecordingProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
-        Box::pin(async move { Ok(State::not_found(id)) })
+        Box::pin(async move { Ok(ReadOutcome::not_found(id)) })
     }
 
     fn read_data_source(
@@ -3729,14 +3733,15 @@ impl Provider for BootstrapRecordingProvider {
         if self.fail_create {
             return Box::pin(async { Err(ProviderError::internal("bootstrap create failed")) });
         }
-        let state = State::existing(id.clone(), HashMap::new()).with_identifier("bucket-id");
+        let state = AppliedState::new(id.clone(), "bucket-id", HashMap::new())
+            .expect("fixture identifier is non-empty");
         Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
     }
 
     fn update(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("unexpected update")) })
@@ -3745,7 +3750,7 @@ impl Provider for BootstrapRecordingProvider {
     fn delete(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
@@ -4490,7 +4495,8 @@ fn move_plus_update_keeps_post_update_attributes() {
     let mut plan = Plan::new();
     let from_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
-        from: Box::new(State::existing(from_id.clone(), HashMap::new())),
+        identifier: crate::fixture_applied_identifier("tag-abc"),
+        from: Box::new(State::existing(from_id.clone(), HashMap::new()).with_identifier("tag-abc")),
         to: sorted_resources[0].clone(),
         changed_attributes: vec!["value".to_string()],
     });
@@ -6235,7 +6241,62 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported-version error, got: {error}");
         };
         assert_eq!(*found, 15);
-        assert_eq!(*expected, 17);
+        assert_eq!(*expected, 19);
+        assert_eq!(
+            replan_command.as_deref(),
+            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn version_18_saved_plan_is_rejected_after_abandoned_generation_shape_change() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        let v18 = serde_json::json!({
+            "version": 18,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-10-23T00:00:00Z",
+            "source_path": "infra",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": [] },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "data_source_origins": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(&plan_path, serde_json::to_string(&v18).unwrap()).expect("write plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("v18 saved plans contain the old abandoned-generation shape");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found,
+            expected,
+            replan_command,
+            ..
+        } = &error
+        else {
+            panic!("expected typed unsupported-version error, got: {error}");
+        };
+        assert_eq!(*found, 18);
+        assert_eq!(*expected, 19);
         assert_eq!(
             replan_command.as_deref(),
             Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
@@ -6546,6 +6607,36 @@ mod saved_plan_version_tests {
         }
 
         panic!("fixture delete effect has an unexpected serde shape: {delete_effect:#?}");
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_empty_mutation_identifier_requests_replan() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        let delete_idx = json["plan"]["replace_display"][0]["delete_idx"]
+            .as_u64()
+            .expect("delete_idx should be numeric") as usize;
+        json["plan"]["effects"][delete_idx]["Delete"]["identifier"] =
+            serde_json::Value::String(String::new());
+
+        let message = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "an empty saved-plan mutation identifier must be rejected",
+        )
+        .await;
+
+        assert!(
+            message.contains("an applied resource identifier must not be empty"),
+            "the typed identifier error must survive saved-plan decoding: {message}",
+        );
+        assert!(
+            message.contains("The plan file may be corrupted. Re-run"),
+            "the decode error must include re-plan guidance: {message}",
+        );
+        assert!(
+            message.contains(&format!("carina plan --out {}", plan_path.display())),
+            "the re-plan guidance must name the saved-plan output: {message}",
+        );
     }
 
     #[tokio::test]

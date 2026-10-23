@@ -858,7 +858,7 @@ fn delete_record_effect(binding: &'static str) -> Effect {
             "route53.Record",
             binding,
         )),
-        identifier: format!("{binding}-id"),
+        identifier: crate::fixture_applied_identifier(format!("{binding}-id")),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(binding.to_string()),
@@ -1041,7 +1041,8 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]),
-    );
+    )
+    .with_identifier("vpc-id");
 
     // SG: Create effect with RESOLVED ref (string instead of ResourceRef).
     // This is what happens after resolve_refs_with_state() runs:
@@ -1063,6 +1064,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
+        identifier: crate::fixture_applied_identifier("vpc-id"),
         from: Box::new(vpc_from),
         to: resolved(vpc_to),
         changed_attributes: vec!["tags".to_string()],
@@ -1105,7 +1107,7 @@ fn format_effect_delete_uses_binding_name() {
             "ec2_vpc_fb75c929",
             None,
         )),
-        identifier: "vpc-12345".to_string(),
+        identifier: crate::fixture_applied_identifier("vpc-12345"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("my_vpc".to_string()),
@@ -1125,7 +1127,7 @@ fn format_effect_delete_falls_back_to_id_name() {
             "ec2_vpc_fb75c929",
             None,
         )),
-        identifier: "vpc-12345".to_string(),
+        identifier: crate::fixture_applied_identifier("vpc-12345"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
@@ -1156,12 +1158,8 @@ fn format_effect_update_separates_type_and_name_with_space() {
     let mut to = Resource::new("iam.Role", "bs.bootstrap.role");
     to.id = id.clone();
     let effect = Effect::Update {
-        from: Box::new(State::not_found(ResourceId::with_provider_identity(
-            "awscc",
-            "iam.Role",
-            "bs.bootstrap.role",
-            None,
-        ))),
+        identifier: crate::fixture_applied_identifier("role-id"),
+        from: Box::new(State::existing(id.clone(), HashMap::new()).with_identifier("role-id")),
         to: resolved(to),
         changed_attributes: Vec::new(),
     };
@@ -1690,7 +1688,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
         id: carina_core::resource::ResolvedResourceId::new(
             carina_core::resource::ResourceId::with_identity("cloudfront.Distribution", "dist"),
         ),
-        identifier: "E123".to_string(),
+        identifier: crate::fixture_applied_identifier("E123"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Default::default(),
         binding: None,
@@ -1766,10 +1764,14 @@ fn forcing_changed_uses_plain_green_cli_value() {
         new: render_value(&Value::Concrete(ConcreteValue::String("new".into()))),
     };
     let effect = Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("test.Widget", "w"),
-            HashMap::new(),
-        )),
+        identifier: crate::fixture_applied_identifier("w"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("test.Widget", "w"),
+                HashMap::new(),
+            )
+            .with_identifier("w"),
+        ),
         to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["name".to_string()],
     };
@@ -1798,10 +1800,14 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
         new,
     };
     let effect = Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("test.Widget", "w"),
-            HashMap::new(),
-        )),
+        identifier: crate::fixture_applied_identifier("w"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("test.Widget", "w"),
+                HashMap::new(),
+            )
+            .with_identifier("w"),
+        ),
         to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["rules".to_string()],
     };
@@ -1832,10 +1838,14 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
         removed: Vec::new(),
     };
     let effect = Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("test.Widget", "w"),
-            HashMap::new(),
-        )),
+        identifier: crate::fixture_applied_identifier("w"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("test.Widget", "w"),
+                HashMap::new(),
+            )
+            .with_identifier("w"),
+        ),
         to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["items".to_string()],
     };
@@ -1843,7 +1853,10 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
     let mut out = String::new();
     render_detail_row(&mut out, &row, &effect, "");
 
-    assert!(out.contains("  + 'a'\n"), "rendered row: {out:?}");
+    assert!(
+        strip_ansi(&out).contains("  + 'a'\n"),
+        "rendered row: {out:?}"
+    );
 }
 
 /// When a state refresh has been printed above the plan output, a single
@@ -2036,7 +2049,8 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
     });
     plan.add(Effect::Update {
-        from: Box::new(State::not_found(to_id.clone())),
+        identifier: crate::fixture_applied_identifier("logs-id"),
+        from: Box::new(State::existing(to_id.clone(), HashMap::new()).with_identifier("logs-id")),
         to: resolved(updated),
         changed_attributes: Vec::new(),
     });
@@ -2111,7 +2125,8 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
     });
     plan.add(Effect::Update {
-        from: Box::new(State::not_found(to_id.clone())),
+        identifier: crate::fixture_applied_identifier("child-id"),
+        from: Box::new(State::existing(to_id.clone(), HashMap::new()).with_identifier("child-id")),
         to: resolved(updated),
         changed_attributes: Vec::new(),
     });

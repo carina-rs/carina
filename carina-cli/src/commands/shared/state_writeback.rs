@@ -9,6 +9,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
+#[cfg(test)]
+use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::PersistedAttributes;
 use carina_core::resource::{
     ConcreteValue, DefaultTagKeys, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
@@ -62,13 +64,11 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
 /// internal version.
 #[cfg(test)]
 pub(crate) fn queue_state_refresh(
-    pending_refreshes: &mut HashMap<ResourceId, String>,
+    pending_refreshes: &mut HashMap<ResourceId, AppliedIdentifier>,
     id: &ResourceId,
-    identifier: Option<&str>,
+    identifier: &AppliedIdentifier,
 ) {
-    if let Some(identifier) = identifier.filter(|identifier| !identifier.is_empty()) {
-        pending_refreshes.insert(id.clone(), identifier.to_string());
-    }
+    pending_refreshes.insert(id.clone(), identifier.clone());
 }
 
 /// Resource attribute map ready for export-resolution after an apply
@@ -876,7 +876,7 @@ fn delete_input_from_effect<'a>(
     };
     Some(ReplacementDeleteInput {
         id,
-        identifier,
+        identifier: identifier.as_str(),
         provider_instance: id.as_inner().provider_instance.clone(),
         generation,
         fallback_dependency_bindings: dependencies.iter().cloned().collect(),
@@ -887,7 +887,7 @@ fn delete_input_from_effect<'a>(
 fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDeleteInput<'_> {
     ReplacementDeleteInput {
         id: &delete.id,
-        identifier: &delete.identifier,
+        identifier: delete.identifier.as_str(),
         provider_instance: delete.id.as_inner().provider_instance.clone(),
         generation: &CURRENT_GENERATION,
         fallback_dependency_bindings: delete.dependencies.iter().cloned().collect(),
@@ -1027,6 +1027,10 @@ fn decompose_with_moved_origins<'a>(
     let schemas = input.schemas;
     let mut wb = WritebackPlan::new();
 
+    for (id, key) in plan.abandoned_deposed_generations() {
+        wb.add_remove_deposed(id.clone(), key.clone());
+    }
+
     for resource in sorted_resources {
         if let Some(applied) = applied_states.get(&resource.id) {
             wb.add_upsert(resource, UpsertSource::Applied(applied))?;
@@ -1098,7 +1102,7 @@ fn decompose_with_moved_origins<'a>(
             generation: generation @ EffectGeneration::Deposed(key),
             ..
         } = effect
-            && delete_succeeded(successfully_deleted, id, generation, identifier)
+            && delete_succeeded(successfully_deleted, id, generation, identifier.as_str())
         {
             wb.add_remove_deposed(id.clone(), key.clone());
         }
@@ -1683,7 +1687,7 @@ mod apply_state_save_tests {
         for (id, identifier) in [(&id_a, "a-old"), (&id_b, "b-old")] {
             plan.add(Effect::Delete {
                 id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-                identifier: identifier.to_string(),
+                identifier: crate::fixture_applied_identifier(identifier),
                 generation: EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: None,
@@ -1747,7 +1751,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-            identifier: "old-record-id".to_string(),
+            identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Deposed(deposed_key.clone()),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -1815,7 +1819,7 @@ mod apply_state_save_tests {
     fn deferred_replace_delete(id: &ResourceId) -> DeferredReplaceDelete {
         DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-            identifier: "old-record-id".to_string(),
+            identifier: crate::fixture_applied_identifier("old-record-id"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
@@ -2058,6 +2062,7 @@ mod apply_state_save_tests {
         .with_identifier("vpc-canonical-new");
         let mut plan = Plan::new();
         plan.add(Effect::Update {
+            identifier: crate::fixture_applied_identifier("vpc-canonical-old"),
             from: Box::new(from_state),
             to: carina_core::resource::ResolvedResource::new(desired.clone()),
             changed_attributes: vec!["cidr_block".to_string()],
@@ -2303,7 +2308,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(delete_id.clone()),
-            identifier: "vpc-old".to_string(),
+            identifier: crate::fixture_applied_identifier("vpc-old"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("main".to_string()),
@@ -2466,7 +2471,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-            identifier: "old-record-id".to_string(),
+            identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -2579,7 +2584,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-            identifier: "old-record-id".to_string(),
+            identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -2735,6 +2740,7 @@ mod apply_state_save_tests {
         .with_identifier("db-1");
         let mut plan = Plan::new();
         plan.add(Effect::Update {
+            identifier: crate::fixture_applied_identifier("db-1"),
             from: Box::new(from_state),
             to: carina_core::resource::ResolvedResource::new(desired.clone()),
             changed_attributes: vec!["password".to_string()],
@@ -2764,7 +2770,8 @@ mod apply_state_save_tests {
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
         );
 
-        let current_states = HashMap::from([(id.clone(), saved.build_state_for_resource(&id))]);
+        let current_states =
+            HashMap::from([(id.clone(), saved.build_state_for_resource(&id).into_state())]);
         let second_plan = create_plan(
             std::slice::from_ref(&resolved(desired.clone())),
             &[],
@@ -2853,6 +2860,7 @@ mod apply_state_save_tests {
         let applied_state = State::existing(id.clone(), HashMap::new()).with_identifier("db-1");
         let mut plan = Plan::new();
         plan.add(Effect::Update {
+            identifier: crate::fixture_applied_identifier("db-1"),
             from: Box::new(from_state),
             to: carina_core::resource::ResolvedResource::new(desired.clone()),
             changed_attributes: vec!["password".to_string()],
@@ -2889,7 +2897,8 @@ mod apply_state_save_tests {
         );
         assert_eq!(row.write_only_attributes, vec!["password"]);
 
-        let current_states = HashMap::from([(id.clone(), saved.build_state_for_resource(&id))]);
+        let current_states =
+            HashMap::from([(id.clone(), saved.build_state_for_resource(&id).into_state())]);
         let second_plan = create_plan(
             std::slice::from_ref(&resolved(desired.clone())),
             &[],

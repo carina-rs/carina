@@ -67,10 +67,12 @@ mod tests {
         fn read(
             &self,
             _id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &crate::provider::AppliedIdentifier,
             _request: crate::provider::ReadRequest,
-        ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<crate::resource::State>>
-        {
+        ) -> crate::provider::BoxFuture<
+            '_,
+            crate::provider::ProviderResult<crate::provider::ReadOutcome>,
+        > {
             Box::pin(async { panic!("unexpected read") })
         }
 
@@ -96,7 +98,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &crate::provider::AppliedIdentifier,
             _request: crate::provider::UpdateRequest,
         ) -> crate::provider::BoxFuture<
             '_,
@@ -108,7 +110,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &crate::provider::AppliedIdentifier,
             _request: crate::provider::DeleteRequest,
         ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<()>> {
             Box::pin(async { panic!("unexpected delete") })

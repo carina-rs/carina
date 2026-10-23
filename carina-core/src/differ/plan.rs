@@ -405,6 +405,20 @@ fn create_plan_parts(
             .get(&resource.id)
             .cloned()
             .unwrap_or_else(|| State::not_found(resource.id.clone()).into_plan_input());
+        let current_identifier = if current.as_state().exists {
+            match PlanError::require_provider_identifier(
+                &resource.id,
+                current.as_state().identifier.as_deref(),
+            ) {
+                Ok(identifier) => Some(identifier),
+                Err(error) => {
+                    plan.add_error(*error);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         let saved = saved_attrs.get(&resource.id);
         let prev_explicit_for_resource = prev_explicit.get(&resource.id);
@@ -445,6 +459,10 @@ fn create_plan_parts(
                     continue;
                 }
 
+                let Some(identifier) = current_identifier else {
+                    continue;
+                };
+
                 // Check if any changed attributes are create-only
                 let changed_create_only = find_changed_create_only(
                     &resource.id.provider,
@@ -464,6 +482,7 @@ fn create_plan_parts(
                     }
                     match pending_replace_from_parts(
                         from,
+                        identifier,
                         to,
                         resource.directives.clone(),
                         changed_create_only,
@@ -478,6 +497,7 @@ fn create_plan_parts(
                 } else {
                     plan.add(Effect::Update {
                         from,
+                        identifier,
                         to: ResolvedResource::new(to),
                         changed_attributes,
                     });
@@ -492,10 +512,9 @@ fn create_plan_parts(
                     ));
                     continue;
                 }
-                let identifier = current_states
-                    .get(&id)
-                    .and_then(|s| s.as_state().identifier.clone())
-                    .unwrap_or_default();
+                let Some(identifier) = current_identifier else {
+                    continue;
+                };
                 let directives = resource.directives.clone();
                 let binding = resource.binding.clone();
                 let dependencies = get_resource_dependencies(resource);
@@ -527,6 +546,14 @@ fn create_plan_parts(
         if !state.exists {
             continue;
         }
+        let identifier =
+            match PlanError::require_provider_identifier(id, state.identifier.as_deref()) {
+                Ok(identifier) => identifier,
+                Err(error) => {
+                    plan.add_error(*error);
+                    continue;
+                }
+            };
         let directives = orphan.directives().clone();
         if directives.prevent_destroy {
             plan.add_error(PlanError::prevent_destroy(
@@ -535,7 +562,6 @@ fn create_plan_parts(
             ));
             continue;
         }
-        let identifier = state.identifier.clone().unwrap_or_default();
         let binding = orphan.binding().map(str::to_owned);
         let dependencies = dependencies_from_prior_state(state, directives.clone());
         let explicit_dependencies = directives.depends_on.iter().cloned().collect();
@@ -809,6 +835,7 @@ fn resource_identity(resource: &ResolvedResource) -> ResourceIdentity {
 
 fn pending_replace_from_parts(
     from: Box<State>,
+    identifier: crate::provider::AppliedIdentifier,
     to: Resource,
     directives: Directives,
     changed_create_only: ChangedCreateOnly,
@@ -827,7 +854,7 @@ fn pending_replace_from_parts(
     let explicit_dependencies = directives.depends_on.iter().cloned().collect();
     let delete = ReplacementDelete {
         id: ResolvedResourceId::new(from.id.clone()),
-        identifier: from.identifier.clone().unwrap_or_default(),
+        identifier,
         directives,
         binding: create.binding.clone(),
         dependencies,
@@ -1148,18 +1175,31 @@ fn promote_resource_to_pending_replace(
     current_states: &HashMap<ResourceId, PlanInputState>,
     registry: &SchemaRegistry,
 ) -> Option<PendingReplace> {
-    let from = take_update_from_plan(plan, &resource.id).or_else(|| {
-        current_states
+    let (from, identifier) = if let Some(update) = take_update_from_plan(plan, &resource.id) {
+        update
+    } else {
+        let from = current_states
             .get(&resource.id)
-            .map(|state| Box::new(state.as_state().clone()))
-    })?;
-
-    if !from.exists {
-        return None;
-    }
+            .map(|state| Box::new(state.as_state().clone()))?;
+        if !from.exists {
+            return None;
+        }
+        let identifier = match PlanError::require_provider_identifier(
+            &resource.id,
+            from.identifier.as_deref(),
+        ) {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                plan.add_error(*error);
+                return None;
+            }
+        };
+        (from, identifier)
+    };
 
     match pending_replace_from_parts(
         from,
+        identifier,
         resource.clone(),
         resource.directives.clone(),
         changed_create_only,
@@ -1174,14 +1214,19 @@ fn promote_resource_to_pending_replace(
     }
 }
 
-fn take_update_from_plan(plan: &mut Plan, resource_id: &ResourceId) -> Option<Box<State>> {
+fn take_update_from_plan(
+    plan: &mut Plan,
+    resource_id: &ResourceId,
+) -> Option<(Box<State>, crate::provider::AppliedIdentifier)> {
     let index = plan
         .effects()
         .iter()
         .position(|effect| matches!(effect, Effect::Update { to, .. } if to.id == *resource_id))?;
     let effect = plan.effects_mut().remove(index);
     match effect {
-        Effect::Update { from, .. } => Some(from),
+        Effect::Update {
+            from, identifier, ..
+        } => Some((from, identifier)),
         _ => None,
     }
 }
@@ -1232,8 +1277,18 @@ fn ensure_consumer_update(
         return false;
     }
 
+    let identifier =
+        match PlanError::require_provider_identifier(&resource.id, from.identifier.as_deref()) {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                plan.add_error(*error);
+                return false;
+            }
+        };
+
     plan.add(Effect::Update {
         from: Box::new(from),
+        identifier,
         to: ResolvedResource::new(resource.clone()),
         changed_attributes: changed_attributes.to_vec(),
     });

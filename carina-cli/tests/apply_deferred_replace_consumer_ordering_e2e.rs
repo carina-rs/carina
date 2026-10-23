@@ -12,6 +12,7 @@ use carina_core::parser::{
     SavedProviderConfigs,
 };
 use carina_core::plan::Plan;
+use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
     ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, State,
     Value,
@@ -254,7 +255,8 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
-            identifier: "old-validation-id".to_string(),
+            identifier: AppliedIdentifier::new("old-validation-id")
+                .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
@@ -270,6 +272,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         template: Box::new(template),
     })));
     plan.add(Effect::Update {
+        identifier: AppliedIdentifier::new("consumer-id").expect("fixture identifier is non-empty"),
         from: Box::new(consumer_from.clone()),
         to: resolved(consumer.clone()),
         changed_attributes: vec!["web_acl_arn".to_string()],

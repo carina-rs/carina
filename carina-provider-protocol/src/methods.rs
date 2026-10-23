@@ -48,11 +48,8 @@ pub struct InitializeResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadParams {
     pub id: ResourceId,
-    /// `None` when no prior identifier exists for this resource.
-    /// Mirrors the `option<string>` shape in the WIT contract; see
-    /// carina-rs/carina#2596.
-    #[serde(default)]
-    pub identifier: Option<String>,
+    /// Validated, non-empty provider identifier of the managed resource.
+    pub identifier: AppliedIdentifier,
     /// Per-operation request record. Present so future fields (e.g.
     /// freshness hint) can be added without breaking existing
     /// providers. Defaults to an empty record on the wire.
@@ -62,7 +59,7 @@ pub struct ReadParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadResult {
-    pub state: State,
+    pub outcome: ReadOutcome,
 }
 
 // -- create --
@@ -83,7 +80,7 @@ pub struct CreateResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateParams {
     pub id: ResourceId,
-    pub identifier: String,
+    pub identifier: AppliedIdentifier,
     pub request: UpdateRequest,
 }
 
@@ -97,7 +94,7 @@ pub struct UpdateResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteParams {
     pub id: ResourceId,
-    pub identifier: String,
+    pub identifier: AppliedIdentifier,
     pub request: DeleteRequest,
 }
 

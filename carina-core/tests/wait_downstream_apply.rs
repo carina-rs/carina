@@ -37,8 +37,9 @@ use carina_core::executor::{
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
-    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, NoopNormalizer, Provider,
-    ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
+    NoopNormalizer, Provider, ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome,
+    UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ConcreteValue, ResolvedResource, ResourceId, State, Value};
@@ -70,10 +71,11 @@ impl Provider for MockProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
+        let identifier = identifier.clone();
         Box::pin(async move {
             if id.resource_type == "acm.Certificate" {
                 let mut attrs = HashMap::new();
@@ -89,9 +91,12 @@ impl Provider for MockProvider {
                             .into(),
                     )),
                 );
-                Ok(State::existing(id, attrs).with_identifier("acm-cert-id"))
+                Ok(ReadOutcome::found(
+                    AppliedState::new(id, identifier.into_inner(), attrs)
+                        .expect("typed read identifier is non-empty"),
+                ))
             } else {
-                Ok(State::not_found(id))
+                Ok(ReadOutcome::not_found(id))
             }
         })
     }
@@ -123,7 +128,8 @@ impl Provider for MockProvider {
                 Value::Concrete(ConcreteValue::String("id-123".into())),
             );
             Ok(CreateOutcome::Success {
-                state: State::existing(id, attrs).with_identifier("id-123"),
+                state: AppliedState::new(id, "id-123", attrs)
+                    .expect("fixture identifier is non-empty"),
             })
         })
     }
@@ -131,13 +137,15 @@ impl Provider for MockProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
+        let identifier = identifier.to_string();
         Box::pin(async move {
             Ok(UpdateOutcome::Success {
-                state: State::existing(id, HashMap::new()),
+                state: AppliedState::new(id, identifier, HashMap::new())
+                    .expect("provider input identifier is non-empty"),
             })
         })
     }
@@ -145,7 +153,7 @@ impl Provider for MockProvider {
     fn delete(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })

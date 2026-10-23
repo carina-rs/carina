@@ -49,6 +49,9 @@
 //! backend.release_lock(&lock).await?;
 //! ```
 
+#[cfg(test)]
+use carina_core::provider::fixture_applied_identifier;
+
 pub mod backend;
 mod backend_config;
 pub mod backend_lock;
@@ -74,8 +77,9 @@ pub use backends::{
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost};
 pub use lock::LockInfo;
 pub use state::{
-    ApplyDecision, DeposedInstance, DeposedKey, LoadedState, MigratedStateFile, MigrationInfo,
-    NameOverride, PreviousSecretHashAuthority, ResourceState, ResourceStateEncodingError,
+    ApplyDecision, DeposedInstance, DeposedKey, LoadedOrphans, LoadedState, MigratedStateFile,
+    MigrationInfo, NameOverride, OrphanStateLoad, PresentResourceState,
+    PreviousSecretHashAuthority, ResourceState, ResourceStateEncodingError, ResourceStateLoad,
     StateFile, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
     should_apply_override,
 };

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use carina_core::parser::{BackendConfig, SavedProviderConfigs};
 use carina_core::plan::Plan;
-use carina_core::provider::{PersistedAttributes, Provider, ReadRequest};
+use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
 use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State, Value};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
@@ -78,6 +78,13 @@ impl InspectedPlanFile {
         match self {
             Self::Verified(plan) => plan.state_serial(),
             Self::NeedsSecretVerification(plan) => plan.plan_file.state_serial,
+        }
+    }
+
+    pub(super) fn data_source_origins(&self) -> &[DataSource] {
+        match self {
+            Self::Verified(plan) => plan.data_source_origins(),
+            Self::NeedsSecretVerification(plan) => &plan.plan_file.data_source_origins,
         }
     }
 }
@@ -228,14 +235,22 @@ impl DesiredVerifiedPlanFile {
             // here because their historical secret still needs verification.
             if !actual_states.contains_key(&entry.id) {
                 let historical_id = historical_addresses.origin_for(&entry.id);
+                let identifier = entry
+                    .state
+                    .identifier
+                    .as_deref()
+                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
+                    .ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "saved plan resource {} has no valid provider identifier; create a new plan before applying",
+                            entry.id
+                        ))
+                    })?;
                 let mut actual = provider
-                    .read(
-                        historical_id,
-                        entry.state.identifier.as_deref(),
-                        ReadRequest,
-                    )
+                    .read(historical_id, &identifier, ReadRequest)
                     .await
-                    .map_err(AppError::Provider)?;
+                    .map_err(AppError::Provider)?
+                    .into_state();
                 if !actual.exists {
                     return Err(super::saved_plan_secret_orphan_vanished_error(
                         entry.id.to_string(),

@@ -11,9 +11,11 @@ use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::module::DependencyGraph;
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
+use crate::provider::AppliedIdentifier;
 pub use crate::resource::ModuleSource;
 use crate::resource::{
-    Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, Value,
+    DeposedKey, Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity,
+    Value,
 };
 
 /// Error detected while constructing a plan.
@@ -70,6 +72,19 @@ pub enum PlanErrorKind {
     },
     SchemaNotRegistered(SchemaNotRegisteredError),
     ReplacementCannotCoexist(ReplacementCannotCoexistError),
+    /// An existing state row cannot safely be mutated because it has no
+    /// provider identifier.
+    MissingProviderIdentifier,
+    /// An import cannot identify a provider resource with an empty string.
+    InvalidImportProviderIdentifier,
+    /// A historical replacement generation cannot be destroyed because its
+    /// persisted provider identifier is empty.
+    MissingDeposedProviderIdentifier {
+        key: DeposedKey,
+        /// A healthy current generation that will also leave state when the
+        /// `removed` block is applied and therefore needs a subsequent import.
+        current_identifier: Option<AppliedIdentifier>,
+    },
     WaitTargetMissing {
         wait_binding: String,
         target: String,
@@ -99,6 +114,44 @@ impl PlanError {
 
     pub fn prevent_destroy(resource_id: ResourceId, action: PreventDestroyAction) -> Self {
         Self::new(resource_id, PlanErrorKind::PreventDestroy { action })
+    }
+
+    /// Validate a provider identifier while constructing mutation effects.
+    ///
+    /// State rows created by older clients can claim that a resource exists
+    /// without recording the provider identifier needed to update or delete
+    /// it. Reject those rows before any effect can be executed.
+    pub fn require_provider_identifier(
+        resource_id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> Result<AppliedIdentifier, Box<Self>> {
+        identifier
+            .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
+            .ok_or_else(|| {
+                Box::new(Self::new(
+                    resource_id.clone(),
+                    PlanErrorKind::MissingProviderIdentifier,
+                ))
+            })
+    }
+
+    /// Validate the provider identifier for one deposed generation.
+    pub fn require_deposed_provider_identifier(
+        resource_id: &ResourceId,
+        key: &DeposedKey,
+        identifier: &str,
+        current_identifier: Option<&str>,
+    ) -> Result<AppliedIdentifier, Box<Self>> {
+        AppliedIdentifier::new(identifier).map_err(|_error| {
+            Box::new(Self::new(
+                resource_id.clone(),
+                PlanErrorKind::MissingDeposedProviderIdentifier {
+                    key: key.clone(),
+                    current_identifier: current_identifier
+                        .and_then(|identifier| AppliedIdentifier::new(identifier).ok()),
+                },
+            ))
+        })
     }
 }
 
@@ -138,6 +191,28 @@ impl std::fmt::Display for PlanErrorKind {
             Self::PreventDestroy { action } => f.write_str(Self::prevent_destroy_message(*action)),
             Self::SchemaNotRegistered(err) => write!(f, "{err}"),
             Self::ReplacementCannotCoexist(err) => write!(f, "{err}"),
+            Self::MissingProviderIdentifier => f.write_str(
+                "saved state has no provider identifier; add a `removed` block for this resource and apply it, then add an `import` block with the provider identifier to restore management",
+            ),
+            Self::InvalidImportProviderIdentifier => f.write_str(
+                "import id must be a non-empty provider identifier; set `id` in the `import` block to the identifier used by the provider",
+            ),
+            Self::MissingDeposedProviderIdentifier {
+                key,
+                current_identifier,
+            } => {
+                write!(
+                    f,
+                    "saved deposed generation `{key}` has no provider identifier and cannot be destroyed; add a `removed` block for this resource and apply it to abandon the unrecoverable generation from state"
+                )?;
+                if let Some(identifier) = current_identifier {
+                    write!(
+                        f,
+                        ", then add an `import` block with provider identifier `{identifier}` to restore management of the healthy current instance"
+                    )?;
+                }
+                Ok(())
+            }
             Self::WaitTargetMissing {
                 wait_binding,
                 target,
@@ -320,11 +395,20 @@ pub(crate) struct ReplacementGroup {
 
 pub(crate) struct ReplacementDelete {
     pub id: ResolvedResourceId,
-    pub identifier: String,
+    pub identifier: AppliedIdentifier,
     pub directives: Directives,
     pub binding: Option<String>,
     pub dependencies: HashSet<String>,
     pub explicit_dependencies: HashSet<String>,
+}
+
+/// A malformed historical generation explicitly abandoned by a `removed`
+/// block because it has no provider identifier and therefore cannot be
+/// deleted from the provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct AbandonedDeposedGeneration {
+    id: ResolvedResourceId,
+    key: DeposedKey,
 }
 
 /// Plan containing Effects to be executed
@@ -338,6 +422,10 @@ pub struct Plan {
     /// Errors detected during plan generation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<PlanError>,
+    /// Deposed generations a `removed` block must forget without a provider
+    /// call because their persisted identifiers are unusable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    abandoned_deposed: Vec<AbandonedDeposedGeneration>,
 }
 
 impl Plan {
@@ -407,6 +495,7 @@ impl Plan {
             replace_display,
             permanent_name_overrides: _permanent_name_overrides,
             errors: _errors,
+            abandoned_deposed: _abandoned_deposed,
         } = self;
 
         effects
@@ -498,6 +587,31 @@ impl Plan {
     /// Returns true if there are plan-construction errors.
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+    }
+
+    /// Remove plan-construction errors that don't satisfy the predicate.
+    pub fn retain_errors<F>(&mut self, f: F)
+    where
+        F: FnMut(&PlanError) -> bool,
+    {
+        self.errors.retain(f);
+    }
+
+    /// Record one unrecoverable deposed generation that a matching `removed`
+    /// block explicitly abandons from state.
+    pub fn abandon_deposed_generation(&mut self, id: ResolvedResourceId, key: DeposedKey) {
+        self.abandoned_deposed
+            .push(AbandonedDeposedGeneration { id, key });
+    }
+
+    /// Deposed generations that state writeback must forget without treating
+    /// them as successful provider deletes.
+    pub fn abandoned_deposed_generations(
+        &self,
+    ) -> impl Iterator<Item = (&ResolvedResourceId, &DeposedKey)> {
+        self.abandoned_deposed
+            .iter()
+            .map(|generation| (&generation.id, &generation.key))
     }
 
     /// Remove effects that don't satisfy the predicate
@@ -956,7 +1070,7 @@ mod tests {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "ec2.Vpc", "vpc-old",
                 )),
-                identifier: "vpc-123".to_string(),
+                identifier: crate::effect::fixture_applied_identifier("vpc-123"),
                 directives: Directives::default(),
                 binding: Some("vpc".to_string()),
                 dependencies: HashSet::from(["internet_gateway".to_string()]),
@@ -1110,7 +1224,7 @@ mod tests {
             id: crate::resource::ResolvedResourceId::new(
                 crate::resource::ResourceId::with_identity("s3.Bucket", "c"),
             ),
-            identifier: String::new(),
+            identifier: crate::effect::fixture_applied_identifier("c"),
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -1211,7 +1325,7 @@ mod tests {
                     ))
                     .unwrap(),
                 )),
-                identifier: format!("record-{idx}"),
+                identifier: crate::effect::fixture_applied_identifier(format!("record-{idx}")),
                 directives: Directives::default(),
                 binding: Some(format!("validation_records[{idx}]")),
                 dependencies: HashSet::new(),
@@ -1614,7 +1728,7 @@ mod tests {
                 "s3.Bucket",
                 "b",
             )),
-            identifier: "b-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("b-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,

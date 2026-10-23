@@ -734,7 +734,7 @@ fn effect_to_node(
     historical_display: &HistoricalDisplayAttributes,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
 ) -> TreeNode {
-    let detail_rows = if let (Effect::Create(resource), Some(replacement)) =
+    let mut detail_rows = if let (Effect::Create(resource), Some(replacement)) =
         (effect, replacement_info)
     {
         build_replace_detail_rows_from_display(
@@ -749,6 +749,15 @@ fn effect_to_node(
     } else {
         build_detail_rows_by_instance(effect, schemas, DetailLevel::Full, historical_display, None)
     };
+    if let Effect::Remove { id } = effect {
+        detail_rows.extend(
+            plan.abandoned_deposed_generations()
+                .filter(|(abandoned_id, _)| *abandoned_id == id)
+                .map(|(_, key)| DetailRow::Text {
+                    text: format!("abandon deposed generation `{key}`"),
+                }),
+        );
+    }
 
     match effect {
         Effect::Read { resource } => TreeNode {

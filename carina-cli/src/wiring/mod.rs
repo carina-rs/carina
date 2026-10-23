@@ -42,8 +42,8 @@ use carina_core::parser::{
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
-    self as provider_mod, LiftedSavedAttrs, Provider, ProviderError, ProviderFactory,
-    ProviderNormalizer, ProviderRouter,
+    self as provider_mod, AppliedIdentifier, LiftedSavedAttrs, Provider, ProviderError,
+    ProviderFactory, ProviderNormalizer, ProviderRouter,
 };
 use carina_core::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, ResolvedResource, ResolvedResourceId,
@@ -56,7 +56,7 @@ use carina_core::schema::{
 };
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
-use carina_state::{BackendError, StateFile};
+use carina_state::{BackendError, LoadedOrphans, OrphanStateLoad, ResourceStateLoad, StateFile};
 
 use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
 use crate::commands::split_validation_message;
@@ -2411,8 +2411,9 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         RefreshProgress::start_header();
         let multi = refresh_multi_progress();
 
-        // Read states for all resources concurrently using identifier from state.
-        // In identifier-based approach, if there's no identifier in state, the resource doesn't exist.
+        // Read states for all resources concurrently using the identifier from
+        // state. An address with no row is absent; a persisted row without an
+        // identifier remains present and invalid so planning can fail closed.
         // Skip composition resources (module attribute containers) — they have no infrastructure.
         let provider_ref = &provider;
         // Pre-build a map of dependency_bindings from the state file so we can
@@ -2457,34 +2458,17 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
-            orphans = sf.build_orphans(&desired_ids);
-            refresh_printed_bars |= !orphans.is_empty();
-            let orphan_results: Vec<Result<(ResourceId, carina_core::differ::Orphan), AppError>> =
-                stream::iter(std::mem::take(&mut orphans))
-                    .map(|(id, orphan)| {
-                        let progress = RefreshProgress::begin_multi(&multi, &id);
-                        async move {
-                            let refreshed = read_with_retry(
-                                provider_ref,
-                                &id,
-                                orphan.state().identifier.as_deref(),
-                            )
-                            .await
-                            .map_err(AppError::Provider)?;
-                            progress.finish();
-                            Ok((id, orphan.with_refreshed_state(refreshed)))
-                        }
-                    })
-                    .buffer_unordered(5)
-                    .collect()
-                    .await;
-            for result in orphan_results {
-                let (id, orphan) = result?;
-                if orphan.state().exists {
-                    orphan_refreshed_ids.insert(id.clone());
-                }
-                orphans.insert(orphan);
-            }
+            let loaded_orphans = sf.build_orphans(&desired_ids);
+            refresh_printed_bars |= !loaded_orphans.is_empty();
+            let refreshed =
+                refresh_loaded_orphans(provider_ref, loaded_orphans, Some(&multi)).await?;
+            orphan_refreshed_ids.extend(
+                refreshed
+                    .iter()
+                    .filter(|(_id, loaded)| loaded.state().exists)
+                    .map(|(id, _loaded)| id.clone()),
+            );
+            orphans = refreshed.into_plan_orphans();
         }
 
         // Hydrate now — before phase 2 resolves data source refs — so
@@ -2605,14 +2589,14 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if let Some(sf) = state_file.as_ref() {
             for resource in &sorted_resources {
-                let state = sf.build_state_for_resource(&resource.id);
+                let state = sf.build_state_for_resource(&resource.id).into_state();
                 current_states.insert(resource.id.clone(), state);
             }
 
             // Also include orphaned resources from state file
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
-            orphans = sf.build_orphans(&desired_ids);
+            orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
 
             // Transfer state for moved blocks and anonymous → let-bound
             // renames so the later `resolve_refs_with_state_and_remote`
@@ -2733,7 +2717,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             // cached state stays `not_found` → Create (mirrors the
             // non-loop ref's behavior under --refresh=false).
             for resource in children() {
-                let state = sf.build_state_for_resource(&resource.id);
+                let state = sf.build_state_for_resource(&resource.id).into_state();
                 current_states.insert(resource.id.clone(), state);
             }
             hydrate_prior_states(
@@ -2943,7 +2927,10 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     add_deposed_delete_effects(&mut plan, state_file);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
 
-    // Add state block effects (import/removed/moved) to the plan.
+    // Add state block effects (import/removed/moved) only after both the
+    // differ and deposed-generation pass have emitted identifier errors.
+    // `removed` is the explicit recovery that suppresses those errors; the
+    // missing-provider-identifier E2E pins this ordering for live planning.
     // carina#3329: pass the same override-aware bindings + upstream_binding_names
     // the resource-attribute resolver uses so an `import { id = "${…}|…" }`
     // expression is folded into a concrete cloud identifier (when the
@@ -3378,6 +3365,8 @@ pub fn add_state_block_effects(
         std::collections::HashSet::new();
     let mut suppress_create: std::collections::HashSet<ResourceId> =
         std::collections::HashSet::new();
+    let mut suppress_identifier_errors: std::collections::HashSet<StateBlockAddress> =
+        std::collections::HashSet::new();
     let desired_ids: std::collections::HashSet<ResourceId> = desired_resources
         .iter()
         .map(|resource| resource.id.clone())
@@ -3417,6 +3406,15 @@ pub fn add_state_block_effects(
                         unresolved_upstream_bindings,
                     );
                     suppress_create.insert(effective_to.as_inner().clone());
+                    if carina_core::effect::resolve_import_identifier(&resolved_id)
+                        .is_ok_and(|identifier| AppliedIdentifier::new(identifier).is_err())
+                    {
+                        plan.add_error(carina_core::plan::PlanError::new(
+                            effective_to.as_inner().clone(),
+                            carina_core::plan::PlanErrorKind::InvalidImportProviderIdentifier,
+                        ));
+                        continue;
+                    }
                     new_effects.push(Effect::Import {
                         id: effective_to,
                         identifier: resolved_id,
@@ -3436,11 +3434,33 @@ pub fn add_state_block_effects(
                 let resolved_from = state_file.as_ref().and_then(|sf| {
                     sf.find_resource(&from.provider, &from.resource_type, from.name_str())
                         .map(|rs| {
-                            resolved_state_row_id(rs, rs.directives.provider_instance.clone())
+                            let id =
+                                resolved_state_row_id(rs, rs.directives.provider_instance.clone());
+                            let abandoned_deposed = rs
+                                .deposed
+                                .iter()
+                                .filter(|deposed| {
+                                    AppliedIdentifier::new(deposed.identifier.as_str()).is_err()
+                                })
+                                .map(|deposed| {
+                                    (
+                                        resolved_state_row_id(
+                                            rs,
+                                            deposed.provider_instance.clone(),
+                                        ),
+                                        deposed.key.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            (id, abandoned_deposed)
                         })
                 });
-                if let Some(id) = resolved_from {
+                if let Some((id, abandoned_deposed)) = resolved_from {
                     suppress_delete.insert(id.as_inner().clone());
+                    suppress_identifier_errors.insert(from.clone());
+                    for (deposed_id, key) in abandoned_deposed {
+                        plan.abandon_deposed_generation(deposed_id, key);
+                    }
                     new_effects.push(Effect::Remove { id });
                 }
             }
@@ -3481,6 +3501,29 @@ pub fn add_state_block_effects(
             } => true,
             Effect::Create(resource) => !suppress_create.contains(&resource.id),
             _ => true,
+        });
+    }
+
+    // A removed block abandons the whole persisted row. Suppress identifier
+    // errors for both its current instance and its deposed generations (whose
+    // provider-instance routing can differ), allowing Remove to be applied.
+    if !suppress_identifier_errors.is_empty() {
+        plan.retain_errors(|error| {
+            if !matches!(
+                error.kind,
+                carina_core::plan::PlanErrorKind::MissingProviderIdentifier
+                    | carina_core::plan::PlanErrorKind::MissingDeposedProviderIdentifier { .. }
+            ) {
+                return true;
+            }
+            let Some(identity) = error.resource_id.identity() else {
+                return true;
+            };
+            !suppress_identifier_errors.contains(&StateBlockAddress::new(
+                error.resource_id.provider.clone(),
+                error.resource_id.resource_type.clone(),
+                identity.clone(),
+            ))
         });
     }
 
@@ -3569,8 +3612,12 @@ pub fn add_deposed_delete_effects(plan: &mut Plan, state_file: &Option<StateFile
     };
 
     for row in state_file.resources() {
-        for effect in deposed_delete_effects_for_row(row) {
+        let (effects, errors) = deposed_delete_effects_for_row(row);
+        for effect in effects {
             plan.add(effect);
+        }
+        for error in errors {
+            plan.add_error(error);
         }
     }
 }
@@ -3579,23 +3626,33 @@ pub fn add_deposed_delete_effects(plan: &mut Plan, state_file: &Option<StateFile
 ///
 /// Each deposed entry owns its provider-instance routing and dependency
 /// bindings; callers must not substitute the current row's routing here.
-pub(crate) fn deposed_delete_effects_for_row(row: &carina_state::ResourceState) -> Vec<Effect> {
-    row.deposed
-        .iter()
-        .map(|deposed| {
-            let id = resolved_state_row_id(row, deposed.provider_instance.clone());
-            Effect::Delete {
+pub(crate) fn deposed_delete_effects_for_row(
+    row: &carina_state::ResourceState,
+) -> (Vec<Effect>, Vec<PlanError>) {
+    let mut effects = Vec::with_capacity(row.deposed.len());
+    let mut errors = Vec::new();
+    for deposed in &row.deposed {
+        let id = resolved_state_row_id(row, deposed.provider_instance.clone());
+        match PlanError::require_deposed_provider_identifier(
+            id.as_inner(),
+            &deposed.key,
+            deposed.identifier.as_str(),
+            row.identifier.as_deref(),
+        ) {
+            Ok(identifier) => effects.push(Effect::Delete {
                 id,
-                identifier: deposed.identifier.clone(),
+                identifier,
                 generation: EffectGeneration::Deposed(deposed.key.clone()),
                 directives: Default::default(),
                 binding: row.binding.clone(),
                 dependencies: deposed.dependency_bindings.iter().cloned().collect(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
-            }
-        })
-        .collect()
+            }),
+            Err(error) => errors.push(*error),
+        }
+    }
+    (effects, errors)
 }
 
 /// Resolve an import block's `to` address to a matching resource in the plan or state.
@@ -3660,24 +3717,15 @@ fn is_throttling_error(err: &ProviderError) -> bool {
 pub async fn read_with_retry(
     provider: &dyn Provider,
     id: &ResourceId,
-    identifier: Option<&str>,
+    identifier: &AppliedIdentifier,
 ) -> Result<State, ProviderError> {
-    // carina-rs/carina#2594: when no prior identifier exists for this
-    // resource (a fresh component, or a newly added resource on top
-    // of an existing component), there is nothing to refresh — short-
-    // circuit to `not_found` and let the planner emit a Create. The
-    // earlier shape passed `""` through to the provider, which AWS
-    // CloudControl rejected with `ValidationException`.
-    if identifier.is_none() {
-        return Ok(State::not_found(id.clone()));
-    }
     let max_retries = 3;
     for attempt in 0..=max_retries {
         match provider
             .read(id, identifier, carina_core::provider::ReadRequest)
             .await
         {
-            Ok(state) => return Ok(state),
+            Ok(outcome) => return Ok(outcome.into_state()),
             Err(ProviderError::NotFound(_)) => {
                 // carina-rs/carina-provider-aws#462: ProviderError::NotFound is
                 // the canonical drift signal — the resource is recorded in state
@@ -3699,6 +3747,76 @@ pub async fn read_with_retry(
         }
     }
     unreachable!()
+}
+
+/// Refresh one managed state-file entry without erasing a malformed row.
+///
+/// Only [`ResourceStateLoad::Present`] may cross the provider read boundary.
+/// A missing-identifier row stays present in cached state so planning can emit
+/// its actionable error, while an absent address remains `not_found`.
+pub async fn refresh_loaded_resource_with_retry(
+    provider: &dyn Provider,
+    loaded: ResourceStateLoad,
+) -> Result<State, ProviderError> {
+    match loaded {
+        ResourceStateLoad::Present(present) => {
+            let (state, identifier) = present.into_parts();
+            read_with_retry(provider, &state.id, &identifier).await
+        }
+        ResourceStateLoad::Absent(state) | ResourceStateLoad::MissingProviderIdentifier(state) => {
+            Ok(state)
+        }
+    }
+}
+
+/// Refresh one typed orphan without allowing a missing identifier to cross the
+/// provider boundary.
+///
+/// The missing condition stays attached to the returned orphan so a later
+/// planning conversion still fails closed.
+pub async fn refresh_loaded_orphan_with_retry(
+    provider: &dyn Provider,
+    loaded: OrphanStateLoad,
+) -> Result<OrphanStateLoad, ProviderError> {
+    match loaded {
+        OrphanStateLoad::Present { orphan, identifier } => {
+            let fresh = read_with_retry(provider, &orphan.state().id, &identifier).await?;
+            Ok(OrphanStateLoad::Present {
+                orphan: orphan.with_refreshed_state(fresh),
+                identifier,
+            })
+        }
+        missing @ OrphanStateLoad::MissingProviderIdentifier(_) => Ok(missing),
+    }
+}
+
+async fn refresh_loaded_orphans(
+    provider: &dyn Provider,
+    loaded: LoadedOrphans,
+    multi: Option<&indicatif::MultiProgress>,
+) -> Result<LoadedOrphans, AppError> {
+    let results: Vec<Result<OrphanStateLoad, AppError>> = stream::iter(loaded)
+        .map(|(_id, loaded)| {
+            let progress =
+                multi.map(|multi| RefreshProgress::begin_multi(multi, &loaded.state().id));
+            async move {
+                let refreshed = refresh_loaded_orphan_with_retry(provider, loaded)
+                    .await
+                    .map_err(AppError::Provider)?;
+                if let Some(progress) = progress {
+                    progress.finish();
+                }
+                Ok(refreshed)
+            }
+        })
+        .buffer_unordered(5)
+        .collect()
+        .await;
+    let mut refreshed = LoadedOrphans::default();
+    for result in results {
+        refreshed.insert(result?);
+    }
+    Ok(refreshed)
 }
 
 /// Refresh a set of managed resources concurrently and merge the
@@ -3733,12 +3851,13 @@ pub(crate) async fn refresh_resource_set<'a>(
             .map(|resource| {
                 started_bar = true;
                 let progress = RefreshProgress::begin_multi(multi, &resource.id);
-                let identifier = state_file
+                let loaded = state_file
                     .as_ref()
-                    .and_then(|sf| sf.get_identifier_for_resource(resource));
+                    .map(|sf| sf.build_state_for_resource(&resource.id))
+                    .unwrap_or_else(|| ResourceStateLoad::absent(resource.id.clone()));
                 let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                 async move {
-                    let mut state = read_with_retry(provider, &resource.id, identifier.as_deref())
+                    let mut state = refresh_loaded_resource_with_retry(provider, loaded)
                         .await
                         .map_err(AppError::Provider)?;
                     if let Some(deps) = dep_bindings {

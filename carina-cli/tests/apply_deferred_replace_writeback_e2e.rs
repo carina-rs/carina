@@ -12,6 +12,7 @@ use carina_core::parser::{
     SavedProviderConfigs,
 };
 use carina_core::plan::Plan;
+use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
     ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
 };
@@ -214,7 +215,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
-            identifier: "old-validation-id".to_string(),
+            identifier: AppliedIdentifier::new("old-validation-id")
+                .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
@@ -341,7 +343,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(id),
-        identifier: "main-old".to_string(),
+        identifier: AppliedIdentifier::new("main-old").expect("fixture identifier is non-empty"),
         generation: EffectGeneration::Deposed(deposed_key),
         directives: Directives::default(),
         binding: Some("main".to_string()),

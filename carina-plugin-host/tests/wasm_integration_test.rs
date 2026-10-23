@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    CreateRequest, DeleteRequest, Provider, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
-    ReadRequest, SavedAttrs, UpdateRequest,
+    AppliedIdentifier, CreateRequest, DeleteRequest, Provider, ProviderFactory,
+    ProviderReadyConfig, RawSavedAttrs, ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, EnumValueResolver, RawEnumIdentifier,
@@ -16,6 +16,10 @@ use carina_core::resource::{
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::WasmProviderFactory;
+
+fn mock_identifier() -> AppliedIdentifier {
+    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
+}
 
 fn lifted_saved_attrs(
     entries: impl IntoIterator<Item = (ResourceId, HashMap<String, Value>)>,
@@ -287,7 +291,7 @@ async fn test_wasm_pending_update_polls_until_success() {
     .await;
 
     let state = provider
-        .update(&id, "mock-id", request)
+        .update(&id, &mock_identifier(), request)
         .await
         .expect("pending update should settle")
         .into_state_for_writeback();
@@ -328,7 +332,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
 
     let delete_started = Instant::now();
     provider
-        .delete(&id, "mock-id", DeleteRequest::default())
+        .delete(&id, &mock_identifier(), DeleteRequest::default())
         .await
         .expect("pending delete should settle");
     assert!(
@@ -337,9 +341,10 @@ async fn test_wasm_pending_delete_polls_until_success() {
     );
 
     let state = provider
-        .read(&id, Some("mock-id"), ReadRequest)
+        .read(&id, &mock_identifier(), ReadRequest)
         .await
-        .expect("provider should remain usable");
+        .expect("provider should remain usable")
+        .into_state();
     assert!(!state.exists);
 }
 
@@ -500,11 +505,12 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         tokio::time::timeout(
             Duration::from_millis(500),
-            provider.read(&sibling_id, None, ReadRequest),
+            provider.read(&sibling_id, &mock_identifier(), ReadRequest),
         )
         .await
         .expect("sibling read must not wait for the provider's poll sleep")
         .expect("sibling read should succeed")
+        .into_state()
     };
 
     let (pending_result, sibling_state) = tokio::join!(pending_operation, sibling_operation);
@@ -584,9 +590,10 @@ async fn test_wasm_mock_provider_create_and_read() {
     // Read before create - should return a state with no identifier and empty attributes
     let id = ResourceId::with_provider_identity("mock", "test.resource", "my-resource", None);
     let state = provider
-        .read(&id, None, ReadRequest)
+        .read(&id, &mock_identifier(), ReadRequest)
         .await
-        .expect("read should not error");
+        .expect("read should not error")
+        .into_state();
     assert!(state.identifier.is_none());
     assert!(state.attributes.is_empty());
 
@@ -627,9 +634,10 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     // Read back - should return the created state
     let read_state = provider
-        .read(&id, Some("mock-id"), ReadRequest)
+        .read(&id, &mock_identifier(), ReadRequest)
         .await
-        .expect("read should not error");
+        .expect("read should not error")
+        .into_state();
     assert_eq!(read_state.identifier, Some("mock-id".into()));
     assert_eq!(
         read_state.attributes.get("name"),
@@ -663,7 +671,7 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
     );
 
     let error = provider
-        .read(&id, Some("mock-id"), ReadRequest)
+        .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("guest output containing nested NaN must be a provider error");
 
@@ -718,7 +726,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     .await;
 
     let updated = provider
-        .update(&id, "mock-id", request)
+        .update(&id, &mock_identifier(), request)
         .await
         .expect("update should succeed")
         .into_state_for_writeback();
@@ -752,9 +760,10 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Read to verify update persisted in memory
     let read_state = provider
-        .read(&id, Some("mock-id"), ReadRequest)
+        .read(&id, &mock_identifier(), ReadRequest)
         .await
-        .expect("read should not error");
+        .expect("read should not error")
+        .into_state();
     assert_eq!(
         read_state.attributes.get("color"),
         Some(&Value::Concrete(ConcreteValue::String("blue".into())))
@@ -762,15 +771,16 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Delete
     provider
-        .delete(&id, "mock-id", DeleteRequest::default())
+        .delete(&id, &mock_identifier(), DeleteRequest::default())
         .await
         .expect("delete should succeed");
 
     // Read after delete - should return empty state (no identifier, no attributes)
     let deleted_state = provider
-        .read(&id, None, ReadRequest)
+        .read(&id, &mock_identifier(), ReadRequest)
         .await
-        .expect("read should not error");
+        .expect("read should not error")
+        .into_state();
     assert!(deleted_state.identifier.is_none());
     assert!(deleted_state.attributes.is_empty());
 }
@@ -809,7 +819,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
     .await;
 
     let updated = provider
-        .update(&id, "mock-id", request)
+        .update(&id, &mock_identifier(), request)
         .await
         .expect("persisted current-state secrets must cross the update boundary")
         .into_state_for_writeback();
@@ -853,7 +863,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
 
     let updated = provider
-        .update(&id, "mock-id", request)
+        .update(&id, &mock_identifier(), request)
         .await
         .expect("unchanged persisted secrets must cross the update outcome boundary")
         .into_state_for_writeback();
@@ -919,14 +929,15 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     );
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
     provider
-        .update(&id, "mock-id", request)
+        .update(&id, &mock_identifier(), request)
         .await
         .expect("update should preserve the unchanged persisted attribute");
 
     let read = provider
-        .read(&id, Some("mock-id"), ReadRequest)
+        .read(&id, &mock_identifier(), ReadRequest)
         .await
-        .expect("read after update should succeed");
+        .expect("read after update should succeed")
+        .into_state();
     assert_eq!(read.attributes.get("payload"), Some(&cloud_payload));
     assert_eq!(
         read.attributes.get("color"),
@@ -1756,7 +1767,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-create-trap", None);
     let followup_error = provider
-        .read(&followup_id, None, ReadRequest)
+        .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the shared instance must remain poisoned after a CRUD trap");
     let rendered = followup_error.to_string();
@@ -1796,9 +1807,10 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-create-error", None);
     let state = provider
-        .read(&followup_id, None, ReadRequest)
+        .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
-        .expect("a provider-returned error must not poison the shared instance");
+        .expect("a provider-returned error must not poison the shared instance")
+        .into_state();
     assert!(!state.exists);
 }
 
@@ -1944,9 +1956,10 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         None,
     );
     let state = provider
-        .read(&read_id, None, ReadRequest)
+        .read(&read_id, &mock_identifier(), ReadRequest)
         .await
-        .expect("provider-returned normalizer errors must not poison a later CRUD call");
+        .expect("provider-returned normalizer errors must not poison a later CRUD call")
+        .into_state();
     assert!(!state.exists);
 }
 

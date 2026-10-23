@@ -7,7 +7,7 @@ use std::time::Instant;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
 use crate::effect::{DeletedInstanceKey, Effect};
-use crate::provider::Provider;
+use crate::provider::{AppliedIdentifier, Provider};
 #[cfg(test)]
 use crate::resource::Resource;
 use crate::resource::{ResolvedResource, ResourceId, ResourceIdentity, Value};
@@ -231,7 +231,7 @@ pub(super) async fn execute_effects_sequential(
     let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
     let mut successfully_deleted: HashSet<DeletedInstanceKey> = HashSet::new();
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
-    let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
+    let mut pending_refreshes: HashMap<ResourceId, AppliedIdentifier> = HashMap::new();
     let mut runtime_synthesized_resources: Vec<ResolvedResource> = Vec::new();
     let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = super::ModuleConstraintGate::new(input.compositions);
@@ -876,8 +876,8 @@ mod tests {
     };
     use crate::plan::Plan;
     use crate::provider::{
-        BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
-        ReadRequest, UpdateRequest,
+        AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError,
+        ProviderResult, ReadRequest, UpdateRequest,
     };
     use crate::resource::{
         Composition, ConcreteValue, ResolvedResource, ResourceIdentity, State, Value,
@@ -910,6 +910,7 @@ mod tests {
             );
         }
         Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new(state_for(&id)),
             to: resolved(to),
             changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
@@ -936,23 +937,24 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ReadOutcome>> {
             let mut attrs = HashMap::new();
             attrs.insert(
                 "status".to_string(),
                 Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
             );
-            let state = State::existing(id.clone(), attrs).with_identifier("cert-id");
-            Box::pin(async move { Ok(state) })
+            let state = crate::provider::AppliedState::new(id.clone(), identifier.as_str(), attrs)
+                .expect("typed read identifier is non-empty");
+            Box::pin(async move { Ok(crate::provider::ReadOutcome::found(state)) })
         }
 
         fn read_data_source(
             &self,
-            resource: &crate::provider::ProviderReadyDataSource,
+            _resource: &crate::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None, ReadRequest)
+            Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
         }
 
         fn create(
@@ -971,7 +973,8 @@ mod tests {
                     Err(ProviderError::api_error("alb create failed"))
                 } else {
                     Ok(crate::provider::CreateOutcome::Success {
-                        state: State::existing(id, HashMap::new()).with_identifier("cert-id"),
+                        state: AppliedState::new(id, "cert-id", HashMap::new())
+                            .expect("fixture identifier is non-empty"),
                     })
                 }
             })
@@ -980,7 +983,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &crate::provider::AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("update not used")) })
@@ -989,7 +992,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &crate::provider::AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("delete not used")) })
@@ -1333,6 +1336,7 @@ mod tests {
             }),
         );
         let child = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new(state_for(&child.id)),
             to: resolved(child),
             changed_attributes: vec!["name".to_string()],
@@ -1351,6 +1355,7 @@ mod tests {
         };
         child.directives.depends_on.push("parent".to_string());
         let child = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new(state_for(&child.id)),
             to: resolved(child),
             changed_attributes: vec!["name".to_string()],
@@ -1375,6 +1380,7 @@ mod tests {
         let effects = vec![
             parent,
             Effect::Update {
+                identifier: crate::effect::fixture_applied_identifier("id"),
                 from: Box::new(state_for(&child_id)),
                 to: resolved(child.clone()),
                 changed_attributes: vec!["name".to_string()],
@@ -1463,6 +1469,7 @@ mod tests {
         let effects = vec![
             parent,
             Effect::Update {
+                identifier: crate::effect::fixture_applied_identifier("id"),
                 from: Box::new(state_for(&child_id)),
                 to: resolved(child.clone()),
                 changed_attributes: vec!["name".to_string()],

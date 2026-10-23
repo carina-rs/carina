@@ -15,8 +15,8 @@ use crate::executor::provider_ready::{
     prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
-    CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderReadyResource,
-    ReadRequest, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider,
+    ProviderReadyResource, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -46,7 +46,7 @@ pub(super) enum BasicEffectResult {
         binding: Option<String>,
     },
     Failure {
-        refresh: Option<(ResourceId, String)>,
+        refresh: Option<(ResourceId, AppliedIdentifier)>,
     },
     Deleted {
         instance_key: DeletedInstanceKey,
@@ -66,26 +66,24 @@ pub(super) struct ExecutionState<'a> {
     pub(super) applied_states: &'a mut AppliedStates,
     pub(super) failed_indices: &'a mut std::collections::HashSet<usize>,
     pub(super) successfully_deleted: &'a mut std::collections::HashSet<DeletedInstanceKey>,
-    pub(super) pending_refreshes: &'a mut HashMap<ResourceId, String>,
+    pub(super) pending_refreshes: &'a mut HashMap<ResourceId, AppliedIdentifier>,
     pub(super) bindings: &'a mut ResolvedBindings,
 }
 
 /// Queue a state refresh for a resource after a failed operation.
 pub(super) fn queue_state_refresh(
-    pending_refreshes: &mut HashMap<ResourceId, String>,
+    pending_refreshes: &mut HashMap<ResourceId, AppliedIdentifier>,
     id: &ResourceId,
-    identifier: Option<&str>,
+    identifier: &AppliedIdentifier,
 ) {
-    if let Some(identifier) = identifier.filter(|identifier| !identifier.is_empty()) {
-        pending_refreshes.insert(id.clone(), identifier.to_string());
-    }
+    pending_refreshes.insert(id.clone(), identifier.clone());
 }
 
 /// Refresh states for resources whose operations failed.
 pub(super) async fn refresh_pending_states(
     provider: &dyn Provider,
     current_states: &mut HashMap<ResourceId, State>,
-    pending_refreshes: &HashMap<ResourceId, String>,
+    pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
     observer: &dyn ExecutionObserver,
 ) -> std::collections::HashSet<ResourceId> {
     if pending_refreshes.is_empty() {
@@ -99,13 +97,10 @@ pub(super) async fn refresh_pending_states(
     let mut failed_refreshes = std::collections::HashSet::new();
 
     for (id, identifier) in refreshes {
-        match provider
-            .read(id, Some(identifier.as_str()), ReadRequest)
-            .await
-        {
-            Ok(state) => {
+        match provider.read(id, identifier, ReadRequest).await {
+            Ok(outcome) => {
                 observer.on_event(&ExecutionEvent::RefreshSucceeded { id });
-                current_states.insert(id.clone(), state);
+                current_states.insert(id.clone(), outcome.into_state());
             }
             Err(error) => {
                 let error_str = error.to_string();
@@ -528,7 +523,7 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             *exec.failure_count += 1;
             exec.failed_indices.insert(exec.idx);
             if let Some((id, identifier)) = &refresh {
-                queue_state_refresh(exec.pending_refreshes, id, Some(identifier.as_str()));
+                queue_state_refresh(exec.pending_refreshes, id, identifier);
             }
         }
         BasicEffectResult::PartialSuccess {
@@ -675,6 +670,7 @@ pub(super) async fn execute_basic_effect<'a>(
         }
         BasicEffect::Update {
             from,
+            identifier,
             to,
             changed_attributes,
             ..
@@ -703,7 +699,6 @@ pub(super) async fn execute_basic_effect<'a>(
                     return BasicEffectResult::Failure { refresh: None };
                 }
             };
-            let identifier = from.identifier.as_deref().unwrap_or("");
             // Augment plan-time `changed_attributes` with any
             // ResourceRef-derived attributes whose resolved value at
             // apply time differs from `from`. This catches the case
@@ -794,7 +789,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         progress,
                     });
                     BasicEffectResult::Failure {
-                        refresh: Some((id.clone(), identifier.to_string())),
+                        refresh: Some((id.clone(), identifier.clone())),
                     }
                 }
             }
@@ -805,47 +800,49 @@ pub(super) async fn execute_basic_effect<'a>(
             generation,
             directives,
             ..
-        } => match provider
-            .delete(
-                id,
-                identifier,
-                DeleteRequest {
-                    directives: directives.clone(),
-                },
-            )
-            .await
-        {
-            Ok(()) => {
-                observer.on_event(&ExecutionEvent::EffectSucceeded {
-                    effect,
-                    state: None,
-                    duration: started.elapsed(),
-                    progress,
-                });
-                BasicEffectResult::Deleted {
-                    instance_key: DeletedInstanceKey::new(
-                        id.clone(),
-                        generation.clone(),
-                        identifier.to_string(),
-                    ),
-                }
-            }
-            Err(e) => {
-                let error_str = e.to_string();
-                observer.on_event(&ExecutionEvent::EffectFailed {
-                    effect,
-                    error: &error_str,
-                    duration: started.elapsed(),
-                    progress,
-                });
-                BasicEffectResult::Failure {
-                    refresh: match generation {
-                        EffectGeneration::Current => Some((id.clone(), identifier.to_string())),
-                        EffectGeneration::Deposed(_) => None,
+        } => {
+            match provider
+                .delete(
+                    id,
+                    identifier,
+                    DeleteRequest {
+                        directives: directives.clone(),
                     },
+                )
+                .await
+            {
+                Ok(()) => {
+                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                        effect,
+                        state: None,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::Deleted {
+                        instance_key: DeletedInstanceKey::new(
+                            id.clone(),
+                            generation.clone(),
+                            identifier.to_string(),
+                        ),
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &error_str,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::Failure {
+                        refresh: match generation {
+                            EffectGeneration::Current => Some((id.clone(), identifier.clone())),
+                            EffectGeneration::Deposed(_) => None,
+                        },
+                    }
                 }
             }
-        },
+        }
     }
 }
 

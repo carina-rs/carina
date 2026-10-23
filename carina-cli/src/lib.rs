@@ -34,6 +34,9 @@ pub(crate) fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAt
         .lift(&carina_core::schema::SchemaRegistry::new())
 }
 
+#[cfg(test)]
+pub(crate) use carina_core::provider::fixture_applied_identifier;
+
 /// Controls how much detail is shown in plan output (CLI-facing enum with clap support).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DetailLevel {

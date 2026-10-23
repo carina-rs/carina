@@ -339,6 +339,102 @@ pub struct PersistedState {
     pub exists: bool,
 }
 
+/// Error returned when an applied provider identifier is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyAppliedIdentifier;
+
+impl std::fmt::Display for EmptyAppliedIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an applied resource identifier must not be empty")
+    }
+}
+
+impl std::error::Error for EmptyAppliedIdentifier {}
+
+/// Non-empty provider identifier used by managed reads and mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct AppliedIdentifier(String);
+
+impl AppliedIdentifier {
+    pub fn new(identifier: impl Into<String>) -> Result<Self, EmptyAppliedIdentifier> {
+        let identifier = identifier.into();
+        if identifier.is_empty() {
+            Err(EmptyAppliedIdentifier)
+        } else {
+            Ok(Self(identifier))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AppliedIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for AppliedIdentifier {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for AppliedIdentifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let identifier = String::deserialize(deserializer)?;
+        Self::new(identifier).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Ordinary-value state known to identify an existing provider-side resource.
+///
+/// Successful reads and create outcomes use this form. It always carries a
+/// required provider identifier, so an existing resource cannot be written
+/// back as absent. Unlike generic [`State`], applied state has no `exists`
+/// flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppliedState {
+    /// Used by the JSON-RPC/process transport. The guest SDK's WIT encoding
+    /// drops this field because the WIT outcome is already bound to the
+    /// request resource id.
+    pub id: ResourceId,
+    pub identifier: AppliedIdentifier,
+    pub attributes: HashMap<String, Value>,
+}
+
+/// Persisted-value state observed after a successful update mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppliedPersistedState {
+    /// Used by the JSON-RPC/process transport. The guest SDK's WIT encoding
+    /// drops this field because the WIT outcome is already bound to the
+    /// request resource id.
+    pub id: ResourceId,
+    pub identifier: AppliedIdentifier,
+    pub attributes: HashMap<String, PersistedValue>,
+}
+
+/// Result of reading a managed resource by its provider identifier.
+///
+/// The resource ID is retained in both variants for the JSON-RPC/process
+/// transport. The guest SDK drops it while encoding WIT because the request
+/// already supplies the ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ReadOutcome {
+    NotFound { id: ResourceId },
+    Found { state: AppliedState },
+}
+
 impl From<State> for PersistedState {
     fn from(state: State) -> Self {
         Self {
@@ -376,10 +472,10 @@ impl TryFrom<PersistedState> for State {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum CreateOutcome {
     Success {
-        state: State,
+        state: AppliedState,
     },
     PartialSuccess {
-        state: State,
+        state: AppliedState,
         diagnostic: PartialReadDiagnostic,
     },
 }
@@ -389,10 +485,10 @@ pub enum CreateOutcome {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum UpdateOutcome {
     Success {
-        state: PersistedState,
+        state: AppliedPersistedState,
     },
     PartialSuccess {
-        state: PersistedState,
+        state: AppliedPersistedState,
         diagnostic: PartialReadDiagnostic,
     },
 }
@@ -1189,6 +1285,56 @@ mod tests {
         let secret =
             PersistedValue::List(vec![PersistedValue::RedactedSecret("digest".to_string())]);
         assert_eq!(secret.into_value(), Err(RedactedSecretValueError));
+    }
+
+    #[test]
+    fn applied_outcomes_use_required_identifier_without_exists_flag() {
+        let id = ResourceId {
+            provider: "mock".into(),
+            resource_type: "test.resource".into(),
+            identity: "example".into(),
+        };
+        let create = CreateOutcome::Success {
+            state: AppliedState {
+                id: id.clone(),
+                identifier: AppliedIdentifier::new("created-id")
+                    .expect("fixture identifier is non-empty"),
+                attributes: HashMap::new(),
+            },
+        };
+        let read = ReadOutcome::Found {
+            state: AppliedState {
+                id: id.clone(),
+                identifier: AppliedIdentifier::new("read-id")
+                    .expect("fixture identifier is non-empty"),
+                attributes: HashMap::new(),
+            },
+        };
+        let update = UpdateOutcome::Success {
+            state: AppliedPersistedState {
+                id,
+                identifier: AppliedIdentifier::new("updated-id")
+                    .expect("fixture identifier is non-empty"),
+                attributes: HashMap::new(),
+            },
+        };
+
+        let create_json = serde_json::to_value(create).expect("serialize create outcome");
+        let read_json = serde_json::to_value(read).expect("serialize read outcome");
+        let update_json = serde_json::to_value(update).expect("serialize update outcome");
+        assert_eq!(create_json["state"]["identifier"], "created-id");
+        assert_eq!(read_json["state"]["identifier"], "read-id");
+        assert_eq!(update_json["state"]["identifier"], "updated-id");
+        assert!(create_json["state"].get("exists").is_none());
+        assert!(read_json["state"].get("exists").is_none());
+        assert!(update_json["state"].get("exists").is_none());
+    }
+
+    #[test]
+    fn applied_identifier_deserialization_rejects_empty_string() {
+        let error = serde_json::from_str::<AppliedIdentifier>("\"\"")
+            .expect_err("protocol deserialization must preserve the non-empty invariant");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
     }
 
     #[test]

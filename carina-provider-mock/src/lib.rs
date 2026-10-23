@@ -10,8 +10,9 @@ use std::time::Duration;
 use carina_core::effect::PlanOp;
 use carina_core::parser::ProviderConfig;
 use carina_core::provider::{
-    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError,
-    ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
+    PatchOpKind, Provider, ProviderError, ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome,
+    UpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
@@ -617,11 +618,14 @@ impl MockProvider {
 
         let mut state_attrs = resource.resolved_attributes();
         Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
-        let mut state = State::existing(id.clone(), state_attrs).with_identifier("mock-id");
         if let Some(config) = partial_create {
             for attr in &config.missing_attributes {
-                state.attributes.remove(attr);
+                state_attrs.remove(attr);
             }
+        }
+        let state = AppliedState::new(id.clone(), "mock-id", state_attrs)
+            .expect("mock provider identifier is non-empty");
+        if let Some(config) = partial_create {
             Self::append_op_log_if_configured("create", &id)?;
             return Ok(CreateOutcome::partial_success(
                 state,
@@ -721,6 +725,35 @@ fn append_update_trace(event: &str, resource: &str, active: Option<usize>) {
     let _ = file.write_all(line.as_bytes());
 }
 
+impl MockProvider {
+    async fn read_attributes(
+        &self,
+        id: &ResourceId,
+    ) -> ProviderResult<Option<HashMap<String, Value>>> {
+        let mut read_outcome = None;
+        if let Some(delay) = Self::read_delay_for(id) {
+            read_outcome = Some(ReadOutcomeGuard::from_env());
+            Self::signal_ready("CARINA_MOCK_READ_READY_PATH")?;
+            tokio::time::sleep(delay).await;
+        }
+
+        let _state_guard = Self::lock_state_file()?;
+        let states = self.load_states_for_operation()?;
+        let attributes = Self::resource_key(id).and_then(|key| {
+            states.get(&key).map(|attrs| {
+                attrs
+                    .iter()
+                    .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+                    .collect()
+            })
+        });
+        if let Some(read_outcome) = &mut read_outcome {
+            read_outcome.complete();
+        }
+        Ok(attributes)
+    }
+}
+
 impl Default for MockProvider {
     fn default() -> Self {
         Self::new()
@@ -735,37 +768,18 @@ impl Provider for MockProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
+        let identifier = identifier.clone();
         Box::pin(async move {
-            let mut read_outcome = None;
-            if let Some(delay) = Self::read_delay_for(&id) {
-                read_outcome = Some(ReadOutcomeGuard::from_env());
-                Self::signal_ready("CARINA_MOCK_READ_READY_PATH")?;
-                tokio::time::sleep(delay).await;
-            }
-
-            let _state_guard = Self::lock_state_file()?;
-            let states = self.load_states_for_operation()?;
-            let Some(key) = Self::resource_key(&id) else {
-                return Ok(State::not_found(id));
-            };
-
-            let state = if let Some(attrs) = states.get(&key) {
-                let attributes: HashMap<String, Value> = attrs
-                    .iter()
-                    .filter_map(|(k, v)| v.decode().map(|val| (k.clone(), val)))
-                    .collect();
-                State::existing(id, attributes).with_identifier("mock-id")
+            let outcome = if let Some(attributes) = self.read_attributes(&id).await? {
+                ReadOutcome::found(AppliedState::from_identifier(id, identifier, attributes))
             } else {
-                State::not_found(id)
+                ReadOutcome::not_found(id)
             };
-            if let Some(read_outcome) = &mut read_outcome {
-                read_outcome.complete();
-            }
-            Ok(state)
+            Ok(outcome)
         })
     }
 
@@ -773,7 +787,13 @@ impl Provider for MockProvider {
         &self,
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, None, ReadRequest)
+        let id = resource.id.clone();
+        Box::pin(async move {
+            Ok(match self.read_attributes(&id).await? {
+                Some(attributes) => State::existing(id, attributes),
+                None => State::not_found(id),
+            })
+        })
     }
 
     fn create(
@@ -789,10 +809,11 @@ impl Provider for MockProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
+        let identifier = identifier.as_str().to_string();
         Box::pin(async move {
             let key = Self::resolved_resource_key(&id)?;
             let _active = ActiveUpdateGuard::enter(key.clone());
@@ -846,12 +867,22 @@ impl Provider for MockProvider {
             self.save_states(&states)
                 .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
 
-            let mut state = State::existing(id, attributes).with_identifier("mock-id");
             if let Some(config) = partial_update {
                 for attr in &config.missing_attributes {
-                    state.attributes.remove(attr);
+                    attributes.remove(attr);
                 }
-                Self::append_op_log_if_configured("update", &state.id)?;
+            }
+            Self::append_op_log_if_configured("update", &id)?;
+            let applied_identifier =
+                env::var("CARINA_MOCK_UPDATE_RESULT_IDENTIFIER").unwrap_or(identifier);
+            let state =
+                AppliedState::new(id, applied_identifier, attributes).map_err(|source| {
+                    ProviderError::internal_caused_by(
+                        "mock update result identifier must not be empty",
+                        source,
+                    )
+                })?;
+            if let Some(config) = partial_update {
                 return Ok(UpdateOutcome::partial_success(
                     state,
                     "mock partial update".to_string(),
@@ -859,7 +890,6 @@ impl Provider for MockProvider {
                 ));
             }
 
-            Self::append_op_log_if_configured("update", &state.id)?;
             Ok(UpdateOutcome::Success { state })
         })
     }
@@ -867,11 +897,11 @@ impl Provider for MockProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
-        let identifier = identifier.to_string();
+        let identifier = identifier.as_str().to_string();
         Box::pin(async move {
             let key = Self::resolved_resource_key(&id)?;
             if let Some(err) = Self::delete_fail_error_for(&id, &identifier) {
@@ -1077,8 +1107,13 @@ mod tests {
             .unwrap();
 
         let state = runtime
-            .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
-            .expect("legacy mock state should load after migration");
+            .block_on(provider.read(
+                &id,
+                &AppliedIdentifier::new("mock-id").unwrap(),
+                ReadRequest,
+            ))
+            .expect("legacy mock state should load after migration")
+            .into_state();
 
         let Some(Value::Concrete(ConcreteValue::Map(payload))) = state.attributes.get("payload")
         else {
@@ -1178,8 +1213,13 @@ mod tests {
         );
 
         let state = runtime
-            .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
-            .expect("fresh mock v2 state should reload");
+            .block_on(provider.read(
+                &id,
+                &AppliedIdentifier::new("mock-id").unwrap(),
+                ReadRequest,
+            ))
+            .expect("fresh mock v2 state should reload")
+            .into_state();
         assert_eq!(state.attributes.get("comment"), Some(&plain));
         assert!(matches!(
             state.attributes.get("tags"),
@@ -1219,7 +1259,11 @@ mod tests {
         ] {
             fs::write(&state_file, content).unwrap();
             let error = runtime
-                .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
+                .block_on(provider.read(
+                    &id,
+                    &AppliedIdentifier::new("mock-id").unwrap(),
+                    ReadRequest,
+                ))
                 .expect_err("corrupt mock state must not look like an empty store");
             let rendered = error.to_string();
             assert!(
@@ -1264,8 +1308,13 @@ mod tests {
         assert!(raw.get("states").is_some());
 
         let state = runtime
-            .block_on(provider.read(&id, Some("mock-id"), ReadRequest))
-            .expect("new mock state should reload");
+            .block_on(provider.read(
+                &id,
+                &AppliedIdentifier::new("mock-id").unwrap(),
+                ReadRequest,
+            ))
+            .expect("new mock state should reload")
+            .into_state();
         assert_eq!(state.attributes.get("payload"), Some(&payload));
     }
 
@@ -1309,9 +1358,14 @@ mod tests {
                 .await
                 .expect("create succeeds");
             provider
-                .read(&id, Some("mock-id"), ReadRequest)
+                .read(
+                    &id,
+                    &AppliedIdentifier::new("mock-id").unwrap(),
+                    ReadRequest,
+                )
                 .await
                 .expect("read succeeds")
+                .into_state()
         });
 
         assert_eq!(read.attributes.get("mode"), Some(&canonical));
@@ -1407,13 +1461,15 @@ mod tests {
             )
             .await
             .expect("update request should pass checked preparation");
+            let identifier =
+                AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
             provider
-                .update(&id, "mock-id", request)
+                .update(&id, &identifier, request)
                 .await
                 .expect("update should succeed");
 
             provider
-                .delete(&id, "mock-id", DeleteRequest::default())
+                .delete(&id, &identifier, DeleteRequest::default())
                 .await
                 .expect("delete should succeed");
         });
@@ -1489,8 +1545,10 @@ mod tests {
         }
 
         let started = Instant::now();
+        let identifier =
+            AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
         runtime
-            .block_on(provider.delete(&id, "mock-id", DeleteRequest::default()))
+            .block_on(provider.delete(&id, &identifier, DeleteRequest::default()))
             .unwrap();
         let elapsed = started.elapsed();
 

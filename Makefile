@@ -22,6 +22,8 @@ plan-delete-list-of-maps:
 	$(PLAN_FIXTURE) delete_orphan_list_of_maps
 plan-state-blocks:
 	$(PLAN_FIXTURE) state_blocks
+plan-removed-missing-identifier:
+	$(PLAN_FIXTURE) removed_missing_identifier
 plan-compact:
 	$(PLAN_FIXTURE) compact --detail none
 plan-map-diff:
@@ -332,7 +334,7 @@ plan-multi-instance-module:
         plan-list-diff-modified-with-unchanged-nested \
         plan-enum-display plan-string-dot-suffix plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace plan-postfix-access \
-        plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
+        plan-state-blocks plan-removed-missing-identifier plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \

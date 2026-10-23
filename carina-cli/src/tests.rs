@@ -9,7 +9,9 @@ use serde_json::json;
 use carina_core::effect::Effect;
 use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
-use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
+use carina_core::provider::{
+    AppliedIdentifier, BoxFuture, ProviderError, ProviderResult, ReadOutcome, fixture_read_outcome,
+};
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, ResolvedDataSource, ResolvedResource,
     Resource, ResourceId, State, Value,
@@ -103,23 +105,27 @@ impl Provider for TestProvider {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         _request: carina_core::provider::ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
-        let key = (id.to_string(), identifier.unwrap_or("").to_string());
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        let key = (id.to_string(), identifier.as_str().to_string());
         let result = self
             .read_results
             .get(&key)
             .cloned()
             .unwrap_or_else(|| panic!("missing read state for {:?}", key));
-        Box::pin(async move { result.map_err(ProviderError::internal) })
+        Box::pin(async move {
+            result
+                .map(fixture_read_outcome)
+                .map_err(ProviderError::internal)
+        })
     }
 
     fn read_data_source(
         &self,
-        resource: &carina_core::provider::ProviderReadyDataSource,
+        _resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, None, carina_core::provider::ReadRequest)
+        Box::pin(async { Err(ProviderError::internal("unexpected read_data_source")) })
     }
 
     fn create(
@@ -133,7 +139,7 @@ impl Provider for TestProvider {
     fn update(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("unexpected update")) })
@@ -142,7 +148,7 @@ impl Provider for TestProvider {
     fn delete(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
@@ -188,7 +194,9 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     );
 
     let mut pending_refreshes = HashMap::new();
-    queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
+    let pending_identifier =
+        AppliedIdentifier::new(identifier).expect("fixture identifier is non-empty");
+    queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
     let failed_refreshes =
         refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
@@ -244,7 +252,9 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     let provider = TestProvider::with_read_state(&id, identifier, State::not_found(id.clone()));
 
     let mut pending_refreshes = HashMap::new();
-    queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
+    let pending_identifier =
+        AppliedIdentifier::new(identifier).expect("fixture identifier is non-empty");
+    queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
     let failed_refreshes =
         refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
@@ -296,7 +306,9 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     let provider = TestProvider::with_read_error(&id, identifier, "read failed");
 
     let mut pending_refreshes = HashMap::new();
-    queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
+    let pending_identifier =
+        AppliedIdentifier::new(identifier).expect("fixture identifier is non-empty");
+    queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
     let failed_refreshes =
         refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
@@ -350,7 +362,7 @@ fn plan_file_serde_round_trip() {
             "old-bucket",
             None,
         )),
-        identifier: "old-bucket".to_string(),
+        identifier: crate::fixture_applied_identifier("old-bucket"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
@@ -1054,8 +1066,14 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         "Prefix reconciliation should restore original bucket_name from state"
     );
 
-    // 5. get_identifier_for_resource - should find the resource in state
-    let identifier = state_file.get_identifier_for_resource(&resources_run2[0]);
+    // 5. The typed state loader should find the resource identifier.
+    let identifier = match state_file.build_state_for_resource(&resources_run2[0].id) {
+        carina_state::ResourceStateLoad::Present(present) => {
+            Some(present.identifier().as_str().to_owned())
+        }
+        carina_state::ResourceStateLoad::Absent(_)
+        | carina_state::ResourceStateLoad::MissingProviderIdentifier(_) => None,
+    };
     assert_eq!(
         identifier,
         Some("my-app-abcd1234".to_string()),
@@ -1174,7 +1192,13 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
 
     reconcile_prefixed_names(&mut resources_run2, &Some(state_file.clone()));
 
-    let identifier = state_file.get_identifier_for_resource(&resources_run2[0]);
+    let identifier = match state_file.build_state_for_resource(&resources_run2[0].id) {
+        carina_state::ResourceStateLoad::Present(present) => {
+            Some(present.identifier().as_str().to_owned())
+        }
+        carina_state::ResourceStateLoad::Absent(_)
+        | carina_state::ResourceStateLoad::MissingProviderIdentifier(_) => None,
+    };
     assert!(
         identifier.is_some(),
         "Should find IAM role identifier in state for plan-verify (issue #535)"
@@ -1345,7 +1369,7 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     // Orphans remain in their typed collection rather than being duplicated
     // into the desired-resource current-state map.
-    let orphans = state_file.build_orphans(&desired_ids);
+    let orphans = state_file.build_orphans(&desired_ids).into_plan_orphans();
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
@@ -1388,7 +1412,7 @@ fn orphaned_state_resource_produces_delete_effect() {
     match &delete_effects[0] {
         Effect::Delete { id, identifier, .. } => {
             assert_eq!(id.identity_str(), "removed-bucket");
-            assert_eq!(identifier, "removed-bucket");
+            assert_eq!(identifier.as_str(), "removed-bucket");
         }
         _ => unreachable!(),
     }
@@ -2070,16 +2094,17 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     // Simulate provider refresh replacing only the provider-observed state
     // inside each typed orphan.
     let orphans = state_file.build_orphans(&desired_ids);
-    let orphans: carina_core::differ::Orphans = orphans
+    let orphans = orphans
         .into_iter()
         .map(|(id, orphan)| {
             // Simulate provider.read() returning not-found for this identifier.
-            // In the real code, provider.read(&id, state.identifier.as_deref())
-            // would return State { exists: false, .. }.
+            // In the real code the typed orphan supplies `AppliedIdentifier`
+            // and the provider returns `ReadOutcome::NotFound`.
             let refreshed = State::not_found(id.clone());
             orphan.with_refreshed_state(refreshed)
         })
-        .collect();
+        .collect::<carina_state::LoadedOrphans>()
+        .into_plan_orphans();
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
@@ -2156,7 +2181,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     // Simulate refresh=false code path: build current_states from state file
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for res in &desired {
-        let state = state_file.build_state_for_resource(&res.id);
+        let state = state_file.build_state_for_resource(&res.id).into_state();
         current_states.insert(res.id.clone(), state);
     }
 
@@ -2230,7 +2255,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
 
     // Simulate refresh=false: the typed orphan state is the cached state-file
     // value and is not duplicated into `current_states`.
-    let orphans = state_file.build_orphans(&desired_ids);
+    let orphans = state_file.build_orphans(&desired_ids).into_plan_orphans();
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());

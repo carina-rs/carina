@@ -865,9 +865,10 @@ impl Provider for NoopProvider {
     fn read(
         &self,
         _id: &carina_core::resource::ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::ReadRequest,
-    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<carina_core::provider::ReadOutcome>>
+    {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }
     fn read_data_source(
@@ -887,7 +888,7 @@ impl Provider for NoopProvider {
     fn update(
         &self,
         _id: &carina_core::resource::ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<carina_core::provider::UpdateOutcome>>
     {
@@ -896,7 +897,7 @@ impl Provider for NoopProvider {
     fn delete(
         &self,
         _id: &carina_core::resource::ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<()>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })

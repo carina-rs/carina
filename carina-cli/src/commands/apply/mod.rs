@@ -24,13 +24,15 @@ use carina_core::executor::{
 };
 use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
+use carina_core::provider::{
+    self as provider_mod, AppliedIdentifier, Provider, ProviderNormalizer, ReadRequest,
+};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
-use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
+use carina_state::{BackendLock, LockInfo, ResourceStateLoad, StateBackend, StateFile};
 
 use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfigs};
 
@@ -63,14 +65,17 @@ use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::{AppError, SavedPlanSecretVerificationError};
+#[cfg(test)]
+use crate::wiring::read_with_retry;
 use crate::wiring::{
     DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
     build_factories_from_providers, create_normalizers_from_configs_with_ctx,
     create_providers_from_configs_with_ctx, data_source_refresh_bindings, get_provider_with_ctx,
     prepare_data_sources_for_plan, prepare_default_provider_ready_config,
-    prepare_desired_side_for_plan, read_data_source_with_retry, read_with_retry,
+    prepare_desired_side_for_plan, read_data_source_with_retry,
     reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
-    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
+    reconcile_prefixed_names, refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
+    resolve_data_source_refs_for_refresh,
 };
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
@@ -695,7 +700,7 @@ mod upstream_snapshot_tests {
 pub async fn refresh_pending_states(
     provider: &dyn Provider,
     current_states: &mut HashMap<ResourceId, State>,
-    pending_refreshes: &HashMap<ResourceId, String>,
+    pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
 ) -> HashSet<ResourceId> {
     if pending_refreshes.is_empty() {
         return HashSet::new();
@@ -709,7 +714,7 @@ pub async fn refresh_pending_states(
     let mut failed_refreshes = HashSet::new();
 
     for (id, identifier) in refreshes {
-        match read_with_retry(provider, id, Some(identifier)).await {
+        match read_with_retry(provider, id, identifier).await {
             Ok(state) => {
                 println!("  {} Refresh {}", "✓".green(), id);
                 current_states.insert(id.clone(), state);
@@ -903,6 +908,31 @@ pub(crate) async fn load_state_persist_if_migrated(
     }
 }
 
+/// Remove pre-#3181 data-source rows identified by the parser's typed `read`
+/// addresses and persist the normalized state while the caller's lock is held.
+///
+/// This is intentionally separate from JSON migration: identifier-less
+/// managed rows and historical data-source rows have the same old wire shape,
+/// so only the parsed resource kind/address can distinguish them safely.
+pub(crate) async fn prune_legacy_data_source_rows_persist_if_changed(
+    backend: &dyn StateBackend,
+    lock: StateLockRef<'_>,
+    state_file: &mut Option<StateFile>,
+    data_sources: &[DataSource],
+) -> Result<(), AppError> {
+    let Some(state) = state_file.as_mut() else {
+        return Ok(());
+    };
+    if state.remove_legacy_data_source_rows(data_sources) == 0 {
+        return Ok(());
+    }
+    match lock {
+        StateLockRef::Held(lock) => save_state_locked(backend, lock, state).await?,
+        StateLockRef::Disabled(disabled) => save_state_unlocked(backend, disabled, state).await?,
+    }
+    Ok(())
+}
+
 /// Persist export changes when the plan has no mutating effects.
 ///
 /// Used when `!plan.has_mutations()` short-circuits apply: no
@@ -1008,15 +1038,30 @@ pub(crate) async fn detect_drift(
         // detection only operates over provider-backed managed
         // resources.
         let planned_state = planned_states.get(&resource.id).copied();
-        let identifier = planned_state.and_then(|s| s.identifier.as_deref());
         let historical_id = planned_state
             .map(|_| historical_addresses.origin_for(&resource.id))
             .unwrap_or(&resource.id);
 
-        let mut actual_state = provider
-            .read(historical_id, identifier, ReadRequest)
-            .await
-            .map_err(AppError::Provider)?;
+        let mut actual_state = match planned_state {
+            Some(planned) if planned.exists => {
+                let identifier = planned
+                    .identifier
+                    .as_deref()
+                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
+                    .ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "saved plan resource {} has no valid provider identifier; create a new plan before applying",
+                            resource.id
+                        ))
+                    })?;
+                provider
+                    .read(historical_id, &identifier, ReadRequest)
+                    .await
+                    .map_err(AppError::Provider)?
+                    .into_state()
+            }
+            Some(_) | None => State::not_found(historical_id.clone()),
+        };
         // The provider read uses the pre-move address, but every downstream
         // saved-plan map is keyed by the moved-to runtime address.
         actual_state.id = resource.id.clone();
@@ -1559,6 +1604,19 @@ async fn run_apply_locked_owned(
             };
         }
     };
+    if let Err(error) = prune_legacy_data_source_rows_persist_if_changed(
+        backend.as_ref(),
+        lock.as_ref(),
+        &mut state_file,
+        &parsed.data_sources,
+    )
+    .await
+    {
+        return LockCommandOutcome::Kept {
+            result: Err(error),
+            lock,
+        };
+    }
     let heartbeat_outcome =
         with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
             if let Some(state) = state_file.as_ref() {
@@ -1642,7 +1700,8 @@ async fn run_apply_locked_owned(
                 .unwrap_or_default();
 
             // Read states for all resources using identifier from state
-            // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
+            // An address with no state row is absent. A persisted row without
+            // an identifier stays present and invalid until planning reports it.
             // Skip composition resources (module attribute containers) — they have no infrastructure.
             RefreshProgress::start_header();
             let multi = refresh_multi_progress();
@@ -1676,13 +1735,14 @@ async fn run_apply_locked_owned(
                 stream::iter(sorted_resources.iter())
                     .map(|resource| {
                         let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                        let identifier = state_file
+                        let loaded = state_file
                             .as_ref()
-                            .and_then(|sf| sf.get_identifier_for_resource(resource));
+                            .map(|sf| sf.build_state_for_resource(&resource.id))
+                            .unwrap_or_else(|| ResourceStateLoad::absent(resource.id.clone()));
                         let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                         async move {
                             let mut state =
-                                read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                                refresh_loaded_resource_with_retry(provider_ref, loaded)
                                     .await
                                     .map_err(AppError::Provider)?;
                             if let Some(deps) = dep_bindings {
@@ -1715,30 +1775,28 @@ async fn run_apply_locked_owned(
             if let Some(sf) = state_file.as_ref() {
                 let desired_ids: HashSet<ResourceId> =
                     sorted_resources.iter().map(|r| r.id.clone()).collect();
-                orphans = sf.build_orphans(&desired_ids);
+                let loaded_orphans = sf.build_orphans(&desired_ids);
                 let orphan_results: Vec<
-                    Result<(ResourceId, carina_core::differ::Orphan), AppError>,
-                > = stream::iter(std::mem::take(&mut orphans))
-                    .map(|(id, orphan)| async move {
-                        let refreshed = read_with_retry(
-                            provider_ref,
-                            &id,
-                            orphan.state().identifier.as_deref(),
-                        )
-                        .await
-                        .map_err(AppError::Provider)?;
-                        Ok((id, orphan.with_refreshed_state(refreshed)))
+                    Result<(ResourceId, carina_state::OrphanStateLoad), AppError>,
+                > = stream::iter(loaded_orphans)
+                    .map(|(id, loaded)| async move {
+                        let refreshed = refresh_loaded_orphan_with_retry(provider_ref, loaded)
+                            .await
+                            .map_err(AppError::Provider)?;
+                        Ok((id, refreshed))
                     })
                     .buffer_unordered(5)
                     .collect()
                     .await;
+                let mut refreshed_orphans = carina_state::LoadedOrphans::default();
                 for result in orphan_results {
-                    let (id, orphan) = result?;
-                    if orphan.state().exists {
+                    let (id, loaded) = result?;
+                    if loaded.state().exists {
                         orphan_refreshed_ids.insert(id.clone());
                     }
-                    orphans.insert(orphan);
+                    refreshed_orphans.insert(loaded);
                 }
+                orphans = refreshed_orphans.into_plan_orphans();
             }
 
             // Hydrate, transfer state for moved blocks and anonymous → let-bound
@@ -2082,7 +2140,10 @@ async fn run_apply_locked_owned(
             crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
             block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
 
-            // Add state block effects (import/removed/moved) to the plan.
+            // Add state block effects (import/removed/moved) only after both
+            // identifier-error producers above. `removed` suppresses those
+            // errors; the missing-provider-identifier E2E pins this ordering
+            // for live apply as well as the ordinary plan path.
             // carina#3329: resolve `import { id = "${…}|…" }` interpolations
             // against the same binding view the resource-attribute resolver
             // uses. The empty `unresolved_upstream_bindings` set here just
@@ -2796,10 +2857,17 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 17 guarantees that
-    // state-originated secret placeholders came from structural secret tags;
-    // v16 may contain marker-shaped user strings that were misclassified and
-    // must be regenerated. Version 16 guarantees that unquoted wait RHS
+    // Validate version compatibility. Plan-file version 19 guarantees that
+    // mutation effects carry validated provider identifiers, update effects
+    // persist their identifier explicitly, and `removed` can record malformed
+    // deposed generations it abandons by key without serializing their known-
+    // invalid identifier. Version 18 included that redundant identifier and
+    // must be regenerated for the current shape. Version 17 lacks the update
+    // identifier field and must likewise be regenerated.
+    // Version 17 guaranteed that state-originated secret placeholders came
+    // from structural secret tags; v16 may contain marker-shaped user strings
+    // that were misclassified and must be regenerated. Version 16 guarantees
+    // that unquoted wait RHS
     // identifiers use the typed enum representation; v15
     // encoded them as Strings indistinguishable from intentionally quoted
     // comparisons and must be regenerated. Version 15 guarantees that secret
@@ -3040,6 +3108,7 @@ async fn run_apply_from_plan_locked_owned(
     }
 
     let project_dir = apply_target.source_dir();
+    let legacy_data_source_origins = inspected_plan.data_source_origins().to_vec();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
     // the apply lock so the carina#3283 warning text matches
@@ -3091,11 +3160,15 @@ async fn run_apply_from_plan_locked_owned(
         }
     }
 
-    // Persist an in-memory schema migration after the saved-plan lineage and
-    // serial checks, but before drift detection or secret verification can
-    // return early (carina#3315). The migration is independent of plan values
-    // and records only the state schema upgrade performed while reading.
-    if pending_migration.is_some()
+    // Typed `read` addresses are the only safe way to distinguish historical
+    // pre-#3181 data-source rows from malformed managed rows. Normalize those
+    // artifacts only after checking the saved plan against the original
+    // on-disk serial, then persist that cleanup together with any schema
+    // migration before drift detection can return early.
+    let removed_legacy_data_source_rows = state_file
+        .as_mut()
+        .is_some_and(|state| state.remove_legacy_data_source_rows(&legacy_data_source_origins) > 0);
+    if (pending_migration.is_some() || removed_legacy_data_source_rows)
         && let Some(state) = state_file.as_mut()
     {
         match lock.as_ref() {
