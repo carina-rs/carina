@@ -14,8 +14,8 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult};
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, PlanInputState, ResolvedDataSource, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
@@ -25,7 +25,7 @@ use crate::wait::augment::satisfier_augmentation;
 use crate::wait::find_wait_target_with_schema_kind;
 use crate::wait::predicate::resolve_wait_predicate;
 
-use super::{Diff, PlanPriorStates, diff};
+use super::{PlanPriorStates, PresentDiff, diff_present};
 
 pub(crate) struct PendingReplace {
     pub create: ResolvedResource,
@@ -226,19 +226,19 @@ pub fn generate_temporary_name(
 /// use std::collections::HashMap;
 /// use carina_core::differ::{Orphans, PlanPriorStates, create_plan};
 /// use carina_core::provider::RawSavedAttrs;
-/// use carina_core::resource::{Composition, ResourceId, State, into_plan_input_map};
+/// use carina_core::resource::{Composition, Current, ResourceId, into_plan_input_current_map};
 /// use carina_core::schema::SchemaRegistry;
 /// let compositions: Vec<Composition> = vec![];
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
-/// let states = HashMap::<ResourceId, State>::new();
-/// let plan_states = into_plan_input_map(states, &registry, &[]);
+/// let states = HashMap::<ResourceId, Current>::new();
+/// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let orphans = Orphans::new();
 /// let _ = create_plan(
 ///     &compositions,
 ///     &[],
 ///     &carina_core::provider::ProviderRouter::new(),
-///     PlanPriorStates::new(&plan_states, &orphans),
+///     PlanPriorStates::new(&plan_states, &HashMap::new(), &orphans),
 ///     &HashMap::new(),
 ///     &registry,
 ///     &saved_attrs,
@@ -248,14 +248,14 @@ pub fn generate_temporary_name(
 /// ```
 ///
 /// Raw [`State`] maps cannot be passed directly to planning. Callers must pair
-/// planning-ready current states and typed orphans in [`PlanPriorStates`],
+/// planning-ready managed current states and typed orphans in [`PlanPriorStates`],
 /// which lets the differ own same-id orphan promotion.
 ///
 /// ```compile_fail
 /// use std::collections::HashMap;
 /// use carina_core::differ::create_plan;
 /// use carina_core::provider::{ProviderRouter, RawSavedAttrs};
-/// use carina_core::resource::{ResolvedResource, ResourceId, State, into_plan_input_map};
+/// use carina_core::resource::{ResolvedResource, ResourceId, State};
 /// use carina_core::schema::SchemaRegistry;
 ///
 /// let resources: Vec<ResolvedResource> = vec![];
@@ -282,20 +282,20 @@ pub fn generate_temporary_name(
 /// use std::collections::HashMap;
 /// use carina_core::differ::{Orphans, PlanPriorStates, create_plan};
 /// use carina_core::provider::{ProviderRouter, RawSavedAttrs};
-/// use carina_core::resource::{ResolvedResource, ResourceId, State, into_plan_input_map};
+/// use carina_core::resource::{Current, ResolvedResource, ResourceId, into_plan_input_current_map};
 /// use carina_core::schema::SchemaRegistry;
 ///
 /// let resources: Vec<ResolvedResource> = vec![];
-/// let states = HashMap::<ResourceId, State>::new();
+/// let states = HashMap::<ResourceId, Current>::new();
 /// let orphans = Orphans::new();
 /// let registry = SchemaRegistry::default();
-/// let plan_states = into_plan_input_map(states, &registry, &[]);
+/// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let raw_saved_attrs = RawSavedAttrs::default();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
 ///     &ProviderRouter::new(),
-///     PlanPriorStates::new(&plan_states, &orphans),
+///     PlanPriorStates::new(&plan_states, &HashMap::new(), &orphans),
 ///     &HashMap::new(),
 ///     &registry,
 ///     &raw_saved_attrs,
@@ -315,12 +315,14 @@ pub fn create_plan(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<Plan> {
-    let current_states = prior_states.materialize_current_states(managed, registry);
+    let managed_current = prior_states.materialize_current_states(managed, registry);
+    let data_source_states = prior_states.data_source_states();
     let mut build = create_plan_parts(
         managed,
         data_sources,
         provider,
-        &current_states,
+        &managed_current,
+        data_source_states,
         registry,
         saved_attrs,
         prev_explicit,
@@ -345,12 +347,14 @@ pub fn create_plan_with_cascades(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<Plan> {
-    let current_states = prior_states.materialize_current_states(managed, registry);
+    let managed_current = prior_states.materialize_current_states(managed, registry);
+    let data_source_states = prior_states.data_source_states();
     let mut build = create_plan_parts(
         managed,
         data_sources,
         provider,
-        &current_states,
+        &managed_current,
+        data_source_states,
         registry,
         saved_attrs,
         prev_explicit,
@@ -361,7 +365,7 @@ pub fn create_plan_with_cascades(
         &mut build.plan,
         &mut build.pending_replaces,
         unresolved_managed,
-        &current_states,
+        &managed_current,
         registry,
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
@@ -379,7 +383,8 @@ fn create_plan_parts(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    data_source_states: &HashMap<ResourceId, State>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
@@ -404,22 +409,7 @@ fn create_plan_parts(
         let current = current_states
             .get(&resource.id)
             .cloned()
-            .unwrap_or_else(|| State::not_found(resource.id.clone()).into_plan_input());
-        let current_identifier = if current.as_state().exists {
-            match PlanError::require_provider_identifier(
-                &resource.id,
-                current.as_state().identifier.as_deref(),
-            ) {
-                Ok(identifier) => Some(identifier),
-                Err(error) => {
-                    plan.add_error(*error);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
+            .unwrap_or_else(|| PlanInputCurrent::absent(resource.id.clone()));
         let saved = saved_attrs.get(&resource.id);
         let prev_explicit_for_resource = prev_explicit.get(&resource.id);
         let schema = registry.get(
@@ -427,133 +417,106 @@ fn create_plan_parts(
             &resource.id.resource_type,
             SchemaKind::Resource,
         );
-        let d = diff(
-            resource,
-            current.as_state(),
-            saved,
-            prev_explicit_for_resource,
-            schema,
-        );
-
-        match d {
-            Diff::Create(r) => plan.add(Effect::Create(ResolvedResource::new(r))),
-            Diff::Update {
-                id,
-                from,
-                to,
-                changed_attributes,
-            } => {
-                // Filter out non-removable attribute removals.
-                // A "removal" is an attribute in changed_attributes that is not in `to`.
-                // Only attributes marked as `removable` in the schema should trigger removal.
-                let changed_attributes = filter_non_removable_removals(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    &to,
-                    changed_attributes,
-                    registry,
-                );
-
-                if changed_attributes.is_empty() {
-                    // All changes were spurious non-removable removals
-                    continue;
-                }
-
-                let Some(identifier) = current_identifier else {
-                    continue;
-                };
-
-                // Check if any changed attributes are create-only
-                let changed_create_only = find_changed_create_only(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    &changed_attributes,
-                    registry,
-                );
-
-                if let Some(changed_create_only) = ChangedCreateOnly::new(changed_create_only) {
-                    // Replace involves destroying the old resource
-                    if resource.directives.prevent_destroy {
-                        plan.add_error(PlanError::prevent_destroy(
-                            id.clone(),
-                            PreventDestroyAction::Replace,
-                        ));
-                        continue;
-                    }
-                    match pending_replace_from_parts(
-                        from,
-                        identifier,
-                        to,
-                        resource.directives.clone(),
-                        changed_create_only,
-                        Vec::new(),
-                        registry,
-                    ) {
-                        Ok(pending) => {
-                            pending_replaces.insert(resource_identity(&pending.create), pending);
-                        }
-                        Err(err) => plan.add_error(PlanError::new(id.clone(), err.into())),
-                    }
-                } else {
-                    plan.add(Effect::Update {
-                        from,
-                        identifier,
-                        to: ResolvedResource::new(to),
-                        changed_attributes,
-                    });
-                }
+        match current.current() {
+            Current::Absent(_absent) => plan.add(Effect::Create(resource.clone())),
+            Current::MissingIdentifier(_unidentified) => {
+                plan.add_error(PlanError::new(
+                    resource.id.clone(),
+                    PlanErrorKind::MissingProviderIdentifier,
+                ));
             }
-            Diff::NoChange(_) => {}
-            Diff::Delete(id) => {
-                if resource.directives.prevent_destroy {
-                    plan.add_error(PlanError::prevent_destroy(
-                        id.clone(),
-                        PreventDestroyAction::Delete,
-                    ));
-                    continue;
+            Current::Present(present) => {
+                match diff_present(resource, present, saved, prev_explicit_for_resource, schema) {
+                    PresentDiff::Update {
+                        id,
+                        from,
+                        to,
+                        changed_attributes,
+                    } => {
+                        let to = *to;
+                        // Filter out non-removable attribute removals.
+                        // A "removal" is an attribute in changed_attributes that is not in `to`.
+                        // Only attributes marked as `removable` in the schema should trigger removal.
+                        let changed_attributes = filter_non_removable_removals(
+                            &resource.id.provider,
+                            &resource.id.resource_type,
+                            &to,
+                            changed_attributes,
+                            registry,
+                        );
+
+                        if changed_attributes.is_empty() {
+                            continue;
+                        }
+
+                        let identifier = present.identifier().clone();
+                        let changed_create_only = find_changed_create_only(
+                            &resource.id.provider,
+                            &resource.id.resource_type,
+                            &changed_attributes,
+                            registry,
+                        );
+
+                        if let Some(changed_create_only) =
+                            ChangedCreateOnly::new(changed_create_only)
+                        {
+                            if resource.directives.prevent_destroy {
+                                plan.add_error(PlanError::prevent_destroy(
+                                    id.clone(),
+                                    PreventDestroyAction::Replace,
+                                ));
+                                continue;
+                            }
+                            match pending_replace_from_parts(
+                                from,
+                                identifier,
+                                to,
+                                resource.directives.clone(),
+                                changed_create_only,
+                                Vec::new(),
+                                registry,
+                            ) {
+                                Ok(pending) => {
+                                    pending_replaces
+                                        .insert(resource_identity(&pending.create), pending);
+                                }
+                                Err(err) => plan.add_error(PlanError::new(id, err.into())),
+                            }
+                        } else {
+                            plan.add(Effect::Update {
+                                from,
+                                identifier,
+                                to: ResolvedResource::new(to),
+                                changed_attributes,
+                            });
+                        }
+                    }
+                    PresentDiff::NoChange => {}
                 }
-                let Some(identifier) = current_identifier else {
-                    continue;
-                };
-                let directives = resource.directives.clone();
-                let binding = resource.binding.clone();
-                let dependencies = get_resource_dependencies(resource);
-                let explicit_dependencies =
-                    resource.directives.depends_on.iter().cloned().collect();
-                plan.add(Effect::Delete {
-                    id: ResolvedResourceId::new(id),
-                    identifier,
-                    generation: crate::effect::EffectGeneration::Current,
-                    directives,
-                    binding,
-                    dependencies,
-                    explicit_dependencies,
-                    blocked_by_updates: HashSet::new(),
-                });
             }
         }
     }
 
-    // Same-id managed orphans were materialized into `current_states` by
-    // `PlanPriorStates`; skip them here so only still-unmanaged orphans emit
-    // Deletes. Binding, directives, and provider state remain paired.
+    // Same-id managed orphans were materialized into the managed
+    // `PlanInputCurrent` map by `PlanPriorStates`; skip them here so only
+    // still-unmanaged orphans emit Deletes. Binding, directives, and provider
+    // state remain paired.
     let managed_ids: HashSet<&ResourceId> = managed.iter().map(|resource| &resource.id).collect();
     for (id, orphan) in orphans {
         if managed_ids.contains(id) {
             continue;
         }
-        let state = orphan.state();
-        if !state.exists {
-            continue;
-        }
-        let identifier =
-            match PlanError::require_provider_identifier(id, state.identifier.as_deref()) {
-                Ok(identifier) => identifier,
-                Err(error) => {
-                    plan.add_error(*error);
-                    continue;
-                }
-            };
+        let (state, identifier) = match orphan.current() {
+            Current::Absent(_state) => continue,
+            Current::Present(present) => (present.state(), present.identifier().clone()),
+            Current::MissingIdentifier(_state) => {
+                plan.add_error(PlanError::new(
+                    id.clone(),
+                    PlanErrorKind::MissingProviderIdentifier,
+                ));
+                continue;
+            }
+        };
         let directives = orphan.directives().clone();
         if directives.prevent_destroy {
             plan.add_error(PlanError::prevent_destroy(
@@ -707,10 +670,20 @@ fn create_plan_parts(
         //      attributes are stale, must re-poll; or
         //   3. the target is unchanged but its cached state does not yet
         //      satisfy the predicate (missing state ⇒ treat as work).
-        let wait_has_work = current_states
-            .get(&target_id)
-            .map(|plan_state| {
-                let state = plan_state.as_state();
+        let cached_state = match target_schema_kind {
+            SchemaKind::Resource => {
+                current_states
+                    .get(&target_id)
+                    .and_then(|current| match current.current() {
+                        Current::Absent(_absent) => None,
+                        Current::Present(present) => Some(present.state()),
+                        Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
+                    })
+            }
+            SchemaKind::DataSource => data_source_states.get(&target_id),
+        };
+        let wait_has_work = cached_state
+            .map(|state| {
                 let target_is_mutating = plan
                     .effects()
                     .iter()
@@ -959,7 +932,7 @@ fn cascade_dependent_updates(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
     unresolved_managed: &[ResolvedResource],
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
 ) {
     loop {
@@ -1051,7 +1024,7 @@ fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
     unresolved_managed: &[ResolvedResource],
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
 ) -> bool {
     let ref_targets = pending_reference_targets(pending_replaces, true);
@@ -1172,25 +1145,23 @@ fn promote_resource_to_pending_replace(
     resource: &Resource,
     changed_create_only: ChangedCreateOnly,
     ref_hints: Vec<(String, String)>,
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
 ) -> Option<PendingReplace> {
     let (from, identifier) = if let Some(update) = take_update_from_plan(plan, &resource.id) {
         update
     } else {
-        let from = current_states
-            .get(&resource.id)
-            .map(|state| Box::new(state.as_state().clone()))?;
-        if !from.exists {
-            return None;
-        }
-        let identifier = match PlanError::require_provider_identifier(
-            &resource.id,
-            from.identifier.as_deref(),
-        ) {
-            Ok(identifier) => identifier,
-            Err(error) => {
-                plan.add_error(*error);
+        let (from, identifier) = match current_states.get(&resource.id)?.current() {
+            Current::Absent(_state) => return None,
+            Current::Present(present) => (
+                Box::new(present.state().clone()),
+                present.identifier().clone(),
+            ),
+            Current::MissingIdentifier(_state) => {
+                plan.add_error(PlanError::new(
+                    resource.id.clone(),
+                    PlanErrorKind::MissingProviderIdentifier,
+                ));
                 return None;
             }
         };
@@ -1235,7 +1206,7 @@ fn ensure_consumer_update(
     plan: &mut Plan,
     resource: &Resource,
     changed_attributes: &[String],
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
 ) -> bool {
     if let Some(effect) = plan
         .effects_mut()
@@ -1266,25 +1237,20 @@ fn ensure_consumer_update(
         return false;
     }
 
-    let Some(from) = current_states
-        .get(&resource.id)
-        .map(|state| state.as_state().clone())
-    else {
+    let Some(current) = current_states.get(&resource.id) else {
         return false;
     };
-
-    if !from.exists {
-        return false;
-    }
-
-    let identifier =
-        match PlanError::require_provider_identifier(&resource.id, from.identifier.as_deref()) {
-            Ok(identifier) => identifier,
-            Err(error) => {
-                plan.add_error(*error);
-                return false;
-            }
-        };
+    let (from, identifier) = match current.current() {
+        Current::Absent(_state) => return false,
+        Current::Present(present) => (present.state().clone(), present.identifier().clone()),
+        Current::MissingIdentifier(_state) => {
+            plan.add_error(PlanError::new(
+                resource.id.clone(),
+                PlanErrorKind::MissingProviderIdentifier,
+            ));
+            return false;
+        }
+    };
 
     plan.add(Effect::Update {
         from: Box::new(from),
@@ -1293,4 +1259,72 @@ fn ensure_consumer_update(
         changed_attributes: changed_attributes.to_vec(),
     });
     true
+}
+
+#[cfg(test)]
+mod typed_current_identifier_tests {
+    use super::*;
+
+    fn current_with_authoritative_identifier(
+        resource: &Resource,
+    ) -> HashMap<ResourceId, PlanInputCurrent> {
+        let state = State::existing(resource.id.clone(), HashMap::new());
+        let identifier = crate::provider::fixture_applied_identifier("typed-provider-id");
+        crate::resource::into_plan_input_current_map(
+            HashMap::from([(
+                resource.id.clone(),
+                crate::resource::fixture_present_current(state, identifier),
+            )]),
+            &SchemaRegistry::new(),
+            std::slice::from_ref(resource),
+        )
+    }
+
+    #[test]
+    fn ensure_consumer_update_uses_identifier_carried_by_present_current() {
+        let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
+        let current = current_with_authoritative_identifier(&resource);
+        let mut plan = Plan::new();
+
+        assert!(ensure_consumer_update(
+            &mut plan,
+            &resource,
+            &["input".to_string()],
+            &current,
+        ));
+        let [
+            Effect::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            },
+        ] = plan.effects()
+        else {
+            panic!("expected one Update effect, got: {:?}", plan.effects());
+        };
+        assert_eq!(from.id, resource.id);
+        assert_eq!(identifier.as_str(), "typed-provider-id");
+        assert_eq!(to.id, resource.id);
+        assert_eq!(changed_attributes, &["input".to_string()]);
+    }
+
+    #[test]
+    fn pending_replace_promotion_uses_identifier_carried_by_present_current() {
+        let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
+        let current = current_with_authoritative_identifier(&resource);
+        let mut plan = Plan::new();
+
+        let pending = promote_resource_to_pending_replace(
+            &mut plan,
+            &resource,
+            ChangedCreateOnly::new(vec!["input".to_string()]).expect("non-empty change set"),
+            Vec::new(),
+            &current,
+            &SchemaRegistry::new(),
+        )
+        .expect("present current state can be promoted");
+
+        assert_eq!(pending.delete.identifier.as_str(), "typed-provider-id");
+    }
 }

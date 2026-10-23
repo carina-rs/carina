@@ -34,6 +34,68 @@ fn planned_secret_hashes(resources: &[Resource]) -> PlannedSecretHashes {
 
 pub(crate) type HistoricalResourceAddresses = MovedOrigins;
 
+struct HistoricalStateVerifier<'a> {
+    provider: &'a dyn Provider,
+    actual_states: &'a mut HashMap<ResourceId, State>,
+    verified_planned_states: &'a mut HashMap<ResourceId, State>,
+    historical_addresses: &'a HistoricalResourceAddresses,
+    apply_target: ApplyTarget<'a>,
+}
+
+impl HistoricalStateVerifier<'_> {
+    async fn verify(
+        &mut self,
+        id: &ResourceId,
+        state: &State,
+        provider_identifier: Option<&AppliedIdentifier>,
+    ) -> Result<Option<State>, AppError> {
+        if !state
+            .attributes
+            .values()
+            .any(carina_core::value::contains_redacted_secret)
+        {
+            return Ok(None);
+        }
+
+        if let Some(verified) = self.verified_planned_states.get(id) {
+            return Ok(Some(verified.clone()));
+        }
+
+        // Orphans do not participate in ordinary drift reads. Read them here
+        // because their historical secret still needs verification.
+        if !self.actual_states.contains_key(id) {
+            let historical_id = self.historical_addresses.origin_for(id);
+            let identifier = provider_identifier.ok_or_else(|| {
+                AppError::Validation(format!(
+                    "saved plan resource {id} has no valid provider identifier; create a new plan before applying"
+                ))
+            })?;
+            let mut actual = self
+                .provider
+                .read(historical_id, identifier, ReadRequest)
+                .await
+                .map_err(AppError::Provider)?
+                .into_state();
+            if !actual.exists {
+                return Err(super::saved_plan_secret_orphan_vanished_error(
+                    id.to_string(),
+                    self.apply_target,
+                ));
+            }
+            actual.id = id.clone();
+            self.actual_states.insert(id.clone(), actual);
+        }
+        let actual = self.actual_states.get(id).ok_or_else(|| {
+            super::saved_plan_secret_shape_error(id.to_string(), self.apply_target)
+        })?;
+        let verified = carina_core::value::rehydrate_state_secrets_from_plaintext(state, actual)
+            .map_err(|error| saved_plan_secret_rehydration_error(error, self.apply_target))?;
+        self.verified_planned_states
+            .insert(id.clone(), verified.clone());
+        Ok(Some(verified))
+    }
+}
+
 /// Result of the one typed placeholder inventory performed after decoding.
 ///
 /// Both payload fields are private. The parent apply module can inspect only
@@ -214,59 +276,59 @@ impl DesiredVerifiedPlanFile {
             .plan_file
             .current_states
             .iter()
-            .map(|entry| (entry.id.clone(), entry.state.clone()))
-            .collect();
-        for entry in &mut self.plan_file.current_states {
-            if !entry
-                .state
-                .attributes
-                .values()
-                .any(carina_core::value::contains_redacted_secret)
-            {
-                continue;
-            }
-
-            if let Some(verified) = verified_planned_states.get(&entry.id) {
-                entry.state = verified.clone();
-                continue;
-            }
-
-            // Orphans do not participate in ordinary drift reads. Read them
-            // here because their historical secret still needs verification.
-            if !actual_states.contains_key(&entry.id) {
-                let historical_id = historical_addresses.origin_for(&entry.id);
-                let identifier = entry
-                    .state
-                    .identifier
-                    .as_deref()
-                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
-                    .ok_or_else(|| {
-                        AppError::Validation(format!(
-                            "saved plan resource {} has no valid provider identifier; create a new plan before applying",
-                            entry.id
-                        ))
-                    })?;
-                let mut actual = provider
-                    .read(historical_id, &identifier, ReadRequest)
-                    .await
-                    .map_err(AppError::Provider)?
-                    .into_state();
-                if !actual.exists {
-                    return Err(super::saved_plan_secret_orphan_vanished_error(
-                        entry.id.to_string(),
-                        apply_target,
-                    ));
+            .map(|entry| match entry {
+                CurrentStateEntry::Managed { id, current } => {
+                    let state = match current {
+                        carina_core::resource::Current::Absent(state) => state.state(),
+                        carina_core::resource::Current::Present(present) => present.state(),
+                        carina_core::resource::Current::MissingIdentifier(state) => state.state(),
+                    };
+                    (id.clone(), state.clone())
                 }
-                actual.id = entry.id.clone();
-                actual_states.insert(entry.id.clone(), actual);
+                CurrentStateEntry::DataSource { id, state } => (id.clone(), state.clone()),
+            })
+            .collect();
+        {
+            let mut verifier = HistoricalStateVerifier {
+                provider,
+                actual_states,
+                verified_planned_states,
+                historical_addresses,
+                apply_target,
+            };
+            for entry in &mut self.plan_file.current_states {
+                match entry {
+                    CurrentStateEntry::Managed { id, current } => {
+                        let verified = match &*current {
+                            carina_core::resource::Current::Absent(state) => {
+                                verifier.verify(id, state.state(), None).await?
+                            }
+                            carina_core::resource::Current::Present(present) => {
+                                verifier
+                                    .verify(id, present.state(), Some(present.identifier()))
+                                    .await?
+                            }
+                            carina_core::resource::Current::MissingIdentifier(state) => {
+                                verifier.verify(id, state.state(), None).await?
+                            }
+                        };
+                        if let Some(verified) = verified {
+                            *current.attributes_mut() = verified.attributes;
+                        }
+                    }
+                    CurrentStateEntry::DataSource { id, state } => {
+                        let identifier = state
+                            .identifier
+                            .as_deref()
+                            .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
+                        if let Some(verified) =
+                            verifier.verify(id, state, identifier.as_ref()).await?
+                        {
+                            *state = verified;
+                        }
+                    }
+                }
             }
-            let actual = actual_states.get(&entry.id).ok_or_else(|| {
-                super::saved_plan_secret_shape_error(entry.id.to_string(), apply_target)
-            })?;
-            entry.state =
-                carina_core::value::rehydrate_state_secrets_from_plaintext(&entry.state, actual)
-                    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-            verified_planned_states.insert(entry.id.clone(), entry.state.clone());
         }
         self.plan_file.plan =
             carina_core::value::rehydrate_plan_historical_secrets_from_verified_states(

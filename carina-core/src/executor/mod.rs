@@ -43,8 +43,8 @@ use crate::provider::{
     PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer, ProviderReadyDataSource,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, ResolvedResource,
-    Resource, ResourceId, State, UnknownReason, Value,
+    AccessPath, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
+    ResolvedResource, Resource, ResourceId, State, UnknownReason, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -68,7 +68,8 @@ pub struct ExecutionInput<'a> {
     /// followed through the composition's own attribute refs (#2543).
     pub compositions: &'a [crate::resource::Composition],
     pub bindings: ResolvedBindings,
-    pub current_states: HashMap<ResourceId, State>,
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_states: HashMap<ResourceId, State>,
     /// Data-source `Read` effects whose input refs depend on upstream
     /// apply-time publication, even when the referenced attribute value was
     /// computable from desired config during refresh.
@@ -194,7 +195,7 @@ pub struct UnresolvedDataSourceInput {
 
 /// Explicit classification for data-source reads that the apply
 /// executor must run at runtime. A read absent from this set is a
-/// pre-apply read: refresh has already populated `current_states`, so
+/// pre-apply read: refresh has already populated `data_source_states`, so
 /// the executor should keep treating its `Effect::Read` as a no-op.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeferredDataSourceReads {
@@ -320,7 +321,8 @@ pub struct ExecutionResult {
     pub runtime_synthesized_resources: Vec<ResolvedResource>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
-    pub current_states: HashMap<ResourceId, State>,
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_states: HashMap<ResourceId, State>,
     pub bindings: ResolvedBindings,
     pub failed_refreshes: HashSet<ResourceId>,
 }

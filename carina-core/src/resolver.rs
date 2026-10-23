@@ -12,8 +12,8 @@ use crate::binding_index::{BindingValueSource, ResolvedBindings};
 use crate::resource::State;
 use crate::resource::{
     AccessMissPolicy, Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart,
-    PlanInputState, Resource, ResourceId, Value, ValuePathSegmentResult, apply_value_path_segment,
-    contains_resource_ref,
+    PlanInputCurrent, Resource, ResourceId, Value, ValuePathSegmentResult,
+    apply_value_path_segment, contains_resource_ref,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -31,14 +31,15 @@ use crate::resource::{
 /// to their attributes. For example, `network -> { vpc -> { vpc_id -> "vpc-123" } }`.
 pub fn resolve_refs_with_state(
     resources: &mut [Resource],
-    current_states: &HashMap<ResourceId, PlanInputState>,
+    managed_current: &HashMap<ResourceId, PlanInputCurrent>,
 ) -> Result<(), String> {
     let bindings =
         crate::binding_index::ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
             data_sources: &[],
-            current_states,
+            managed_current,
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -624,7 +625,8 @@ mod tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         })
@@ -650,7 +652,7 @@ mod tests {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
     ) -> Result<(), String> {
-        let plan_input_states = crate::resource::into_plan_input_map(
+        let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -659,7 +661,8 @@ mod tests {
             managed: resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &plan_input_states,
+            managed_current: &plan_input_states,
+            data_source_states: &HashMap::new(),
             remote_bindings,
             wait_aliases,
         });
@@ -674,7 +677,7 @@ mod tests {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
     ) -> Result<(), String> {
-        let plan_input_states = crate::resource::into_plan_input_map(
+        let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -683,7 +686,8 @@ mod tests {
             managed: resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &plan_input_states,
+            managed_current: &plan_input_states,
+            data_source_states: &HashMap::new(),
             remote_bindings,
             wait_aliases,
         });
@@ -1421,7 +1425,7 @@ mod tests {
 
         resolve_refs_with_state(
             &mut resources,
-            &crate::resource::into_plan_input_map(
+            &crate::resource::into_plan_input_current_map_from_states(
                 current_states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
@@ -1935,7 +1939,7 @@ mod tests {
         let current_states: HashMap<ResourceId, State> = HashMap::new();
         let result = resolve_refs_with_state(
             &mut resources,
-            &crate::resource::into_plan_input_map(
+            &crate::resource::into_plan_input_current_map_from_states(
                 current_states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
@@ -2646,7 +2650,8 @@ mod tests {
             managed: &[cert],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: crate::parser::BindingName::new("cert_issued"),
@@ -2675,7 +2680,8 @@ mod tests {
             managed: &[],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: crate::parser::BindingName::new("cert_issued"),

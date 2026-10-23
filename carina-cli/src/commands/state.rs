@@ -8,7 +8,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::into_all_prior_states;
+use carina_core::differ::{
+    Orphan, Orphans, into_all_prior_states, lift_prior_state_enum_leaves,
+    transform_prior_provider_states,
+};
 use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
@@ -18,7 +21,7 @@ use carina_core::provider::{
     ProviderNormalizer, RawSavedAttrs,
 };
 use carina_core::resource::{
-    DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
+    Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
     ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
@@ -29,8 +32,8 @@ use carina_core::value::format_value;
 use carina_state::LockInfo;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LoadedOrphans,
-    OrphanStateLoad, ResourceState, ResourceStateLoad, StateBackend, StateFile, StateUrl,
-    create_backend, create_remote_backend, load_state_from_url, resolve_backend_for_read,
+    ResourceState, StateBackend, StateFile, StateUrl, create_backend, create_remote_backend,
+    load_state_from_url, resolve_backend_for_read,
 };
 
 use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
@@ -481,13 +484,13 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
             rs.directives.provider_instance.clone(),
         );
         match state.build_state_for_resource(&id) {
-            ResourceStateLoad::Absent(_) => {
+            Current::Absent(_state) => {
                 lines.push(format!("{row_prefix}  (no current instance)"));
             }
-            ResourceStateLoad::MissingProviderIdentifier(_) => {
+            Current::MissingIdentifier(_state) => {
                 lines.push(format!("{row_prefix}  (missing provider identifier)"));
             }
-            ResourceStateLoad::Present(_) => lines.push(row_prefix.clone()),
+            Current::Present(_present) => lines.push(row_prefix.clone()),
         }
         for deposed in &rs.deposed {
             lines.push(format!(
@@ -1147,6 +1150,7 @@ async fn run_state_refresh_locked_with_ctx(
         reconcile_anonymous_identifiers_with_ctx(
             ctx,
             &mut parsed.resources,
+            &parsed.data_sources,
             sf,
             &state_block_claims,
         )?;
@@ -1179,27 +1183,28 @@ async fn run_state_refresh_locked_with_ctx(
     // Read states for all resources using identifier from state.
     // Cancel stops dispatching new reads, then waits for in-flight reads to finish
     // so provider futures are not dropped mid-call.
-    let mut current_states = HashMap::new();
+    let mut managed_current = HashMap::new();
+    let mut data_source_states = HashMap::new();
     let mut managed_reads = Vec::new();
     let mut missing_provider_identifier_ids = HashSet::new();
     if let Some(state_file) = state_file.as_ref() {
         for resource in &sorted_resources {
             match state_file.build_state_for_resource(&resource.id) {
-                ResourceStateLoad::Present(present) => {
+                Current::Present(present) => {
                     managed_reads.push((resource.id.clone(), present.identifier().clone()));
                 }
-                ResourceStateLoad::MissingProviderIdentifier(state) => {
+                Current::MissingIdentifier(state) => {
                     warn_missing_provider_identifier(&resource.id);
                     missing_provider_identifier_ids.insert(resource.id.clone());
-                    current_states.insert(resource.id.clone(), state);
+                    managed_current.insert(resource.id.clone(), Current::MissingIdentifier(state));
                 }
-                ResourceStateLoad::Absent(_) => {}
+                Current::Absent(_state) => {}
             }
         }
     }
     let (managed_states, mut already_refreshed) =
         refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
-    current_states.extend(managed_states);
+    managed_current.extend(managed_states);
     match cancel.phase() {
         ShutdownPhase::Running => {}
         ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -1220,9 +1225,13 @@ async fn run_state_refresh_locked_with_ctx(
     let (refreshed_orphans, refreshed_orphan_ids) =
         refresh_orphans_until_cancelled(&provider, loaded_orphans, &cancel).await?;
     for (id, loaded) in refreshed_orphans.iter() {
-        if matches!(loaded, OrphanStateLoad::MissingProviderIdentifier(_)) {
-            warn_missing_provider_identifier(id);
-            missing_provider_identifier_ids.insert(id.clone());
+        match loaded.current() {
+            Current::Absent(_state) => {}
+            Current::Present(_present) => {}
+            Current::MissingIdentifier(_state) => {
+                warn_missing_provider_identifier(id);
+                missing_provider_identifier_ids.insert(id.clone());
+            }
         }
     }
     let mut orphans = refreshed_orphans.into_plan_orphans();
@@ -1231,7 +1240,7 @@ async fn run_state_refresh_locked_with_ctx(
     // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
     // way `run_apply_locked` does, so the materialised children land
     // in `sorted_resources` (and therefore in the orphan-classification
-    // `desired_ids` set below + the `lift_current_state_enum_leaves`
+    // `desired_ids` set below + the `lift_prior_state_enum_leaves`
     // input slice). Without this, every for-loop-produced resource is
     // mis-classified as `(orphan)` on refresh and its enum-typed attrs
     // skip the Enum lift, surfacing snake_case ↔ SCREAMING_CASE
@@ -1258,7 +1267,8 @@ async fn run_state_refresh_locked_with_ctx(
         .unwrap_or_default()
         .lift(ctx.schemas());
     crate::wiring::hydrate_prior_states(
-        &mut current_states,
+        &mut managed_current,
+        &mut data_source_states,
         &mut orphans,
         &provider,
         &saved_attrs_for_expansion,
@@ -1294,7 +1304,8 @@ async fn run_state_refresh_locked_with_ctx(
         parsed,
         provider: &provider,
         sorted_resources: &sorted_resources,
-        current_states: &mut current_states,
+        managed_current: &mut managed_current,
+        data_source_states: &mut data_source_states,
         orphans: &mut orphans,
         remote_bindings: &HashMap::new(),
         wait_aliases: &wait_aliases_for_expansion,
@@ -1324,10 +1335,10 @@ async fn run_state_refresh_locked_with_ctx(
         .cloned()
         .map(ResolvedResourceId::new)
         .collect();
-    current_states = into_all_prior_states(orphans, current_states);
+    managed_current = into_all_prior_states(orphans, managed_current);
 
     // carina#3271: re-read every `read aws.*` data source. Without
-    // this, `current_states` has no entry for any data source and
+    // this, `data_source_states` has no entry for any data source and
     // the downstream post-apply export resolver (after #3266) cannot resolve
     // `<data_source>.<attr>` references in `exports {}`, so
     // `state.exports` keeps the pre-refresh literal for any export
@@ -1336,7 +1347,7 @@ async fn run_state_refresh_locked_with_ctx(
     // Mirrors the data-source phase of `run_apply_locked`
     // (`resolve_data_source_refs_for_refresh` + `read_data_source_with_retry`):
     // resolve input attribute `ResourceRef`s against the
-    // already-refreshed managed `current_states`, then read each
+    // already-refreshed `managed_current`, then read each
     // data source through the provider.
     if !parsed.data_sources.is_empty() {
         let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
@@ -1349,7 +1360,8 @@ async fn run_state_refresh_locked_with_ctx(
             &sorted_resources,
             &parsed.compositions,
             &parsed.data_sources,
-            &current_states,
+            &managed_current,
+            &data_source_states,
             &empty_remote_bindings,
             ctx.schemas(),
             &wait_aliases,
@@ -1363,7 +1375,8 @@ async fn run_state_refresh_locked_with_ctx(
             &sorted_resources,
             &parsed.compositions,
             &parsed.data_sources,
-            &current_states,
+            &managed_current,
+            &data_source_states,
             &empty_remote_bindings,
             ctx.schemas(),
             &wait_aliases,
@@ -1403,23 +1416,40 @@ async fn run_state_refresh_locked_with_ctx(
                     return Err(AppError::Interrupted);
                 }
             }
-            current_states.insert(resource.id.clone(), fresh_state);
+            data_source_states.insert(resource.id.clone(), fresh_state);
         }
     }
 
-    // Restore unreturned attributes from the same lifted map used by the
+    // Restore managed attributes from the same lifted map used by the
     // expansion hydration above (CloudControl doesn't always return them).
+    // Data sources have no persisted rows and therefore hydrate against an
+    // empty saved-attribute set even when a managed orphan shares their ID.
     let saved_attrs = saved_attrs_for_expansion;
-    provider
-        .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-        .await?;
-    // awscc#251: also lift the provider-read `current_states` (not just
+    transform_prior_provider_states(
+        &mut managed_current,
+        &mut data_source_states,
+        &mut Orphans::new(),
+        async |states| {
+            provider
+                .hydrate_read_state(states, saved_attrs.as_provider_saved_attrs())
+                .await
+        },
+        async |states| {
+            let empty_saved_attrs = carina_core::provider::SavedAttrs::new();
+            provider
+                .hydrate_read_state(states, &empty_saved_attrs)
+                .await
+        },
+    )
+    .await?;
+    // awscc#251: also lift the provider-read managed current states (not just
     // `saved_attrs`) — the values read at the refresh loop above arrive
     // as plain `String` for IAM enum fields and must be lifted before
     // they are written back / compared.
     // carina#3272: same `sorted_resources` reason as above.
-    carina_core::utils::lift_current_state_enum_leaves(
-        &mut current_states,
+    lift_prior_state_enum_leaves(
+        &mut managed_current,
+        &mut Orphans::new(),
         &sorted_resources,
         ctx.schemas(),
     );
@@ -1436,13 +1466,13 @@ async fn run_state_refresh_locked_with_ctx(
         if missing_provider_identifier_ids.contains(&resource.id) {
             continue;
         }
-        let fresh_state = match current_states.get(&resource.id) {
-            Some(s) => s,
+        let fresh_current = match managed_current.get(&resource.id) {
+            Some(current) => current,
             None => continue, // Not in state, skip
         };
         diff_display_update_resource(
             &resource.resolved_id(),
-            fresh_state,
+            fresh_current,
             &mut state,
             Some(resource),
             ctx.schemas(),
@@ -1456,13 +1486,13 @@ async fn run_state_refresh_locked_with_ctx(
         if missing_provider_identifier_ids.contains(orphan_id.as_inner()) {
             continue;
         }
-        let fresh_state = match current_states.get(orphan_id.as_inner()) {
-            Some(s) => s,
+        let fresh_current = match managed_current.get(orphan_id.as_inner()) {
+            Some(current) => current,
             None => continue,
         };
         diff_display_update_resource(
             orphan_id,
-            fresh_state,
+            fresh_current,
             &mut state,
             None,
             ctx.schemas(),
@@ -1499,7 +1529,8 @@ async fn run_state_refresh_locked_with_ctx(
         // re-resolution needs (#3169 / #3177).
         let post_apply_states =
             crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
-                &current_states,
+                &managed_current,
+                &data_source_states,
                 &state,
             );
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
@@ -1592,8 +1623,8 @@ async fn refresh_existing_resources_until_cancelled(
     provider: &dyn Provider,
     reads: Vec<(ResourceId, AppliedIdentifier)>,
     cancel: &ShutdownToken,
-) -> Result<(HashMap<ResourceId, State>, HashSet<ResourceId>), AppError> {
-    let mut current_states = HashMap::new();
+) -> Result<(HashMap<ResourceId, Current>, HashSet<ResourceId>), AppError> {
+    let mut managed_current = HashMap::new();
     let mut refreshed = HashSet::new();
     let mut read_iter = reads.into_iter();
     let mut in_flight = FuturesUnordered::new();
@@ -1675,7 +1706,7 @@ async fn refresh_existing_resources_until_cancelled(
 
         let (id, state) = result?;
         refreshed.insert(id.clone());
-        current_states.insert(id, state);
+        managed_current.insert(id, Current::from_state(state));
     }
 
     drop(in_flight);
@@ -1685,7 +1716,7 @@ async fn refresh_existing_resources_until_cancelled(
         return Err(AppError::Interrupted);
     }
 
-    Ok((current_states, refreshed))
+    Ok((managed_current, refreshed))
 }
 
 async fn refresh_orphans_until_cancelled(
@@ -1717,7 +1748,11 @@ async fn refresh_orphans_until_cancelled(
             let Some((id, loaded)) = entries.next() else {
                 break;
             };
-            let provider_read = matches!(&loaded, OrphanStateLoad::Present { .. });
+            let provider_read = match loaded.current() {
+                Current::Absent(_state) => false,
+                Current::Present(_present) => true,
+                Current::MissingIdentifier(_state) => false,
+            };
             in_flight.push(async move {
                 let loaded = refresh_loaded_orphan_with_retry(provider, loaded)
                     .await
@@ -1757,7 +1792,7 @@ async fn refresh_orphans_until_cancelled(
                 }
             }
         };
-        let result: Result<(ResourceId, OrphanStateLoad, bool), AppError> = match next {
+        let result: Result<(ResourceId, Orphan, bool), AppError> = match next {
             CleanupInterrupted::Completed(Some(result)) => result,
             CleanupInterrupted::Completed(None) => break,
             CleanupInterrupted::Abandoned => {
@@ -2039,15 +2074,16 @@ where
     P: ProviderNormalizer + ?Sized,
 {
     let mut states = HashMap::from([(target.id.as_inner().clone(), fresh_state.clone())]);
-    let resources = std::slice::from_ref(resource.as_resource());
     let saved_attrs = deposed_saved_attrs(target).lift(schemas);
     provider
         .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
         .await?;
-    carina_core::utils::lift_current_state_enum_leaves(&mut states, resources, schemas);
 
     if let Some(normalized) = states.remove(target.id.as_inner()) {
         *fresh_state = normalized;
+    }
+    if let Some(schema) = schemas.get_for(resource.as_resource()) {
+        carina_core::utils::lift_state_enum_leaves(&mut fresh_state.attributes, schema);
     }
     Ok(())
 }
@@ -2075,13 +2111,18 @@ struct StateRefreshCounts {
 
 fn diff_display_update_resource(
     id: &ResolvedResourceId,
-    fresh_state: &State,
+    fresh_current: &Current,
     state: &mut carina_state::StateFile,
     resource: Option<&ResolvedResource>,
     schemas: &carina_core::schema::SchemaRegistry,
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
+    let (fresh_state, exists) = match fresh_current {
+        Current::Absent(absent) => (absent.state(), false),
+        Current::Present(present) => (present.state(), true),
+        Current::MissingIdentifier(unidentified) => (unidentified.state(), true),
+    };
     let identity = id.identity();
     let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_str());
     let existing_rs = match existing {
@@ -2089,7 +2130,7 @@ fn diff_display_update_resource(
         None => return Ok(()),
     };
 
-    let refreshed_resource_state = if fresh_state.exists {
+    let refreshed_resource_state = if exists {
         match resource {
             Some(resource) => {
                 let schema = schemas.get_for(resource);
@@ -2152,7 +2193,7 @@ fn diff_display_update_resource(
     let mut has_changes = false;
     let mut changes: Vec<String> = Vec::new();
 
-    if !fresh_state.exists {
+    if !exists {
         // Resource was deleted externally
         has_changes = true;
         changes.push(format!("    {} resource no longer exists", "-".red()));
@@ -3170,19 +3211,20 @@ mod tests {
             .expect("source resource");
         let mut current_states = HashMap::from([(
             source.id.clone(),
-            State::existing(
+            Current::from_state(State::existing(
                 source.id.clone(),
                 HashMap::from([(
                     "items".to_string(),
                     Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
                 )]),
-            ),
+            )),
         )]);
 
         let preview = crate::wiring::expand_same_config_deferred_for(
             &parsed,
             &sorted_resources,
             &current_states,
+            &HashMap::new(),
             &SchemaRegistry::new(),
             &HashMap::new(),
             &[],
@@ -3249,12 +3291,14 @@ mod tests {
         let state_file = Some(state_file);
         let multi =
             indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let mut data_source_states = HashMap::new();
         let expanded = crate::wiring::expand_refresh_and_lift_states(
             crate::wiring::ExpandRefreshAndLiftInputs {
                 parsed: &parsed,
                 provider: &provider,
                 sorted_resources: &sorted_resources,
-                current_states: &mut current_states,
+                managed_current: &mut current_states,
+                data_source_states: &mut data_source_states,
                 orphans: &mut orphans,
                 remote_bindings: &HashMap::new(),
                 wait_aliases: &[],
@@ -4272,7 +4316,7 @@ mod tests {
 
         diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
-            &fresh,
+            &Current::from_state(fresh.clone()),
             &mut state,
             None,
             &SchemaRegistry::new(),
@@ -4327,7 +4371,7 @@ mod tests {
             &[],
             &[],
             &carina_core::provider::ProviderRouter::new(),
-            carina_core::differ::PlanPriorStates::new(&HashMap::new(), &orphans),
+            carina_core::differ::PlanPriorStates::new(&HashMap::new(), &HashMap::new(), &orphans),
             &state.build_directives(),
             &SchemaRegistry::new(),
             &RawSavedAttrs::default().lift(&SchemaRegistry::new()),
@@ -4364,7 +4408,7 @@ mod tests {
 
         diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
-            &fresh,
+            &Current::from_state(fresh.clone()),
             &mut state,
             None,
             &SchemaRegistry::new(),
@@ -4419,7 +4463,7 @@ mod tests {
 
         diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
-            &fresh,
+            &Current::from_state(fresh.clone()),
             &mut state,
             None,
             &SchemaRegistry::new(),
@@ -4443,7 +4487,7 @@ mod tests {
 
         diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
-            &fresh,
+            &Current::from_state(fresh.clone()),
             &mut state,
             None,
             &SchemaRegistry::new(),
@@ -4490,7 +4534,7 @@ mod tests {
 
         diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
-            &fresh,
+            &Current::from_state(fresh.clone()),
             &mut state,
             Some(&resolved(desired.clone())),
             &schemas,
@@ -4530,7 +4574,7 @@ mod tests {
 
         diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
-            &fresh,
+            &Current::from_state(fresh.clone()),
             &mut state,
             Some(&resolved(desired)),
             &schemas,
@@ -4848,7 +4892,7 @@ mod tests {
 
         diff_display_update_resource(
             &ResolvedResourceId::new(id.clone()),
-            &fresh,
+            &Current::from_state(fresh.clone()),
             &mut state,
             Some(&resolved(desired.clone())),
             &SchemaRegistry::new(),

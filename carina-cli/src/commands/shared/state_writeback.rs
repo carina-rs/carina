@@ -13,8 +13,8 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesF
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::PersistedAttributes;
 use carina_core::resource::{
-    ConcreteValue, DefaultTagKeys, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
-    State, Value,
+    ConcreteValue, Current, DefaultTagKeys, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -82,38 +82,38 @@ pub(crate) fn queue_state_refresh(
 ///    consulting `state.resources` alone leaves any
 ///    `<data_source>.<attr>` reference in `exports {}` unresolved
 ///    (carina#3266, carina#3271).
-/// 2. `current_states` holds the live execution view — every
-///    resource read this run, including data sources. For managed
-///    resources it may still carry the **pre-apply** snapshot
+/// 2. `managed_current` and `data_source_states` together hold the live
+///    execution view. For managed resources, `managed_current` may still
+///    carry the **pre-apply** snapshot
 ///    (whatever the executor read at refresh time, before the apply
 ///    mutation ran), so the post-apply attribute values in
 ///    `state.resources` must win on key collision.
 ///
-/// The single correct merge is therefore: seed from
-/// `current_states.clone()` (so data sources survive), then overlay
-/// entries derived from `state.resources` (so managed
-/// post-apply values win). Earlier ad-hoc call sites that built
-/// `current_states` HashMaps by hand re-introduced the bug each
-/// time they forgot one half of the merge; this newtype forces the
-/// merge to happen exactly once, in
+/// The single correct merge is therefore: preserve the transient data-source
+/// map, clone `managed_current`, then overlay entries derived from
+/// `state.resources` so managed post-apply values win. Earlier ad-hoc call
+/// sites re-introduced the bug each time they forgot one half of the merge;
+/// this newtype forces the merge to happen exactly once, in
 /// [`PostApplyStates::from_current_and_state`].
 #[derive(Debug, Clone)]
 pub(crate) struct PostApplyStates {
-    map: HashMap<ResourceId, carina_core::resource::State>,
+    managed_current: HashMap<ResourceId, Current>,
+    data_source_states: HashMap<ResourceId, State>,
 }
 
 impl PostApplyStates {
-    /// Build the post-apply view from the live execution `current_states`
-    /// (with data-source read results) and the `StateFile` whose
+    /// Build the post-apply view from the live managed and data-source maps
+    /// and the `StateFile` whose
     /// `state.resources` was just rewritten by the apply writeback.
     ///
     /// State-derived managed entries win on key collision (see the
     /// type-level doc-comment for why).
     pub(crate) fn from_current_and_state(
-        current_states: &HashMap<ResourceId, carina_core::resource::State>,
+        managed_current: &HashMap<ResourceId, Current>,
+        data_source_states: &HashMap<ResourceId, State>,
         state: &StateFile,
     ) -> Self {
-        let mut map = current_states.clone();
+        let mut managed_current = managed_current.clone();
         for rs in state.resources() {
             let identity = rs.identity.clone();
             let id = ResourceId::with_provider_identity(
@@ -122,20 +122,30 @@ impl PostApplyStates {
                 identity,
                 rs.directives.provider_instance.clone(),
             );
-            let attrs = rs.persisted_attributes().to_values();
-            map.insert(
-                id.clone(),
-                carina_core::resource::State::existing(id, attrs),
-            );
+            let current = if rs.has_current_instance() {
+                let mut row_state =
+                    State::existing(id.clone(), rs.persisted_attributes().to_values());
+                if let Some(identifier) = &rs.identifier {
+                    row_state.identifier = Some(identifier.clone());
+                }
+                Current::from_state(row_state)
+            } else {
+                Current::absent(id.clone())
+            };
+            managed_current.insert(id, current);
         }
-        Self { map }
+        Self {
+            managed_current,
+            data_source_states: data_source_states.clone(),
+        }
     }
 
-    /// Borrow the underlying storage-form map. Callers that feed this
-    /// into binding resolution must convert it through
-    /// `into_plan_input_map` at that boundary.
-    pub(crate) fn as_map(&self) -> &HashMap<ResourceId, carina_core::resource::State> {
-        &self.map
+    pub(crate) fn managed_current(&self) -> &HashMap<ResourceId, Current> {
+        &self.managed_current
+    }
+
+    pub(crate) fn data_source_states(&self) -> &HashMap<ResourceId, State> {
+        &self.data_source_states
     }
 }
 
@@ -151,14 +161,12 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// export-resolution binding view so `exports { x = some_read.attr }`
     /// resolves (carina#3181).
     pub data_sources: &'a [carina_core::resource::DataSource],
-    /// Live execution view of every resource read this run, including
-    /// data-source results. Forwarded to `resolve_export_values_post_apply` so a
-    /// `<data_source>.<attr>` export reference can resolve against
-    /// the provider-read attributes — `state.resources` never persists
-    /// data sources, so consulting it alone leaves those references
-    /// unresolved and `state.exports` stuck at the prior literal
-    /// (carina#3266).
-    pub current_states: &'a HashMap<ResourceId, State>,
+    /// Live execution view of managed resources read this run.
+    pub managed_current: &'a HashMap<ResourceId, Current>,
+    /// Transient provider-read data-source results. `state.resources` never
+    /// persists these, so post-apply export resolution receives them
+    /// separately (carina#3266).
+    pub data_source_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
     pub backend: &'a dyn StateBackend,
     pub lock: StateLockRef<'a>,
@@ -373,11 +381,9 @@ pub(crate) struct SkippedExport {
 /// The fix splits `sorted_resources` by kind and re-resolves composition
 /// attributes against the post-apply view before exports use them:
 ///
-/// 1. Build `post_apply_states` by starting from the live
-///    `current_states` (so data-source read results survive — see
-///    carina#3266) and overlaying entries derived from
-///    `state.resources` (managed resources' applied attributes win
-///    over any pre-apply snapshot left in `current_states`).
+/// 1. Build `post_apply_states` from the live managed and data-source maps,
+///    overlaying managed entries derived from `state.resources` so applied
+///    attributes win over any pre-apply managed snapshot (carina#3266).
 /// 2. Split `sorted_resources` into a managed view (Managed +
 ///    DataSource collapsed onto `Resource` by field projection)
 ///    and a composition view ([`Composition::try_from`]).
@@ -444,8 +450,8 @@ pub(crate) fn resolve_export_values_post_apply(
     // with `compositions: &[]` here, then call
     // `layer_compositions_post_apply` once the re-resolution is done.
     // (carina#3181, carina#3248)
-    let plan_input_states = carina_core::resource::into_plan_input_map(
-        input.post_apply_states.as_map().clone(),
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        input.post_apply_states.managed_current().clone(),
         input.schemas,
         input.sorted_resources,
     );
@@ -453,7 +459,8 @@ pub(crate) fn resolve_export_values_post_apply(
         managed: input.sorted_resources,
         compositions: &[],
         data_sources: input.data_sources,
-        current_states: &plan_input_states,
+        managed_current: &plan_input_current,
+        data_source_states: input.post_apply_states.data_source_states(),
         remote_bindings: &HashMap::new(),
         wait_aliases: input.wait_aliases,
     });
@@ -540,7 +547,7 @@ pub(crate) struct ApplyStateSave<'a> {
     pub state_file: Option<StateFile>,
     pub sorted_resources: &'a [ResolvedResource],
     pub runtime_synthesized_resources: &'a [ResolvedResource],
-    pub current_states: &'a HashMap<ResourceId, State>,
+    pub managed_current: &'a HashMap<ResourceId, Current>,
     pub applied_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
     pub successfully_deleted: &'a HashSet<DeletedInstanceKey>,
@@ -561,7 +568,7 @@ pub(crate) struct ApplyStateSave<'a> {
 /// contents always come from Phase 1's `add_upsert`. For
 /// Move+Replace / Move+Update / Move+Create the `to` row is fed by
 /// `applied_states[to]` (the provider's post-apply State); for a pure
-/// rename, by `current_states[to]` (which `materialize_moved_states`
+/// rename, by `managed_current[to]` (which `materialize_moved_states`
 /// has already populated from the `from` row before writeback runs).
 /// Either way, Move's only writeback responsibility is dropping the
 /// stale `from` address. See carina#3170 for the bug class this
@@ -753,7 +760,7 @@ fn classify_replacement_outcome(
     delete: ReplacementDeleteInput<'_>,
     create_upsert: Option<&PlannedUpsert<'_>>,
     state_file: &StateFile,
-    current_states: &HashMap<ResourceId, State>,
+    managed_current: &HashMap<ResourceId, Current>,
     moved_origins: &MovedOrigins,
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
@@ -780,7 +787,7 @@ fn classify_replacement_outcome(
                 upsert.resource,
                 schemas.get_for(upsert.resource),
                 state_file,
-                current_states,
+                managed_current,
                 moved_origins,
             ))
         }
@@ -802,11 +809,16 @@ fn planned_depose(
     desired_resource: &ResolvedResource,
     schema: Option<&ResourceSchema>,
     state_file: &StateFile,
-    current_states: &HashMap<ResourceId, State>,
+    managed_current: &HashMap<ResourceId, Current>,
     moved_origins: &MovedOrigins,
 ) -> PlannedDepose {
     let existing = moved_origins.find_persisted_row_at_address(state_file, delete.id.as_inner());
-    let current = current_states.get(delete.id.as_inner());
+    let current = managed_current.get(delete.id.as_inner());
+    let current_state = current.map(|current| match current {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    });
     let existing_attributes = existing.map(ResourceState::persisted_attributes);
 
     let attributes = if let Some(existing) = existing
@@ -829,7 +841,7 @@ fn planned_depose(
             .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(previous) = delete.previous_attributes {
             previous.encode(desired_resource, schema, previous_hash_authority)
-        } else if let Some(current) = current {
+        } else if let Some(current) = current_state {
             ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
                 desired_resource,
                 schema,
@@ -844,7 +856,7 @@ fn planned_depose(
     let dependency_bindings = existing
         .map(|rs| rs.dependency_bindings.clone())
         .filter(|bindings| !bindings.is_empty())
-        .or_else(|| current.map(|state| state.dependency_bindings.clone()))
+        .or_else(|| current_state.map(|state| state.dependency_bindings.clone()))
         .filter(|bindings| !bindings.is_empty())
         .unwrap_or(delete.fallback_dependency_bindings);
 
@@ -940,9 +952,13 @@ fn plan_displaced_identifier_deposes(
         };
         if !input.failed_refreshes.contains(id.as_inner())
             && input
-                .current_states
+                .managed_current
                 .get(id.as_inner())
-                .is_some_and(|state| !state.exists)
+                .is_some_and(|current| match current {
+                    Current::Absent(_state) => true,
+                    Current::Present(_present) => false,
+                    Current::MissingIdentifier(_state) => false,
+                })
         {
             continue;
         }
@@ -978,7 +994,7 @@ fn plan_displaced_identifier_deposes(
             upsert.resource,
             input.schemas.get_for(upsert.resource),
             input.state_file,
-            input.current_states,
+            input.managed_current,
             moved_origins,
         ));
     }
@@ -987,7 +1003,7 @@ fn plan_displaced_identifier_deposes(
 /// Build the typed writeback plan from the raw apply inputs.
 ///
 /// Phase 1 (`sorted_resources` walk) registers upserts from
-/// `applied_states` first, falling back to `current_states` when the
+/// `applied_states` first, falling back to `managed_current` when the
 /// resource exists but had no provider call, and emitting cleanups
 /// when the resource was absent post-refresh. Phase 2 (`plan.effects()`
 /// walk) classifies replacement outcomes for decomposed replacements
@@ -998,7 +1014,7 @@ struct DecomposeInput<'a, 's> {
     state_file: &'s StateFile,
     sorted_resources: &'a [ResolvedResource],
     runtime_synthesized_resources: &'a [ResolvedResource],
-    current_states: &'a HashMap<ResourceId, State>,
+    managed_current: &'a HashMap<ResourceId, Current>,
     applied_states: &'a HashMap<ResourceId, State>,
     plan: &'a Plan,
     successfully_deleted: &'a HashSet<DeletedInstanceKey>,
@@ -1019,7 +1035,7 @@ fn decompose_with_moved_origins<'a>(
     let state_file = input.state_file;
     let sorted_resources = input.sorted_resources;
     let runtime_synthesized_resources = input.runtime_synthesized_resources;
-    let current_states = input.current_states;
+    let managed_current = input.managed_current;
     let applied_states = input.applied_states;
     let plan = input.plan;
     let successfully_deleted = input.successfully_deleted;
@@ -1038,11 +1054,15 @@ fn decompose_with_moved_origins<'a>(
             // Refresh failed; we don't know whether the live resource
             // still exists, so leave any pre-existing row untouched.
             continue;
-        } else if let Some(current) = current_states.get(&resource.id) {
-            if current.exists {
-                wb.add_upsert(resource, UpsertSource::CurrentState(current))?;
-            } else {
-                wb.add_cleanup(resource.resolved_id())?;
+        } else if let Some(current) = managed_current.get(&resource.id) {
+            match current {
+                Current::Absent(_state) => wb.add_cleanup(resource.resolved_id())?,
+                Current::Present(present) => {
+                    wb.add_upsert(resource, UpsertSource::CurrentState(present.state()))?
+                }
+                Current::MissingIdentifier(state) => {
+                    wb.add_upsert(resource, UpsertSource::CurrentState(state.state()))?
+                }
             }
         }
     }
@@ -1068,7 +1088,7 @@ fn decompose_with_moved_origins<'a>(
                     delete,
                     wb.upserts.get(create_id),
                     state_file,
-                    current_states,
+                    managed_current,
                     moved_origins,
                     successfully_deleted,
                     schemas,
@@ -1086,7 +1106,7 @@ fn decompose_with_moved_origins<'a>(
                     delete,
                     create_upsert,
                     state_file,
-                    current_states,
+                    managed_current,
                     moved_origins,
                     successfully_deleted,
                     schemas,
@@ -1125,7 +1145,7 @@ pub(crate) fn build_state_after_apply(
         state_file,
         sorted_resources,
         runtime_synthesized_resources,
-        current_states,
+        managed_current,
         applied_states,
         plan,
         successfully_deleted,
@@ -1140,7 +1160,7 @@ pub(crate) fn build_state_after_apply(
             state_file: &state,
             sorted_resources,
             runtime_synthesized_resources,
-            current_states,
+            managed_current,
             applied_states,
             plan,
             successfully_deleted,
@@ -1284,20 +1304,19 @@ pub(crate) fn build_orphan_resource(
 mod post_apply_states_tests {
     use super::*;
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
-    use carina_state::StateFile;
+    use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
 
     /// Type-level contract pin for the carina#3266 + carina#3271 merge rule.
     ///
     /// `from_current_and_state` must:
-    /// 1. Keep entries that exist in `current_states` but **not** in
-    ///    `state.resources` — data sources land here (they are never
-    ///    persisted to `state.resources`).
-    /// 2. For entries present in **both** maps, pick the one
-    ///    derived from `state.resources` — that is the post-apply
-    ///    writeback value, while `current_states` may still hold
-    ///    the pre-apply snapshot.
+    /// 1. Preserve every entry in `data_source_states`; these transient reads
+    ///    are never persisted to `state.resources`.
+    /// 2. For managed entries present in both `managed_current` and
+    ///    `state.resources`, pick the value derived from `state.resources` —
+    ///    that is the post-apply writeback value, while `managed_current` may
+    ///    still hold the pre-apply snapshot.
     #[test]
-    fn data_source_only_in_current_states_survives() {
+    fn data_source_states_survive_without_state_resource_rows() {
         let ds_id =
             ResourceId::with_provider_identity("aws", "iam.Roles", "admin_access_roles", None);
         let mut ds_attrs = HashMap::new();
@@ -1307,8 +1326,8 @@ mod post_apply_states_tests {
                 ConcreteValue::String("arn:aws:iam::1:role/x".into()),
             )])),
         );
-        let mut current_states = HashMap::new();
-        current_states.insert(
+        let mut data_source_states = HashMap::new();
+        data_source_states.insert(
             ds_id.clone(),
             State::existing(ds_id.clone(), ds_attrs.clone()),
         );
@@ -1317,26 +1336,27 @@ mod post_apply_states_tests {
         // the production reality the bug springs from.
         let state = StateFile::new();
 
-        let post = PostApplyStates::from_current_and_state(&current_states, &state);
+        let post =
+            PostApplyStates::from_current_and_state(&HashMap::new(), &data_source_states, &state);
         let entry = post
-            .as_map()
+            .data_source_states()
             .get(&ds_id)
             .expect("data-source entry must survive merge");
         assert_eq!(entry.attributes.get("arns"), ds_attrs.get("arns"));
     }
 
     #[test]
-    fn state_resources_entry_wins_over_current_states_on_collision() {
+    fn state_resources_identifier_row_is_present_and_wins_over_current_state() {
         let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "log", None);
 
-        // current_states carries the PRE-apply attribute value.
+        // managed_current carries the PRE-apply attribute value.
         let mut pre_attrs = HashMap::new();
         pre_attrs.insert(
             "versioning".to_string(),
             Value::Concrete(ConcreteValue::String("Suspended".into())),
         );
-        let mut current_states = HashMap::new();
-        current_states.insert(id.clone(), State::existing(id.clone(), pre_attrs));
+        let mut managed_states = HashMap::new();
+        managed_states.insert(id.clone(), State::existing(id.clone(), pre_attrs));
 
         // state.resources carries the POST-apply value — this must win.
         let json = serde_json::json!({
@@ -1358,11 +1378,95 @@ mod post_apply_states_tests {
             .unwrap()
             .into_state();
 
-        let post = PostApplyStates::from_current_and_state(&current_states, &state);
-        let entry = post.as_map().get(&id).expect("merged entry");
+        let managed_current = crate::managed_current_from_states(managed_states);
+        let post =
+            PostApplyStates::from_current_and_state(&managed_current, &HashMap::new(), &state);
+        let current = post.managed_current().get(&id).expect("merged entry");
+        let present = match current {
+            Current::Absent(state) => {
+                panic!("identifier row was classified absent: {state:?}")
+            }
+            Current::Present(present) => present,
+            Current::MissingIdentifier(state) => {
+                panic!("identifier row lost its identifier: {state:?}")
+            }
+        };
+        assert_eq!(present.identifier().as_str(), "log-bucket");
+        let entry = present.state();
         match entry.attributes.get("versioning") {
             Some(Value::Concrete(ConcreteValue::String(s))) => assert_eq!(s, "Enabled"),
             other => panic!("expected post-apply 'Enabled', got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deposed_only_shell_is_absent_from_post_apply_current() {
+        let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
+        let mut row = ResourceState::new("test.Resource", "main", "mock");
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "old-id".to_string(),
+            None,
+            HashMap::new(),
+            BTreeSet::new(),
+        ));
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(row)
+            .expect("deposed-only fixture must be valid");
+
+        let post =
+            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
+        let current = post
+            .managed_current()
+            .get(&id)
+            .expect("deposed-only row must retain its address classification");
+
+        match current {
+            Current::Absent(state) => {
+                assert!(!state.state().exists);
+                assert!(state.state().attributes.is_empty());
+            }
+            Current::Present(present) => {
+                panic!("deposed-only row was classified present: {present:?}")
+            }
+            Current::MissingIdentifier(state) => {
+                panic!("deposed-only row was treated as malformed current state: {state:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn identifierless_current_row_is_missing_identifier_post_apply() {
+        let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
+        let row = ResourceState::new("test.Resource", "main", "mock")
+            .with_attribute("name", serde_json::json!("main"));
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(row)
+            .expect("identifierless fixture must be valid");
+
+        let post =
+            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
+        let current = post
+            .managed_current()
+            .get(&id)
+            .expect("identifierless row must retain its address classification");
+
+        match current {
+            Current::Absent(state) => {
+                panic!("malformed current row was classified absent: {state:?}")
+            }
+            Current::Present(present) => {
+                panic!("identifierless row was classified present: {present:?}")
+            }
+            Current::MissingIdentifier(state) => {
+                assert!(state.state().exists);
+                assert_eq!(
+                    state.state().attributes.get("name"),
+                    Some(&Value::Concrete(ConcreteValue::String("main".into())))
+                );
+            }
         }
     }
 }
@@ -1463,7 +1567,7 @@ mod apply_state_save_tests {
                 state_file: None,
                 sorted_resources: &[resolved(resource)],
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -1547,7 +1651,7 @@ mod apply_state_save_tests {
                 sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
                     .unwrap(),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -1600,7 +1704,7 @@ mod apply_state_save_tests {
                 sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
                     .unwrap(),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -1644,7 +1748,7 @@ mod apply_state_save_tests {
             ApplyStateSave {
                 state_file: Some(StateFile::new()),
                 sorted_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(child_id.clone(), child_state)]),
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 plan: &Plan::new(),
@@ -1704,7 +1808,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: &[],
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::new(),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -1795,7 +1899,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: &[],
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::new(),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -1886,7 +1990,7 @@ mod apply_state_save_tests {
             state_file: &StateFile::new(),
             sorted_resources: &[],
             runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &successfully_deleted,
@@ -1954,7 +2058,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-                current_states: &current_states,
+                managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2007,7 +2111,7 @@ mod apply_state_save_tests {
                 state_file: Some(StateFile::new()),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-                current_states: &current_states,
+                managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2073,7 +2177,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2129,7 +2233,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2191,7 +2295,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::from([(id.clone(), current_state)]),
+                managed_current: &HashMap::from([(id.clone(), Current::from_state(current_state))]),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2248,7 +2352,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2345,7 +2449,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(create_id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -2406,7 +2510,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(create_id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -2506,7 +2610,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2621,7 +2725,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, applied_state)]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
@@ -2687,7 +2791,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::from([(id, refreshed_state)]),
+                managed_current: &HashMap::from([(id, Current::from_state(refreshed_state))]),
                 applied_states: &HashMap::new(),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -2751,7 +2855,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id.clone(), applied_state)]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2770,18 +2874,24 @@ mod apply_state_save_tests {
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
         );
 
-        let current_states =
-            HashMap::from([(id.clone(), saved.build_state_for_resource(&id).into_state())]);
+        let loaded = saved.build_state_for_resource(&id);
+        let current_state = match loaded {
+            carina_core::resource::Current::Absent(state) => state.into_state(),
+            carina_core::resource::Current::Present(present) => present.into_parts().0,
+            carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
+        };
+        let current_states = HashMap::from([(id.clone(), current_state)]);
         let second_plan = create_plan(
             std::slice::from_ref(&resolved(desired.clone())),
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &carina_core::resource::into_plan_input_map(
+                &crate::plan_input_current_from_states(
                     current_states.clone(),
                     &SchemaRegistry::new(),
                     &[],
                 ),
+                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -2822,7 +2932,7 @@ mod apply_state_save_tests {
                 state_file: None,
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id.clone(), applied_state)]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -2877,7 +2987,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id.clone(), applied_state)]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -2897,14 +3007,20 @@ mod apply_state_save_tests {
         );
         assert_eq!(row.write_only_attributes, vec!["password"]);
 
-        let current_states =
-            HashMap::from([(id.clone(), saved.build_state_for_resource(&id).into_state())]);
+        let loaded = saved.build_state_for_resource(&id);
+        let current_state = match loaded {
+            carina_core::resource::Current::Absent(state) => state.into_state(),
+            carina_core::resource::Current::Present(present) => present.into_parts().0,
+            carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
+        };
+        let current_states = HashMap::from([(id.clone(), current_state)]);
         let second_plan = create_plan(
             std::slice::from_ref(&resolved(desired.clone())),
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &carina_core::resource::into_plan_input_map(current_states.clone(), &schemas, &[]),
+                &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
+                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -2965,7 +3081,7 @@ mod apply_state_save_tests {
                 state_file: Some(StateFile::new()),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-                current_states: &current_states,
+                managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -3046,7 +3162,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-                current_states: &current_states,
+                managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -3120,7 +3236,7 @@ mod apply_state_save_tests {
                 state_file: Some(StateFile::new()),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-                current_states: &current_states,
+                managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -3318,7 +3434,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
-                current_states: &current_states,
+                managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -3350,7 +3466,7 @@ mod apply_state_save_tests {
         );
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
-        let current_states = HashMap::new();
+        let current_states: HashMap<ResourceId, Current> = HashMap::new();
         let applied_states = HashMap::new();
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
@@ -3361,7 +3477,7 @@ mod apply_state_save_tests {
             state_file: &StateFile::new(),
             sorted_resources: &[],
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &successfully_deleted,
@@ -3403,11 +3519,12 @@ mod apply_state_save_tests {
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &carina_core::resource::into_plan_input_map(
+                &crate::plan_input_current_from_states(
                     current_states.clone(),
                     &SchemaRegistry::new(),
                     &[],
                 ),
+                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -3423,11 +3540,12 @@ mod apply_state_save_tests {
             HashSet::from([DeletedInstanceKey::current(id.clone(), "vpc-old")]);
         let failed_refreshes = HashSet::new();
 
+        let managed_current = crate::managed_current_from_states(current_states.clone());
         let wb = decompose(DecomposeInput {
             state_file: &StateFile::new(),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &managed_current,
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &successfully_deleted,
@@ -3484,7 +3602,8 @@ mod apply_state_save_tests {
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &carina_core::resource::into_plan_input_map(current_states.clone(), &schemas, &[]),
+                &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
+                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -3564,7 +3683,7 @@ mod apply_state_save_tests {
                 state_file: Some(state_file),
                 sorted_resources: &sorted_resources,
                 runtime_synthesized_resources: &[],
-                current_states: &current_states,
+                managed_current: &crate::managed_current_from_states(current_states.clone()),
                 applied_states: &applied_states,
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
@@ -3628,7 +3747,7 @@ mod apply_state_save_tests {
             state_file: &StateFile::new(),
             sorted_resources: std::slice::from_ref(&desired),
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &successfully_deleted,
@@ -3649,9 +3768,9 @@ mod export_writeback_tests {
     use super::*;
     use carina_core::parser::{InferredExportParam, TypeExpr};
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, Value,
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker, Value,
     };
-    use carina_state::StateFile;
+    use carina_state::{ResourceState, StateFile};
 
     fn export_param(name: &str, value: Value) -> InferredExportParam {
         InferredExportParam {
@@ -3665,7 +3784,8 @@ mod export_writeback_tests {
         export_params: &[InferredExportParam],
     ) -> (HashMap<String, PersistedExportValue>, Vec<SkippedExport>) {
         let state = StateFile::new();
-        let post_apply_states = PostApplyStates::from_current_and_state(&HashMap::new(), &state);
+        let post_apply_states =
+            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
         let checked = carina_core::validation::check_export_values_pre_apply(
             export_params,
             &carina_core::binding_index::ResolvedBindings::default(),
@@ -3686,6 +3806,74 @@ mod export_writeback_tests {
         materialize_exports(&values)
             .expect("unresolved exports should be skipped, not abort writeback")
             .into_parts()
+    }
+
+    #[test]
+    fn partial_read_row_keeps_missing_post_apply_export_attribute_absent() {
+        let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
+        let provider_state = State::existing(id.clone(), HashMap::new()).with_identifier("main-id");
+        let mut row = ResourceState::new("test.Resource", "main", "mock")
+            .with_attributes_from_state(&provider_state)
+            .expect("partial-read fixture must encode");
+        row.partial_read = Some(PartialReadMarker {
+            detail: "provider read after create did not return every attribute".to_string(),
+            missing_attributes: BTreeSet::from(["computed".to_string()]),
+        });
+        row.dependency_bindings = BTreeSet::from(["upstream".to_string()]);
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(row)
+            .expect("partial-read fixture must be valid");
+
+        let resource =
+            Resource::with_provider("mock", "test.Resource", "main", None).with_binding("instance");
+        let reference = Value::resource_ref("instance", "computed", vec![]);
+        let export_params = [export_param("computed", reference.clone())];
+        let checked = carina_core::validation::check_export_values_pre_apply(
+            &export_params,
+            &carina_core::binding_index::ResolvedBindings::default(),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("test export must pass the secret boundary");
+        let post_apply_states =
+            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
+        let current = post_apply_states
+            .managed_current()
+            .get(&id)
+            .expect("partial-read row must be in the post-apply view");
+        match current {
+            Current::Absent(state) => panic!("partial-read row was classified absent: {state:?}"),
+            Current::Present(present) => {
+                assert_eq!(present.state().partial_read, None);
+                assert!(present.state().dependency_bindings.is_empty());
+            }
+            Current::MissingIdentifier(state) => {
+                panic!("partial-read row lost its identifier: {state:?}")
+            }
+        }
+
+        let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
+            export_params: &checked,
+            sorted_resources: std::slice::from_ref(&resource),
+            data_sources: &[],
+            pre_resolve_compositions: &[],
+            post_apply_states: &post_apply_states,
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+            wait_aliases: &[],
+            provider_context: &carina_core::parser::ProviderContext::default(),
+        })
+        .expect("post-apply export resolution should succeed");
+
+        assert_eq!(
+            values.as_slice()[0].value,
+            Some(reference),
+            "HEAD treated a missing persisted attribute as absent, not as a partial-read Unknown"
+        );
+        let (_, skipped) = materialize_exports(&values)
+            .expect("unresolved export must be skippable")
+            .into_parts();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, "unresolved reference instance.computed");
     }
 
     #[test]

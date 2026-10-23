@@ -90,7 +90,8 @@ fn resolve_managed_refs_resolves_resource_ref_against_managed_sibling() {
             managed: &managed,
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -114,7 +115,8 @@ fn resolve_managed_refs_records_dependency_bindings() {
             managed: &managed,
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -132,7 +134,7 @@ fn resolve_managed_refs_records_dependency_bindings() {
 #[test]
 fn resolve_managed_refs_falls_through_state_attributes() {
     // `b` references `a.value`, but `a` has no `value` attribute in
-    // its DSL — the resolved binding must come from `current_states`.
+    // its DSL — the resolved binding must come from managed current state.
     let a = make_managed("a", &[]);
     let b = make_managed("b", &[("dep", ref_to("a", "value"))]);
     let mut managed = vec![a, b];
@@ -150,11 +152,12 @@ fn resolve_managed_refs_falls_through_state_attributes() {
             managed: &managed,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
+            managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 current_states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -176,7 +179,8 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
         managed: std::slice::from_ref(&referenced),
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -204,7 +208,8 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
         managed: std::slice::from_ref(&role),
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -233,7 +238,8 @@ fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
         managed: &[],
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -257,7 +263,8 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
             managed: &managed,
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -273,7 +280,8 @@ fn resolve_virtual_refs_post_apply_with_empty_slice_is_ok() {
         managed: &[],
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -297,7 +305,8 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             managed: &managed,
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -311,7 +320,8 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             managed: &legacy,
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });

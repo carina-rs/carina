@@ -20,7 +20,7 @@ use crate::provider::{
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
 use crate::value::{SerializationContext, SerializationError};
 
@@ -82,7 +82,7 @@ pub(super) fn queue_state_refresh(
 /// Refresh states for resources whose operations failed.
 pub(super) async fn refresh_pending_states(
     provider: &dyn Provider,
-    current_states: &mut HashMap<ResourceId, State>,
+    managed_current: &mut HashMap<ResourceId, Current>,
     pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
     observer: &dyn ExecutionObserver,
 ) -> std::collections::HashSet<ResourceId> {
@@ -100,7 +100,7 @@ pub(super) async fn refresh_pending_states(
         match provider.read(id, identifier, ReadRequest).await {
             Ok(outcome) => {
                 observer.on_event(&ExecutionEvent::RefreshSucceeded { id });
-                current_states.insert(id.clone(), outcome.into_state());
+                managed_current.insert(id.clone(), Current::from_state(outcome.into_state()));
             }
             Err(error) => {
                 let error_str = error.to_string();
@@ -863,7 +863,7 @@ mod process_basic_result_tests {
         )
         .expect("missing attributes are non-empty");
         let writeback_state = diagnostic.clone().into_state_for_writeback(state.clone());
-        let (mut applied_states, _) = AppliedStates::with_initial(&HashMap::new());
+        let (mut applied_states, _) = AppliedStates::with_initial(&HashMap::new(), &HashMap::new());
         let mut success_count = 0;
         let mut failure_count = 0;
         let mut partial_count = 0;

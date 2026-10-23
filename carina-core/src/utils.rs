@@ -610,13 +610,13 @@ pub(crate) fn lift_saved_state_enum_leaves(
     }
 }
 
-/// Apply [`lift_state_enum_leaves`] to every resource's
-/// **read-back** state attributes (`current_states`), resolving each
-/// resource's schema from `registry`.
+/// Apply [`lift_state_enum_leaves`] to every managed resource's
+/// **read-back** state attributes, resolving each resource's schema from
+/// `registry`.
 ///
 /// [`lift_saved_state_enum_leaves`] only migrates the cached
 /// `saved_attrs` map (state-file JSON). On a refresh, the live value is
-/// produced by `provider.read()` and lands in `current_states`, a
+/// produced by `provider.read()` and lands in managed current state, a
 /// *different* map the saved-attrs lift never touches. A provider that
 /// returns an IAM policy document with plain `String` `version` /
 /// `effect` (the on-the-wire shape for a field that was `Custom` when
@@ -624,7 +624,7 @@ pub(crate) fn lift_saved_state_enum_leaves(
 /// flows un-lifted into the differ, where the strict carina#2986
 /// validator rejects it — the exact failure awscc#251's first cut
 /// (#3055) did not fix because it only covered `saved_attrs`. Call this
-/// once after both refresh branches have populated `current_states`,
+/// once after both refresh branches have populated managed current state,
 /// before the differ / resolver consume it.
 ///
 /// Resources whose schema is not in `registry` (or that have no state)
@@ -632,7 +632,7 @@ pub(crate) fn lift_saved_state_enum_leaves(
 pub fn lift_current_state_enum_leaves(
     current_states: &mut std::collections::HashMap<
         crate::resource::ResourceId,
-        crate::resource::State,
+        crate::resource::Current,
     >,
     resources: &[crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
@@ -641,7 +641,7 @@ pub fn lift_current_state_enum_leaves(
         if let Some(schema) = registry.get_for(resource)
             && let Some(state) = current_states.get_mut(&resource.id)
         {
-            lift_state_enum_leaves(&mut state.attributes, schema);
+            lift_state_enum_leaves(state.attributes_mut(), schema);
         }
     }
 }
@@ -1859,13 +1859,13 @@ mod tests {
         );
     }
 
-    /// awscc#251 follow-up: the read-back map (`current_states`) must be
+    /// awscc#251 follow-up: the managed read-back map must be
     /// lifted too — #3055 only covered `saved_attrs`, so a refresh whose
     /// `provider.read()` returns plain-String IAM enum values still
     /// failed the strict validator.
     #[test]
     fn lift_current_state_enum_leaves_lifts_provider_read_state() {
-        use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+        use crate::resource::{ConcreteValue, Current, Resource, ResourceId, State, Value};
         use crate::schema::{
             AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
         };
@@ -1904,13 +1904,21 @@ mod tests {
             Value::Concrete(ConcreteValue::Map(pd)),
         );
 
-        let mut current: HashMap<ResourceId, State> = HashMap::new();
-        current.insert(role.id.clone(), State::existing(role.id.clone(), attrs));
+        let mut current: HashMap<ResourceId, Current> = HashMap::new();
+        current.insert(
+            role.id.clone(),
+            Current::from_state(State::existing(role.id.clone(), attrs)),
+        );
 
         lift_current_state_enum_leaves(&mut current, std::slice::from_ref(&role), &registry);
 
+        let state = match &current[&role.id] {
+            Current::Absent(state) => state.state(),
+            Current::Present(present) => present.state(),
+            Current::MissingIdentifier(state) => state.state(),
+        };
         let Value::Concrete(ConcreteValue::Map(pd)) =
-            &current[&role.id].attributes["assume_role_policy_document"]
+            &state.attributes["assume_role_policy_document"]
         else {
             panic!("assume_role_policy_document map");
         };

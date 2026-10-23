@@ -78,8 +78,7 @@ pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, DeposedInstance, DeposedKey, LoadedOrphans, LoadedState, MigratedStateFile,
-    MigrationInfo, NameOverride, OrphanStateLoad, PresentResourceState,
-    PreviousSecretHashAuthority, ResourceState, ResourceStateEncodingError, ResourceStateLoad,
-    StateFile, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
-    should_apply_override,
+    MigrationInfo, NameOverride, PreviousSecretHashAuthority, ResourceState,
+    ResourceStateEncodingError, StateFile, check_and_migrate, check_and_migrate_bytes,
+    log_state_migration_once, should_apply_override,
 };

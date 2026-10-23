@@ -35,6 +35,38 @@ pub(crate) fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAt
 }
 
 #[cfg(test)]
+pub(crate) fn managed_current_from_states(
+    states: std::collections::HashMap<
+        carina_core::resource::ResourceId,
+        carina_core::resource::State,
+    >,
+) -> std::collections::HashMap<carina_core::resource::ResourceId, carina_core::resource::Current> {
+    states
+        .into_iter()
+        .map(|(id, state)| (id, carina_core::resource::Current::from_state(state)))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn plan_input_current_from_states(
+    states: std::collections::HashMap<
+        carina_core::resource::ResourceId,
+        carina_core::resource::State,
+    >,
+    schemas: &carina_core::schema::SchemaRegistry,
+    resources: &[carina_core::resource::Resource],
+) -> std::collections::HashMap<
+    carina_core::resource::ResourceId,
+    carina_core::resource::PlanInputCurrent,
+> {
+    carina_core::resource::into_plan_input_current_map(
+        managed_current_from_states(states),
+        schemas,
+        resources,
+    )
+}
+
+#[cfg(test)]
 pub(crate) use carina_core::provider::fixture_applied_identifier;
 
 /// Controls how much detail is shown in plan output (CLI-facing enum with clap support).

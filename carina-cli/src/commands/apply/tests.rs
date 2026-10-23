@@ -133,7 +133,11 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
     let resource = Resource::with_provider("mock", "test.Resource", "legacy", None)
         .with_attribute("name", string_value("kept"));
     let id = resource.id.clone();
-    let planned_state = state_file.build_state_for_resource(&id).into_state();
+    let planned_state = match state_file.build_state_for_resource(&id) {
+        carina_core::resource::Current::Absent(state) => state.into_state(),
+        carina_core::resource::Current::Present(present) => present.into_parts().0,
+        carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
+    };
     assert_eq!(
         planned_state.attributes.keys().collect::<Vec<_>>(),
         vec![&"name".to_string()]
@@ -146,10 +150,10 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
     );
     let result = detect_drift(
         &[resource],
-        &[crate::commands::plan::CurrentStateEntry {
+        &[crate::commands::plan::CurrentStateEntry::managed(
             id,
-            state: planned_state,
-        }],
+            planned_state,
+        )],
         &HistoricalResourceAddresses::from_plan(&Plan::new()),
         &ApplyTimeReadProvider { shared },
         ApplyTarget::Project(Path::new(".")),
@@ -423,10 +427,10 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
-        current_states: vec![crate::commands::plan::CurrentStateEntry {
+        current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             id,
-            state: planned_state,
-        }],
+            planned_state,
+        )],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
@@ -2001,24 +2005,24 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         data_sources: vec![lookup.clone()],
         data_source_origins: vec![lookup],
         current_states: vec![
-            crate::commands::plan::CurrentStateEntry {
-                id: target_id,
-                state: State::not_found(ResourceId::with_provider_identity(
+            crate::commands::plan::CurrentStateEntry::managed(
+                target_id,
+                State::not_found(ResourceId::with_provider_identity(
                     "mock",
                     "test.resource",
                     "target",
                     None,
                 )),
-            },
-            crate::commands::plan::CurrentStateEntry {
-                id: consumer_id,
-                state: State::not_found(ResourceId::with_provider_identity(
+            ),
+            crate::commands::plan::CurrentStateEntry::managed(
+                consumer_id,
+                State::not_found(ResourceId::with_provider_identity(
                     "mock",
                     "test.resource",
                     "consumer",
                     None,
                 )),
-            },
+            ),
         ],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -2126,14 +2130,14 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
         current_states: vec![
-            crate::commands::plan::CurrentStateEntry {
-                id: producer_id.clone(),
-                state: State::not_found(producer_id.clone()),
-            },
-            crate::commands::plan::CurrentStateEntry {
-                id: consumer_id.clone(),
-                state: State::not_found(consumer_id),
-            },
+            crate::commands::plan::CurrentStateEntry::managed(
+                producer_id.clone(),
+                State::not_found(producer_id.clone()),
+            ),
+            crate::commands::plan::CurrentStateEntry::managed(
+                consumer_id.clone(),
+                State::not_found(consumer_id),
+            ),
         ],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -2549,7 +2553,8 @@ fn apply_emits_legacy_override_warning_to_stderr() {
             managed: &[],
             compositions: &[],
             data_sources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -2596,7 +2601,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
             state_file: Some(state_file),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -2768,10 +2773,10 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
-        current_states: vec![crate::commands::plan::CurrentStateEntry {
-            id: resource_id.clone(),
-            state: State::not_found(resource_id),
-        }],
+        current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
+            resource_id.clone(),
+            State::not_found(resource_id),
+        )],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
@@ -4023,7 +4028,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
             state_file: None,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &successfully_deleted,
@@ -4140,7 +4145,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
             state_file: None,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &successfully_deleted,
@@ -4192,7 +4197,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
 #[test]
 fn block_unique_name_attribute_no_diff_when_hydrated() {
     // After apply, the state file contains the block_name attribute (canonical name).
-    // On re-plan, if hydrate_read_state restores it into current_states,
+    // On re-plan, if hydrate_read_state restores it into the managed-current map,
     // the differ should see no changes.
     //
     // This tests the scenario from issue #1499 where plan-verify fails
@@ -4377,7 +4382,7 @@ fn block_unique_name_attribute_state_roundtrip() {
             state_file: None,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied_states,
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -4510,7 +4515,7 @@ fn move_plus_update_keeps_post_update_attributes() {
             state_file: Some(state_file),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -4537,11 +4542,11 @@ fn move_plus_update_keeps_post_update_attributes() {
 
 /// Pure-rename `moved {}` block — no Create/Update/Replace on the
 /// `to` address. `materialize_moved_states` transferred the `from`
-/// State into `current_states[to]` before writeback runs, so Phase 1
-/// must pick up the row from `current_states` and the new address
+/// State into `managed_current[to]` before writeback runs, so Phase 1
+/// must pick up the row from `managed_current` and the new address
 /// must end up with the carried-over attributes.
 #[test]
-fn move_alone_carries_attributes_via_current_states() {
+fn move_alone_carries_attributes_via_managed_current() {
     use carina_core::effect::Effect;
     use carina_state::{ResourceState, StateFile};
 
@@ -4560,15 +4565,15 @@ fn move_alone_carries_attributes_via_current_states() {
     );
     let sorted_resources = vec![resolved(resource)];
 
-    // current_states already carries the migrated row at the new id.
+    // managed_current already carries the migrated row at the new id.
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
     let current = State::existing(new_id.clone(), current_attrs).with_identifier("my-bucket");
-    let mut current_states = HashMap::new();
-    current_states.insert(new_id.clone(), current);
+    let mut managed_current = HashMap::new();
+    managed_current.insert(new_id.clone(), Current::from_state(current));
 
     // State file still has the pre-move address — that's what the
     // Move's `from` cleanup targets.
@@ -4592,7 +4597,7 @@ fn move_alone_carries_attributes_via_current_states() {
             state_file: Some(state_file),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &managed_current,
             applied_states: &HashMap::new(),
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -4615,7 +4620,7 @@ fn move_alone_carries_attributes_via_current_states() {
     assert_eq!(
         new_row.identifier.as_deref(),
         Some("my-bucket"),
-        "identifier carried over via current_states",
+        "identifier carried over via managed_current",
     );
     assert_eq!(
         new_row.persisted_attributes().get("bucket_name"),
@@ -4647,7 +4652,7 @@ fn move_with_absent_from_is_no_op() {
             state_file: Some(StateFile::default()),
             sorted_resources: &[],
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &HashMap::new(),
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -4701,7 +4706,7 @@ fn failed_refresh_preserves_existing_row() {
             state_file: Some(state_file),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &HashMap::new(),
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -4761,7 +4766,7 @@ fn move_from_overlapping_desired_resource_errors() {
             state_file: None,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied,
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -4819,7 +4824,7 @@ fn remove_overlapping_desired_resource_errors() {
             state_file: None,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied,
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -4876,7 +4881,7 @@ fn self_move_overlapping_desired_resource_errors() {
             state_file: None,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied,
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -4960,7 +4965,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
 
     // Mirror production callers: the resource is in sorted_resources
     // with a binding; provider-returned attributes flow in via
-    // `current_states` derived from `state.resources`.
+    // `managed_current` derived from `state.resources`.
     let mut registry_prod =
         Resource::with_provider("awscc", "organizations.account", "registry-prod", None);
     registry_prod.binding = Some("registry_prod".to_string());
@@ -4968,6 +4973,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &state,
         );
@@ -5075,6 +5081,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &state,
         );
@@ -5204,6 +5211,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
             &state,
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
@@ -5238,7 +5246,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     //
     // **The bug** (pre-#3177): the apply path's head-of-pipeline
     // call to `resolve_refs_with_state_and_remote(&mut
-    // resources_for_plan, &pre_apply_current_states, …)` collapses
+    // resources_for_plan, &pre_apply_managed_states, …)` collapses
     // every `ResourceRef` — including the ones inside a
     // `Composition`'s `attributes` — into the pre-apply
     // concrete value (here: OLD_ARN). The composition's `role_arn`
@@ -5265,7 +5273,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // **The test** mirrors that production pipeline: it (1)
     // constructs the same managed + composition graph, (2) takes a
     // pre-resolve snapshot of the composition, (3) runs the head-of-
-    // pipeline resolver against a *pre-apply* `current_states`
+    // pipeline resolver against a *pre-apply* managed-current map
     // (OLD_ARN), then (4) feeds the pre-resolve snapshot and the
     // resolved working slice into `resolve_export_values_post_apply` along with a
     // *post-apply* `StateFile` (NEW_ARN). The assertion checks the
@@ -5309,10 +5317,10 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         state_file_from_json(json)
     };
 
-    // Step (b): pre-apply `current_states` — what the head-of-
+    // Step (b): pre-apply managed state — what the head-of-
     // pipeline resolver sees. Holds the OLD ARN, so the pre-apply
     // pass freezes composition `role_arn` to OLD_ARN.
-    let pre_apply_current_states: HashMap<ResourceId, ResourceState> = {
+    let pre_apply_managed_states: HashMap<ResourceId, ResourceState> = {
         let id = ResourceId::with_provider_identity("awscc", "iam.Role", "carina_role", None);
         let mut attrs: HashMap<String, Value> = HashMap::new();
         attrs.insert(
@@ -5377,11 +5385,12 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             managed: &sorted_resources.clone(),
             compositions: &[],
             data_sources: &[],
-            current_states: &carina_core::resource::into_plan_input_map(
-                pre_apply_current_states.clone(),
+            managed_current: &crate::plan_input_current_from_states(
+                pre_apply_managed_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &sorted_resources,
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -5398,6 +5407,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &post_apply_state_file,
         );
@@ -5432,20 +5442,21 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     //
     // The bug: `resolve_export_values_post_apply` builds `post_apply_states` from
     // `state.resources` only. Managed resources are persisted there,
-    // but data sources are not — they are queried each run and the
-    // result lives in `current_states` during execution and is
+    // but data sources are not — they are queried each run and their
+    // results live in `data_source_states` during execution before being
     // discarded at writeback. So when an export references a
     // data-source attribute (e.g. `exports { x = ds.arns }`), the
     // post-apply binding view layered onto `pre_apply` finds no
     // attributes for the data source (#3265's `layer_data_source_bindings`
-    // merge fires only when `current_states[ds.id]` carries the read
+    // merge fires only when `data_source_states[ds.id]` carries the read
     // result), the ResourceRef resolves to nothing, and the resolver
     // silently keeps the prior literal in `state.exports`.
     //
-    // The fix: thread `current_states` from `finalize_apply` into
-    // `resolve_export_values_post_apply` so the read results stay visible across the
-    // exports-resolution boundary. `layer_data_source_bindings` then
-    // merges the read attrs and `ds.arns` resolves to the read value.
+    // The fix: carry the split `managed_current` and `data_source_states` maps
+    // through `finalize_apply` into `resolve_export_values_post_apply` so the
+    // transient read results stay visible across the exports-resolution
+    // boundary. `layer_data_source_bindings` then merges the read attrs and
+    // `ds.arns` resolves to the read value.
     //
     // Without the fix, `resolve_export_values_post_apply` returns an empty map (no
     // entry for the export) instead of the NEW arn — exports stays
@@ -5486,8 +5497,8 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     let data_sources = vec![ds];
 
     // The provider-read result that `read_data_source_with_retry`
-    // writes into `current_states[ds.id]` during apply execution.
-    let current_states: HashMap<ResourceId, ResourceState> = {
+    // writes into `data_source_states[ds.id]` during apply execution.
+    let data_source_states: HashMap<ResourceId, ResourceState> = {
         let mut attrs: HashMap<String, Value> = HashMap::new();
         attrs.insert(
             "arns".to_string(),
@@ -5511,7 +5522,8 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
-            &current_states,
+            &HashMap::new(),
+            &data_source_states,
             &post_apply_state_file,
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
@@ -5534,7 +5546,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
             .get("admin_access_role_arns")
             .map(carina_core::value::PersistedExportValue::as_json),
         Some(&expected_json),
-        "data-source-derived export must resolve via current_states read result, got: {exports:?}",
+        "data-source-derived export must resolve via data_source_states read result, got: {exports:?}",
     );
 }
 
@@ -5676,7 +5688,7 @@ mod apply_deferred_for_parity {
 
     /// The apply path's exact call: same-config `let cert` read
     /// iterable with a chained loop-var body, fed a post-refresh
-    /// `current_states`. Asserts the apply side materializes AND
+    /// managed-current map. Asserts the apply side materializes AND
     /// resolves the chained ref — parity with the plan path's
     /// `chained_loop_var_field_access_resolves_post_expansion`.
     #[test]
@@ -5705,7 +5717,8 @@ mod apply_deferred_for_parity {
         let out = crate::wiring::expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5766,7 +5779,8 @@ mod apply_deferred_for_parity {
         let out = crate::wiring::expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &empty,
+            &crate::managed_current_from_states(empty),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5819,7 +5833,8 @@ mod apply_deferred_for_parity {
         let baseline = crate::wiring::expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5846,7 +5861,8 @@ mod apply_deferred_for_parity {
         let out = crate::wiring::expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -6177,14 +6193,15 @@ mod saved_plan_version_tests {
         .expect_err("v13 saved plan must be rejected after the orphan ownership change");
 
         let crate::error::AppError::UnsupportedPlanVersion {
+            path: error_path,
             found,
             expected,
             replan_command,
-            ..
         } = &error
         else {
             panic!("expected typed unsupported-version error, got: {error}");
         };
+        assert_eq!(error_path, &plan_path);
         assert_eq!(*found, 13);
         assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
         assert_eq!(
@@ -6241,7 +6258,7 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported-version error, got: {error}");
         };
         assert_eq!(*found, 15);
-        assert_eq!(*expected, 19);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
         assert_eq!(
             replan_command.as_deref(),
             Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
@@ -6296,7 +6313,63 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported-version error, got: {error}");
         };
         assert_eq!(*found, 18);
-        assert_eq!(*expected, 19);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        assert_eq!(
+            replan_command.as_deref(),
+            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn version_19_saved_plan_is_rejected_after_current_state_tagging_change() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        let v19 = serde_json::json!({
+            "version": 19,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-10-23T00:00:00Z",
+            "source_path": "infra",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": [] },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "data_source_origins": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(&plan_path, serde_json::to_string(&v19).unwrap()).expect("write plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("v19 saved plans contain the untagged current-state shape");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            path: error_path,
+            found,
+            expected,
+            replan_command,
+        } = &error
+        else {
+            panic!("expected typed unsupported-version error, got: {error}");
+        };
+        assert_eq!(error_path, &plan_path);
+        assert_eq!(*found, 19);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
         assert_eq!(
             replan_command.as_deref(),
             Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
@@ -6470,7 +6543,7 @@ mod saved_plan_version_tests {
                 AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
             ),
         );
-        let plan_input_states = carina_core::resource::into_plan_input_map(
+        let plan_input_states = crate::plan_input_current_from_states(
             current_states.clone(),
             &SchemaRegistry::new(),
             &[],
@@ -6482,6 +6555,7 @@ mod saved_plan_version_tests {
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
                 &plan_input_states,
+                &std::collections::HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &std::collections::HashMap::new(),
@@ -6507,10 +6581,10 @@ mod saved_plan_version_tests {
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
-            current_states: vec![crate::commands::plan::CurrentStateEntry {
+            current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
                 id,
-                state: current_state,
-            }],
+                current_state,
+            )],
             upstream_snapshot: std::collections::HashMap::new(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
@@ -6814,7 +6888,8 @@ fn skipped_export_does_not_downgrade_partial_success() {
         runtime_synthesized_resources: Vec::new(),
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
-        current_states: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
         bindings: Default::default(),
         failed_refreshes: HashSet::new(),
     };

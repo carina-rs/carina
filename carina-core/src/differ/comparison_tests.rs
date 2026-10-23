@@ -1286,7 +1286,7 @@ fn union_string_or_list_compares_string_list() {
 }
 
 #[test]
-fn into_plan_input_map_canonicalizes_string_or_list_state() {
+fn into_plan_input_current_map_from_states_canonicalizes_string_or_list_state() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let mut schema = ResourceSchema::new("iam.policy");
@@ -1316,7 +1316,8 @@ fn into_plan_input_map_canonicalizes_string_or_list_state() {
     let mut states = HashMap::new();
     states.insert(id.clone(), State::existing(id, state_attrs));
 
-    let plan_input_states = crate::resource::into_plan_input_map(states, &registry, &resources);
+    let plan_input_states =
+        crate::resource::into_plan_input_current_map_from_states(states, &registry, &resources);
     let plan = create_plan(
         &resources,
         &[],
@@ -1332,14 +1333,15 @@ fn into_plan_input_map_canonicalizes_string_or_list_state() {
 
     assert!(
         plan.effects().is_empty(),
-        "into_plan_input_map must canonicalize degraded List[String] state \
+        "into_plan_input_current_map_from_states must canonicalize degraded List[String] state \
          to StringList before diffing; effects were {:?}",
         plan.effects()
     );
 }
 
 #[test]
-fn into_plan_input_map_canonicalizes_separator_folded_enum_state_before_diffing() {
+fn into_plan_input_current_map_from_states_canonicalizes_separator_folded_enum_state_before_diffing()
+ {
     use crate::schema::{AttributeSchema, ResourceSchema, enum_identity};
 
     let mut schema = ResourceSchema::new("acm.Certificate");
@@ -1377,7 +1379,8 @@ fn into_plan_input_map_canonicalizes_separator_folded_enum_state_before_diffing(
     let mut states = HashMap::new();
     states.insert(id.clone(), State::existing(id, state_attrs));
 
-    let plan_input_states = crate::resource::into_plan_input_map(states, &registry, &resources);
+    let plan_input_states =
+        crate::resource::into_plan_input_current_map_from_states(states, &registry, &resources);
     let plan = create_plan(
         &resources,
         &[],
@@ -1463,11 +1466,16 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     id.provider = "aws".to_string();
     let mut states = std::collections::HashMap::new();
     let st = State::existing(id, state_attrs);
-    states.insert(st.id.clone(), st);
+    states.insert(st.id.clone(), Current::from_state(st));
     canonicalize_states_with_schemas(&mut states, &registry);
 
     let current = states.into_values().next().unwrap();
-    let result = diff_test(&resources[0], &current, None, None, Some(&schema));
+    let current = match &current {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
+    let result = diff_test(&resources[0], current, None, None, Some(&schema));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "carina#3080: scalar (desired) vs singleton-list (state) under \
@@ -1532,13 +1540,13 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     let id = resources[0].id.clone();
     let mut states = HashMap::from([(
         id.clone(),
-        State::existing(
+        Current::from_state(State::existing(
             id.clone(),
             HashMap::from([(
                 "statement".to_string(),
                 Value::Concrete(ConcreteValue::Map(persisted_statement())),
             )]),
-        ),
+        )),
     )]);
     canonicalize_states_with_schemas(&mut states, &registry);
 
@@ -1551,9 +1559,14 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     )]))
     .lift(&registry);
 
+    let current = match states.get(&id).unwrap() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
     let result = diff_test(
         &resources[0],
-        states.get(&id).unwrap(),
+        current,
         saved_attrs.get(&id),
         None,
         Some(&schema),
@@ -1879,7 +1892,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     id.provider = "awscc".to_string();
     let mut states = std::collections::HashMap::new();
     let st = State::existing(id, state_attrs);
-    states.insert(st.id.clone(), st);
+    states.insert(st.id.clone(), Current::from_state(st));
     canonicalize_states_with_schemas(&mut states, &registry);
 
     // The carina-cli plan path passes `prev_explicit` built from the
@@ -1888,9 +1901,14 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
 
     let current = states.into_values().next().unwrap();
+    let current = match &current {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
     let result = diff_test(
         &resources[0],
-        &current,
+        current,
         None,
         Some(&prev_explicit),
         Some(&schema),
@@ -2011,14 +2029,19 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     id.provider = "awscc".to_string();
     let mut states = std::collections::HashMap::new();
     let st = State::existing(id, state_attrs);
-    states.insert(st.id.clone(), st);
+    states.insert(st.id.clone(), Current::from_state(st));
     canonicalize_states_with_schemas(&mut states, &registry);
 
     let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
     let current = states.into_values().next().unwrap();
+    let current = match &current {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
     let result = diff_test(
         &resources[0],
-        &current,
+        current,
         None,
         Some(&prev_explicit),
         Some(&schema),

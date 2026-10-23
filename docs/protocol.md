@@ -23,8 +23,10 @@ empty string.
 This change prevents new invalid mutation outcomes; it does not infer or repair
 provider identifiers in legacy managed rows. Once configuration is parsed, the
 state load boundary removes pre-#3181 data-source artifacts only when their
-complete address matches a typed `read` declaration; identifier absence alone
-never classifies a row as a data source. An identifier-less managed row that
+complete address matches a typed `read` declaration and the historical row has
+no provider identifier. Address alone never removes an identifier-bearing
+managed orphan, and identifier absence alone never classifies a row as a data
+source. An identifier-less managed row that
 reaches ordinary resource planning or destroy is retained as an explicit
 invalid condition instead of being treated as absent. A matching `removed`
 block is the explicit exception: it abandons the broken row without a provider
@@ -35,11 +37,11 @@ import read cannot produce a non-empty identifier, that read fails at the
 provider-response boundary and no row is written; it is not reported later as
 corruption of the saved state.
 
-The pre-#3181 data-source cleanup is address-driven and only runs while the
-configuration still contains the matching typed `read` declaration. If that
-declaration has already been removed, its legacy row is indistinguishable from
-a managed orphan, so planning hard-fails on the missing identifier. Add and
-apply a matching `removed` block to discard that legacy row.
+The pre-#3181 data-source cleanup requires both the identifier-less legacy row
+shape and a matching typed `read` declaration. If that declaration has already
+been removed, its legacy row is indistinguishable from a managed orphan, so
+planning hard-fails on the missing identifier. Add and apply a matching
+`removed` block to discard that legacy row.
 
 A deposed generation with an empty identifier cannot be imported. Applying a
 matching `removed` block explicitly abandons that generation from state, and
@@ -53,9 +55,13 @@ empty deposed-only shell: it has no current attributes, binding, or other
 current-instance metadata, but retains historical generations awaiting delete.
 Data-source results are transient and are not written to managed-resource rows.
 
-Saved-plan format 19 records validated mutation identifiers directly and also
-records the key (but not the known-invalid empty identifier) of every malformed
-deposed generation explicitly abandoned by a `removed` block. Format 18 plans
+Saved-plan format 20 explicitly tags each current-state entry as managed or
+data-source state and tags every managed row as absent, present, or missing its
+identifier. Present rows are reclassified from their serialized state during
+decode, so the stored tag cannot bypass provider-identifier validation. The
+format also records validated mutation identifiers directly and records the key
+(but not the known-invalid empty identifier) of every malformed deposed
+generation explicitly abandoned by a `removed` block. Format 19 and older plans
 are rejected with re-plan guidance.
 
 Hosts and providers must both use protocol v9; the minimum supported protocol

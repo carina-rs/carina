@@ -5716,22 +5716,27 @@ pub fn canonicalize_data_sources_with_schemas(
     Ok(())
 }
 
-/// Walk every entry in a `current_states` map and canonicalize attribute
+/// Walk every entry in the managed-current map and canonicalize attribute
 /// values whose declared schema type is `Union[String, list(String)]`
 /// into `Value::Concrete(ConcreteValue::StringList)`.
 ///
 /// State files written before #2510 / #2511 (or by an apply path that
 /// somehow produced the legacy shape) come back through serde as the
 /// natural `Value::Concrete(ConcreteValue::String)` / `Value::Concrete(ConcreteValue::List)` form. Run this immediately
-/// after `current_states` is built — typically right after
+/// after managed current state is built — typically right after
 /// `StateFile::build_state_for_resource` populates the map — so the
 /// differ never sees a non-canonical state value compared against a
 /// canonical desired value. See #2481, #2513.
 pub fn canonicalize_states_with_schemas(
-    states: &mut std::collections::HashMap<crate::resource::ResourceId, crate::resource::State>,
+    states: &mut std::collections::HashMap<crate::resource::ResourceId, crate::resource::Current>,
     registry: &crate::schema::SchemaRegistry,
 ) {
-    for state in states.values_mut() {
+    for current in states.values_mut() {
+        let state = match current {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
         let kind = if state.id.resource_type.is_empty() {
             None
         } else {
@@ -5744,7 +5749,7 @@ pub fn canonicalize_states_with_schemas(
         let Some(schema) = kind else {
             continue;
         };
-        canonicalize_state_attribute_map_with_schema(&mut state.attributes, schema);
+        canonicalize_state_attribute_map_with_schema(current.attributes_mut(), schema);
     }
 }
 
@@ -7863,7 +7868,8 @@ mod tests {
             managed: &managed,
             compositions: &[],
             data_sources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
+            data_source_states: &std::collections::HashMap::new(),
             remote_bindings: &remote_bindings,
             wait_aliases: &[],
         });
@@ -11195,9 +11201,13 @@ mod tests {
             "subject",
             Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
         )]);
-        states.insert(s.id.clone(), s);
+        states.insert(s.id.clone(), crate::resource::Current::from_state(s));
         canonicalize_states_with_schemas(&mut states, &registry);
-        let state = states.values().next().unwrap();
+        let state = match states.values().next().unwrap() {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
         assert_eq!(
             state.attributes.get("subject"),
             Some(&Value::Concrete(ConcreteValue::StringList(vec![
@@ -11216,9 +11226,13 @@ mod tests {
                 ConcreteValue::String("repo:foo:*".into()),
             )])),
         )]);
-        states.insert(s.id.clone(), s);
+        states.insert(s.id.clone(), crate::resource::Current::from_state(s));
         canonicalize_states_with_schemas(&mut states, &registry);
-        let state = states.values().next().unwrap();
+        let state = match states.values().next().unwrap() {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
         assert_eq!(
             state.attributes.get("subject"),
             Some(&Value::Concrete(ConcreteValue::StringList(vec![
@@ -11233,11 +11247,18 @@ mod tests {
         let secret_hash = redacted_secret(&"deadbeef".repeat(8));
         let mut states = std::collections::HashMap::new();
         let state = make_state(vec![("subject", secret_hash.clone())]);
-        states.insert(state.id.clone(), state);
+        states.insert(
+            state.id.clone(),
+            crate::resource::Current::from_state(state),
+        );
 
         canonicalize_states_with_schemas(&mut states, &registry);
 
-        let state = states.values().next().unwrap();
+        let state = match states.values().next().unwrap() {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
         assert_eq!(
             state.attributes["subject"], secret_hash,
             "carina#3740: a current-state secret hash is an opaque scalar sentinel, never a list"
@@ -11252,9 +11273,13 @@ mod tests {
             "subject",
             Value::Concrete(ConcreteValue::String("x".into())),
         )]);
-        states.insert(s.id.clone(), s);
+        states.insert(s.id.clone(), crate::resource::Current::from_state(s));
         canonicalize_states_with_schemas(&mut states, &registry);
-        let state = states.values().next().unwrap();
+        let state = match states.values().next().unwrap() {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
         assert_eq!(
             state.attributes.get("subject"),
             Some(&Value::Concrete(ConcreteValue::String("x".into())))
@@ -11282,10 +11307,14 @@ mod tests {
             "subject",
             Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
         )]);
-        states.insert(s.id.clone(), s);
+        states.insert(s.id.clone(), crate::resource::Current::from_state(s));
         canonicalize_states_with_schemas(&mut states, &registry);
 
-        let state = states.values().next().unwrap();
+        let state = match states.values().next().unwrap() {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
         assert_eq!(
             resources[0].attributes.get("subject"),
             state.attributes.get("subject"),
@@ -11328,16 +11357,18 @@ mod tests {
             Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
         );
         let mut states = HashMap::new();
-        states.insert(id.clone(), State::existing(id, attrs));
+        states.insert(
+            id.clone(),
+            crate::resource::Current::from_state(State::existing(id, attrs)),
+        );
         canonicalize_states_with_schemas(&mut states, &registry);
 
-        let result = diff_test(
-            &desired[0],
-            states.values().next().expect("state exists"),
-            None,
-            None,
-            Some(&schema),
-        );
+        let current = match states.values().next().expect("state exists") {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
+        let result = diff_test(&desired[0], current, None, None, Some(&schema));
         assert!(
             matches!(result, Diff::NoChange(_)),
             "dynamic AZ enum API spelling in state must canonicalize to DSL spelling; got {result:?}"
@@ -11397,10 +11428,14 @@ mod tests {
             "principal",
             Value::Concrete(ConcreteValue::Map(state_inner)),
         )]);
-        states.insert(s.id.clone(), s);
+        states.insert(s.id.clone(), crate::resource::Current::from_state(s));
         canonicalize_states_with_schemas(&mut states, &registry);
 
-        let state = states.values().next().unwrap();
+        let state = match states.values().next().unwrap() {
+            crate::resource::Current::Absent(state) => state.state(),
+            crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::MissingIdentifier(state) => state.state(),
+        };
         let expected = {
             let mut m = IndexMap::new();
             m.insert(

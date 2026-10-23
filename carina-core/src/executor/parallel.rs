@@ -228,7 +228,8 @@ pub(super) async fn execute_effects_sequential(
     let mut partial_count = 0;
     let mut partial_diagnostics = Vec::new();
     let mut skip_count = 0;
-    let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
+    let (mut applied_states, wait_identifiers) =
+        AppliedStates::with_initial(&input.managed_current, &input.data_source_states);
     let mut successfully_deleted: HashSet<DeletedInstanceKey> = HashSet::new();
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, AppliedIdentifier> = HashMap::new();
@@ -730,7 +731,7 @@ pub(super) async fn execute_effects_sequential(
                         &state,
                     );
                     input
-                        .current_states
+                        .data_source_states
                         .insert(resource.id.clone(), state.clone());
                     applied_states.insert(resource.id.clone(), state);
                 }
@@ -826,7 +827,7 @@ pub(super) async fn execute_effects_sequential(
         LoopStep::Continue(cleanup_wait) => {
             let refresh = refresh_pending_states(
                 provider,
-                &mut input.current_states,
+                &mut input.managed_current,
                 &pending_refreshes,
                 observer,
             );
@@ -859,7 +860,8 @@ pub(super) async fn execute_effects_sequential(
         runtime_synthesized_resources,
         successfully_deleted,
         permanent_name_overrides,
-        current_states: input.current_states.clone(),
+        managed_current: input.managed_current.clone(),
+        data_source_states: input.data_source_states.clone(),
         bindings: input.bindings.clone(),
         failed_refreshes,
     };
@@ -1127,7 +1129,8 @@ mod tests {
             },
             compositions: &[],
             bindings: Default::default(),
-            current_states: HashMap::new(),
+            managed_current: HashMap::new(),
+            data_source_states: HashMap::new(),
             deferred_data_source_reads: DeferredDataSourceReads::none(),
             normalizer: &NoopNormalizer,
             provider_configs: &[],
@@ -1241,7 +1244,8 @@ mod tests {
             },
             compositions: &[],
             bindings: Default::default(),
-            current_states: HashMap::new(),
+            managed_current: HashMap::new(),
+            data_source_states: HashMap::new(),
             deferred_data_source_reads: DeferredDataSourceReads::none(),
             normalizer: &NoopNormalizer,
             provider_configs: &[],

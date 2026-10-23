@@ -6,12 +6,10 @@ use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
 pub use carina_core::provider::PreviousSecretHashAuthority;
-use carina_core::provider::{
-    AppliedIdentifier, PersistedAttributes, PersistedAttributesError, RawSavedAttrs,
-};
+use carina_core::provider::{PersistedAttributes, PersistedAttributesError, RawSavedAttrs};
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
-    ConcreteValue, DataSource, Directives, PartialReadMarker, ResolvedResource, Resource,
+    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, ResolvedResource, Resource,
     ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::ResourceSchema;
@@ -56,124 +54,6 @@ pub struct StateFile {
     pub exports: HashMap<String, PersistedExportValue>,
 }
 
-/// Typed result of loading one managed resource's current instance.
-///
-/// A row without a provider identifier is distinct from an address that is
-/// absent from state. Callers must preserve [`Self::MissingProviderIdentifier`]
-/// through planning so it becomes an actionable plan error instead of a
-/// duplicate Create. [`Self::Absent`] also represents a deposed-only shell:
-/// that row has historical delete work but no current instance.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResourceStateLoad {
-    Absent(State),
-    Present(PresentResourceState),
-    MissingProviderIdentifier(State),
-}
-
-/// A loaded current instance whose provider identifier has been validated.
-///
-/// The fields are private so callers cannot pair a state with one identifier
-/// and use a different identifier for refresh.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PresentResourceState {
-    state: State,
-    identifier: AppliedIdentifier,
-}
-
-impl PresentResourceState {
-    pub fn state(&self) -> &State {
-        &self.state
-    }
-
-    pub fn identifier(&self) -> &AppliedIdentifier {
-        &self.identifier
-    }
-
-    pub fn into_parts(self) -> (State, AppliedIdentifier) {
-        (self.state, self.identifier)
-    }
-}
-
-impl ResourceStateLoad {
-    pub fn absent(id: ResourceId) -> Self {
-        Self::Absent(State::not_found(id))
-    }
-
-    /// Classify cached provider state at the state-file refresh boundary.
-    fn from_cached_state(state: State) -> Self {
-        if !state.exists {
-            return Self::Absent(state);
-        }
-        match state
-            .identifier
-            .as_deref()
-            .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
-        {
-            Some(identifier) => Self::Present(PresentResourceState { state, identifier }),
-            None => Self::MissingProviderIdentifier(state),
-        }
-    }
-
-    pub fn state(&self) -> &State {
-        match self {
-            Self::Absent(state) | Self::MissingProviderIdentifier(state) => state,
-            Self::Present(present) => present.state(),
-        }
-    }
-
-    pub fn into_state(self) -> State {
-        match self {
-            Self::Absent(state) | Self::MissingProviderIdentifier(state) => state,
-            Self::Present(present) => present.state,
-        }
-    }
-}
-
-/// One loaded orphan at the provider-refresh boundary.
-///
-/// A missing provider identifier remains attached to the orphan itself; there
-/// is no parallel set that a refresh caller can accidentally discard.
-#[derive(Debug, Clone, PartialEq)]
-pub enum OrphanStateLoad {
-    Present {
-        orphan: Orphan,
-        identifier: AppliedIdentifier,
-    },
-    MissingProviderIdentifier(Orphan),
-}
-
-impl OrphanStateLoad {
-    fn orphan(&self) -> &Orphan {
-        match self {
-            Self::Present { orphan, .. } | Self::MissingProviderIdentifier(orphan) => orphan,
-        }
-    }
-
-    pub fn state(&self) -> &State {
-        self.orphan().state()
-    }
-
-    pub fn binding(&self) -> Option<&str> {
-        self.orphan().binding()
-    }
-
-    pub fn with_refreshed_state(self, state: State) -> Self {
-        match self {
-            Self::Present { orphan, identifier } => Self::Present {
-                orphan: orphan.with_refreshed_state(state),
-                identifier,
-            },
-            Self::MissingProviderIdentifier(orphan) => Self::MissingProviderIdentifier(orphan),
-        }
-    }
-
-    fn into_orphan(self) -> Orphan {
-        match self {
-            Self::Present { orphan, .. } | Self::MissingProviderIdentifier(orphan) => orphan,
-        }
-    }
-}
-
 /// Persisted orphans classified per row for safe provider refresh.
 ///
 /// Converting to planner input preserves malformed rows as existing states
@@ -181,20 +61,24 @@ impl OrphanStateLoad {
 /// [`carina_core::plan::PlanErrorKind::MissingProviderIdentifier`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoadedOrphans {
-    by_id: HashMap<ResourceId, OrphanStateLoad>,
+    by_id: HashMap<ResourceId, Orphan>,
 }
 
 impl LoadedOrphans {
-    pub fn insert(&mut self, loaded: OrphanStateLoad) {
-        self.by_id
-            .insert(loaded.orphan().state().id.clone(), loaded);
+    pub fn insert(&mut self, orphan: Orphan) {
+        let id = match orphan.current() {
+            Current::Absent(state) => state.state().id.clone(),
+            Current::Present(present) => present.state().id.clone(),
+            Current::MissingIdentifier(state) => state.state().id.clone(),
+        };
+        self.by_id.insert(id, orphan);
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &OrphanStateLoad)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &Orphan)> {
         self.by_id.iter()
     }
 
@@ -202,24 +86,21 @@ impl LoadedOrphans {
     /// consumed. Missing-identifier rows remain present and invalid in the
     /// returned provider state; they are not converted to `not_found`.
     pub fn into_plan_orphans(self) -> carina_core::differ::Orphans {
-        self.by_id
-            .into_values()
-            .map(OrphanStateLoad::into_orphan)
-            .collect()
+        self.by_id.into_values().collect()
     }
 }
 
 impl IntoIterator for LoadedOrphans {
-    type Item = (ResourceId, OrphanStateLoad);
-    type IntoIter = std::collections::hash_map::IntoIter<ResourceId, OrphanStateLoad>;
+    type Item = (ResourceId, Orphan);
+    type IntoIter = std::collections::hash_map::IntoIter<ResourceId, Orphan>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_id.into_iter()
     }
 }
 
-impl FromIterator<OrphanStateLoad> for LoadedOrphans {
-    fn from_iter<T: IntoIterator<Item = OrphanStateLoad>>(iter: T) -> Self {
+impl FromIterator<Orphan> for LoadedOrphans {
+    fn from_iter<T: IntoIterator<Item = Orphan>>(iter: T) -> Self {
         let mut loaded = Self::default();
         for orphan in iter {
             loaded.insert(orphan);
@@ -701,14 +582,15 @@ impl StateFile {
     /// Remove historical rows that correspond to typed `read` declarations.
     ///
     /// Releases before #3181 could persist data-source results in the managed
-    /// resource table. Match the complete typed address supplied by the parser;
-    /// identifier absence alone is deliberately not a classifier because a
-    /// managed row can lose its identifier and must fail closed.
+    /// resource table. Match both the complete typed address supplied by the
+    /// parser and the legacy row shape. An identifier-bearing row is managed
+    /// state even when a new data source now occupies the same address.
     pub fn remove_legacy_data_source_rows(&mut self, data_sources: &[DataSource]) -> usize {
         let data_source_ids: HashSet<_> = data_sources.iter().map(|source| &source.id).collect();
         let original_len = self.resources.len();
-        self.resources
-            .retain(|row| !data_source_ids.contains(&Self::id_for_resource_state(row)));
+        self.resources.retain(|row| {
+            row.identifier.is_some() || !data_source_ids.contains(&Self::id_for_resource_state(row))
+        });
         original_len - self.resources.len()
     }
 
@@ -754,23 +636,23 @@ impl StateFile {
     /// Load the current-instance state for a managed resource.
     ///
     /// Missing and empty identifiers are returned as the typed
-    /// [`ResourceStateLoad::MissingProviderIdentifier`] condition. A row whose
+    /// [`Current::MissingIdentifier`] condition. A row whose
     /// current instance is absent but which retains deposed generations is the
-    /// sole legitimate identifier-less row and returns [`ResourceStateLoad::Absent`].
+    /// sole legitimate identifier-less row and returns [`Current::Absent`].
     /// Such a shell must have no current-instance attributes, binding, or
     /// related metadata; otherwise it is a malformed current instance rather
     /// than a shell.
     /// Data sources never enter `StateFile::resources`; their provider results
     /// are transient and therefore are not a second identifier-less row kind.
-    pub fn build_state_for_resource(&self, id: &ResourceId) -> ResourceStateLoad {
+    pub fn build_state_for_resource(&self, id: &ResourceId) -> Current {
         let rs = id
             .identity_str()
             .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity));
         let Some(rs) = rs else {
-            return ResourceStateLoad::absent(id.clone());
+            return Current::absent(id.clone());
         };
-        if rs.is_deposed_only_shell() {
-            return ResourceStateLoad::absent(id.clone());
+        if !rs.has_current_instance() {
+            return Current::absent(id.clone());
         }
 
         let state = State {
@@ -781,7 +663,7 @@ impl StateFile {
             dependency_bindings: rs.dependency_bindings.clone(),
             partial_read: rs.partial_read.clone(),
         };
-        ResourceStateLoad::from_cached_state(state)
+        Current::from_state(state)
     }
 
     /// Build each persisted orphan as one typed value containing its
@@ -796,24 +678,16 @@ impl StateFile {
             if desired_ids.contains(&id) {
                 continue;
             }
-            let loaded_orphan = match self.build_state_for_resource(&id) {
-                ResourceStateLoad::Absent(_) => continue,
-                ResourceStateLoad::Present(present) => {
-                    let (state, identifier) = present.into_parts();
-                    OrphanStateLoad::Present {
-                        orphan: Orphan::new(state, rs.binding.clone(), rs.directives.clone()),
-                        identifier,
-                    }
+            let orphan = match self.build_state_for_resource(&id) {
+                Current::Absent(_state) => continue,
+                Current::Present(present) => {
+                    Orphan::present(present, rs.binding.clone(), rs.directives.clone())
                 }
-                ResourceStateLoad::MissingProviderIdentifier(state) => {
-                    OrphanStateLoad::MissingProviderIdentifier(Orphan::new(
-                        state,
-                        rs.binding.clone(),
-                        rs.directives.clone(),
-                    ))
+                Current::MissingIdentifier(state) => {
+                    Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
                 }
             };
-            loaded.insert(loaded_orphan);
+            loaded.insert(orphan);
         }
         loaded
     }
@@ -1580,6 +1454,15 @@ impl ResourceState {
     /// Borrow this row's attributes through the persisted decode seam.
     pub fn persisted_attributes(&self) -> &PersistedAttributes {
         &self.attributes
+    }
+
+    /// Whether this row contains a current instance in addition to any
+    /// historical deposed generations.
+    ///
+    /// An identifier-less row is still a malformed current instance unless it
+    /// has the exact deposed-only shell shape produced by state writeback.
+    pub fn has_current_instance(&self) -> bool {
+        !self.is_deposed_only_shell()
     }
 
     /// Whether this row contains only deposed generations and no current

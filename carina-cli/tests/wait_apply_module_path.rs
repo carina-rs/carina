@@ -41,7 +41,7 @@ use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, Provider, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadOutcome,
 };
-use carina_core::resource::{ResolvedResource, ResourceId, State, Value};
+use carina_core::resource::{Current, ResolvedResource, ResourceId, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
@@ -477,7 +477,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let ctx = WiringContext::new(factories, &parsed.providers);
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut current_states: HashMap<ResourceId, Current> = HashMap::new();
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
@@ -491,11 +491,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             managed: &resources_for_plan,
             compositions: &parsed.compositions,
             data_sources: &[],
-            current_states: &carina_core::resource::into_plan_input_map(
+            managed_current: &carina_core::resource::into_plan_input_current_map(
                 current_states.clone(),
                 ctx.schemas(),
                 &resources_for_plan,
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -511,11 +512,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             managed: &[],
             compositions: &parsed.compositions,
             data_sources: &parsed.data_sources,
-            current_states: &carina_core::resource::into_plan_input_map(
+            managed_current: &carina_core::resource::into_plan_input_current_map(
                 current_states.clone(),
                 ctx.schemas(),
                 &resource_origins,
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -527,6 +529,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let compositions = parsed.compositions.clone();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
     let mut data_sources = parsed.data_sources.clone();
+    let mut data_source_states = HashMap::new();
     let mut orphans = Orphans::new();
     let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
     preprocessor
@@ -535,6 +538,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             &resource_origins,
             &module_gate,
             &mut current_states,
+            &mut data_source_states,
             &mut orphans,
             &parsed.providers,
             &mut data_sources,
@@ -552,11 +556,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &parsed.data_sources,
         &provider,
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &carina_core::resource::into_plan_input_current_map(
                 current_states.clone(),
                 ctx.schemas(),
                 &resources_for_plan,
             ),
+            &HashMap::new(),
             &orphans,
         ),
         &HashMap::new(),
@@ -596,7 +601,8 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         },
         compositions: &parsed.compositions,
         bindings: ResolvedBindings::default(),
-        current_states,
+        managed_current: current_states,
+        data_source_states: HashMap::new(),
         deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],

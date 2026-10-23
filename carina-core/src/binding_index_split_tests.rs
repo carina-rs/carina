@@ -71,7 +71,8 @@ fn pre_apply_records_dsl_attributes() {
         managed: &[m],
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -95,11 +96,12 @@ fn pre_apply_merges_state_for_missing_dsl_keys() {
         managed: &[m],
         compositions: &[],
         data_sources: &[],
-        current_states: &crate::resource::into_plan_input_map(
+        managed_current: &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -116,7 +118,8 @@ fn pre_apply_skips_resources_without_binding() {
         managed: &[m],
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -130,7 +133,8 @@ fn add_compositions_layers_on_top_of_resources() {
         managed: &[managed],
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -157,7 +161,8 @@ fn add_compositions_overwrites_same_name_resource_binding() {
         managed: &[managed],
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -178,7 +183,8 @@ fn add_compositions_skips_unbound() {
         managed: &[],
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -203,7 +209,8 @@ fn managed_plus_virtual_layering() {
         managed: std::slice::from_ref(&managed),
         compositions: &[],
         data_sources: &[],
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });

@@ -4529,7 +4529,8 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
             managed: &[resource],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         })

@@ -42,11 +42,28 @@ use carina_core::provider::{
     UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{ConcreteValue, ResolvedResource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, Resource, ResourceId, State, Value,
+};
 use carina_core::schema::SchemaRegistry;
 
 fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
+}
+
+fn managed_current(states: HashMap<ResourceId, State>) -> HashMap<ResourceId, Current> {
+    states
+        .into_iter()
+        .map(|(id, state)| (id, Current::from_state(state)))
+        .collect()
+}
+
+fn plan_input_current(
+    states: HashMap<ResourceId, State>,
+    schemas: &SchemaRegistry,
+    resources: &[Resource],
+) -> HashMap<ResourceId, PlanInputCurrent> {
+    carina_core::resource::into_plan_input_current_map(managed_current(states), schemas, resources)
 }
 
 fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
@@ -264,11 +281,12 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
                 data_sources: &[],
-                current_states: &carina_core::resource::into_plan_input_map(
+                managed_current: &plan_input_current(
                     current_states.clone(),
                     &carina_core::schema::SchemaRegistry::new(),
                     &[],
                 ),
+                data_source_states: &HashMap::new(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -285,11 +303,12 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &[],
         &MockProvider,
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &plan_input_current(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
@@ -331,7 +350,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         },
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
-        current_states,
+        managed_current: managed_current(current_states),
+        data_source_states: HashMap::new(),
         deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
@@ -438,11 +458,12 @@ async fn nested_module_wait_binding_survives_two_expansions() {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
                 data_sources: &[],
-                current_states: &carina_core::resource::into_plan_input_map(
+                managed_current: &plan_input_current(
                     current_states.clone(),
                     &carina_core::schema::SchemaRegistry::new(),
                     &[],
                 ),
+                data_source_states: &HashMap::new(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -459,11 +480,12 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &[],
         &MockProvider,
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &plan_input_current(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
@@ -504,7 +526,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         },
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
-        current_states,
+        managed_current: managed_current(current_states),
+        data_source_states: HashMap::new(),
         deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
@@ -590,11 +613,12 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
                 data_sources: &[],
-                current_states: &carina_core::resource::into_plan_input_map(
+                managed_current: &plan_input_current(
                     current_states.clone(),
                     &carina_core::schema::SchemaRegistry::new(),
                     &[],
                 ),
+                data_source_states: &HashMap::new(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -641,11 +665,12 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &[],
         &MockProvider,
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &plan_input_current(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),

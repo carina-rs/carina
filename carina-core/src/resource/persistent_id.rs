@@ -4,7 +4,7 @@
 //! ## What problem these solve
 //!
 //! Pre-#3293 every node in the IR carried a `ResourceId`. The state
-//! layer's lookup APIs (`current_states: HashMap<ResourceId, State>`,
+//! layer's lookup APIs (managed and data-source maps keyed by `ResourceId`,
 //! `StateBackend::load`, etc.) accepted any `&ResourceId`, including
 //! one from a [`Composition`](super::Composition) — which never
 //! persists. A composition id passed to a state lookup is guaranteed
@@ -25,10 +25,9 @@
 //! This PR is **boundary-only**: the wrappers exist, accessor
 //! methods on [`Resource`](super::Resource) / [`DataSource`](super::DataSource) /
 //! [`Composition`](super::Composition) make them reachable, but the
-//! existing `current_states: HashMap<ResourceId, State>` maps and
-//! the ~1130 sites that touch `ResourceId` are *not* migrated in
-//! this PR. The wrappers become the canonical type at every new
-//! state-touching boundary going forward; existing boundaries can
+//! existing state maps still use `ResourceId` keys, and the ~1130 sites that
+//! touch `ResourceId` are *not* migrated in this PR. The wrappers become the
+//! canonical type at every new state-touching boundary; existing boundaries can
 //! be widened one at a time without large mechanical diffs.
 //!
 //! `into_inner()` is provided as an explicit escape hatch (the wrapper

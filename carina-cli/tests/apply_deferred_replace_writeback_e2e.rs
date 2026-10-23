@@ -166,10 +166,7 @@ fn mock_resource(name: &str, binding: &str) -> Resource {
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {
-    CurrentStateEntry {
-        id: resource.id.clone(),
-        state: State::not_found(resource.id.clone()),
-    }
+    CurrentStateEntry::managed(resource.id.clone(), State::not_found(resource.id.clone()))
 }
 
 fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
