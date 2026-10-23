@@ -49,7 +49,8 @@ pub struct OverrideAwareResources {
 pub struct RebuildBindingsInputs<'a> {
     pub compositions: &'a [crate::resource::Composition],
     pub data_sources: &'a [crate::resource::DataSource],
-    pub current_states: &'a HashMap<ResourceId, crate::resource::PlanInputState>,
+    pub managed_current: &'a HashMap<ResourceId, crate::resource::PlanInputCurrent>,
+    pub data_source_states: &'a HashMap<ResourceId, crate::resource::State>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [crate::binding_index::WaitAliasSpec],
 }
@@ -105,7 +106,8 @@ impl OverrideAwareResources {
             managed: _,
             compositions,
             data_sources,
-            current_states,
+            managed_current,
+            data_source_states,
             remote_bindings,
             wait_aliases,
         } = inputs;
@@ -115,7 +117,8 @@ impl OverrideAwareResources {
             managed: &resources,
             compositions,
             data_sources,
-            current_states,
+            managed_current,
+            data_source_states,
             remote_bindings,
             wait_aliases,
         });
@@ -160,7 +163,8 @@ impl OverrideAwareResources {
             managed: &resources,
             compositions,
             data_sources,
-            current_states,
+            managed_current,
+            data_source_states,
             remote_bindings,
             wait_aliases,
         });
@@ -283,7 +287,8 @@ impl OverrideAwareResources {
         let RebuildBindingsInputs {
             compositions,
             data_sources,
-            current_states,
+            managed_current,
+            data_source_states,
             remote_bindings,
             wait_aliases,
         } = inputs;
@@ -291,7 +296,8 @@ impl OverrideAwareResources {
             managed: &self.resources,
             compositions,
             data_sources,
-            current_states,
+            managed_current,
+            data_source_states,
             remote_bindings,
             wait_aliases,
         });
@@ -312,14 +318,16 @@ impl OverrideAwareResources {
     ) -> Self {
         let compositions = [];
         let data_sources = [];
-        let current_states = HashMap::new();
+        let managed_current = HashMap::new();
+        let data_source_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = [];
         let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &compositions,
             data_sources: &data_sources,
-            current_states: &current_states,
+            managed_current: &managed_current,
+            data_source_states: &data_source_states,
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         });
@@ -430,7 +438,7 @@ fn push_unique(resources: &mut Vec<ResourceId>, id: ResourceId) {
 mod tests {
     use super::*;
     use crate::binding_index::WaitAliasSpec;
-    use crate::resource::{AccessPath, DeferredValue, PlanInputState};
+    use crate::resource::{AccessPath, DeferredValue, PlanInputCurrent};
 
     fn string(value: impl Into<String>) -> Value {
         Value::Concrete(ConcreteValue::String(value.into().into()))
@@ -468,7 +476,7 @@ mod tests {
     ) -> OverrideAwareResources {
         let compositions = [];
         let data_sources = [];
-        let current_states: HashMap<ResourceId, PlanInputState> = HashMap::new();
+        let managed_current: HashMap<ResourceId, PlanInputCurrent> = HashMap::new();
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
@@ -479,7 +487,8 @@ mod tests {
                 managed: &[],
                 compositions: &compositions,
                 data_sources: &data_sources,
-                current_states: &current_states,
+                managed_current: &managed_current,
+                data_source_states: &HashMap::new(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },

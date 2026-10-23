@@ -21,7 +21,7 @@ use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{AppliedIdentifier, Provider, ProviderError, ReadRequest};
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
-use crate::resource::{ResolvedResourceId, ResourceId, State, Value};
+use crate::resource::{Current, ResolvedResourceId, ResourceId, State, Value};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
 use crate::wait::WaitObservation;
@@ -31,19 +31,29 @@ pub(crate) type WaitIdentifierResolver<'a> =
     dyn Fn(&ResourceId) -> Option<AppliedIdentifier> + Send + Sync + 'a;
 pub(crate) type SharedWaitIdentifiers = Arc<Mutex<HashMap<ResourceId, Option<AppliedIdentifier>>>>;
 
-fn initial_wait_identifiers(current_states: &HashMap<ResourceId, State>) -> SharedWaitIdentifiers {
-    Arc::new(Mutex::new(
-        current_states
-            .iter()
-            .map(|(id, state)| {
-                let identifier = state
-                    .identifier
-                    .as_deref()
-                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
-                (id.clone(), identifier)
-            })
-            .collect(),
-    ))
+fn initial_wait_identifiers(
+    managed_current: &HashMap<ResourceId, Current>,
+    data_source_states: &HashMap<ResourceId, State>,
+) -> SharedWaitIdentifiers {
+    let mut identifiers: HashMap<ResourceId, Option<AppliedIdentifier>> = managed_current
+        .iter()
+        .map(|(id, current)| {
+            let identifier = match current {
+                Current::Absent(_state) => None,
+                Current::Present(present) => Some(present.identifier().clone()),
+                Current::MissingIdentifier(_state) => None,
+            };
+            (id.clone(), identifier)
+        })
+        .collect();
+    identifiers.extend(data_source_states.iter().map(|(id, state)| {
+        let identifier = state
+            .identifier
+            .as_deref()
+            .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
+        (id.clone(), identifier)
+    }));
+    Arc::new(Mutex::new(identifiers))
 }
 
 pub(crate) fn resolve_wait_identifier(
@@ -65,9 +75,10 @@ pub(crate) struct AppliedStates {
 
 impl AppliedStates {
     pub(crate) fn with_initial(
-        current_states: &HashMap<ResourceId, State>,
+        managed_current: &HashMap<ResourceId, Current>,
+        data_source_states: &HashMap<ResourceId, State>,
     ) -> (Self, SharedWaitIdentifiers) {
-        let shared = initial_wait_identifiers(current_states);
+        let shared = initial_wait_identifiers(managed_current, data_source_states);
         let applied_states = Self {
             states: HashMap::new(),
             wait_identifiers: shared.clone(),
@@ -539,6 +550,24 @@ mod tests {
             AppliedIdentifier::new("wait-target-id")
                 .expect("fixture provider identifier is non-empty"),
         )
+    }
+
+    #[test]
+    fn initial_wait_identifiers_include_separate_data_source_states() {
+        let id = ResourceId::with_identity("test.lookup", "target");
+        let data_source_states = HashMap::from([(
+            id.clone(),
+            State::existing(id.clone(), HashMap::new()).with_identifier("lookup-id"),
+        )]);
+
+        let identifiers = initial_wait_identifiers(&HashMap::new(), &data_source_states);
+
+        assert_eq!(
+            resolve_wait_identifier(&identifiers, &id)
+                .expect("data-source identifier must be available to waits")
+                .as_str(),
+            "lookup-id"
+        );
     }
 
     /// Minimal test provider: returns a queue of pre-canned read

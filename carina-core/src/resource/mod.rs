@@ -20,6 +20,7 @@ use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
+use crate::provider::AppliedIdentifier;
 use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
 pub use enum_value::{
@@ -6545,31 +6546,256 @@ pub struct PartialReadMarker {
     pub missing_attributes: BTreeSet<String>,
 }
 
-/// State as fed to plan/diff/render.
+/// A loaded managed resource that is known to exist and has a validated
+/// provider identifier.
+///
+/// The fields stay private so production callers cannot pair one state's
+/// attributes with another resource's identifier. [`Current::from_state`] is
+/// the only production path that can mint this type.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PlanInputState(State);
+pub struct PresentResourceState {
+    state: State,
+    identifier: AppliedIdentifier,
+}
 
-impl PlanInputState {
-    pub fn as_state(&self) -> &State {
+impl PresentResourceState {
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        &self.identifier
+    }
+
+    pub fn into_parts(self) -> (State, AppliedIdentifier) {
+        (self.state, self.identifier)
+    }
+}
+
+/// A loaded managed resource that is known not to exist.
+///
+/// The field is private so callers outside `carina-core` must classify raw
+/// provider state through [`Current::from_state`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbsentState(State);
+
+impl AbsentState {
+    pub fn state(&self) -> &State {
         &self.0
     }
 
-    pub fn into_inner(self) -> State {
+    pub fn into_state(self) -> State {
         self.0
     }
 }
 
-pub fn into_plan_input_map(
-    mut states: HashMap<ResourceId, State>,
+/// A loaded managed resource that exists but has no valid provider identifier.
+///
+/// The field is private so callers outside `carina-core` must classify raw
+/// provider state through [`Current::from_state`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnidentifiedState(State);
+
+impl UnidentifiedState {
+    pub fn state(&self) -> &State {
+        &self.0
+    }
+
+    pub fn into_state(self) -> State {
+        self.0
+    }
+}
+
+/// Typed current-instance state for a managed resource.
+///
+/// Callers must match every variant instead of flattening this type. That
+/// keeps a future lifecycle variant compile-visible at every classification
+/// boundary.
+///
+/// ```compile_fail
+/// use carina_core::resource::{Current, State};
+///
+/// fn flatten(current: Current) -> State {
+///     current.into_state()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::resource::{Current, State};
+///
+/// fn flatten(current: &Current) -> &State {
+///     current.state()
+/// }
+/// ```
+///
+/// Lifecycle variants cannot be constructed from raw state outside
+/// `carina-core`:
+///
+/// ```compile_fail
+/// use carina_core::resource::{Current, ResourceId, State};
+///
+/// let id = ResourceId::with_identity("test.Resource", "example");
+/// let current = Current::Absent(State::not_found(id));
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::resource::{Current, ResourceId, State};
+///
+/// let id = ResourceId::with_identity("test.Resource", "example");
+/// let state = State::existing(id, Default::default());
+/// let current = Current::MissingIdentifier(state);
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub enum Current {
+    Absent(AbsentState),
+    Present(PresentResourceState),
+    MissingIdentifier(UnidentifiedState),
+}
+
+impl Current {
+    pub fn absent(id: ResourceId) -> Self {
+        Self::Absent(AbsentState(State::not_found(id)))
+    }
+
+    pub fn from_state(state: State) -> Self {
+        if !state.exists {
+            return Self::Absent(AbsentState(state));
+        }
+        let Some(identifier) = state
+            .identifier
+            .as_deref()
+            .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
+        else {
+            return Self::MissingIdentifier(UnidentifiedState(state));
+        };
+        Self::Present(PresentResourceState { state, identifier })
+    }
+
+    pub fn attributes_mut(&mut self) -> &mut HashMap<String, Value> {
+        match self {
+            Self::Absent(state) => &mut state.0.attributes,
+            Self::Present(present) => &mut present.state.attributes,
+            Self::MissingIdentifier(state) => &mut state.0.attributes,
+        }
+    }
+
+    pub fn set_id(&mut self, id: ResourceId) {
+        match self {
+            Self::Absent(state) => state.0.id = id,
+            Self::Present(present) => present.state.id = id,
+            Self::MissingIdentifier(state) => state.0.id = id,
+        }
+    }
+
+    pub fn set_dependency_bindings(&mut self, dependency_bindings: BTreeSet<String>) {
+        match self {
+            Self::Absent(state) => state.0.dependency_bindings = dependency_bindings,
+            Self::Present(present) => {
+                present.state.dependency_bindings = dependency_bindings;
+            }
+            Self::MissingIdentifier(state) => {
+                state.0.dependency_bindings = dependency_bindings;
+            }
+        }
+    }
+
+    /// Apply the value-bearing fields returned by provider normalization or
+    /// hydration without letting that raw-state bridge reclassify this row.
+    ///
+    /// The managed lifecycle fields (`id`, `exists`, and `identifier`) remain
+    /// owned by this typed value. Provider transforms operate on attributes
+    /// and may restore host metadata such as dependency bindings and partial
+    /// read markers, but they cannot mint or discard a validated identifier.
+    pub fn apply_transformed_state(&mut self, transformed: State) {
+        let State {
+            id: _id,
+            identifier: _identifier,
+            attributes,
+            exists: _exists,
+            dependency_bindings,
+            partial_read,
+        } = transformed;
+        let state = match self {
+            Self::Absent(state) => &mut state.0,
+            Self::Present(present) => &mut present.state,
+            Self::MissingIdentifier(state) => &mut state.0,
+        };
+        state.attributes = attributes;
+        state.dependency_bindings = dependency_bindings;
+        state.partial_read = partial_read;
+    }
+
+    fn into_plan_input(mut self) -> PlanInputCurrent {
+        match &mut self {
+            Self::Absent(state) => state.0.materialize_partial_read_unknowns(),
+            Self::Present(present) => present.state.materialize_partial_read_unknowns(),
+            Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
+        }
+        PlanInputCurrent(self)
+    }
+}
+
+/// Construct an adversarial `Present` fixture whose raw `State::identifier`
+/// may differ from the identifier already validated by `Current`.
+///
+/// Production code must always use [`Current::from_state`]. This helper exists
+/// only so cross-crate regression tests can prove that consumers treat the
+/// typed identifier as authoritative instead of re-validating the raw field.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn fixture_present_current(state: State, identifier: AppliedIdentifier) -> Current {
+    Current::Present(PresentResourceState { state, identifier })
+}
+
+/// Managed current state after plan-only canonicalization and unknown
+/// reconstruction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanInputCurrent(Current);
+
+impl PlanInputCurrent {
+    pub(crate) fn absent(id: ResourceId) -> Self {
+        Current::absent(id).into_plan_input()
+    }
+
+    pub fn current(&self) -> &Current {
+        &self.0
+    }
+
+    pub fn into_current(self) -> Current {
+        self.0
+    }
+}
+
+pub fn into_plan_input_current_map(
+    mut current: HashMap<ResourceId, Current>,
     schemas: &crate::schema::SchemaRegistry,
     resources: &[Resource],
-) -> HashMap<ResourceId, PlanInputState> {
-    crate::value::canonicalize_states_with_schemas(&mut states, schemas);
-    crate::utils::lift_current_state_enum_leaves(&mut states, resources, schemas);
+) -> HashMap<ResourceId, PlanInputCurrent> {
+    crate::value::canonicalize_states_with_schemas(&mut current, schemas);
+    crate::utils::lift_current_state_enum_leaves(&mut current, resources, schemas);
+    current
+        .into_iter()
+        .map(|(id, current)| (id, current.into_plan_input()))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn current_map_from_states(
+    states: HashMap<ResourceId, State>,
+) -> HashMap<ResourceId, Current> {
     states
         .into_iter()
-        .map(|(id, state)| (id, state.into_plan_input()))
+        .map(|(id, state)| (id, Current::from_state(state)))
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn into_plan_input_current_map_from_states(
+    states: HashMap<ResourceId, State>,
+    registry: &crate::schema::SchemaRegistry,
+    resources: &[Resource],
+) -> HashMap<ResourceId, PlanInputCurrent> {
+    into_plan_input_current_map(current_map_from_states(states), registry, resources)
 }
 
 /// Current state fetched from actual infrastructure
@@ -6622,11 +6848,6 @@ impl State {
     pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
         self.dependency_bindings = deps;
         self
-    }
-
-    pub(crate) fn into_plan_input(mut self) -> PlanInputState {
-        self.materialize_partial_read_unknowns();
-        PlanInputState(self)
     }
 
     /// Reconstruct plan-time unknowns from the partial-read marker.

@@ -621,37 +621,52 @@ saying what was recorded:
 Bindings and `wait` targets are not published for either, because their
 dependents do not run.
 
-### Current-state map
+### Managed-current map
 
-`current_states` changes from `HashMap<ResourceId, State>` to a map of:
+`managed_current` changes from `HashMap<ResourceId, State>` to a map of:
 
 ```rust
+pub struct AbsentState(State);       // private field
+pub struct UnidentifiedState(State); // private field
+
 pub enum Current {
-    Absent(State),
+    Absent(AbsentState),
     Present(PresentResourceState),
     CreateInFlight(InFlightCreate),
-    MissingIdentifier(State),       // still becomes the existing plan error
+    MissingIdentifier(UnidentifiedState), // still becomes the existing plan error
 }
 ```
 
-`ResourceStateLoad` gains `CreateInFlight`, and `OrphanStateLoad` and
-`Orphan` gain an in-flight variant. The flattening accessors
-`ResourceStateLoad::state()` and `into_state()` are deleted. Both turned every
-variant into a `State`, and an in-flight row flattened to `State::not_found`
-is exactly the duplicate create. An in-flight row is never refreshed, because
-there may be nothing to read. The sites that flatten today all move to
-`Current`:
+`Current` is the only enum that gains `CreateInFlight`; managed loaders and
+`Orphan` carry it directly instead of mirroring its variants in parallel
+enums. `AbsentState`, `PresentResourceState`, and `UnidentifiedState` have
+private fields and are minted by the state-classification boundary, so a
+variant cannot contradict `State::exists` or provider-identifier validity.
+Their read-only payload accessors do not flatten `Current`; `Current`
+deliberately has no `state()` or `into_state()` accessor. An in-flight row
+flattened to `State::not_found` is exactly the duplicate create. An in-flight
+row is never refreshed, because there may be nothing to read. Every consumer
+matches `Current` exhaustively:
 
 - refresh: `refresh_resource_set` and `refresh_loaded_resource_with_retry`;
-- `--refresh=false`, top level and loop children (wiring `build_state_for_resource(..).into_state()`);
+- `--refresh=false`, top level and loop children (wiring keeps the typed result
+  returned by `build_state_for_resource`);
 - destroy's state loading;
 - `carina state` subcommands (`state.rs` loaders);
 - the plan fixture loader;
 - the saved plan's `CurrentStateEntry`. An in-flight entry is its own variant,
   not a non-existing `State`;
-- the executor's input and result maps, the binding index's pre-apply inputs,
-  and the differ's current-state and orphan inputs;
+- the executor's managed input and result maps, the binding index's pre-apply
+  inputs, and the differ's managed-current and orphan inputs;
 - `materialize_moved_states`, including promotion of a moved orphan.
+
+Provider normalization and hydration join managed current state with managed
+orphans, but transform transient data-source state in a separate call. The two
+key spaces can legitimately contain the same `ResourceId` after a managed
+declaration becomes a `read`: the old managed row must be deleted while the new
+data source is read. Anonymous managed-ID reconciliation still reserves active
+data-source identities because wait-identifier and execution-result maps remain
+keyed by `ResourceId` across both active declaration kinds.
 
 ### Writeback (`carina-cli` `state_writeback`)
 

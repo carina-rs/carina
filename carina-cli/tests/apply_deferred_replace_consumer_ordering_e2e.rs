@@ -195,10 +195,7 @@ fn identity(value: &str) -> ResourceIdentity {
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {
-    CurrentStateEntry {
-        id: resource.id.clone(),
-        state: State::not_found(resource.id.clone()),
-    }
+    CurrentStateEntry::managed(resource.id.clone(), State::not_found(resource.id.clone()))
 }
 
 fn consumer_current_state(id: &ResourceId) -> State {
@@ -281,10 +278,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
     let sorted_resources = vec![cert.clone(), consumer.clone()];
     let current_states = vec![
         state_not_found(&cert),
-        CurrentStateEntry {
-            id: consumer.id.clone(),
-            state: consumer_from,
-        },
+        CurrentStateEntry::managed(consumer.id.clone(), consumer_from),
     ];
 
     PlanFile {

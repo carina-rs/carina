@@ -17,6 +17,7 @@ use carina_core::resource::{
 use carina_core::value::canonicalize_resources_with_schemas;
 
 enum ReadBehavior {
+    Success,
     NotFound,
     ApiError,
     NotFoundThenSuccess,
@@ -258,7 +259,7 @@ fn create_plan(
     managed: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
     provider: &dyn Provider,
-    current_states: &HashMap<ResourceId, carina_core::resource::PlanInputState>,
+    current_states: &HashMap<ResourceId, carina_core::resource::PlanInputCurrent>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &carina_core::provider::LiftedSavedAttrs,
@@ -271,7 +272,7 @@ fn create_plan(
         &managed,
         data_sources,
         provider,
-        carina_core::differ::PlanPriorStates::new(current_states, orphans),
+        carina_core::differ::PlanPriorStates::new(current_states, &HashMap::new(), orphans),
         directives_map,
         registry,
         saved_attrs,
@@ -342,7 +343,8 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             managed: &[],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -350,6 +352,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     .unwrap();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
     let mut current_states = HashMap::new();
+    let mut data_source_states = HashMap::new();
     let mut orphans = Orphans::new();
 
     let error = PlanPreprocessor::new(&normalizer, &ctx)
@@ -358,6 +361,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             &[],
             &module_gate,
             &mut current_states,
+            &mut data_source_states,
             &mut orphans,
             &[],
             &mut [],
@@ -459,7 +463,8 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             managed: &[],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -467,28 +472,49 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     .unwrap();
     let resource_origins = resources.paired_unresolved_resources();
     let mut current_states = HashMap::new();
-    let mut orphans = Orphans::from([carina_core::differ::Orphan::new(
-        State::existing(
-            old_id.clone(),
-            HashMap::from([
-                (
-                    "status".to_string(),
-                    Value::Concrete(ConcreteValue::String("provider-alias".into())),
-                ),
-                (
-                    "observed".to_string(),
-                    Value::Concrete(ConcreteValue::String("from-provider".into())),
-                ),
-            ]),
-        ),
+    let orphan_state = State::existing(
+        old_id.clone(),
+        HashMap::from([
+            (
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("provider-alias".into())),
+            ),
+            (
+                "observed".to_string(),
+                Value::Concrete(ConcreteValue::String("from-provider".into())),
+            ),
+        ]),
+    )
+    .with_identifier("resource-123");
+    let present = match Current::from_state(orphan_state) {
+        Current::Absent(state) => panic!("test orphan is absent: {state:?}"),
+        Current::Present(present) => present,
+        Current::MissingIdentifier(state) => {
+            panic!("test orphan lacks a provider identifier: {state:?}")
+        }
+    };
+    let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
+        present,
         Some("resource".to_string()),
         Directives::default(),
     )]);
     let normalizer = TransformingNormalizer;
     let saved_attrs = crate::empty_lifted_saved_attrs();
+    let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "source", None);
+    let mut data_source_states = HashMap::from([(
+        data_source_id.clone(),
+        State::existing(
+            data_source_id.clone(),
+            HashMap::from([(
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("provider-alias".into())),
+            )]),
+        ),
+    )]);
 
     hydrate_prior_states(
         &mut current_states,
+        &mut data_source_states,
         &mut orphans,
         &normalizer,
         &saved_attrs,
@@ -502,6 +528,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             &resource_origins,
             &carina_core::executor::ModuleConstraintGate::new(&[]),
             &mut current_states,
+            &mut data_source_states,
             &mut orphans,
             &[],
             &mut [],
@@ -510,11 +537,22 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         .await
         .unwrap();
 
+    let data_source_state = &data_source_states[&data_source_id];
+    assert_eq!(
+        data_source_state.attributes.get("status"),
+        Some(&Value::Concrete(ConcreteValue::String("canonical".into())))
+    );
+    assert_eq!(
+        data_source_state.attributes.get("restored"),
+        Some(&Value::Concrete(ConcreteValue::String("saved".into())))
+    );
+    assert!(data_source_state.identifier.is_none());
+
     assert!(orphans.rekey(&old_id, target_id.clone()));
 
     let provider_states =
         carina_core::differ::provider_states_for(&current_states, &orphans, resources.resources());
-    let input_states = carina_core::resource::into_plan_input_map(
+    let input_states = carina_core::resource::into_plan_input_current_map(
         provider_states,
         &SchemaRegistry::new(),
         resources.resources(),
@@ -522,7 +560,8 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     resources.rebuild_bindings_after_identity_reconciliation(RebuildBindingsInputs {
         compositions: &[],
         data_sources: &[],
-        current_states: &input_states,
+        managed_current: &input_states,
+        data_source_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -540,7 +579,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         resources.resources(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
+        &carina_core::resource::into_plan_input_current_map(
             current_states,
             &SchemaRegistry::new(),
             resources.resources(),
@@ -561,7 +600,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
 }
 
 #[tokio::test]
-async fn combined_hydration_restores_partial_read_marker_on_refreshed_orphan() {
+async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "orphan", None);
     let marker = carina_core::resource::PartialReadMarker {
         detail: "provider read omitted token".to_string(),
@@ -574,11 +613,14 @@ async fn combined_hydration_restores_partial_read_marker_on_refreshed_orphan() {
     )
     .with_identifier("resource-123");
     row.binding = Some("orphan".to_string());
+    row.set_persisted_attribute("managed_saved", serde_json::json!("saved-value"));
+    row.write_only_attributes.push("managed_saved".to_string());
     row.partial_read = Some(marker.clone());
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(row)
         .expect("test state setup must be valid");
+    let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
 
     let mut orphans = state_file
         .build_orphans(&HashSet::new())
@@ -586,20 +628,45 @@ async fn combined_hydration_restores_partial_read_marker_on_refreshed_orphan() {
     let orphan = orphans.remove(&id).expect("orphan row");
     let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("resource-123");
     orphans.insert(orphan.with_refreshed_state(refreshed));
-    assert_eq!(orphans[&id].state().partial_read, None);
+    let state = match orphans[&id].current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
+    assert_eq!(state.partial_read, None);
 
     let mut current_states = HashMap::new();
+    let mut data_source_states =
+        HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
     hydrate_prior_states(
         &mut current_states,
+        &mut data_source_states,
         &mut orphans,
-        &carina_core::provider::NoopNormalizer,
-        &crate::empty_lifted_saved_attrs(),
+        &SavedAttrsHydratingNormalizer,
+        &saved_attrs,
         Some(&state_file),
     )
     .await
     .expect("combined state hydration");
 
-    assert_eq!(orphans[&id].state().partial_read, Some(marker));
+    let state = match orphans[&id].current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
+    assert_eq!(state.partial_read, Some(marker));
+    assert_eq!(
+        state.attributes.get("managed_saved"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "saved-value".into()
+        )))
+    );
+    assert!(
+        !data_source_states[&id]
+            .attributes
+            .contains_key("managed_saved")
+    );
+    assert_eq!(data_source_states[&id].partial_read, None);
     assert!(current_states.is_empty());
 }
 
@@ -1107,6 +1174,10 @@ impl Provider for ReadWithRetryProvider {
         let attempt = self.read_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             match self.behavior {
+                ReadBehavior::Success => Ok(ReadOutcome::found(
+                    AppliedState::new(id, identifier.as_str(), HashMap::new())
+                        .expect("typed read identifier is non-empty"),
+                )),
                 ReadBehavior::NotFound => Err(ProviderError::not_found("missing")),
                 ReadBehavior::ApiError => Err(ProviderError::api_error("boom")),
                 ReadBehavior::NotFoundThenSuccess if attempt == 0 => {
@@ -1171,6 +1242,187 @@ impl Provider for ReadWithRetryProvider {
     fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
         Ok(Vec::new())
     }
+}
+
+struct ManagedAndDataSourceFactory;
+
+struct SavedAttrsHydratingNormalizer;
+
+impl ProviderNormalizer for SavedAttrsHydratingNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        carina_core::provider::ready_noop()
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _states: &'a mut HashMap<ResourceId, State>,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        carina_core::provider::ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        states: &'a mut HashMap<ResourceId, State>,
+        saved_attrs: &'a carina_core::provider::SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        for (id, state) in states {
+            if let Some(saved) = saved_attrs.get(id) {
+                for (attribute, value) in saved {
+                    state
+                        .attributes
+                        .entry(attribute.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+        carina_core::provider::ready_noop()
+    }
+}
+
+impl ProviderFactory for ManagedAndDataSourceFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "managed/data-source collision test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "local".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async {
+            Ok(Box::new(ReadWithRetryProvider::new(ReadBehavior::Success)) as Box<dyn Provider>)
+        })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async {
+            Ok(Box::new(SavedAttrsHydratingNormalizer) as Box<dyn ProviderNormalizer>)
+        })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![
+            ResourceSchema::new("shared.Type"),
+            ResourceSchema::new("shared.Type").as_data_source(),
+        ]
+    }
+}
+
+#[tokio::test]
+async fn plan_deletes_managed_orphan_and_reads_same_id_data_source() {
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_state::state::ResourceState;
+
+    let parsed = parse(
+        r#"
+provider test {}
+
+let shared = read test.shared.Type {}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("parse managed-to-data-source fixture");
+    let data_source_id = parsed.data_sources[0].id.clone();
+    let identity = data_source_id
+        .identity()
+        .expect("let-bound data source identity is resolved")
+        .clone();
+    let mut prior_row = ResourceState::new(
+        data_source_id.resource_type.clone(),
+        identity,
+        data_source_id.provider.clone(),
+    )
+    .with_identifier("managed-provider-id");
+    prior_row.binding = Some("shared".to_string());
+    prior_row.set_persisted_attribute(
+        "managed_saved",
+        serde_json::json!("managed-write-only-value"),
+    );
+    prior_row
+        .write_only_attributes
+        .push("managed_saved".to_string());
+    let partial_read = carina_core::resource::PartialReadMarker {
+        detail: "managed read omitted an attribute".to_string(),
+        missing_attributes: BTreeSet::from(["managed_missing".to_string()]),
+    };
+    prior_row.partial_read = Some(partial_read.clone());
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(prior_row)
+        .expect("test state row is unique");
+    let state_file = Some(state_file);
+    let provider_configs = resolved_provider_configs(&parsed);
+    let ctx = WiringContext::new(
+        vec![Box::new(ManagedAndDataSourceFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &provider_configs,
+        &parsed.resources,
+        &state_file,
+        true,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+        temp.path(),
+    )
+    .await
+    .expect("managed orphan and same-id data source must coexist through planning");
+
+    let summary = plan_context.plan.summary();
+    assert_eq!(summary.read, 1);
+    assert_eq!(summary.delete, 1);
+    assert_eq!(plan_context.plan.effects().len(), 2);
+    assert!(plan_context.plan.errors().is_empty());
+
+    let orphan_state = match &plan_context.managed_current[&data_source_id] {
+        Current::Present(present) => present.state(),
+        Current::Absent(absent) => panic!("managed orphan unexpectedly absent: {absent:?}"),
+        Current::MissingIdentifier(unidentified) => {
+            panic!("managed orphan unexpectedly lacks an identifier: {unidentified:?}")
+        }
+    };
+    assert_eq!(
+        orphan_state.attributes.get("managed_saved"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "managed-write-only-value".into()
+        )))
+    );
+    assert_eq!(orphan_state.partial_read, Some(partial_read));
+
+    let data_source_state = &plan_context.data_source_states[&data_source_id];
+    assert!(!data_source_state.attributes.contains_key("managed_saved"));
+    assert_eq!(data_source_state.partial_read, None);
 }
 
 #[tokio::test]
@@ -1256,7 +1508,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     );
     let state = State::existing(id.clone(), state_attrs).with_identifier("test-vpc");
     let mut current_states = HashMap::new();
-    current_states.insert(id.clone(), state);
+    current_states.insert(id.clone(), Current::from_state(state));
 
     // Without normalize_state, the differ would see a false diff
     let resources_without = vec![resource.clone()];
@@ -1269,7 +1521,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_without,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
+        &carina_core::resource::into_plan_input_current_map(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -1294,7 +1546,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_with,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
+        &carina_core::resource::into_plan_input_current_map(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -1587,7 +1839,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &resources_without,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
+        &crate::plan_input_current_from_states(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -1623,7 +1875,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &resources_with,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(
+        &crate::plan_input_current_from_states(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -1645,7 +1897,7 @@ fn test_merge_default_tags_prevents_false_diff() {
 /// `moved { from = X 'a', to = X 'b' }` faces the same address-
 /// equality bug when the state-resident `a` carries
 /// `provider_instance = Some("X")`. Without the root fix
-/// `current_states.remove(from)` misses (since the key in the map has
+/// `managed_current.remove(from)` misses (since the key in the map has
 /// the routed id), the moved state is never transferred, and the
 /// orphan Delete for `a` is never suppressed — the operator sees both
 /// `<- moved` and `- delete` for the same address.
@@ -1657,7 +1909,7 @@ fn test_merge_default_tags_prevents_false_diff() {
 /// keys correctly.
 #[test]
 fn moved_block_resolves_routed_instance_on_from_and_to() {
-    use carina_core::resource::{ResourceId, State};
+    use carina_core::resource::ResourceId;
     use carina_state::state::{ResourceState, StateFile};
 
     // State has the source resource under a routed id.
@@ -1668,7 +1920,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
         .upsert_resource(rs)
         .expect("test state setup must be valid");
 
-    // Pre-populate `current_states` with the routed `from` id (mirrors
+    // Pre-populate managed current state with the routed `from` id (mirrors
     // what `build_state_for_resource` would produce).
     let routed_from = ResourceId::with_provider_identity(
         "aws",
@@ -1677,7 +1929,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
         Some("management".to_string()),
     );
     let mut current_states = HashMap::new();
-    current_states.insert(routed_from.clone(), State::not_found(routed_from.clone()));
+    current_states.insert(routed_from.clone(), Current::absent(routed_from.clone()));
 
     let mut prev_explicit = HashMap::new();
     let mut saved_attrs = crate::empty_lifted_saved_attrs();
@@ -1707,7 +1959,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
         "moved.from must inherit routing from the matched state row, got {from:?}",
     );
 
-    // And `current_states` must no longer carry the old key — the
+    // And managed current state must no longer carry the old key — the
     // state was actually transferred (not silently left under the
     // routed id while a None-routing key was inserted).
     assert!(
@@ -1719,7 +1971,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
 #[test]
 fn same_type_moved_block_parses_and_materializes_state() {
     use carina_core::parser::{ProviderContext, parse};
-    use carina_core::resource::{ResourceId, State};
+    use carina_core::resource::ResourceId;
     use carina_state::state::{ResourceState, StateFile};
 
     let parsed = parse(
@@ -1735,7 +1987,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
 
     let from = ResourceId::with_provider_identity("awscc", "s3.Bucket", "old_bucket", None);
     let to = ResourceId::with_provider_identity("awscc", "s3.Bucket", "new_bucket", None);
-    let mut current_states = HashMap::from([(to.clone(), State::not_found(to.clone()))]);
+    let mut current_states = HashMap::from([(to.clone(), Current::absent(to.clone()))]);
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(
@@ -1766,6 +2018,11 @@ fn same_type_moved_block_parses_and_materializes_state() {
     let moved = current_states
         .get(&to)
         .expect("source state must be transferred to the destination address");
+    let moved = match moved {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
     assert_eq!(moved.id, to);
     assert_eq!(moved.identifier.as_deref(), Some("bucket-123"));
     assert!(orphans.is_empty());
@@ -1828,7 +2085,11 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
         &[],
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states, &SchemaRegistry::new(), &[]),
+        &carina_core::resource::into_plan_input_current_map(
+            current_states,
+            &SchemaRegistry::new(),
+            &[],
+        ),
         &state_file.build_directives(),
         &SchemaRegistry::new(),
         &crate::empty_lifted_saved_attrs(),
@@ -2544,8 +2805,14 @@ fn test_plan_fails_on_removed_from_colliding_with_desired() {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", desired_name),
     }];
     let resolution = resolve_state_blocks(&blocks, &state_file, &desired, ctx.schemas());
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut desired, &mut state, &resolution.claims)
-        .expect("test state identities must remain unique");
+    reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &mut desired,
+        &[],
+        &mut state,
+        &resolution.claims,
+    )
+    .expect("test state identities must remain unique");
 
     assert_eq!(desired[0].id.identity_str(), Some(desired_name));
 
@@ -2832,7 +3099,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         "effective removed block must claim its state entry"
     );
 
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims)
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
         .expect("test state identities must remain unique");
 
     assert_eq!(
@@ -2913,6 +3180,7 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
     reconcile_anonymous_identifiers_with_ctx(
         &ctx,
         &mut resources,
+        &[],
         &mut state_file,
         &carina_core::identifier::StateBlockClaims::empty(),
     )
@@ -2930,6 +3198,63 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
             "ec2_subnet_route_table_association_33333333",
         ],
         "desired anonymous associations must adopt state names by resolved create-only values",
+    );
+}
+
+#[test]
+fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
+    use carina_core::resource::DataSource;
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_state::state::{ResourceState, StateFile};
+
+    let managed_schema = ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::new("bucket", AttributeType::string()).create_only());
+    let data_source_schema = ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::new("bucket", AttributeType::string()))
+        .as_data_source();
+    let ctx = WiringContext::new_with_additional_schemas(
+        Vec::new(),
+        &[],
+        [
+            ("aws".to_string(), managed_schema),
+            ("aws".to_string(), data_source_schema),
+        ],
+    );
+
+    let mut state_file = StateFile::new();
+    let mut prior = ResourceState::new("s3.Bucket", test_identity("logs"), "aws");
+    prior.set_persisted_attribute("bucket", serde_json::json!("x"));
+    state_file
+        .upsert_resource(prior)
+        .expect("test state setup must be valid");
+
+    let mut managed = vec![
+        Resource::with_provider(
+            "aws",
+            "s3.Bucket",
+            test_identity("aws_s3_bucket_aaaaaaaa"),
+            None,
+        )
+        .with_attribute("bucket", Value::Concrete(ConcreteValue::String("x".into()))),
+    ];
+    let data_sources = vec![
+        DataSource::with_provider("aws", "s3.Bucket", test_identity("logs"), None)
+            .with_binding("logs")
+            .with_attribute("bucket", Value::Concrete(ConcreteValue::String("x".into()))),
+    ];
+
+    reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &mut managed,
+        &data_sources,
+        &mut state_file,
+        &StateBlockClaims::empty(),
+    )
+    .expect("test state identities must remain unique");
+
+    assert_ne!(
+        managed[0].id, data_sources[0].id,
+        "anonymous managed resource must not adopt a data-source binding's ResourceId",
     );
 }
 
@@ -2978,7 +3303,7 @@ fn test_stale_moved_block_releases_claims() {
         ),
         "ineffective moved block must not pin its to address"
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims)
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
         .expect("test state identities must remain unique");
 
     assert_eq!(
@@ -2990,7 +3315,7 @@ fn test_stale_moved_block_releases_claims() {
 
 #[test]
 fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
-    use carina_core::resource::{ResourceId, State};
+    use carina_core::resource::ResourceId;
     use carina_state::state::StateFile;
 
     let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
@@ -3030,7 +3355,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
             test_identity(old_name.clone()),
             None,
         );
-        current_states.insert(old_id.clone(), State::not_found(old_id));
+        current_states.insert(old_id.clone(), Current::absent(old_id));
         old_names.push(old_name);
         desired_names.push(desired_name);
     }
@@ -3041,7 +3366,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         &resources,
         ctx.schemas(),
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims)
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
         .expect("test state identities must remain unique");
     assert_eq!(
         resources
@@ -3239,8 +3564,8 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
             )
         })
         .collect();
-    let plan_input_states = carina_core::resource::into_plan_input_map(
-        plan_ctx.current_states.clone(),
+    let plan_input_states = carina_core::resource::into_plan_input_current_map(
+        plan_ctx.managed_current.clone(),
         ctx.schemas(),
         &plan_ctx.sorted_resources,
     );
@@ -3248,7 +3573,8 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         managed: &plan_ctx.sorted_resources,
         compositions: &[],
         data_sources: &plan_ctx.data_sources,
-        current_states: &plan_input_states,
+        managed_current: &plan_input_states,
+        data_source_states: &plan_ctx.data_source_states,
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -3262,7 +3588,8 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         },
         compositions: &[],
         bindings,
-        current_states: plan_ctx.current_states,
+        managed_current: plan_ctx.managed_current,
+        data_source_states: plan_ctx.data_source_states,
         deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &carina_core::provider::NoopNormalizer,
         provider_configs: &parsed.providers,
@@ -3422,7 +3749,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
         Value::Concrete(ConcreteValue::String("gosukenator@gmail.com".into())),
     );
 
-    // current_states after phase 1: sso has been refreshed and its
+    // Managed current state after phase 1: sso has been refreshed and its
     // state carries the concrete identity_store_id.
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     let sso_state = State::existing(
@@ -3439,7 +3766,8 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
         &[sso],
         &[],
         &[mizzy],
-        &current_states,
+        &crate::managed_current_from_states(current_states.clone()),
+        &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
         &[],
@@ -3493,6 +3821,7 @@ fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
         &[lookup],
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -3534,6 +3863,7 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
         &[lookup],
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -3561,6 +3891,7 @@ fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_
         &[],
         &[],
         &[lookup],
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
@@ -3605,6 +3936,7 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
         &[lookup],
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -3640,6 +3972,7 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
         &[target],
         &[],
         &[lookup],
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &carina_core::schema::SchemaRegistry::new(),
@@ -3691,7 +4024,8 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
         &[target],
         &[],
         &[lookup],
-        &current_states,
+        &crate::managed_current_from_states(current_states.clone()),
+        &HashMap::new(),
         &HashMap::new(),
         &registry,
         &[],
@@ -3744,7 +4078,8 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
         &[existing, target],
         &[],
         &[lookup],
-        &current_states,
+        &crate::managed_current_from_states(current_states.clone()),
+        &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
         &[],
@@ -3790,6 +4125,7 @@ fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
         &[target],
         &[],
         &[first, second],
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
@@ -3855,7 +4191,8 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
         &[target],
         &[],
         &[lookup],
-        &current_states,
+        &crate::managed_current_from_states(current_states.clone()),
+        &HashMap::new(),
         &HashMap::new(),
         &registry,
         &[],
@@ -3889,6 +4226,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
         &[],
         &[],
         &[lookup],
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
@@ -4154,7 +4492,8 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             managed: &[],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -4166,6 +4505,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
         &ctx,
         LateAnonymousIdentityInputs {
             resources: &mut resources,
+            data_sources: &[],
             state_file: None,
             state_block_claims: &claims,
             providers: &[],
@@ -4291,12 +4631,13 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         "provider config region spelling must canonicalize before rename simhash"
     );
     assert!(orphans.is_empty());
-    assert_eq!(
-        current_states
-            .get(&named.id)
-            .and_then(|state| state.identifier.as_deref()),
-        Some("route-123")
-    );
+    let current = current_states.get(&named.id).expect("renamed state");
+    let state = match current {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
+    assert_eq!(state.identifier.as_deref(), Some("route-123"));
 }
 
 // Smoke test for the module/provider wrappers: empty input exercises
@@ -4671,13 +5012,13 @@ mod read_with_retry_identifier_tests {
 // ---------------------------------------------------------------------
 // carina#3132 PR-1: `expand_same_config_deferred_for` — the pure
 // post-refresh expansion the plan path calls. Tested with a hand-built
-// post-refresh `current_states` (the documented refresh-phase output);
+// post-refresh managed current state (the documented refresh-phase output);
 // `create_plan_from_parsed_with_upstream_with_ctx` invokes this exact function,
 // so this is the real plan-path expansion, not a transform in
 // isolation (cf. MEMORY "unit-test path ≠ apply path").
 //
 // `--refresh=false` needs no dedicated case here: the pure function is
-// refresh-agnostic (it expands against whatever `current_states` it is
+// refresh-agnostic (it expands against whatever managed-current map it is
 // given — cached-state and live-refresh are the same input shape, both
 // covered below). The only refresh-specific code is the child-state
 // restore in `create_plan_from_parsed_with_upstream_with_ctx`, which routes the
@@ -4934,7 +5275,7 @@ mod expand_same_config_deferred_for_tests {
         }
     "#;
 
-    /// Build `current_states` as the refresh phase would: the parsed
+    /// Build managed current state as the refresh phase would: the parsed
     /// `cert` resource's own id → an existing State carrying the
     /// provider-read list attribute the loop iterates.
     fn states_with_cert(
@@ -4981,6 +5322,7 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &[],
+            &HashMap::new(),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
@@ -5046,8 +5388,17 @@ mod expand_same_config_deferred_for_tests {
         assert!(empty.is_empty());
         assert_eq!(empty.select(&resources, &no_orphans).count(), 0);
 
-        let orphan_owned = Orphans::from([carina_core::differ::Orphan::new(
-            State::existing(r_a.id.clone(), HashMap::new()),
+        let orphan_state =
+            State::existing(r_a.id.clone(), HashMap::new()).with_identifier("resource-a");
+        let present = match Current::from_state(orphan_state) {
+            Current::Absent(state) => panic!("test orphan is absent: {state:?}"),
+            Current::Present(present) => present,
+            Current::MissingIdentifier(state) => {
+                panic!("test orphan lacks a provider identifier: {state:?}")
+            }
+        };
+        let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(
+            present,
             Some("a".to_string()),
             Directives::default(),
         )]);
@@ -5076,7 +5427,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5137,7 +5489,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5173,7 +5526,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5203,7 +5557,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5239,7 +5594,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5284,7 +5640,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &empty_states,
+            &crate::managed_current_from_states(empty_states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5352,6 +5709,7 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
+            &HashMap::new(),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &remote,
@@ -5421,7 +5779,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5525,7 +5884,8 @@ mod expand_same_config_deferred_for_tests {
         let out_no_moved = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5556,7 +5916,8 @@ mod expand_same_config_deferred_for_tests {
         let out_moved = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5633,7 +5994,8 @@ mod expand_same_config_deferred_for_tests {
         let baseline = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5658,7 +6020,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5691,7 +6054,7 @@ mod expand_same_config_deferred_for_tests {
     /// is in the state file. On the next `plan`/`apply`, the phase-1
     /// orphan pass classifies it as an orphan (it is not yet a desired
     /// resource — expansion happens *after* refresh) and performs a live
-    /// provider read of it, storing the result in `current_states`. The
+    /// provider read of it, storing the result in managed current state. The
     /// post-expansion child refresh then reads the *same* address a
     /// second time. Two live provider reads for one resource.
     ///
@@ -5749,7 +6112,8 @@ mod expand_same_config_deferred_for_tests {
         let baseline = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -5782,7 +6146,8 @@ mod expand_same_config_deferred_for_tests {
         let out = expand_same_config_deferred_for(
             &parsed,
             &sorted,
-            &states,
+            &crate::managed_current_from_states(states.clone()),
+            &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -6628,7 +6993,8 @@ mod resolved_value_constraint_gate {
                 managed: &[],
                 compositions: &compositions,
                 data_sources: &data_sources,
-                current_states: &current_states,
+                managed_current: &current_states,
+                data_source_states: &HashMap::new(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -6648,6 +7014,7 @@ mod resolved_value_constraint_gate {
         let compositions = Vec::new();
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
         let mut current_states = HashMap::new();
+        let mut data_source_states = HashMap::new();
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
@@ -6657,6 +7024,7 @@ mod resolved_value_constraint_gate {
                 &origins,
                 &module_gate,
                 &mut current_states,
+                &mut data_source_states,
                 &mut orphans,
                 &[],
                 &mut data_sources,
@@ -6726,7 +7094,8 @@ mod resolved_value_constraint_gate {
                 managed: &[],
                 compositions,
                 data_sources: &empty_data_sources,
-                current_states: &current_states,
+                managed_current: &current_states,
+                data_source_states: &HashMap::new(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -6734,6 +7103,7 @@ mod resolved_value_constraint_gate {
         .unwrap();
         let origins = resources.paired_unresolved_resources();
         let mut states = HashMap::new();
+        let mut data_source_states = HashMap::new();
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let module_gate =
@@ -6745,6 +7115,7 @@ mod resolved_value_constraint_gate {
                 &origins,
                 &module_gate,
                 &mut states,
+                &mut data_source_states,
                 &mut orphans,
                 &[],
                 &mut data_sources,
@@ -6859,7 +7230,8 @@ mod resolved_value_constraint_gate {
                 managed: &[],
                 compositions: &[],
                 data_sources: &[],
-                current_states: &HashMap::new(),
+                managed_current: &HashMap::new(),
+                data_source_states: &HashMap::new(),
                 remote_bindings: &HashMap::new(),
                 wait_aliases: &[],
             },
@@ -6875,6 +7247,7 @@ mod resolved_value_constraint_gate {
         ];
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
         let mut states = HashMap::new();
+        let mut data_source_states = HashMap::new();
         let mut orphans = Orphans::new();
 
         let errors = PlanPreprocessor::new(&normalizer, &ctx)
@@ -6883,6 +7256,7 @@ mod resolved_value_constraint_gate {
                 &[],
                 &module_gate,
                 &mut states,
+                &mut data_source_states,
                 &mut orphans,
                 &[],
                 &mut data_sources,

@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::parser::ProviderConfig;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    ConcreteValue, DeferredValue, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
-    Value, ValueString,
+    ConcreteValue, DataSource, DeferredValue, ResolvedResourceId, Resource, ResourceId,
+    ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
@@ -1117,6 +1117,13 @@ fn canonical_or_resolved_create_only_value_string(
 /// against dot-free root state entry names.
 /// Binding lookup reads an exact address's attributes; it does not select an
 /// identity to adopt or re-key, so it is not an identity-candidate source.
+/// `data_sources` reserves resolved identities because active managed and
+/// data-source rows later meet in wait-identifier and execution-result maps
+/// keyed by `ResourceId`; reconciliation must not make those entries alias.
+/// The reservation uses the state-row uniqueness key
+/// `(provider, resource_type, identity)`. It deliberately excludes
+/// `provider_instance`, matching reconciliation candidate lookup and
+/// `StateFile::find_resource`.
 ///
 /// Returns a list of `(old_state_name, new_resource_name)` pairs that the
 /// caller should apply to state-keyed maps. These are emitted when a SimHash
@@ -1126,6 +1133,7 @@ fn canonical_or_resolved_create_only_value_string(
 /// re-keys the state entry instead of destroy+recreate.
 pub fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
+    data_sources: &[DataSource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
@@ -1133,14 +1141,15 @@ pub fn reconcile_anonymous_identifiers(
 ) -> Vec<(String, String)> {
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
-    for resource in resources.iter() {
-        let Some(identity) = resource.id.identity_str() else {
+    for id in resources
+        .iter()
+        .map(|resource| &resource.id)
+        .chain(data_sources.iter().map(|data_source| &data_source.id))
+    {
+        let Some(identity) = id.identity_str() else {
             continue;
         };
-        let key = (
-            resource.id.provider.clone(),
-            resource.id.resource_type.clone(),
-        );
+        let key = (id.provider.clone(), id.resource_type.clone());
         used_names
             .entry(key)
             .or_default()

@@ -134,7 +134,13 @@ fn v14_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     let reloaded = check_and_migrate(&json)
         .expect("reload current state")
         .into_state();
-    let loaded = reloaded.build_state_for_resource(&resource.id).into_state();
+    let loaded = match reloaded.build_state_for_resource(&resource.id) {
+        Current::Present(present) => present.state().clone(),
+        Current::Absent(state) => panic!("expected present state, got {state:?}"),
+        Current::MissingIdentifier(state) => {
+            panic!("expected valid provider identifier, got {state:?}")
+        }
+    };
 
     assert_eq!(loaded.attributes.get("authored"), Some(&plain));
     assert_eq!(loaded.attributes.get("provider_only"), Some(&plain));
@@ -797,7 +803,7 @@ fn test_build_state_for_resource_carries_typed_identifier() {
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let loaded = state.build_state_for_resource(&resource.id);
-    let ResourceStateLoad::Present(present) = loaded else {
+    let Current::Present(present) = loaded else {
         panic!("state row must load as present");
     };
     assert_eq!(present.identifier().as_str(), "my-bucket-abcd1234");
@@ -811,7 +817,7 @@ fn test_build_state_for_resource_distinguishes_absent_address() {
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     assert!(matches!(
         state.build_state_for_resource(&resource.id),
-        ResourceStateLoad::Absent(_)
+        Current::Absent(_state)
     ));
 }
 
@@ -1588,14 +1594,14 @@ fn test_multi_provider_resources_do_not_collide() {
     let aws_res = Resource::with_provider("aws", "s3.Bucket", "main", None);
     assert!(matches!(
         state.build_state_for_resource(&aws_res.id),
-        ResourceStateLoad::Present(ref present)
+        Current::Present(ref present)
             if present.identifier().as_str() == "aws-bucket-id"
     ));
 
     let awscc_res = Resource::with_provider("awscc", "s3.Bucket", "main", None);
     assert!(matches!(
         state.build_state_for_resource(&awscc_res.id),
-        ResourceStateLoad::Present(ref present)
+        Current::Present(ref present)
             if present.identifier().as_str() == "awscc-bucket-id"
     ));
 
@@ -1703,7 +1709,13 @@ fn test_build_state_for_resource_existing() {
         .expect("test state setup must be valid");
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
-    let result = state.build_state_for_resource(&resource.id).into_state();
+    let result = match state.build_state_for_resource(&resource.id) {
+        Current::Present(present) => present.state().clone(),
+        Current::Absent(state) => panic!("expected present state, got {state:?}"),
+        Current::MissingIdentifier(state) => {
+            panic!("expected valid provider identifier, got {state:?}")
+        }
+    };
 
     assert!(result.exists);
     assert_eq!(result.identifier, Some("my-bucket-id".to_string()));
@@ -1730,7 +1742,13 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
         .expect("test state setup must be valid");
 
     let resource = Resource::with_provider("mock", "test.resource", "old", None);
-    let loaded = state.build_state_for_resource(&resource.id).into_state();
+    let loaded = match state.build_state_for_resource(&resource.id) {
+        Current::Present(present) => present.state().clone(),
+        Current::Absent(state) => panic!("expected present state, got {state:?}"),
+        Current::MissingIdentifier(state) => {
+            panic!("expected valid provider identifier, got {state:?}")
+        }
+    };
     let saved_attrs = state.build_saved_attrs();
 
     for loaded in [
@@ -1832,11 +1850,53 @@ fn test_build_state_for_resource_not_found() {
     let state = StateFile::new();
     let resource =
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "missing", None);
-    let result = state.build_state_for_resource(&resource.id).into_state();
+    let result = match state.build_state_for_resource(&resource.id) {
+        Current::Absent(state) => state.into_state(),
+        Current::Present(present) => {
+            panic!("expected absent state, got {:?}", present.state())
+        }
+        Current::MissingIdentifier(state) => {
+            panic!("expected absent state, got {state:?}")
+        }
+    };
 
     assert!(!result.exists);
     assert!(result.identifier.is_none());
     assert!(result.attributes.is_empty());
+}
+
+#[test]
+fn v14_loader_classifies_absent_present_and_missing_without_flattening() {
+    use carina_core::resource::Current;
+
+    let absent_id = ResourceId::with_provider_identity("mock", "test.resource", "absent", None);
+    let present_id = ResourceId::with_provider_identity("mock", "test.resource", "present", None);
+    let missing_id = ResourceId::with_provider_identity("mock", "test.resource", "missing", None);
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(
+            ResourceState::new("test.resource", "present", "mock")
+                .with_identifier("provider-present"),
+        )
+        .expect("present fixture row is valid");
+    state
+        .upsert_resource(ResourceState::new("test.resource", "missing", "mock"))
+        .expect("missing-identifier fixture row is valid v14 state");
+
+    let absent = state.build_state_for_resource(&absent_id);
+    let present = state.build_state_for_resource(&present_id);
+    let missing = state.build_state_for_resource(&missing_id);
+
+    assert!(matches!(absent, Current::Absent(ref state) if !state.state().exists));
+    assert!(matches!(
+        present,
+        Current::Present(ref state) if state.identifier().as_ref() == "provider-present"
+    ));
+    assert!(matches!(
+        missing,
+        Current::MissingIdentifier(ref state)
+            if state.state().exists && state.state().identifier.is_none()
+    ));
 }
 
 #[test]
@@ -1856,8 +1916,8 @@ fn test_build_state_for_resource_without_identifier() {
 
     assert!(matches!(
         result,
-        ResourceStateLoad::MissingProviderIdentifier(ref state)
-            if state.exists && state.identifier.is_none()
+        Current::MissingIdentifier(ref state)
+            if state.state().exists && state.state().identifier.is_none()
     ));
 }
 
@@ -1883,7 +1943,7 @@ fn build_state_for_resource_does_not_hide_current_content_behind_deposed_generat
 
         assert!(matches!(
             state.build_state_for_resource(&id),
-            ResourceStateLoad::MissingProviderIdentifier(_)
+            Current::MissingIdentifier(_state)
         ));
     }
 }
@@ -1917,7 +1977,7 @@ fn removing_last_deposed_generation_retains_malformed_current_instance() {
     assert!(retained.deposed.is_empty());
     assert!(matches!(
         state.build_state_for_resource(&id),
-        ResourceStateLoad::MissingProviderIdentifier(_)
+        Current::MissingIdentifier(_state)
     ));
 }
 
@@ -1982,10 +2042,19 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
 
     let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "orphan-subnet", None);
     let mut loaded = orphans.into_iter();
-    let (loaded_id, orphan) = loaded.next().expect("orphan remains visible");
+    let (loaded_id, loaded_orphan) = loaded.next().expect("orphan remains visible");
     assert_eq!(loaded_id, id);
     assert!(loaded.next().is_none());
-    let orphan_state = orphan.state();
+    let orphan = loaded_orphan;
+    let Current::Present(present) = orphan.current() else {
+        panic!("expected valid orphan identifier: {orphan:?}");
+    };
+    assert_eq!(present.identifier().as_str(), "subnet-123");
+    let orphan_state = match orphan.current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
     assert!(orphan_state.exists);
     assert!(
         orphan_state
@@ -1995,8 +2064,8 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         "provider-facing orphan state must not contain host metadata"
     );
     assert_eq!(orphan.binding(), Some("my_subnet"));
-    assert!(orphan.orphan().directives().prevent_destroy);
-    assert_eq!(orphan.orphan().directives().depends_on, ["security_group"]);
+    assert!(orphan.directives().prevent_destroy);
+    assert_eq!(orphan.directives().depends_on, ["security_group"]);
     assert_eq!(
         orphan_state.dependency_bindings,
         BTreeSet::from(["my_vpc".to_string()])
@@ -2013,18 +2082,48 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     )
     .with_identifier("subnet-123");
     let refreshed = orphan.with_refreshed_state(fresh);
+    let refreshed_state = match refreshed.current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
     assert_eq!(refreshed.binding(), Some("my_subnet"));
-    assert_eq!(refreshed.state().id, id);
-    assert!(refreshed.orphan().directives().prevent_destroy);
+    assert_eq!(refreshed_state.id, id);
+    assert!(refreshed.directives().prevent_destroy);
+    assert_eq!(refreshed.directives().depends_on, ["security_group"]);
     assert_eq!(
-        refreshed.orphan().directives().depends_on,
-        ["security_group"]
-    );
-    assert_eq!(
-        refreshed.state().dependency_bindings,
+        refreshed_state.dependency_bindings,
         BTreeSet::from(["my_vpc".to_string()])
     );
-    assert!(refreshed.state().attributes.contains_key("cidr_block"));
+    assert!(refreshed_state.attributes.contains_key("cidr_block"));
+}
+
+#[test]
+fn refreshing_loaded_orphan_to_absent_cannot_retain_an_identifier() {
+    let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(
+            ResourceState::new("test.Resource", "orphan", "mock").with_identifier("resource-123"),
+        )
+        .expect("test state setup must be valid");
+    let (_id, loaded) = state
+        .build_orphans(&HashSet::new())
+        .into_iter()
+        .next()
+        .expect("orphan remains visible");
+
+    let refreshed = loaded.with_refreshed_state(State::not_found(id));
+    match refreshed.current() {
+        Current::Absent(state) => assert!(state.state().identifier.is_none()),
+        Current::Present(present) => panic!(
+            "an absent refreshed orphan retained identifier {:?}",
+            present.identifier()
+        ),
+        Current::MissingIdentifier(state) => {
+            panic!("an absent refreshed orphan remained existing: {state:?}")
+        }
+    }
 }
 
 #[test]
@@ -2051,15 +2150,17 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
     let loaded = state.build_orphans(&HashSet::new());
 
     let mut entries = loaded.iter();
-    let (loaded_id, orphan) = entries.next().expect("invalid orphan remains visible");
+    let (loaded_id, loaded_orphan) = entries.next().expect("invalid orphan remains visible");
     assert_eq!(loaded_id, &id);
     assert!(entries.next().is_none());
-    assert!(matches!(
-        orphan,
-        OrphanStateLoad::MissingProviderIdentifier(_)
-    ));
-    assert!(orphan.state().exists);
-    assert!(orphan.state().identifier.is_none());
+    let orphan = loaded_orphan;
+    let state = match orphan.current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
+    assert!(state.exists);
+    assert!(state.identifier.is_none());
 }
 
 #[test]
@@ -2154,10 +2255,15 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     );
     let resolved = ResolvedResource::new(desired);
     let id = resolved.id.clone();
-    let current_states =
-        HashMap::from([(id.clone(), state.build_state_for_resource(&id).into_state())]);
-    let plan_input_states = carina_core::resource::into_plan_input_map(
-        current_states,
+    let current = match state.build_state_for_resource(&id) {
+        Current::Absent(state) => carina_core::resource::Current::Absent(state),
+        Current::Present(present) => carina_core::resource::Current::Present(present),
+        Current::MissingIdentifier(state) => {
+            carina_core::resource::Current::MissingIdentifier(state)
+        }
+    };
+    let plan_input_states = carina_core::resource::into_plan_input_current_map(
+        HashMap::from([(id.clone(), current)]),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
     );
@@ -2167,6 +2273,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
             &plan_input_states,
+            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &state.build_directives(),
@@ -2807,7 +2914,7 @@ fn check_and_migrate_retains_identifier_none_rows_for_typed_classification() {
     );
     assert!(matches!(
         state.build_state_for_resource(&invalid_id),
-        ResourceStateLoad::MissingProviderIdentifier(_)
+        Current::MissingIdentifier(_state)
     ));
 }
 
@@ -3242,6 +3349,39 @@ fn typed_data_source_cleanup_removes_historical_null_identifier_row() {
         state
             .find_resource("aws", "iam.Roles", "admin_access_roles")
             .is_none()
+    );
+}
+
+#[test]
+fn typed_data_source_cleanup_preserves_managed_row_with_identifier() {
+    use super::check_and_migrate;
+
+    let json = r#"{
+        "version": 7,
+        "serial": 14,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [
+            {
+                "resource_type": "shared.Type",
+                "name": "shared",
+                "provider": "test",
+                "identifier": "provider-id",
+                "attributes": { "name": "old-managed-value" },
+                "binding": "shared"
+            }
+        ]
+    }"#;
+
+    let mut state = check_and_migrate(json).expect("read").into_state();
+    let data_source =
+        carina_core::resource::DataSource::with_provider("test", "shared.Type", "shared", None);
+
+    assert_eq!(state.remove_legacy_data_source_rows(&[data_source]), 0);
+    assert!(
+        state
+            .find_resource("test", "shared.Type", "shared")
+            .is_some()
     );
 }
 

@@ -15,7 +15,7 @@ use carina_core::differ::{
 use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
-use carina_core::resource::{ResourceId, State, Value};
+use carina_core::resource::{Current, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity,
@@ -116,7 +116,8 @@ fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
-    pub current_states: HashMap<ResourceId, State>,
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_states: HashMap<ResourceId, State>,
     pub state_file: Option<StateFile>,
     pub schemas: SchemaRegistry,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
@@ -242,6 +243,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         reconcile_anonymous_identifiers_with_ctx(
             &wiring,
             &mut parsed.resources,
+            &parsed.data_sources,
             sf,
             &state_block_claims,
         )
@@ -257,14 +259,15 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         sf.remove_legacy_data_source_rows(&data_sources);
     }
 
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
+    let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
     let mut orphans = Orphans::new();
     if let Some(sf) = state_file.as_ref() {
         for resource in &sorted_resources {
-            let state = sf.build_state_for_resource(&resource.id).into_state();
-            current_states.insert(resource.id.clone(), state);
+            let current = sf.build_state_for_resource(&resource.id);
+            managed_current.insert(resource.id.clone(), current);
         }
-        current_states.extend(
+        data_source_states.extend(
             data_sources
                 .iter()
                 .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
@@ -278,10 +281,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
     } else {
         for resource in &sorted_resources {
-            current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
+            managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
         }
         for ds in &data_sources {
-            current_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
+            data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
         }
     }
 
@@ -342,8 +345,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // resolve through the composition layer to the managed sibling.
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
-    let pre_apply_input_states = carina_core::resource::into_plan_input_map(
-        current_states.clone(),
+    let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
+        managed_current.clone(),
         wiring.schemas(),
         &sorted_resources,
     );
@@ -354,7 +357,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             managed: &[],
             compositions: &parsed.compositions,
             data_sources: &data_sources,
-            current_states: &pre_apply_input_states,
+            managed_current: &pre_apply_input_current,
+            data_source_states: &data_source_states,
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -372,7 +376,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             managed: &[],
             compositions: &parsed.compositions,
             data_sources: &data_sources,
-            current_states: &pre_apply_input_states,
+            managed_current: &pre_apply_input_current,
+            data_source_states: &data_source_states,
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -390,7 +395,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     .expect("Failed to resolve data source refs with state");
 
     carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
-        &mut current_states,
+        &mut data_source_states,
         &data_sources,
         wiring.schemas(),
     );
@@ -434,7 +439,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                     &mut override_aware_resources,
                     &constraint_origin_resources,
                     &module_gate,
-                    &mut current_states,
+                    &mut managed_current,
+                    &mut data_source_states,
                     &mut orphans,
                     raw_provider_configs,
                     &mut data_sources_for_plan,
@@ -454,10 +460,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         for error in errors {
             plan.add_error(error);
         }
-        current_states = into_all_prior_states(orphans, current_states);
+        managed_current = into_all_prior_states(orphans, managed_current);
         return FixturePlan {
             plan,
-            current_states,
+            managed_current,
+            data_source_states,
             state_file,
             schemas: wiring.schemas().clone(),
             moved_origins: HashMap::new(),
@@ -477,6 +484,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &wiring,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
+            data_sources: &data_sources_for_plan,
             state_file: state_file.as_ref(),
             state_block_claims: &state_block_claims,
             providers: raw_provider_configs,
@@ -485,7 +493,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     .expect("fixture late anonymous identities must resolve uniquely");
 
     let moved_pairs = crate::wiring::materialize_moved_states(
-        &mut current_states,
+        &mut managed_current,
         &mut orphans,
         &mut prev_explicit,
         &mut saved_attrs,
@@ -501,11 +509,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     .expect("state block collision validation failed");
 
     let reconciled_provider_states = provider_states_for(
-        &current_states,
+        &managed_current,
         &orphans,
         override_aware_resources.resources(),
     );
-    let reconciled_input_states = carina_core::resource::into_plan_input_map(
+    let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
         reconciled_provider_states,
         wiring.schemas(),
         override_aware_resources.resources(),
@@ -514,7 +522,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
             data_sources: &data_sources,
-            current_states: &reconciled_input_states,
+            managed_current: &reconciled_input_current,
+            data_source_states: &data_source_states,
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -523,7 +532,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let deferred_for_expansion = expand_same_config_deferred_for(
         &parsed,
         &sorted_resources,
-        &current_states,
+        &managed_current,
+        &data_source_states,
         wiring.schemas(),
         &remote_bindings,
         &wait_aliases,
@@ -556,8 +566,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         override_aware_resources.paired_unresolved_resources(),
     )
     .expect("fixture unresolved resources must have paired identities");
-    let plan_input_states = carina_core::resource::into_plan_input_map(
-        current_states.clone(),
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        managed_current.clone(),
         wiring.schemas(),
         override_aware_resources.resources(),
     );
@@ -566,7 +576,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &unresolved_resources,
         &data_sources_for_plan,
         &provider_router,
-        PlanPriorStates::new(&plan_input_states, &orphans),
+        PlanPriorStates::new(&plan_input_current, &data_source_states, &orphans),
         &directives_map,
         wiring.schemas(),
         &saved_attrs,
@@ -589,7 +599,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &upstream_binding_names,
     );
     add_deferred_create_effects(&mut plan, &deferred_create_targets);
-    current_states = into_all_prior_states(orphans, current_states);
+    managed_current = into_all_prior_states(orphans, managed_current);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -607,7 +617,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             resources: override_aware_resources.resources(),
             compositions: &parsed.compositions,
             data_sources: &data_sources_for_plan,
-            current_states: &current_states,
+            managed_current: &managed_current,
+            data_source_states: &data_source_states,
             state_file: state_file.as_ref(),
             plan: &plan,
             schemas: wiring.schemas(),
@@ -619,7 +630,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     FixturePlan {
         plan,
-        current_states,
+        managed_current,
+        data_source_states,
         state_file,
         schemas: wiring.schemas().clone(),
         moved_origins,
@@ -1126,8 +1138,8 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
 /// Collect `Delete`-effect attributes keyed by resource id plus generation.
 pub fn delete_instance_attributes_from_plan(
     plan: &Plan,
-    current_states: &HashMap<ResourceId, State>,
+    managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
 ) -> carina_core::detail_rows::HistoricalDisplayAttributes {
-    crate::commands::plan::collect_historical_display_attributes(plan, current_states, state_file)
+    crate::commands::plan::collect_historical_display_attributes(plan, managed_current, state_file)
 }

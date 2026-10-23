@@ -348,7 +348,7 @@ fn current_state_comment_placeholder_hash<'a>(plan: &'a Value, identity: &str) -
         .find(|entry| entry.pointer("/id/identity").and_then(Value::as_str) == Some(identity))
         .and_then(|entry| {
             entry
-                .pointer("/state/attributes/comment/RedactedSecret/hash")
+                .pointer("/current/state/attributes/comment/RedactedSecret/hash")
                 .and_then(Value::as_str)
         })
         .unwrap_or_else(|| {
@@ -437,17 +437,17 @@ mock.test.resource {{
         .iter()
         .find(|entry| {
             entry
-                .pointer("/state/attributes/name/String")
+                .pointer("/current/state/attributes/name/String")
                 .and_then(Value::as_str)
                 == Some("marker-collision")
         })
         .unwrap_or_else(|| panic!("saved plan has no marker-collision current state: {plan:#}"));
     assert_eq!(
-        current.pointer("/state/attributes/comment/String"),
+        current.pointer("/current/state/attributes/comment/String"),
         Some(&Value::String(marker.clone()))
     );
     assert_eq!(
-        current.pointer("/state/attributes/tags/Map/nested/String"),
+        current.pointer("/current/state/attributes/tags/Map/nested/String"),
         Some(&Value::String(marker.clone()))
     );
     assert!(

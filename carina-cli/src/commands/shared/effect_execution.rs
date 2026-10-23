@@ -158,7 +158,8 @@ mod tests {
             runtime_synthesized_resources: Vec::new(),
             successfully_deleted: HashSet::new(),
             permanent_name_overrides: HashMap::new(),
-            current_states: HashMap::new(),
+            managed_current: HashMap::new(),
+            data_source_states: HashMap::new(),
             bindings: carina_core::binding_index::ResolvedBindings::default(),
             failed_refreshes: HashSet::new(),
         }

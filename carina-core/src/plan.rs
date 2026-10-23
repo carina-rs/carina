@@ -116,25 +116,6 @@ impl PlanError {
         Self::new(resource_id, PlanErrorKind::PreventDestroy { action })
     }
 
-    /// Validate a provider identifier while constructing mutation effects.
-    ///
-    /// State rows created by older clients can claim that a resource exists
-    /// without recording the provider identifier needed to update or delete
-    /// it. Reject those rows before any effect can be executed.
-    pub fn require_provider_identifier(
-        resource_id: &ResourceId,
-        identifier: Option<&str>,
-    ) -> Result<AppliedIdentifier, Box<Self>> {
-        identifier
-            .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
-            .ok_or_else(|| {
-                Box::new(Self::new(
-                    resource_id.clone(),
-                    PlanErrorKind::MissingProviderIdentifier,
-                ))
-            })
-    }
-
     /// Validate the provider identifier for one deposed generation.
     pub fn require_deposed_provider_identifier(
         resource_id: &ResourceId,

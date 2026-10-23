@@ -87,7 +87,7 @@ fn main() -> ExitCode {
 
     let fp = build_plan_from_fixture_name(&fixture);
     let historical_display =
-        delete_instance_attributes_from_plan(&fp.plan, &fp.current_states, fp.state_file.as_ref());
+        delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
 
     if tui {
         if let Err(e) = carina_tui::run(&fp.plan, &fp.schemas, &historical_display) {

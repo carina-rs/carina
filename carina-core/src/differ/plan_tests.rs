@@ -17,6 +17,95 @@ fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     State::existing(id, attributes).with_identifier(identifier)
 }
 
+#[test]
+fn missing_identifier_current_produces_existing_plan_error() {
+    let resource = Resource::new("test.resource", "managed");
+    let id = resource.id.clone();
+    let managed_current = HashMap::from([(
+        id.clone(),
+        crate::resource::Current::from_state(State::existing(id.clone(), HashMap::new())),
+    )]);
+    let plan_current = crate::resource::into_plan_input_current_map(
+        managed_current,
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&resource),
+    );
+
+    let plan = create_plan(
+        &[resource],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &plan_current,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(plan.errors()[0].resource_id, id);
+    assert_eq!(
+        plan.errors()[0].kind,
+        PlanErrorKind::MissingProviderIdentifier
+    );
+}
+
+#[test]
+fn current_variant_determines_create_update_or_plan_error() {
+    let desired = Resource::new("test.resource", "managed")
+        .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into())));
+    let id = desired.id.clone();
+    let make_plan = |current| {
+        let current = crate::resource::into_plan_input_current_map(
+            HashMap::from([(id.clone(), current)]),
+            &SchemaRegistry::new(),
+            std::slice::from_ref(&desired),
+        );
+        create_plan(
+            std::slice::from_ref(&desired),
+            &[],
+            &HintProvider { hints: Vec::new() },
+            &current,
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &Orphans::new(),
+            &[],
+        )
+    };
+
+    let absent = make_plan(Current::absent(id.clone()));
+    assert_eq!(absent.summary().create, 1);
+    assert!(absent.errors().is_empty());
+
+    let present = make_plan(Current::from_state(
+        State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("old".into())),
+            )]),
+        )
+        .with_identifier("provider-id"),
+    ));
+    assert_eq!(present.summary().update, 1);
+    assert!(present.errors().is_empty());
+
+    let missing_identifier = make_plan(Current::from_state(State::existing(
+        id.clone(),
+        HashMap::new(),
+    )));
+    assert!(missing_identifier.effects().is_empty());
+    assert_eq!(missing_identifier.errors().len(), 1);
+    assert_eq!(
+        missing_identifier.errors()[0].kind,
+        PlanErrorKind::MissingProviderIdentifier
+    );
+}
+
 fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::new(&[]);
@@ -180,7 +269,7 @@ fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -272,7 +361,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -346,7 +435,7 @@ fn no_temporary_name_without_create_before_destroy() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -419,7 +508,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -477,7 +566,7 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -544,7 +633,7 @@ fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -653,7 +742,7 @@ fn no_temporary_name_when_unique_name_attribute_changes() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1243,7 +1332,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
             )]),
         },
     )]);
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         web_acl_state,
         Some("web_acl".to_string()),
         Directives::default(),
@@ -1253,7 +1342,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         &[desired],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states,
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1325,7 +1414,7 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
         "provider-facing state must not carry orphan metadata"
     );
 
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         orphan_state,
         Some("service".to_string()),
         Directives::default(),
@@ -1335,7 +1424,7 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1370,7 +1459,7 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
     let id = ResourceId::with_identity("example.Service", "service");
     let desired = Resource::new("example.Service", "service")
         .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into())));
-    let orphan = Orphan::new(
+    let orphan = Orphan::from_state(
         existing_state(
             id.clone(),
             HashMap::from([(
@@ -1387,7 +1476,11 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
         &[desired],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(HashMap::new(), &SchemaRegistry::new(), &[]),
+        &crate::resource::into_plan_input_current_map_from_states(
+            HashMap::new(),
+            &SchemaRegistry::new(),
+            &[],
+        ),
         &HashMap::new(),
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
@@ -1413,7 +1506,7 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
 fn orphan_collection_rekeys_index_and_provider_state_together() {
     let old_id = ResourceId::with_identity("example.Service", "old");
     let new_id = ResourceId::with_identity("example.Service", "new");
-    let orphan = Orphan::new(
+    let orphan = Orphan::from_state(
         existing_state(old_id.clone(), HashMap::new()),
         Some("service".to_string()),
         Directives::default(),
@@ -1422,35 +1515,199 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
 
     assert!(orphans.rekey(&old_id, new_id.clone()));
     assert!(!orphans.contains_key(&old_id));
-    assert_eq!(orphans.get(&new_id).unwrap().state().id, new_id);
+    let moved = match orphans.get(&new_id).unwrap().current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
+    assert_eq!(moved.id, new_id);
 }
 
 #[tokio::test]
-#[should_panic(expected = "provider transform must preserve the complete prior-state key set")]
+#[should_panic(
+    expected = "provider transform must preserve the managed/orphan prior-state key set"
+)]
 async fn prior_state_transform_rejects_current_state_key_changes() {
     let current_id = ResourceId::with_identity("example.Service", "current");
     let orphan_id = ResourceId::with_identity("example.Service", "orphan");
     let inserted_id = ResourceId::with_identity("example.Service", "inserted");
-    let mut current_states = HashMap::from([(
+    let mut current_states = crate::resource::current_map_from_states(HashMap::from([(
         current_id.clone(),
         existing_state(current_id.clone(), HashMap::new()),
-    )]);
-    let mut orphans = Orphans::from([Orphan::new(
+    )]));
+    let mut orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id, HashMap::new()),
         Some("orphan".to_string()),
         Directives::default(),
     )]);
+    let mut data_source_states = HashMap::new();
 
-    transform_prior_provider_states(&mut current_states, &mut orphans, async |states| {
-        states.remove(&current_id);
-        states.insert(
-            inserted_id.clone(),
-            existing_state(inserted_id, HashMap::new()),
-        );
-        Ok::<(), ()>(())
-    })
+    transform_prior_provider_states(
+        &mut current_states,
+        &mut data_source_states,
+        &mut orphans,
+        async |states| {
+            states.remove(&current_id);
+            states.insert(
+                inserted_id.clone(),
+                existing_state(inserted_id.clone(), HashMap::new()),
+            );
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+        async |states| {
+            assert!(states.is_empty());
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+    )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate() {
+    let id = ResourceId::with_provider_identity("mock", "test.Lookup", "shared", None);
+    let mut current_states = crate::resource::current_map_from_states(HashMap::from([(
+        id.clone(),
+        existing_state(id.clone(), HashMap::new()),
+    )]));
+    let mut data_source_states =
+        HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+    let mut orphans = Orphans::new();
+
+    transform_prior_provider_states(
+        &mut current_states,
+        &mut data_source_states,
+        &mut orphans,
+        async |states| {
+            for state in states.values_mut() {
+                state.attributes.insert(
+                    "managed_normalized".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                );
+            }
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+        async |states| {
+            for state in states.values_mut() {
+                state.attributes.insert(
+                    "data_source_normalized".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                );
+            }
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+    )
+    .await
+    .expect("overlapping ids remain isolated across transform calls");
+
+    let Current::Present(managed) = &current_states[&id] else {
+        panic!("managed fixture must remain present");
+    };
+    assert_eq!(
+        managed.state().attributes.get("managed_normalized"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
+    assert!(
+        !managed
+            .state()
+            .attributes
+            .contains_key("data_source_normalized")
+    );
+    assert_eq!(
+        data_source_states[&id]
+            .attributes
+            .get("data_source_normalized"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
+    assert!(
+        !data_source_states[&id]
+            .attributes
+            .contains_key("managed_normalized")
+    );
+}
+
+#[tokio::test]
+async fn prior_state_transform_rebuilds_managed_current_after_provider_transform() {
+    let id = ResourceId::with_identity("example.Service", "current");
+    let mut current_states = crate::resource::current_map_from_states(HashMap::from([(
+        id.clone(),
+        existing_state(id.clone(), HashMap::new()),
+    )]));
+    let mut orphans = Orphans::new();
+    let mut data_source_states = HashMap::new();
+
+    transform_prior_provider_states(
+        &mut current_states,
+        &mut data_source_states,
+        &mut orphans,
+        async |states| {
+            states.get_mut(&id).unwrap().attributes.insert(
+                "normalized".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            );
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+        async |states| {
+            assert!(states.is_empty());
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+    )
+    .await
+    .unwrap();
+
+    let current = current_states
+        .get(&id)
+        .expect("managed current must be restored after the transform");
+    let state = match current {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
+    assert_eq!(
+        state.attributes.get("normalized"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
+}
+
+#[tokio::test]
+async fn prior_state_transform_preserves_typed_managed_identifier() {
+    let id = ResourceId::with_identity("example.Service", "current");
+    let state = State::existing(id.clone(), HashMap::new());
+    let identifier = crate::provider::fixture_applied_identifier("typed-provider-id");
+    let mut current_states = HashMap::from([(
+        id.clone(),
+        crate::resource::fixture_present_current(state, identifier),
+    )]);
+    let mut orphans = Orphans::new();
+    let mut data_source_states = HashMap::new();
+
+    transform_prior_provider_states(
+        &mut current_states,
+        &mut data_source_states,
+        &mut orphans,
+        async |states| {
+            states.get_mut(&id).unwrap().attributes.insert(
+                "normalized".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            );
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+        async |states| {
+            assert!(states.is_empty());
+            Ok::<(), crate::provider::ProviderError>(())
+        },
+    )
+    .await
+    .unwrap();
+
+    let Current::Present(present) = &current_states[&id] else {
+        panic!("normalization must retain the authoritative Present classification");
+    };
+    assert_eq!(present.identifier().as_str(), "typed-provider-id");
+    assert_eq!(
+        present.state().attributes.get("normalized"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
 }
 
 #[test]
@@ -1462,7 +1719,7 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
         depends_on: vec!["x".to_string()],
         ..Directives::default()
     };
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         orphan_state,
         Some("service".to_string()),
         directives,
@@ -1472,7 +1729,11 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(HashMap::new(), &SchemaRegistry::new(), &[]),
+        &crate::resource::into_plan_input_current_map_from_states(
+            HashMap::new(),
+            &SchemaRegistry::new(),
+            &[],
+        ),
         &HashMap::new(),
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
@@ -1543,7 +1804,7 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
         &[producer, consumer],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states,
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1592,7 +1853,7 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
     let dependency_state =
         existing_state(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
     let current_states = HashMap::from([(consumer_id, consumer_state)]);
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         dependency_state,
         Some("dependency".to_string()),
         Directives::default(),
@@ -1602,7 +1863,7 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
         &[consumer],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states,
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1656,7 +1917,7 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
             ..Default::default()
         },
     )]);
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         dependency_state,
         Some("dependency".to_string()),
         Directives::default(),
@@ -1666,7 +1927,7 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
         &[consumer],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states,
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1804,7 +2065,7 @@ fn create_plan_detects_attribute_removal() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1876,7 +2137,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1951,7 +2212,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -2015,7 +2276,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id.clone(), attrs),
         None,
         Directives {
@@ -2028,7 +2289,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -2099,7 +2360,7 @@ fn prevent_destroy_blocks_replace() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states,
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -2160,7 +2421,7 @@ fn prevent_destroy_does_not_block_update() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -2309,7 +2570,7 @@ fn without_prevent_destroy_delete_works_normally() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id, attrs),
         None,
         Directives::default(),
@@ -2319,7 +2580,7 @@ fn without_prevent_destroy_delete_works_normally() {
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -2364,19 +2625,19 @@ fn prevent_destroy_collects_multiple_errors() {
         ..Default::default()
     };
     let orphans = Orphans::from([
-        Orphan::new(
+        Orphan::from_state(
             existing_state(first_id, attrs1),
             None,
             prevent_destroy.clone(),
         ),
-        Orphan::new(existing_state(second_id, attrs2), None, prevent_destroy),
+        Orphan::from_state(existing_state(second_id, attrs2), None, prevent_destroy),
     ]);
 
     let plan = create_plan(
         &[],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -2927,6 +3188,134 @@ fn data_source_wait_uses_the_data_source_schema_for_enum_resolution() {
 }
 
 #[test]
+fn data_source_wait_uses_separate_cached_state_when_deciding_work() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::resource::{DataSource, ResolvedResource};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let lookup =
+        DataSource::with_provider("test", "lookup.Job", "lookup", None).with_binding("lookup");
+    let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
+        .with_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert("lookup_found".to_string());
+    let wait = WaitBinding {
+        binding: "lookup_found".into(),
+        target: "lookup".into(),
+        until_raw: "lookup.status == \"READY\"".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["lookup".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("READY".into())),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("lookup.Job")
+            .as_data_source()
+            .attribute(AttributeSchema::new("status", AttributeType::string())),
+    );
+    let data_source_states = HashMap::from([(
+        lookup.id.clone(),
+        State::existing(
+            lookup.id.clone(),
+            HashMap::from([(
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("READY".into())),
+            )]),
+        ),
+    )]);
+    let managed = ResolvedResource::collect_resolved(vec![consumer]).unwrap();
+    let managed_current = HashMap::new();
+    let orphans = Orphans::new();
+
+    let plan = super::plan::create_plan(
+        &managed,
+        &[lookup],
+        &HintProvider { hints: Vec::new() },
+        PlanPriorStates::new(&managed_current, &data_source_states, &orphans),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[wait],
+    )
+    .expect("test provider hints should succeed");
+
+    assert!(plan.errors().is_empty());
+    assert!(
+        !plan.effects().iter().any(Effect::is_wait),
+        "an unchanged data source whose cached state satisfies the predicate has no wait work"
+    );
+}
+
+#[test]
+fn data_source_wait_evaluates_cached_state_even_when_not_found() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::resource::{DataSource, ResolvedResource};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let lookup =
+        DataSource::with_provider("test", "lookup.Job", "lookup", None).with_binding("lookup");
+    let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
+        .with_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert("lookup_found".to_string());
+    let wait = WaitBinding {
+        binding: "lookup_found".into(),
+        target: "lookup".into(),
+        until_raw: "lookup.status == \"READY\"".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["lookup".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("READY".into())),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("lookup.Job")
+            .as_data_source()
+            .attribute(AttributeSchema::new("status", AttributeType::string())),
+    );
+    let mut cached_state = State::not_found(lookup.id.clone());
+    cached_state.attributes.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("READY".into())),
+    );
+    let data_source_states = HashMap::from([(lookup.id.clone(), cached_state)]);
+    let managed = ResolvedResource::collect_resolved(vec![consumer]).unwrap();
+    let managed_current = HashMap::new();
+    let orphans = Orphans::new();
+
+    let plan = super::plan::create_plan(
+        &managed,
+        &[lookup],
+        &HintProvider { hints: Vec::new() },
+        PlanPriorStates::new(&managed_current, &data_source_states, &orphans),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[wait],
+    )
+    .expect("test provider hints should succeed");
+
+    assert!(plan.errors().is_empty());
+    assert!(
+        !plan.effects().iter().any(Effect::is_wait),
+        "the cached data-source attributes must be evaluated regardless of the exists flag"
+    );
+}
+
+#[test]
 fn create_plan_records_error_for_empty_predicate_attr_path() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
@@ -3261,7 +3650,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
         &resources,
         &[],
         &HintProvider { hints: Vec::new() },
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -3292,7 +3681,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    // `dist` is new (absent from current_states) → Create → mutating.
+    // `dist` is new (absent from managed current state) → Create → mutating.
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     dist.dependency_bindings.insert("cert_issued".to_string());
     let resources = vec![cert, dist];
@@ -3354,7 +3743,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
             "status",
             Value::Concrete(ConcreteValue::String("ISSUED".into())),
         );
-    // dist is new (absent from current_states) → Create → mutating.
+    // dist is new (absent from managed current state) → Create → mutating.
     // It references the wait binding, so the wait "gates a pending change".
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     dist.dependency_bindings.insert("cert_issued".to_string());
@@ -3406,7 +3795,11 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
         &resources,
         &[],
         &HintProvider { hints: Vec::new() },
-        &crate::resource::into_plan_input_map(current_states.clone(), &schemas, &resources),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states.clone(),
+            &schemas,
+            &resources,
+        ),
         &HashMap::new(),
         &schemas,
         &empty_lifted_saved_attrs(),
@@ -3438,7 +3831,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    // cert is new (absent from current_states) → Create → mutating
+    // cert is new (absent from managed current state) → Create → mutating
     // target. Even though no cached state exists, the wait must poll
     // post-apply.
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
@@ -3543,7 +3936,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         &resources,
         &[],
         &HintProvider { hints: Vec::new() },
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],

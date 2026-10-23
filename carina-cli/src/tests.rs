@@ -13,8 +13,8 @@ use carina_core::provider::{
     AppliedIdentifier, BoxFuture, ProviderError, ProviderResult, ReadOutcome, fixture_read_outcome,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, ResolvedDataSource, ResolvedResource,
-    Resource, ResourceId, State, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, Directives, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{
@@ -171,14 +171,16 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
     let mut current_states = HashMap::from([(
         id.clone(),
-        State::existing(
-            id.clone(),
-            HashMap::from([(
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("before".into())),
-            )]),
-        )
-        .with_identifier(identifier),
+        Current::from_state(
+            State::existing(
+                id.clone(),
+                HashMap::from([(
+                    "status".to_string(),
+                    Value::Concrete(ConcreteValue::String("before".into())),
+                )]),
+            )
+            .with_identifier(identifier),
+        ),
     )]);
     let provider = TestProvider::with_read_state(
         &id,
@@ -214,7 +216,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
             state_file: Some(existing_state),
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &HashMap::new(),
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -240,14 +242,16 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
 
     let mut current_states = HashMap::from([(
         id.clone(),
-        State::existing(
-            id.clone(),
-            HashMap::from([(
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("before".into())),
-            )]),
-        )
-        .with_identifier(identifier),
+        Current::from_state(
+            State::existing(
+                id.clone(),
+                HashMap::from([(
+                    "status".to_string(),
+                    Value::Concrete(ConcreteValue::String("before".into())),
+                )]),
+            )
+            .with_identifier(identifier),
+        ),
     )]);
     let provider = TestProvider::with_read_state(&id, identifier, State::not_found(id.clone()));
 
@@ -272,7 +276,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
             state_file: Some(existing_state),
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &HashMap::new(),
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -294,14 +298,16 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
 
     let mut current_states = HashMap::from([(
         id.clone(),
-        State::existing(
-            id.clone(),
-            HashMap::from([(
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("stale-current".into())),
-            )]),
-        )
-        .with_identifier(identifier),
+        Current::from_state(
+            State::existing(
+                id.clone(),
+                HashMap::from([(
+                    "status".to_string(),
+                    Value::Concrete(ConcreteValue::String("stale-current".into())),
+                )]),
+            )
+            .with_identifier(identifier),
+        ),
     )]);
     let provider = TestProvider::with_read_error(&id, identifier, "read failed");
 
@@ -326,7 +332,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
             state_file: Some(existing_state),
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
-            current_states: &current_states,
+            managed_current: &current_states,
             applied_states: &HashMap::new(),
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -378,15 +384,27 @@ fn plan_file_serde_round_trip() {
         ),
     ];
 
-    let current_states = vec![CurrentStateEntry {
-        id: ResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None),
-        state: State::not_found(ResourceId::with_provider_identity(
-            "aws",
-            "s3.Bucket",
-            "my-bucket",
-            None,
-        )),
-    }];
+    let data_source_id =
+        ResourceId::with_provider_identity("aws", "sts.CallerIdentity", "caller", None);
+    let absent_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "absent-bucket", None);
+    let present_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "present-bucket", None);
+    let missing_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "missing-bucket", None);
+    let current_states = vec![
+        CurrentStateEntry::managed(absent_id.clone(), State::not_found(absent_id.clone())),
+        CurrentStateEntry::managed(
+            present_id.clone(),
+            State::existing(present_id.clone(), HashMap::new())
+                .with_identifier("present-provider-id"),
+        ),
+        CurrentStateEntry::managed(
+            missing_id.clone(),
+            State::existing(missing_id.clone(), HashMap::new()),
+        ),
+        CurrentStateEntry::data_source(
+            data_source_id.clone(),
+            State::existing(data_source_id.clone(), HashMap::new()),
+        ),
+    ];
 
     let plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
@@ -427,6 +445,8 @@ fn plan_file_serde_round_trip() {
         unresolved_resources: sorted_resources,
         current_states,
         compositions: vec![],
+        // The entry tag, not membership in this list, owns the saved row's
+        // managed-vs-data-source classification.
         data_sources: vec![],
         data_source_origins: vec![],
         upstream_snapshot: HashMap::new(),
@@ -435,6 +455,29 @@ fn plan_file_serde_round_trip() {
     };
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
+    let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(wire["version"], serde_json::json!(20));
+    assert_eq!(wire["current_states"][0]["kind"], "managed");
+    assert_eq!(wire["current_states"][0]["current"]["status"], "absent");
+    assert_eq!(wire["current_states"][1]["kind"], "managed");
+    assert_eq!(wire["current_states"][1]["current"]["status"], "present");
+    assert_eq!(wire["current_states"][2]["kind"], "managed");
+    assert_eq!(
+        wire["current_states"][2]["current"]["status"],
+        "missing_identifier"
+    );
+    assert_eq!(wire["current_states"][3]["kind"], "data_source");
+    let mut invalid_present = wire.clone();
+    invalid_present["current_states"][1]["current"]["state"]["identifier"] =
+        serde_json::Value::Null;
+    let error = serde_json::from_value::<PlanFile>(invalid_present)
+        .expect_err("a present tag must not bypass provider-identifier validation");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match classified state"),
+        "{error}"
+    );
     let deserialized: PlanFile = serde_json::from_str(&json).unwrap();
 
     assert_eq!(deserialized.version, PlanFile::CURRENT_VERSION);
@@ -451,7 +494,34 @@ fn plan_file_serde_round_trip() {
     assert_eq!(deserialized.plan.effects().len(), 2);
     assert_eq!(deserialized.sorted_resources.len(), 1);
     assert_eq!(deserialized.unresolved_resources.len(), 1);
-    assert_eq!(deserialized.current_states.len(), 1);
+    match deserialized.current_states.as_slice() {
+        [
+            CurrentStateEntry::Managed {
+                id: loaded_absent_id,
+                current: Current::Absent(_absent),
+            },
+            CurrentStateEntry::Managed {
+                id: loaded_present_id,
+                current: Current::Present(present),
+            },
+            CurrentStateEntry::Managed {
+                id: loaded_missing_id,
+                current: Current::MissingIdentifier(_missing),
+            },
+            CurrentStateEntry::DataSource {
+                id: loaded_data_source_id,
+                state: data_source_state,
+            },
+        ] => {
+            assert_eq!(loaded_absent_id, &absent_id);
+            assert_eq!(loaded_present_id, &present_id);
+            assert_eq!(present.identifier().as_str(), "present-provider-id");
+            assert_eq!(loaded_missing_id, &missing_id);
+            assert_eq!(loaded_data_source_id, &data_source_id);
+            assert!(data_source_state.identifier.is_none());
+        }
+        entries => panic!("unexpected typed current-state entries: {entries:?}"),
+    }
 }
 
 #[test]
@@ -1068,11 +1138,11 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // 5. The typed state loader should find the resource identifier.
     let identifier = match state_file.build_state_for_resource(&resources_run2[0].id) {
-        carina_state::ResourceStateLoad::Present(present) => {
+        carina_core::resource::Current::Present(present) => {
             Some(present.identifier().as_str().to_owned())
         }
-        carina_state::ResourceStateLoad::Absent(_)
-        | carina_state::ResourceStateLoad::MissingProviderIdentifier(_) => None,
+        carina_core::resource::Current::Absent(_state) => None,
+        carina_core::resource::Current::MissingIdentifier(_state) => None,
     };
     assert_eq!(
         identifier,
@@ -1193,11 +1263,11 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     reconcile_prefixed_names(&mut resources_run2, &Some(state_file.clone()));
 
     let identifier = match state_file.build_state_for_resource(&resources_run2[0].id) {
-        carina_state::ResourceStateLoad::Present(present) => {
+        carina_core::resource::Current::Present(present) => {
             Some(present.identifier().as_str().to_owned())
         }
-        carina_state::ResourceStateLoad::Absent(_)
-        | carina_state::ResourceStateLoad::MissingProviderIdentifier(_) => None,
+        carina_core::resource::Current::Absent(_state) => None,
+        carina_core::resource::Current::MissingIdentifier(_state) => None,
     };
     assert!(
         identifier.is_some(),
@@ -1253,10 +1323,7 @@ async fn detect_drift_returns_none_when_no_drift() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, state.clone());
-    let planned_states = vec![CurrentStateEntry {
-        id: id.clone(),
-        state,
-    }];
+    let planned_states = vec![CurrentStateEntry::managed(id.clone(), state)];
 
     let result = detect_drift(
         &[resource],
@@ -1269,6 +1336,33 @@ async fn detect_drift_returns_none_when_no_drift() {
     .expect("drift check succeeds");
 
     assert!(result.drift_messages().is_none(), "Should detect no drift");
+}
+
+#[tokio::test]
+async fn detect_drift_uses_identifier_carried_by_present_current() {
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let id = resource.id.clone();
+    let identifier =
+        AppliedIdentifier::new("typed-provider-id").expect("fixture identifier is non-empty");
+    let planned = State::existing(id.clone(), HashMap::new());
+    let actual = State::existing(id.clone(), HashMap::new()).with_identifier("typed-provider-id");
+    let provider = TestProvider::with_read_state(&id, "typed-provider-id", actual);
+    let planned_states = vec![CurrentStateEntry::Managed {
+        id: id.clone(),
+        current: carina_core::resource::fixture_present_current(planned, identifier),
+    }];
+
+    let result = detect_drift(
+        &[resource],
+        &planned_states,
+        &MovedOrigins::from_plan(&Plan::new()),
+        &provider,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await
+    .expect("typed present identifier must drive the provider read");
+
+    assert!(result.drift_messages().is_none());
 }
 
 #[tokio::test]
@@ -1297,10 +1391,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, actual);
-    let planned_states = vec![CurrentStateEntry {
-        id: id.clone(),
-        state: planned,
-    }];
+    let planned_states = vec![CurrentStateEntry::managed(id.clone(), planned)];
 
     let result = detect_drift(
         &[resource],
@@ -1351,7 +1442,7 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
 
-    // Build current_states from desired resources (simulates the provider read loop)
+    // Build managed current state from desired resources (simulates the provider read loop)
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &desired {
         current_states.insert(
@@ -1380,11 +1471,12 @@ fn orphaned_state_resource_produces_delete_effect() {
         &[],
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &orphans,
         ),
         &directives_map,
@@ -1508,7 +1600,8 @@ async fn lock_released_on_write_state_failure() {
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
-        current_states: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
@@ -1521,7 +1614,8 @@ async fn lock_released_on_write_state_failure() {
             state_file: Some(StateFile::new()),
             sorted_resources: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
@@ -1655,7 +1749,8 @@ async fn finalize_apply_uses_write_state_locked() {
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
-        current_states: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
@@ -1666,7 +1761,8 @@ async fn finalize_apply_uses_write_state_locked() {
             state_file: Some(StateFile::new()),
             sorted_resources: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
@@ -1978,7 +2074,8 @@ async fn finalize_apply_without_lock_uses_write_state() {
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
-        current_states: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
@@ -1989,7 +2086,8 @@ async fn finalize_apply_without_lock_uses_write_state() {
             state_file: Some(StateFile::new()),
             sorted_resources: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
             lock: state_lock.as_ref(),
@@ -2069,7 +2167,7 @@ fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
 /// This test simulates the fixed code path:
 /// 1. State file has "removed-bucket" (orphaned — not in .crn config)
 /// 2. The provider returns not-found for "removed-bucket" (deleted externally)
-/// 3. The refresh loop skips it, so current_states has no entry for it
+/// 3. The refresh loop skips it, so managed current state has no entry for it
 /// 4. Expected: no Delete effect should be generated
 #[test]
 fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
@@ -2115,11 +2213,12 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &[],
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &orphans,
         ),
         &directives_map,
@@ -2150,7 +2249,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
 ///
 /// This test simulates the refresh=false code path:
 /// 1. State file has "my-bucket" with known attributes
-/// 2. With refresh=false, current_states are built from state file
+/// 2. With refresh=false, managed current state is built from the state file
 /// 3. No provider.read() calls are made
 #[test]
 fn refresh_false_uses_cached_state_from_state_file() {
@@ -2178,16 +2277,21 @@ fn refresh_false_uses_cached_state_from_state_file() {
 
     let desired = vec![resource];
 
-    // Simulate refresh=false code path: build current_states from state file
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    // Simulate refresh=false: build managed current state from the state file.
+    let mut current_states: HashMap<ResourceId, Current> = HashMap::new();
     for res in &desired {
-        let state = state_file.build_state_for_resource(&res.id).into_state();
-        current_states.insert(res.id.clone(), state);
+        let current = state_file.build_state_for_resource(&res.id);
+        current_states.insert(res.id.clone(), current);
     }
 
     // Verify state was loaded from state file
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "my-bucket", None);
     let cached_state = current_states.get(&id).unwrap();
+    let cached_state = match cached_state {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+    };
     assert!(cached_state.exists, "State should exist from state file");
     assert_eq!(
         cached_state.identifier,
@@ -2209,11 +2313,12 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &[],
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &carina_core::resource::into_plan_input_current_map(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &directives_map,
@@ -2254,7 +2359,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     let current_states: HashMap<ResourceId, State> = HashMap::new();
 
     // Simulate refresh=false: the typed orphan state is the cached state-file
-    // value and is not duplicated into `current_states`.
+    // value and is not duplicated into the managed-current map.
     let orphans = state_file.build_orphans(&desired_ids).into_plan_orphans();
 
     let directives_map = state_file.build_directives();
@@ -2266,11 +2371,12 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &[],
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &orphans,
         ),
         &directives_map,
@@ -2320,11 +2426,12 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         &[],
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
+            &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
+            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
@@ -2393,7 +2500,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
             state_file: None,
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied_states,
             plan: &plan,
             successfully_deleted: &HashSet::new(),
@@ -2491,7 +2598,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
             state_file: None,
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied_states,
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -2573,7 +2680,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
             state_file: None,
             sorted_resources: &[resolved(resource.clone())],
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied_states,
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -2583,7 +2690,8 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
         None,
     )
     .unwrap();
-    let reloaded = PostApplyStates::from_current_and_state(&HashMap::new(), &saved);
+    let reloaded =
+        PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &saved);
 
     let resources = [resource];
     let plan = create_plan(
@@ -2591,11 +2699,12 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
         &[],
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_map(
-                reloaded.as_map().clone(),
+            &carina_core::resource::into_plan_input_current_map(
+                reloaded.managed_current().clone(),
                 &schemas,
                 &resources,
             ),
+            reloaded.data_source_states(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
@@ -2671,7 +2780,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
             state_file: Some(existing_state),
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
             applied_states: &applied_states,
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
@@ -2742,10 +2851,10 @@ fn plan_file_serialization_redacts_secrets() {
         compositions: vec![],
         data_sources: vec![],
         data_source_origins: vec![],
-        current_states: vec![CurrentStateEntry {
-            id: ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
-            state: redact_secrets_in_state(&state_with_secret).unwrap(),
-        }],
+        current_states: vec![CurrentStateEntry::managed(
+            ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
+            redact_secrets_in_state(&state_with_secret).unwrap(),
+        )],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: vec![],
@@ -2924,6 +3033,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
         &ProviderContext::default(),
     )
     .await;
@@ -2968,6 +3078,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &checked_exports(&export_params),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
+        &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &ProviderContext::default(),
     )
@@ -3017,6 +3128,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         &checked_exports(&export_params),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
+        &HashMap::new(),
         &HashMap::new(),
         &ProviderContext::default(),
     )
@@ -3076,7 +3188,8 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
-        current_states: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
@@ -3087,7 +3200,8 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
             state_file: Some(state_in),
             sorted_resources: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
@@ -3141,7 +3255,8 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
-        current_states: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
@@ -3152,7 +3267,8 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             state_file: Some(state_in),
             sorted_resources: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
@@ -3217,7 +3333,8 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
-        current_states: HashMap::from([(a_id, a_state)]),
+        managed_current: HashMap::from([(a_id, Current::from_state(a_state))]),
+        data_source_states: HashMap::new(),
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
@@ -3245,7 +3362,8 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             state_file: Some(StateFile::new()),
             sorted_resources: &sorted_resources,
             data_sources: &[],
-            current_states: &result.current_states,
+            managed_current: &result.managed_current,
+            data_source_states: &result.data_source_states,
             plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
@@ -3331,7 +3449,8 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
-        current_states: HashMap::from([(resource_id, state)]),
+        managed_current: HashMap::from([(resource_id, Current::from_state(state))]),
+        data_source_states: HashMap::new(),
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
@@ -3347,7 +3466,8 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
             state_file: Some(StateFile::new()),
             sorted_resources: &sorted_resources,
             data_sources: &[],
-            current_states: &result.current_states,
+            managed_current: &result.managed_current,
+            data_source_states: &result.data_source_states,
             plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),

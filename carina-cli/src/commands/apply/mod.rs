@@ -24,15 +24,17 @@ use carina_core::executor::{
 };
 use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
-use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, Provider, ProviderNormalizer, ReadRequest,
-};
+#[cfg(test)]
+use carina_core::provider::AppliedIdentifier;
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
-use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    Current, DataSource, ResolvedResource, Resource, ResourceId, State, Value,
+};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
-use carina_state::{BackendLock, LockInfo, ResourceStateLoad, StateBackend, StateFile};
+use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
 
 use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfigs};
 
@@ -205,7 +207,8 @@ async fn create_checked_bootstrap_resource(
 }
 
 fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
-    let current_states = HashMap::new();
+    let managed_current = HashMap::new();
+    let data_source_states = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases: Vec<WaitAliasSpec> = parsed
         .wait_bindings
@@ -216,7 +219,8 @@ fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> Re
         managed: &parsed.resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
-        current_states: &current_states,
+        managed_current: &managed_current,
+        data_source_states: &data_source_states,
         remote_bindings: &remote_bindings,
         wait_aliases: &wait_aliases,
     })
@@ -241,13 +245,13 @@ fn finalize_module_constraints(
 fn deferred_data_source_reads_from_data_sources(
     data_sources: &[DataSource],
     managed: &[Resource],
-    current_states: &HashMap<ResourceId, State>,
+    managed_current: &HashMap<ResourceId, Current>,
 ) -> DeferredDataSourceReads {
     let mut deferred_data_source_reads = DeferredDataSourceReads::none();
     for (id, unresolved) in crate::wiring::classify_apply_time_data_source_read_inputs(
         data_sources,
         managed,
-        current_states,
+        managed_current,
     ) {
         deferred_data_source_reads.insert(id, unresolved);
     }
@@ -412,7 +416,8 @@ pub async fn execute_effects(
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
-    current_states: &mut HashMap<ResourceId, State>,
+    managed_current: &mut HashMap<ResourceId, Current>,
+    data_source_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
@@ -428,7 +433,8 @@ pub async fn execute_effects(
         factories,
         schemas,
         bindings,
-        current_states,
+        managed_current,
+        data_source_states,
         unresolved_resources,
         data_source_origins,
         compositions,
@@ -449,7 +455,8 @@ async fn execute_effects_with_observer(
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
-    current_states: &mut HashMap<ResourceId, State>,
+    managed_current: &mut HashMap<ResourceId, Current>,
+    data_source_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
@@ -466,7 +473,8 @@ async fn execute_effects_with_observer(
         },
         compositions,
         bindings: bindings.clone(),
-        current_states: std::mem::take(current_states),
+        managed_current: std::mem::take(managed_current),
+        data_source_states: std::mem::take(data_source_states),
         deferred_data_source_reads,
         normalizer,
         provider_configs,
@@ -477,11 +485,12 @@ async fn execute_effects_with_observer(
 
     let outcome = carina_core::executor::execute_plan(provider, input, &*observer, cancel).await;
 
-    // Write back the updated current_states so callers see refreshes
+    // Write back the updated current views so callers see refreshes.
     let result = match &outcome {
         ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
     };
-    *current_states = result.current_states.clone();
+    *managed_current = result.managed_current.clone();
+    *data_source_states = result.data_source_states.clone();
     *bindings = result.bindings.clone();
 
     outcome
@@ -499,7 +508,8 @@ async fn execute_rehydrated_saved_plan(
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
-    current_states: &mut HashMap<ResourceId, State>,
+    managed_current: &mut HashMap<ResourceId, Current>,
+    data_source_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
@@ -516,7 +526,8 @@ async fn execute_rehydrated_saved_plan(
         factories,
         schemas,
         bindings,
-        current_states,
+        managed_current,
+        data_source_states,
         unresolved_resources,
         data_source_origins,
         compositions,
@@ -699,7 +710,7 @@ mod upstream_snapshot_tests {
 #[cfg(test)]
 pub async fn refresh_pending_states(
     provider: &dyn Provider,
-    current_states: &mut HashMap<ResourceId, State>,
+    managed_current: &mut HashMap<ResourceId, Current>,
     pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
 ) -> HashSet<ResourceId> {
     if pending_refreshes.is_empty() {
@@ -717,7 +728,7 @@ pub async fn refresh_pending_states(
         match read_with_retry(provider, id, identifier).await {
             Ok(state) => {
                 println!("  {} Refresh {}", "✓".green(), id);
-                current_states.insert(id.clone(), state);
+                managed_current.insert(id.clone(), Current::from_state(state));
             }
             Err(error) => {
                 println!("  {} Refresh {} - {}", "!".yellow(), id, error);
@@ -748,7 +759,7 @@ pub(crate) async fn finalize_apply(
         state_file: input.state_file,
         sorted_resources: input.sorted_resources,
         runtime_synthesized_resources: &input.result.runtime_synthesized_resources,
-        current_states: input.current_states,
+        managed_current: input.managed_current,
         applied_states: &input.result.applied_states,
         plan: input.plan,
         successfully_deleted: &input.result.successfully_deleted,
@@ -763,8 +774,11 @@ pub(crate) async fn finalize_apply(
     // no source-side view of which exports the user intends — see the
     // `FinalizeApplyInput::export_params` doc-comment.
     let export_resolution = if let Some(params) = input.export_params {
-        let post_apply_states =
-            PostApplyStates::from_current_and_state(input.current_states, &state);
+        let post_apply_states = PostApplyStates::from_current_and_state(
+            input.managed_current,
+            input.data_source_states,
+            &state,
+        );
         let export_resources: Vec<Resource> = input
             .sorted_resources
             .iter()
@@ -908,12 +922,15 @@ pub(crate) async fn load_state_persist_if_migrated(
     }
 }
 
-/// Remove pre-#3181 data-source rows identified by the parser's typed `read`
-/// addresses and persist the normalized state while the caller's lock is held.
+/// Remove pre-#3181 identifier-less data-source rows identified by the
+/// parser's typed `read` addresses and persist the normalized state while the
+/// caller's lock is held.
 ///
 /// This is intentionally separate from JSON migration: identifier-less
 /// managed rows and historical data-source rows have the same old wire shape,
-/// so only the parsed resource kind/address can distinguish them safely.
+/// so cleanup requires both that shape and the parsed resource kind/address.
+/// An identifier-bearing managed row is preserved even when a data source now
+/// occupies the same address.
 pub(crate) async fn prune_legacy_data_source_rows_persist_if_changed(
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
@@ -958,11 +975,13 @@ pub(crate) async fn persist_exports_only(
     >,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
-    current_states: &HashMap<ResourceId, carina_core::resource::State>,
+    managed_current: &HashMap<ResourceId, Current>,
+    data_source_states: &HashMap<ResourceId, State>,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
-    let post_apply_states = PostApplyStates::from_current_and_state(current_states, &state);
+    let post_apply_states =
+        PostApplyStates::from_current_and_state(managed_current, data_source_states, &state);
     let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
         export_params,
         sorted_resources,
@@ -1030,37 +1049,50 @@ pub(crate) async fn detect_drift(
     let mut verified_planned_states = HashMap::new();
     let planned_states: HashMap<_, _> = planned_state_entries
         .iter()
-        .map(|entry| (&entry.id, &entry.state))
+        .filter_map(|entry| match entry {
+            crate::commands::plan::CurrentStateEntry::Managed { id, current } => {
+                Some((id, current))
+            }
+            crate::commands::plan::CurrentStateEntry::DataSource {
+                id: _id,
+                state: _state,
+            } => None,
+        })
         .collect();
 
     for resource in sorted_resources {
         // carina#3181: `sorted_resources` is managed-only — drift
         // detection only operates over provider-backed managed
         // resources.
-        let planned_state = planned_states.get(&resource.id).copied();
-        let historical_id = planned_state
+        let planned_current = planned_states.get(&resource.id).copied();
+        let planned_state = planned_current.map(|current| match current {
+            Current::Absent(state) => state.state(),
+            Current::Present(present) => present.state(),
+            Current::MissingIdentifier(state) => state.state(),
+        });
+        let planned_exists = planned_current.map(|current| match current {
+            Current::Absent(_absent) => false,
+            Current::Present(_present) => true,
+            Current::MissingIdentifier(_unidentified) => true,
+        });
+        let historical_id = planned_current
             .map(|_| historical_addresses.origin_for(&resource.id))
             .unwrap_or(&resource.id);
 
-        let mut actual_state = match planned_state {
-            Some(planned) if planned.exists => {
-                let identifier = planned
-                    .identifier
-                    .as_deref()
-                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
-                    .ok_or_else(|| {
-                        AppError::Validation(format!(
-                            "saved plan resource {} has no valid provider identifier; create a new plan before applying",
-                            resource.id
-                        ))
-                    })?;
-                provider
-                    .read(historical_id, &identifier, ReadRequest)
-                    .await
-                    .map_err(AppError::Provider)?
-                    .into_state()
+        let mut actual_state = match planned_current {
+            Some(Current::Present(present)) => provider
+                .read(historical_id, present.identifier(), ReadRequest)
+                .await
+                .map_err(AppError::Provider)?
+                .into_state(),
+            Some(Current::MissingIdentifier(_state)) => {
+                return Err(AppError::Validation(format!(
+                    "saved plan resource {} has no valid provider identifier; create a new plan before applying",
+                    resource.id
+                )));
             }
-            Some(_) | None => State::not_found(historical_id.clone()),
+            Some(Current::Absent(_state)) => State::not_found(historical_id.clone()),
+            None => State::not_found(historical_id.clone()),
         };
         // The provider read uses the pre-move address, but every downstream
         // saved-plan map is keyed by the moved-to runtime address.
@@ -1068,9 +1100,10 @@ pub(crate) async fn detect_drift(
         actual_states.insert(resource.id.clone(), actual_state.clone());
 
         if let Some(planned) = planned_state {
-            if planned.exists != actual_state.exists {
+            let planned_exists = planned_exists.expect("planned state and variant are paired");
+            if planned_exists != actual_state.exists {
                 drift_detected = true;
-                if planned.exists {
+                if planned_exists {
                     drift_messages.push(format!(
                         "  {} {}: resource existed at plan time but no longer exists",
                         "~".yellow(),
@@ -1083,7 +1116,7 @@ pub(crate) async fn detect_drift(
                         resource.id
                     ));
                 }
-            } else if planned.exists && actual_state.exists {
+            } else if planned_exists && actual_state.exists {
                 let verification =
                     carina_core::value::verify_historical_state_secrets(planned, &actual_state)
                         .map_err(|error| {
@@ -1535,7 +1568,8 @@ struct SourceApplyPersistExports {
     compositions: Vec<carina_core::resource::Composition>,
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
-    current_states: HashMap<ResourceId, State>,
+    managed_current: HashMap<ResourceId, Current>,
+    data_source_states: HashMap<ResourceId, State>,
 }
 
 struct SourceApplyExecuted {
@@ -1546,7 +1580,8 @@ struct SourceApplyExecuted {
     state_file: Option<StateFile>,
     resolved_resources: Vec<ResolvedResource>,
     data_sources: Vec<DataSource>,
-    current_states: HashMap<ResourceId, State>,
+    managed_current: HashMap<ResourceId, Current>,
+    data_source_states: HashMap<ResourceId, State>,
     plan: Plan,
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
@@ -1566,7 +1601,8 @@ struct SavedPlanApplyExecuted {
     apply_phase_started: Instant,
     state_file: Option<StateFile>,
     resolved_resources: Vec<ResolvedResource>,
-    current_states: HashMap<ResourceId, State>,
+    managed_current: HashMap<ResourceId, Current>,
+    data_source_states: HashMap<ResourceId, State>,
     rehydrated_plan: RehydratedPlanFile,
     wait_aliases: Vec<WaitAliasSpec>,
     ctx: WiringContext,
@@ -1654,6 +1690,7 @@ async fn run_apply_locked_owned(
                 reconcile_anonymous_identifiers_with_ctx(
                     ctx,
                     &mut parsed.resources,
+                    &parsed.data_sources,
                     sf,
                     &state_block_claims,
                 )?;
@@ -1678,7 +1715,7 @@ async fn run_apply_locked_owned(
             // carina#3181: `parsed.resources` is managed-only and
             // `parsed.data_sources` holds the `read`-keyword resources. Only
             // managed resources are dependency-sorted; data sources are
-            // refreshed in a later phase against the populated `current_states`.
+            // refreshed in a later phase against the populated `managed_current`.
             let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
             let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
@@ -1706,7 +1743,8 @@ async fn run_apply_locked_owned(
             RefreshProgress::start_header();
             let multi = refresh_multi_progress();
             let provider_ref = &provider;
-            let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+            let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
+            let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
             // Pre-build dependency_bindings from state file so we can restore them
             // after refresh. Provider.read() doesn't know about this metadata (#1565).
             let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
@@ -1731,33 +1769,33 @@ async fn run_apply_locked_owned(
             // Phase 1: refresh managed resources in parallel. carina#3181:
             // `sorted_resources` is managed-only — data sources are refreshed in
             // phase 2 below.
-            let phase1_results: Vec<Result<(ResourceId, State), AppError>> =
+            let phase1_results: Vec<Result<(ResourceId, Current), AppError>> =
                 stream::iter(sorted_resources.iter())
                     .map(|resource| {
                         let progress = RefreshProgress::begin_multi(&multi, &resource.id);
                         let loaded = state_file
                             .as_ref()
                             .map(|sf| sf.build_state_for_resource(&resource.id))
-                            .unwrap_or_else(|| ResourceStateLoad::absent(resource.id.clone()));
+                            .unwrap_or_else(|| Current::absent(resource.id.clone()));
                         let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                         async move {
-                            let mut state =
+                            let mut current =
                                 refresh_loaded_resource_with_retry(provider_ref, loaded)
                                     .await
                                     .map_err(AppError::Provider)?;
                             if let Some(deps) = dep_bindings {
-                                state.dependency_bindings = deps;
+                                current.set_dependency_bindings(deps);
                             }
                             progress.finish();
-                            Ok((resource.id.clone(), state))
+                            Ok((resource.id.clone(), current))
                         }
                     })
                     .buffer_unordered(5)
                     .collect()
                     .await;
             for result in phase1_results {
-                let (id, state) = result?;
-                current_states.insert(id, state);
+                let (id, current) = result?;
+                managed_current.insert(id, current);
             }
 
             // Refresh orphaned resources (#844, #1685). Must run before the
@@ -1777,7 +1815,7 @@ async fn run_apply_locked_owned(
                     sorted_resources.iter().map(|r| r.id.clone()).collect();
                 let loaded_orphans = sf.build_orphans(&desired_ids);
                 let orphan_results: Vec<
-                    Result<(ResourceId, carina_state::OrphanStateLoad), AppError>,
+                    Result<(ResourceId, carina_core::differ::Orphan), AppError>,
                 > = stream::iter(loaded_orphans)
                     .map(|(id, loaded)| async move {
                         let refreshed = refresh_loaded_orphan_with_retry(provider_ref, loaded)
@@ -1791,7 +1829,12 @@ async fn run_apply_locked_owned(
                 let mut refreshed_orphans = carina_state::LoadedOrphans::default();
                 for result in orphan_results {
                     let (id, loaded) = result?;
-                    if loaded.state().exists {
+                    let exists = match loaded.current() {
+                        Current::Absent(_state) => false,
+                        Current::Present(_present) => true,
+                        Current::MissingIdentifier(_state) => true,
+                    };
+                    if exists {
                         orphan_refreshed_ids.insert(id.clone());
                     }
                     refreshed_orphans.insert(loaded);
@@ -1802,7 +1845,8 @@ async fn run_apply_locked_owned(
             // Hydrate, transfer state for moved blocks and anonymous → let-bound
             // renames (#1685), then run phase 2 against the consolidated state.
             crate::wiring::hydrate_prior_states(
-                &mut current_states,
+                &mut managed_current,
+                &mut data_source_states,
                 &mut orphans,
                 &provider,
                 &saved_attrs,
@@ -1811,7 +1855,7 @@ async fn run_apply_locked_owned(
             .await?;
             let moved_pairs = {
                 let mut pairs = crate::wiring::materialize_moved_states(
-                    &mut current_states,
+                    &mut managed_current,
                     &mut orphans,
                     &mut prev_explicit,
                     &mut saved_attrs,
@@ -1822,7 +1866,7 @@ async fn run_apply_locked_owned(
                     ctx,
                     &sorted_resources,
                     raw_provider_configs,
-                    &mut current_states,
+                    &mut managed_current,
                     &mut orphans,
                     &mut prev_explicit,
                     &mut saved_attrs,
@@ -1847,7 +1891,8 @@ async fn run_apply_locked_owned(
                 &sorted_resources,
                 &parsed.compositions,
                 &data_sources,
-                &current_states,
+                &managed_current,
+                &data_source_states,
                 remote_bindings,
                 ctx.schemas(),
                 &wait_aliases,
@@ -1858,7 +1903,8 @@ async fn run_apply_locked_owned(
                 &sorted_resources,
                 &parsed.compositions,
                 &data_sources,
-                &current_states,
+                &managed_current,
+                &data_source_states,
                 remote_bindings,
                 ctx.schemas(),
                 &wait_aliases,
@@ -1907,7 +1953,7 @@ async fn run_apply_locked_owned(
                     .await;
             for result in phase2_results {
                 let (id, state) = result?;
-                current_states.insert(id, state);
+                data_source_states.insert(id, state);
             }
 
             // carina#3132: expand same-config deferred-for loops post-refresh
@@ -1944,7 +1990,8 @@ async fn run_apply_locked_owned(
                     parsed,
                     provider: &provider,
                     sorted_resources: &sorted_resources,
-                    current_states: &mut current_states,
+                    managed_current: &mut managed_current,
+                    data_source_states: &mut data_source_states,
                     orphans: &mut orphans,
                     remote_bindings,
                     wait_aliases: &wait_aliases,
@@ -1973,7 +2020,7 @@ async fn run_apply_locked_owned(
             // independent of the deferred-for expansion sequence the helper
             // above pins.
             carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
-                &mut current_states,
+                &mut data_source_states,
                 &data_sources,
                 ctx.schemas(),
             );
@@ -1991,8 +2038,8 @@ async fn run_apply_locked_owned(
             let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
                 parsed.compositions.clone();
 
-            let pre_apply_input_states = carina_core::resource::into_plan_input_map(
-                current_states.clone(),
+            let pre_apply_current = carina_core::resource::into_plan_input_current_map(
+                managed_current.clone(),
                 ctx.schemas(),
                 &sorted_resources,
             );
@@ -2003,7 +2050,8 @@ async fn run_apply_locked_owned(
                     managed: &[],
                     compositions: &pre_resolve_compositions,
                     data_sources: &data_sources,
-                    current_states: &pre_apply_input_states,
+                    managed_current: &pre_apply_current,
+                    data_source_states: &data_source_states,
                     remote_bindings,
                     wait_aliases: &wait_aliases,
                 },
@@ -2019,7 +2067,8 @@ async fn run_apply_locked_owned(
                     managed: &[],
                     compositions: &pre_resolve_compositions,
                     data_sources: &data_sources,
-                    current_states: &pre_apply_input_states,
+                    managed_current: &pre_apply_current,
+                    data_source_states: &data_source_states,
                     remote_bindings,
                     wait_aliases: &wait_aliases,
                 },
@@ -2051,7 +2100,8 @@ async fn run_apply_locked_owned(
                     &mut override_aware_resources,
                     &constraint_origin_resources,
                     &module_gate,
-                    &mut current_states,
+                    &mut managed_current,
+                    &mut data_source_states,
                     &mut orphans,
                     raw_provider_configs,
                     &mut data_sources_for_plan,
@@ -2076,6 +2126,7 @@ async fn run_apply_locked_owned(
                 ctx,
                 LateAnonymousIdentityInputs {
                     resources: &mut override_aware_resources,
+                    data_sources: &data_sources_for_plan,
                     state_file: state_file.as_ref(),
                     state_block_claims: &state_block_claims,
                     providers: raw_provider_configs,
@@ -2088,11 +2139,11 @@ async fn run_apply_locked_owned(
                 &state_file,
             )?;
             let reconciled_provider_states = provider_states_for(
-                &current_states,
+                &managed_current,
                 &orphans,
                 override_aware_resources.resources(),
             );
-            let reconciled_input_states = carina_core::resource::into_plan_input_map(
+            let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
                 reconciled_provider_states,
                 ctx.schemas(),
                 override_aware_resources.resources(),
@@ -2101,7 +2152,8 @@ async fn run_apply_locked_owned(
                 RebuildBindingsInputs {
                     compositions: &pre_resolve_compositions,
                     data_sources: &data_sources,
-                    current_states: &reconciled_input_states,
+                    managed_current: &reconciled_input_current,
+                    data_source_states: &data_source_states,
                     remote_bindings,
                     wait_aliases: &wait_aliases,
                 },
@@ -2115,8 +2167,8 @@ async fn run_apply_locked_owned(
             )?;
             let resolved_unresolved_resources =
                 ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
-            let plan_input_states = carina_core::resource::into_plan_input_map(
-                current_states.clone(),
+            let plan_input_current = carina_core::resource::into_plan_input_current_map(
+                managed_current.clone(),
                 ctx.schemas(),
                 override_aware_resources.resources(),
             );
@@ -2130,7 +2182,7 @@ async fn run_apply_locked_owned(
                 &resolved_unresolved_resources,
                 &data_sources_for_plan,
                 &provider,
-                PlanPriorStates::new(&plan_input_states, &orphans),
+                PlanPriorStates::new(&plan_input_current, &data_source_states, &orphans),
                 &directives_map,
                 schemas,
                 &saved_attrs,
@@ -2166,7 +2218,7 @@ async fn run_apply_locked_owned(
                 &no_unresolved_upstreams,
             );
             crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
-            current_states = into_all_prior_states(orphans, current_states);
+            managed_current = into_all_prior_states(orphans, managed_current);
 
             let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
                 .iter()
@@ -2195,7 +2247,8 @@ async fn run_apply_locked_owned(
                         resources: &paired_unresolved_resources,
                         compositions: &parsed.compositions,
                         data_sources: &parsed.data_sources,
-                        current_states: &current_states,
+                        managed_current: &managed_current,
+                        data_source_states: &data_source_states,
                         state_file: state_file.as_ref(),
                         plan: &plan,
                         schemas: ctx.schemas(),
@@ -2262,14 +2315,15 @@ async fn run_apply_locked_owned(
                         compositions: pre_resolve_compositions_noop,
                         checked_exports: checked_exports_pre_apply,
                         wait_aliases,
-                        current_states,
+                        managed_current,
+                        data_source_states,
                     },
                 )));
             }
 
             // Build display-safe historical attributes from current and persisted state.
             let historical_display =
-                collect_historical_display_attributes(&plan, &current_states, state_file.as_ref());
+                collect_historical_display_attributes(&plan, &managed_current, state_file.as_ref());
 
             let checked_exports_pre_apply =
                 crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
@@ -2277,7 +2331,8 @@ async fn run_apply_locked_owned(
                     resources: &paired_unresolved_resources,
                     compositions: &parsed.compositions,
                     data_sources: &parsed.data_sources,
-                    current_states: &current_states,
+                    managed_current: &managed_current,
+                    data_source_states: &data_source_states,
                     state_file: state_file.as_ref(),
                     plan: &plan,
                     schemas: ctx.schemas(),
@@ -2335,7 +2390,8 @@ async fn run_apply_locked_owned(
                 ctx.factories(),
                 ctx.schemas(),
                 &mut bindings,
-                &mut current_states,
+                &mut managed_current,
+                &mut data_source_states,
                 &unresolved_resources,
                 &data_sources,
                 &pre_resolve_compositions,
@@ -2363,7 +2419,8 @@ async fn run_apply_locked_owned(
                     state_file,
                     resolved_resources,
                     data_sources: data_sources_for_plan,
-                    current_states,
+                    managed_current,
+                    data_source_states,
                     plan,
                     checked_exports: checked_exports_pre_apply,
                     wait_aliases,
@@ -2396,7 +2453,8 @@ async fn run_apply_locked_owned(
                     compositions,
                     checked_exports,
                     wait_aliases,
-                    current_states,
+                    managed_current,
+                    data_source_states,
                 } = *context;
                 persist_exports_only(
                     backend.as_ref(),
@@ -2408,7 +2466,8 @@ async fn run_apply_locked_owned(
                     &checked_exports,
                     ctx.schemas(),
                     &wait_aliases,
-                    &current_states,
+                    &managed_current,
+                    &data_source_states,
                     provider_context,
                 )
                 .await?;
@@ -2423,7 +2482,8 @@ async fn run_apply_locked_owned(
                     state_file,
                     resolved_resources,
                     data_sources,
-                    current_states,
+                    managed_current,
+                    data_source_states,
                     plan,
                     checked_exports,
                     wait_aliases,
@@ -2443,7 +2503,8 @@ async fn run_apply_locked_owned(
                                 state_file,
                                 sorted_resources: &resolved_resources,
                                 data_sources: &data_sources,
-                                current_states: &current_states,
+                                managed_current: &managed_current,
+                                data_source_states: &data_source_states,
                                 plan: &plan,
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
@@ -2857,13 +2918,16 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 19 guarantees that
-    // mutation effects carry validated provider identifiers, update effects
-    // persist their identifier explicitly, and `removed` can record malformed
-    // deposed generations it abandons by key without serializing their known-
-    // invalid identifier. Version 18 included that redundant identifier and
-    // must be regenerated for the current shape. Version 17 lacks the update
-    // identifier field and must likewise be regenerated.
+    // Validate version compatibility. Plan-file version 20 explicitly tags
+    // current-state ownership and managed lifecycle classification. Version 19
+    // inferred ownership from the saved data-source list and must be
+    // regenerated. Version 19 guarantees that mutation effects carry validated
+    // provider identifiers, update effects persist their identifier explicitly,
+    // and `removed` can record malformed deposed generations it abandons by key
+    // without serializing their known-invalid identifier. Version 18 included
+    // that redundant identifier and must be regenerated for the current shape.
+    // Version 17 lacks the update identifier field and must likewise be
+    // regenerated.
     // Version 17 guaranteed that state-originated secret placeholders came
     // from structural secret tags; v16 may contain marker-shaped user strings
     // that were misclassified and must be regenerated. Version 16 guarantees
@@ -3160,9 +3224,10 @@ async fn run_apply_from_plan_locked_owned(
         }
     }
 
-    // Typed `read` addresses are the only safe way to distinguish historical
-    // pre-#3181 data-source rows from malformed managed rows. Normalize those
-    // artifacts only after checking the saved plan against the original
+    // A typed `read` address plus an identifier-less row shape distinguishes
+    // historical pre-#3181 data-source rows without erasing an identifier-
+    // bearing managed orphan at the same address. Normalize those artifacts
+    // only after checking the saved plan against the original
     // on-disk serial, then persist that cleanup together with any schema
     // migration before drift detection can return early.
     let removed_legacy_data_source_rows = state_file
@@ -3286,19 +3351,23 @@ async fn run_apply_from_plan_locked_owned(
             let plan_data_source_origins: &[carina_core::resource::DataSource] =
                 rehydrated_plan_file.data_source_origins();
 
-            let planned_states: HashMap<ResourceId, State> = rehydrated_plan_file
-                .current_states()
-                .iter()
-                .map(|entry| (entry.id.clone(), entry.state.clone()))
-                .collect();
+            let mut managed_current = HashMap::new();
+            let mut data_source_states = HashMap::new();
+            for entry in rehydrated_plan_file.current_states() {
+                match entry {
+                    crate::commands::plan::CurrentStateEntry::Managed { id, current } => {
+                        managed_current.insert(id.clone(), current.clone());
+                    }
+                    crate::commands::plan::CurrentStateEntry::DataSource { id, state } => {
+                        data_source_states.insert(id.clone(), state.clone());
+                    }
+                }
+            }
             let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
                 plan_data_source_origins,
                 sorted_resources,
-                &planned_states,
+                &managed_current,
             );
-
-            // Use the actual states (freshly read) as current_states for apply
-            let mut current_states = planned_states;
 
             render_plan_errors_and_abort(plan)?;
 
@@ -3318,8 +3387,8 @@ async fn run_apply_from_plan_locked_owned(
                         target: carina_core::parser::BindingName::new(wb.target.clone()),
                     })
                     .collect();
-                let terminal_input_states = carina_core::resource::into_plan_input_map(
-                    current_states.clone(),
+                let terminal_input_current = carina_core::resource::into_plan_input_current_map(
+                    managed_current.clone(),
                     ctx.schemas(),
                     sorted_resources,
                 );
@@ -3328,7 +3397,8 @@ async fn run_apply_from_plan_locked_owned(
                         managed: sorted_resources,
                         compositions: plan_compositions,
                         data_sources: plan_data_sources,
-                        current_states: &terminal_input_states,
+                        managed_current: &terminal_input_current,
+                        data_source_states: &data_source_states,
                         remote_bindings: rehydrated_plan_file.upstream_snapshot(),
                         wait_aliases: &terminal_wait_aliases,
                     });
@@ -3339,7 +3409,7 @@ async fn run_apply_from_plan_locked_owned(
 
             // Build display-safe historical attributes from current and persisted state.
             let historical_display =
-                collect_historical_display_attributes(plan, &current_states, state_file.as_ref());
+                collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
 
             print_plan(
                 plan,
@@ -3396,8 +3466,8 @@ async fn run_apply_from_plan_locked_owned(
             // to the managed sibling literal (carina#3246), and includes data
             // sources so a managed attribute referencing `<read_binding>.<attr>`
             // resolves through the data source's attribute map.
-            let pre_apply_input_states = carina_core::resource::into_plan_input_map(
-                current_states.clone(),
+            let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
+                managed_current.clone(),
                 ctx.schemas(),
                 sorted_resources,
             );
@@ -3406,7 +3476,8 @@ async fn run_apply_from_plan_locked_owned(
                     managed: sorted_resources,
                     compositions: plan_compositions,
                     data_sources: plan_data_sources,
-                    current_states: &pre_apply_input_states,
+                    managed_current: &pre_apply_input_current,
+                    data_source_states: &data_source_states,
                     remote_bindings: &upstream_snapshot,
                     wait_aliases: &wait_aliases,
                 });
@@ -3435,7 +3506,8 @@ async fn run_apply_from_plan_locked_owned(
                 ctx.factories(),
                 ctx.schemas(),
                 &mut bindings,
-                &mut current_states,
+                &mut managed_current,
+                &mut data_source_states,
                 &unresolved_resources,
                 plan_data_source_origins,
                 plan_compositions,
@@ -3461,7 +3533,8 @@ async fn run_apply_from_plan_locked_owned(
                     apply_phase_started,
                     state_file,
                     resolved_resources: resolved_sorted_resources,
-                    current_states,
+                    managed_current,
+                    data_source_states,
                     rehydrated_plan: rehydrated_plan_file,
                     wait_aliases,
                     ctx,
@@ -3493,7 +3566,8 @@ async fn run_apply_from_plan_locked_owned(
                     apply_phase_started,
                     state_file,
                     resolved_resources,
-                    current_states,
+                    managed_current,
+                    data_source_states,
                     rehydrated_plan,
                     wait_aliases,
                     ctx,
@@ -3511,7 +3585,8 @@ async fn run_apply_from_plan_locked_owned(
                                 state_file,
                                 sorted_resources: &resolved_resources,
                                 data_sources: rehydrated_plan.data_sources(),
-                                current_states: &current_states,
+                                managed_current: &managed_current,
+                                data_source_states: &data_source_states,
                                 plan: rehydrated_plan.plan(),
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),

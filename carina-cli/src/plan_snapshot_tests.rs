@@ -14,7 +14,7 @@ use carina_core::module_resolver::{
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::resource::{
-    DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State,
+    Current, DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
 };
 use carina_core::schema::SchemaRegistry;
 
@@ -56,17 +56,17 @@ fn build_plan_and_states_from_fixture(
     fixture_dir: &str,
 ) -> (
     carina_core::plan::Plan,
-    HashMap<ResourceId, State>,
+    HashMap<ResourceId, Current>,
     SchemaRegistry,
     HashMap<ResourceId, ResourceId>,
 ) {
     let fp = build_plan_from_fixture_name(fixture_dir);
-    (fp.plan, fp.current_states, fp.schemas, fp.moved_origins)
+    (fp.plan, fp.managed_current, fp.schemas, fp.moved_origins)
 }
 
 fn delete_attributes_for_plan(
     plan: &Plan,
-    current_states: &HashMap<ResourceId, State>,
+    current_states: &HashMap<ResourceId, Current>,
 ) -> carina_core::detail_rows::HistoricalDisplayAttributes {
     crate::commands::plan::collect_historical_display_attributes(plan, current_states, None)
 }
@@ -630,7 +630,7 @@ fn snapshot_deposed_delete() {
     let fp = build_plan_from_fixture_name("deposed_delete");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
-        &fp.current_states,
+        &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
@@ -669,7 +669,7 @@ fn snapshot_deposed_delete_update_dependency() {
     let fp = build_plan_from_fixture_name("deposed_delete_update_dependency");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
-        &fp.current_states,
+        &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
@@ -2142,7 +2142,7 @@ fn snapshot_deferred_for_create_solo() {
     let fp = build_plan_from_fixture_name("deferred_for_create_solo");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
-        &fp.current_states,
+        &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
@@ -2181,7 +2181,7 @@ fn snapshot_deferred_for_with_paired_destroy() {
     let fp = build_plan_from_fixture_name("deferred_for_with_paired_destroy");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
-        &fp.current_states,
+        &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
@@ -2221,7 +2221,7 @@ fn snapshot_deferred_for_with_dependent_wait() {
     fp.plan = plan;
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
-        &fp.current_states,
+        &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
@@ -2243,7 +2243,7 @@ fn snapshot_deferred_for_with_unrelated_delete() {
     let fp = build_plan_from_fixture_name("deferred_for_with_unrelated_delete");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
-        &fp.current_states,
+        &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(

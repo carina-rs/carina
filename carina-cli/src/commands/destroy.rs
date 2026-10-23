@@ -20,8 +20,10 @@ use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::parser::WaitBinding;
 use carina_core::plan::{Plan, PlanError};
 use carina_core::provider::Provider;
+#[cfg(test)]
+use carina_core::resource::State;
 use carina_core::resource::{
-    ConcreteValue, ResolvedResourceId, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, ResolvedResourceId, Resource, ResourceId, Value,
 };
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
@@ -30,7 +32,7 @@ use carina_core::shutdown::{
 };
 #[cfg(test)]
 use carina_state::LockInfo;
-use carina_state::{ResourceStateLoad, StateBackend, StateFile};
+use carina_state::{StateBackend, StateFile};
 
 use carina_core::parser::ProviderContext;
 
@@ -284,6 +286,7 @@ async fn run_destroy_locked_with_ctx_owned(
         reconcile_anonymous_identifiers_with_ctx(
             ctx,
             &mut parsed.resources,
+            &parsed.data_sources,
             sf,
             &state_block_claims,
         )?;
@@ -319,8 +322,8 @@ async fn run_destroy_locked_with_ctx_owned(
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(ctx, provider_inputs.configs(), base_dir).await?;
 
-    // Build current states -- either from provider (refresh=true) or from state file
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    // Build managed current state -- either from the provider or the state file.
+    let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
 
     if refresh {
         RefreshProgress::start_header();
@@ -357,13 +360,13 @@ async fn run_destroy_locked_with_ctx_owned(
                 let loaded = state_file
                     .as_ref()
                     .map(|sf| sf.build_state_for_resource(&resource.id))
-                    .unwrap_or_else(|| ResourceStateLoad::absent(resource.id.clone()));
+                    .unwrap_or_else(|| Current::absent(resource.id.clone()));
                 refresh_in_flight.push(async move {
-                    let state = refresh_loaded_resource_with_retry(provider_ref, loaded)
+                    let current = refresh_loaded_resource_with_retry(provider_ref, loaded)
                         .await
                         .map_err(AppError::Provider)?;
                     progress.finish();
-                    Ok((resource.id.clone(), state))
+                    Ok((resource.id.clone(), current))
                 });
             }
 
@@ -400,7 +403,7 @@ async fn run_destroy_locked_with_ctx_owned(
                     }
                 }
             };
-            let result: Result<(ResourceId, State), AppError> = match next {
+            let result: Result<(ResourceId, Current), AppError> = match next {
                 CleanupInterrupted::Completed(Some(result)) => result,
                 CleanupInterrupted::Completed(None) => break,
                 CleanupInterrupted::Abandoned => {
@@ -412,8 +415,8 @@ async fn run_destroy_locked_with_ctx_owned(
             if refresh_cancelled {
                 continue;
             }
-            let (id, state) = result?;
-            current_states.insert(id, state);
+            let (id, current) = result?;
+            managed_current.insert(id, current);
         }
         drop(refresh_in_flight);
         drop(resource_iter);
@@ -492,8 +495,7 @@ async fn run_destroy_locked_with_ctx_owned(
                         }
                     }
                 };
-                let result: Result<(ResourceId, carina_state::OrphanStateLoad), AppError> = match next
-                {
+                let result: Result<(ResourceId, carina_core::differ::Orphan), AppError> = match next {
                     CleanupInterrupted::Completed(Some(result)) => result,
                     CleanupInterrupted::Completed(None) => break,
                     CleanupInterrupted::Abandoned => {
@@ -506,13 +508,19 @@ async fn run_destroy_locked_with_ctx_owned(
                     continue;
                 }
                 let (id, loaded) = result?;
-                if loaded.state().exists
+                let current = loaded.into_current();
+                let exists = match &current {
+                    Current::Absent(_state) => false,
+                    Current::Present(_present) => true,
+                    Current::MissingIdentifier(_state) => true,
+                };
+                if exists
                     && let Some(resolved_id) = ResolvedResourceId::try_new(id.clone())
                 {
                     let orphan_resource = build_orphan_resource(sf, &resolved_id);
                     all_resources.push(orphan_resource);
                 }
-                current_states.insert(id, loaded.state().clone());
+                managed_current.insert(id, current);
             }
             if refresh_cancelled {
                 return Err(AppError::Interrupted);
@@ -522,18 +530,19 @@ async fn run_destroy_locked_with_ctx_owned(
         // --refresh=false: build states from state file without AWS calls.
         // carina#3181: `all_resources` is managed-only.
         for resource in &all_resources {
-            let state = sf.build_state_for_resource(&resource.id).into_state();
-            current_states.insert(resource.id.clone(), state);
+            let current = sf.build_state_for_resource(&resource.id);
+            managed_current.insert(resource.id.clone(), current);
         }
 
         // Include orphaned resources (in state but not in .crn)
         let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
         for (id, loaded) in sf.build_orphans(&desired_ids) {
+            let current = loaded.into_current();
             if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
                 let orphan_resource = build_orphan_resource(sf, &resolved_id);
                 all_resources.push(orphan_resource);
             }
-            current_states.insert(id, loaded.state().clone());
+            managed_current.insert(id, current);
         }
     }
 
@@ -546,7 +555,14 @@ async fn run_destroy_locked_with_ctx_owned(
         .filter(|r| {
             // carina#3181: `all_resources` is managed-only — data
             // sources and compositions never enter the destroy set.
-            if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
+            let exists = managed_current
+                .get(&r.id)
+                .is_some_and(|current| match current {
+                    Current::Absent(_state) => false,
+                    Current::Present(_present) => true,
+                    Current::MissingIdentifier(_state) => true,
+                });
+            if !exists {
                 return false;
             }
 
@@ -594,7 +610,7 @@ async fn run_destroy_locked_with_ctx_owned(
         .collect();
     let (delete_effects, identifier_errors) = build_destroy_delete_effects(
         &resources_to_destroy,
-        &current_states,
+        &managed_current,
         state_file.as_ref(),
         &protected_row_keys,
     );
@@ -649,7 +665,7 @@ async fn run_destroy_locked_with_ctx_owned(
     }
 
     let historical_display =
-        collect_historical_display_attributes(&destroy_plan, &current_states, state_file.as_ref());
+        collect_historical_display_attributes(&destroy_plan, &managed_current, state_file.as_ref());
 
     // Display destroy plan as a dependency tree
     print!(
@@ -1443,22 +1459,34 @@ fn build_destroy_wait_aliases(
 
 fn build_destroy_delete_effects(
     resources_to_destroy: &[&Resource],
-    current_states: &HashMap<ResourceId, State>,
+    managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
     protected_row_keys: &HashSet<StateRowKey>,
 ) -> (Vec<Effect>, Vec<PlanError>) {
     let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
     let mut errors = Vec::new();
     for resource in resources_to_destroy {
-        let identifier = match PlanError::require_provider_identifier(
-            &resource.id,
-            current_states
-                .get(&resource.id)
-                .and_then(|state| state.identifier.as_deref()),
-        ) {
-            Ok(identifier) => identifier,
-            Err(error) => {
-                errors.push(*error);
+        let identifier = match managed_current.get(&resource.id) {
+            Some(Current::Present(present)) => present.identifier().clone(),
+            Some(Current::Absent(_state)) => {
+                errors.push(PlanError::new(
+                    resource.id.clone(),
+                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
+                ));
+                continue;
+            }
+            Some(Current::MissingIdentifier(_state)) => {
+                errors.push(PlanError::new(
+                    resource.id.clone(),
+                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
+                ));
+                continue;
+            }
+            None => {
+                errors.push(PlanError::new(
+                    resource.id.clone(),
+                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
+                ));
                 continue;
             }
         };
@@ -2364,7 +2392,9 @@ mod tests {
                 .with_binding("main");
         let current_states = HashMap::from([(
             resource.id.clone(),
-            State::existing(resource.id.clone(), HashMap::new()).with_identifier("vpc-new"),
+            Current::from_state(
+                State::existing(resource.id.clone(), HashMap::new()).with_identifier("vpc-new"),
+            ),
         )]);
         let deposed_key = DeposedKey::new_unique();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
@@ -2413,6 +2443,48 @@ mod tests {
     }
 
     #[test]
+    fn destroy_delete_uses_identifier_carried_by_present_current() {
+        let resource = Resource::with_provider("mock", "test.Widget", "current", None);
+        let state = State::existing(resource.id.clone(), HashMap::new());
+        let identifier = carina_core::provider::fixture_applied_identifier("typed-provider-id");
+        let current_states = HashMap::from([(
+            resource.id.clone(),
+            carina_core::resource::fixture_present_current(state, identifier),
+        )]);
+
+        let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
+            &[&resource],
+            &current_states,
+            None,
+            &HashSet::new(),
+        ));
+
+        let [
+            Effect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected one Delete effect, got: {effects:?}");
+        };
+        assert_eq!(id.as_inner(), &resource.id);
+        assert_eq!(identifier.as_str(), "typed-provider-id");
+        assert_eq!(generation, &EffectGeneration::Current);
+        assert_eq!(directives, &resource.directives);
+        assert_eq!(binding, &resource.binding);
+        assert!(dependencies.is_empty());
+        assert!(explicit_dependencies.is_empty());
+        assert!(blocked_by_updates.is_empty());
+    }
+
+    #[test]
     fn destroy_plan_rejects_identifier_less_row_loaded_from_state_json() {
         let resource = Resource::with_provider("mock", "test.Widget", "broken", None);
         let state_file = carina_state::check_and_migrate(
@@ -2435,11 +2507,8 @@ mod tests {
         .expect("malformed legacy row must remain loadable")
         .into_state();
         let loaded = state_file.build_state_for_resource(&resource.id);
-        assert!(matches!(
-            &loaded,
-            ResourceStateLoad::MissingProviderIdentifier(_)
-        ));
-        let current_states = HashMap::from([(resource.id.clone(), loaded.into_state())]);
+        assert!(matches!(&loaded, Current::MissingIdentifier(_state)));
+        let current_states = HashMap::from([(resource.id.clone(), loaded)]);
 
         let (effects, errors) =
             build_destroy_delete_effects(&[&resource], &current_states, None, &HashSet::new());
@@ -2489,7 +2558,7 @@ mod tests {
         resources.sort_by_key(|resource| resource.binding.clone());
         let current_states = orphan_entries
             .into_iter()
-            .map(|(id, loaded)| (id, loaded.state().clone()))
+            .map(|(id, loaded)| (id, loaded.current().clone()))
             .collect();
         let resource_refs = resources.iter().collect::<Vec<_>>();
 

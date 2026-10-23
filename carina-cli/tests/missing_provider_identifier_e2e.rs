@@ -113,6 +113,19 @@ let roles = read mock.iam.Roles {
         });
     }
 
+    fn add_identifier_bearing_data_source_address_row(&self) {
+        self.mutate_state(|state| {
+            state["resources"] = serde_json::json!([{
+                "resource_type": "iam.Roles",
+                "identity": "roles",
+                "provider": "mock",
+                "identifier": "managed-provider-id",
+                "attributes": { "names": ["old-managed-value"] },
+                "binding": "roles"
+            }]);
+        });
+    }
+
     fn mutate_state(&self, mutate: impl FnOnce(&mut serde_json::Value)) {
         let path = self.project.join("carina.state.json");
         let mut state: serde_json::Value =
@@ -385,6 +398,65 @@ fn typed_read_address_prunes_legacy_data_source_row_without_hiding_managed_corru
         assert_success("apply with legacy data-source artifact", &apply);
         assert_eq!(scenario.state_resource_count(), 0);
     }
+}
+
+#[test]
+fn managed_to_data_source_plan_keeps_orphan_delete_and_data_source_read() {
+    let scenario = Scenario::new(1);
+    scenario.write_data_source();
+    scenario.add_identifier_bearing_data_source_address_row();
+
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    assert_success("managed-to-data-source plan", &plan);
+    let text = output_text(&plan);
+    assert!(
+        text.contains("<= mock.iam.Roles roles (data source)"),
+        "plan must retain the data-source read\n{text}",
+    );
+    assert!(
+        text.contains("- mock.iam.Roles roles"),
+        "plan must retain the managed orphan delete\n{text}",
+    );
+    assert!(
+        text.contains("Plan: 1 to read, 0 to add, 0 to change, 1 to destroy."),
+        "plan summary must include the orphan delete\n{text}",
+    );
+}
+
+#[test]
+fn managed_to_data_source_state_refresh_keeps_key_spaces_separate() {
+    let scenario = Scenario::new(1);
+    scenario.write_data_source();
+    scenario.add_identifier_bearing_data_source_address_row();
+
+    let refresh = scenario.carina(&["state", "refresh", "--lock=false", "."]);
+    assert_success("managed-to-data-source state refresh", &refresh);
+    assert_eq!(
+        scenario.state_resource_count(),
+        0,
+        "the mock reports the old managed orphan missing, so refresh should remove it",
+    );
+}
+
+#[test]
+fn managed_to_data_source_destroy_still_deletes_managed_orphan() {
+    let scenario = Scenario::new(1);
+    scenario.write_data_source();
+    scenario.add_identifier_bearing_data_source_address_row();
+
+    let destroy = scenario.carina(&[
+        "destroy",
+        "--refresh=false",
+        "--auto-approve",
+        "--lock=false",
+        ".",
+    ]);
+    assert_success("managed-to-data-source destroy", &destroy);
+    assert_eq!(scenario.state_resource_count(), 0);
+    assert!(
+        scenario.operations().contains("delete iam.Roles.roles"),
+        "destroy must send the orphan delete to the provider",
+    );
 }
 
 #[test]

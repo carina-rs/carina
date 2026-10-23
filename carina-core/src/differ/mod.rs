@@ -9,9 +9,10 @@ mod plan;
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 
+use crate::provider::ProviderError;
 use crate::resource::{
-    Directives, PlanInputState, ResolvedResource, Resource, ResourceId, State, Value,
-    into_plan_input_map,
+    Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
+    ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
 };
 use crate::schema::ResourceSchema;
 
@@ -21,22 +22,55 @@ pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan
 /// resource that is no longer present in the desired configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Orphan {
-    state: State,
+    current: Current,
     binding: Option<String>,
     directives: Directives,
 }
 
 impl Orphan {
-    pub fn new(state: State, binding: Option<String>, directives: Directives) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_state(
+        state: State,
+        binding: Option<String>,
+        directives: Directives,
+    ) -> Self {
         Self {
-            state,
+            current: Current::from_state(state),
             binding,
             directives,
         }
     }
 
-    pub fn state(&self) -> &State {
-        &self.state
+    pub fn present(
+        present: PresentResourceState,
+        binding: Option<String>,
+        directives: Directives,
+    ) -> Self {
+        Self {
+            current: Current::Present(present),
+            binding,
+            directives,
+        }
+    }
+
+    pub fn missing_identifier(
+        state: UnidentifiedState,
+        binding: Option<String>,
+        directives: Directives,
+    ) -> Self {
+        Self {
+            current: Current::MissingIdentifier(state),
+            binding,
+            directives,
+        }
+    }
+
+    pub fn current(&self) -> &Current {
+        &self.current
+    }
+
+    pub(crate) fn current_mut(&mut self) -> &mut Current {
+        &mut self.current
     }
 
     pub fn binding(&self) -> Option<&str> {
@@ -47,26 +81,31 @@ impl Orphan {
         &self.directives
     }
 
-    pub fn into_state(self) -> State {
-        self.state
+    pub fn into_current(self) -> Current {
+        self.current
     }
 
     fn with_id(mut self, id: ResourceId) -> Self {
-        self.state.id = id;
+        self.current.set_id(id);
         self
     }
 
-    pub fn into_state_with_id(self, id: ResourceId) -> State {
-        self.with_id(id).into_state()
+    pub fn into_current_with_id(self, id: ResourceId) -> Current {
+        self.with_id(id).into_current()
     }
 
     /// Replace only provider-observed state while retaining the dependency
     /// bindings carried by the prior state and the orphan's typed binding and
     /// directive metadata.
     pub fn with_refreshed_state(mut self, mut fresh: State) -> Self {
-        fresh.id = self.state.id.clone();
-        fresh.dependency_bindings = self.state.dependency_bindings;
-        self.state = fresh;
+        let prior = match &self.current {
+            Current::Absent(state) => state.state(),
+            Current::Present(present) => present.state(),
+            Current::MissingIdentifier(state) => state.state(),
+        };
+        fresh.id = prior.id.clone();
+        fresh.dependency_bindings = prior.dependency_bindings.clone();
+        self.current = Current::from_state(fresh);
         self
     }
 }
@@ -87,7 +126,12 @@ impl Orphans {
     }
 
     pub fn insert(&mut self, orphan: Orphan) {
-        self.by_id.insert(orphan.state.id.clone(), orphan);
+        let id = match &orphan.current {
+            Current::Absent(state) => state.state().id.clone(),
+            Current::Present(present) => present.state().id.clone(),
+            Current::MissingIdentifier(state) => state.state().id.clone(),
+        };
+        self.by_id.insert(id, orphan);
     }
 
     pub fn remove(&mut self, id: &ResourceId) -> Option<Orphan> {
@@ -181,30 +225,34 @@ fn extend_disjoint_states<T>(
         additional_states
             .keys()
             .all(|id| !current_states.contains_key(id)),
-        "prior state cannot be owned by both current_states and orphans"
+        "prior state cannot be owned by both managed_current and orphans"
     );
     current_states.extend(additional_states);
 }
 
 /// The complete prior-state input to planning.
 ///
-/// Planning-ready current states and typed orphans remain separately owned
-/// before the differ, but callers cannot pass only one side to [`create_plan`].
-/// The differ materializes same-id orphans as current state for managed
-/// resources and emits orphan deletes only for ids that remain unmanaged.
+/// Planning-ready managed current states, transient data-source states, and
+/// typed orphans remain separately owned before the differ, but callers must
+/// pass all three views to [`create_plan`]. The differ materializes same-id
+/// orphans as current state for managed resources and emits orphan deletes
+/// only for ids that remain unmanaged.
 #[derive(Clone, Copy)]
 pub struct PlanPriorStates<'a> {
-    current_states: &'a HashMap<ResourceId, PlanInputState>,
+    current_states: &'a HashMap<ResourceId, PlanInputCurrent>,
+    data_source_states: &'a HashMap<ResourceId, State>,
     orphans: &'a Orphans,
 }
 
 impl<'a> PlanPriorStates<'a> {
     pub fn new(
-        current_states: &'a HashMap<ResourceId, PlanInputState>,
+        current_states: &'a HashMap<ResourceId, PlanInputCurrent>,
+        data_source_states: &'a HashMap<ResourceId, State>,
         orphans: &'a Orphans,
     ) -> Self {
         Self {
             current_states,
+            data_source_states,
             orphans,
         }
     }
@@ -213,13 +261,13 @@ impl<'a> PlanPriorStates<'a> {
         self,
         managed: &[ResolvedResource],
         registry: &crate::schema::SchemaRegistry,
-    ) -> HashMap<ResourceId, PlanInputState> {
+    ) -> HashMap<ResourceId, PlanInputCurrent> {
         let resources: Vec<Resource> = managed
             .iter()
             .map(|resource| resource.as_resource().clone())
             .collect();
         let mut current_states = self.current_states.clone();
-        let orphan_states = into_plan_input_map(
+        let orphan_states = into_plan_input_current_map(
             managed_orphan_provider_states(self.orphans, &resources),
             registry,
             &resources,
@@ -231,18 +279,22 @@ impl<'a> PlanPriorStates<'a> {
     fn orphans(self) -> &'a Orphans {
         self.orphans
     }
+
+    fn data_source_states(self) -> &'a HashMap<ResourceId, State> {
+        self.data_source_states
+    }
 }
 
 fn managed_orphan_provider_states(
     orphans: &Orphans,
     managed: &[Resource],
-) -> HashMap<ResourceId, State> {
+) -> HashMap<ResourceId, Current> {
     managed
         .iter()
         .filter_map(|resource| {
             orphans
                 .get(&resource.id)
-                .map(|orphan| (resource.id.clone(), orphan.state.clone()))
+                .map(|orphan| (resource.id.clone(), orphan.current.clone()))
         })
         .collect()
 }
@@ -250,58 +302,107 @@ fn managed_orphan_provider_states(
 /// Derive the provider-state view for the managed resource set, promoting
 /// same-id orphans without changing either prior-state owner.
 pub fn provider_states_for(
-    current_states: &HashMap<ResourceId, State>,
+    current_states: &HashMap<ResourceId, Current>,
     orphans: &Orphans,
     managed: &[Resource],
-) -> HashMap<ResourceId, State> {
-    let mut states = current_states.clone();
+) -> HashMap<ResourceId, Current> {
+    let mut current = current_states.clone();
     extend_disjoint_states(
-        &mut states,
+        &mut current,
         managed_orphan_provider_states(orphans, managed),
     );
-    states
+    current
 }
 
-/// Run an asynchronous provider-state transform over both prior-state owners.
+/// Run an asynchronous provider-state transform over managed/orphan state and
+/// data-source state while retaining their distinct key spaces and owners.
 ///
-/// The transform may change values but must preserve the joined key set. On
-/// success the map is split back into its original owners. Callers propagate
-/// errors immediately, so restoration is intentionally skipped on error.
-pub async fn transform_prior_provider_states<E>(
-    current_states: &mut HashMap<ResourceId, State>,
+/// Managed resources and orphans share one call because a desired managed
+/// resource can adopt a same-id orphan. Data sources use a second call because
+/// their `ResourceId` namespace can legitimately overlap the managed/orphan
+/// namespace during a managed-to-data-source configuration change. Each call
+/// must preserve its own key set; transformed values are installed only after
+/// both calls succeed.
+pub async fn transform_prior_provider_states(
+    current_states: &mut HashMap<ResourceId, Current>,
+    data_source_states: &mut HashMap<ResourceId, State>,
     orphans: &mut Orphans,
-    transform: impl AsyncFnOnce(&mut HashMap<ResourceId, State>) -> Result<(), E>,
-) -> Result<(), E> {
-    let mut states = std::mem::take(current_states);
+    mut transform_managed_orphans: impl AsyncFnMut(
+        &mut HashMap<ResourceId, State>,
+    ) -> Result<(), ProviderError>,
+    mut transform_data_sources: impl AsyncFnMut(
+        &mut HashMap<ResourceId, State>,
+    ) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    let mut managed_states: HashMap<ResourceId, State> = current_states
+        .iter()
+        .map(|(id, current)| {
+            let state = match current {
+                Current::Absent(state) => state.state(),
+                Current::Present(present) => present.state(),
+                Current::MissingIdentifier(state) => state.state(),
+            };
+            (id.clone(), state.clone())
+        })
+        .collect();
     let orphan_states = orphans
         .iter()
-        .map(|(id, orphan)| (id.clone(), orphan.state.clone()))
+        .map(|(id, orphan)| {
+            let state = match &orphan.current {
+                Current::Absent(state) => state.state(),
+                Current::Present(present) => present.state(),
+                Current::MissingIdentifier(state) => state.state(),
+            };
+            (id.clone(), state.clone())
+        })
         .collect();
-    extend_disjoint_states(&mut states, orphan_states);
-    let expected_ids: HashSet<ResourceId> = states.keys().cloned().collect();
+    extend_disjoint_states(&mut managed_states, orphan_states);
+    let expected_managed_ids: HashSet<ResourceId> = managed_states.keys().cloned().collect();
+    let mut transformed_data_sources = data_source_states.clone();
+    let expected_data_source_ids: HashSet<ResourceId> =
+        transformed_data_sources.keys().cloned().collect();
 
-    transform(&mut states).await?;
+    transform_managed_orphans(&mut managed_states).await?;
+    if !transformed_data_sources.is_empty() {
+        transform_data_sources(&mut transformed_data_sources).await?;
+    }
 
     assert_eq!(
-        states.keys().cloned().collect::<HashSet<_>>(),
-        expected_ids,
-        "provider transform must preserve the complete prior-state key set"
+        managed_states.keys().cloned().collect::<HashSet<_>>(),
+        expected_managed_ids,
+        "provider transform must preserve the managed/orphan prior-state key set"
+    );
+    assert_eq!(
+        transformed_data_sources
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        expected_data_source_ids,
+        "provider transform must preserve the data-source state key set"
     );
     for (id, orphan) in orphans.iter_mut() {
-        if let Some(mut state) = states.remove(id) {
-            state.id = orphan.state.id.clone();
-            state.dependency_bindings = std::mem::take(&mut orphan.state.dependency_bindings);
-            orphan.state = state;
+        if let Some(state) = managed_states.remove(id) {
+            orphan.current.apply_transformed_state(state);
         }
     }
-    *current_states = states;
+    for (id, current) in current_states {
+        let state = managed_states
+            .remove(id)
+            .expect("provider transform preserved the managed state key");
+        current.apply_transformed_state(state);
+    }
+    assert!(
+        managed_states.is_empty(),
+        "every transformed managed/orphan state must return to its typed owner"
+    );
+    *data_source_states = transformed_data_sources;
     Ok(())
 }
 
 /// Lift enum leaves for every managed provider state, regardless of which
 /// prior-state owner currently carries it.
 pub fn lift_prior_state_enum_leaves(
-    current_states: &mut HashMap<ResourceId, State>,
+    current_states: &mut HashMap<ResourceId, Current>,
     orphans: &mut Orphans,
     resources: &[Resource],
     registry: &crate::schema::SchemaRegistry,
@@ -310,13 +411,16 @@ pub fn lift_prior_state_enum_leaves(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
-        let state = current_states.get_mut(&resource.id).or_else(|| {
-            orphans
-                .get_mut(&resource.id)
-                .map(|orphan| &mut orphan.state)
-        });
-        if let Some(state) = state {
-            crate::utils::lift_state_enum_leaves(&mut state.attributes, schema);
+        let attributes = current_states
+            .get_mut(&resource.id)
+            .map(Current::attributes_mut)
+            .or_else(|| {
+                orphans
+                    .get_mut(&resource.id)
+                    .map(|orphan| orphan.current_mut().attributes_mut())
+            });
+        if let Some(attributes) = attributes {
+            crate::utils::lift_state_enum_leaves(attributes, schema);
         }
     }
 }
@@ -325,11 +429,11 @@ pub fn lift_prior_state_enum_leaves(
 /// display and saved-plan consumers after the differ has finished.
 pub fn into_all_prior_states(
     orphans: Orphans,
-    mut current_states: HashMap<ResourceId, State>,
-) -> HashMap<ResourceId, State> {
+    mut current_states: HashMap<ResourceId, Current>,
+) -> HashMap<ResourceId, Current> {
     let orphan_states = orphans
         .into_iter()
-        .map(|(id, orphan)| (id, orphan.into_state()))
+        .map(|(id, orphan)| (id, orphan.into_current()))
         .collect();
     extend_disjoint_states(&mut current_states, orphan_states);
     current_states
@@ -341,7 +445,7 @@ fn create_plan_for_tests(
     managed: &[Resource],
     data_sources: &[crate::resource::DataSource],
     provider: &dyn crate::provider::Provider,
-    current_states: &HashMap<ResourceId, crate::resource::PlanInputState>,
+    current_states: &HashMap<ResourceId, crate::resource::PlanInputCurrent>,
     directives_map: &HashMap<ResourceId, crate::resource::Directives>,
     registry: &crate::schema::SchemaRegistry,
     saved_attrs: &crate::provider::LiftedSavedAttrs,
@@ -355,7 +459,7 @@ fn create_plan_for_tests(
         &managed,
         data_sources,
         provider,
-        PlanPriorStates::new(current_states, orphans),
+        PlanPriorStates::new(current_states, &HashMap::new(), orphans),
         directives_map,
         registry,
         saved_attrs,
@@ -425,6 +529,53 @@ impl Diff {
     }
 }
 
+enum PresentDiff {
+    Update {
+        id: ResourceId,
+        from: Box<State>,
+        to: Box<Resource>,
+        changed_attributes: Vec<String>,
+    },
+    NoChange,
+}
+
+fn diff_present(
+    desired: &ResolvedResource,
+    current: &PresentResourceState,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> PresentDiff {
+    diff_existing_state(desired, current.state(), saved, prev_explicit, schema)
+}
+
+fn diff_existing_state(
+    desired: &ResolvedResource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> PresentDiff {
+    let changed = comparison::find_changed_attributes(
+        &desired.resolved_attributes(),
+        &current.attributes,
+        saved,
+        prev_explicit,
+        schema,
+    );
+
+    if changed.is_empty() {
+        PresentDiff::NoChange
+    } else {
+        PresentDiff::Update {
+            id: desired.id.clone(),
+            from: Box::new(current.clone()),
+            to: Box::new(desired.as_resource().clone()),
+            changed_attributes: changed,
+        }
+    }
+}
+
 /// Compare desired state with current state to compute a Diff.
 /// If `saved` is provided, unmanaged nested fields from the saved state are merged
 /// into desired before comparison, preventing false diffs when AWS returns extra fields.
@@ -456,24 +607,19 @@ pub fn diff(
     if !current.exists {
         return Diff::Create(desired.as_resource().clone());
     }
-
-    let changed = comparison::find_changed_attributes(
-        &desired.resolved_attributes(),
-        &current.attributes,
-        saved,
-        prev_explicit,
-        schema,
-    );
-
-    if changed.is_empty() {
-        Diff::NoChange(desired.id.clone())
-    } else {
-        Diff::Update {
-            id: desired.id.clone(),
-            from: Box::new(current.clone()),
-            to: desired.as_resource().clone(),
-            changed_attributes: changed,
-        }
+    match diff_existing_state(desired, current, saved, prev_explicit, schema) {
+        PresentDiff::Update {
+            id,
+            from,
+            to,
+            changed_attributes,
+        } => Diff::Update {
+            id,
+            from,
+            to: *to,
+            changed_attributes,
+        },
+        PresentDiff::NoChange => Diff::NoChange(desired.id.clone()),
     }
 }
 

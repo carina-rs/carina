@@ -36,6 +36,7 @@ fn reconcile_anonymous_identifiers(
     };
     super::reconcile_anonymous_identifiers(
         resources,
+        &[],
         registry,
         &find_screened_state_by_type,
         find_state_by_binding,
@@ -2228,6 +2229,7 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
 
     let simhash_renames = super::reconcile_anonymous_identifiers(
         &mut simhash_resources,
+        &[],
         &simhash_schemas,
         &|provider, resource_type| {
             claims.screen_entries(provider, resource_type, simhash_state.clone(), |entry| {
@@ -2267,6 +2269,7 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
 
     let create_only_renames = super::reconcile_anonymous_identifiers(
         &mut create_only_resources,
+        &[],
         &create_only_schemas,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -2317,6 +2320,7 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
 
     super::reconcile_anonymous_identifiers(
         &mut resources,
+        &[],
         &schemas,
         &|provider, resource_type| {
             claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
@@ -4165,6 +4169,7 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
 
     super::reconcile_anonymous_identifiers(
         &mut resources,
+        &[],
         &schemas,
         &|provider, resource_type| {
             claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
@@ -4226,6 +4231,7 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
 
     let renames = super::reconcile_anonymous_identifiers(
         &mut resources,
+        &[],
         &schemas,
         &|provider, resource_type| {
             claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {

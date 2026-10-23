@@ -143,7 +143,7 @@ fn create_plan_from_resources() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -178,7 +178,7 @@ fn create_plan_with_read_only_resource() {
         &resources,
         &data_sources,
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -281,7 +281,7 @@ fn create_plan_detects_typed_orphan_for_deletion() {
         Value::Concrete(ConcreteValue::String("orphaned-bucket".into())),
     );
     let orphan_id = ResourceId::with_identity("bucket", "orphaned-bucket");
-    let orphans = Orphans::from([Orphan::new(
+    let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id, orphan_attrs),
         None,
         Directives::default(),
@@ -291,7 +291,7 @@ fn create_plan_detects_typed_orphan_for_deletion() {
         &desired,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -350,7 +350,7 @@ fn read_only_resource_always_generates_read_effect() {
         &[],
         &data_sources,
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -427,7 +427,7 @@ fn replace_when_create_only_attr_changed() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -484,7 +484,7 @@ fn normal_update_when_non_create_only_attr_changed() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -551,7 +551,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -617,7 +617,7 @@ fn replace_carries_create_before_destroy_directives() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -739,7 +739,7 @@ fn replace_with_provider_prefixed_schema_key() {
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -1010,7 +1010,7 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
     let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
     let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
         .with_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
-    let orphans = crate::differ::Orphans::from([Orphan::new(
+    let orphans = crate::differ::Orphans::from([Orphan::from_state(
         orphan_state,
         Some("my_subnet".to_string()),
         crate::resource::Directives::default(),
@@ -1020,7 +1020,7 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
         &desired,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(
+        &crate::resource::into_plan_input_current_map_from_states(
             HashMap::new(),
             &crate::schema::SchemaRegistry::new(),
             &[],

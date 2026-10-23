@@ -9056,7 +9056,8 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         managed: &parsed.resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
-        current_states: &HashMap::new(),
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
         remote_bindings: &remote_bindings,
         wait_aliases: &[],
     });

@@ -22,7 +22,7 @@ use carina_cli::fixture_plan::{
 fn render_plan(fixture: &str, detail: DetailLevel) -> String {
     let fp = build_plan_from_fixture_name(fixture);
     let delete_attributes =
-        delete_instance_attributes_from_plan(&fp.plan, &fp.current_states, fp.state_file.as_ref());
+        delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     format_plan_with_delete_instances(
         &fp.plan,
         detail,
@@ -40,7 +40,7 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
 fn render_destroy_plan(fixture: &str, detail: DetailLevel) -> String {
     let fp = build_plan_from_fixture_name(fixture);
     let delete_attributes =
-        delete_instance_attributes_from_plan(&fp.plan, &fp.current_states, fp.state_file.as_ref());
+        delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     format_destroy_plan_with_delete_instances(&fp.plan, detail, &delete_attributes)
 }
 

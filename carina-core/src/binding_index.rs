@@ -44,7 +44,7 @@
 
 use crate::parser::{BindingName, ResourceRef};
 use crate::resource::{
-    AccessPath, Composition, PathSegment, PlanInputState, ReferencePathRef, Resource, ResourceId,
+    AccessPath, Composition, PathSegment, PlanInputCurrent, ReferencePathRef, Resource, ResourceId,
     State, Subscript, Value,
 };
 use crate::schema::{
@@ -1365,7 +1365,8 @@ pub struct PreApplyInputs<'a> {
     pub managed: &'a [Resource],
     pub compositions: &'a [Composition],
     pub data_sources: &'a [crate::resource::DataSource],
-    pub current_states: &'a HashMap<ResourceId, PlanInputState>,
+    pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
+    pub data_source_states: &'a HashMap<ResourceId, State>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [WaitAliasSpec],
 }
@@ -1389,7 +1390,8 @@ impl ResolvedBindings {
             managed: &parsed.resources,
             compositions: &parsed.compositions,
             data_sources: &parsed.data_sources,
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &wait_aliases,
         })
@@ -1400,7 +1402,7 @@ impl ResolvedBindings {
     /// Builds the bindings view from every kind of binding that
     /// reference resolution can name — managed resources, composition
     /// resources (module-call attribute containers), and data
-    /// sources — plus the same `current_states`, `remote_bindings`,
+    /// sources — plus the managed/data-source state maps, `remote_bindings`,
     /// and `wait_aliases` inputs the legacy entries took.
     ///
     /// The required-fields `PreApplyInputs` struct turns "forgot to
@@ -1411,7 +1413,7 @@ impl ResolvedBindings {
     /// way the previous managed-only constructor + opt-in
     /// `add_compositions` shape allowed (carina#3246).
     ///
-    /// Layering order: managed first (merged with `current_states`,
+    /// Layering order: managed first (merged with `managed_current`,
     /// DSL-wins-on-collision), then data sources, then compositions,
     /// then wait aliases. The post-apply layering in
     /// `state_writeback.rs` uses the same order, so a same-stack
@@ -1423,10 +1425,10 @@ impl ResolvedBindings {
     pub fn pre_apply(inputs: PreApplyInputs<'_>) -> Self {
         let mut bindings = Self::build_managed_core(
             inputs.managed,
-            inputs.current_states,
+            inputs.managed_current,
             inputs.remote_bindings,
         );
-        bindings.layer_data_source_bindings(inputs.data_sources, inputs.current_states);
+        bindings.layer_data_source_bindings(inputs.data_sources, inputs.data_source_states);
         bindings
             .layer_compositions_post_apply(inputs.compositions)
             .expect("layer_compositions_post_apply is currently infallible");
@@ -1441,7 +1443,7 @@ impl ResolvedBindings {
     /// a data source or composition still snapshots the resolved attrs.
     fn build_managed_core(
         managed: &[Resource],
-        current_states: &HashMap<ResourceId, PlanInputState>,
+        managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
     ) -> Self {
         let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
@@ -1451,11 +1453,19 @@ impl ResolvedBindings {
                 continue;
             };
             let mut merged: HashMap<String, Value> = resource.resolved_attributes();
-            if let Some(state) = current_states.get(&resource.id)
-                && state.as_state().exists
-            {
-                for (k, v) in &state.as_state().attributes {
-                    merged.entry(k.clone()).or_insert_with(|| v.clone());
+            if let Some(current) = managed_current.get(&resource.id) {
+                match current.current() {
+                    crate::resource::Current::Absent(_absent) => {}
+                    crate::resource::Current::Present(present) => {
+                        for (k, v) in &present.state().attributes {
+                            merged.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                    crate::resource::Current::MissingIdentifier(unidentified) => {
+                        for (k, v) in &unidentified.state().attributes {
+                            merged.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
                 }
             }
             by_name.insert(
@@ -1522,7 +1532,7 @@ impl ResolvedBindings {
     /// appends.
     ///
     /// Unlike `pre_apply`, this entry does **not** merge
-    /// `current_states`: compositions have no provider-side state to
+    /// `managed_current`: compositions have no provider-side state to
     /// merge. The composition's own attribute map (as authored, after
     /// `resolve_virtual_refs_post_apply` materialised any refs) is
     /// recorded verbatim.
@@ -1578,7 +1588,7 @@ impl ResolvedBindings {
     /// 1. `DataSource.attributes` — the parsed DSL attributes (input
     ///    filters like `path_prefix` / `name_regex`). Resource type identity
     ///    lives on `DataSource.id`, outside the provider-facing map.
-    /// 2. `current_states[ds.id].attributes` — the **read result** the
+    /// 2. `data_source_states[ds.id].attributes` — the **read result** the
     ///    provider returned: `arns`, `user_id`, `account_id`, etc.
     ///    Populated by `read_data_source_with_retry` (apply path) or
     ///    `resolve_data_source_refs_for_refresh` (plan path). Without
@@ -1591,9 +1601,9 @@ impl ResolvedBindings {
     ///
     /// Layer 2 wins on key collision — same direction as
     /// `record_applied` (post-apply, provider value is truth), but
-    /// gated on `state.exists` the way [`Self::build_managed_core`]
-    /// gates its own state merge (a tombstoned row must not
-    /// contribute attributes). `record_applied` itself has no such
+    /// gated on `state.exists`; managed state uses its typed `Current`
+    /// variant for the equivalent decision (an absent row must not contribute
+    /// attributes). `record_applied` itself has no such
     /// gate because its caller only fires it on a successful apply
     /// result. The merge direction deliberately diverges from
     /// [`Self::build_managed_core`] (which is DSL-wins because the
@@ -1605,7 +1615,7 @@ impl ResolvedBindings {
     /// values).
     ///
     /// The shared structural pattern with [`Self::build_managed_core`]
-    /// is that *both* merge their `current_states` row into the
+    /// is that *both* merge their `data_source_states` row into the
     /// binding — the carina#3252 gap was a data-source binding that
     /// dropped state entirely. The merge-direction divergence above is
     /// intentional.
@@ -1613,21 +1623,21 @@ impl ResolvedBindings {
     /// **Scope:** the only documented caller is
     /// [`ResolvedBindings::pre_apply`]. The function is `pub(crate)`
     /// so a new call site cannot recreate the carina#3252 gap by
-    /// forgetting to pass `current_states`.
+    /// forgetting to pass `data_source_states`.
     pub(crate) fn layer_data_source_bindings(
         &mut self,
         data_sources: &[crate::resource::DataSource],
-        current_states: &HashMap<ResourceId, PlanInputState>,
+        data_source_states: &HashMap<ResourceId, State>,
     ) {
         for d in data_sources.iter() {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
             };
             let mut merged = crate::resource::attrs_to_hashmap(&d.attributes);
-            if let Some(state) = current_states.get(&d.id)
-                && state.as_state().exists
+            if let Some(state) = data_source_states.get(&d.id)
+                && state.exists
             {
-                for (k, v) in &state.as_state().attributes {
+                for (k, v) in &state.attributes {
                     merged.insert(k.clone(), v.clone());
                 }
             }
@@ -2568,11 +2578,8 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
-                states.clone(),
-                &crate::schema::SchemaRegistry::new(),
-                &[],
-            ),
+            managed_current: &HashMap::new(),
+            data_source_states: &states,
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -2629,11 +2636,12 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
+            managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -2678,7 +2686,7 @@ mod resolved_bindings_tests {
         ]
         .into_iter()
         .collect();
-        let plan_input_states = crate::resource::into_plan_input_map(
+        let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
             states,
             &crate::schema::SchemaRegistry::new(),
             &[],
@@ -2690,7 +2698,8 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &plan_input_states,
+            managed_current: &plan_input_states,
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -2740,11 +2749,12 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
+            managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -2777,11 +2787,12 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
+            managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -2818,11 +2829,12 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
+            managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -2876,11 +2888,12 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
+            managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -2997,11 +3010,12 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(
+            managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3098,7 +3112,8 @@ mod resolved_bindings_tests {
             managed: &[cert],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "cert")],
         });
@@ -3129,7 +3144,8 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "nonexistent")],
         });
@@ -3155,7 +3171,8 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &remote,
             wait_aliases: &[wait_spec("waited", "up")],
         });
@@ -3182,7 +3199,8 @@ mod resolved_bindings_tests {
             managed: &[cert],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "cert")],
         });
@@ -3222,7 +3240,8 @@ mod resolved_bindings_tests {
             managed: &[cert],
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "cert")],
         });
@@ -3244,7 +3263,7 @@ mod resolved_bindings_tests {
 
     /// carina#3252: a `read aws.X` data-source binding must expose the
     /// attributes that `read_data_source_with_retry` wrote into
-    /// `current_states[ds.id]`, not just the DSL-side input filters.
+    /// `data_source_states[ds.id]`, not just the DSL-side input filters.
     ///
     /// Pre-fix: `layer_data_sources_post_apply` recorded only
     /// `DataSource.attributes` (the `path_prefix` / `name_regex` filters),
@@ -3308,11 +3327,8 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &crate::resource::into_plan_input_map(
-                states.clone(),
-                &crate::schema::SchemaRegistry::new(),
-                &[],
-            ),
+            managed_current: &HashMap::new(),
+            data_source_states: &states,
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -3341,6 +3357,47 @@ mod resolved_bindings_tests {
         assert_eq!(
             resolved.source("admin_access_roles"),
             Some(&BindingValueSource::Local)
+        );
+    }
+
+    #[test]
+    fn identifierless_data_source_remains_valid_in_separate_map() {
+        let id = ResourceId::with_identity("aws.sts.CallerIdentity", "caller");
+        let mut data_source = DataSource::new("aws.sts.CallerIdentity", "caller");
+        data_source.id = id.clone();
+        data_source.binding = Some("caller".to_string());
+        let data_source_states = HashMap::from([(
+            id.clone(),
+            State::existing(
+                id,
+                HashMap::from([(
+                    "account_id".to_string(),
+                    Value::Concrete(ConcreteValue::String("111111111111".into())),
+                )]),
+            ),
+        )]);
+
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            data_sources: &[data_source],
+            managed_current: &crate::resource::into_plan_input_current_map(
+                HashMap::new(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
+            data_source_states: &data_source_states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+
+        assert_eq!(
+            resolved
+                .get("caller")
+                .and_then(|attributes| attributes.get("account_id")),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "111111111111".into()
+            )))
         );
     }
 
@@ -3385,11 +3442,8 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &crate::resource::into_plan_input_map(
-                states.clone(),
-                &crate::schema::SchemaRegistry::new(),
-                &[],
-            ),
+            managed_current: &HashMap::new(),
+            data_source_states: &states,
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -3406,8 +3460,8 @@ mod resolved_bindings_tests {
     /// carina#3252: cover the no-DSL-input shape (e.g.
     /// `read aws.sts.CallerIdentity {}` — failure path (b)/(c) in the
     /// issue comment). The DSL attribute map is empty; the binding's
-    /// entire visible content comes from `current_states[ds.id]`. A
-    /// regression that re-broke `current_states` merging would still
+    /// entire visible content comes from `data_source_states[ds.id]`. A
+    /// regression that re-broke state merging would still
     /// pass [`data_source_binding_merges_state_attributes`] because that
     /// test also asserts the DSL filter survives — this test does not,
     /// so it pins the state-only variant.
@@ -3440,11 +3494,8 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &crate::resource::into_plan_input_map(
-                states.clone(),
-                &crate::schema::SchemaRegistry::new(),
-                &[],
-            ),
+            managed_current: &HashMap::new(),
+            data_source_states: &states,
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -3623,7 +3674,8 @@ let chosen = if true { "primary" } else { "fallback" }
             managed: &parsed.resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &HashMap::new(),
+            managed_current: &HashMap::new(),
+            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
