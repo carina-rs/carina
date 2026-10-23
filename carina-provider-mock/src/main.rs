@@ -130,11 +130,11 @@ impl MockProcessProvider {
         let resource = request.resource;
         states.insert(key, resource.attributes.clone());
 
-        let state = State {
+        let state = AppliedState {
             id: id.clone(),
-            identifier: Some("mock-id".into()),
+            identifier: AppliedIdentifier::new("mock-id")
+                .expect("the mock identifier is non-empty"),
             attributes: resource.attributes,
-            exists: true,
         };
         carina_provider_protocol::CreateOutcome::Success { state }
     }
@@ -142,6 +142,7 @@ impl MockProcessProvider {
     fn update_done(
         &self,
         id: &ResourceId,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
         polls_served: Option<u32>,
     ) -> carina_provider_protocol::UpdateOutcome {
@@ -173,8 +174,11 @@ impl MockProcessProvider {
                 Value::Int(i64::from(polls_served)).into(),
             );
         }
-        state.identifier = Some("mock-id".into());
-        state.exists = true;
+        let state = AppliedPersistedState {
+            id: state.id,
+            identifier: identifier.clone(),
+            attributes: state.attributes,
+        };
 
         let mut states = self.states.lock().unwrap();
         let cloud_attributes = states.entry(Self::resource_key(id)).or_default();
@@ -264,18 +268,19 @@ impl CarinaProvider for MockProcessProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> Result<State, ProviderError> {
+    ) -> Result<ReadOutcome, ProviderError> {
         if id.identity == "__mock_non_finite_read__" {
-            return Ok(State {
-                id: id.clone(),
-                identifier: Some("mock-id".into()),
-                attributes: HashMap::from([(
-                    "values".to_string(),
-                    Value::List(vec![Value::Float(f64::NAN)]),
-                )]),
-                exists: true,
+            return Ok(ReadOutcome::Found {
+                state: AppliedState {
+                    id: id.clone(),
+                    identifier: identifier.clone(),
+                    attributes: HashMap::from([(
+                        "values".to_string(),
+                        Value::List(vec![Value::Float(f64::NAN)]),
+                    )]),
+                },
             });
         }
 
@@ -283,19 +288,15 @@ impl CarinaProvider for MockProcessProvider {
         let key = Self::resource_key(id);
 
         if let Some(attrs) = states.get(&key) {
-            Ok(State {
-                id: id.clone(),
-                identifier: Some("mock-id".into()),
-                attributes: attrs.clone(),
-                exists: true,
+            Ok(ReadOutcome::Found {
+                state: AppliedState {
+                    id: id.clone(),
+                    identifier: identifier.clone(),
+                    attributes: attrs.clone(),
+                },
             })
         } else {
-            Ok(State {
-                id: id.clone(),
-                identifier: None,
-                attributes: HashMap::new(),
-                exists: false,
-            })
+            Ok(ReadOutcome::NotFound { id: id.clone() })
         }
     }
 
@@ -381,7 +382,7 @@ impl CarinaProvider for MockProcessProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
         let pending_polls = Self::update_pending_polls(&request);
@@ -394,13 +395,15 @@ impl CarinaProvider for MockProcessProvider {
                 poll_after_secs: 1,
             }));
         }
-        Ok(UpdateOutcome::Done(self.update_done(id, request, None)))
+        Ok(UpdateOutcome::Done(
+            self.update_done(id, identifier, request, None),
+        ))
     }
 
     fn poll_update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
@@ -415,6 +418,7 @@ impl CarinaProvider for MockProcessProvider {
         }
         Ok(UpdateOutcome::Done(self.update_done(
             id,
+            identifier,
             request,
             Some(pending.token.polls_served + 1),
         )))
@@ -423,7 +427,7 @@ impl CarinaProvider for MockProcessProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
         let pending_polls = self
@@ -448,7 +452,7 @@ impl CarinaProvider for MockProcessProvider {
     fn poll_delete(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
         pending: Pending<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {

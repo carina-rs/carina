@@ -3,7 +3,7 @@
 use carina_core::effect::{Effect, resolve_import_identifier};
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
-use carina_core::provider::{Provider, ReadRequest};
+use carina_core::provider::{AppliedIdentifier, Provider, ReadRequest};
 use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 use colored::Colorize;
 
@@ -46,6 +46,19 @@ pub(crate) async fn execute_import_effects(
                     continue;
                 }
             };
+            let applied_identifier = match AppliedIdentifier::new(identifier_str.clone()) {
+                Ok(identifier) => identifier,
+                Err(error) => {
+                    println!(
+                        "  {} Import failed for {}: invalid provider identifier: {}. Set import.id to the non-empty identifier used by the provider.",
+                        "✗".red(),
+                        id,
+                        error
+                    );
+                    result.failure_count += 1;
+                    continue;
+                }
+            };
             let identifier_display = if carina_core::value::contains_secret(identifier) {
                 "(secret)"
             } else {
@@ -57,13 +70,14 @@ pub(crate) async fn execute_import_effects(
                 id,
                 identifier_display
             );
-            let read = provider.read(id, Some(identifier_str.as_str()), ReadRequest);
+            let read = provider.read(id, &applied_identifier, ReadRequest);
             let read_result = match cleanup_wait.until_cleanup_priority(read).await {
                 CleanupInterrupted::Completed(result) => result,
                 CleanupInterrupted::Abandoned => return,
             };
             match read_result {
-                Ok(state) => {
+                Ok(outcome) => {
+                    let state = outcome.into_state();
                     if state.exists {
                         println!("  {} Imported {}", "✓".green(), id);
                         result.applied_states.insert(id.clone().into_inner(), state);
@@ -123,7 +137,8 @@ mod tests {
     use carina_core::executor::ExecutionResult;
     use carina_core::plan::Plan;
     use carina_core::provider::{
-        CreateRequest, DeleteRequest, Provider, ProviderResult, ReadRequest, UpdateRequest,
+        CreateRequest, DeleteRequest, Provider, ProviderError, ProviderResult, ReadRequest,
+        UpdateRequest,
     };
     use carina_core::resource::{
         ConcreteValue, DeferredValue, InterpolationPart, ResourceId, State, UnknownReason, Value,
@@ -153,7 +168,7 @@ mod tests {
     /// assert apply *never* invokes the provider when the import
     /// identifier is still deferred.
     struct ReadRecorder {
-        reads: Mutex<Vec<(ResourceId, Option<String>)>>,
+        reads: Mutex<Vec<(ResourceId, String)>>,
     }
 
     impl ReadRecorder {
@@ -176,22 +191,22 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            identifier: Option<&str>,
+            identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ReadOutcome>> {
             self.reads
                 .lock()
                 .unwrap()
-                .push((id.clone(), identifier.map(str::to_string)));
+                .push((id.clone(), identifier.as_str().to_string()));
             let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(async move { Ok(carina_core::provider::ReadOutcome::not_found(id)) })
         }
 
         fn read_data_source(
             &self,
-            resource: &carina_core::provider::ProviderReadyDataSource,
+            _resource: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None, ReadRequest)
+            Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
         }
 
         fn create(
@@ -205,7 +220,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             unreachable!("import path must not call update")
@@ -214,7 +229,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             unreachable!("import path must not call delete")
@@ -290,7 +305,7 @@ mod tests {
 
         let reads = recorder.reads.lock().unwrap();
         assert_eq!(reads.len(), 1);
-        assert_eq!(reads[0].1.as_deref(), Some("my-bucket"));
+        assert_eq!(reads[0].1, "my-bucket");
     }
 
     /// carina#3332: the state-only `Remove` line must not shape-collide

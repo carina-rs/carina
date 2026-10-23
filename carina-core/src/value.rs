@@ -2352,6 +2352,7 @@ pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) ->
         }
         Effect::Update {
             from,
+            identifier: _identifier,
             to,
             changed_attributes: _changed_attributes,
         } => {
@@ -3514,10 +3515,12 @@ pub fn redact_secrets_in_effect(
         )),
         Effect::Update {
             from,
+            identifier,
             to,
             changed_attributes,
         } => Effect::Update {
             from: Box::new(redact_secrets_in_state(from)?),
+            identifier: identifier.clone(),
             to: crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?),
             changed_attributes: changed_attributes.clone(),
         },
@@ -3616,10 +3619,12 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                 },
                 crate::effect::Effect::Update {
                     from,
+                    identifier,
                     to,
                     changed_attributes,
                 } => crate::effect::Effect::Update {
                     from: Box::new(redact_secrets_in_state(from)?),
+                    identifier: identifier.clone(),
                     to: match reusable_resource(&to.id) {
                         Some(planned) => crate::resource::ResolvedResource::new(
                             redact_resource_using_redacted_shape(to, planned)?,
@@ -3736,6 +3741,7 @@ pub fn rehydrate_plan_desired_secrets(
             }
             Effect::Update {
                 from,
+                identifier,
                 to,
                 changed_attributes,
             } => {
@@ -3750,6 +3756,7 @@ pub fn rehydrate_plan_desired_secrets(
                 })?;
                 Ok(Effect::Update {
                     from: from.clone(),
+                    identifier: identifier.clone(),
                     to: crate::resource::ResolvedResource::new(rehydrate_resource_secrets(
                         to, fresh,
                     )?),
@@ -3985,12 +3992,14 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states(
         .map(|effect| match effect {
             Effect::Update {
                 from,
+                identifier,
                 to,
                 changed_attributes,
             } if from.attributes.values().any(contains_redacted_secret) => {
                 let (redacted, verified) = state_evidence(&from.id)?;
                 Ok(Effect::Update {
                     from: Box::new(restore_state(from, redacted, verified)?),
+                    identifier: identifier.clone(),
                     to: to.clone(),
                     changed_attributes: changed_attributes.clone(),
                 })
@@ -8997,6 +9006,9 @@ mod tests {
         );
         let mut plan = Plan::new();
         plan.add(Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                canonical_from.id.identity_display().to_string(),
+            ),
             from: Box::new(canonical_from.clone()),
             to: ResolvedResource::new(to.clone()),
             changed_attributes: vec!["items".to_string()],
@@ -11892,7 +11904,7 @@ mod tests {
             create: ResolvedResource::new(create),
             delete: ReplacementDelete {
                 id: ResolvedResourceId::new(id.clone()),
-                identifier: "bucket-old".to_string(),
+                identifier: crate::effect::fixture_applied_identifier("bucket-old"),
                 directives: Directives::default(),
                 binding: Some("bucket".to_string()),
                 dependencies: HashSet::new(),

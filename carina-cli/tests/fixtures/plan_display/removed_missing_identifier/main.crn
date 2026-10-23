@@ -1,0 +1,5 @@
+provider mock {}
+
+removed {
+  from = mock.test.resource 'legacy'
+}

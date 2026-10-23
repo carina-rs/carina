@@ -9,6 +9,14 @@ use crate::plan::{
 };
 use crate::resource::{ConcreteValue, Resource, ResourceIdentity};
 
+fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
+    let identifier = id
+        .identity_str()
+        .expect("fixture resource identity must be resolved")
+        .to_string();
+    State::existing(id, attributes).with_identifier(identifier)
+}
+
 fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::new(&[]);
@@ -52,9 +60,10 @@ impl crate::provider::Provider for HintProvider {
     fn read(
         &self,
         _id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &crate::provider::AppliedIdentifier,
         _request: crate::provider::ReadRequest,
-    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
+    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<crate::provider::ReadOutcome>>
+    {
         Box::pin(async { panic!("unexpected read") })
     }
 
@@ -79,7 +88,7 @@ impl crate::provider::Provider for HintProvider {
     fn update(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &crate::provider::AppliedIdentifier,
         _request: crate::provider::UpdateRequest,
     ) -> crate::provider::BoxFuture<
         '_,
@@ -91,7 +100,7 @@ impl crate::provider::Provider for HintProvider {
     fn delete(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &crate::provider::AppliedIdentifier,
         _request: crate::provider::DeleteRequest,
     ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<()>> {
         Box::pin(async { panic!("unexpected delete") })
@@ -153,7 +162,7 @@ fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -241,7 +250,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
     );
     current_states.insert(
         ResourceId::with_identity("logs.LogGroup", "my-log-group"),
-        State::existing(
+        existing_state(
             ResourceId::with_identity("logs.LogGroup", "my-log-group"),
             attrs,
         ),
@@ -319,7 +328,7 @@ fn no_temporary_name_without_create_before_destroy() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -392,7 +401,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -452,7 +461,7 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
     );
     current_states.insert(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+        existing_state(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -520,7 +529,7 @@ fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
     );
     current_states.insert(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+        existing_state(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -578,7 +587,7 @@ fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
 #[test]
 fn create_before_destroy_with_missing_schema_reports_schema_not_registered() {
     let resource = Resource::new("ec2.Vpc", "my-vpc");
-    let from = State::existing(
+    let from = existing_state(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
         HashMap::new(),
     );
@@ -626,7 +635,7 @@ fn no_temporary_name_when_unique_name_attribute_changes() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -686,7 +695,7 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
             Value::Concrete(ConcreteValue::String("test".into())),
         )]))),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("s3.Bucket", "test"),
         current_attrs,
     );
@@ -724,7 +733,7 @@ fn diff_ignores_attributes_not_in_prev_desired_keys() {
         "arn".to_string(),
         Value::Concrete(ConcreteValue::String("arn:aws:s3:::test".into())),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("s3.Bucket", "test"),
         current_attrs,
     );
@@ -786,7 +795,7 @@ fn server_default_struct_field_does_not_appear_in_diff() {
         "lifecycle_configuration".to_string(),
         Value::Concrete(ConcreteValue::Map(current_lc)),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("s3.Bucket", "test"),
         current_attrs,
     );
@@ -841,7 +850,7 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
         ),
     ])));
     let current_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
-    let current = State::existing(distribution_id.clone(), current_attrs.clone());
+    let current = existing_state(distribution_id.clone(), current_attrs.clone());
     let saved_attrs = HashMap::from([(distribution_id, current_attrs)]);
     let prev_explicit = ExplicitFields::Struct {
         children: HashMap::from([(
@@ -907,7 +916,7 @@ fn saved_server_default_nested_field_not_authored_remains_no_change() {
         ),
     ])));
     let current_attrs = HashMap::from([("lifecycle_configuration".to_string(), current_config)]);
-    let current = State::existing(bucket_id, current_attrs.clone());
+    let current = existing_state(bucket_id, current_attrs.clone());
     let prev_explicit = ExplicitFields::Struct {
         children: HashMap::from([(
             "lifecycle_configuration".to_string(),
@@ -966,7 +975,7 @@ fn list_union_authoring_does_not_turn_provider_field_into_removal() {
     let desired =
         Resource::new("example.Listener", "listener").with_attribute("rules", desired_rules);
     let current_attrs = HashMap::from([("rules".to_string(), current_rules)]);
-    let current = State::existing(resource_id, current_attrs.clone());
+    let current = existing_state(resource_id, current_attrs.clone());
     let prev_explicit = ExplicitFields::Struct {
         children: HashMap::from([(
             "rules".to_string(),
@@ -1019,7 +1028,7 @@ fn list_elements_authored_field_removal_produces_update_for_paired_element() {
     let desired =
         Resource::new("example.Listener", "listener").with_attribute("rules", desired_rules);
     let current_attrs = HashMap::from([("rules".to_string(), current_rules)]);
-    let current = State::existing(resource_id, current_attrs.clone());
+    let current = existing_state(resource_id, current_attrs.clone());
     let prev_explicit = ExplicitFields::Struct {
         children: HashMap::from([(
             "rules".to_string(),
@@ -1133,7 +1142,7 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
     };
     assert!(matches!(elements[1], ExplicitFields::Unrecorded));
 
-    let current = State::existing(authored.id.clone(), saved_attributes.clone());
+    let current = existing_state(authored.id.clone(), saved_attributes.clone());
     let result = diff_test(
         &authored,
         &current,
@@ -1168,7 +1177,7 @@ fn migrated_leaf_authoring_for_map_preserves_provider_nested_fields() {
     let desired =
         Resource::new("example.Service", "service").with_attribute("settings", desired_settings);
     let current_attrs = HashMap::from([("settings".to_string(), current_settings)]);
-    let current = State::existing(resource_id, current_attrs.clone());
+    let current = existing_state(resource_id, current_attrs.clone());
     let prev_explicit = ExplicitFields::Struct {
         children: HashMap::from([("settings".to_string(), ExplicitFields::Leaf)]),
     };
@@ -1211,9 +1220,9 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         ),
     ])));
     let distribution_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
-    let distribution_state = State::existing(distribution_id.clone(), distribution_attrs.clone())
+    let distribution_state = existing_state(distribution_id.clone(), distribution_attrs.clone())
         .with_dependency_bindings(BTreeSet::from(["web_acl".to_string()]));
-    let web_acl_state = State::existing(web_acl_id.clone(), HashMap::new())
+    let web_acl_state = existing_state(web_acl_id.clone(), HashMap::new())
         .with_identifier("arn:aws:wafv2:acl/test");
     let current_states = HashMap::from([(distribution_id.clone(), distribution_state)]);
     let saved_attrs = crate::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from(
@@ -1264,6 +1273,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         .expect("Distribution must be updated");
     let Effect::Update {
         from,
+        identifier: _identifier,
         to,
         changed_attributes,
     } = update
@@ -1298,7 +1308,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
 #[test]
 fn orphan_delete_uses_typed_binding_without_state_attribute() {
     let orphan_id = ResourceId::with_identity("example.Service", "removed-service");
-    let orphan_state = State::existing(
+    let orphan_state = existing_state(
         orphan_id.clone(),
         HashMap::from([(
             "name".to_string(),
@@ -1361,7 +1371,7 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
     let desired = Resource::new("example.Service", "service")
         .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into())));
     let orphan = Orphan::new(
-        State::existing(
+        existing_state(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -1404,7 +1414,7 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
     let old_id = ResourceId::with_identity("example.Service", "old");
     let new_id = ResourceId::with_identity("example.Service", "new");
     let orphan = Orphan::new(
-        State::existing(old_id.clone(), HashMap::new()),
+        existing_state(old_id.clone(), HashMap::new()),
         Some("service".to_string()),
         Directives::default(),
     );
@@ -1423,10 +1433,10 @@ async fn prior_state_transform_rejects_current_state_key_changes() {
     let inserted_id = ResourceId::with_identity("example.Service", "inserted");
     let mut current_states = HashMap::from([(
         current_id.clone(),
-        State::existing(current_id.clone(), HashMap::new()),
+        existing_state(current_id.clone(), HashMap::new()),
     )]);
     let mut orphans = Orphans::from([Orphan::new(
-        State::existing(orphan_id, HashMap::new()),
+        existing_state(orphan_id, HashMap::new()),
         Some("orphan".to_string()),
         Directives::default(),
     )]);
@@ -1435,7 +1445,7 @@ async fn prior_state_transform_rejects_current_state_key_changes() {
         states.remove(&current_id);
         states.insert(
             inserted_id.clone(),
-            State::existing(inserted_id, HashMap::new()),
+            existing_state(inserted_id, HashMap::new()),
         );
         Ok::<(), ()>(())
     })
@@ -1447,7 +1457,7 @@ async fn prior_state_transform_rejects_current_state_key_changes() {
 fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependencies() {
     let orphan_id = ResourceId::with_identity("example.Service", "removed-service");
     let orphan_state =
-        State::existing(orphan_id.clone(), HashMap::new()).with_identifier("service-123");
+        existing_state(orphan_id.clone(), HashMap::new()).with_identifier("service-123");
     let directives = Directives {
         depends_on: vec!["x".to_string()],
         ..Directives::default()
@@ -1501,7 +1511,7 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
             Value::Concrete(ConcreteValue::String("new".into())),
         );
     let consumer = Resource::new("example.Consumer", "consumer-id").with_binding("consumer");
-    let producer_state = State::existing(
+    let producer_state = existing_state(
         producer_id.clone(),
         HashMap::from([(
             "replace_key".to_string(),
@@ -1509,7 +1519,7 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
         )]),
     )
     .with_identifier("producer-old");
-    let consumer_state = State::existing(
+    let consumer_state = existing_state(
         consumer_id.clone(),
         HashMap::from([(
             "producer_id".to_string(),
@@ -1571,7 +1581,7 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
         .with_binding("consumer")
         .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]))
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
-    let consumer_state = State::existing(
+    let consumer_state = existing_state(
         consumer_id.clone(),
         HashMap::from([(
             "version".to_string(),
@@ -1580,7 +1590,7 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
     )
     .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]));
     let dependency_state =
-        State::existing(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
+        existing_state(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
     let current_states = HashMap::from([(consumer_id, consumer_state)]);
     let orphans = Orphans::from([Orphan::new(
         dependency_state,
@@ -1629,7 +1639,7 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
     let consumer = Resource::new("example.Consumer", "consumer-id")
         .with_binding("consumer")
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
-    let consumer_state = State::existing(
+    let consumer_state = existing_state(
         consumer_id.clone(),
         HashMap::from([(
             "version".to_string(),
@@ -1637,7 +1647,7 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
         )]),
     );
     let dependency_state =
-        State::existing(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
+        existing_state(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
     let current_states = HashMap::from([(consumer_id.clone(), consumer_state)]);
     let directives_map = HashMap::from([(
         consumer_id,
@@ -1702,7 +1712,7 @@ fn explicit_top_level_removal_still_detected() {
             Value::Concrete(ConcreteValue::String("prod".into())),
         )]))),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("s3.Bucket", "test"),
         current_attrs,
     );
@@ -1744,7 +1754,7 @@ fn diff_no_change_without_prev_desired_keys() {
             Value::Concrete(ConcreteValue::String("test".into())),
         )]))),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("s3.Bucket", "test"),
         current_attrs,
     );
@@ -1781,7 +1791,7 @@ fn create_plan_detects_attribute_removal() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "test"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "test"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_explicit = HashMap::new();
@@ -1840,7 +1850,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "test"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "test"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_explicit = HashMap::new();
@@ -1919,7 +1929,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "test"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "test"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_explicit = HashMap::new();
@@ -1977,7 +1987,7 @@ fn diff_includes_underscore_prefixed_attributes_in_removal_detection() {
         "_internal".to_string(),
         Value::Concrete(ConcreteValue::String("something".into())),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("s3.Bucket", "test"),
         current_attrs,
     );
@@ -2006,7 +2016,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
     let orphans = Orphans::from([Orphan::new(
-        State::existing(orphan_id.clone(), attrs),
+        existing_state(orphan_id.clone(), attrs),
         None,
         Directives {
             prevent_destroy: true,
@@ -2075,7 +2085,7 @@ fn prevent_destroy_blocks_replace() {
     );
     current_states.insert(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+        existing_state(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -2143,7 +2153,7 @@ fn prevent_destroy_does_not_block_update() {
     );
     current_states.insert(
         ResourceId::with_identity("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
+        existing_state(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let plan = create_plan(
@@ -2300,7 +2310,7 @@ fn without_prevent_destroy_delete_works_normally() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
     let orphans = Orphans::from([Orphan::new(
-        State::existing(orphan_id, attrs),
+        existing_state(orphan_id, attrs),
         None,
         Directives::default(),
     )]);
@@ -2355,11 +2365,11 @@ fn prevent_destroy_collects_multiple_errors() {
     };
     let orphans = Orphans::from([
         Orphan::new(
-            State::existing(first_id, attrs1),
+            existing_state(first_id, attrs1),
             None,
             prevent_destroy.clone(),
         ),
-        Orphan::new(State::existing(second_id, attrs2), None, prevent_destroy),
+        Orphan::new(existing_state(second_id, attrs2), None, prevent_destroy),
     ]);
 
     let plan = create_plan(
@@ -3221,14 +3231,14 @@ fn wait_omitted_when_all_consumers_unchanged() {
     let mut current_states = HashMap::new();
     current_states.insert(
         ResourceId::with_identity("acm.Certificate", "cert"),
-        State::existing(
+        existing_state(
             ResourceId::with_identity("acm.Certificate", "cert"),
             HashMap::new(),
         ),
     );
     current_states.insert(
         ResourceId::with_identity("cloudfront.Distribution", "dist"),
-        State::existing(
+        existing_state(
             ResourceId::with_identity("cloudfront.Distribution", "dist"),
             HashMap::new(),
         ),
@@ -3359,7 +3369,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     let cert_id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
     current_states.insert(
         cert_id.clone(),
-        State::existing(cert_id, cert_state_attrs).with_identifier("arn:aws:acm:::certificate/abc"),
+        existing_state(cert_id, cert_state_attrs).with_identifier("arn:aws:acm:::certificate/abc"),
     );
 
     let wait = WaitBinding {
@@ -3509,7 +3519,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     let mut current_states = HashMap::new();
     current_states.insert(
         ResourceId::with_identity("acm.Certificate", "cert"),
-        State::existing(
+        existing_state(
             ResourceId::with_identity("acm.Certificate", "cert"),
             cert_state_attrs,
         )

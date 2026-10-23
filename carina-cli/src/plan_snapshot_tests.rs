@@ -648,6 +648,23 @@ fn snapshot_deposed_delete() {
 }
 
 #[test]
+fn fixture_removed_block_suppresses_prior_missing_identifier_error() {
+    let fp = build_plan_from_fixture_name("removed_missing_identifier");
+
+    assert!(
+        fp.plan.errors().is_empty(),
+        "fixture planning must apply removed-block recovery after the differ: {:?}",
+        fp.plan.errors()
+    );
+    assert!(matches!(fp.plan.effects(), [Effect::Remove { .. }]));
+    assert_eq!(
+        fp.plan.abandoned_deposed_generations().count(),
+        1,
+        "fixture planning must also suppress the later deposed identifier error"
+    );
+}
+
+#[test]
 fn snapshot_deposed_delete_update_dependency() {
     let fp = build_plan_from_fixture_name("deposed_delete_update_dependency");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(

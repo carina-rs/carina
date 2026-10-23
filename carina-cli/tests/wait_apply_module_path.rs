@@ -38,7 +38,8 @@ use carina_core::executor::{
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
-    BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
+    AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, Provider, ProviderFactory,
+    ProviderNormalizer, ProviderResult, ReadOutcome,
 };
 use carina_core::resource::{ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
@@ -158,10 +159,11 @@ impl Provider for NoopProvider {
     fn read(
         &self,
         id: &carina_core::resource::ResourceId,
-        _i: Option<&str>,
+        identifier: &AppliedIdentifier,
         _r: carina_core::provider::ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
+        let identifier = identifier.clone();
         let publishes_arn = self.cert_publishes_arn;
         Box::pin(async move {
             // Model the ACM cert as already ISSUED so the wait's
@@ -188,12 +190,12 @@ impl Provider for NoopProvider {
                         )),
                     );
                 }
-                Ok(
-                    carina_core::resource::State::existing(id, attrs)
-                        .with_identifier("acm-cert-id"),
-                )
+                Ok(ReadOutcome::found(
+                    AppliedState::new(id, identifier.as_str(), attrs)
+                        .expect("typed read identifier is non-empty"),
+                ))
             } else {
-                Ok(carina_core::resource::State::not_found(id))
+                Ok(ReadOutcome::not_found(id))
             }
         })
     }
@@ -212,27 +214,30 @@ impl Provider for NoopProvider {
         let id = id.clone();
         Box::pin(async move {
             Ok(carina_core::provider::CreateOutcome::Success {
-                state: carina_core::resource::State::existing(id, HashMap::new()),
+                state: carina_core::provider::AppliedState::new(id, "mock-id", HashMap::new())
+                    .expect("fixture identifier is non-empty"),
             })
         })
     }
     fn update(
         &self,
         id: &carina_core::resource::ResourceId,
-        _i: &str,
+        identifier: &carina_core::provider::AppliedIdentifier,
         _r: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
+        let identifier = identifier.to_string();
         Box::pin(async move {
             Ok(carina_core::provider::UpdateOutcome::Success {
-                state: carina_core::resource::State::existing(id, HashMap::new()),
+                state: carina_core::provider::AppliedState::new(id, identifier, HashMap::new())
+                    .expect("provider input identifier is non-empty"),
             })
         })
     }
     fn delete(
         &self,
         _id: &carina_core::resource::ResourceId,
-        _i: &str,
+        _i: &carina_core::provider::AppliedIdentifier,
         _r: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })

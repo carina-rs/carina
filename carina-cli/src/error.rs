@@ -320,6 +320,13 @@ pub enum AppError {
         error: carina_core::resource::ResourceIdentityError,
     },
 
+    /// A state-bucket argument was not a valid provider identifier.
+    #[error("State bucket name '{bucket_name}' is not a valid provider identifier: {error}")]
+    InvalidStateBucketProviderIdentifier {
+        bucket_name: String,
+        error: carina_core::provider::EmptyAppliedIdentifier,
+    },
+
     /// Identity assignment was incomplete at a resolved-only pipeline boundary.
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),

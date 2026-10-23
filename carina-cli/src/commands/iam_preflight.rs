@@ -778,9 +778,9 @@ mod tests {
         fn read(
             &self,
             _id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ReadOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unused")) })
         }
 
@@ -803,7 +803,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unused")) })
@@ -812,7 +812,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unused")) })
@@ -849,13 +849,17 @@ mod tests {
         });
         plan.add(Effect::Create(resolved(create)));
         plan.add(Effect::Update {
-            from: Box::new(State::not_found(update_id.clone())),
+            identifier: crate::fixture_applied_identifier("subnet-old"),
+            from: Box::new(
+                State::existing(update_id.clone(), Default::default())
+                    .with_identifier("subnet-old"),
+            ),
             to: resolved(update_to),
             changed_attributes: vec!["cidr".to_string()],
         });
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(replace_id.clone()),
-            identifier: "bucket-old".to_string(),
+            identifier: crate::fixture_applied_identifier("bucket-old"),
             generation: carina_core::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
@@ -866,7 +870,7 @@ mod tests {
         plan.add(Effect::Create(resolved(replace_to)));
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(delete_id.clone()),
-            identifier: "role-id".to_string(),
+            identifier: crate::fixture_applied_identifier("role-id"),
             generation: carina_core::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carina_state::check_and_migrate;
 use tempfile::TempDir;
 
 struct Scenario {
@@ -74,6 +75,7 @@ let r1 = mock.test.resource {{
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
             .env("CARINA_MOCK_PARTIAL_UPDATE_FOR", "*")
             .env("CARINA_MOCK_PARTIAL_UPDATE_MISSING", "tags")
+            .env("CARINA_MOCK_UPDATE_RESULT_IDENTIFIER", "mock-updated-id")
             .output()
             .expect("failed to execute carina apply")
     }
@@ -151,6 +153,17 @@ fn partial_update_records_state_and_next_plan_surfaces_unknown_reason() {
     assert!(
         state_text.contains("mock partial update"),
         "state file must persist partial update detail:\n{state_text}"
+    );
+    let state = check_and_migrate(&state_text)
+        .expect("state file must decode")
+        .into_state();
+    let updated = state
+        .find_resource("mock", "test.resource", "r1")
+        .expect("updated resource must have a state row");
+    assert_eq!(
+        updated.identifier.as_deref(),
+        Some("mock-updated-id"),
+        "the updated resource row must contain the identifier returned by update:\n{state_text}"
     );
 
     let plan = scenario.plan();

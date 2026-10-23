@@ -8,8 +8,8 @@ use carina_core::executor::{
     ProviderCheckInputs, UnresolvedResource, execute_plan,
 };
 use carina_core::provider::{
-    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
-    UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
+    ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
     Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
@@ -580,7 +580,9 @@ async fn combined_hydration_restores_partial_read_marker_on_refreshed_orphan() {
         .upsert_resource(row)
         .expect("test state setup must be valid");
 
-    let mut orphans = state_file.build_orphans(&HashSet::new());
+    let mut orphans = state_file
+        .build_orphans(&HashSet::new())
+        .into_plan_orphans();
     let orphan = orphans.remove(&id).expect("orphan row");
     let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("resource-123");
     orphans.insert(orphan.with_refreshed_state(refreshed));
@@ -990,9 +992,9 @@ impl Provider for CascadeCreateProvider {
     fn read(
         &self,
         _id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         Box::pin(async { Err(ProviderError::internal("read not used")) })
     }
 
@@ -1018,27 +1020,29 @@ impl Provider for CascadeCreateProvider {
         Box::pin(async move {
             if id.resource_type == "ec2.Vpc" {
                 return Ok(CreateOutcome::Success {
-                    state: State::existing(
+                    state: AppliedState::new(
                         id,
+                        "vpc-new",
                         HashMap::from([(
                             "vpc_id".to_string(),
                             Value::Concrete(ConcreteValue::String("vpc-new".into())),
                         )]),
                     )
-                    .with_identifier("vpc-new"),
+                    .expect("fixture identifier is non-empty"),
                 });
             }
 
             if id.resource_type == "ec2.Subnet" {
                 return Ok(CreateOutcome::Success {
-                    state: State::existing(
+                    state: AppliedState::new(
                         id,
+                        "subnet-new",
                         HashMap::from([(
                             "subnet_id".to_string(),
                             Value::Concrete(ConcreteValue::String("subnet-new".into())),
                         )]),
                     )
-                    .with_identifier("subnet-new"),
+                    .expect("fixture identifier is non-empty"),
                 });
             }
 
@@ -1049,7 +1053,7 @@ impl Provider for CascadeCreateProvider {
     fn update(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
@@ -1058,7 +1062,7 @@ impl Provider for CascadeCreateProvider {
     fn delete(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Ok(()) })
@@ -1095,10 +1099,11 @@ impl Provider for ReadWithRetryProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         _request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let id = id.clone();
+        let identifier = identifier.clone();
         let attempt = self.read_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             match self.behavior {
@@ -1107,9 +1112,10 @@ impl Provider for ReadWithRetryProvider {
                 ReadBehavior::NotFoundThenSuccess if attempt == 0 => {
                     Err(ProviderError::not_found("missing"))
                 }
-                ReadBehavior::NotFoundThenSuccess => {
-                    Ok(State::existing(id, HashMap::new()).with_identifier("read-on-retry"))
-                }
+                ReadBehavior::NotFoundThenSuccess => Ok(ReadOutcome::found(
+                    AppliedState::new(id, identifier.as_str(), HashMap::new())
+                        .expect("typed read identifier is non-empty"),
+                )),
             }
         })
     }
@@ -1131,7 +1137,8 @@ impl Provider for ReadWithRetryProvider {
         let id = id.clone();
         Box::pin(async move {
             Ok(CreateOutcome::Success {
-                state: State::existing(id, HashMap::new()),
+                state: AppliedState::new(id, "mock-id", HashMap::new())
+                    .expect("fixture identifier is non-empty"),
             })
         })
     }
@@ -1139,13 +1146,15 @@ impl Provider for ReadWithRetryProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
+        let identifier = identifier.to_string();
         Box::pin(async move {
             Ok(UpdateOutcome::Success {
-                state: State::existing(id, HashMap::new()),
+                state: AppliedState::new(id, identifier, HashMap::new())
+                    .expect("provider input identifier is non-empty"),
             })
         })
     }
@@ -1153,7 +1162,7 @@ impl Provider for ReadWithRetryProvider {
     fn delete(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
@@ -1169,7 +1178,8 @@ async fn read_with_retry_translates_not_found_to_state_not_found() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
     let id = ResourceId::with_identity("test.Resource", "gone");
 
-    let state = read_with_retry(&provider, &id, Some("some-identifier"))
+    let identifier = crate::fixture_applied_identifier("some-identifier");
+    let state = read_with_retry(&provider, &id, &identifier)
         .await
         .expect("not found should translate into a not_found state");
 
@@ -1183,7 +1193,8 @@ async fn read_with_retry_propagates_other_errors() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::ApiError);
     let id = ResourceId::with_identity("test.Resource", "broken");
 
-    let result = read_with_retry(&provider, &id, Some("some-identifier")).await;
+    let identifier = crate::fixture_applied_identifier("some-identifier");
+    let result = read_with_retry(&provider, &id, &identifier).await;
 
     assert!(matches!(result, Err(ProviderError::ApiError(_))));
 }
@@ -1193,7 +1204,8 @@ async fn read_with_retry_does_not_retry_not_found() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFoundThenSuccess);
     let id = ResourceId::with_identity("test.Resource", "gone");
 
-    let state = read_with_retry(&provider, &id, Some("some-identifier"))
+    let identifier = crate::fixture_applied_identifier("some-identifier");
+    let state = read_with_retry(&provider, &id, &identifier)
         .await
         .expect("not found should translate into a not_found state");
 
@@ -1242,7 +1254,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         "instance_tenancy".to_string(),
         Value::Concrete(ConcreteValue::String("default".into())),
     );
-    let state = State::existing(id.clone(), state_attrs);
+    let state = State::existing(id.clone(), state_attrs).with_identifier("test-vpc");
     let mut current_states = HashMap::new();
     current_states.insert(id.clone(), state);
 
@@ -1537,7 +1549,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(tags)),
     );
-    let state = State::existing(id.clone(), state_attrs);
+    let state = State::existing(id.clone(), state_attrs).with_identifier("test-bucket");
     let mut current_states = HashMap::new();
     current_states.insert(id.clone(), state);
 
@@ -1730,7 +1742,9 @@ fn same_type_moved_block_parses_and_materializes_state() {
             ResourceState::new("s3.Bucket", "old_bucket", "awscc").with_identifier("bucket-123"),
         )
         .expect("test state setup must be valid");
-    let mut orphans = state_file.build_orphans(&HashSet::from([to.clone()]));
+    let mut orphans = state_file
+        .build_orphans(&HashSet::from([to.clone()]))
+        .into_plan_orphans();
 
     let moved_pairs = materialize_moved_states(
         &mut current_states,
@@ -1782,7 +1796,9 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
     let mut state_file = StateFile::new();
     state_file.upsert_resource(row).unwrap();
 
-    let mut orphans = state_file.build_orphans(&HashSet::new());
+    let mut orphans = state_file
+        .build_orphans(&HashSet::new())
+        .into_plan_orphans();
     let mut current_states = HashMap::new();
     let moved_pairs = materialize_moved_states(
         &mut current_states,
@@ -1862,7 +1878,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
             "r.delegation_ns",
             Some("management".to_string()),
         )),
-        identifier: String::new(),
+        identifier: crate::fixture_applied_identifier("record-current"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: carina_core::resource::Directives::default(),
         binding: None,
@@ -1938,7 +1954,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-        identifier: "record-current".to_string(),
+        identifier: crate::fixture_applied_identifier("record-current"),
         generation: EffectGeneration::Current,
         directives: carina_core::resource::Directives::default(),
         binding: None,
@@ -1983,7 +1999,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
                     identifier,
                     generation: EffectGeneration::Deposed(key),
                     ..
-                } if identifier == "record-deposed" && key == &deposed_key
+                } if identifier.as_str() == "record-deposed" && key == &deposed_key
             )
         }),
         "deposed generation delete must stay in the plan"
@@ -1994,6 +2010,73 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
             .any(|effect| matches!(effect, Effect::Remove { .. })),
         "removed block must still emit the Remove state operation"
     );
+}
+
+#[test]
+fn deposed_delete_without_provider_identifier_becomes_plan_error() {
+    use carina_core::plan::{Plan, PlanErrorKind};
+    use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
+    use std::collections::{BTreeSet, HashMap};
+
+    let mut row = ResourceState::new("example.Widget", "broken", "mock");
+    let deposed_key = DeposedKey::new_unique();
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        deposed_key.clone(),
+        String::new(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+    let mut plan = Plan::new();
+
+    add_deposed_delete_effects(&mut plan, &Some(state_file));
+
+    assert!(plan.effects().is_empty());
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(
+        plan.errors()[0].kind,
+        PlanErrorKind::MissingDeposedProviderIdentifier {
+            key: deposed_key,
+            current_identifier: None,
+        }
+    );
+    let message = plan.errors()[0].to_string();
+    assert!(message.contains("mock.example.Widget.broken"), "{message}");
+    assert!(message.contains("`removed` block"), "{message}");
+    assert!(!message.contains("`import` block"), "{message}");
+}
+
+#[test]
+fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimport() {
+    use carina_core::plan::Plan;
+    use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
+    use std::collections::{BTreeSet, HashMap};
+
+    let mut row = ResourceState::new("example.Widget", "healthy-current", "mock")
+        .with_identifier("current-id");
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        String::new(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+    let mut plan = Plan::new();
+
+    add_deposed_delete_effects(&mut plan, &Some(state_file));
+
+    let message = plan.errors()[0].to_string();
+    assert!(message.contains("`removed` block"), "{message}");
+    assert!(message.contains("`import` block"), "{message}");
+    assert!(message.contains("current-id"), "{message}");
 }
 
 #[test]
@@ -2033,12 +2116,14 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
             Value::Concrete(ConcreteValue::Int(1)),
         )]),
     )
+    .with_identifier("consumer-id")
     .with_dependency_bindings(BTreeSet::from(["producer".to_string()]));
     let to = Resource::with_provider("aws", "example.Consumer", "consumer-id", None)
         .with_binding("consumer")
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let mut plan = Plan::new();
     plan.add(Effect::Update {
+        identifier: crate::fixture_applied_identifier("consumer-id"),
         from: Box::new(from),
         to: ResolvedResource::new(to),
         changed_attributes: vec!["version".to_string()],
@@ -4175,7 +4260,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         .expect("test state setup must be valid");
     let mut current_states = HashMap::new();
     let desired_ids = HashSet::from([named.id.clone()]);
-    let mut orphans = state_file.build_orphans(&desired_ids);
+    let mut orphans = state_file.build_orphans(&desired_ids).into_plan_orphans();
     let mut prev_explicit = HashMap::new();
     let mut saved_attrs = crate::empty_lifted_saved_attrs();
 
@@ -4462,10 +4547,9 @@ fn validate_passes_when_no_empty_interpolation() {
     );
 }
 
-// carina-rs/carina#2594 / #2596: read_with_retry must short-circuit
-// to State::not_found when the identifier is None. This guarantees a
-// fresh component (no saved state) does not produce an empty-string
-// `GetResource` call against the provider.
+// carina#3913: read_with_retry accepts only a validated provider identifier,
+// so a caller cannot accidentally turn a missing identifier into an
+// identity-less provider read.
 #[cfg(test)]
 mod read_with_retry_identifier_tests {
     use super::*;
@@ -4478,7 +4562,7 @@ mod read_with_retry_identifier_tests {
     /// that `read_with_retry` does *not* call into the provider when
     /// `identifier` is None.
     struct RecordingProvider {
-        calls: Mutex<Vec<(ResourceId, Option<String>)>>,
+        calls: Mutex<Vec<(ResourceId, String)>>,
     }
 
     impl RecordingProvider {
@@ -4497,15 +4581,21 @@ mod read_with_retry_identifier_tests {
         fn read(
             &self,
             id: &ResourceId,
-            identifier: Option<&str>,
+            identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((id.clone(), identifier.map(|s| s.to_string())));
+                .push((id.clone(), identifier.as_str().to_string()));
             let id = id.clone();
-            Box::pin(async move { Ok(State::existing(id, std::collections::HashMap::new())) })
+            let identifier = identifier.clone();
+            Box::pin(async move {
+                Ok(ReadOutcome::found(
+                    AppliedState::new(id, identifier.as_str(), HashMap::new())
+                        .expect("typed read identifier is non-empty"),
+                ))
+            })
         }
 
         fn read_data_source(
@@ -4524,7 +4614,8 @@ mod read_with_retry_identifier_tests {
             let id = id.clone();
             Box::pin(async move {
                 Ok(carina_core::provider::CreateOutcome::Success {
-                    state: State::not_found(id),
+                    state: AppliedState::new(id, "recording-id", HashMap::new())
+                        .expect("fixture identifier is non-empty"),
                 })
             })
         }
@@ -4532,13 +4623,15 @@ mod read_with_retry_identifier_tests {
         fn update(
             &self,
             id: &ResourceId,
-            _identifier: &str,
+            identifier: &carina_core::provider::AppliedIdentifier,
             _request: carina_core::provider::UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             let id = id.clone();
+            let identifier = identifier.to_string();
             Box::pin(async move {
                 Ok(carina_core::provider::UpdateOutcome::Success {
-                    state: State::not_found(id),
+                    state: AppliedState::new(id, identifier, HashMap::new())
+                        .expect("provider input identifier is non-empty"),
                 })
             })
         }
@@ -4546,7 +4639,7 @@ mod read_with_retry_identifier_tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: carina_core::provider::DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
@@ -4562,36 +4655,16 @@ mod read_with_retry_identifier_tests {
     }
 
     #[tokio::test]
-    async fn read_with_retry_short_circuits_when_identifier_is_none() {
-        let provider = RecordingProvider::new();
-        let id = ResourceId::with_provider_identity("awscc", "iam.Role", "fresh", None);
-
-        let state = read_with_retry(&provider, &id, None).await.unwrap();
-
-        assert!(
-            !state.exists,
-            "missing identifier must yield not_found state, not a real read"
-        );
-        assert_eq!(
-            provider.calls.lock().unwrap().len(),
-            0,
-            "provider.read must NOT be called when identifier is None \
-             (regression guard for carina#2594)"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_with_retry_forwards_when_identifier_is_some() {
+    async fn read_with_retry_forwards_validated_identifier() {
         let provider = RecordingProvider::new();
         let id = ResourceId::with_provider_identity("awscc", "iam.Role", "existing", None);
+        let identifier = crate::fixture_applied_identifier("AROABC123");
 
-        let _state = read_with_retry(&provider, &id, Some("AROABC123"))
-            .await
-            .unwrap();
+        let _state = read_with_retry(&provider, &id, &identifier).await.unwrap();
 
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "provider.read must be called exactly once");
-        assert_eq!(calls[0].1.as_deref(), Some("AROABC123"));
+        assert_eq!(calls[0].1, "AROABC123");
     }
 }
 
@@ -4676,7 +4749,7 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
             test_identity(binding),
             None,
         ),
-        identifier: format!("{binding}-old-id"),
+        identifier: crate::fixture_applied_identifier(format!("{binding}-old-id")),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(binding.to_string()),
@@ -4753,7 +4826,7 @@ fn deferred_create_targets_do_not_absorb_deposed_deletes() {
     } = &mut deposed_delete
     {
         *generation = carina_core::effect::EffectGeneration::Deposed(deposed_key.clone());
-        *identifier = "deposed-old-id".to_string();
+        *identifier = crate::fixture_applied_identifier("deposed-old-id");
     } else {
         unreachable!("helper builds Delete");
     }
@@ -6268,8 +6341,9 @@ mod resolved_value_constraint_gate {
     use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
     use carina_core::plan::PlanErrorKind;
     use carina_core::provider::{
-        BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderFactory,
-        ProviderNormalizer, ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest, ready_noop,
+        AppliedIdentifier, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderFactory,
+        ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
+        ready_noop,
     };
     use carina_core::resource::{
         AccessPath, Composition, CompositionArgument, DataSource, InterpolationPart,
@@ -6430,11 +6504,11 @@ mod resolved_value_constraint_gate {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(async move { Ok(ReadOutcome::not_found(id)) })
         }
 
         fn read_data_source(
@@ -6457,7 +6531,7 @@ mod resolved_value_constraint_gate {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unexpected update")) })
@@ -6466,7 +6540,7 @@ mod resolved_value_constraint_gate {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })

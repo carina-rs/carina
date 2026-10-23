@@ -56,9 +56,10 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
 use carina_provider_protocol::jsonrpc::{Notification, Request, Response};
 use carina_provider_protocol::methods;
 use carina_provider_protocol::types::{
-    AttributeType, CompletionValue, CreateRequest, DeleteRequest, OperationConfig, PersistedState,
-    PersistedValue, ProviderError, ProviderErrorKind, ProviderInfo, ReadRequest, Resource,
-    ResourceId, ResourceSchema, State, TypeIdentity, UpdateRequest, Value,
+    AppliedIdentifier, AttributeType, CompletionValue, CreateRequest, DeleteRequest,
+    OperationConfig, PersistedState, PersistedValue, ProviderError, ProviderErrorKind,
+    ProviderInfo, ReadOutcome, ReadRequest, Resource, ResourceId, ResourceSchema, State,
+    TypeIdentity, UpdateRequest, Value,
 };
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -183,19 +184,15 @@ pub trait CarinaProvider {
 
     /// Read current state of a resource.
     ///
-    /// `identifier` is `None` when no prior identifier exists (a fresh
-    /// component, or a newly added resource on top of an existing
-    /// component). In that case the provider MUST return
-    /// [`State::not_found`] without contacting any external API.
-    /// Encoding presence in the type — instead of using `""` as a
-    /// sentinel — makes that contract enforceable at compile time
-    /// (carina-rs/carina#2594 / #2596).
+    /// `identifier` is the validated, non-empty provider identifier of an
+    /// already managed resource. The result distinguishes a missing resource
+    /// from a present observation that also carries a non-empty identifier.
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         request: ReadRequest,
-    ) -> Result<State, ProviderError>;
+    ) -> Result<ReadOutcome, ProviderError>;
 
     /// Read a data source resource.
     ///
@@ -203,9 +200,9 @@ pub trait CarinaProvider {
     /// so the plugin can see user-supplied input attributes (e.g. the
     /// `user_name` for `aws.identitystore.user`).
     ///
-    /// Each provider must implement this explicitly. For zero-input data
-    /// sources (e.g. `aws.sts.caller_identity`), the implementation can
-    /// delegate to a state-only read against `resource.id`.
+    /// Each provider must implement this explicitly. Data sources do not have
+    /// a managed-resource identifier, so implementations must not manufacture
+    /// one merely to delegate to [`CarinaProvider::read`].
     fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError>;
 
     /// Perform one short create step.
@@ -242,7 +239,7 @@ pub trait CarinaProvider {
     fn update(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
 
@@ -254,7 +251,7 @@ pub trait CarinaProvider {
     fn poll_update(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
@@ -267,7 +264,7 @@ pub trait CarinaProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: DeleteRequest,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError>;
 
@@ -279,7 +276,7 @@ pub trait CarinaProvider {
     fn poll_delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: DeleteRequest,
         pending: Pending<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError>;
@@ -591,8 +588,8 @@ fn dispatch(
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.read(&params.id, params.identifier.as_deref(), params.request) {
-                Ok(state) => Response::success(id, methods::ReadResult { state }),
+            match provider.read(&params.id, &params.identifier, params.request) {
+                Ok(outcome) => Response::success(id, methods::ReadResult { outcome }),
                 Err(e) => Response::error(id, -1, e.message),
             }
         }
@@ -732,6 +729,7 @@ fn parse_params<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_provider_protocol::types::{AppliedIdentifier, AppliedState};
 
     #[test]
     fn never_token_decode_always_fails() {
@@ -774,11 +772,11 @@ mod tests {
 
         fn completed_create(id: &ResourceId) -> CreateOutcome<u8> {
             CreateOutcome::Done(protocol::CreateOutcome::Success {
-                state: State {
+                state: AppliedState {
                     id: id.clone(),
-                    identifier: Some("created".to_string()),
+                    identifier: AppliedIdentifier::new("created")
+                        .expect("the test identifier is non-empty"),
                     attributes: HashMap::new(),
-                    exists: true,
                 },
             })
         }
@@ -813,9 +811,9 @@ mod tests {
         fn read(
             &self,
             _id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> Result<State, ProviderError> {
+        ) -> Result<ReadOutcome, ProviderError> {
             unreachable!("read is not used by this test")
         }
 
@@ -856,7 +854,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
         ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
             unreachable!("update is not used by this test")
@@ -865,7 +863,7 @@ mod tests {
         fn poll_update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
             pending: Pending<Self::UpdateToken>,
         ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
@@ -875,7 +873,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: DeleteRequest,
         ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
             unreachable!("delete is not used by this test")
@@ -884,7 +882,7 @@ mod tests {
         fn poll_delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &AppliedIdentifier,
             _request: DeleteRequest,
             pending: Pending<Self::DeleteToken>,
         ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {

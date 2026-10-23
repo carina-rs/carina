@@ -30,7 +30,7 @@ fn app_from_plan_with_effects() {
             "s3.Bucket",
             "old-bucket",
         )),
-        identifier: "old-bucket-id".to_string(),
+        identifier: crate::fixture_applied_identifier("old-bucket-id"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
@@ -76,6 +76,30 @@ fn remove_effect_uses_non_failure_symbol_and_kind() {
          and re-introduces the misread the symbol fix removed"
     );
     assert_eq!(app.nodes[0].kind, EffectKind::Update);
+}
+
+#[test]
+fn removed_plan_shows_each_abandoned_deposed_generation() {
+    let mut plan = Plan::new();
+    let id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+        "mock.test.resource",
+        "r1",
+    ));
+    let key = carina_core::resource::DeposedKey::new_unique();
+    let key_text = key.to_string();
+    plan.add(Effect::Remove { id: id.clone() });
+    plan.abandon_deposed_generation(id, key);
+
+    let app = App::for_plan(&plan, &SchemaRegistry::new());
+
+    assert_eq!(app.nodes.len(), 1);
+    assert!(app.nodes[0].effect_label.contains("r1"));
+    assert_eq!(
+        app.nodes[0].detail_rows,
+        vec![DetailRow::Text {
+            text: format!("abandon deposed generation `{key_text}`"),
+        }]
+    );
 }
 
 #[test]
@@ -148,15 +172,19 @@ fn navigation() {
 fn update_effect_has_detail_rows() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("s3.Bucket", "my-bucket"),
-            [(
-                "versioning".to_string(),
-                Value::Concrete(ConcreteValue::String("Disabled".into())),
-            )]
-            .into_iter()
-            .collect(),
-        )),
+        identifier: crate::fixture_applied_identifier("my-bucket-id"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("s3.Bucket", "my-bucket"),
+                [(
+                    "versioning".to_string(),
+                    Value::Concrete(ConcreteValue::String("Disabled".into())),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .with_identifier("my-bucket-id"),
+        ),
         to: resolved(Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".into())),
@@ -713,15 +741,19 @@ fn move_suppressed_when_update_exists_for_same_target() {
     });
     // Update for the same target
     plan.add(Effect::Update {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("s3.Bucket", "new-name"),
-            [(
-                "versioning".to_string(),
-                Value::Concrete(ConcreteValue::String("Disabled".into())),
-            )]
-            .into_iter()
-            .collect(),
-        )),
+        identifier: crate::fixture_applied_identifier("new-name-id"),
+        from: Box::new(
+            State::existing(
+                ResourceId::with_identity("s3.Bucket", "new-name"),
+                [(
+                    "versioning".to_string(),
+                    Value::Concrete(ConcreteValue::String("Disabled".into())),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .with_identifier("new-name-id"),
+        ),
         to: resolved(Resource::new("s3.Bucket", "new-name").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".into())),

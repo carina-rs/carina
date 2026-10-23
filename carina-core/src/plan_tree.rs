@@ -729,7 +729,7 @@ mod tests {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "ec2.Vpc", "vpc-old",
                 )),
-                identifier: "vpc-123".to_string(),
+                identifier: crate::effect::fixture_applied_identifier("vpc-123"),
                 directives: Directives::default(),
                 binding: Some("vpc_old".to_string()),
                 dependencies: HashSet::from(["internet_gateway".to_string()]),
@@ -792,11 +792,13 @@ mod tests {
             );
         let mut plan = Plan::new();
         plan.add(Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("main"),
             from: Box::new(State::existing(main.id.clone(), HashMap::new())),
             to: resolved(main),
             changed_attributes: vec!["cidr_block".to_string()],
         });
         plan.add(Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("subnet"),
             from: Box::new(State::existing(subnet.id.clone(), HashMap::new())),
             to: resolved(subnet),
             changed_attributes: vec!["cidr_block".to_string()],
@@ -805,7 +807,7 @@ mod tests {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "ec2.Vpc", "main",
             )),
-            identifier: "vpc-old".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("vpc-old"),
             generation: crate::effect::EffectGeneration::Deposed(
                 crate::resource::DeposedKey::new_unique(),
             ),
@@ -867,7 +869,7 @@ mod tests {
                     "route53.Record",
                     "validation_records[0]",
                 )),
-                identifier: "record-0".to_string(),
+                identifier: crate::effect::fixture_applied_identifier("record-0"),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
@@ -887,7 +889,7 @@ mod tests {
                 "route53.Record",
                 "old-record-0",
             )),
-            identifier: "record-0".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("record-0"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -900,7 +902,7 @@ mod tests {
                 "route53.Record",
                 "old-record-abc",
             )),
-            identifier: "record-abc".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("record-abc"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[abc]".to_string()),
@@ -943,7 +945,7 @@ mod tests {
                     "route53.Record",
                     "validation_records[0]",
                 )),
-                identifier: "record-0".to_string(),
+                identifier: crate::effect::fixture_applied_identifier("record-0"),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),

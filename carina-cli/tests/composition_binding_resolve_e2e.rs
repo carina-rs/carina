@@ -100,11 +100,11 @@ impl Provider for NoopProvider {
     fn read(
         &self,
         id: &carina_core::resource::ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ReadOutcome>> {
         let id = id.clone();
-        Box::pin(async move { Ok(carina_core::resource::State::not_found(id)) })
+        Box::pin(async move { Ok(carina_core::provider::ReadOutcome::not_found(id)) })
     }
     fn read_data_source(
         &self,
@@ -121,27 +121,30 @@ impl Provider for NoopProvider {
         let id = id.clone();
         Box::pin(async move {
             Ok(carina_core::provider::CreateOutcome::Success {
-                state: carina_core::resource::State::existing(id, HashMap::new()),
+                state: carina_core::provider::AppliedState::new(id, "mock-id", HashMap::new())
+                    .expect("fixture identifier is non-empty"),
             })
         })
     }
     fn update(
         &self,
         id: &carina_core::resource::ResourceId,
-        _identifier: &str,
+        identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
+        let identifier = identifier.to_string();
         Box::pin(async move {
             Ok(carina_core::provider::UpdateOutcome::Success {
-                state: carina_core::resource::State::existing(id, HashMap::new()),
+                state: carina_core::provider::AppliedState::new(id, identifier, HashMap::new())
+                    .expect("provider input identifier is non-empty"),
             })
         })
     }
     fn delete(
         &self,
         _id: &carina_core::resource::ResourceId,
-        _identifier: &str,
+        _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })

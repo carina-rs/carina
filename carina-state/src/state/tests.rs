@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::resource::DeferredValue;
 use indexmap::IndexMap;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
@@ -134,7 +134,7 @@ fn v14_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     let reloaded = check_and_migrate(&json)
         .expect("reload current state")
         .into_state();
-    let loaded = reloaded.build_state_for_resource(&resource.id);
+    let loaded = reloaded.build_state_for_resource(&resource.id).into_state();
 
     assert_eq!(loaded.attributes.get("authored"), Some(&plain));
     assert_eq!(loaded.attributes.get("provider_only"), Some(&plain));
@@ -785,7 +785,7 @@ fn should_apply_override_returns_apply_legacy_for_pre_phase_5_state() {
 }
 
 #[test]
-fn test_get_identifier_for_resource_from_state() {
+fn test_build_state_for_resource_carries_typed_identifier() {
     use carina_core::resource::Resource;
 
     let mut state = StateFile::new();
@@ -796,19 +796,23 @@ fn test_get_identifier_for_resource_from_state() {
         .expect("test state setup must be valid");
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
-    assert_eq!(
-        state.get_identifier_for_resource(&resource),
-        Some("my-bucket-abcd1234".to_string())
-    );
+    let loaded = state.build_state_for_resource(&resource.id);
+    let ResourceStateLoad::Present(present) = loaded else {
+        panic!("state row must load as present");
+    };
+    assert_eq!(present.identifier().as_str(), "my-bucket-abcd1234");
 }
 
 #[test]
-fn test_get_identifier_for_resource_returns_none() {
+fn test_build_state_for_resource_distinguishes_absent_address() {
     use carina_core::resource::Resource;
 
     let state = StateFile::new();
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
-    assert_eq!(state.get_identifier_for_resource(&resource), None);
+    assert!(matches!(
+        state.build_state_for_resource(&resource.id),
+        ResourceStateLoad::Absent(_)
+    ));
 }
 
 #[test]
@@ -1580,18 +1584,20 @@ fn test_multi_provider_resources_do_not_collide() {
     let found_awscc = state.find_resource("awscc", "s3.Bucket", "main").unwrap();
     assert_eq!(found_awscc.identifier, Some("awscc-bucket-id".to_string()));
 
-    // get_identifier_for_resource should return provider-scoped identifiers
+    // Loaded identifiers remain provider-scoped.
     let aws_res = Resource::with_provider("aws", "s3.Bucket", "main", None);
-    assert_eq!(
-        state.get_identifier_for_resource(&aws_res),
-        Some("aws-bucket-id".to_string())
-    );
+    assert!(matches!(
+        state.build_state_for_resource(&aws_res.id),
+        ResourceStateLoad::Present(ref present)
+            if present.identifier().as_str() == "aws-bucket-id"
+    ));
 
     let awscc_res = Resource::with_provider("awscc", "s3.Bucket", "main", None);
-    assert_eq!(
-        state.get_identifier_for_resource(&awscc_res),
-        Some("awscc-bucket-id".to_string())
-    );
+    assert!(matches!(
+        state.build_state_for_resource(&awscc_res.id),
+        ResourceStateLoad::Present(ref present)
+            if present.identifier().as_str() == "awscc-bucket-id"
+    ));
 
     // Upsert should only update the matching provider's entry
     let updated_aws =
@@ -1697,7 +1703,7 @@ fn test_build_state_for_resource_existing() {
         .expect("test state setup must be valid");
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
-    let result = state.build_state_for_resource(&resource.id);
+    let result = state.build_state_for_resource(&resource.id).into_state();
 
     assert!(result.exists);
     assert_eq!(result.identifier, Some("my-bucket-id".to_string()));
@@ -1724,7 +1730,7 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
         .expect("test state setup must be valid");
 
     let resource = Resource::with_provider("mock", "test.resource", "old", None);
-    let loaded = state.build_state_for_resource(&resource.id);
+    let loaded = state.build_state_for_resource(&resource.id).into_state();
     let saved_attrs = state.build_saved_attrs();
 
     for loaded in [
@@ -1826,7 +1832,7 @@ fn test_build_state_for_resource_not_found() {
     let state = StateFile::new();
     let resource =
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "missing", None);
-    let result = state.build_state_for_resource(&resource.id);
+    let result = state.build_state_for_resource(&resource.id).into_state();
 
     assert!(!result.exists);
     assert!(result.identifier.is_none());
@@ -1848,8 +1854,71 @@ fn test_build_state_for_resource_without_identifier() {
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "pending", None);
     let result = state.build_state_for_resource(&resource.id);
 
-    assert!(!result.exists);
-    assert!(result.identifier.is_none());
+    assert!(matches!(
+        result,
+        ResourceStateLoad::MissingProviderIdentifier(ref state)
+            if state.exists && state.identifier.is_none()
+    ));
+}
+
+#[test]
+fn build_state_for_resource_does_not_hide_current_content_behind_deposed_generations() {
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "current", None);
+    for identifier in [None, Some(String::new())] {
+        let mut row = ResourceState::new("test.resource", "current", "mock")
+            .with_attribute("name", serde_json::json!("current"));
+        row.identifier = identifier;
+        row.binding = Some("current".to_string());
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "old-id".to_string(),
+            None,
+            HashMap::new(),
+            BTreeSet::new(),
+        ));
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
+
+        assert!(matches!(
+            state.build_state_for_resource(&id),
+            ResourceStateLoad::MissingProviderIdentifier(_)
+        ));
+    }
+}
+
+#[test]
+fn removing_last_deposed_generation_retains_malformed_current_instance() {
+    let identity = ResourceIdentity::from("current");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity.clone(), None);
+    let key = DeposedKey::new_unique();
+    let mut row = ResourceState::new("test.resource", identity, "mock")
+        .with_attribute("name", serde_json::json!("current"));
+    row.binding = Some("current".to_string());
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        key.clone(),
+        "old-id".to_string(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+
+    let removed = state.remove_deposed_generation("mock", "test.resource", "current", &key);
+
+    assert!(removed.is_some());
+    let retained = state
+        .find_resource("mock", "test.resource", "current")
+        .expect("malformed current instance must remain visible");
+    assert!(retained.deposed.is_empty());
+    assert!(matches!(
+        state.build_state_for_resource(&id),
+        ResourceStateLoad::MissingProviderIdentifier(_)
+    ));
 }
 
 #[test]
@@ -1909,10 +1978,13 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         .expect("test state setup must be valid");
 
     let desired_ids = std::collections::HashSet::new();
-    let mut orphans = state.build_orphans(&desired_ids);
+    let orphans = state.build_orphans(&desired_ids);
 
     let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "orphan-subnet", None);
-    let orphan = orphans.remove(&id).unwrap();
+    let mut loaded = orphans.into_iter();
+    let (loaded_id, orphan) = loaded.next().expect("orphan remains visible");
+    assert_eq!(loaded_id, id);
+    assert!(loaded.next().is_none());
     let orphan_state = orphan.state();
     assert!(orphan_state.exists);
     assert!(
@@ -1923,8 +1995,8 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         "provider-facing orphan state must not contain host metadata"
     );
     assert_eq!(orphan.binding(), Some("my_subnet"));
-    assert!(orphan.directives().prevent_destroy);
-    assert_eq!(orphan.directives().depends_on, ["security_group"]);
+    assert!(orphan.orphan().directives().prevent_destroy);
+    assert_eq!(orphan.orphan().directives().depends_on, ["security_group"]);
     assert_eq!(
         orphan_state.dependency_bindings,
         BTreeSet::from(["my_vpc".to_string()])
@@ -1943,13 +2015,51 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     let refreshed = orphan.with_refreshed_state(fresh);
     assert_eq!(refreshed.binding(), Some("my_subnet"));
     assert_eq!(refreshed.state().id, id);
-    assert!(refreshed.directives().prevent_destroy);
-    assert_eq!(refreshed.directives().depends_on, ["security_group"]);
+    assert!(refreshed.orphan().directives().prevent_destroy);
+    assert_eq!(
+        refreshed.orphan().directives().depends_on,
+        ["security_group"]
+    );
     assert_eq!(
         refreshed.state().dependency_bindings,
         BTreeSet::from(["my_vpc".to_string()])
     );
     assert!(refreshed.state().attributes.contains_key("cidr_block"));
+}
+
+#[test]
+fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
+    let json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "missing-provider-identifier",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.resource",
+            "identity": "legacy",
+            "provider": "mock",
+            "identifier": null,
+            "attributes": { "name": "legacy" }
+        }],
+        "exports": {}
+    });
+    let state = check_and_migrate(&json.to_string())
+        .expect("load state JSON")
+        .into_state();
+
+    let loaded = state.build_orphans(&HashSet::new());
+
+    let mut entries = loaded.iter();
+    let (loaded_id, orphan) = entries.next().expect("invalid orphan remains visible");
+    assert_eq!(loaded_id, &id);
+    assert!(entries.next().is_none());
+    assert!(matches!(
+        orphan,
+        OrphanStateLoad::MissingProviderIdentifier(_)
+    ));
+    assert!(orphan.state().exists);
+    assert!(orphan.state().identifier.is_none());
 }
 
 #[test]
@@ -2044,7 +2154,8 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     );
     let resolved = ResolvedResource::new(desired);
     let id = resolved.id.clone();
-    let current_states = HashMap::from([(id.clone(), state.build_state_for_resource(&id))]);
+    let current_states =
+        HashMap::from([(id.clone(), state.build_state_for_resource(&id).into_state())]);
     let plan_input_states = carina_core::resource::into_plan_input_map(
         current_states,
         &carina_core::schema::SchemaRegistry::new(),
@@ -2097,7 +2208,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     let generation = carina_core::effect::EffectGeneration::Deposed(row.deposed[0].key.clone());
     let delete = carina_core::effect::Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-        identifier: "resource-old".to_string(),
+        identifier: crate::fixture_applied_identifier("resource-old"),
         generation: generation.clone(),
         directives: Directives::default(),
         binding: None,
@@ -2644,7 +2755,7 @@ fn v9_deposed_entries_round_trip() {
 }
 
 #[test]
-fn check_and_migrate_retains_identifier_none_rows_only_when_deposed_is_non_empty() {
+fn check_and_migrate_retains_identifier_none_rows_for_typed_classification() {
     use super::check_and_migrate;
 
     let json = r#"{
@@ -2687,12 +2798,17 @@ fn check_and_migrate_retains_identifier_none_rows_only_when_deposed_is_non_empty
             .is_some(),
         "identifier=None row must survive while deposed entries remain"
     );
+    let invalid_id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "empty_artifact", None);
     assert!(
         state
             .find_resource("awscc", "ec2.Vpc", "empty_artifact")
-            .is_none(),
-        "identifier=None row with no deposed entries should still be dropped"
+            .is_some(),
+        "an identifier-less managed row must survive loading so planning can fail closed"
     );
+    assert!(matches!(
+        state.build_state_for_resource(&invalid_id),
+        ResourceStateLoad::MissingProviderIdentifier(_)
+    ));
 }
 
 #[test]
@@ -3081,20 +3197,12 @@ fn test_check_and_migrate_no_migration_info_for_current_version() {
     assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
 }
 
-// carina#3266: `state.resources` is managed-only by invariant since
-// #3181, but pre-#3181 carina releases (and an older `carina state
-// refresh` path) persisted `read aws.*` data-source rows here. They
-// share one distinguishing shape — `identifier: null` — because a
-// data source has no provider-side identity to record. They must be
-// pruned at the single read seam so every downstream consumer (apply,
-// destroy, state refresh, plan) sees an invariant-respecting state.
-// In production, the bug surfaced as `state.exports` for a
-// data-source-derived value never converging — the post-apply binding
-// overlay was lifting the stale `arns` value out of the artifact row
-// and writing it straight back. See the issue body for the full
-// repro on `aws/management/identity-center/`.
+// `state.resources` has been managed-only since #3181. Historical releases
+// could persist transient data-source results here. The parser now supplies a
+// typed data-source address at the load boundary, so cleanup can target that
+// exact row without treating every identifier-less managed row as disposable.
 #[test]
-fn check_and_migrate_drops_artifact_rows_with_null_identifier_3266() {
+fn typed_data_source_cleanup_removes_historical_null_identifier_row() {
     use super::check_and_migrate;
 
     let json = r#"{
@@ -3121,17 +3229,19 @@ fn check_and_migrate_drops_artifact_rows_with_null_identifier_3266() {
         ]
     }"#;
 
-    let state = check_and_migrate(json).expect("read").into_state();
-    let kept_identities: Vec<&str> = state
-        .resources
-        .iter()
-        .map(|r| r.identity.as_str())
-        .collect();
-    assert_eq!(
-        kept_identities,
-        vec!["log"],
-        "identifier=None artifact rows must be pruned at read time; \
-         only managed resources with identifiers survive. Got: {kept_identities:?}",
+    let mut state = check_and_migrate(json).expect("read").into_state();
+    let data_source = carina_core::resource::DataSource::with_provider(
+        "aws",
+        "iam.Roles",
+        "admin_access_roles",
+        None,
+    );
+    assert_eq!(state.remove_legacy_data_source_rows(&[data_source]), 1);
+    assert!(state.find_resource("awscc", "s3.Bucket", "log").is_some());
+    assert!(
+        state
+            .find_resource("aws", "iam.Roles", "admin_access_roles")
+            .is_none()
     );
 }
 
@@ -4230,10 +4340,10 @@ fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
     // Reading it under v6 must (a) bump the version to 6 and
     // (b) lift each top-level key to a `Leaf` child of the root
     // `ExplicitFields::Struct`.
-    // carina#3266: production v5 rows carry an identifier (the
-    // provider returns one on every successful apply). The read
-    // path now prunes identifier=None rows as historical artifacts,
-    // so this fixture has to mirror real shape.
+    // carina#3266: production v5 managed rows carry an identifier (the
+    // provider returns one on every successful apply). Historical data-source
+    // rows are pruned later, once the parser supplies their typed addresses;
+    // migration itself must preserve this production-shaped managed row.
     let v5 = r#"{
         "version": 5,
         "serial": 0,
@@ -4277,9 +4387,9 @@ fn current_state_writes_and_reads_full_explicit_tree() {
     // A current-version state file with a nested `explicit` tree
     // round-trips through serde without loss.
     let mut state = StateFile::new();
-    // carina#3266: `check_and_migrate` prunes identifier=None rows
-    // (historical-artifact shape from pre-#3181 data-source writeback).
-    // Production rows always carry an identifier from `from_provider_state`.
+    // carina#3266: current managed rows carry an identifier from the provider's
+    // applied result. Identifier-less historical data-source artifacts are
+    // removed only at the typed configuration/state boundary, not by serde.
     let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "aws").with_identifier("my-bucket");
     rs.explicit = ExplicitFields::Struct {
         children: HashMap::from([(

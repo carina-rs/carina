@@ -16,6 +16,9 @@ mod test_utils;
 #[cfg(test)]
 mod tui_snapshot_tests;
 
+#[cfg(test)]
+use carina_core::provider::fixture_applied_identifier;
+
 use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};

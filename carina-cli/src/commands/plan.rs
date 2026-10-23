@@ -47,6 +47,12 @@ pub struct PlanFile {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 19 carries the validated mutation identifiers introduced in
+    /// format 18 and records malformed deposed generations explicitly
+    /// abandoned by `removed` using only their generation key. Mutation
+    /// identifiers remain JSON strings on disk, but decode through a validated
+    /// newtype, so empty strings in current-version files fail through the
+    /// ordinary corrupt-plan path with re-plan guidance.
     pub version: u32,
     /// Carina version that created this plan
     pub carina_version: String,
@@ -156,7 +162,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 17;
+    pub const CURRENT_VERSION: u32 = 19;
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -355,6 +361,12 @@ impl PlanFile {
                     }
                 }
             }
+        }
+        for (index, (id, _key)) in self.plan.abandoned_deposed_generations().enumerate() {
+            require_identity(
+                id.as_inner(),
+                &format!("plan.abandoned_deposed[{index}].id"),
+            )?;
         }
 
         Ok(())
@@ -588,7 +600,8 @@ mod historical_display_tests {
                 "comment".to_string(),
                 Value::Concrete(ConcreteValue::String(PLAINTEXT.into())),
             )]),
-        );
+        )
+        .with_identifier("masked-update");
         let to = ResolvedResource::new(
             Resource::new("mock.test.resource", "masked-update").with_attribute(
                 "comment",
@@ -600,6 +613,7 @@ mod historical_display_tests {
 
         let mut plan = Plan::new();
         plan.add(Effect::Update {
+            identifier: crate::fixture_applied_identifier("masked-update"),
             from: Box::new(from.clone()),
             to,
             changed_attributes: vec!["comment".to_string()],
@@ -770,6 +784,10 @@ fn build_plan_file<E>(
         .collect();
 
     Ok(PlanFile {
+        // carina#3913: bumped 18→19 — abandoned deposed generations now
+        // serialize only their resource address and generation key. The
+        // removed field was necessarily an invalid empty provider identifier;
+        // reject v18 files so the saved-plan shape stays explicit.
         // carina#3855: bumped 15→16 — unquoted wait RHS identifiers are
         // persisted as typed enum values. A v15 plan may contain the same
         // dotted text as an ordinary String, which cannot be distinguished
@@ -1190,6 +1208,9 @@ pub async fn run_plan(
 
     // T0 fingerprint; see `StateSnapshot` for the TOCTOU rationale.
     let state_snapshot_t0 = StateSnapshot::capture(state_file.as_ref());
+    if let Some(state) = state_file.as_mut() {
+        state.remove_legacy_data_source_rows(&parsed.data_sources);
+    }
 
     // Show bootstrap plan if needed
     if will_create_state_bucket {
@@ -2837,6 +2858,7 @@ mod run_plan_out_tests {
             carina_core::resource::ResolvedResource::new(created_effect),
         ));
         plan.add(Effect::Update {
+            identifier: crate::fixture_applied_identifier("updated-id"),
             from: Box::new(
                 State::existing(updated.id.clone(), HashMap::new()).with_identifier("updated-id"),
             ),

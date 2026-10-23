@@ -754,6 +754,32 @@ impl<'a> TreeRenderContext<'a> {
                     "(remove from state)".dimmed()
                 )
                 .unwrap();
+                let abandoned: Vec<_> = self
+                    .plan
+                    .abandoned_deposed_generations()
+                    .filter(|(abandoned_id, _)| *abandoned_id == id)
+                    .collect();
+                if !abandoned.is_empty() {
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
+                    } else {
+                        let continuation = if is_last {
+                            format!("{}{}", prefix, SPACE_CONTINUATION)
+                        } else {
+                            format!("{}{}", prefix, VERTICAL_CONTINUATION)
+                        };
+                        format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
+                    };
+                    for (_, key) in abandoned {
+                        writeln!(
+                            self.out,
+                            "{}abandon deposed generation `{}`",
+                            attr_prefix, key
+                        )
+                        .unwrap();
+                    }
+                    has_displayed_attrs = true;
+                }
             }
             Effect::Move { from, to } => {
                 // Skip Move line display when an Update/Replace effect already exists

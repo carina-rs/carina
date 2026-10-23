@@ -18,7 +18,9 @@ use tokio::time::Instant;
 
 use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver};
-use crate::provider::{Provider, ProviderError, ReadRequest};
+use crate::provider::{AppliedIdentifier, Provider, ProviderError, ReadRequest};
+#[cfg(test)]
+use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
 use crate::resource::{ResolvedResourceId, ResourceId, State, Value};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
@@ -26,14 +28,20 @@ use crate::wait::WaitObservation;
 use crate::wait::predicate::WaitPredicate;
 
 pub(crate) type WaitIdentifierResolver<'a> =
-    dyn Fn(&ResourceId) -> Option<String> + Send + Sync + 'a;
-pub(crate) type SharedWaitIdentifiers = Arc<Mutex<HashMap<ResourceId, Option<String>>>>;
+    dyn Fn(&ResourceId) -> Option<AppliedIdentifier> + Send + Sync + 'a;
+pub(crate) type SharedWaitIdentifiers = Arc<Mutex<HashMap<ResourceId, Option<AppliedIdentifier>>>>;
 
 fn initial_wait_identifiers(current_states: &HashMap<ResourceId, State>) -> SharedWaitIdentifiers {
     Arc::new(Mutex::new(
         current_states
             .iter()
-            .map(|(id, state)| (id.clone(), state.identifier.clone()))
+            .map(|(id, state)| {
+                let identifier = state
+                    .identifier
+                    .as_deref()
+                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
+                (id.clone(), identifier)
+            })
             .collect(),
     ))
 }
@@ -41,7 +49,7 @@ fn initial_wait_identifiers(current_states: &HashMap<ResourceId, State>) -> Shar
 pub(crate) fn resolve_wait_identifier(
     shared: &SharedWaitIdentifiers,
     target_id: &ResourceId,
-) -> Option<String> {
+) -> Option<AppliedIdentifier> {
     shared
         .lock()
         .expect("wait identifier map poisoned")
@@ -71,7 +79,13 @@ impl AppliedStates {
         self.wait_identifiers
             .lock()
             .expect("wait identifier map poisoned")
-            .insert(id.clone(), state.identifier.clone());
+            .insert(
+                id.clone(),
+                state
+                    .identifier
+                    .as_deref()
+                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok()),
+            );
         self.states.insert(id, state);
     }
 
@@ -416,12 +430,20 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_cadence(
             LoopStep::Abandon => return WaitOutcome::Abandoned,
         };
         let iteration = async {
-            let target_identifier = identifier_resolver(target_id);
+            let Some(target_identifier) = identifier_resolver(target_id) else {
+                return Some(WaitOutcome::ReadFailed(
+                    ProviderError::internal(format!(
+                        "wait target {} has no provider identifier",
+                        target_id
+                    ))
+                    .for_resource(target_id.clone()),
+                ));
+            };
             let state = match provider
-                .read(target_id, target_identifier.as_deref(), ReadRequest)
+                .read(target_id, &target_identifier, ReadRequest)
                 .await
             {
-                Ok(state) => state,
+                Ok(outcome) => outcome.into_state(),
                 Err(err @ ProviderError::NotFound(_)) => {
                     return Some(WaitOutcome::NotFound(err));
                 }
@@ -500,7 +522,8 @@ mod tests {
     use super::*;
     use crate::executor::{ExecutionEvent, ExecutionObserver};
     use crate::provider::{
-        BoxFuture, CreateRequest, DeleteRequest, ProviderResult, ReadRequest, UpdateRequest,
+        AppliedState, BoxFuture, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
+        UpdateRequest,
     };
     use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -511,8 +534,11 @@ mod tests {
 
     const CLEANUP_TEST_BOUND: Duration = Duration::from_secs(1);
 
-    fn no_identifier(_: &ResourceId) -> Option<String> {
-        None
+    fn provider_identifier(_: &ResourceId) -> Option<AppliedIdentifier> {
+        Some(
+            AppliedIdentifier::new("wait-target-id")
+                .expect("fixture provider identifier is non-empty"),
+        )
     }
 
     /// Minimal test provider: returns a queue of pre-canned read
@@ -554,9 +580,10 @@ mod tests {
         fn read(
             &self,
             _id: &ResourceId,
-            _identifier: Option<&str>,
+            identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+            let identifier = identifier.clone();
             Box::pin(async move {
                 {
                     let mut reads = self.reads.lock().unwrap();
@@ -567,9 +594,15 @@ mod tests {
                 }
                 let mut responses = self.responses.lock().unwrap();
                 if responses.len() > 1 {
-                    Ok(responses.remove(0))
+                    Ok(fixture_read_outcome_for_identifier(
+                        responses.remove(0),
+                        &identifier,
+                    ))
                 } else if let Some(last) = responses.last() {
-                    Ok(last.clone())
+                    Ok(fixture_read_outcome_for_identifier(
+                        last.clone(),
+                        &identifier,
+                    ))
                 } else {
                     Err(ProviderError::api_error("no canned response"))
                 }
@@ -592,7 +625,8 @@ mod tests {
             let id = id.clone();
             Box::pin(async move {
                 Ok(crate::provider::CreateOutcome::Success {
-                    state: State::existing(id, HashMap::new()),
+                    state: AppliedState::new(id, "created-id", HashMap::new())
+                        .expect("fixture identifier is non-empty"),
                 })
             })
         }
@@ -600,13 +634,15 @@ mod tests {
         fn update(
             &self,
             id: &ResourceId,
-            _identifier: &str,
+            identifier: &crate::provider::AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             let id = id.clone();
+            let identifier = identifier.to_string();
             Box::pin(async move {
                 Ok(crate::provider::UpdateOutcome::Success {
-                    state: State::existing(id, HashMap::new()),
+                    state: AppliedState::new(id, identifier, HashMap::new())
+                        .expect("provider input identifier is non-empty"),
                 })
             })
         }
@@ -614,7 +650,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &crate::provider::AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async move { Ok(()) })
@@ -709,7 +745,7 @@ mod tests {
                 &cleanup_loop,
                 &provider,
                 &target,
-                &no_identifier,
+                &provider_identifier,
                 &pred,
                 Duration::from_secs(60),
                 Duration::from_secs(60),
@@ -765,7 +801,7 @@ mod tests {
                 &cleanup_loop,
                 &provider,
                 &target,
-                &no_identifier,
+                &provider_identifier,
                 &pred,
                 Duration::from_secs(600),
                 Duration::from_secs(30),
@@ -835,7 +871,7 @@ mod tests {
                     &cleanup_loop,
                     worker_provider.as_ref(),
                     &target,
-                    &no_identifier,
+                    &provider_identifier,
                     &pred,
                     Duration::from_secs(60),
                     Duration::from_secs(60),
@@ -888,7 +924,7 @@ mod tests {
                 &cleanup_loop,
                 &provider,
                 &target,
-                &no_identifier,
+                &provider_identifier,
                 &pred,
                 Duration::from_secs(60),
                 Duration::from_secs(30),
@@ -924,7 +960,7 @@ mod tests {
             &cleanup_loop,
             &provider,
             &target,
-            &no_identifier,
+            &provider_identifier,
             &pred,
             Duration::from_secs(60),
             Duration::from_millis(10),
@@ -959,7 +995,7 @@ mod tests {
             &cleanup_loop,
             &provider,
             &target,
-            &no_identifier,
+            &provider_identifier,
             &pred,
             Duration::from_secs(60),
             Duration::from_millis(1),
@@ -987,7 +1023,7 @@ mod tests {
             &cleanup_loop,
             &provider,
             &target,
-            &no_identifier,
+            &provider_identifier,
             &pred,
             Duration::from_millis(10),
             Duration::from_millis(2),
@@ -1101,7 +1137,7 @@ mod tests {
             &cleanup_loop,
             &provider,
             &target,
-            &no_identifier,
+            &provider_identifier,
             &pred,
             Duration::from_secs(60),
             Duration::from_millis(1),
@@ -1141,7 +1177,7 @@ mod tests {
                 &cleanup_loop,
                 &provider,
                 &target,
-                &no_identifier,
+                &provider_identifier,
                 &pred,
                 Duration::from_secs(60),
                 Duration::from_millis(1),
@@ -1179,7 +1215,7 @@ mod tests {
             &provider,
             "cert_issued",
             &target,
-            &no_identifier,
+            &provider_identifier,
             &pred,
             Duration::from_millis(100),
             Duration::from_millis(1),

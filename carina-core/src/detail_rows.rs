@@ -76,7 +76,7 @@ impl HistoricalDisplayAttributes {
                         DeletedInstanceKey::new(
                             id.as_inner().clone(),
                             generation.clone(),
-                            identifier.clone(),
+                            identifier.to_string(),
                         ),
                         HashMap::new(),
                     );
@@ -102,7 +102,7 @@ impl HistoricalDisplayAttributes {
                 DeletedInstanceKey::new(
                     id.as_inner().clone(),
                     generation.clone(),
-                    identifier.clone(),
+                    identifier.to_string(),
                 ),
                 mask_attributes_using_secret_shape(replacement.previous_attributes, &to.attributes),
             );
@@ -536,7 +536,7 @@ pub fn build_detail_rows_by_instance(
             identifier,
             generation,
             ..
-        } => build_delete_rows(id, identifier, generation, historical_attributes),
+        } => build_delete_rows(id, identifier.as_str(), generation, historical_attributes),
         Effect::Read { resource } => {
             let schema = registry.and_then(|reg| reg.get_for_data_source(resource));
             build_create_rows(
@@ -579,12 +579,9 @@ pub fn delete_identifier_fallback_row(effect: &Effect) -> Option<DetailRow> {
     let Effect::Delete { identifier, .. } = effect else {
         return None;
     };
-    if identifier.is_empty() {
-        return None;
-    }
     Some(DetailRow::Attribute {
         key: "identifier".to_string(),
-        value: render_other(identifier),
+        value: render_other(identifier.to_string()),
         ref_binding: None,
         annotation: None,
     })
@@ -1093,7 +1090,7 @@ pub fn build_replace_detail_rows_from_display(
     let key = DeletedInstanceKey::new(
         id.as_inner().clone(),
         generation.clone(),
-        identifier.clone(),
+        identifier.to_string(),
     );
     let Some(historical_attributes) = historical_display.delete(&key) else {
         return Vec::new();
@@ -2244,6 +2241,9 @@ mod tests {
             Value::Concrete(ConcreteValue::String("Enabled".into())),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["versioning".to_string()],
@@ -2301,6 +2301,9 @@ mod tests {
             .collect(),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["tags".to_string()],
@@ -2360,6 +2363,9 @@ mod tests {
         );
         let from = State::existing(to.id.clone(), HashMap::new());
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["tags".to_string()],
@@ -2446,7 +2452,7 @@ mod tests {
         plan.add(Effect::Create(resolved(to.clone())));
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(to.id.clone()),
-            identifier: "old-widget".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("old-widget"),
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
@@ -2554,6 +2560,9 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("Enabled".into())),
             );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["versioning".to_string()],
@@ -2607,6 +2616,9 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("new-value".into())),
             );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["trigger_diff".to_string()],
@@ -2654,7 +2666,7 @@ mod tests {
         let id = ResourceId::with_identity("s3.Bucket", "old-bucket");
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id.clone()),
-            identifier: "old-bucket".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("old-bucket"),
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -2678,11 +2690,11 @@ mod tests {
     }
 
     #[test]
-    fn delete_identifier_fallback_requires_a_non_empty_delete_effect() {
+    fn delete_identifier_fallback_uses_the_typed_delete_identifier() {
         let id = ResourceId::with_identity("s3.Bucket", "old-bucket");
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id),
-            identifier: "old-bucket".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("old-bucket"),
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
@@ -2703,13 +2715,6 @@ mod tests {
         };
         assert_eq!(key, "identifier");
         assert_eq!(value.plain(), "old-bucket");
-
-        let mut empty_identifier = effect.clone();
-        let Effect::Delete { identifier, .. } = &mut empty_identifier else {
-            unreachable!();
-        };
-        identifier.clear();
-        assert!(delete_identifier_fallback_row(&empty_identifier).is_none());
 
         let create = Effect::Create(resolved(Resource::new("s3.Bucket", "new-bucket")));
         assert!(delete_identifier_fallback_row(&create).is_none());
@@ -2737,6 +2742,9 @@ mod tests {
             Value::Concrete(ConcreteValue::String("test".into())),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["removed_attr".to_string()],
@@ -2760,7 +2768,7 @@ mod tests {
         plan.add(Effect::Create(resolved(to.clone())));
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(to.id.clone()),
-            identifier: "vpc-old".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("vpc-old"),
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
@@ -2814,7 +2822,7 @@ mod tests {
         plan.add(Effect::Create(resolved(to.clone())));
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(to.id.clone()),
-            identifier: "old-widget".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("old-widget"),
             generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
             directives: Default::default(),
             binding: None,
@@ -2848,7 +2856,7 @@ mod tests {
         let delete_key = DeletedInstanceKey::new(
             id.as_inner().clone(),
             generation.clone(),
-            identifier.clone(),
+            identifier.to_string(),
         );
         let persisted = PersistedAttributes::from_persisted_values(HashMap::from([(
             "comment".to_string(),
@@ -2901,6 +2909,9 @@ mod tests {
         );
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["rules".to_string()],
@@ -3049,7 +3060,7 @@ mod tests {
         let id = ResourceId::with_identity("s3.Bucket", "old-bucket");
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id.clone()),
-            identifier: "old-bucket".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("old-bucket"),
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -3097,7 +3108,7 @@ mod tests {
         let id = ResourceId::with_identity("acm.Certificate", "cert");
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id.clone()),
-            identifier: "cert".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("cert"),
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -3890,6 +3901,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
@@ -3938,6 +3952,9 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("new".into())),
             );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
@@ -3981,6 +3998,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
@@ -4020,6 +4040,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
@@ -4081,6 +4104,9 @@ mod tests {
         let to = Resource::new("x.Thing", "t")
             .with_attribute("modes", mk(ConcreteValue::String("On".into())));
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["modes".to_string()],
@@ -4120,6 +4146,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
@@ -4180,6 +4209,9 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("us-east-1".into())),
             );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
@@ -4547,6 +4579,9 @@ mod tests {
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["modes".to_string()],
@@ -4765,6 +4800,9 @@ mod tests {
             )])),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["tags".to_string()],
@@ -4807,6 +4845,9 @@ mod tests {
             )))),
         );
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["password".to_string()],
@@ -5193,6 +5234,9 @@ mod tests {
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                from.id.identity_display().to_string(),
+            ),
             from: Box::new(from),
             to: resolved(to),
             changed_attributes: vec!["modes".to_string()],

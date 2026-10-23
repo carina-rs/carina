@@ -27,9 +27,10 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    BoxFuture, CanonicalCustomTypeValue, CanonicalProviderConfigAttributes, CreateOutcome,
-    CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
-    ProviderReadyConfig, ProviderResult, ReadRequest, SavedAttrs, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, BoxFuture, CanonicalCustomTypeValue, CanonicalProviderConfigAttributes,
+    CreateOutcome, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
+    ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadOutcome, ReadRequest, SavedAttrs,
+    UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
     Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
@@ -1657,9 +1658,9 @@ pub(crate) mod version_checked_bindings {
             &self,
             store: &mut Store<HostState>,
             id: &wit_types::ResourceId,
-            identifier: Option<&str>,
+            identifier: &str,
             request: wit_types::ReadRequest,
-        ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
+        ) -> wasmtime::Result<Result<wit_types::ReadOutcome, wit_types::ProviderError>> {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
                     b.carina_provider_provider()
@@ -3227,7 +3228,7 @@ impl WasmProvider {
             },
             move |outcome, id| {
                 let outcome = wasm_convert::wit_to_core_create_outcome(outcome, &id)?;
-                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                Ok::<_, wasm_convert::WasmAppliedStateDecodeError>(match outcome {
                     wasm_convert::WasmCreateOutcome::Done(outcome) => CreateProgress::Done(outcome),
                     wasm_convert::WasmCreateOutcome::Pending(operation) => {
                         CreateProgress::Pending(Box::new(PendingCreate {
@@ -3267,7 +3268,7 @@ impl WasmProvider {
             },
             move |outcome, id| {
                 let outcome = wasm_convert::wit_to_core_create_outcome(outcome, &id)?;
-                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                Ok::<_, wasm_convert::WasmAppliedStateDecodeError>(match outcome {
                     wasm_convert::WasmCreateOutcome::Done(outcome) => CreateProgress::Done(outcome),
                     wasm_convert::WasmCreateOutcome::Pending(operation) => {
                         CreateProgress::Pending(Box::new(PendingCreate {
@@ -3310,7 +3311,7 @@ impl WasmProvider {
             },
             move |outcome, id| {
                 let outcome = wasm_convert::wit_to_core_update_outcome(outcome, &id)?;
-                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                Ok::<_, wasm_convert::WasmAppliedStateDecodeError>(match outcome {
                     wasm_convert::WasmUpdateOutcome::Done(outcome) => UpdateProgress::Done(outcome),
                     wasm_convert::WasmUpdateOutcome::Pending(operation) => {
                         UpdateProgress::Pending(Box::new(PendingUpdate {
@@ -3359,7 +3360,7 @@ impl WasmProvider {
             },
             move |outcome, id| {
                 let outcome = wasm_convert::wit_to_core_update_outcome(outcome, &id)?;
-                Ok::<_, wasm_convert::WasmValueDecodeError>(match outcome {
+                Ok::<_, wasm_convert::WasmAppliedStateDecodeError>(match outcome {
                     wasm_convert::WasmUpdateOutcome::Done(outcome) => UpdateProgress::Done(outcome),
                     wasm_convert::WasmUpdateOutcome::Pending(operation) => {
                         UpdateProgress::Pending(Box::new(PendingUpdate {
@@ -3478,24 +3479,21 @@ impl Provider for WasmProvider {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &AppliedIdentifier,
         request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let wit_request = wasm_convert::core_to_wit_read_request(&request);
-        let identifier = identifier.map(|s| s.to_string());
+        let identifier = identifier.as_str().to_string();
         let id = id.clone();
         Box::pin(async move {
             let mut locked = LockedStore::acquire(&self.instance, "read").await?;
             let call = with_operation_timeout(
                 "read",
                 self.operation_hard_timeout,
-                self.instance.bindings.call_read(
-                    locked.store(),
-                    &wit_id,
-                    identifier.as_deref(),
-                    wit_request,
-                ),
+                self.instance
+                    .bindings
+                    .call_read(locked.store(), &wit_id, &identifier, wit_request),
             )
             .await?;
             let result = finish_guest_call(
@@ -3506,11 +3504,10 @@ impl Provider for WasmProvider {
                 call,
             )?;
             match result {
-                Ok(wit_state) => {
-                    wasm_convert::wit_to_core_state(&wit_state, &id).map_err(|error| {
+                Ok(wit_outcome) => wasm_convert::wit_to_core_read_outcome(wit_outcome, &id)
+                    .map_err(|error| {
                         wasm_value_decode_provider_error("read", error).for_resource(id.clone())
-                    })
-                }
+                    }),
                 Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
         })
@@ -3573,11 +3570,11 @@ impl Provider for WasmProvider {
     fn update(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
-        let identifier = identifier.to_string();
+        let identifier = identifier.as_str().to_string();
         let budget = self.operation_budget(&id, carina_provider_protocol::OperationKind::Update);
         Box::pin(async move {
             let initial = self.call_update(id.clone(), identifier, request);
@@ -3591,11 +3588,11 @@ impl Provider for WasmProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: &AppliedIdentifier,
         request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
-        let identifier = identifier.to_string();
+        let identifier = identifier.as_str().to_string();
         let budget = self.operation_budget(&id, carina_provider_protocol::OperationKind::Delete);
         Box::pin(async move {
             let initial = self.call_delete(id.clone(), identifier, request);

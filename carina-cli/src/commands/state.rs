@@ -8,14 +8,14 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{Orphans, into_all_prior_states};
+use carina_core::differ::into_all_prior_states;
 use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    self as provider_mod, PersistedAttributes, Provider, ProviderError, ProviderNormalizer,
-    RawSavedAttrs,
+    self as provider_mod, AppliedIdentifier, PersistedAttributes, Provider, ProviderError,
+    ProviderNormalizer, RawSavedAttrs,
 };
 use carina_core::resource::{
     DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
@@ -28,9 +28,9 @@ use carina_core::value::format_value;
 #[cfg(test)]
 use carina_state::LockInfo;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, ResourceState,
-    StateBackend, StateFile, StateUrl, create_backend, create_remote_backend, load_state_from_url,
-    resolve_backend_for_read,
+    BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LoadedOrphans,
+    OrphanStateLoad, ResourceState, ResourceStateLoad, StateBackend, StateFile, StateUrl,
+    create_backend, create_remote_backend, load_state_from_url, resolve_backend_for_read,
 };
 
 use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
@@ -46,7 +46,8 @@ use crate::wiring::{
     DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
     data_source_refresh_bindings, get_provider_with_ctx, prepare_default_provider_ready_config,
     read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
+    reconcile_prefixed_names, refresh_loaded_orphan_with_retry,
+    resolve_data_source_refs_for_refresh,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -473,10 +474,20 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
     for rs in state.resources() {
         let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
         let row_prefix = format!("{}.{} {}", rs.provider, rs.resource_type, display_name);
-        if rs.identifier.is_none() {
-            lines.push(format!("{row_prefix}  (no current instance)"));
-        } else {
-            lines.push(row_prefix.clone());
+        let id = ResourceId::with_provider_identity(
+            rs.provider.clone(),
+            rs.resource_type.clone(),
+            rs.identity.clone(),
+            rs.directives.provider_instance.clone(),
+        );
+        match state.build_state_for_resource(&id) {
+            ResourceStateLoad::Absent(_) => {
+                lines.push(format!("{row_prefix}  (no current instance)"));
+            }
+            ResourceStateLoad::MissingProviderIdentifier(_) => {
+                lines.push(format!("{row_prefix}  (missing provider identifier)"));
+            }
+            ResourceStateLoad::Present(_) => lines.push(row_prefix.clone()),
         }
         for deposed in &rs.deposed {
             lines.push(format!(
@@ -929,6 +940,12 @@ async fn run_state_bucket_delete(
             error,
         }
     })?;
+    let bucket_identifier = AppliedIdentifier::new(bucket_name).map_err(|error| {
+        AppError::InvalidStateBucketProviderIdentifier {
+            bucket_name: bucket_name.to_string(),
+            error,
+        }
+    })?;
     let bucket_id = ResourceId::with_provider_identity(
         backend_provider_name,
         backend_resource_type,
@@ -938,7 +955,7 @@ async fn run_state_bucket_delete(
     match bucket_provider
         .delete(
             &bucket_id,
-            bucket_name,
+            &bucket_identifier,
             carina_core::provider::DeleteRequest::default(),
         )
         .await
@@ -1101,6 +1118,13 @@ async fn run_state_refresh_locked_with_ctx(
     // must advance so the carina#3283 warning text matches reality.
     let mut state_file =
         crate::commands::apply::load_state_persist_if_migrated(backend, lock).await?;
+    crate::commands::apply::prune_legacy_data_source_rows_persist_if_changed(
+        backend,
+        lock,
+        &mut state_file,
+        &parsed.data_sources,
+    )
+    .await?;
 
     if state_file.as_ref().is_none_or(|s| s.resources().is_empty()) {
         let msg = if state_file.is_none() {
@@ -1155,18 +1179,27 @@ async fn run_state_refresh_locked_with_ctx(
     // Read states for all resources using identifier from state.
     // Cancel stops dispatching new reads, then waits for in-flight reads to finish
     // so provider futures are not dropped mid-call.
-    let managed_reads: Vec<(ResourceId, String)> = sorted_resources
-        .iter()
-        .filter_map(|resource| {
-            let identifier = state_file
-                .as_ref()
-                .and_then(|sf| sf.get_identifier_for_resource(resource))?;
-            Some((resource.id.clone(), identifier))
-        })
-        .collect();
+    let mut current_states = HashMap::new();
+    let mut managed_reads = Vec::new();
+    let mut missing_provider_identifier_ids = HashSet::new();
+    if let Some(state_file) = state_file.as_ref() {
+        for resource in &sorted_resources {
+            match state_file.build_state_for_resource(&resource.id) {
+                ResourceStateLoad::Present(present) => {
+                    managed_reads.push((resource.id.clone(), present.identifier().clone()));
+                }
+                ResourceStateLoad::MissingProviderIdentifier(state) => {
+                    warn_missing_provider_identifier(&resource.id);
+                    missing_provider_identifier_ids.insert(resource.id.clone());
+                    current_states.insert(resource.id.clone(), state);
+                }
+                ResourceStateLoad::Absent(_) => {}
+            }
+        }
+    }
     let (managed_states, mut already_refreshed) =
         refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
-    let mut current_states = managed_states;
+    current_states.extend(managed_states);
     match cancel.phase() {
         ShutdownPhase::Running => {}
         ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -1180,13 +1213,19 @@ async fn run_state_refresh_locked_with_ctx(
     // every hydration/lift stage.
     let pre_expansion_desired_ids: HashSet<ResourceId> =
         sorted_resources.iter().map(|r| r.id.clone()).collect();
-    let mut orphans = state_file
+    let loaded_orphans = state_file
         .as_ref()
         .map(|sf| sf.build_orphans(&pre_expansion_desired_ids))
         .unwrap_or_default();
     let (refreshed_orphans, refreshed_orphan_ids) =
-        refresh_orphans_until_cancelled(&provider, orphans, &cancel).await?;
-    orphans = refreshed_orphans;
+        refresh_orphans_until_cancelled(&provider, loaded_orphans, &cancel).await?;
+    for (id, loaded) in refreshed_orphans.iter() {
+        if matches!(loaded, OrphanStateLoad::MissingProviderIdentifier(_)) {
+            warn_missing_provider_identifier(id);
+            missing_provider_identifier_ids.insert(id.clone());
+        }
+    }
+    let mut orphans = refreshed_orphans.into_plan_orphans();
     already_refreshed.extend(refreshed_orphan_ids);
 
     // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
@@ -1394,6 +1433,9 @@ async fn run_state_refresh_locked_with_ctx(
     let mut refresh_counts = StateRefreshCounts::default();
 
     for resource in &resolved_resources {
+        if missing_provider_identifier_ids.contains(&resource.id) {
+            continue;
+        }
         let fresh_state = match current_states.get(&resource.id) {
             Some(s) => s,
             None => continue, // Not in state, skip
@@ -1411,6 +1453,9 @@ async fn run_state_refresh_locked_with_ctx(
 
     // Process orphaned resources (in state but removed from config)
     for orphan_id in &orphan_ids {
+        if missing_provider_identifier_ids.contains(orphan_id.as_inner()) {
+            continue;
+        }
         let fresh_state = match current_states.get(orphan_id.as_inner()) {
             Some(s) => s,
             None => continue,
@@ -1545,7 +1590,7 @@ fn format_state_refresh_summary(
 
 async fn refresh_existing_resources_until_cancelled(
     provider: &dyn Provider,
-    reads: Vec<(ResourceId, String)>,
+    reads: Vec<(ResourceId, AppliedIdentifier)>,
     cancel: &ShutdownToken,
 ) -> Result<(HashMap<ResourceId, State>, HashSet<ResourceId>), AppError> {
     let mut current_states = HashMap::new();
@@ -1574,13 +1619,10 @@ async fn refresh_existing_resources_until_cancelled(
             };
             in_flight.push(async move {
                 let fresh_state = provider
-                    .read(
-                        &id,
-                        Some(identifier.as_str()),
-                        carina_core::provider::ReadRequest,
-                    )
+                    .read(&id, &identifier, carina_core::provider::ReadRequest)
                     .await
-                    .map_err(AppError::Provider)?;
+                    .map_err(AppError::Provider)?
+                    .into_state();
                 Ok((id, fresh_state))
             });
         }
@@ -1648,21 +1690,108 @@ async fn refresh_existing_resources_until_cancelled(
 
 async fn refresh_orphans_until_cancelled(
     provider: &dyn Provider,
-    mut orphans: Orphans,
+    loaded: LoadedOrphans,
     cancel: &ShutdownToken,
-) -> Result<(Orphans, HashSet<ResourceId>), AppError> {
-    let reads = orphans
-        .iter()
-        .filter_map(|(id, orphan)| Some((id.clone(), orphan.state().identifier.clone()?)))
-        .collect();
-    let (states, refreshed) =
-        refresh_existing_resources_until_cancelled(provider, reads, cancel).await?;
-    for (id, state) in states {
-        if let Some(orphan) = orphans.remove(&id) {
-            orphans.insert(orphan.with_refreshed_state(state));
+) -> Result<(LoadedOrphans, HashSet<ResourceId>), AppError> {
+    let mut entries = loaded.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    let mut refreshed_orphans = LoadedOrphans::default();
+    let mut refreshed = HashSet::new();
+    let mut refresh_cancelled = false;
+    let cleanup_loop = cancel.cleanup_aware_loop();
+
+    loop {
+        let cleanup_wait = match cleanup_loop.step() {
+            LoopStep::Continue(wait) => wait,
+            LoopStep::Abandon => {
+                refresh_cancelled = true;
+                break;
+            }
+        };
+        match cleanup_wait.phase() {
+            LoopShutdownPhase::Running => {}
+            LoopShutdownPhase::Graceful => refresh_cancelled = true,
         }
+
+        while !refresh_cancelled && in_flight.len() < 5 {
+            let Some((id, loaded)) = entries.next() else {
+                break;
+            };
+            let provider_read = matches!(&loaded, OrphanStateLoad::Present { .. });
+            in_flight.push(async move {
+                let loaded = refresh_loaded_orphan_with_retry(provider, loaded)
+                    .await
+                    .map_err(AppError::Provider)?;
+                Ok((id, loaded, provider_read))
+            });
+        }
+
+        if in_flight.is_empty() {
+            break;
+        }
+
+        let draining = refresh_cancelled;
+        #[cfg(test)]
+        let next_in_flight = async {
+            if draining {
+                crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                    cancel,
+                )
+                .await;
+            }
+            in_flight.next().await
+        };
+        #[cfg(not(test))]
+        let next_in_flight = in_flight.next();
+        let next = cleanup_wait.until_cleanup_priority(next_in_flight);
+        tokio::pin!(next);
+        let next = if draining {
+            next.await
+        } else {
+            tokio::select! {
+                biased;
+                next = &mut next => next,
+                _ = cancel.cancelled() => {
+                    refresh_cancelled = true;
+                    continue;
+                }
+            }
+        };
+        let result: Result<(ResourceId, OrphanStateLoad, bool), AppError> = match next {
+            CleanupInterrupted::Completed(Some(result)) => result,
+            CleanupInterrupted::Completed(None) => break,
+            CleanupInterrupted::Abandoned => {
+                refresh_cancelled = true;
+                break;
+            }
+        };
+
+        if refresh_cancelled {
+            continue;
+        }
+        let (id, loaded, provider_read) = result?;
+        if provider_read {
+            refreshed.insert(id);
+        }
+        refreshed_orphans.insert(loaded);
     }
-    Ok((orphans, refreshed))
+
+    drop(in_flight);
+    drop(entries);
+    if refresh_cancelled {
+        return Err(AppError::Interrupted);
+    }
+    Ok((refreshed_orphans, refreshed))
+}
+
+fn warn_missing_provider_identifier(id: &ResourceId) {
+    eprintln!(
+        "{}",
+        format!(
+            "Warning: {id}: saved state has no provider identifier and was not refreshed; the row was preserved. Add a `removed` block and apply it, then add an `import` block with the real provider identifier to restore management."
+        )
+        .yellow()
+    );
 }
 
 #[derive(Clone)]
@@ -1716,10 +1845,28 @@ where
             LoopShutdownPhase::Graceful => return Err(AppError::Interrupted),
         }
 
+        let identifier = match AppliedIdentifier::new(target.identifier.as_str()) {
+            Ok(identifier) => identifier,
+            Err(_) => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Warning: {} {}: saved deposed generation {} has no provider identifier and was not refreshed; the generation was preserved. Apply a matching `removed` block to abandon it from state.",
+                        target.id,
+                        deposed_state_marker(&target.key, &target.identifier),
+                        target.key,
+                    )
+                    .yellow()
+                );
+                summary.failed_generations += 1;
+                continue;
+            }
+        };
+
         let read_result = match cleanup_wait
             .until_cleanup_priority(provider.read(
                 &target.id,
-                Some(target.identifier.as_str()),
+                &identifier,
                 carina_core::provider::ReadRequest,
             ))
             .await
@@ -1735,7 +1882,7 @@ where
         }
 
         let fresh_state = match read_result {
-            Ok(fresh_state) => fresh_state,
+            Ok(outcome) => outcome.into_state(),
             Err(err) => {
                 eprintln!(
                     "{}",
@@ -2569,11 +2716,11 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ReadOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(async move { Ok(carina_core::provider::ReadOutcome::not_found(id)) })
         }
 
         fn read_data_source(
@@ -2596,7 +2743,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unexpected update")) })
@@ -2605,7 +2752,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
@@ -2765,23 +2912,27 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            identifier: Option<&str>,
+            identifier: &AppliedIdentifier,
             _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let key = (id.to_string(), identifier.unwrap_or("").to_string());
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ReadOutcome>> {
+            let key = (id.to_string(), identifier.as_str().to_string());
             let result = self
                 .read_results
                 .get(&key)
                 .cloned()
                 .unwrap_or_else(|| panic!("missing deposed refresh result for {:?}", key));
-            Box::pin(async move { result.map_err(ProviderError::internal) })
+            Box::pin(async move {
+                result
+                    .map(carina_core::provider::fixture_read_outcome)
+                    .map_err(ProviderError::internal)
+            })
         }
 
         fn read_data_source(
             &self,
-            resource: &carina_core::provider::ProviderReadyDataSource,
+            _resource: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None, ReadRequest)
+            Box::pin(async { Err(ProviderError::internal("unexpected read_data_source")) })
         }
 
         fn create(
@@ -2795,7 +2946,7 @@ mod tests {
         fn update(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unexpected update")) })
@@ -2804,7 +2955,7 @@ mod tests {
         fn delete(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: &carina_core::provider::AppliedIdentifier,
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
@@ -3087,13 +3238,14 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default()
             .with_saved_attr_hydration()
             .with_read_state(&child.id, "widget-1", refreshed);
-        let (mut orphans, already_refreshed) = refresh_orphans_until_cancelled(
+        let (orphans, already_refreshed) = refresh_orphans_until_cancelled(
             &provider,
             state_file.build_orphans(&desired_ids),
             &ShutdownToken::running(),
         )
         .await
         .expect("production orphan refresh should succeed");
+        let mut orphans = orphans.into_plan_orphans();
         let state_file = Some(state_file);
         let multi =
             indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
@@ -3165,7 +3317,6 @@ mod tests {
             .expect("test state setup must be valid");
 
         let mut shell = ResourceState::new("ec2.Subnet", "abandoned", "awscc");
-        shell.binding = Some("abandoned".to_string());
         shell.deposed.push(deposed_instance(
             deposed_key("dep-shell"),
             "subnet-old",
@@ -3292,6 +3443,21 @@ mod tests {
                 "awscc.ec2.Subnet abandoned  (no current instance)",
                 "awscc.ec2.Subnet abandoned  (deposed dep-shell subnet-old)",
             ]
+        );
+    }
+
+    #[test]
+    fn state_list_distinguishes_malformed_current_instance_from_deposed_shell() {
+        let mut state = StateFile::new();
+        let malformed = ResourceState::new("ec2.Subnet", "malformed", "awscc")
+            .with_attribute("subnet_id", json!("subnet-live"));
+        state
+            .upsert_resource(malformed)
+            .expect("test state setup must be valid");
+
+        assert_eq!(
+            format_state_list(&state),
+            vec!["awscc.ec2.Subnet malformed  (missing provider identifier)"]
         );
     }
 
@@ -4156,7 +4322,7 @@ mod tests {
         assert_eq!(refreshed.deposed[0].identifier, "subnet-prior");
 
         let desired_ids = HashSet::new();
-        let orphans = state.build_orphans(&desired_ids);
+        let orphans = state.build_orphans(&desired_ids).into_plan_orphans();
         let plan = carina_core::differ::create_plan(
             &[],
             &[],

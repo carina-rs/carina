@@ -5,11 +5,12 @@ use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
-    CreateOutcome as CoreCreateOutcome, CreateRequest as CoreCreateRequest,
-    DeleteRequest as CoreDeleteRequest, PatchOp as CorePatchOp, PatchOpKind as CorePatchOpKind,
-    ProviderError as CoreProviderError, ReadRequest as CoreReadRequest,
-    SavedAttrs as CoreSavedAttrs, UpdateOutcome as CoreUpdateOutcome,
-    UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
+    AppliedState as CoreAppliedState, CreateOutcome as CoreCreateOutcome,
+    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
+    PatchOp as CorePatchOp, PatchOpKind as CorePatchOpKind, ProviderError as CoreProviderError,
+    ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
+    UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives, RedactedSecretHash,
@@ -226,6 +227,87 @@ impl fmt::Display for WasmValueDecodeError {
 }
 
 impl std::error::Error for WasmValueDecodeError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedStateOperation {
+    Read,
+    Create,
+    Update,
+}
+
+impl fmt::Display for AppliedStateOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::Create => "create",
+            Self::Update => "update",
+        })
+    }
+}
+
+#[derive(Debug)]
+enum WasmAppliedStateDecodeErrorKind {
+    Attributes(Box<WasmValueDecodeError>),
+    Identifier(EmptyAppliedIdentifier),
+}
+
+/// Failure to decode an existing-resource observation returned across the WIT
+/// boundary.
+///
+/// The operation and request resource ID are host-owned context. This is a
+/// terminal in-repo error: its display contains the complete diagnostic while
+/// `kind` preserves structured classification for tests and callers.
+#[derive(Debug)]
+pub(crate) struct WasmAppliedStateDecodeError {
+    operation: AppliedStateOperation,
+    resource_id: Box<CoreResourceId>,
+    kind: WasmAppliedStateDecodeErrorKind,
+}
+
+impl WasmAppliedStateDecodeError {
+    fn attributes(
+        operation: AppliedStateOperation,
+        resource_id: &CoreResourceId,
+        source: WasmValueDecodeError,
+    ) -> Self {
+        Self {
+            operation,
+            resource_id: Box::new(resource_id.clone()),
+            kind: WasmAppliedStateDecodeErrorKind::Attributes(Box::new(source)),
+        }
+    }
+
+    fn identifier(
+        operation: AppliedStateOperation,
+        resource_id: &CoreResourceId,
+        source: EmptyAppliedIdentifier,
+    ) -> Self {
+        Self {
+            operation,
+            resource_id: Box::new(resource_id.clone()),
+            kind: WasmAppliedStateDecodeErrorKind::Identifier(source),
+        }
+    }
+}
+
+impl fmt::Display for WasmAppliedStateDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            WasmAppliedStateDecodeErrorKind::Attributes(error) => write!(
+                f,
+                "failed to decode WIT {} outcome applied state attributes for resource '{}': {error}",
+                self.operation, self.resource_id
+            ),
+            WasmAppliedStateDecodeErrorKind::Identifier(error) => write!(
+                f,
+                "failed to decode WIT {} outcome applied state identifier for resource '{}': {error}",
+                self.operation, self.resource_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WasmAppliedStateDecodeError {}
 
 // -- Value --
 
@@ -975,21 +1057,6 @@ pub(crate) fn core_to_wit_persisted_state(
     })
 }
 
-pub(crate) fn wit_to_core_persisted_state(
-    state: &wit::PersistedState,
-    id: &CoreResourceId,
-) -> Result<CoreState, WasmValueDecodeError> {
-    let attributes = wit_to_core_persisted_value_map(&state.attributes)?;
-    if !state.exists {
-        return Ok(CoreState::not_found(id.clone()));
-    }
-    let mut core_state = CoreState::existing(id.clone(), attributes);
-    if let Some(ref identifier) = state.identifier {
-        core_state = core_state.with_identifier(identifier);
-    }
-    Ok(core_state)
-}
-
 pub(crate) fn wit_to_core_state(
     state: &wit::State,
     id: &CoreResourceId,
@@ -1003,6 +1070,48 @@ pub(crate) fn wit_to_core_state(
         core_state = core_state.with_identifier(ident);
     }
     Ok(core_state)
+}
+
+fn wit_to_core_applied_state_for_operation(
+    state: wit::AppliedState,
+    id: &CoreResourceId,
+    operation: AppliedStateOperation,
+) -> Result<CoreAppliedState, WasmAppliedStateDecodeError> {
+    let wit::AppliedState {
+        identifier,
+        attributes,
+    } = state;
+    let attributes = wit_to_core_value_map(&attributes)
+        .map_err(|source| WasmAppliedStateDecodeError::attributes(operation, id, source))?;
+    CoreAppliedState::new(id.clone(), identifier, attributes)
+        .map_err(|source| WasmAppliedStateDecodeError::identifier(operation, id, source))
+}
+
+fn wit_to_core_applied_persisted_state(
+    state: wit::AppliedPersistedState,
+    id: &CoreResourceId,
+) -> Result<CoreAppliedState, WasmAppliedStateDecodeError> {
+    let wit::AppliedPersistedState {
+        identifier,
+        attributes,
+    } = state;
+    let operation = AppliedStateOperation::Update;
+    let attributes = wit_to_core_persisted_value_map(&attributes)
+        .map_err(|source| WasmAppliedStateDecodeError::attributes(operation, id, source))?;
+    CoreAppliedState::new(id.clone(), identifier, attributes)
+        .map_err(|source| WasmAppliedStateDecodeError::identifier(operation, id, source))
+}
+
+pub(crate) fn wit_to_core_read_outcome(
+    outcome: wit::ReadOutcome,
+    id: &CoreResourceId,
+) -> Result<CoreReadOutcome, WasmAppliedStateDecodeError> {
+    match outcome {
+        wit::ReadOutcome::NotFound => Ok(CoreReadOutcome::not_found(id.clone())),
+        wit::ReadOutcome::Found(state) => Ok(CoreReadOutcome::found(
+            wit_to_core_applied_state_for_operation(state, id, AppliedStateOperation::Read)?,
+        )),
+    }
 }
 
 struct PendingToken(String);
@@ -1101,20 +1210,35 @@ pub(crate) enum WasmDeleteOutcome {
 pub(crate) fn wit_to_core_create_outcome(
     outcome: wit::CreateOutcome,
     id: &CoreResourceId,
-) -> Result<WasmCreateOutcome, WasmValueDecodeError> {
+) -> Result<WasmCreateOutcome, WasmAppliedStateDecodeError> {
     match outcome {
         wit::CreateOutcome::Success(state) => Ok(WasmCreateOutcome::Done(Box::new(
             CoreCreateOutcome::Success {
-                state: wit_to_core_state(&state, id)?,
+                state: wit_to_core_applied_state_for_operation(
+                    state,
+                    id,
+                    AppliedStateOperation::Create,
+                )?,
             },
         ))),
-        wit::CreateOutcome::PartialSuccess(partial) => Ok(WasmCreateOutcome::Done(Box::new(
-            CoreCreateOutcome::partial_success(
-                wit_to_core_state(&partial.state, id)?,
-                partial.diagnostic.reason,
-                partial.diagnostic.missing_attributes,
-            ),
-        ))),
+        wit::CreateOutcome::PartialSuccess(partial) => {
+            let wit::CreatePartialSuccess { state, diagnostic } = partial;
+            let wit::PartialReadDiagnostic {
+                reason,
+                missing_attributes,
+            } = diagnostic;
+            Ok(WasmCreateOutcome::Done(Box::new(
+                CoreCreateOutcome::partial_success(
+                    wit_to_core_applied_state_for_operation(
+                        state,
+                        id,
+                        AppliedStateOperation::Create,
+                    )?,
+                    reason,
+                    missing_attributes,
+                ),
+            )))
+        }
         wit::CreateOutcome::Pending(pending) => Ok(WasmCreateOutcome::Pending(
             CreatePendingOperation(PendingOperation::from_wit(pending)),
         )),
@@ -1124,20 +1248,27 @@ pub(crate) fn wit_to_core_create_outcome(
 pub(crate) fn wit_to_core_update_outcome(
     outcome: wit::UpdateOutcome,
     id: &CoreResourceId,
-) -> Result<WasmUpdateOutcome, WasmValueDecodeError> {
+) -> Result<WasmUpdateOutcome, WasmAppliedStateDecodeError> {
     match outcome {
         wit::UpdateOutcome::Success(state) => Ok(WasmUpdateOutcome::Done(Box::new(
             CoreUpdateOutcome::Success {
-                state: wit_to_core_persisted_state(&state, id)?,
+                state: wit_to_core_applied_persisted_state(state, id)?,
             },
         ))),
-        wit::UpdateOutcome::PartialSuccess(partial) => Ok(WasmUpdateOutcome::Done(Box::new(
-            CoreUpdateOutcome::partial_success(
-                wit_to_core_persisted_state(&partial.state, id)?,
-                partial.diagnostic.reason,
-                partial.diagnostic.missing_attributes,
-            ),
-        ))),
+        wit::UpdateOutcome::PartialSuccess(partial) => {
+            let wit::UpdatePartialSuccess { state, diagnostic } = partial;
+            let wit::PartialReadDiagnostic {
+                reason,
+                missing_attributes,
+            } = diagnostic;
+            Ok(WasmUpdateOutcome::Done(Box::new(
+                CoreUpdateOutcome::partial_success(
+                    wit_to_core_applied_persisted_state(state, id)?,
+                    reason,
+                    missing_attributes,
+                ),
+            )))
+        }
         wit::UpdateOutcome::Pending(pending) => Ok(WasmUpdateOutcome::Pending(
             UpdatePendingOperation(PendingOperation::from_wit(pending)),
         )),
@@ -1844,6 +1975,73 @@ fn proto_input_mode_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_outcome_rejects_empty_identifier_with_typed_context() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let outcome = wit::ReadOutcome::Found(wit::AppliedState {
+            identifier: String::new(),
+            attributes: Vec::new(),
+        });
+
+        let error = wit_to_core_read_outcome(outcome, &id)
+            .expect_err("an existing read must not accept an empty identifier");
+
+        let message = error.to_string();
+        assert!(message.contains("read"), "{message}");
+        assert!(message.contains(&id.to_string()), "{message}");
+        assert!(matches!(
+            &error.kind,
+            WasmAppliedStateDecodeErrorKind::Identifier(EmptyAppliedIdentifier)
+        ));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn create_outcome_rejects_empty_applied_identifier_with_typed_context() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let outcome = wit::CreateOutcome::Success(wit::AppliedState {
+            identifier: String::new(),
+            attributes: Vec::new(),
+        });
+
+        let error = match wit_to_core_create_outcome(outcome, &id) {
+            Err(error) => error,
+            Ok(_) => panic!("a successful create must not accept an empty identifier"),
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("create"), "{message}");
+        assert!(message.contains(&id.to_string()), "{message}");
+        assert!(matches!(
+            &error.kind,
+            WasmAppliedStateDecodeErrorKind::Identifier(EmptyAppliedIdentifier)
+        ));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn update_outcome_rejects_empty_applied_identifier_with_typed_context() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let outcome = wit::UpdateOutcome::Success(wit::AppliedPersistedState {
+            identifier: String::new(),
+            attributes: Vec::new(),
+        });
+
+        let error = match wit_to_core_update_outcome(outcome, &id) {
+            Err(error) => error,
+            Ok(_) => panic!("a successful update must not accept an empty identifier"),
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("update"), "{message}");
+        assert!(message.contains(&id.to_string()), "{message}");
+        assert!(matches!(
+            &error.kind,
+            WasmAppliedStateDecodeErrorKind::Identifier(EmptyAppliedIdentifier)
+        ));
+        assert!(std::error::Error::source(&error).is_none());
+    }
 
     #[test]
     fn pending_token_debug_is_redacted() {
@@ -3550,9 +3748,9 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v8_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 8);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 8);
+    fn test_protocol_version_range_is_v9_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 9);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 9);
     }
 
     #[test]

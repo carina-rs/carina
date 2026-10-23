@@ -3,6 +3,14 @@ use super::{create_plan_for_tests as create_plan, *};
 use crate::resource::ConcreteValue;
 use indexmap::IndexMap;
 
+fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
+    let identifier = id
+        .identity_str()
+        .expect("fixture resource identity must be resolved")
+        .to_string();
+    State::existing(id, attributes).with_identifier(identifier)
+}
+
 fn replacement_metadata<'a>(
     plan: &'a Plan,
     id: &ResourceId,
@@ -34,7 +42,7 @@ fn diff_no_change_when_same() {
         "region".to_string(),
         Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     );
-    let current = State::existing(ResourceId::with_identity("bucket", "test"), attrs);
+    let current = existing_state(ResourceId::with_identity("bucket", "test"), attrs);
 
     let result = diff_test(&desired, &current, None, None, None);
     assert!(matches!(result, Diff::NoChange(_)));
@@ -52,7 +60,7 @@ fn diff_update_when_different() {
         "region".to_string(),
         Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     );
-    let current = State::existing(ResourceId::with_identity("bucket", "test"), attrs);
+    let current = existing_state(ResourceId::with_identity("bucket", "test"), attrs);
 
     let result = diff_test(&desired, &current, None, None, None);
     match result {
@@ -94,7 +102,7 @@ fn diff_reports_string_list_vs_generic_string_list_shape_mismatch() {
             ConcreteValue::Map(statement),
         )])),
     )])));
-    let current = State::existing(
+    let current = existing_state(
         desired.id.clone(),
         HashMap::from([("policy_document".to_string(), current_policy)]),
     );
@@ -125,7 +133,7 @@ fn create_plan_from_resources() {
     );
     current_states.insert(
         ResourceId::with_identity("bucket", "existing-bucket"),
-        State::existing(
+        existing_state(
             ResourceId::with_identity("bucket", "existing-bucket"),
             attrs,
         ),
@@ -234,7 +242,7 @@ fn diff_update_when_list_of_maps_changed() {
             ConcreteValue::Map(ingress1),
         )])),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("ec2_security_group", "test-sg"),
         current_attrs,
     );
@@ -261,7 +269,7 @@ fn create_plan_detects_typed_orphan_for_deletion() {
     // "keep-this" exists and matches
     current_states.insert(
         ResourceId::with_identity("bucket", "keep-this"),
-        State::existing(
+        existing_state(
             ResourceId::with_identity("bucket", "keep-this"),
             HashMap::new(),
         ),
@@ -274,7 +282,7 @@ fn create_plan_detects_typed_orphan_for_deletion() {
     );
     let orphan_id = ResourceId::with_identity("bucket", "orphaned-bucket");
     let orphans = Orphans::from([Orphan::new(
-        State::existing(orphan_id, orphan_attrs),
+        existing_state(orphan_id, orphan_attrs),
         None,
         Directives::default(),
     )]);
@@ -332,7 +340,7 @@ fn read_only_resource_always_generates_read_effect() {
     );
     current_states.insert(
         ResourceId::with_identity("bucket", "existing-bucket"),
-        State::existing(
+        existing_state(
             ResourceId::with_identity("bucket", "existing-bucket"),
             attrs,
         ),
@@ -377,7 +385,7 @@ fn no_false_update_without_unique_name_attribute() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    let current = State::existing(ResourceId::with_identity("ec2.Vpc", "vpc"), attrs);
+    let current = existing_state(ResourceId::with_identity("ec2.Vpc", "vpc"), attrs);
 
     let result = diff_test(&desired, &current, None, None, None);
     assert!(
@@ -404,7 +412,7 @@ fn replace_when_create_only_attr_changed() {
     );
     current_states.insert(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+        existing_state(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // Build schema with cidr_block marked as create-only
@@ -457,7 +465,7 @@ fn normal_update_when_non_create_only_attr_changed() {
     );
     current_states.insert(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+        existing_state(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // cidr_block is create-only, but enable_dns_support is not
@@ -525,7 +533,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     );
     current_states.insert(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+        existing_state(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -593,7 +601,7 @@ fn replace_carries_create_before_destroy_directives() {
     );
     current_states.insert(
         ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+        existing_state(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -679,7 +687,7 @@ fn diff_no_change_when_list_of_maps_reordered() {
             Value::Concrete(ConcreteValue::Map(rule1)),
         ])),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("ec2_security_group", "test-sg"),
         current_attrs,
     );
@@ -713,7 +721,7 @@ fn replace_with_provider_prefixed_schema_key() {
     );
     current_states.insert(
         ResourceId::with_provider_identity("awscc", "ec2.Vpc", "my-vpc", None),
-        State::existing(
+        existing_state(
             ResourceId::with_provider_identity("awscc", "ec2.Vpc", "my-vpc", None),
             attrs,
         ),
@@ -787,7 +795,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
             ),
         ]))),
     )]);
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("ec2.Subnet", "test-subnet"),
         current_attrs,
     );
@@ -854,7 +862,7 @@ fn diff_detects_drift_on_unmanaged_field() {
             ),
         ]))),
     )]);
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("ec2.Subnet", "test-subnet"),
         current_attrs,
     );
@@ -923,7 +931,7 @@ fn diff_no_change_when_bare_struct_with_extra_fields() {
             ),
         ]))),
     )]);
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("ec2.Subnet", "test-subnet"),
         current_attrs,
     );
@@ -977,7 +985,7 @@ fn diff_works_without_saved_state() {
             ("c".to_string(), Value::Concrete(ConcreteValue::Int(3))),
         ]))),
     )]);
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_identity("ec2.Subnet", "test-subnet"),
         current_attrs,
     );
@@ -1000,7 +1008,7 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
     let desired = vec![];
 
     let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
-    let orphan_state = State::existing(orphan_id.clone(), HashMap::new())
+    let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
         .with_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
     let orphans = crate::differ::Orphans::from([Orphan::new(
         orphan_state,
@@ -1199,7 +1207,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
             ]))),
         ])),
     )]);
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_provider_identity("awscc", "ec2.SecurityGroup", "test-sg", None),
         current_attrs,
     );
@@ -1347,7 +1355,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
             "security_group_egress",
             Value::Concrete(ConcreteValue::List(vec![item_a.clone(), item_b.clone()])),
         );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_provider_identity("awscc", "ec2.SecurityGroup", "test-sg", None),
         HashMap::from([(
             "security_group_egress".to_string(),
@@ -1435,7 +1443,7 @@ fn diff_no_change_for_compound_word_dsl_alias() {
         "object_ownership".to_string(),
         Value::Concrete(ConcreteValue::String("BucketOwnerEnforced".into())),
     );
-    let current = State::existing(
+    let current = existing_state(
         ResourceId::with_provider_identity("aws", "s3.BucketOwnershipControls", "test", None),
         attrs,
     );

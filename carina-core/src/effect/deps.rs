@@ -605,7 +605,8 @@ mod tests {
     use crate::resource::{ResolvedResource, ResolvedResourceId, ResourceIdentity, State, Value};
 
     fn state_for(id: &ResourceId) -> State {
-        State::not_found(id.clone())
+        State::existing(id.clone(), Default::default())
+            .with_identifier(id.identity_display().to_string())
     }
 
     fn update_effect(binding: &'static str, refs: &[(&str, &str)], changed: &[&str]) -> Effect {
@@ -618,6 +619,9 @@ mod tests {
             );
         }
         Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier(
+                resource.id.identity_display().to_string(),
+            ),
             from: Box::new(state_for(&resource.id)),
             to: ResolvedResource::new(resource),
             changed_attributes: changed.iter().map(|s| (*s).to_string()).collect(),
@@ -637,7 +641,7 @@ mod tests {
     ) -> Effect {
         Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", identity)),
-            identifier: format!("{identity}-id"),
+            identifier: crate::effect::fixture_applied_identifier(format!("{identity}-id")),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(identity.to_string()),
@@ -700,7 +704,7 @@ mod tests {
     fn effect_identity_returns_system_hash_for_anonymous_effect() {
         let anonymous = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "anon_1234")),
-            identifier: "anonymous-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("anonymous-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
@@ -883,7 +887,7 @@ mod tests {
     fn blocked_by_if_delete_resolves_anonymous_delete_through_identity_index() {
         let delete = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
-            identifier: "foo-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("foo-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
@@ -922,7 +926,7 @@ mod tests {
     fn string_ref_resolves_to_anonymous_delete_via_identity_match() {
         let delete = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
-            identifier: "foo-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("foo-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
@@ -957,7 +961,7 @@ mod tests {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "parent",
             )),
-            identifier: "parent-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("parent-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some("parent".to_string()),
@@ -969,7 +973,7 @@ mod tests {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "child",
             )),
-            identifier: "child-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("child-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some("child".to_string()),
@@ -994,7 +998,7 @@ mod tests {
     fn destroy_wait_alias_bridges_target_to_consumers() {
         let cert = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "cert")),
-            identifier: "cert-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("cert-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some("cert".to_string()),
@@ -1006,7 +1010,7 @@ mod tests {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "listener",
             )),
-            identifier: "listener-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("listener-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some("listener".to_string()),
@@ -1105,7 +1109,7 @@ mod tests {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "listener",
             )),
-            identifier: "listener-id".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("listener-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some("listener".to_string()),
@@ -1128,7 +1132,7 @@ mod tests {
     fn deposed_delete_and_current_create_same_identity_have_no_replacement_edge() {
         let delete = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "thing")),
-            identifier: "thing-old".to_string(),
+            identifier: crate::effect::fixture_applied_identifier("thing-old"),
             generation: crate::effect::EffectGeneration::Deposed(
                 crate::resource::DeposedKey::new_unique(),
             ),
