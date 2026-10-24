@@ -94,12 +94,50 @@ fn assert_plan_counts(output: &Output, add: usize, change: usize, destroy: usize
 }
 
 fn resource_by_identity<'a>(state: &'a Value, identity: &str) -> &'a Value {
-    state["resources"]
+    let resource = state["resources"]
         .as_array()
         .expect("state resources")
         .iter()
         .find(|resource| resource["identity"] == identity)
-        .unwrap_or_else(|| panic!("missing state resource {identity:?}: {state:#}"))
+        .unwrap_or_else(|| panic!("missing state resource {identity:?}: {state:#}"));
+    &resource["current"]
+}
+
+fn downgrade_state_to_v13(state: &mut Value) {
+    state["version"] = Value::from(13);
+    for row in state["resources"].as_array_mut().expect("state resources") {
+        let row_object = row.as_object_mut().expect("state resource row");
+        let current = row_object
+            .remove("current")
+            .expect("v15 row has a current instance");
+        let mut current = current
+            .as_object()
+            .expect("current instance object")
+            .clone();
+        assert_eq!(
+            current.remove("kind"),
+            Some(Value::String("applied".to_string())),
+            "legacy-secret fixtures start from applied rows"
+        );
+        row_object.insert(
+            "identifier".to_string(),
+            current.remove("identifier").expect("applied identifier"),
+        );
+        row_object.insert(
+            "attributes".to_string(),
+            current.remove("attributes").expect("applied attributes"),
+        );
+        if let Some(value) = current.remove("write_only_attributes") {
+            row_object.insert("write_only_attributes".to_string(), value);
+        }
+        if let Some(value) = current.remove("partial_read") {
+            row_object.insert("partial_read".to_string(), value);
+        }
+        assert!(
+            current.is_empty(),
+            "unexpected v15 current fields: {current:?}"
+        );
+    }
 }
 
 fn comment_digest(state: &Value, identity: &str) -> String {
@@ -251,7 +289,7 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
         &Value::String("MOVED_LEGACY_PLAIN".to_string()),
         "mock.test.resource",
@@ -349,7 +387,7 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
         &Value::String("ORPHAN_REKEY_LEGACY_PLAIN".to_string()),
         "mock.test.resource",
@@ -414,7 +452,7 @@ let old = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     state["resources"][0]["attributes"]["comment"] = Value::String(legacy_marker(
         &Value::String("ROUND_TWO_SAME_PLAIN".to_string()),
         "mock.test.resource",
@@ -492,7 +530,7 @@ mock.example.consumer {
     );
 
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     let old_identity = state["resources"][0]["identity"]
         .as_str()
         .expect("anonymous state identity")
@@ -592,7 +630,7 @@ let legacy = mock.test.resource {
     );
 
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
@@ -670,7 +708,7 @@ let legacy_plan = mock.test.resource {
     );
 
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
@@ -737,7 +775,7 @@ let legacy_changed = mock.test.resource {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")
@@ -786,7 +824,7 @@ let legacy_role = mock.iam.Role {
         &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
     );
     let mut state = scenario.state_json();
-    state["version"] = Value::from(13);
+    downgrade_state_to_v13(&mut state);
     let resource = state["resources"]
         .as_array_mut()
         .expect("state resources")

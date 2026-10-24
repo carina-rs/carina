@@ -31,6 +31,9 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             | PlanErrorKind::WaitTargetMissing { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. }
             | PlanErrorKind::ResolvedValueConstraint { .. }
+            | PlanErrorKind::CreateInFlightOrphan
+            | PlanErrorKind::DestroyCreateInFlight
+            | PlanErrorKind::ResumeCreateRoutingMismatch { .. }
             | PlanErrorKind::ModuleConstraint(_) => other_count += 1,
         }
     }

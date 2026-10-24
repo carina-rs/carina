@@ -6,7 +6,7 @@ use serde::de::Error as DeError;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::PERSISTED_SECRET_KEY;
 
@@ -412,6 +412,12 @@ pub struct AppliedState {
     pub attributes: HashMap<String, Value>,
 }
 
+impl AppliedState {
+    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, HashMap<String, Value>) {
+        (self.id, self.identifier, self.attributes)
+    }
+}
+
 /// Persisted-value state observed after a successful update mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppliedPersistedState {
@@ -433,6 +439,269 @@ pub struct AppliedPersistedState {
 pub enum ReadOutcome {
     NotFound { id: ResourceId },
     Found { state: AppliedState },
+}
+
+impl ReadOutcome {
+    pub fn into_found(self) -> Option<AppliedState> {
+        match self {
+            Self::Found { state } => Some(state),
+            Self::NotFound { id: _id } => None,
+        }
+    }
+}
+
+/// Opaque provider continuation persisted for an unfinished create.
+///
+/// Its payload is deliberately absent from `Debug`, and this type has no
+/// `Display` implementation. Serialization exists only because create tokens
+/// cross the WIT boundary and are persisted in state.
+///
+/// ```compile_fail
+/// use carina_provider_protocol::PendingToken;
+///
+/// let token = PendingToken::new("opaque");
+/// let _ = format!("{token}");
+/// ```
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PendingToken(String);
+
+impl PendingToken {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// Expose the token only when handing it back to the provider that owns it.
+    pub fn expose_for_provider_call(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PendingToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingToken([REDACTED])")
+    }
+}
+
+/// Top-level request attributes carried by the create request accepted by the
+/// cloud API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "attributes")]
+pub enum Sent {
+    AllRequestAttributes,
+    Only(BTreeSet<String>),
+}
+
+impl Sent {
+    pub fn only<I, S>(attributes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Only(attributes.into_iter().map(Into::into).collect())
+    }
+
+    pub fn names<'a>(&'a self, request_attributes: &'a BTreeSet<String>) -> &'a BTreeSet<String> {
+        match self {
+            Self::AllRequestAttributes => request_attributes,
+            Self::Only(attributes) => attributes,
+        }
+    }
+
+    pub fn is_valid_for(&self, request_attributes: &BTreeSet<String>) -> bool {
+        match self {
+            Self::AllRequestAttributes => true,
+            Self::Only(attributes) => attributes.is_subset(request_attributes),
+        }
+    }
+
+    /// Restrict an explicit sent set to request attribute names. Returns
+    /// whether the original set was already valid.
+    pub fn clip_to(&mut self, request_attributes: &BTreeSet<String>) -> bool {
+        if self.is_valid_for(request_attributes) {
+            return true;
+        }
+        let Self::Only(attributes) = self else {
+            return true;
+        };
+        attributes.retain(|attribute| request_attributes.contains(attribute));
+        false
+    }
+}
+
+/// Provider observation made while completing a create.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum Observation<R, E> {
+    Read(R),
+    ReadFailed(E),
+}
+
+/// An unfinished initial create, including the immutable `sent` declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCreate<T> {
+    pub token: T,
+    pub identifier: Option<AppliedIdentifier>,
+    pub sent: Sent,
+    pub poll_after_secs: u32,
+}
+
+impl<T> PendingCreate<T> {
+    pub fn token(&self) -> &T {
+        &self.token
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        self.identifier.as_ref()
+    }
+
+    pub fn sent(&self) -> &Sent {
+        &self.sent
+    }
+
+    pub fn poll_after_secs(&self) -> u32 {
+        self.poll_after_secs
+    }
+
+    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, Sent, u32) {
+        (self.token, self.identifier, self.sent, self.poll_after_secs)
+    }
+}
+
+/// An unfinished resumed create. Sent values stay in the persisted envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumePending<T> {
+    pub token: T,
+    pub identifier: Option<AppliedIdentifier>,
+    pub poll_after_secs: u32,
+}
+
+impl<T> ResumePending<T> {
+    pub fn token(&self) -> &T {
+        &self.token
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        self.identifier.as_ref()
+    }
+
+    pub fn poll_after_secs(&self) -> u32 {
+        self.poll_after_secs
+    }
+
+    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, u32) {
+        (self.token, self.identifier, self.poll_after_secs)
+    }
+}
+
+/// One provider step for an ordinary create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateStep<A, D, T> {
+    Success {
+        identifier: AppliedIdentifier,
+        attributes: A,
+    },
+    PartialSuccess {
+        identifier: AppliedIdentifier,
+        attributes: A,
+        diagnostic: D,
+    },
+    Pending(PendingCreate<T>),
+}
+
+/// Failure payload for a create that is known to have produced a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedFailure<R, E> {
+    pub identifier: AppliedIdentifier,
+    pub observation: Observation<R, E>,
+    pub sent: Sent,
+    pub error: E,
+}
+
+impl<R, E> CreatedFailure<R, E> {
+    pub fn into_parts(self) -> (AppliedIdentifier, Observation<R, E>, Sent, E) {
+        (self.identifier, self.observation, self.sent, self.error)
+    }
+}
+
+/// Plain wire verdict from an initial create.
+///
+/// This transport enum carries no typestate or provenance guarantee. The SDK
+/// and native core adapters enforce create classification before converting
+/// their opaque verdict types into this wire representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateVerdict<R, E> {
+    Untracked(E),
+    Created(CreatedFailure<R, E>),
+    Discarded(E),
+}
+
+/// Plain wire verdict from polling a create. Classification is enforced by
+/// the SDK or native core adapter before this value is encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollVerdict<R, E> {
+    Untracked(E),
+    Created(CreatedFailure<R, E>),
+    Discarded(E),
+    Undetermined(E),
+}
+
+impl<R, E> From<CreateVerdict<R, E>> for PollVerdict<R, E> {
+    fn from(verdict: CreateVerdict<R, E>) -> Self {
+        match verdict {
+            CreateVerdict::Untracked(error) => Self::Untracked(error),
+            CreateVerdict::Created(created) => Self::Created(created),
+            CreateVerdict::Discarded(error) => Self::Discarded(error),
+        }
+    }
+}
+
+/// Failure payload for an issued create resumed from persisted state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumedFailure<R, E> {
+    pub identifier: AppliedIdentifier,
+    pub observation: Observation<R, E>,
+    pub error: E,
+}
+
+impl<R, E> ResumedFailure<R, E> {
+    pub fn into_parts(self) -> (AppliedIdentifier, Observation<R, E>, E) {
+        (self.identifier, self.observation, self.error)
+    }
+}
+
+/// One provider step while resuming a persisted create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeStep<A, D, T> {
+    Completed {
+        identifier: AppliedIdentifier,
+        attributes: A,
+    },
+    Pending(ResumePending<T>),
+    Resent(CreateStep<A, D, T>),
+}
+
+/// Plain wire verdict while resuming a persisted create. Classification is
+/// enforced by the SDK or native core adapter before this value is encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeVerdict<R, E> {
+    Untracked(E),
+    Created(ResumedFailure<R, E>),
+    Discarded(E),
+    Undetermined(E),
+    Resent(CreateVerdict<R, E>),
+}
+
+impl<A, D, T> From<CreateStep<A, D, T>> for ResumeStep<A, D, T> {
+    fn from(step: CreateStep<A, D, T>) -> Self {
+        Self::Resent(step)
+    }
+}
+
+impl<R, E> From<CreateVerdict<R, E>> for ResumeVerdict<R, E> {
+    fn from(verdict: CreateVerdict<R, E>) -> Self {
+        Self::Resent(verdict)
+    }
 }
 
 impl From<State> for PersistedState {
@@ -2214,5 +2483,19 @@ mod tests {
         let json = serde_json::to_string(&transform).unwrap();
         let back: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn pending_token_debug_is_redacted() {
+        let token = PendingToken::new("do-not-log-this");
+        let debug = format!("{token:?}");
+
+        assert_eq!(debug, "PendingToken([REDACTED])");
+        assert!(!debug.contains("do-not-log-this"));
+        assert_eq!(
+            token.expose_for_provider_call(),
+            "do-not-log-this",
+            "the raw value is available only at the explicit provider-call seam"
+        );
     }
 }

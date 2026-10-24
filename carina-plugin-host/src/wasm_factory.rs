@@ -27,10 +27,17 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, CanonicalCustomTypeValue, CanonicalProviderConfigAttributes,
-    CreateOutcome, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
-    ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadOutcome, ReadRequest, SavedAttrs,
+    AppliedIdentifier, AppliedState, BoxFuture, CanonicalCustomTypeValue,
+    CanonicalProviderConfigAttributes, CreateAttempt, CreateFailure, CreateOutcome, CreateRequest,
+    DeleteRequest, Observation, PendingCreate as CorePendingCreate, Poll as CorePoll, Provider,
+    ProviderError, ProviderFactory, ProviderNormalizer, ProviderReadyConfig, ProviderResult,
+    ReadOutcome, ReadRequest, ResentPendingCreate, ResentPoll as CoreResentPoll,
+    Resume as CoreResume, ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent,
     UpdateOutcome, UpdateRequest,
+};
+#[cfg(test)]
+use carina_core::provider::{
+    CreateFailureKind, InFlightCreate, InFlightPersistence, ResumeFailureKind,
 };
 use carina_core::resource::{
     Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
@@ -42,6 +49,7 @@ use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
 
 use crate::{secret_seal, wasm_convert};
+use carina_provider_protocol::types as proto;
 
 /// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
 /// the async `BoxFuture` shape used by `Provider`, preserving its typed cause.
@@ -65,6 +73,24 @@ impl<E: fmt::Display> fmt::Display for WasmOperationError<E> {
 }
 
 impl<E> std::error::Error for WasmOperationError<E> where E: std::error::Error + 'static {}
+
+#[derive(Debug)]
+struct InvalidWasmCreateResult {
+    detail: &'static str,
+    source: ProviderError,
+}
+
+impl fmt::Display for InvalidWasmCreateResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.detail)
+    }
+}
+
+impl std::error::Error for InvalidWasmCreateResult {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 fn wasm_value_decode_provider_error<E>(operation: &'static str, error: E) -> ProviderError
 where
@@ -1302,7 +1328,7 @@ async fn traced_send_request_handler(
                 .unwrap_or("/"),
         )
         .build()
-        .expect("comes from valid request");
+        .map_err(|_| ErrorCode::HttpRequestUriInvalid)?;
 
     let resp = timeout(first_byte_timeout, sender.send_request(request))
         .await
@@ -1699,7 +1725,7 @@ pub(crate) mod version_checked_bindings {
             store: &mut Store<HostState>,
             id: &wit_types::ResourceId,
             request: &wit_types::CreateRequest,
-        ) -> wasmtime::Result<Result<wit_types::CreateOutcome, wit_types::ProviderError>> {
+        ) -> wasmtime::Result<Result<wit_types::CreateStep, wit_types::CreateVerdict>> {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
                     b.carina_provider_provider()
@@ -1719,8 +1745,8 @@ pub(crate) mod version_checked_bindings {
             store: &mut Store<HostState>,
             id: &wit_types::ResourceId,
             request: &wit_types::CreateRequest,
-            pending: &wit_types::PendingOperation,
-        ) -> wasmtime::Result<Result<wit_types::CreateOutcome, wit_types::ProviderError>> {
+            pending: &wit_types::PendingCreate,
+        ) -> wasmtime::Result<Result<wit_types::CreateStep, wit_types::PollVerdict>> {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
                     b.carina_provider_provider()
@@ -1730,6 +1756,27 @@ pub(crate) mod version_checked_bindings {
                 RawWasmBindings::Http(b) => {
                     b.carina_provider_provider()
                         .call_poll_create(store, id, request, pending)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_resume_create(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            request: &wit_types::CreateRequest,
+            pending: &wit_types::ResumePending,
+        ) -> wasmtime::Result<Result<wit_types::ResumeStep, wit_types::ResumeVerdict>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_resume_create(store, id, request, pending)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_resume_create(store, id, request, pending)
                         .await
                 }
             }
@@ -3018,9 +3065,56 @@ struct PendingCreate {
     id: ResourceId,
     wit_id: wit_types::ResourceId,
     wit_request: wit_types::CreateRequest,
-    operation: wasm_convert::CreatePendingOperation,
+    pending: CorePendingCreate,
 }
 
+enum PendingResume {
+    Resume {
+        id: ResourceId,
+        wit_id: wit_types::ResourceId,
+        wit_request: wit_types::CreateRequest,
+        resume: CoreResume,
+        poll_after_secs: u32,
+    },
+    Resent(PendingResentCreate),
+}
+
+struct PendingResentCreate {
+    id: ResourceId,
+    wit_id: wit_types::ResourceId,
+    wit_request: wit_types::CreateRequest,
+    pending: ResentPendingCreate,
+}
+
+impl PendingResume {
+    fn poll_after_secs(&self) -> u32 {
+        match self {
+            Self::Resume {
+                id: _id,
+                wit_id: _wit_id,
+                wit_request: _wit_request,
+                resume: _resume,
+                poll_after_secs,
+            } => *poll_after_secs,
+            Self::Resent(pending) => pending.pending.poll_after_secs(),
+        }
+    }
+
+    fn into_failure(self, error: ProviderError) -> ResumeFailure {
+        match self {
+            Self::Resume {
+                id: _id,
+                wit_id: _wit_id,
+                wit_request: _wit_request,
+                resume,
+                poll_after_secs: _poll_after_secs,
+            } => resume.preserve(error),
+            Self::Resent(pending) => pending.pending.preserve(error),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PendingUpdate {
     id: ResourceId,
     wit_id: wit_types::ResourceId,
@@ -3029,6 +3123,7 @@ struct PendingUpdate {
     operation: wasm_convert::UpdatePendingOperation,
 }
 
+#[derive(Clone)]
 struct PendingDelete {
     id: ResourceId,
     wit_id: wit_types::ResourceId,
@@ -3037,14 +3132,64 @@ struct PendingDelete {
     operation: wasm_convert::DeletePendingOperation,
 }
 
-enum CreateProgress {
-    Done(Box<CreateOutcome>),
-    Pending(Box<PendingCreate>),
-}
-
 enum UpdateProgress {
     Done(Box<UpdateOutcome>),
     Pending(Box<PendingUpdate>),
+}
+
+enum CreateProgress {
+    Done(Box<CreateOutcome>),
+    Verdict(Box<CreateFailure>),
+    Pending(Box<PendingCreate>),
+}
+
+enum ResumeProgress {
+    Done(ResumeOutcome),
+    Verdict(Box<ResumeFailure>),
+    Pending(Box<PendingResume>),
+}
+
+impl OperationProgress for ResumeProgress {
+    type Output = ResumeOutcome;
+    type Verdict = Box<ResumeFailure>;
+    type PendingState = Box<PendingResume>;
+
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Box<ResumeFailure>, Self::PendingState>
+    {
+        match self {
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(outcome),
+            Self::Verdict(verdict) => carina_provider_protocol::OperationStep::Verdict(verdict),
+            Self::Pending(pending) => {
+                let poll_after_secs = pending.poll_after_secs();
+                carina_provider_protocol::OperationStep::Pending {
+                    pending,
+                    poll_after_secs,
+                }
+            }
+        }
+    }
+}
+
+impl OperationProgress for CreateProgress {
+    type Output = CreateOutcome;
+    type Verdict = Box<CreateFailure>;
+    type PendingState = Box<PendingCreate>;
+
+    fn into_step(
+        self,
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Box<CreateFailure>, Self::PendingState>
+    {
+        match self {
+            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(*outcome),
+            Self::Verdict(verdict) => carina_provider_protocol::OperationStep::Verdict(verdict),
+            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
+                poll_after_secs: pending.pending.poll_after_secs(),
+                pending,
+            },
+        }
+    }
 }
 
 enum DeleteProgress {
@@ -3054,36 +3199,26 @@ enum DeleteProgress {
 
 trait OperationProgress {
     type Output;
+    type Verdict;
     type PendingState;
-
-    fn into_step(self)
-    -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState>;
-}
-
-impl OperationProgress for CreateProgress {
-    type Output = CreateOutcome;
-    type PendingState = Box<PendingCreate>;
 
     fn into_step(
         self,
-    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
-        match self {
-            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(*outcome),
-            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
-                poll_after_secs: pending.operation.poll_after_secs(),
-                pending,
-            },
-        }
-    }
+    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::Verdict, Self::PendingState>;
 }
 
 impl OperationProgress for UpdateProgress {
     type Output = UpdateOutcome;
+    type Verdict = std::convert::Infallible;
     type PendingState = Box<PendingUpdate>;
 
     fn into_step(
         self,
-    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
+    ) -> carina_provider_protocol::OperationStep<
+        Self::Output,
+        std::convert::Infallible,
+        Self::PendingState,
+    > {
         match self {
             Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(*outcome),
             Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
@@ -3096,11 +3231,16 @@ impl OperationProgress for UpdateProgress {
 
 impl OperationProgress for DeleteProgress {
     type Output = ();
+    type Verdict = std::convert::Infallible;
     type PendingState = Box<PendingDelete>;
 
     fn into_step(
         self,
-    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
+    ) -> carina_provider_protocol::OperationStep<
+        Self::Output,
+        std::convert::Infallible,
+        Self::PendingState,
+    > {
         match self {
             Self::Deleted => carina_provider_protocol::OperationStep::Done(()),
             Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
@@ -3180,7 +3320,8 @@ impl WasmProvider {
         mut poll: Poll,
     ) -> ProviderResult<Progress::Output>
     where
-        Progress: OperationProgress,
+        Progress: OperationProgress<Verdict = std::convert::Infallible>,
+        Progress::PendingState: Clone,
         Initial: Future<Output = ProviderResult<Progress>>,
         Poll: FnMut(Progress::PendingState) -> PollFuture,
         PollFuture: Future<Output = ProviderResult<Progress>>,
@@ -3194,12 +3335,739 @@ impl WasmProvider {
             },
             tokio::time::sleep,
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            carina_provider_protocol::DriveError::Initial(error) => error,
+            carina_provider_protocol::DriveError::Poll {
+                error,
+                last_pending: _last_pending,
+            } => error,
+        })?;
         match outcome {
             carina_provider_protocol::DriveOutcome::Done(output) => Ok(output),
-            carina_provider_protocol::DriveOutcome::OverBudget => {
-                Err(Self::over_budget(operation, id))
+            carina_provider_protocol::DriveOutcome::Verdict(verdict) => match verdict {},
+            carina_provider_protocol::DriveOutcome::OverBudget {
+                last_pending: _last_pending,
+            } => Err(Self::over_budget(operation, id)),
+        }
+    }
+
+    fn create_request_attribute_names(request: &wit_types::CreateRequest) -> BTreeSet<String> {
+        request
+            .res
+            .attributes
+            .iter()
+            .map(|(name, _value)| name.clone())
+            .collect()
+    }
+
+    fn create_boundary_error(id: &ResourceId, detail: &str) -> ProviderError {
+        ProviderError::internal(format!("invalid WASM create result: {detail}"))
+            .for_resource(id.clone())
+    }
+
+    fn create_boundary_error_with_source(
+        id: &ResourceId,
+        detail: &'static str,
+        source: ProviderError,
+    ) -> ProviderError {
+        ProviderError::internal_caused_by(
+            "invalid WASM create result",
+            InvalidWasmCreateResult { detail, source },
+        )
+        .for_resource(id.clone())
+    }
+
+    /// Turn a boundary decode failure that happened after a valid create
+    /// identifier into the only safe classification: the resource was
+    /// created, but its post-create observation could not be decoded.
+    fn created_read_decode_failure(
+        operation: &'static str,
+        id: &ResourceId,
+        failure: wasm_convert::CreatedReadDecodeFailure,
+    ) -> (AppliedIdentifier, Option<Sent>, Observation, ProviderError) {
+        let (identifier, sent, declared_error, decode_error) = failure.into_parts();
+        let read_error =
+            wasm_value_decode_provider_error(operation, decode_error).for_resource(id.clone());
+        let error =
+            declared_error.unwrap_or_else(|| ProviderError::from_wire(read_error.to_wire()));
+        (identifier, sent, Observation::ReadFailed(read_error), error)
+    }
+
+    fn initial_created_read_decode_failure(
+        id: ResourceId,
+        wit_request: &wit_types::CreateRequest,
+        attempt: CreateAttempt,
+        failure: wasm_convert::CreatedReadDecodeFailure,
+    ) -> CreateProgress {
+        let (identifier, sent, observation, error) =
+            Self::created_read_decode_failure("create", &id, failure);
+        Self::initial_create_verdict(
+            id,
+            wit_request,
+            attempt,
+            proto::CreateVerdict::Created(proto::CreatedFailure {
+                identifier,
+                observation,
+                sent: sent.unwrap_or(Sent::AllRequestAttributes),
+                error,
+            }),
+        )
+    }
+
+    fn polled_step_created_read_decode_failure(
+        starting: PendingCreate,
+        failure: wasm_convert::CreatedReadDecodeFailure,
+    ) -> CreateProgress {
+        let (identifier, _sent, observation, error) =
+            Self::created_read_decode_failure("poll_create", &starting.id, failure);
+        let poll = starting.pending.into_poll();
+        CreateProgress::Verdict(Box::new(match poll {
+            CorePoll::Unissued(attempt) => attempt.issued(identifier).failed(observation, error),
+            CorePoll::Issued(issued) => issued.canonicalize(identifier).failed(observation, error),
+        }))
+    }
+
+    fn polled_verdict_created_read_decode_failure(
+        starting: PendingCreate,
+        failure: wasm_convert::CreatedReadDecodeFailure,
+    ) -> CreateProgress {
+        let (identifier, sent, observation, error) =
+            Self::created_read_decode_failure("poll_create", &starting.id, failure);
+        let sent = sent.unwrap_or_else(|| starting.pending.sent().clone());
+        Self::polled_create_verdict(
+            starting,
+            proto::PollVerdict::Created(proto::CreatedFailure {
+                identifier,
+                observation,
+                sent,
+                error,
+            }),
+        )
+    }
+
+    fn resumed_created_read_decode_failure(
+        id: ResourceId,
+        wit_request: wit_types::CreateRequest,
+        starting: CoreResume,
+        failure: wasm_convert::CreatedReadDecodeFailure,
+    ) -> ResumeProgress {
+        let (identifier, sent, observation, error) =
+            Self::created_read_decode_failure("resume_create", &id, failure);
+        match sent {
+            None => Self::fail_resumed_create(starting, identifier, observation, error),
+            Some(sent) => Self::resumed_create_verdict(
+                id,
+                &wit_request,
+                starting,
+                proto::ResumeVerdict::Resent(proto::CreateVerdict::Created(
+                    proto::CreatedFailure {
+                        identifier,
+                        observation,
+                        sent,
+                        error,
+                    },
+                )),
+            ),
+        }
+    }
+
+    fn initial_create_step(
+        id: ResourceId,
+        wit_id: wit_types::ResourceId,
+        wit_request: wit_types::CreateRequest,
+        attempt: CreateAttempt,
+        step: wasm_convert::DecodedCreateStep,
+    ) -> CreateProgress {
+        match step {
+            proto::CreateStep::Success {
+                identifier,
+                attributes,
+            } => CreateProgress::Done(Box::new(
+                attempt
+                    .issued(identifier, Sent::AllRequestAttributes)
+                    .succeeded(attributes),
+            )),
+            proto::CreateStep::PartialSuccess {
+                identifier,
+                attributes,
+                diagnostic,
+            } => CreateProgress::Done(Box::new(
+                attempt
+                    .issued(identifier, Sent::AllRequestAttributes)
+                    .partial(attributes, diagnostic),
+            )),
+            proto::CreateStep::Pending(pending) => {
+                let request_names = Self::create_request_attribute_names(&wit_request);
+                let (token, identifier, mut sent, poll_after_secs) = pending.into_parts();
+                let invalid_sent = !sent.is_valid_for(&request_names);
+                if invalid_sent {
+                    sent.clip_to(&request_names);
+                }
+                let pending = match identifier {
+                    Some(identifier) => attempt
+                        .issued(identifier, sent)
+                        .pending(token, poll_after_secs),
+                    None => attempt.pending(token, sent, poll_after_secs),
+                };
+                if invalid_sent {
+                    return CreateProgress::Verdict(Box::new(pending.preserve(
+                        Self::create_boundary_error(
+                            &id,
+                            "pending sent attributes are not a subset of the request",
+                        ),
+                    )));
+                }
+                CreateProgress::Pending(Box::new(PendingCreate {
+                    id,
+                    wit_id,
+                    wit_request,
+                    pending,
+                }))
             }
+        }
+    }
+
+    fn initial_create_verdict(
+        id: ResourceId,
+        wit_request: &wit_types::CreateRequest,
+        attempt: CreateAttempt,
+        verdict: wasm_convert::DecodedCreateVerdict,
+    ) -> CreateProgress {
+        match verdict {
+            proto::CreateVerdict::Untracked(error) | proto::CreateVerdict::Discarded(error) => {
+                CreateProgress::Verdict(Box::new(attempt.untracked(error)))
+            }
+            proto::CreateVerdict::Created(created) => {
+                let (identifier, observation, mut sent, mut error) = created.into_parts();
+                let request_names = Self::create_request_attribute_names(wit_request);
+                if !sent.is_valid_for(&request_names) {
+                    sent.clip_to(&request_names);
+                    error = Self::create_boundary_error_with_source(
+                        &id,
+                        "created verdict sent attributes are not a subset of the request",
+                        error,
+                    );
+                }
+                CreateProgress::Verdict(Box::new(
+                    attempt.issued(identifier, sent).failed(observation, error),
+                ))
+            }
+        }
+    }
+
+    fn preserve_polled_create(pending: PendingCreate, error: ProviderError) -> CreateProgress {
+        CreateProgress::Verdict(Box::new(pending.pending.preserve(error)))
+    }
+
+    fn polled_create_step(
+        starting: PendingCreate,
+        step: wasm_convert::DecodedCreateStep,
+    ) -> CreateProgress {
+        match step {
+            proto::CreateStep::Success {
+                identifier,
+                attributes,
+            } => {
+                let poll = starting.pending.into_poll();
+                CreateProgress::Done(Box::new(match poll {
+                    CorePoll::Unissued(attempt) => attempt.issued(identifier).succeeded(attributes),
+                    CorePoll::Issued(issued) => {
+                        issued.canonicalize(identifier).succeeded(attributes)
+                    }
+                }))
+            }
+            proto::CreateStep::PartialSuccess {
+                identifier,
+                attributes,
+                diagnostic,
+            } => {
+                let poll = starting.pending.into_poll();
+                CreateProgress::Done(Box::new(match poll {
+                    CorePoll::Unissued(attempt) => {
+                        attempt.issued(identifier).partial(attributes, diagnostic)
+                    }
+                    CorePoll::Issued(issued) => issued
+                        .canonicalize(identifier)
+                        .partial(attributes, diagnostic),
+                }))
+            }
+            proto::CreateStep::Pending(next) => {
+                let request_names = Self::create_request_attribute_names(&starting.wit_request);
+                let same_sent = next.sent() == starting.pending.sent();
+                if !same_sent || !next.sent().is_valid_for(&request_names) {
+                    let error = Self::create_boundary_error(
+                        &starting.id,
+                        "pending changed its sent attributes",
+                    );
+                    return Self::preserve_polled_create(starting, error);
+                }
+                let poll = starting.pending.into_poll();
+                let (token, identifier, sent, poll_after_secs) = next.into_parts();
+                let pending = match poll {
+                    CorePoll::Unissued(attempt) => match identifier {
+                        Some(identifier) => {
+                            attempt.issued(identifier).pending(token, poll_after_secs)
+                        }
+                        None => attempt.pending(token, poll_after_secs),
+                    },
+                    CorePoll::Issued(issued) => {
+                        drop(identifier);
+                        drop(sent);
+                        issued.pending(token, poll_after_secs)
+                    }
+                };
+                CreateProgress::Pending(Box::new(PendingCreate {
+                    id: starting.id,
+                    wit_id: starting.wit_id,
+                    wit_request: starting.wit_request,
+                    pending,
+                }))
+            }
+        }
+    }
+
+    fn polled_create_verdict(
+        starting: PendingCreate,
+        verdict: wasm_convert::DecodedPollVerdict,
+    ) -> CreateProgress {
+        match verdict {
+            proto::PollVerdict::Untracked(error) => {
+                CreateProgress::Verdict(Box::new(starting.pending.untracked(error)))
+            }
+            proto::PollVerdict::Created(created) => {
+                let (identifier, observation, sent, error) = created.into_parts();
+                if &sent != starting.pending.sent() {
+                    let error = Self::create_boundary_error(
+                        &starting.id,
+                        "created verdict changed the sent attributes",
+                    );
+                    return Self::preserve_polled_create(starting, error);
+                }
+                let poll = starting.pending.into_poll();
+                CreateProgress::Verdict(Box::new(match poll {
+                    CorePoll::Unissued(attempt) => {
+                        attempt.issued(identifier).failed(observation, error)
+                    }
+                    CorePoll::Issued(issued) => {
+                        issued.canonicalize(identifier).failed(observation, error)
+                    }
+                }))
+            }
+            proto::PollVerdict::Discarded(error) => {
+                let poll = starting.pending.into_poll();
+                CreateProgress::Verdict(Box::new(match poll {
+                    CorePoll::Unissued(attempt) => attempt.untracked(error),
+                    CorePoll::Issued(issued) => issued.discarded(error),
+                }))
+            }
+            proto::PollVerdict::Undetermined(error) => {
+                Self::preserve_polled_create(starting, error)
+            }
+        }
+    }
+
+    fn preserve_resent_create(
+        starting: PendingResentCreate,
+        error: ProviderError,
+    ) -> ResumeProgress {
+        ResumeProgress::Verdict(Box::new(starting.pending.preserve(error)))
+    }
+
+    fn polled_resent_step(
+        starting: PendingResentCreate,
+        step: wasm_convert::DecodedCreateStep,
+    ) -> ResumeProgress {
+        match step {
+            proto::CreateStep::Success {
+                identifier,
+                attributes,
+            } => {
+                let poll = starting.pending.into_poll();
+                ResumeProgress::Done(match poll {
+                    CoreResentPoll::Unissued(attempt) => {
+                        attempt.issued(identifier).succeeded(attributes)
+                    }
+                    CoreResentPoll::Issued(issued) => {
+                        issued.canonicalize(identifier).succeeded(attributes)
+                    }
+                })
+            }
+            proto::CreateStep::PartialSuccess {
+                identifier,
+                attributes,
+                diagnostic,
+            } => {
+                let poll = starting.pending.into_poll();
+                ResumeProgress::Done(match poll {
+                    CoreResentPoll::Unissued(attempt) => {
+                        attempt.issued(identifier).partial(attributes, diagnostic)
+                    }
+                    CoreResentPoll::Issued(issued) => issued
+                        .canonicalize(identifier)
+                        .partial(attributes, diagnostic),
+                })
+            }
+            proto::CreateStep::Pending(next) => {
+                let request_names = Self::create_request_attribute_names(&starting.wit_request);
+                let same_sent = next.sent() == starting.pending.sent();
+                if !same_sent || !next.sent().is_valid_for(&request_names) {
+                    let error = Self::create_boundary_error(
+                        &starting.id,
+                        "resent pending changed its sent attributes",
+                    );
+                    return Self::preserve_resent_create(starting, error);
+                }
+                let poll = starting.pending.into_poll();
+                let (token, identifier, sent, poll_after_secs) = next.into_parts();
+                let pending = match poll {
+                    CoreResentPoll::Unissued(attempt) => match identifier {
+                        Some(identifier) => {
+                            attempt.issued(identifier).pending(token, poll_after_secs)
+                        }
+                        None => attempt.pending(token, poll_after_secs),
+                    },
+                    CoreResentPoll::Issued(issued) => {
+                        drop(identifier);
+                        drop(sent);
+                        issued.pending(token, poll_after_secs)
+                    }
+                };
+                ResumeProgress::Pending(Box::new(PendingResume::Resent(PendingResentCreate {
+                    id: starting.id,
+                    wit_id: starting.wit_id,
+                    wit_request: starting.wit_request,
+                    pending,
+                })))
+            }
+        }
+    }
+
+    fn polled_resent_verdict(
+        starting: PendingResentCreate,
+        verdict: wasm_convert::DecodedPollVerdict,
+    ) -> ResumeProgress {
+        match verdict {
+            proto::PollVerdict::Untracked(error) => {
+                ResumeProgress::Verdict(Box::new(starting.pending.untracked(error)))
+            }
+            proto::PollVerdict::Created(created) => {
+                let (identifier, observation, sent, error) = created.into_parts();
+                if &sent != starting.pending.sent() {
+                    let error = Self::create_boundary_error(
+                        &starting.id,
+                        "resent created verdict changed the sent attributes",
+                    );
+                    return Self::preserve_resent_create(starting, error);
+                }
+                let poll = starting.pending.into_poll();
+                ResumeProgress::Verdict(Box::new(match poll {
+                    CoreResentPoll::Unissued(attempt) => {
+                        attempt.issued(identifier).failed(observation, error)
+                    }
+                    CoreResentPoll::Issued(issued) => {
+                        issued.canonicalize(identifier).failed(observation, error)
+                    }
+                }))
+            }
+            proto::PollVerdict::Discarded(error) => {
+                let poll = starting.pending.into_poll();
+                ResumeProgress::Verdict(Box::new(match poll {
+                    CoreResentPoll::Unissued(attempt) => attempt.untracked(error),
+                    CoreResentPoll::Issued(issued) => issued.discarded(error),
+                }))
+            }
+            proto::PollVerdict::Undetermined(error) => {
+                Self::preserve_resent_create(starting, error)
+            }
+        }
+    }
+
+    fn polled_resent_created_read_decode_failure(
+        starting: PendingResentCreate,
+        failure: wasm_convert::CreatedReadDecodeFailure,
+    ) -> ResumeProgress {
+        let (identifier, sent, observation, error) =
+            Self::created_read_decode_failure("poll_create", &starting.id, failure);
+        let sent = sent.unwrap_or_else(|| starting.pending.sent().clone());
+        Self::polled_resent_verdict(
+            starting,
+            proto::PollVerdict::Created(proto::CreatedFailure {
+                identifier,
+                observation,
+                sent,
+                error,
+            }),
+        )
+    }
+
+    fn preserve_resumed_create(resume: CoreResume, error: ProviderError) -> ResumeProgress {
+        ResumeProgress::Verdict(Box::new(resume.preserve(error)))
+    }
+
+    fn fail_resumed_create(
+        resume: CoreResume,
+        identifier: AppliedIdentifier,
+        observation: Observation,
+        error: ProviderError,
+    ) -> ResumeProgress {
+        let failure = match resume {
+            CoreResume::Unissued(attempt) => attempt.issued(identifier).failed(observation, error),
+            CoreResume::Issued(resumed) => {
+                resumed.canonicalize(identifier).failed(observation, error)
+            }
+        };
+        ResumeProgress::Verdict(Box::new(failure))
+    }
+
+    fn resumed_create_step(
+        id: ResourceId,
+        wit_id: wit_types::ResourceId,
+        wit_request: wit_types::CreateRequest,
+        starting: CoreResume,
+        step: wasm_convert::DecodedResumeStep,
+    ) -> ResumeProgress {
+        match step {
+            proto::ResumeStep::Completed {
+                identifier,
+                attributes,
+            } => {
+                let state = AppliedState::from_identifier(id, identifier.clone(), attributes);
+                let outcome = match starting {
+                    CoreResume::Unissued(attempt) => attempt.issued(identifier).completed(state),
+                    CoreResume::Issued(resumed) => {
+                        resumed.canonicalize(identifier).completed(state)
+                    }
+                };
+                ResumeProgress::Done(outcome)
+            }
+            proto::ResumeStep::Pending(next) => {
+                let (token, identifier, poll_after_secs) = next.into_parts();
+                let resume = match starting {
+                    CoreResume::Unissued(attempt) => match identifier {
+                        Some(identifier) => attempt.issued(identifier).repend(token),
+                        None => attempt.repend(token),
+                    },
+                    CoreResume::Issued(resumed) => {
+                        drop(identifier);
+                        resumed.repend(token)
+                    }
+                };
+                ResumeProgress::Pending(Box::new(PendingResume::Resume {
+                    id,
+                    wit_id,
+                    wit_request,
+                    resume,
+                    poll_after_secs,
+                }))
+            }
+            proto::ResumeStep::Resent(step) => {
+                Self::resent_create_step(id, wit_id, wit_request, starting, step)
+            }
+        }
+    }
+
+    fn resent_create_step(
+        id: ResourceId,
+        wit_id: wit_types::ResourceId,
+        wit_request: wit_types::CreateRequest,
+        starting: CoreResume,
+        step: wasm_convert::DecodedCreateStep,
+    ) -> ResumeProgress {
+        let attempt = match starting {
+            CoreResume::Unissued(attempt) => attempt.resend(),
+            CoreResume::Issued(resumed) => {
+                return Self::preserve_resumed_create(
+                    CoreResume::Issued(resumed),
+                    Self::create_boundary_error(
+                        &id,
+                        "an issued resume attempted to resend the create",
+                    ),
+                );
+            }
+        };
+        match step {
+            proto::CreateStep::Success {
+                identifier,
+                attributes,
+            } => ResumeProgress::Done(
+                attempt
+                    .issued(identifier, Sent::AllRequestAttributes)
+                    .succeeded(attributes),
+            ),
+            proto::CreateStep::PartialSuccess {
+                identifier,
+                attributes,
+                diagnostic,
+            } => ResumeProgress::Done(
+                attempt
+                    .issued(identifier, Sent::AllRequestAttributes)
+                    .partial(attributes, diagnostic),
+            ),
+            proto::CreateStep::Pending(pending) => {
+                let request_names = Self::create_request_attribute_names(&wit_request);
+                if !pending.sent().is_valid_for(&request_names) {
+                    return ResumeProgress::Verdict(Box::new(attempt.preserve(
+                        Self::create_boundary_error(
+                            &id,
+                            "resent pending attributes are not a subset of the request",
+                        ),
+                    )));
+                }
+                let (token, identifier, sent, poll_after_secs) = pending.into_parts();
+                let pending = match identifier {
+                    Some(identifier) => attempt
+                        .issued(identifier, sent)
+                        .pending(token, poll_after_secs),
+                    None => attempt.pending(token, sent, poll_after_secs),
+                };
+                ResumeProgress::Pending(Box::new(PendingResume::Resent(PendingResentCreate {
+                    id,
+                    wit_id,
+                    wit_request,
+                    pending,
+                })))
+            }
+        }
+    }
+
+    fn resumed_create_verdict(
+        id: ResourceId,
+        wit_request: &wit_types::CreateRequest,
+        starting: CoreResume,
+        verdict: wasm_convert::DecodedResumeVerdict,
+    ) -> ResumeProgress {
+        match verdict {
+            proto::ResumeVerdict::Untracked(error) => {
+                ResumeProgress::Verdict(Box::new(starting.untracked(error)))
+            }
+            proto::ResumeVerdict::Created(created) => {
+                let (identifier, observation, error) = created.into_parts();
+                Self::fail_resumed_create(starting, identifier, observation, error)
+            }
+            proto::ResumeVerdict::Discarded(error) => {
+                ResumeProgress::Verdict(Box::new(starting.discarded(error)))
+            }
+            proto::ResumeVerdict::Undetermined(error) => {
+                Self::preserve_resumed_create(starting, error)
+            }
+            proto::ResumeVerdict::Resent(verdict) => {
+                let attempt = match starting {
+                    CoreResume::Unissued(attempt) => attempt.resend(),
+                    CoreResume::Issued(resumed) => {
+                        return Self::preserve_resumed_create(
+                            CoreResume::Issued(resumed),
+                            Self::create_boundary_error(
+                                &id,
+                                "an issued resume attempted to resend the create",
+                            ),
+                        );
+                    }
+                };
+                match verdict {
+                    proto::CreateVerdict::Untracked(error)
+                    | proto::CreateVerdict::Discarded(error) => {
+                        ResumeProgress::Verdict(Box::new(attempt.untracked(error)))
+                    }
+                    proto::CreateVerdict::Created(created) => {
+                        let (identifier, observation, sent, error) = created.into_parts();
+                        let request_names = Self::create_request_attribute_names(wit_request);
+                        if !sent.is_valid_for(&request_names) {
+                            return ResumeProgress::Verdict(Box::new(attempt.preserve(
+                                Self::create_boundary_error(
+                                    &id,
+                                    "resent verdict attributes are not a subset of the request",
+                                ),
+                            )));
+                        }
+                        ResumeProgress::Verdict(Box::new(
+                            attempt.issued(identifier, sent).failed(observation, error),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn call_resume_record(
+        &self,
+        id: ResourceId,
+        wit_id: wit_types::ResourceId,
+        wit_request: wit_types::CreateRequest,
+        resume: CoreResume,
+    ) -> ResumeProgress {
+        let wit_pending =
+            wasm_convert::core_to_wit_resume_pending(resume.token(), resume.identifier());
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = wit_id.clone();
+        let call_request = wit_request.clone();
+        let call_result = async {
+            let mut locked = LockedStore::acquire(&self.instance, "resume_create").await?;
+            let call = with_operation_timeout(
+                "resume_create",
+                self.operation_hard_timeout,
+                call_instance.bindings.call_resume_create(
+                    locked.store(),
+                    &call_id,
+                    &call_request,
+                    &wit_pending,
+                ),
+            )
+            .await?;
+            finish_guest_call(
+                &self.instance,
+                "resume_create",
+                WasmTrapContext::ProviderOperation,
+                &mut locked,
+                call,
+            )
+        }
+        .await;
+        let result = match call_result {
+            Ok(result) => result,
+            Err(error) => return Self::preserve_resumed_create(resume, error),
+        };
+        match result {
+            Ok(step) => match wasm_convert::wit_to_core_resume_step(step, &id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
+                    Self::resumed_create_step(id, wit_id, wit_request, resume, step)
+                }
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
+                    Self::resumed_created_read_decode_failure(id, wit_request, resume, failure)
+                }
+                Err(error) => Self::preserve_resumed_create(
+                    resume,
+                    wasm_value_decode_provider_error("resume_create", error).for_resource(id),
+                ),
+            },
+            Err(verdict) => match wasm_convert::wit_to_core_resume_verdict(verdict, &id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => {
+                    Self::resumed_create_verdict(id, &wit_request, resume, verdict)
+                }
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
+                    Self::resumed_created_read_decode_failure(id, wit_request, resume, failure)
+                }
+                Err(error) => Self::preserve_resumed_create(
+                    resume,
+                    wasm_value_decode_provider_error("resume_create", error).for_resource(id),
+                ),
+            },
+        }
+    }
+
+    async fn poll_resume_state(&self, pending: PendingResume) -> ResumeProgress {
+        match pending {
+            PendingResume::Resume {
+                id,
+                wit_id,
+                wit_request,
+                resume,
+                poll_after_secs: _poll_after_secs,
+            } => {
+                self.call_resume_record(id, wit_id, wit_request, resume)
+                    .await
+            }
+            PendingResume::Resent(pending) => self.call_poll_resent_create(pending).await,
         }
     }
 
@@ -3207,81 +4075,267 @@ impl WasmProvider {
         &self,
         id: ResourceId,
         request: CreateRequest,
-    ) -> ProviderResult<CreateProgress> {
+        attempt: CreateAttempt,
+    ) -> Result<CreateProgress, CreateFailure> {
         let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let wit_request = wasm_convert::core_to_wit_create_request(&request).map_err(|error| {
-            wasm_value_encode_provider_error("create", error).for_resource(id.clone())
-        })?;
+        let wit_request = match wasm_convert::core_to_wit_create_request(&request) {
+            Ok(request) => request,
+            Err(error) => {
+                return Err(attempt.untracked(
+                    wasm_value_encode_provider_error("create", error).for_resource(id),
+                ));
+            }
+        };
         let call_instance = Arc::clone(&self.instance);
         let call_id = wit_id.clone();
         let call_request = wit_request.clone();
-        self.call_operation(
+        let mut locked = match LockedStore::acquire(&self.instance, "create").await {
+            Ok(locked) => locked,
+            Err(error) => return Err(attempt.untracked(error.for_resource(id))),
+        };
+        let call = match with_operation_timeout(
             "create",
-            id,
-            move |store| {
-                Box::pin(async move {
-                    call_instance
-                        .bindings
-                        .call_create(store, &call_id, &call_request)
-                        .await
-                })
-            },
-            move |outcome, id| {
-                let outcome = wasm_convert::wit_to_core_create_outcome(outcome, &id)?;
-                Ok::<_, wasm_convert::WasmAppliedStateDecodeError>(match outcome {
-                    wasm_convert::WasmCreateOutcome::Done(outcome) => CreateProgress::Done(outcome),
-                    wasm_convert::WasmCreateOutcome::Pending(operation) => {
-                        CreateProgress::Pending(Box::new(PendingCreate {
-                            id,
-                            wit_id,
-                            wit_request,
-                            operation,
-                        }))
-                    }
-                })
-            },
+            self.operation_hard_timeout,
+            call_instance
+                .bindings
+                .call_create(locked.store(), &call_id, &call_request),
         )
         .await
+        {
+            Ok(call) => call,
+            Err(error) => return Err(attempt.untracked(error.for_resource(id))),
+        };
+        let result = match finish_guest_call(
+            &self.instance,
+            "create",
+            WasmTrapContext::ProviderOperation,
+            &mut locked,
+            call,
+        ) {
+            Ok(result) => result,
+            Err(error) => return Err(attempt.untracked(error.for_resource(id))),
+        };
+        match result {
+            Ok(step) => match wasm_convert::wit_to_core_create_step(step, &id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(step)) => Ok(Self::initial_create_step(
+                    id,
+                    wit_id,
+                    wit_request,
+                    attempt,
+                    step,
+                )),
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => Ok(
+                    Self::initial_created_read_decode_failure(id, &wit_request, attempt, failure),
+                ),
+                Err(error) => Err(attempt
+                    .untracked(wasm_value_decode_provider_error("create", error).for_resource(id))),
+            },
+            Err(verdict) => match wasm_convert::wit_to_core_create_verdict(verdict, &id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => Ok(
+                    Self::initial_create_verdict(id, &wit_request, attempt, verdict),
+                ),
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => Ok(
+                    Self::initial_created_read_decode_failure(id, &wit_request, attempt, failure),
+                ),
+                Err(error) => Err(attempt
+                    .untracked(wasm_value_decode_provider_error("create", error).for_resource(id))),
+            },
+        }
     }
 
-    async fn call_poll_create(&self, pending: PendingCreate) -> ProviderResult<CreateProgress> {
-        let PendingCreate {
-            id,
-            wit_id,
-            wit_request,
-            operation,
-        } = pending;
-        let wit_pending = operation.into_wit();
+    async fn call_poll_create(&self, starting: PendingCreate) -> CreateProgress {
+        let id = starting.id.clone();
+        let wit_pending = wasm_convert::core_to_wit_pending_create(&starting.pending);
         let call_instance = Arc::clone(&self.instance);
-        let call_id = wit_id.clone();
-        let call_request = wit_request.clone();
-        self.call_operation(
-            "poll_create",
-            id,
-            move |store| {
-                Box::pin(async move {
-                    call_instance
-                        .bindings
-                        .call_poll_create(store, &call_id, &call_request, &wit_pending)
-                        .await
-                })
+        let call_id = starting.wit_id.clone();
+        let call_request = starting.wit_request.clone();
+        let call_result = async {
+            let mut locked = LockedStore::acquire(&self.instance, "poll_create").await?;
+            let call = with_operation_timeout(
+                "poll_create",
+                self.operation_hard_timeout,
+                call_instance.bindings.call_poll_create(
+                    locked.store(),
+                    &call_id,
+                    &call_request,
+                    &wit_pending,
+                ),
+            )
+            .await?;
+            finish_guest_call(
+                &self.instance,
+                "poll_create",
+                WasmTrapContext::ProviderOperation,
+                &mut locked,
+                call,
+            )
+        }
+        .await;
+        let result = match call_result {
+            Ok(result) => result,
+            Err(error) => return Self::preserve_polled_create(starting, error),
+        };
+        match result {
+            Ok(step) => match wasm_convert::wit_to_core_create_step(step, &id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
+                    Self::polled_create_step(starting, step)
+                }
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
+                    Self::polled_step_created_read_decode_failure(starting, failure)
+                }
+                Err(error) => Self::preserve_polled_create(
+                    starting,
+                    wasm_value_decode_provider_error("poll_create", error).for_resource(id),
+                ),
             },
-            move |outcome, id| {
-                let outcome = wasm_convert::wit_to_core_create_outcome(outcome, &id)?;
-                Ok::<_, wasm_convert::WasmAppliedStateDecodeError>(match outcome {
-                    wasm_convert::WasmCreateOutcome::Done(outcome) => CreateProgress::Done(outcome),
-                    wasm_convert::WasmCreateOutcome::Pending(operation) => {
-                        CreateProgress::Pending(Box::new(PendingCreate {
-                            id,
-                            wit_id,
-                            wit_request,
-                            operation,
-                        }))
-                    }
-                })
+            Err(verdict) => match wasm_convert::wit_to_core_poll_verdict(verdict, &id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => {
+                    Self::polled_create_verdict(starting, verdict)
+                }
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
+                    Self::polled_verdict_created_read_decode_failure(starting, failure)
+                }
+                Err(error) => Self::preserve_polled_create(
+                    starting,
+                    wasm_value_decode_provider_error("poll_create", error).for_resource(id),
+                ),
             },
+        }
+    }
+
+    async fn call_poll_resent_create(&self, starting: PendingResentCreate) -> ResumeProgress {
+        let wit_pending = wasm_convert::core_to_wit_pending_create_parts(
+            starting.pending.token(),
+            starting.pending.identifier(),
+            starting.pending.sent(),
+            starting.pending.poll_after_secs(),
+        );
+        let call_instance = Arc::clone(&self.instance);
+        let call_id = starting.wit_id.clone();
+        let call_request = starting.wit_request.clone();
+        let call_result = async {
+            let mut locked = LockedStore::acquire(&self.instance, "poll_create").await?;
+            let call = with_operation_timeout(
+                "poll_create",
+                self.operation_hard_timeout,
+                call_instance.bindings.call_poll_create(
+                    locked.store(),
+                    &call_id,
+                    &call_request,
+                    &wit_pending,
+                ),
+            )
+            .await?;
+            finish_guest_call(
+                &self.instance,
+                "poll_create",
+                WasmTrapContext::ProviderOperation,
+                &mut locked,
+                call,
+            )
+        }
+        .await;
+        let result = match call_result {
+            Ok(result) => result,
+            Err(error) => return Self::preserve_resent_create(starting, error),
+        };
+        match result {
+            Ok(step) => match wasm_convert::wit_to_core_create_step(step, &starting.id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
+                    Self::polled_resent_step(starting, step)
+                }
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
+                    Self::polled_resent_created_read_decode_failure(starting, failure)
+                }
+                Err(error) => {
+                    let id = starting.id.clone();
+                    Self::preserve_resent_create(
+                        starting,
+                        wasm_value_decode_provider_error("poll_create", error).for_resource(id),
+                    )
+                }
+            },
+            Err(verdict) => match wasm_convert::wit_to_core_poll_verdict(verdict, &starting.id) {
+                Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => {
+                    Self::polled_resent_verdict(starting, verdict)
+                }
+                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
+                    Self::polled_resent_created_read_decode_failure(starting, failure)
+                }
+                Err(error) => {
+                    let id = starting.id.clone();
+                    Self::preserve_resent_create(
+                        starting,
+                        wasm_value_decode_provider_error("poll_create", error).for_resource(id),
+                    )
+                }
+            },
+        }
+    }
+
+    async fn drive_create(
+        &self,
+        id: ResourceId,
+        request: CreateRequest,
+        attempt: CreateAttempt,
+        budget: std::time::Duration,
+    ) -> Result<CreateOutcome, CreateFailure> {
+        let initial = self.call_create(id.clone(), request, attempt);
+        let outcome = carina_provider_protocol::drive_pending_infallible(
+            budget,
+            async move {
+                match initial.await {
+                    Ok(progress) => progress,
+                    Err(failure) => CreateProgress::Verdict(Box::new(failure)),
+                }
+                .into_step()
+            },
+            |pending| async move { self.call_poll_create(*pending).await.into_step() },
+            tokio::time::sleep,
         )
-        .await
+        .await;
+        match outcome {
+            carina_provider_protocol::DriveOutcome::Done(outcome) => Ok(outcome),
+            carina_provider_protocol::DriveOutcome::Verdict(failure) => Err(*failure),
+            carina_provider_protocol::DriveOutcome::OverBudget { last_pending } => {
+                Err(last_pending
+                    .pending
+                    .preserve(Self::over_budget("create", id)))
+            }
+        }
+    }
+
+    async fn drive_resume_create(
+        &self,
+        request: ResumeCreateRequest,
+        budget: std::time::Duration,
+    ) -> Result<ResumeOutcome, ResumeFailure> {
+        let (resume, create_request) = request.into_parts();
+        let id = resume.id().clone();
+        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+        let wit_request = match wasm_convert::core_to_wit_create_request(&create_request) {
+            Ok(request) => request,
+            Err(error) => {
+                return Err(resume.preserve(
+                    wasm_value_encode_provider_error("resume_create", error).for_resource(id),
+                ));
+            }
+        };
+        let initial = self.call_resume_record(id.clone(), wit_id, wit_request, resume);
+        let outcome = carina_provider_protocol::drive_pending_infallible(
+            budget,
+            async move { initial.await.into_step() },
+            |pending| async move { self.poll_resume_state(*pending).await.into_step() },
+            tokio::time::sleep,
+        )
+        .await;
+        match outcome {
+            carina_provider_protocol::DriveOutcome::Done(outcome) => Ok(outcome),
+            carina_provider_protocol::DriveOutcome::Verdict(failure) => Err(*failure),
+            carina_provider_protocol::DriveOutcome::OverBudget { last_pending } => {
+                Err((*last_pending).into_failure(Self::over_budget("resume_create", id)))
+            }
+        }
     }
 
     async fn call_update(
@@ -3555,16 +4609,22 @@ impl Provider for WasmProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+        attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
         let id = id.clone();
         let budget = self.operation_budget(&id, carina_provider_protocol::OperationKind::Create);
-        Box::pin(async move {
-            let initial = self.call_create(id.clone(), request);
-            Self::drive_operation("create", id, budget, initial, |pending| {
-                self.call_poll_create(*pending)
-            })
-            .await
-        })
+        Box::pin(async move { self.drive_create(id, request, attempt, budget).await })
+    }
+
+    fn resume_create(
+        &self,
+        request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        let budget = self.operation_budget(
+            request.id(),
+            carina_provider_protocol::OperationKind::Create,
+        );
+        Box::pin(async move { self.drive_resume_create(request, budget).await })
     }
 
     fn update(
@@ -3734,6 +4794,23 @@ impl std::error::Error for WasmNormalizerResultCountError {}
 
 type WitStateAttributeUpdate = (ResourceId, Vec<(String, wit_types::PersistedValue)>);
 
+trait StateValueAccess {
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State>;
+}
+
+impl StateValueAccess for carina_core::provider::StateTransformMap {
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+        self.get_mut(id)
+    }
+}
+
+#[cfg(test)]
+impl StateValueAccess for HashMap<ResourceId, State> {
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+        self.get_mut(id)
+    }
+}
+
 fn validate_wit_state_result_keys(
     operation: &'static str,
     expected_ids_by_key: &HashMap<String, ResourceId>,
@@ -3765,15 +4842,24 @@ fn validate_wit_state_result_keys(
         ));
     }
 
-    Ok(expected_ids_by_key
-        .iter()
-        .map(|(key, id)| {
-            let state = returned
-                .remove(key)
-                .expect("validated result contains every expected key");
-            (id.clone(), state.attributes)
-        })
-        .collect())
+    let mut updates = Vec::with_capacity(expected_ids_by_key.len());
+    for (key, id) in expected_ids_by_key {
+        let Some(state) = returned.remove(key) else {
+            return Err(ProviderError::internal_caused_by(
+                "WASM provider returned invalid state keys",
+                WasmOperationError {
+                    operation,
+                    source: WasmNormalizerResultKeysError {
+                        missing: BTreeSet::from([key.clone()]),
+                        unexpected: BTreeSet::new(),
+                        duplicates: BTreeSet::new(),
+                    },
+                },
+            ));
+        };
+        updates.push((id.clone(), state.attributes));
+    }
+    Ok(updates)
 }
 
 fn take_single_wit_state_result(
@@ -3794,16 +4880,22 @@ fn take_single_wit_state_result(
         .for_resource(id));
     }
 
-    let (_, state) = results
-        .into_iter()
-        .next()
-        .expect("validated single-resource result contains one entry");
+    let Some((_, state)) = results.into_iter().next() else {
+        return Err(ProviderError::internal_caused_by(
+            "WASM provider returned an invalid state count",
+            WasmOperationError {
+                operation,
+                source: WasmNormalizerResultCountError { actual: 0 },
+            },
+        )
+        .for_resource(id));
+    };
     Ok((id, state.attributes))
 }
 
-fn apply_wit_state_attribute_updates(
+fn apply_wit_state_attribute_updates<M: StateValueAccess>(
     operation: &'static str,
-    current_states: &mut HashMap<ResourceId, State>,
+    current_states: &mut M,
     updates: Vec<WitStateAttributeUpdate>,
 ) -> ProviderResult<()> {
     let decoded = updates
@@ -3818,7 +4910,7 @@ fn apply_wit_state_attribute_updates(
         .collect::<ProviderResult<Vec<_>>>()?;
 
     for (id, attributes) in decoded {
-        if let Some(state) = current_states.get_mut(&id) {
+        if let Some(state) = current_states.state_mut(&id) {
             state.attributes = attributes;
         }
     }
@@ -3990,7 +5082,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
     fn normalize_state<'a>(
         &'a self,
-        current_states: &'a mut HashMap<ResourceId, State>,
+        current_states: &'a mut carina_core::provider::StateTransformMap,
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             let mut resolved_by_key = HashMap::new();
@@ -4086,7 +5178,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
     fn hydrate_read_state<'a>(
         &'a self,
-        current_states: &'a mut HashMap<ResourceId, State>,
+        current_states: &'a mut carina_core::provider::StateTransformMap,
         saved_attrs: &'a SavedAttrs,
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
@@ -4213,12 +5305,630 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::provider::SentRecord;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason,
+        AccessPath, ConcreteValue, Current, DeferredValue, InterpolationPart, UnknownReason,
     };
+
+    #[test]
+    fn protocol_v10_wit_surface_compiles() {
+        fn assert_type<T>() {}
+
+        assert_type::<wit_types::Observation>();
+        assert_type::<wit_types::SentAttributes>();
+        assert_type::<wit_types::PendingCreate>();
+        assert_type::<wit_types::CreateStep>();
+        assert_type::<wit_types::CreateVerdict>();
+        assert_type::<wit_types::PollVerdict>();
+        assert_type::<wit_types::ResumePending>();
+        assert_type::<wit_types::ResumeStep>();
+        assert_type::<wit_types::ResumeVerdict>();
+    }
 
     fn test_string_value(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
+    }
+
+    fn boundary_resource() -> (ResourceId, wit_types::ResourceId, wit_types::CreateRequest) {
+        let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
+        let mut resource = Resource::from_id(id.clone());
+        resource.set_attr("name", test_string_value("example"));
+        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+        let wit_request = wit_types::CreateRequest {
+            res: wasm_convert::core_to_wit_resource(&resource)
+                .expect("boundary fixture must encode"),
+        };
+        (id, wit_id, wit_request)
+    }
+
+    fn sent_name_only() -> Sent {
+        Sent::Only(["name".to_string()].into_iter().collect())
+    }
+
+    fn malformed_wit_attributes() -> Vec<(String, wit_types::Value)> {
+        vec![(
+            "broken".to_string(),
+            wit_types::Value::ListVal("not-json".to_string()),
+        )]
+    }
+
+    fn decode_failed_create_step(id: &ResourceId) -> wasm_convert::CreatedReadDecodeFailure {
+        let step = wit_types::CreateStep::Success(wit_types::AppliedState {
+            identifier: "decoded-created-id".to_string(),
+            attributes: malformed_wit_attributes(),
+        });
+        match wasm_convert::wit_to_core_create_step(step, id)
+            .expect("the valid identifier makes the attribute failure recoverable")
+        {
+            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::Decoded(_) => {
+                panic!("malformed attributes unexpectedly decoded")
+            }
+        }
+    }
+
+    fn decode_failed_created_verdict(id: &ResourceId) -> wasm_convert::CreatedReadDecodeFailure {
+        let error = ProviderError::internal("guest create failure");
+        let verdict = wit_types::PollVerdict::Created(wit_types::CreatedFailure {
+            identifier: "decoded-created-id".to_string(),
+            read: wit_types::Observation::Read(wit_types::ReadOutcome::Found(
+                wit_types::AppliedState {
+                    identifier: "decoded-created-id".to_string(),
+                    attributes: malformed_wit_attributes(),
+                },
+            )),
+            sent: wit_types::SentAttributes::Only(vec!["name".to_string()]),
+            error: wasm_convert::wire_to_wit_provider_error(error.to_wire()),
+        });
+        match wasm_convert::wit_to_core_poll_verdict(verdict, id)
+            .expect("the valid identifier makes the observation failure recoverable")
+        {
+            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::Decoded(_) => {
+                panic!("malformed observation unexpectedly decoded")
+            }
+        }
+    }
+
+    fn assert_created_after_decode_failure(progress: CreateProgress) {
+        let CreateProgress::Verdict(failure) = progress else {
+            panic!("post-identifier decode failure must be a created verdict")
+        };
+        match failure.into_kind() {
+            CreateFailureKind::Created { created, error: _ } => {
+                assert_eq!(created.identifier().as_str(), "decoded-created-id");
+                assert!(matches!(created.observation(), Observation::ReadFailed(_)));
+            }
+            CreateFailureKind::Untracked(error) => {
+                panic!("post-identifier decode failure became untracked: {error}")
+            }
+            CreateFailureKind::InFlight { error, .. } => {
+                panic!("post-identifier decode failure stayed in flight: {error}")
+            }
+        }
+    }
+
+    fn assert_created_after_resume_decode_failure(progress: ResumeProgress) {
+        let ResumeProgress::Verdict(failure) = progress else {
+            panic!("post-identifier resume decode failure must be a created verdict")
+        };
+        match failure.into_kind() {
+            ResumeFailureKind::Created { created, error: _ } => {
+                assert_eq!(created.identifier().as_str(), "decoded-created-id");
+                assert!(matches!(created.observation(), Observation::ReadFailed(_)));
+            }
+            ResumeFailureKind::Ended(error) => {
+                panic!("post-identifier resume decode failure ended the record: {error}")
+            }
+            ResumeFailureKind::InFlight { error, .. } => {
+                panic!("post-identifier resume decode failure stayed in flight: {error}")
+            }
+        }
+    }
+
+    struct PendingFixtureProvider;
+
+    impl Provider for PendingFixtureProvider {
+        fn name(&self) -> &str {
+            "pending-fixture"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(ReadOutcome::not_found(id)) })
+        }
+
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = resource.id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            attempt: CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            Box::pin(async move {
+                let pending = attempt
+                    .issued(
+                        AppliedIdentifier::new("issued-id").expect("valid identifier"),
+                        sent_name_only(),
+                    )
+                    .pending(proto::PendingToken::new("original-token"), 1);
+                Err(pending.preserve(ProviderError::timeout("fixture remains pending")))
+            })
+        }
+
+        fn resume_create(
+            &self,
+            request: ResumeCreateRequest,
+        ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+            Box::pin(async move {
+                let (resume, create_request) = request.into_parts();
+                drop(create_request);
+                Err(resume.preserve(ProviderError::internal(
+                    "resume is not used by this fixture",
+                )))
+            })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "update is not used by this fixture",
+                ))
+            })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "delete is not used by this fixture",
+                ))
+            })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn pending_create_with_issued_identifier() -> PendingCreate {
+        let (id, wit_id, wit_request) = boundary_resource();
+        let mut resource = Resource::from_id(id.clone());
+        resource.set_attr("name", test_string_value("example"));
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let preparation = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            &[],
+            &carina_core::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+        let request = carina_core::executor::prepare_create_request(resource, &preparation)
+            .await
+            .expect("fixture resource passes provider preparation");
+        let failure = carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request)
+            .await
+            .expect_err("fixture create remains pending");
+        let pending = match failure.into_kind() {
+            CreateFailureKind::InFlight {
+                pending,
+                error: _error,
+            } => pending
+                .into_fresh()
+                .unwrap_or_else(|_| panic!("fixture provider returned a persisted continuation")),
+            CreateFailureKind::Created {
+                created: _created,
+                error,
+            } => {
+                panic!("fixture create was created: {error}")
+            }
+            CreateFailureKind::Untracked(error) => {
+                panic!("fixture create was not pending: {error}")
+            }
+        };
+        PendingCreate {
+            id,
+            wit_id,
+            wit_request,
+            pending,
+        }
+    }
+
+    fn persisted_resume_with_issued_identifier() -> InFlightCreate {
+        let (id, _wit_id, _wit_request) = boundary_resource();
+        let identity = id
+            .identity()
+            .cloned()
+            .expect("resume fixture identity is resolved");
+        let mut row = serde_json::to_value(carina_state::ResourceState::new(
+            &id.resource_type,
+            identity,
+            &id.provider,
+        ))
+        .expect("fixture row serializes");
+        row["current"] = serde_json::json!({
+            "kind": "create_in_flight",
+            "envelope": {
+                "token": "original-token",
+                "identifier": "issued-id",
+                "write_only": {},
+                "secrets": {},
+            },
+            "started_at": "2026-10-23T12:34:56Z",
+        });
+        let mut document =
+            serde_json::to_value(carina_state::StateFile::new()).expect("fixture state serializes");
+        document["resources"] = serde_json::json!([row]);
+        let loaded = carina_state::state::check_and_migrate(&document.to_string())
+            .expect("v15 fixture passes the public state loader")
+            .into_state();
+        match loaded.build_state_for_resource(&id) {
+            Current::CreateInFlight(pending) => pending,
+            Current::Absent(state) => panic!("resume fixture loaded as absent: {state:?}"),
+            Current::Present(state) => panic!("resume fixture loaded as present: {state:?}"),
+            Current::MissingIdentifier(state) => {
+                panic!("resume fixture loaded without an identifier: {state:?}")
+            }
+        }
+    }
+
+    async fn resume_witness(pending: InFlightCreate) -> CoreResume {
+        let mut resource = Resource::from_id(pending.id().clone());
+        resource.set_attr("name", test_string_value("example"));
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let provider_configs = [];
+        let normalizer = carina_core::provider::NoopNormalizer;
+        let factories = [];
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let context = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &provider_configs,
+            &normalizer,
+            &factories,
+            &schemas,
+        );
+        let request = carina_core::executor::prepare_create_request(resource, &context)
+            .await
+            .expect("resume fixture request must pass provider preparation");
+        let (resume, _request) = ResumeCreateRequest::for_test(pending, request)
+            .expect("resume fixture route must match")
+            .into_parts();
+        resume
+    }
+
+    fn assert_original_polled_record(
+        progress: CreateProgress,
+        expected_id: &ResourceId,
+        expected_started_at: &carina_core::provider::Timestamp,
+    ) {
+        match progress {
+            CreateProgress::Verdict(failure) => match failure.into_kind() {
+                CreateFailureKind::InFlight { pending, error } => {
+                    assert_eq!(pending.id(), expected_id);
+                    match pending.persistence() {
+                        InFlightPersistence::Fresh(fresh) => {
+                            assert_eq!(fresh.token().expose_for_provider_call(), "original-token");
+                            assert_eq!(
+                                fresh.identifier().map(AppliedIdentifier::as_str),
+                                Some("issued-id")
+                            );
+                            assert_eq!(fresh.sent(), &sent_name_only());
+                            assert_eq!(fresh.started_at(), expected_started_at);
+                        }
+                        InFlightPersistence::Persisted => {
+                            panic!("fresh polling unexpectedly produced a persisted envelope")
+                        }
+                    }
+                    assert_eq!(pending.token().expose_for_provider_call(), "original-token");
+                    assert_eq!(
+                        pending.identifier().map(AppliedIdentifier::as_str),
+                        Some("issued-id")
+                    );
+                    match pending.sent() {
+                        SentRecord::Request(Sent::Only(attributes)) => {
+                            assert_eq!(attributes, ["name".to_string()].into_iter().collect());
+                        }
+                        SentRecord::Request(Sent::AllRequestAttributes) => {
+                            panic!("the starting sent subset was replaced with all attributes")
+                        }
+                        SentRecord::Persisted(envelope) => {
+                            panic!(
+                                "fresh polling unexpectedly produced a persisted envelope: {envelope:?}"
+                            )
+                        }
+                    }
+                    assert!(!error.to_string().is_empty());
+                }
+                CreateFailureKind::Untracked(error) => {
+                    panic!("issued create was downgraded to untracked: {error}")
+                }
+                CreateFailureKind::Created { created, error } => {
+                    panic!(
+                        "invalid boundary response was accepted as created for {}: {error}",
+                        created.identifier()
+                    )
+                }
+            },
+            CreateProgress::Done(outcome) => {
+                panic!("invalid boundary response unexpectedly completed: {outcome:?}")
+            }
+            CreateProgress::Pending(pending) => {
+                panic!(
+                    "invalid boundary response unexpectedly replaced token with {:?}",
+                    pending.pending.token()
+                )
+            }
+        }
+    }
+
+    fn assert_original_resumed_record(progress: ResumeProgress, expected: &InFlightCreate) {
+        match progress {
+            ResumeProgress::Verdict(failure) => match failure.into_kind() {
+                ResumeFailureKind::InFlight { pending, error } => {
+                    assert_eq!(&pending, expected);
+                    assert!(!error.to_string().is_empty());
+                }
+                ResumeFailureKind::Ended(error) => {
+                    panic!("issued resume was incorrectly ended: {error}")
+                }
+                ResumeFailureKind::Created { created, error } => {
+                    panic!(
+                        "invalid resume boundary response was accepted as created for {}: {error}",
+                        created.identifier()
+                    )
+                }
+            },
+            ResumeProgress::Done(outcome) => {
+                panic!("invalid resume boundary response unexpectedly completed: {outcome:?}")
+            }
+            ResumeProgress::Pending(pending) => match pending.as_ref() {
+                PendingResume::Resume {
+                    id,
+                    wit_id,
+                    wit_request,
+                    resume,
+                    poll_after_secs,
+                } => panic!(
+                    "invalid resume boundary response unexpectedly replaced the record for {id} ({wit_id:?}, {wit_request:?}, {resume:?}, {poll_after_secs})"
+                ),
+                PendingResume::Resent(pending) => panic!(
+                    "invalid resume boundary response unexpectedly resent create for {}",
+                    pending.id
+                ),
+            },
+        }
+    }
+
+    fn assert_issued_poll_repended_with_original_identifier(progress: CreateProgress) {
+        let CreateProgress::Pending(pending) = progress else {
+            panic!("issued poll must accept the replacement token")
+        };
+        assert_eq!(
+            pending.pending.identifier().map(AppliedIdentifier::as_str),
+            Some("issued-id")
+        );
+        assert_eq!(
+            pending.pending.token().expose_for_provider_call(),
+            "replacement-token"
+        );
+    }
+
+    fn assert_issued_resume_repended_with_original_identifier(progress: ResumeProgress) {
+        let ResumeProgress::Pending(pending) = progress else {
+            panic!("issued resume must accept the replacement token")
+        };
+        let PendingResume::Resume { resume, .. } = *pending else {
+            panic!("issued resume unexpectedly changed into a resent create")
+        };
+        assert_eq!(
+            resume.identifier().map(AppliedIdentifier::as_str),
+            Some("issued-id")
+        );
+        assert_eq!(
+            resume.token().expose_for_provider_call(),
+            "replacement-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_poll_boundary_never_drops_or_mutates_the_starting_record() {
+        let starting = pending_create_with_issued_identifier().await;
+        let expected_id = starting.id.clone();
+        let expected_started_at = starting.pending.started_at().clone();
+        let verdict: wasm_convert::DecodedPollVerdict =
+            proto::PollVerdict::Untracked(ProviderError::internal("untracked"));
+        assert_original_polled_record(
+            WasmProvider::polled_create_verdict(starting, verdict),
+            &expected_id,
+            &expected_started_at,
+        );
+
+        let starting = pending_create_with_issued_identifier().await;
+        let expected_id = starting.id.clone();
+        let expected_started_at = starting.pending.started_at().clone();
+        let verdict: wasm_convert::DecodedPollVerdict =
+            proto::PollVerdict::Undetermined(ProviderError::internal("undetermined"));
+        assert_original_polled_record(
+            WasmProvider::polled_create_verdict(starting, verdict),
+            &expected_id,
+            &expected_started_at,
+        );
+
+        let identifier_variants = [
+            proto::PendingCreate {
+                token: proto::PendingToken::new("replacement-token"),
+                identifier: None,
+                sent: sent_name_only(),
+                poll_after_secs: 2,
+            },
+            proto::PendingCreate {
+                token: proto::PendingToken::new("replacement-token"),
+                identifier: Some(AppliedIdentifier::new("changed-id").expect("valid identifier")),
+                sent: sent_name_only(),
+                poll_after_secs: 2,
+            },
+        ];
+        for next in identifier_variants {
+            let starting = pending_create_with_issued_identifier().await;
+            let step: wasm_convert::DecodedCreateStep = proto::CreateStep::Pending(next);
+            assert_issued_poll_repended_with_original_identifier(WasmProvider::polled_create_step(
+                starting, step,
+            ));
+        }
+
+        let starting = pending_create_with_issued_identifier().await;
+        let expected_id = starting.id.clone();
+        let expected_started_at = starting.pending.started_at().clone();
+        let changed_sent: wasm_convert::DecodedCreateStep =
+            proto::CreateStep::Pending(proto::PendingCreate {
+                token: proto::PendingToken::new("replacement-token"),
+                identifier: Some(AppliedIdentifier::new("issued-id").expect("valid identifier")),
+                sent: Sent::AllRequestAttributes,
+                poll_after_secs: 2,
+            });
+        assert_original_polled_record(
+            WasmProvider::polled_create_step(starting, changed_sent),
+            &expected_id,
+            &expected_started_at,
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_decode_failure_after_identifier_is_created_not_untracked() {
+        let starting = pending_create_with_issued_identifier().await;
+        let failure = decode_failed_create_step(&starting.id);
+        assert_created_after_decode_failure(WasmProvider::polled_step_created_read_decode_failure(
+            starting, failure,
+        ));
+
+        let starting = pending_create_with_issued_identifier().await;
+        let failure = decode_failed_created_verdict(&starting.id);
+        assert_created_after_decode_failure(
+            WasmProvider::polled_verdict_created_read_decode_failure(starting, failure),
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_decode_failure_after_identifier_is_created_not_ended() {
+        let (id, _wit_id, wit_request) = boundary_resource();
+        let starting = persisted_resume_with_issued_identifier();
+        let resume = resume_witness(starting).await;
+        let step = wit_types::ResumeStep::Completed(wit_types::AppliedState {
+            identifier: "decoded-created-id".to_string(),
+            attributes: malformed_wit_attributes(),
+        });
+        let failure = match wasm_convert::wit_to_core_resume_step(step, &id)
+            .expect("the valid identifier makes the attribute failure recoverable")
+        {
+            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::Decoded(_) => {
+                panic!("malformed attributes unexpectedly decoded")
+            }
+        };
+
+        let progress =
+            WasmProvider::resumed_created_read_decode_failure(id, wit_request, resume, failure);
+        assert_created_after_resume_decode_failure(progress);
+
+        let (id, _wit_id, wit_request) = boundary_resource();
+        let starting = persisted_resume_with_issued_identifier();
+        let resume = resume_witness(starting).await;
+        let declared_error = ProviderError::internal("guest resume failure");
+        let verdict = wit_types::ResumeVerdict::Created(wit_types::ResumedFailure {
+            identifier: "decoded-created-id".to_string(),
+            read: wit_types::Observation::Read(wit_types::ReadOutcome::Found(
+                wit_types::AppliedState {
+                    identifier: "decoded-created-id".to_string(),
+                    attributes: malformed_wit_attributes(),
+                },
+            )),
+            error: wasm_convert::wire_to_wit_provider_error(declared_error.to_wire()),
+        });
+        let failure = match wasm_convert::wit_to_core_resume_verdict(verdict, &id)
+            .expect("the valid identifier makes the verdict observation failure recoverable")
+        {
+            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::Decoded(_) => {
+                panic!("malformed resume verdict observation unexpectedly decoded")
+            }
+        };
+        let progress =
+            WasmProvider::resumed_created_read_decode_failure(id, wit_request, resume, failure);
+        assert_created_after_resume_decode_failure(progress);
+    }
+
+    #[tokio::test]
+    async fn issued_resume_boundary_never_drops_or_mutates_the_starting_record() {
+        let (id, _wit_id, wit_request) = boundary_resource();
+        let starting = persisted_resume_with_issued_identifier();
+        let resume = resume_witness(starting.clone()).await;
+        let verdict: wasm_convert::DecodedResumeVerdict =
+            proto::ResumeVerdict::Untracked(ProviderError::internal("untracked"));
+        assert_original_resumed_record(
+            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict),
+            &starting,
+        );
+
+        let (id, _wit_id, wit_request) = boundary_resource();
+        let starting = persisted_resume_with_issued_identifier();
+        let resume = resume_witness(starting.clone()).await;
+        let verdict: wasm_convert::DecodedResumeVerdict =
+            proto::ResumeVerdict::Undetermined(ProviderError::internal("undetermined"));
+        assert_original_resumed_record(
+            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict),
+            &starting,
+        );
+
+        let identifier_variants = [
+            proto::ResumePending {
+                token: proto::PendingToken::new("replacement-token"),
+                identifier: None,
+                poll_after_secs: 2,
+            },
+            proto::ResumePending {
+                token: proto::PendingToken::new("replacement-token"),
+                identifier: Some(AppliedIdentifier::new("changed-id").expect("valid identifier")),
+                poll_after_secs: 2,
+            },
+        ];
+        for next in identifier_variants {
+            let (id, wit_id, wit_request) = boundary_resource();
+            let resume = resume_witness(persisted_resume_with_issued_identifier()).await;
+            let step: wasm_convert::DecodedResumeStep = proto::ResumeStep::Pending(next);
+            assert_issued_resume_repended_with_original_identifier(
+                WasmProvider::resumed_create_step(id, wit_id, wit_request, resume, step),
+            );
+        }
     }
 
     fn migrate_legacy_state_attribute(
@@ -4888,7 +6598,6 @@ mod tests {
             Value::Deferred(DeferredValue::RedactedSecret { hash }),
         )]);
         let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
-
         apply_wit_state_attribute_updates(
             "normalize_state",
             &mut states,

@@ -1,16 +1,85 @@
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
 use carina_core::resource::{
     ResourceIdentity as CoreResourceIdentity, ResourceIdentityError as CoreResourceIdentityError,
 };
 use carina_plugin_sdk::types::*;
-use carina_plugin_sdk::{CarinaProvider, CreateOutcome, DeleteOutcome, Pending, UpdateOutcome};
+use carina_plugin_sdk::{
+    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, FoundRead, Pending,
+    Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CreateMode {
+    #[default]
+    Normal,
+    Untracked,
+    Created,
+    Pending,
+    Resumed,
+    Discarded,
+    Undetermined,
+    MalformedPending,
+    Resend,
+}
+
+const UNENCODABLE_CREATE_TOKEN_POLLS: u32 = u32::MAX;
+
+#[derive(Debug)]
 struct CreateToken {
     remaining: u32,
     polls_served: u32,
+    mode: CreateMode,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EncodedCreateToken {
+    remaining: u32,
+    polls_served: u32,
+    #[serde(default)]
+    mode: CreateMode,
+}
+
+impl Serialize for CreateToken {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.polls_served == UNENCODABLE_CREATE_TOKEN_POLLS {
+            return Err(serde::ser::Error::custom(
+                "intentional mock create-token encode failure",
+            ));
+        }
+        EncodedCreateToken {
+            remaining: self.remaining,
+            polls_served: self.polls_served,
+            mode: self.mode,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CreateToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = EncodedCreateToken::deserialize(deserializer)?;
+        if encoded.mode == CreateMode::MalformedPending {
+            return Err(serde::de::Error::custom(
+                "intentional mock create-token decode failure",
+            ));
+        }
+        Ok(Self {
+            remaining: encoded.remaining,
+            polls_served: encoded.polls_served,
+            mode: encoded.mode,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +106,30 @@ impl Default for MockProcessProvider {
 }
 
 impl MockProcessProvider {
+    fn optional_string_attribute(name: &str) -> AttributeSchema {
+        AttributeSchema {
+            name: name.to_string(),
+            attr_type: AttributeType::String {
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            },
+            required: false,
+            default: None,
+            description: Some("Mock create/resume test control".to_string()),
+            create_only: false,
+            read_only: false,
+            write_only: false,
+            block_name: None,
+            provider_name: None,
+            removable: None,
+            identity: true,
+            deferred_populate: false,
+        }
+    }
+
     fn resource_key(id: &ResourceId) -> String {
         format!("{}.{}", id.resource_type, id.identity)
     }
@@ -87,6 +180,141 @@ impl MockProcessProvider {
             .unwrap_or(0)
     }
 
+    fn create_mode(attributes: &HashMap<String, Value>) -> CreateMode {
+        let Some(value) = attributes.get("create_mode") else {
+            return CreateMode::Normal;
+        };
+        let value = match value {
+            Value::String(value) => value.as_str(),
+            Value::Bool(value) => {
+                let _ignored = value;
+                return CreateMode::Normal;
+            }
+            Value::Int(value) => {
+                let _ignored = value;
+                return CreateMode::Normal;
+            }
+            Value::Float(value) => {
+                let _ignored = value;
+                return CreateMode::Normal;
+            }
+            Value::StringList(value) => {
+                let _ignored = value;
+                return CreateMode::Normal;
+            }
+            Value::List(value) => {
+                let _ignored = value;
+                return CreateMode::Normal;
+            }
+            Value::Map(value) => {
+                let _ignored = value;
+                return CreateMode::Normal;
+            }
+        };
+        match value {
+            "normal" => CreateMode::Normal,
+            "untracked" => CreateMode::Untracked,
+            "created" => CreateMode::Created,
+            "pending" => CreateMode::Pending,
+            "resumed" => CreateMode::Resumed,
+            "discarded" => CreateMode::Discarded,
+            "undetermined" => CreateMode::Undetermined,
+            "malformed_pending" => CreateMode::MalformedPending,
+            "resend" => CreateMode::Resend,
+            _unsupported => CreateMode::Normal,
+        }
+    }
+
+    fn sent_attributes(attributes: &HashMap<String, Value>) -> Sent {
+        let Some(value) = attributes.get("create_sent") else {
+            return Sent::AllRequestAttributes;
+        };
+        match value {
+            Value::StringList(values) => Sent::only(values.iter().cloned()),
+            Value::String(value) => Sent::only(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(ToString::to_string),
+            ),
+            Value::Bool(value) => {
+                let _ignored = value;
+                Sent::AllRequestAttributes
+            }
+            Value::Int(value) => {
+                let _ignored = value;
+                Sent::AllRequestAttributes
+            }
+            Value::Float(value) => {
+                let _ignored = value;
+                Sent::AllRequestAttributes
+            }
+            Value::List(value) => {
+                let _ignored = value;
+                Sent::AllRequestAttributes
+            }
+            Value::Map(value) => {
+                let _ignored = value;
+                Sent::AllRequestAttributes
+            }
+        }
+    }
+
+    fn canonical_identifier(attributes: &HashMap<String, Value>) -> Option<AppliedIdentifier> {
+        let value = attributes.get("canonical_identifier")?;
+        match value {
+            Value::String(value) => AppliedIdentifier::new(value.clone()).ok(),
+            Value::Bool(value) => {
+                let _ignored = value;
+                None
+            }
+            Value::Int(value) => {
+                let _ignored = value;
+                None
+            }
+            Value::Float(value) => {
+                let _ignored = value;
+                None
+            }
+            Value::StringList(value) => {
+                let _ignored = value;
+                None
+            }
+            Value::List(value) => {
+                let _ignored = value;
+                None
+            }
+            Value::Map(value) => {
+                let _ignored = value;
+                None
+            }
+        }
+    }
+
+    fn found_read(id: &ResourceId, attributes: HashMap<String, Value>) -> FoundRead {
+        FoundRead::from_applied_state(AppliedState {
+            id: id.clone(),
+            identifier: AppliedIdentifier::new("mock-read-id")
+                .expect("the mock read identifier is non-empty"),
+            attributes,
+        })
+    }
+
+    fn create_mode_error(id: &ResourceId, mode: CreateMode) -> ProviderError {
+        ProviderError {
+            kind: ProviderErrorKind::Internal,
+            message: format!("intentional mock {mode:?} create verdict"),
+            resource_id: Some(id.clone()),
+            cause: None,
+            provider_name: Some("mock".to_string()),
+            operation: Some("create".to_string()),
+            status: None,
+            code: None,
+            request_id: None,
+        }
+    }
+
     fn update_pending_polls(request: &UpdateRequest) -> u32 {
         request
             .patch
@@ -118,7 +346,7 @@ impl MockProcessProvider {
         id: &ResourceId,
         mut request: CreateRequest,
         polls_served: Option<u32>,
-    ) -> carina_provider_protocol::CreateOutcome {
+    ) -> HashMap<String, Value> {
         if let Some(polls_served) = polls_served {
             request.resource.attributes.insert(
                 "__mock_create_polls_served__".to_string(),
@@ -130,13 +358,7 @@ impl MockProcessProvider {
         let resource = request.resource;
         states.insert(key, resource.attributes.clone());
 
-        let state = AppliedState {
-            id: id.clone(),
-            identifier: AppliedIdentifier::new("mock-id")
-                .expect("the mock identifier is non-empty"),
-            attributes: resource.attributes,
-        };
-        carina_provider_protocol::CreateOutcome::Success { state }
+        resource.attributes
     }
 
     fn update_done(
@@ -233,7 +455,10 @@ impl CarinaProvider for MockProcessProvider {
     fn schemas(&self) -> Vec<ResourceSchema> {
         vec![ResourceSchema {
             resource_type: "test.short_budget".to_string(),
-            attributes: HashMap::new(),
+            attributes: HashMap::from([(
+                "create_mode".to_string(),
+                Self::optional_string_attribute("create_mode"),
+            )]),
             description: Some("Mock resource with short operation budgets".to_string()),
             kind: SchemaKind::Managed,
             unique_name: UniqueNameSpec::default(),
@@ -319,12 +544,13 @@ impl CarinaProvider for MockProcessProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError> {
+        attempt: CreateAttempt,
+    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict> {
         if id.identity == "__mock_create_trap__" {
             panic!("intentional mock create trap");
         }
         if id.identity == "__mock_create_error__" {
-            return Err(ProviderError {
+            return Err(attempt.untracked(ProviderError {
                 kind: ProviderErrorKind::Internal,
                 message: "intentional mock create error".to_string(),
                 resource_id: Some(id.clone()),
@@ -334,9 +560,68 @@ impl CarinaProvider for MockProcessProvider {
                 status: None,
                 code: None,
                 request_id: None,
-            });
+            }));
         }
 
+        let unencodable_created = matches!(
+            request.resource.attributes.get("create_mode"),
+            Some(Value::String(mode)) if mode == "unencodable_created"
+        );
+        let unencodable_pending = matches!(
+            request.resource.attributes.get("create_mode"),
+            Some(Value::String(mode)) if mode == "unencodable_pending"
+        );
+        let unencodable_pending_issued = matches!(
+            request.resource.attributes.get("create_mode"),
+            Some(Value::String(mode)) if mode == "unencodable_pending_issued"
+        );
+        let unencodable_poll = matches!(
+            request.resource.attributes.get("create_mode"),
+            Some(Value::String(mode)) if mode == "unencodable_poll"
+        );
+        let unencodable_poll_issued = matches!(
+            request.resource.attributes.get("create_mode"),
+            Some(Value::String(mode)) if mode == "unencodable_poll_issued"
+        );
+        let mode = Self::create_mode(&request.resource.attributes);
+        let sent = Self::sent_attributes(&request.resource.attributes);
+        let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
+        if unencodable_created {
+            let mut attributes = self.create_done(id, request, None);
+            attributes.insert(
+                "__mock_unencodable__".to_string(),
+                Value::List(vec![Value::Float(f64::NAN)]),
+            );
+            let identifier =
+                AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+            return Ok(attempt.issued(identifier, sent).succeeded(attributes));
+        }
+        if unencodable_pending || unencodable_pending_issued {
+            let token = CreateToken {
+                remaining: 100,
+                polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
+                mode: CreateMode::Pending,
+            };
+            if unencodable_pending_issued {
+                let identifier =
+                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                return Ok(attempt.issued(identifier, sent).pending(token, 1));
+            }
+            return Ok(attempt.pending(token, sent, 1));
+        }
+        if unencodable_poll || unencodable_poll_issued {
+            let token = CreateToken {
+                remaining: 100,
+                polls_served: 0,
+                mode: CreateMode::Pending,
+            };
+            if unencodable_poll_issued {
+                let identifier =
+                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                return Ok(attempt.issued(identifier, sent).pending(token, 1));
+            }
+            return Ok(attempt.pending(token, sent, 1));
+        }
         if let Some(Value::Int(delay_millis)) = request.resource.attributes.get("call_delay_millis")
             && let Ok(delay_millis) = u64::try_from(*delay_millis)
         {
@@ -344,39 +629,370 @@ impl CarinaProvider for MockProcessProvider {
         }
         let pending_polls =
             Self::pending_polls(&request.resource.attributes, "create_pending_polls");
-        if pending_polls > 0 {
-            return Ok(CreateOutcome::Pending(Pending {
-                token: CreateToken {
+        match mode {
+            CreateMode::Untracked => Err(attempt.untracked(Self::create_mode_error(id, mode))),
+            CreateMode::Created => {
+                let attributes = self.create_done(id, request, None);
+                let identifier =
+                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                let observation = Observation::Read(ReadOutcome::Found {
+                    state: AppliedState {
+                        id: id.clone(),
+                        identifier: identifier.clone(),
+                        attributes: attributes.clone(),
+                    },
+                });
+                let issued = attempt.issued(identifier, sent);
+                Err(match canonical_identifier {
+                    Some(identifier) => issued
+                        .canonicalize(identifier)
+                        .failed(observation, Self::create_mode_error(id, mode)),
+                    None => issued.failed(observation, Self::create_mode_error(id, mode)),
+                })
+            }
+            CreateMode::Normal if pending_polls == 0 => {
+                let attributes = self.create_done(id, request, None);
+                let identifier =
+                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                let issued = attempt.issued(identifier, sent);
+                Ok(match canonical_identifier {
+                    Some(identifier) => issued.canonicalize(identifier).succeeded(attributes),
+                    None => issued.succeeded(attributes),
+                })
+            }
+            CreateMode::Normal => Ok(attempt.pending(
+                CreateToken {
                     remaining: pending_polls - 1,
                     polls_served: 0,
+                    mode,
                 },
-                poll_after_secs: 1,
-            }));
+                sent,
+                1,
+            )),
+            CreateMode::Resumed | CreateMode::Discarded => {
+                let identifier =
+                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                Ok(attempt.issued(identifier, sent).pending(
+                    CreateToken {
+                        remaining: 100,
+                        polls_served: 0,
+                        mode,
+                    },
+                    1,
+                ))
+            }
+            CreateMode::Pending
+            | CreateMode::Undetermined
+            | CreateMode::MalformedPending
+            | CreateMode::Resend => Ok(attempt.pending(
+                CreateToken {
+                    remaining: 100,
+                    polls_served: 0,
+                    mode,
+                },
+                sent,
+                1,
+            )),
         }
-
-        Ok(CreateOutcome::Done(self.create_done(id, request, None)))
     }
 
     fn poll_create(
         &self,
         id: &ResourceId,
         request: CreateRequest,
-        pending: Pending<Self::CreateToken>,
-    ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError> {
-        if pending.token.remaining > 0 {
-            return Ok(CreateOutcome::Pending(Pending {
-                token: CreateToken {
-                    remaining: pending.token.remaining - 1,
-                    polls_served: pending.token.polls_served + 1,
-                },
-                poll_after_secs: 1,
-            }));
+        poll: Poll<Self::CreateToken>,
+    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict> {
+        let unencodable_poll = matches!(
+            request.resource.attributes.get("create_mode"),
+            Some(Value::String(mode))
+                if mode == "unencodable_poll" || mode == "unencodable_poll_issued"
+        );
+        if unencodable_poll {
+            let token = CreateToken {
+                remaining: 100,
+                polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
+                mode: CreateMode::Pending,
+            };
+            return Ok(match poll {
+                Poll::Unissued(attempt, _previous) => attempt.pending(token, 1),
+                Poll::Issued(issued, _previous) => issued.pending(token, 1),
+            });
         }
-        Ok(CreateOutcome::Done(self.create_done(
-            id,
-            request,
-            Some(pending.token.polls_served + 1),
-        )))
+        let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
+        match poll {
+            Poll::Unissued(attempt, token) => match token.mode {
+                CreateMode::Normal => {
+                    if token.remaining > 0 {
+                        return Ok(attempt.pending(
+                            CreateToken {
+                                remaining: token.remaining - 1,
+                                polls_served: token.polls_served + 1,
+                                mode: token.mode,
+                            },
+                            1,
+                        ));
+                    }
+                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    let identifier = AppliedIdentifier::new("mock-id")
+                        .expect("the mock identifier is non-empty");
+                    let issued = attempt.issued(identifier);
+                    Ok(match canonical_identifier {
+                        Some(identifier) => issued.canonicalize(identifier).succeeded(attributes),
+                        None => issued.succeeded(attributes),
+                    })
+                }
+                mode @ (CreateMode::Pending
+                | CreateMode::Resumed
+                | CreateMode::Discarded
+                | CreateMode::Undetermined
+                | CreateMode::Resend) => Ok(attempt.pending(
+                    CreateToken {
+                        remaining: token.remaining,
+                        polls_served: token.polls_served + 1,
+                        mode,
+                    },
+                    1,
+                )),
+                CreateMode::MalformedPending => {
+                    Err(attempt
+                        .undetermined(Self::create_mode_error(id, CreateMode::MalformedPending)))
+                }
+                CreateMode::Untracked => {
+                    Err(attempt.untracked(Self::create_mode_error(id, CreateMode::Untracked)))
+                }
+                CreateMode::Created => {
+                    let identifier = AppliedIdentifier::new("mock-id")
+                        .expect("the mock identifier is non-empty");
+                    let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
+                    let issued = attempt.issued(identifier);
+                    Err(match canonical_identifier {
+                        Some(identifier) => issued
+                            .canonicalize(identifier)
+                            .failed(
+                                observation,
+                                Self::create_mode_error(id, CreateMode::Created),
+                            )
+                            .into(),
+                        None => issued
+                            .failed(
+                                observation,
+                                Self::create_mode_error(id, CreateMode::Created),
+                            )
+                            .into(),
+                    })
+                }
+            },
+            Poll::Issued(issued, token) => match token.mode {
+                CreateMode::Normal => {
+                    if token.remaining > 0 {
+                        return Ok(issued.pending(
+                            CreateToken {
+                                remaining: token.remaining - 1,
+                                polls_served: token.polls_served + 1,
+                                mode: token.mode,
+                            },
+                            1,
+                        ));
+                    }
+                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    Ok(match canonical_identifier {
+                        Some(identifier) => issued.canonicalize(identifier).succeeded(attributes),
+                        None => issued.succeeded(attributes),
+                    })
+                }
+                mode @ (CreateMode::Pending
+                | CreateMode::Resumed
+                | CreateMode::Discarded
+                | CreateMode::Undetermined
+                | CreateMode::Resend) => Ok(issued.pending(
+                    CreateToken {
+                        remaining: token.remaining,
+                        polls_served: token.polls_served + 1,
+                        mode,
+                    },
+                    1,
+                )),
+                CreateMode::MalformedPending | CreateMode::Untracked => Err(issued
+                    .discarded(Self::create_mode_error(id, token.mode))
+                    .into()),
+                CreateMode::Created => {
+                    let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
+                    Err(match canonical_identifier {
+                        Some(identifier) => issued
+                            .canonicalize(identifier)
+                            .failed(
+                                observation,
+                                Self::create_mode_error(id, CreateMode::Created),
+                            )
+                            .into(),
+                        None => issued
+                            .failed(
+                                observation,
+                                Self::create_mode_error(id, CreateMode::Created),
+                            )
+                            .into(),
+                    })
+                }
+            },
+        }
+    }
+
+    fn resume_create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+        resume: Resume<Self::CreateToken>,
+    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict> {
+        let unencodable_repending = matches!(
+            request.resource.attributes.get("create_mode"),
+            Some(Value::String(mode)) if mode == "unencodable_repending"
+        );
+        if unencodable_repending {
+            let token = CreateToken {
+                remaining: 100,
+                polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
+                mode: CreateMode::Pending,
+            };
+            return Ok(match resume {
+                Resume::Unissued(attempt, _previous) => attempt.pending(token, 1),
+                Resume::Issued(resumed, _previous) => resumed.pending(token, 1),
+            });
+        }
+        let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
+        match resume {
+            Resume::Unissued(attempt, token) => match token.mode {
+                CreateMode::Normal => {
+                    if token.remaining > 0 {
+                        return Ok(attempt.pending(
+                            CreateToken {
+                                remaining: token.remaining - 1,
+                                polls_served: token.polls_served + 1,
+                                mode: token.mode,
+                            },
+                            1,
+                        ));
+                    }
+                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    let identifier = AppliedIdentifier::new("mock-id")
+                        .expect("the mock identifier is non-empty");
+                    let resumed = attempt.issued(identifier);
+                    Ok(match canonical_identifier {
+                        Some(identifier) => resumed
+                            .canonicalize(identifier)
+                            .completed(Self::found_read(id, attributes)),
+                        None => resumed.completed(Self::found_read(id, attributes)),
+                    })
+                }
+                CreateMode::Pending => Ok(attempt.pending(
+                    CreateToken {
+                        remaining: token.remaining,
+                        polls_served: token.polls_served + 1,
+                        mode: token.mode,
+                    },
+                    1,
+                )),
+                CreateMode::Resumed => {
+                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    let identifier = AppliedIdentifier::new("mock-id")
+                        .expect("the mock identifier is non-empty");
+                    let resumed = attempt.issued(identifier);
+                    Ok(match canonical_identifier {
+                        Some(identifier) => resumed
+                            .canonicalize(identifier)
+                            .completed(Self::found_read(id, attributes)),
+                        None => resumed.completed(Self::found_read(id, attributes)),
+                    })
+                }
+                CreateMode::Discarded | CreateMode::Untracked => {
+                    Err(attempt.untracked(Self::create_mode_error(id, token.mode)))
+                }
+                CreateMode::Undetermined | CreateMode::MalformedPending => {
+                    Err(attempt.undetermined(Self::create_mode_error(id, token.mode)))
+                }
+                CreateMode::Resend => {
+                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    let identifier = AppliedIdentifier::new("mock-id")
+                        .expect("the mock identifier is non-empty");
+                    let issued = attempt
+                        .resend()
+                        .issued(identifier, Sent::AllRequestAttributes);
+                    Ok(match canonical_identifier {
+                        Some(identifier) => {
+                            issued.canonicalize(identifier).succeeded(attributes).into()
+                        }
+                        None => issued.succeeded(attributes).into(),
+                    })
+                }
+                CreateMode::Created => {
+                    let identifier = AppliedIdentifier::new("mock-id")
+                        .expect("the mock identifier is non-empty");
+                    let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
+                    let resumed = attempt.issued(identifier);
+                    Err(match canonical_identifier {
+                        Some(identifier) => resumed.canonicalize(identifier).failed(
+                            observation,
+                            Self::create_mode_error(id, CreateMode::Created),
+                        ),
+                        None => resumed.failed(
+                            observation,
+                            Self::create_mode_error(id, CreateMode::Created),
+                        ),
+                    })
+                }
+            },
+            Resume::Issued(resumed, token) => match token.mode {
+                CreateMode::Normal => {
+                    if token.remaining > 0 {
+                        return Ok(resumed.pending(
+                            CreateToken {
+                                remaining: token.remaining - 1,
+                                polls_served: token.polls_served + 1,
+                                mode: token.mode,
+                            },
+                            1,
+                        ));
+                    }
+                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    Ok(match canonical_identifier {
+                        Some(identifier) => resumed
+                            .canonicalize(identifier)
+                            .completed(Self::found_read(id, attributes)),
+                        None => resumed.completed(Self::found_read(id, attributes)),
+                    })
+                }
+                CreateMode::Pending => Ok(resumed.pending(
+                    CreateToken {
+                        remaining: token.remaining,
+                        polls_served: token.polls_served + 1,
+                        mode: token.mode,
+                    },
+                    1,
+                )),
+                CreateMode::Resumed | CreateMode::Resend => {
+                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    Ok(match canonical_identifier {
+                        Some(identifier) => resumed
+                            .canonicalize(identifier)
+                            .completed(Self::found_read(id, attributes)),
+                        None => resumed.completed(Self::found_read(id, attributes)),
+                    })
+                }
+                CreateMode::Discarded | CreateMode::Untracked | CreateMode::MalformedPending => {
+                    Err(resumed.discarded(Self::create_mode_error(id, token.mode)))
+                }
+                CreateMode::Undetermined | CreateMode::Created => {
+                    let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
+                    Err(match canonical_identifier {
+                        Some(identifier) => resumed
+                            .canonicalize(identifier)
+                            .failed(observation, Self::create_mode_error(id, token.mode)),
+                        None => {
+                            resumed.failed(observation, Self::create_mode_error(id, token.mode))
+                        }
+                    })
+                }
+            },
+        }
     }
 
     fn update(
@@ -644,7 +1260,9 @@ impl CarinaProvider for MockProcessProvider {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
-    carina_plugin_sdk::run(MockProcessProvider::default());
+    eprintln!(
+        "carina-provider-mock no longer has a native provider transport; build the wasm32-wasip2 component"
+    );
 }
 
 // For WASM: export_provider! macro bridges CarinaProvider to the WIT interface.

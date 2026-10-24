@@ -721,8 +721,11 @@ fn plan_reports_how_to_repair_a_legacy_empty_identity_row() {
                 "resource_type": "test.resource",
                 "identity": "",
                 "provider": "mock",
-                "identifier": "legacy-resource-123",
-                "attributes": {}
+                "current": {
+                    "kind": "applied",
+                    "identifier": "legacy-resource-123",
+                    "attributes": {}
+                }
             }
         ],
         "exports": {}

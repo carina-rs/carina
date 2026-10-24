@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -10,9 +10,15 @@ use std::time::Duration;
 use carina_core::effect::PlanOp;
 use carina_core::parser::ProviderConfig;
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
-    PatchOpKind, Provider, ProviderError, ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome,
-    UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome,
+    CreateRequest, DeleteRequest, Observation, PartialReadDiagnostic, PatchOpKind, PendingToken,
+    Provider, ProviderError, ProviderResult, ReadOutcome, ReadRequest, Resume as CoreResume,
+    ResumeCreateRequest, ResumeFailure, ResumeOutcome, Sent, UpdateOutcome, UpdateRequest,
+};
+#[cfg(test)]
+use carina_core::provider::{
+    CreateFailureKind, CreateOutcomeKind, InFlightCreate, InFlightPersistence, ResumeFailureKind,
+    ResumeOutcomeKind,
 };
 use carina_core::resource::{
     ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
@@ -583,26 +589,77 @@ impl MockProvider {
         &self,
         id: ResourceId,
         resource: Resource,
-    ) -> ProviderResult<CreateOutcome> {
+        attempt: CreateAttempt,
+    ) -> Result<CreateOutcome, CreateFailure> {
+        let mode = env::var("CARINA_MOCK_CREATE_MODE").unwrap_or_else(|_| "success".to_string());
         if let Some(err) = Self::create_fail_error_for(&id) {
-            return Err(err);
+            return Err(attempt.untracked(err));
+        }
+        if mode == "untracked" {
+            return Err(attempt.untracked(ProviderError::api_error(
+                "builtin mock returned an untracked create verdict",
+            )));
+        }
+
+        let sent = match env::var("CARINA_MOCK_CREATE_SENT") {
+            Ok(raw) if raw != "all" => Sent::Only(
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            Ok(raw) => {
+                drop(raw);
+                Sent::AllRequestAttributes
+            }
+            Err(error) => {
+                drop(error);
+                Sent::AllRequestAttributes
+            }
+        };
+        if mode == "pending" || mode == "malformed_pending" {
+            let token = if mode == "malformed_pending" {
+                "not-a-decodable-mock-token"
+            } else {
+                "builtin-mock-pending"
+            };
+            let pending = attempt.pending(PendingToken::new(token), sent, 1);
+            return Err(pending.preserve(ProviderError::timeout(
+                "builtin mock create remains in progress",
+            )));
         }
 
         if let Some(delay) = Self::create_delay_for(&id) {
-            Self::signal_ready("CARINA_MOCK_CREATE_READY_PATH")?;
+            if let Err(error) = Self::signal_ready("CARINA_MOCK_CREATE_READY_PATH") {
+                return Err(attempt.untracked(error));
+            }
             tokio::time::sleep(delay).await;
         }
 
-        let _state_guard = Self::lock_state_file()?;
-        let mut states = self.load_states_for_operation()?;
-        let key = Self::resolved_resource_key(&id)?;
+        let _state_guard = match Self::lock_state_file() {
+            Ok(guard) => guard,
+            Err(error) => return Err(attempt.untracked(error)),
+        };
+        let mut states = match self.load_states_for_operation() {
+            Ok(states) => states,
+            Err(error) => return Err(attempt.untracked(error)),
+        };
+        let key = match Self::resolved_resource_key(&id) {
+            Ok(key) => key,
+            Err(error) => return Err(attempt.untracked(error)),
+        };
 
-        let mut attrs: HashMap<String, PersistedValue> = resource
+        let attrs = resource
             .attributes
             .iter()
             .map(|(k, v)| PersistedValue::encode_provider_value(v, None).map(|jv| (k.clone(), jv)))
             .collect::<Result<_, _>>()
-            .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
+            .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)));
+        let mut attrs = match attrs {
+            Ok(attrs) => attrs,
+            Err(error) => return Err(attempt.untracked(error)),
+        };
         Self::populate_test_resource_identifier_json(&id, &mut attrs);
 
         let partial_create = self.partial_create_config_for(&id);
@@ -613,8 +670,12 @@ impl MockProvider {
         }
 
         states.insert(key, attrs);
-        self.save_states(&states)
-            .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
+        if let Err(error) = self
+            .save_states(&states)
+            .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))
+        {
+            return Err(attempt.untracked(error));
+        }
 
         let mut state_attrs = resource.resolved_attributes();
         Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
@@ -623,19 +684,67 @@ impl MockProvider {
                 state_attrs.remove(attr);
             }
         }
-        let state = AppliedState::new(id.clone(), "mock-id", state_attrs)
-            .expect("mock provider identifier is non-empty");
-        if let Some(config) = partial_create {
-            Self::append_op_log_if_configured("create", &id)?;
-            return Ok(CreateOutcome::partial_success(
-                state,
-                "mock partial create".to_string(),
-                config.missing_attributes.clone(),
+        let identifier =
+            AppliedIdentifier::new("mock-id").expect("mock provider identifier is non-empty");
+        let observed_state =
+            AppliedState::from_identifier(id.clone(), identifier.clone(), state_attrs.clone());
+        let issued = attempt.issued(identifier, sent);
+        if let Err(error) = Self::append_op_log_if_configured("create", &id) {
+            return Err(issued.failed(Observation::Read(ReadOutcome::found(observed_state)), error));
+        }
+        if mode == "created" {
+            return Err(issued.failed(
+                Observation::Read(ReadOutcome::found(observed_state)),
+                ProviderError::api_error("builtin mock failed after creating the resource"),
             ));
         }
+        if let Some(config) = partial_create {
+            let outcome = match PartialReadDiagnostic::new(
+                "mock partial create".to_string(),
+                config.missing_attributes.clone(),
+            ) {
+                Some(diagnostic) => issued.partial(state_attrs, diagnostic),
+                None => issued.succeeded(state_attrs),
+            };
+            return Ok(outcome);
+        }
 
-        Self::append_op_log_if_configured("create", &id)?;
-        Ok(CreateOutcome::Success { state })
+        Ok(issued.succeeded(state_attrs))
+    }
+
+    fn persist_resumed_resource(
+        &self,
+        id: &ResourceId,
+        resource: &Resource,
+    ) -> ProviderResult<HashMap<String, Value>> {
+        let _state_guard = Self::lock_state_file()?;
+        let mut states = self.load_states_for_operation()?;
+        let key = Self::resolved_resource_key(id)?;
+        let mut persisted = resource
+            .attributes
+            .iter()
+            .map(|(key, value)| {
+                PersistedValue::encode_provider_value(value, None).map(|value| (key.clone(), value))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| {
+                ProviderError::internal_caused_by(
+                    "Failed to encode builtin mock resumed-create state",
+                    error,
+                )
+            })?;
+        Self::populate_test_resource_identifier_json(id, &mut persisted);
+        states.insert(key, persisted);
+        self.save_states(&states).map_err(|error| {
+            ProviderError::internal_caused_by(
+                "Failed to save builtin mock resumed-create state",
+                error,
+            )
+        })?;
+
+        let mut attributes = resource.resolved_attributes();
+        Self::populate_test_resource_identifier_value(id, &mut attributes);
+        Ok(attributes)
     }
 }
 
@@ -800,10 +909,110 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+        attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
         let id = id.clone();
         let resource = request.resource().as_resource().clone();
-        Box::pin(async move { self.create_resource(id, resource).await })
+        Box::pin(async move { self.create_resource(id, resource, attempt).await })
+    }
+
+    fn resume_create(
+        &self,
+        request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        Box::pin(async move {
+            let id = request.id().clone();
+            let mode =
+                env::var("CARINA_MOCK_RESUME_MODE").unwrap_or_else(|_| "resumed".to_string());
+            match mode.as_str() {
+                "discarded" => {
+                    let (resume, create_request) = request.into_parts();
+                    drop(create_request);
+                    return Err(resume.discarded(ProviderError::not_found(
+                        "builtin mock reports that the recorded create ended",
+                    )));
+                }
+                "untracked" => {
+                    let (resume, create_request) = request.into_parts();
+                    drop(create_request);
+                    return Err(resume.untracked(ProviderError::api_error(
+                        "builtin mock lost the resume response",
+                    )));
+                }
+                "undetermined" | "malformed_pending" => {
+                    let (resume, create_request) = request.into_parts();
+                    drop(create_request);
+                    return Err(resume.preserve(ProviderError::internal(
+                        "builtin mock cannot determine the recorded create outcome",
+                    )));
+                }
+                "pending" => {
+                    let (resume, create_request) = request.into_parts();
+                    drop(create_request);
+                    let next_token = PendingToken::new("builtin-mock-repending");
+                    let resume = match resume {
+                        CoreResume::Unissued(attempt) => attempt.repend(next_token),
+                        CoreResume::Issued(resumed) => resumed.repend(next_token),
+                    };
+                    return Err(resume.preserve(ProviderError::timeout(
+                        "builtin mock create remains in progress",
+                    )));
+                }
+                "resumed" | "resend" | "created_read_failed" => {}
+                unsupported => {
+                    let (resume, create_request) = request.into_parts();
+                    drop(create_request);
+                    return Err(resume.preserve(ProviderError::invalid_input(format!(
+                        "unsupported CARINA_MOCK_RESUME_MODE {unsupported:?}"
+                    ))));
+                }
+            }
+
+            let (resume, create_request) = request.into_parts();
+            let resource = create_request.resource().as_resource().clone();
+            let fallback_identifier =
+                AppliedIdentifier::new("mock-id").expect("mock provider identifier is non-empty");
+
+            if mode == "resend" {
+                let attempt = match resume {
+                    CoreResume::Unissued(attempt) => attempt.resend(),
+                    CoreResume::Issued(resumed) => {
+                        return Err(resumed.preserve(ProviderError::invalid_input(
+                            "builtin mock cannot resend a create with a known identifier",
+                        )));
+                    }
+                };
+                let attributes = match self.persist_resumed_resource(&id, &resource) {
+                    Ok(attributes) => attributes,
+                    Err(error) => return Err(attempt.preserve(error)),
+                };
+                return Ok(attempt
+                    .issued(fallback_identifier, Sent::AllRequestAttributes)
+                    .succeeded(attributes));
+            }
+
+            let resumed = match resume {
+                CoreResume::Unissued(attempt) => attempt.issued(fallback_identifier),
+                CoreResume::Issued(resumed) => resumed,
+            };
+            let identifier = resumed.identifier().clone();
+            let attributes = match self.persist_resumed_resource(&id, &resource) {
+                Ok(attributes) => attributes,
+                Err(error) => return Err(resumed.preserve(error)),
+            };
+            if mode == "created_read_failed" {
+                return Err(resumed.failed(
+                    Observation::ReadFailed(ProviderError::api_error(
+                        "builtin mock post-create read failed",
+                    )),
+                    ProviderError::api_error(
+                        "builtin mock resume finished after creating the resource",
+                    ),
+                ));
+            }
+            let observed_state = AppliedState::from_identifier(id, identifier, attributes);
+            Ok(resumed.completed(observed_state))
+        })
     }
 
     fn update(
@@ -990,6 +1199,249 @@ mod tests {
     fn string_value(value: impl Into<String>) -> Value {
         let value: String = value.into();
         Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    async fn dispatch_mock_create(
+        provider: &MockProvider,
+        id: ResourceId,
+        resource: Resource,
+    ) -> Result<CreateOutcome, CreateFailure> {
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let preparation = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            &[],
+            &carina_core::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+        let request = carina_core::executor::prepare_create_request(resource, &preparation)
+            .await
+            .expect("mock test resource should pass create preparation");
+        carina_core::executor::dispatch_create(provider, &id, request).await
+    }
+
+    fn persist_pending_for_resume(pending: &InFlightCreate) -> InFlightCreate {
+        let InFlightPersistence::Fresh(fresh) = pending.persistence() else {
+            panic!("builtin create fixture starts as a fresh pending record")
+        };
+        let id = pending.id();
+        let identity = id
+            .identity()
+            .cloned()
+            .expect("resume fixture identity is resolved");
+        let mut row = serde_json::to_value(carina_state::ResourceState::new(
+            &id.resource_type,
+            identity,
+            &id.provider,
+        ))
+        .expect("fixture row serializes");
+        row["current"] = serde_json::json!({
+            "kind": "create_in_flight",
+            "envelope": {
+                "token": fresh.token(),
+                "identifier": fresh.identifier(),
+                "write_only": {},
+                "secrets": {},
+            },
+            "started_at": pending.started_at(),
+        });
+        let mut document =
+            serde_json::to_value(carina_state::StateFile::new()).expect("fixture state serializes");
+        document["resources"] = serde_json::json!([row]);
+        let loaded = carina_state::state::check_and_migrate(&document.to_string())
+            .expect("v15 fixture passes the public state loader")
+            .into_state();
+        match loaded.build_state_for_resource(id) {
+            carina_core::resource::Current::CreateInFlight(pending) => pending,
+            carina_core::resource::Current::Absent(state) => {
+                panic!("resume fixture loaded as absent: {state:?}")
+            }
+            carina_core::resource::Current::Present(state) => {
+                panic!("resume fixture loaded as present: {state:?}")
+            }
+            carina_core::resource::Current::MissingIdentifier(state) => {
+                panic!("resume fixture loaded without an identifier: {state:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_mock_exercises_every_create_and_resume_verdict_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _legacy_create_failure = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
+        let _operation_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            state_file: tmp.path().join("mock-state.json"),
+            partial_create: None,
+            partial_update: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        for (mode, expected) in [
+            ("untracked", "untracked"),
+            ("created", "created"),
+            ("pending", "in_flight"),
+            ("malformed_pending", "in_flight"),
+        ] {
+            let mode_guard = EnvGuard::set("CARINA_MOCK_CREATE_MODE", mode);
+            let identity = format!("create-{mode}");
+            let id = ResourceId::with_provider_identity(
+                "mock",
+                "test.resource",
+                carina_core::resource::ResourceIdentity::try_from(identity.clone())
+                    .expect("fixture identity is non-empty"),
+                None,
+            );
+            let resource = Resource::with_provider(
+                "mock",
+                "test.resource",
+                carina_core::resource::ResourceIdentity::try_from(identity)
+                    .expect("fixture identity is non-empty"),
+                None,
+            )
+            .with_attribute("name", string_value(mode));
+            let result = runtime
+                .block_on(dispatch_mock_create(&provider, id, resource))
+                .map(CreateOutcome::into_kind)
+                .map_err(CreateFailure::into_kind);
+            match (expected, result) {
+                ("untracked", Err(CreateFailureKind::Untracked(error))) => drop(error),
+                ("created", Err(CreateFailureKind::Created { created, error })) => {
+                    assert_eq!(created.identifier().as_str(), "mock-id");
+                    drop(error);
+                }
+                ("in_flight", Err(CreateFailureKind::InFlight { pending, error })) => {
+                    assert_eq!(
+                        pending.token().expose_for_provider_call(),
+                        if mode == "malformed_pending" {
+                            "not-a-decodable-mock-token"
+                        } else {
+                            "builtin-mock-pending"
+                        }
+                    );
+                    drop(error);
+                }
+                (expected, Ok(CreateOutcomeKind::Success { state })) => {
+                    panic!("expected {expected}, got success {state:?}")
+                }
+                (expected, Ok(CreateOutcomeKind::PartialSuccess { state, diagnostic })) => {
+                    panic!("expected {expected}, got partial {state:?}: {diagnostic:?}")
+                }
+                (expected, Err(CreateFailureKind::Untracked(error))) => {
+                    panic!("expected {expected}, got untracked {error}")
+                }
+                (expected, Err(CreateFailureKind::Created { created, error })) => {
+                    panic!("expected {expected}, got created {created:?}: {error}")
+                }
+                (expected, Err(CreateFailureKind::InFlight { pending, error })) => {
+                    panic!("expected {expected}, got in flight {pending:?}: {error}")
+                }
+            }
+            drop(mode_guard);
+        }
+
+        let create_mode = EnvGuard::set("CARINA_MOCK_CREATE_MODE", "pending");
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "resume-modes", None);
+        let resource = Resource::with_provider("mock", "test.resource", "resume-modes", None)
+            .with_attribute("name", string_value("resume-modes"));
+        let pending = match runtime
+            .block_on(dispatch_mock_create(
+                &provider,
+                id.clone(),
+                resource.clone(),
+            ))
+            .map(CreateOutcome::into_kind)
+            .map_err(CreateFailure::into_kind)
+        {
+            Err(CreateFailureKind::InFlight { pending, error }) => {
+                drop(error);
+                persist_pending_for_resume(&pending)
+            }
+            Ok(CreateOutcomeKind::Success { state }) => panic!("expected pending, got {state:?}"),
+            Ok(CreateOutcomeKind::PartialSuccess { state, diagnostic }) => {
+                panic!("expected pending, got {state:?}: {diagnostic:?}")
+            }
+            Err(CreateFailureKind::Untracked(error)) => panic!("expected pending, got {error}"),
+            Err(CreateFailureKind::Created { created, error }) => {
+                panic!("expected pending, got {created:?}: {error}")
+            }
+        };
+        drop(create_mode);
+
+        for (mode, expected) in [
+            ("resumed", "resumed"),
+            ("discarded", "ended"),
+            ("undetermined", "in_flight"),
+            ("pending", "in_flight"),
+            ("malformed_pending", "in_flight"),
+            ("resend", "resent"),
+        ] {
+            let mode_guard = EnvGuard::set("CARINA_MOCK_RESUME_MODE", mode);
+            let request = runtime.block_on(async {
+                let bindings = carina_core::binding_index::ResolvedBindings::default();
+                let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+                let schemas = carina_core::schema::SchemaRegistry::new();
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                );
+                let create_request =
+                    carina_core::executor::prepare_create_request(resource.clone(), &preparation)
+                        .await
+                        .expect("resume fixture passes create preparation");
+                ResumeCreateRequest::for_test(pending.clone(), create_request)
+                    .expect("resume fixture route matches")
+            });
+            let result = runtime
+                .block_on(provider.resume_create(request))
+                .map(ResumeOutcome::into_kind)
+                .map_err(ResumeFailure::into_kind);
+            match (expected, result) {
+                ("resumed", Ok(ResumeOutcomeKind::Resumed(created))) => {
+                    assert_eq!(created.identifier().as_str(), "mock-id");
+                }
+                ("resent", Ok(ResumeOutcomeKind::Resent(outcome))) => match outcome.into_kind() {
+                    CreateOutcomeKind::Success { state } => {
+                        assert_eq!(state.identifier().as_str(), "mock-id");
+                    }
+                    CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
+                        panic!("unexpected partial resend {state:?}: {diagnostic:?}")
+                    }
+                },
+                ("ended", Err(ResumeFailureKind::Ended(error))) => drop(error),
+                ("in_flight", Err(ResumeFailureKind::InFlight { pending, error })) => {
+                    assert_eq!(pending.id(), &id);
+                    drop(error);
+                }
+                (expected, Ok(ResumeOutcomeKind::Resumed(created))) => {
+                    panic!("expected {expected}, got resumed {created:?}")
+                }
+                (expected, Ok(ResumeOutcomeKind::Resent(outcome))) => {
+                    panic!("expected {expected}, got resent {outcome:?}")
+                }
+                (expected, Err(ResumeFailureKind::Ended(error))) => {
+                    panic!("expected {expected}, got ended {error}")
+                }
+                (expected, Err(ResumeFailureKind::Created { created, error })) => {
+                    panic!("expected {expected}, got created {created:?}: {error}")
+                }
+                (expected, Err(ResumeFailureKind::InFlight { pending, error })) => {
+                    panic!("expected {expected}, got in flight {pending:?}: {error}")
+                }
+            }
+            drop(mode_guard);
+        }
     }
 
     fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
@@ -1201,7 +1653,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(provider.create_resource(id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
             .expect("create should save mock v2 state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
@@ -1300,7 +1752,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(provider.create_resource(id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
             .expect("create should save versioned mock state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
@@ -1353,8 +1805,7 @@ mod tests {
             .unwrap();
 
         let read = runtime.block_on(async {
-            provider
-                .create_resource(id.clone(), resource)
+            dispatch_mock_create(&provider, id.clone(), resource)
                 .await
                 .expect("create succeeds");
             provider
@@ -1433,8 +1884,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            provider
-                .create_resource(id.clone(), resource)
+            dispatch_mock_create(&provider, id.clone(), resource)
                 .await
                 .expect("create should succeed");
 
@@ -1504,13 +1954,16 @@ mod tests {
             .unwrap();
 
         let err = runtime
-            .block_on(provider.create_resource(id, resource))
+            .block_on(dispatch_mock_create(&provider, id, resource))
             .expect_err("create should fail when CARINA_MOCK_CREATE_FAIL_FOR matches");
-        let message = err.to_string();
+        assert_eq!(err.to_string(), "create failed before it could be tracked");
+        let message = std::error::Error::source(&err)
+            .expect("classified create failure retains the provider error")
+            .to_string();
         assert!(
             message.contains("CARINA_MOCK_CREATE_FAIL_FOR")
                 && message.contains("test.resource.blocked"),
-            "create failure should mention env var and resource key, got: {message}"
+            "create failure source should mention env var and resource key, got: {message}"
         );
 
         let log = fs::read_to_string(log_path).unwrap_or_default();

@@ -3,6 +3,180 @@ use carina_core::resource::DeferredValue;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+#[test]
+fn v15_round_trips_none_applied_in_flight_and_missing_identifier() {
+    let json = serde_json::json!({
+        "version": 15,
+        "serial": 4,
+        "lineage": "test-lineage",
+        "carina_version": "test",
+        "resources": [
+            {
+                "resource_type": "test.Resource",
+                "identity": "none",
+                "provider": "mock",
+                "current": { "kind": "none" },
+                "deposed": [{
+                    "key": "00000000-0000-4000-8000-000000000001",
+                    "identifier": "old",
+                    "attributes": {},
+                    "dependency_bindings": []
+                }]
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "applied",
+                "provider": "mock",
+                "current": {
+                    "kind": "applied",
+                    "identifier": "cloud-id",
+                    "attributes": { "name": "example" },
+                    "write_only_attributes": ["password"],
+                    "partial_read": null
+                }
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "pending",
+                "provider": "mock",
+                "current": {
+                    "kind": "create_in_flight",
+                    "envelope": {
+                        "token": "opaque-token",
+                        "identifier": null,
+                        "write_only": {},
+                        "secrets": {}
+                    },
+                    "started_at": "2026-10-23T08:00:00Z"
+                }
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "missing",
+                "provider": "mock",
+                "current": {
+                    "kind": "missing_identifier",
+                    "attributes": { "name": "unknown-owner" }
+                }
+            }
+        ],
+        "exports": {}
+    });
+
+    let state = check_and_migrate(&json.to_string())
+        .expect("v15 state must load")
+        .into_state();
+    assert!(matches!(
+        state.resources()[0].current(),
+        CurrentInstance::None
+    ));
+    assert!(matches!(
+        state.resources()[1].current(),
+        CurrentInstance::Applied { .. }
+    ));
+    assert!(matches!(
+        state.resources()[2].current(),
+        CurrentInstance::CreateInFlight { .. }
+    ));
+    assert!(matches!(
+        state.resources()[3].current(),
+        CurrentInstance::MissingIdentifier { .. }
+    ));
+
+    let encoded = serde_json::to_string(&state).expect("v15 state must serialize");
+    let reloaded = check_and_migrate(&encoded)
+        .expect("serialized v15 state must reload")
+        .into_state();
+    assert_eq!(
+        serde_json::to_value(&state).unwrap(),
+        serde_json::to_value(&reloaded).unwrap()
+    );
+}
+
+#[test]
+fn v15_in_flight_row_has_stable_golden_serialization() {
+    let json = serde_json::json!({
+        "version": 15,
+        "serial": 4,
+        "lineage": "golden-lineage",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "pending",
+            "provider": "mock",
+            "current": {
+                "kind": "create_in_flight",
+                "envelope": {
+                    "token": "opaque-token",
+                    "identifier": null,
+                    "write_only": {},
+                    "secrets": {}
+                },
+                "started_at": "2026-10-23T08:00:00Z"
+            }
+        }],
+        "exports": {}
+    });
+    let state = check_and_migrate(&json.to_string())
+        .expect("golden v15 state must load")
+        .into_state();
+
+    assert_eq!(
+        serde_json::to_string(&state.resources()[0]).expect("v15 row serializes"),
+        r#"{"resource_type":"test.Resource","identity":"pending","provider":"mock","current":{"kind":"create_in_flight","envelope":{"token":"opaque-token","identifier":null,"write_only":{},"secrets":{}},"started_at":"2026-10-23T08:00:00Z"},"protected":false,"directives":{"force_delete":false,"create_before_destroy":false,"prevent_destroy":false},"prefixes":{},"name_overrides":{},"binding":null,"dependency_bindings":[]}"#
+    );
+}
+
+#[test]
+fn v14_to_v15_preserves_write_only_partial_and_deposed_fields() {
+    let json = serde_json::json!({
+        "version": 14,
+        "serial": 2,
+        "lineage": "legacy",
+        "carina_version": "legacy",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "main",
+            "provider": "mock",
+            "identifier": "cloud-id",
+            "attributes": { "name": "example", "password": "masked" },
+            "write_only_attributes": ["password"],
+            "partial_read": {
+                "detail": "provider read omitted status",
+                "missing_attributes": ["status"]
+            },
+            "deposed": [{
+                "key": "00000000-0000-4000-8000-000000000002",
+                "identifier": "old-id",
+                "attributes": { "name": "old" },
+                "dependency_bindings": []
+            }]
+        }],
+        "exports": {}
+    });
+
+    let migrated = check_and_migrate(&json.to_string()).expect("v14 state must migrate");
+    assert_eq!(
+        migrated.migration(),
+        Some(MigrationInfo { from: 14, to: 15 })
+    );
+    let state = migrated.into_state();
+    let CurrentInstance::Applied {
+        identifier,
+        attributes,
+        write_only_attributes,
+        partial_read,
+    } = state.resources()[0].current()
+    else {
+        panic!("v14 applied row must migrate to CurrentInstance::Applied");
+    };
+    assert_eq!(identifier.as_str(), "cloud-id");
+    assert!(attributes.contains_key("password"));
+    assert_eq!(write_only_attributes, &["password"]);
+    assert!(partial_read.is_some());
+    assert_eq!(state.resources()[0].deposed.len(), 1);
+}
+
 const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
 fn persisted_attributes_from_state_json(
@@ -103,10 +277,10 @@ fn test_state_file_new() {
 }
 
 #[test]
-fn v14_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
+fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 14);
+    assert_eq!(StateFile::CURRENT_VERSION, 15);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -137,6 +311,7 @@ fn v14_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     let loaded = match reloaded.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => {
             panic!("expected valid provider identifier, got {state:?}")
         }
@@ -145,8 +320,14 @@ fn v14_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     assert_eq!(loaded.attributes.get("authored"), Some(&plain));
     assert_eq!(loaded.attributes.get("provider_only"), Some(&plain));
     let raw: serde_json::Value = serde_json::from_str(&json).expect("state JSON");
-    assert_eq!(raw["resources"][0]["attributes"]["authored"], marker);
-    assert_eq!(raw["resources"][0]["attributes"]["provider_only"], marker);
+    assert_eq!(
+        raw["resources"][0]["current"]["attributes"]["authored"],
+        marker
+    );
+    assert_eq!(
+        raw["resources"][0]["current"]["attributes"]["provider_only"],
+        marker
+    );
 }
 
 #[test]
@@ -192,7 +373,12 @@ fn test_state_file_upsert_resource() {
         .expect("test state setup must be valid");
     assert_eq!(state.resources.len(), 1);
     assert_eq!(
-        persisted_json_attribute(&state.resources[0].attributes, "region"),
+        persisted_json_attribute(
+            state.resources[0]
+                .persisted_attributes()
+                .expect("fixture has persisted attributes"),
+            "region",
+        ),
         Some(serde_json::json!("us-west-2"))
     );
 }
@@ -329,8 +515,8 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
 #[test]
 fn upsert_resource_preserves_existing_deposed_generations() {
     let mut state = StateFile::new();
-    let mut existing = ResourceState::new("ec2.Vpc", "main", "aws")
-        .with_identifier("vpc-old")
+    let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "aws", "vpc-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
     let deposed_key = DeposedKey::new_unique();
     existing.deposed.push(DeposedInstance {
@@ -347,8 +533,8 @@ fn upsert_resource_preserves_existing_deposed_generations() {
         .upsert_resource(existing)
         .expect("test state setup must be valid");
 
-    let incoming = ResourceState::new("ec2.Vpc", "main", "aws")
-        .with_identifier("vpc-new")
+    let incoming = ResourceState::try_applied("ec2.Vpc", "main", "aws", "vpc-new")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
     state
         .upsert_resource(incoming)
@@ -357,9 +543,16 @@ fn upsert_resource_preserves_existing_deposed_generations() {
     let row = state
         .find_resource("aws", "ec2.Vpc", "main")
         .expect("resource should still exist");
-    assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
     assert_eq!(
-        persisted_json_attribute(&row.attributes, "cidr_block"),
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("vpc-new")
+    );
+    assert_eq!(
+        persisted_json_attribute(
+            row.persisted_attributes()
+                .expect("fixture has persisted attributes"),
+            "cidr_block",
+        ),
         Some(serde_json::json!("10.1.0.0/16"))
     );
     assert_eq!(row.deposed.len(), 1);
@@ -372,8 +565,8 @@ fn upsert_resource_preserves_existing_deposed_generations() {
 fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
     let mut state = StateFile::new();
     let retained_key = DeposedKey::new_unique();
-    let mut existing = ResourceState::new("ec2.Vpc", "main", "aws")
-        .with_identifier("vpc-current")
+    let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "aws", "vpc-current")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
     existing.deposed.push(DeposedInstance {
         key: DeposedKey::new_unique(),
@@ -399,8 +592,8 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
         .upsert_resource(existing)
         .expect("test state setup must be valid");
 
-    let mut incoming = ResourceState::new("ec2.Vpc", "main", "aws")
-        .with_identifier("vpc-reused")
+    let mut incoming = ResourceState::try_applied("ec2.Vpc", "main", "aws", "vpc-reused")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.2.0.0/16"));
     incoming.directives.provider_instance = Some("west".to_string());
     state
@@ -410,7 +603,10 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
     let row = state
         .find_resource("aws", "ec2.Vpc", "main")
         .expect("resource should still exist");
-    assert_eq!(row.identifier.as_deref(), Some("vpc-reused"));
+    assert_eq!(
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("vpc-reused")
+    );
     assert_eq!(row.deposed.len(), 1);
     assert_eq!(row.deposed[0].key, retained_key);
     assert_eq!(row.deposed[0].identifier, "vpc-older");
@@ -420,8 +616,8 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
 fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provider_instance() {
     let mut state = StateFile::new();
     let retained_key = DeposedKey::new_unique();
-    let mut existing = ResourceState::new("ec2.Vpc", "main", "aws")
-        .with_identifier("vpc-current")
+    let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "aws", "vpc-current")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
     existing.deposed.push(DeposedInstance {
         key: retained_key.clone(),
@@ -437,8 +633,8 @@ fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provid
         .upsert_resource(existing)
         .expect("test state setup must be valid");
 
-    let mut incoming = ResourceState::new("ec2.Vpc", "main", "aws")
-        .with_identifier("vpc-reused")
+    let mut incoming = ResourceState::try_applied("ec2.Vpc", "main", "aws", "vpc-reused")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.2.0.0/16"));
     incoming.directives.provider_instance = Some("east".to_string());
     state
@@ -448,7 +644,10 @@ fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provid
     let row = state
         .find_resource("aws", "ec2.Vpc", "main")
         .expect("resource should still exist");
-    assert_eq!(row.identifier.as_deref(), Some("vpc-reused"));
+    assert_eq!(
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("vpc-reused")
+    );
     assert_eq!(row.directives.provider_instance.as_deref(), Some("east"));
     assert_eq!(row.deposed.len(), 1);
     assert_eq!(row.deposed[0].key, retained_key);
@@ -478,8 +677,8 @@ fn test_state_file_remove_resource() {
 #[test]
 fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     let mut state = StateFile::new();
-    let mut resource = ResourceState::new("ec2.Vpc", "main", "aws")
-        .with_identifier("vpc-new")
+    let mut resource = ResourceState::try_applied("ec2.Vpc", "main", "aws", "vpc-new")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
     resource.protected = true;
     resource.directives.create_before_destroy = true;
@@ -499,11 +698,11 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     };
     resource.binding = Some("vpc".to_string());
     resource.dependency_bindings.insert("internet".to_string());
-    resource.write_only_attributes.push("token".to_string());
-    resource.partial_read = Some(PartialReadMarker {
+    resource.set_write_only_attributes_for_test(vec!["token".to_string()]);
+    resource.set_partial_read_for_test(Some(PartialReadMarker {
         detail: "partial".to_string(),
         missing_attributes: BTreeSet::from(["token".to_string()]),
-    });
+    }));
     resource.deposed.push(DeposedInstance {
         key: DeposedKey::new_unique(),
         identifier: "vpc-old".to_string(),
@@ -521,14 +720,14 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     let removed = state.remove_resource("aws", "ec2.Vpc", "main");
 
     assert_eq!(
-        removed.and_then(|rs| rs.identifier),
+        removed.and_then(|rs| rs.identifier().map(ToString::to_string)),
         Some("vpc-new".to_string())
     );
     let retained = state
         .find_resource("aws", "ec2.Vpc", "main")
         .expect("row with deposed generations should be retained");
-    assert_eq!(retained.identifier, None);
-    assert!(retained.attributes.is_empty());
+    assert_eq!(retained.identifier(), None);
+    assert!(retained.persisted_attributes().is_none());
     assert_eq!(retained.deposed.len(), 1);
     assert_eq!(retained.deposed[0].identifier, "vpc-old");
     assert_eq!(
@@ -550,8 +749,8 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     assert_eq!(retained.explicit, ExplicitFields::default());
     assert_eq!(retained.binding, None);
     assert!(retained.dependency_bindings.is_empty());
-    assert!(retained.write_only_attributes.is_empty());
-    assert_eq!(retained.partial_read, None);
+    assert!(retained.write_only_attributes().is_empty());
+    assert_eq!(retained.partial_read(), None);
 }
 
 #[test]
@@ -571,8 +770,9 @@ fn test_resource_state_managed_state_bucket_shape() {
         "aws",
         "s3.Bucket",
         "aws_s3_bucket_a3f2b1c8",
-        "my-state-bucket",
-    );
+        AppliedIdentifier::new("my-state-bucket").unwrap(),
+    )
+    .unwrap();
     assert_eq!(resource.provider, "aws");
     assert_eq!(resource.resource_type, "s3.Bucket");
     assert_eq!(
@@ -581,13 +781,18 @@ fn test_resource_state_managed_state_bucket_shape() {
         "identity must match the desired resource's anonymous identifier"
     );
     assert_eq!(
-        resource.identifier.as_deref(),
+        resource.identifier().map(AppliedIdentifier::as_str),
         Some("my-state-bucket"),
         "identifier must be the AWS bucket name so the provider can Read/Update it"
     );
     assert!(resource.protected);
     assert_eq!(
-        persisted_json_attribute(&resource.attributes, "bucket"),
+        persisted_json_attribute(
+            resource
+                .persisted_attributes()
+                .expect("managed bucket has persisted attributes"),
+            "bucket",
+        ),
         Some(serde_json::json!("my-state-bucket"))
     );
 }
@@ -598,12 +803,16 @@ fn test_state_file_with_managed_state_bucket_contains_one_resource() {
         "aws",
         "s3.Bucket",
         "aws_s3_bucket_a3f2b1c8",
-        "my-state-bucket",
-    );
+        AppliedIdentifier::new("my-state-bucket").unwrap(),
+    )
+    .unwrap();
     assert_eq!(state.resources.len(), 1);
     let bucket = &state.resources[0];
     assert_eq!(bucket.identity.as_str(), "aws_s3_bucket_a3f2b1c8");
-    assert_eq!(bucket.identifier.as_deref(), Some("my-state-bucket"));
+    assert_eq!(
+        bucket.identifier().map(AppliedIdentifier::as_str),
+        Some("my-state-bucket")
+    );
     assert!(bucket.protected);
 }
 
@@ -684,8 +893,11 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
                 "resource_type": "test.resource",
                 "identity": "legacy",
                 "provider": "mock",
-                "identifier": "legacy-id",
-                "attributes": {},
+                "current": {
+                    "kind": "applied",
+                    "identifier": "legacy-id",
+                    "attributes": {}
+                },
                 "name_overrides": {
                     "name": "legacy-temp"
                 }
@@ -694,8 +906,11 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
                 "resource_type": "test.resource",
                 "identity": "current",
                 "provider": "mock",
-                "identifier": "current-id",
-                "attributes": {},
+                "current": {
+                    "kind": "applied",
+                    "identifier": "current-id",
+                    "attributes": {}
+                },
                 "name_overrides": {
                     "name": {
                         "temp_value": "current-temp",
@@ -722,8 +937,11 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
                 "resource_type": "test.resource",
                 "identity": "current",
                 "provider": "mock",
-                "identifier": "current-id",
-                "attributes": {},
+                "current": {
+                    "kind": "applied",
+                    "identifier": "current-id",
+                    "attributes": {}
+                },
                 "name_overrides": {
                     "name": {
                         "temp_value": "current-temp",
@@ -795,8 +1013,8 @@ fn test_build_state_for_resource_carries_typed_identifier() {
     use carina_core::resource::Resource;
 
     let mut state = StateFile::new();
-    let rs =
-        ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_identifier("my-bucket-abcd1234");
+    let rs = ResourceState::try_applied("s3.Bucket", "my-bucket", "awscc", "my-bucket-abcd1234")
+        .expect("fixture identifier is non-empty");
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -865,7 +1083,10 @@ fn test_resource_state_serialization_with_binding_and_deps() {
         "resource_type": "s3.Bucket",
         "name": "my-bucket",
         "provider": "aws",
-        "attributes": {"region": "ap-northeast-1"},
+        "current": {
+            "kind": "missing_identifier",
+            "attributes": {"region": "ap-northeast-1"}
+        },
         "protected": false,
         "directives": {},
         "prefixes": {},
@@ -891,7 +1112,10 @@ fn test_resource_state_deserialization_without_v3_fields() {
         "resource_type": "s3.Bucket",
         "name": "my-bucket",
         "provider": "aws",
-        "attributes": {"region": "ap-northeast-1"},
+        "current": {
+            "kind": "missing_identifier",
+            "attributes": {"region": "ap-northeast-1"}
+        },
         "protected": false,
         "directives": {},
         "prefixes": {},
@@ -903,7 +1127,7 @@ fn test_resource_state_deserialization_without_v3_fields() {
     assert_eq!(deserialized.identity.as_str(), "my-bucket");
     assert_eq!(deserialized.binding, None);
     assert!(deserialized.dependency_bindings.is_empty());
-    assert!(deserialized.write_only_attributes.is_empty());
+    assert!(deserialized.write_only_attributes().is_empty());
 }
 
 #[test]
@@ -912,7 +1136,10 @@ fn resource_state_name_overrides_migrates_from_v7_bare_string() {
         "resource_type": "s3.Bucket",
         "identity": "my-bucket",
         "provider": "aws",
-        "attributes": {"bucket": "old-name"},
+        "current": {
+            "kind": "missing_identifier",
+            "attributes": {"bucket": "old-name"}
+        },
         "protected": false,
         "directives": {},
         "prefixes": {},
@@ -968,9 +1195,16 @@ fn test_from_provider_state() {
     )
     .unwrap();
 
-    assert_eq!(rs.identifier, Some("my-bucket-abcd1234".to_string()));
     assert_eq!(
-        persisted_json_attribute(&rs.attributes, "region"),
+        rs.identifier().map(ToString::to_string),
+        Some("my-bucket-abcd1234".to_string())
+    );
+    assert_eq!(
+        persisted_json_attribute(
+            rs.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "region",
+        ),
         Some(serde_json::json!("ap-northeast-1"))
     );
     assert!(rs.protected);
@@ -1007,7 +1241,10 @@ fn test_from_provider_state_without_existing() {
     )
     .unwrap();
     assert!(!rs.protected);
-    assert_eq!(rs.identifier, Some("test-id".to_string()));
+    assert_eq!(
+        rs.identifier().map(ToString::to_string),
+        Some("test-id".to_string())
+    );
 }
 
 #[test]
@@ -1067,8 +1304,12 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     )
     .unwrap();
 
-    let stored_rules_json =
-        persisted_json_attribute(&row.attributes, "rules").expect("stored rules attribute");
+    let stored_rules_json = persisted_json_attribute(
+        row.persisted_attributes()
+            .expect("provider row has persisted attributes"),
+        "rules",
+    )
+    .expect("stored rules attribute");
     let stored_rules = stored_rules_json.as_array().expect("stored rules");
     assert_eq!(stored_rules.len(), 3);
     assert_eq!(stored_rules[0]["port"], 443);
@@ -1568,10 +1809,11 @@ fn test_multi_provider_resources_do_not_collide() {
     let mut state = StateFile::new();
 
     // Store two resources with the same resource_type and name but different providers
-    let aws_resource =
-        ResourceState::new("s3.Bucket", "main", "aws").with_identifier("aws-bucket-id");
+    let aws_resource = ResourceState::try_applied("s3.Bucket", "main", "aws", "aws-bucket-id")
+        .expect("fixture identifier is non-empty");
     let awscc_resource =
-        ResourceState::new("s3.Bucket", "main", "awscc").with_identifier("awscc-bucket-id");
+        ResourceState::try_applied("s3.Bucket", "main", "awscc", "awscc-bucket-id")
+            .expect("fixture identifier is non-empty");
 
     state
         .upsert_resource(aws_resource)
@@ -1585,10 +1827,16 @@ fn test_multi_provider_resources_do_not_collide() {
 
     // find_resource should return the correct one for each provider
     let found_aws = state.find_resource("aws", "s3.Bucket", "main").unwrap();
-    assert_eq!(found_aws.identifier, Some("aws-bucket-id".to_string()));
+    assert_eq!(
+        found_aws.identifier().map(ToString::to_string),
+        Some("aws-bucket-id".to_string())
+    );
 
     let found_awscc = state.find_resource("awscc", "s3.Bucket", "main").unwrap();
-    assert_eq!(found_awscc.identifier, Some("awscc-bucket-id".to_string()));
+    assert_eq!(
+        found_awscc.identifier().map(ToString::to_string),
+        Some("awscc-bucket-id".to_string())
+    );
 
     // Loaded identifiers remain provider-scoped.
     let aws_res = Resource::with_provider("aws", "s3.Bucket", "main", None);
@@ -1606,8 +1854,8 @@ fn test_multi_provider_resources_do_not_collide() {
     ));
 
     // Upsert should only update the matching provider's entry
-    let updated_aws =
-        ResourceState::new("s3.Bucket", "main", "aws").with_identifier("aws-bucket-id-v2");
+    let updated_aws = ResourceState::try_applied("s3.Bucket", "main", "aws", "aws-bucket-id-v2")
+        .expect("fixture identifier is non-empty");
     state
         .upsert_resource(updated_aws)
         .expect("test state setup must be valid");
@@ -1616,14 +1864,16 @@ fn test_multi_provider_resources_do_not_collide() {
         state
             .find_resource("aws", "s3.Bucket", "main")
             .unwrap()
-            .identifier,
+            .identifier()
+            .map(ToString::to_string),
         Some("aws-bucket-id-v2".to_string())
     );
     assert_eq!(
         state
             .find_resource("awscc", "s3.Bucket", "main")
             .unwrap()
-            .identifier,
+            .identifier()
+            .map(ToString::to_string),
         Some("awscc-bucket-id".to_string())
     );
 
@@ -1702,8 +1952,8 @@ fn test_build_state_for_resource_existing() {
     let mut state = StateFile::new();
     state
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "my-bucket", "awscc")
-                .with_identifier("my-bucket-id")
+            ResourceState::try_applied("s3.Bucket", "my-bucket", "awscc", "my-bucket-id")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1")),
         )
         .expect("test state setup must be valid");
@@ -1712,6 +1962,7 @@ fn test_build_state_for_resource_existing() {
     let result = match state.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => {
             panic!("expected valid provider identifier, got {state:?}")
         }
@@ -1735,8 +1986,8 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
     let mut state = StateFile::new();
     state
         .upsert_resource(
-            ResourceState::new("test.resource", "old", "mock")
-                .with_identifier("mock-id")
+            ResourceState::try_applied("test.resource", "old", "mock", "mock-id")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("comment".to_string(), structural_legacy_secret(hash)),
         )
         .expect("test state setup must be valid");
@@ -1745,6 +1996,7 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
     let loaded = match state.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => {
             panic!("expected valid provider identifier, got {state:?}")
         }
@@ -1789,7 +2041,9 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
     };
 
     for decoded in [
-        row.persisted_attributes().to_values(),
+        row.persisted_attributes()
+            .expect("fixture has persisted attributes")
+            .to_values(),
         deposed.persisted_attributes().to_values(),
     ] {
         assert!(matches!(
@@ -1804,8 +2058,8 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
 fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let tag = structural_legacy_secret(hash);
-    let mut row = ResourceState::new("test.resource", "main", "mock")
-        .with_identifier("current-id")
+    let mut row = ResourceState::try_applied("test.resource", "main", "mock", "current-id")
+        .expect("fixture identifier is non-empty")
         .with_attribute("token", tag.clone());
     row.deposed.push(DeposedInstance {
         key: DeposedKey::new_unique(),
@@ -1828,7 +2082,9 @@ fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
         StateFile::from_json_str(std::str::from_utf8(&before).expect("serialized state is UTF-8"))
             .expect("reload serialized state");
 
-    let current: &PersistedAttributes = &reloaded.resources()[0].attributes;
+    let current: &PersistedAttributes = reloaded.resources()[0]
+        .persisted_attributes()
+        .expect("reloaded fixture has persisted attributes");
     let deposed: &PersistedAttributes = &reloaded.resources()[0].deposed[0].attributes;
     assert!(matches!(
         current.get("token"),
@@ -1855,6 +2111,7 @@ fn test_build_state_for_resource_not_found() {
         Current::Present(present) => {
             panic!("expected absent state, got {:?}", present.state())
         }
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => {
             panic!("expected absent state, got {state:?}")
         }
@@ -1866,7 +2123,7 @@ fn test_build_state_for_resource_not_found() {
 }
 
 #[test]
-fn v14_loader_classifies_absent_present_and_missing_without_flattening() {
+fn v15_loader_classifies_none_present_and_missing_without_flattening() {
     use carina_core::resource::Current;
 
     let absent_id = ResourceId::with_provider_identity("mock", "test.resource", "absent", None);
@@ -1875,13 +2132,15 @@ fn v14_loader_classifies_absent_present_and_missing_without_flattening() {
     let mut state = StateFile::new();
     state
         .upsert_resource(
-            ResourceState::new("test.resource", "present", "mock")
-                .with_identifier("provider-present"),
+            ResourceState::try_applied("test.resource", "present", "mock", "provider-present")
+                .expect("fixture identifier is non-empty"),
         )
         .expect("present fixture row is valid");
+    let mut missing_row = ResourceState::new("test.resource", "missing", "mock");
+    missing_row.set_persisted_attribute("name", serde_json::json!("legacy-without-id"));
     state
-        .upsert_resource(ResourceState::new("test.resource", "missing", "mock"))
-        .expect("missing-identifier fixture row is valid v14 state");
+        .upsert_resource(missing_row)
+        .expect("identifier-less fixture row is valid v15 state");
 
     let absent = state.build_state_for_resource(&absent_id);
     let present = state.build_state_for_resource(&present_id);
@@ -1892,11 +2151,242 @@ fn v14_loader_classifies_absent_present_and_missing_without_flattening() {
         present,
         Current::Present(ref state) if state.identifier().as_ref() == "provider-present"
     ));
+    assert!(matches!(missing, Current::MissingIdentifier(ref state) if state.state().exists));
+}
+
+#[test]
+fn v15_none_is_absent_even_when_address_metadata_is_retained() {
+    use carina_core::resource::Current;
+
+    let json = serde_json::json!({
+        "version": 15,
+        "serial": 1,
+        "lineage": "exact-shell",
+        "carina_version": "test",
+        "resources": [
+            {
+                "resource_type": "test.Resource",
+                "identity": "shell",
+                "provider": "mock",
+                "current": { "kind": "none" },
+                "deposed": [{
+                    "key": "00000000-0000-4000-8000-000000000001",
+                    "identifier": "old",
+                    "attributes": {},
+                    "dependency_bindings": []
+                }]
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "malformed",
+                "provider": "mock",
+                "current": { "kind": "none" },
+                "binding": "still_current",
+                "deposed": [{
+                    "key": "00000000-0000-4000-8000-000000000002",
+                    "identifier": "old",
+                    "attributes": {},
+                    "dependency_bindings": []
+                }]
+            }
+        ],
+        "exports": {}
+    });
+    let state = check_and_migrate(&json.to_string())
+        .expect("v15 state must load")
+        .into_state();
+    let shell = ResourceId::with_provider_identity("mock", "test.Resource", "shell", None);
+    let malformed = ResourceId::with_provider_identity("mock", "test.Resource", "malformed", None);
+
     assert!(matches!(
-        missing,
-        Current::MissingIdentifier(ref state)
-            if state.state().exists && state.state().identifier.is_none()
+        state.build_state_for_resource(&shell),
+        Current::Absent(ref absent) if !absent.state().exists
     ));
+    assert!(matches!(
+        state.build_state_for_resource(&malformed),
+        Current::Absent(ref absent) if !absent.state().exists
+    ));
+}
+
+#[test]
+fn in_flight_state_keeps_the_persisted_provider_route() {
+    use carina_core::resource::Current;
+
+    let json = serde_json::json!({
+        "version": 15,
+        "serial": 1,
+        "lineage": "persisted-route",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "pending",
+            "provider": "mock",
+            "current": {
+                "kind": "create_in_flight",
+                "envelope": {
+                    "token": "opaque-token",
+                    "identifier": null,
+                    "write_only": {},
+                    "secrets": {}
+                },
+                "started_at": "2026-10-23T08:00:00Z"
+            },
+            "directives": { "provider_instance": "issuing" }
+        }],
+        "exports": {}
+    });
+    let state = check_and_migrate(&json.to_string())
+        .expect("v15 state must load")
+        .into_state();
+    let desired =
+        ResourceId::with_provider_identity("mock", "test.Resource", "pending", Some("new".into()));
+
+    let Current::CreateInFlight(pending) = state.build_state_for_resource(&desired) else {
+        panic!("persisted in-flight row must remain visible across a route mismatch");
+    };
+    assert_eq!(pending.id().provider_instance.as_deref(), Some("issuing"));
+}
+
+#[test]
+fn v15_rejects_a_route_embedded_inside_an_in_flight_record() {
+    let json = serde_json::json!({
+        "version": 15,
+        "serial": 1,
+        "lineage": "mismatched-persisted-route",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "pending",
+            "provider": "mock",
+            "current": {
+                "kind": "create_in_flight",
+                "id": {
+                    "provider": "mock",
+                    "resource_type": "test.Resource",
+                    "identity": "another-resource"
+                },
+                "envelope": {
+                    "token": "opaque-token",
+                    "identifier": null,
+                    "write_only": {},
+                    "secrets": {}
+                },
+                "started_at": "2026-10-23T08:00:00Z"
+            }
+        }],
+        "exports": {}
+    });
+
+    assert!(
+        check_and_migrate(&json.to_string()).is_err(),
+        "the ID-less envelope must derive its route only from the containing state row"
+    );
+}
+
+#[test]
+fn v15_rejects_token_plus_attributes_and_identifier_plus_token() {
+    let base = serde_json::json!({
+        "version": 15,
+        "serial": 1,
+        "lineage": "exclusive-current",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "pending",
+            "provider": "mock",
+            "current": {
+                "kind": "create_in_flight",
+                "envelope": {
+                    "token": "opaque-token",
+                    "identifier": null,
+                    "write_only": {},
+                    "secrets": {}
+                },
+                "started_at": "2026-10-23T08:00:00Z"
+            }
+        }],
+        "exports": {}
+    });
+
+    let mut token_plus_attributes = base.clone();
+    token_plus_attributes["resources"][0]["current"]["attributes"] =
+        serde_json::json!({"name": "must-not-coexist"});
+    assert!(
+        check_and_migrate(&token_plus_attributes.to_string()).is_err(),
+        "an in-flight current slot cannot also carry resource attributes"
+    );
+
+    let mut identifier_plus_token = base;
+    identifier_plus_token["resources"][0]["current"]["identifier"] =
+        serde_json::json!("applied-id");
+    assert!(
+        check_and_migrate(&identifier_plus_token.to_string()).is_err(),
+        "an in-flight current slot cannot also carry an applied identifier"
+    );
+}
+
+#[test]
+fn in_flight_load_preserves_route_started_at_and_deposed_generations() {
+    use carina_core::resource::Current;
+
+    let json = serde_json::json!({
+        "version": 15,
+        "serial": 1,
+        "lineage": "complete-in-flight-load",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "pending",
+            "provider": "mock",
+            "current": {
+                "kind": "create_in_flight",
+                "envelope": {
+                    "token": "opaque-token",
+                    "identifier": "issued-id",
+                    "write_only": {"password": "sent"},
+                    "secrets": {}
+                },
+                "started_at": "2026-10-23T08:00:00Z"
+            },
+            "directives": {"provider_instance": "issuing"},
+            "deposed": [{
+                "key": "00000000-0000-4000-8000-000000000001",
+                "identifier": "old-id",
+                "provider_instance": "old-route",
+                "attributes": {"name": "old"},
+                "dependency_bindings": []
+            }]
+        }],
+        "exports": {}
+    });
+    let state = check_and_migrate(&json.to_string())
+        .expect("v15 in-flight state must load")
+        .into_state();
+    let desired = ResourceId::with_provider_identity(
+        "mock",
+        "test.Resource",
+        "pending",
+        Some("issuing".into()),
+    );
+    let Current::CreateInFlight(pending) = state.build_state_for_resource(&desired) else {
+        panic!("expected in-flight current");
+    };
+
+    assert_eq!(pending.id(), &desired);
+    assert_eq!(pending.started_at().as_str(), "2026-10-23T08:00:00Z");
+    assert_eq!(
+        pending.identifier().map(|value| value.as_str()),
+        Some("issued-id")
+    );
+    let row = state
+        .find_resource_for_id(&desired)
+        .expect("persisted row remains addressable");
+    assert_eq!(row.deposed.len(), 1);
+    assert_eq!(row.deposed[0].identifier, "old-id");
+    assert_eq!(
+        row.deposed[0].provider_instance.as_deref(),
+        Some("old-route")
+    );
 }
 
 #[test]
@@ -1924,28 +2414,25 @@ fn test_build_state_for_resource_without_identifier() {
 #[test]
 fn build_state_for_resource_does_not_hide_current_content_behind_deposed_generations() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "current", None);
-    for identifier in [None, Some(String::new())] {
-        let mut row = ResourceState::new("test.resource", "current", "mock")
-            .with_attribute("name", serde_json::json!("current"));
-        row.identifier = identifier;
-        row.binding = Some("current".to_string());
-        row.deposed.push(DeposedInstance::from_persisted_json(
-            DeposedKey::new_unique(),
-            "old-id".to_string(),
-            None,
-            HashMap::new(),
-            BTreeSet::new(),
-        ));
-        let mut state = StateFile::new();
-        state
-            .upsert_resource(row)
-            .expect("test state setup must be valid");
+    let mut row = ResourceState::new("test.resource", "current", "mock")
+        .with_attribute("name", serde_json::json!("current"));
+    row.binding = Some("current".to_string());
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        "old-id".to_string(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
 
-        assert!(matches!(
-            state.build_state_for_resource(&id),
-            Current::MissingIdentifier(_state)
-        ));
-    }
+    assert!(matches!(
+        state.build_state_for_resource(&id),
+        Current::MissingIdentifier(_state)
+    ));
 }
 
 #[test]
@@ -2027,8 +2514,8 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     use carina_core::resource::ResourceId;
 
     let mut state = StateFile::new();
-    let mut rs =
-        ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc").with_identifier("subnet-123");
+    let mut rs = ResourceState::try_applied("ec2.Subnet", "orphan-subnet", "awscc", "subnet-123")
+        .expect("fixture identifier is non-empty");
     rs.binding = Some("my_subnet".to_string());
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
     rs.directives.prevent_destroy = true;
@@ -2053,6 +2540,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     let orphan_state = match orphan.current() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     assert!(orphan_state.exists);
@@ -2085,6 +2573,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     let refreshed_state = match refreshed.current() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(refreshed.binding(), Some("my_subnet"));
@@ -2104,7 +2593,8 @@ fn refreshing_loaded_orphan_to_absent_cannot_retain_an_identifier() {
     let mut state = StateFile::new();
     state
         .upsert_resource(
-            ResourceState::new("test.Resource", "orphan", "mock").with_identifier("resource-123"),
+            ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-123")
+                .expect("fixture identifier is non-empty"),
         )
         .expect("test state setup must be valid");
     let (_id, loaded) = state
@@ -2120,6 +2610,7 @@ fn refreshing_loaded_orphan_to_absent_cannot_retain_an_identifier() {
             "an absent refreshed orphan retained identifier {:?}",
             present.identifier()
         ),
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => {
             panic!("an absent refreshed orphan remained existing: {state:?}")
         }
@@ -2138,8 +2629,10 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
             "resource_type": "test.resource",
             "identity": "legacy",
             "provider": "mock",
-            "identifier": null,
-            "attributes": { "name": "legacy" }
+            "current": {
+                "kind": "missing_identifier",
+                "attributes": { "name": "legacy" }
+            }
         }],
         "exports": {}
     });
@@ -2157,6 +2650,7 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
     let state = match orphan.current() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     assert!(state.exists);
@@ -2166,8 +2660,8 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
 #[test]
 fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
     let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
-    let mut row =
-        ResourceState::new("test.Resource", "orphan", "mock").with_identifier("resource-123");
+    let mut row = ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-123")
+        .expect("fixture identifier is non-empty");
     row.explicit = ExplicitFields::ListElements {
         elements: vec![ExplicitFields::Struct {
             children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)]),
@@ -2182,7 +2676,11 @@ fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
     )
     .with_identifier("resource-123");
 
-    let refreshed = row.refreshed_from_provider_state(&fresh, None).unwrap();
+    let refreshed = row
+        .refreshable()
+        .unwrap()
+        .refreshed_from_provider_state(&fresh, None)
+        .unwrap();
 
     assert_eq!(
         refreshed.explicit,
@@ -2258,6 +2756,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     let current = match state.build_state_for_resource(&id) {
         Current::Absent(state) => carina_core::resource::Current::Absent(state),
         Current::Present(present) => carina_core::resource::Current::Present(present),
+        Current::CreateInFlight(pending) => carina_core::resource::Current::CreateInFlight(pending),
         Current::MissingIdentifier(state) => {
             carina_core::resource::Current::MissingIdentifier(state)
         }
@@ -2298,7 +2797,10 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         .find_resource("mock", "test.Resource", "legacy")
         .expect("legacy row should remain");
     assert_eq!(
-        row.persisted_attributes().keys().collect::<Vec<_>>(),
+        row.persisted_attributes()
+            .expect("legacy row has persisted attributes")
+            .keys()
+            .collect::<Vec<_>>(),
         vec![&"name".to_string()]
     );
     assert_eq!(
@@ -2359,13 +2861,14 @@ fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
     .expect("v12 fixture should migrate")
     .into_state();
 
-    assert_eq!(state.version, 14);
+    assert_eq!(state.version, StateFile::CURRENT_VERSION);
     let row = state
         .find_resource("mock", "test.Resource", "main")
         .expect("fixture resource exists");
 
     for attributes in [
-        row.persisted_attributes(),
+        row.persisted_attributes()
+            .expect("migrated row has persisted attributes"),
         row.deposed[0].persisted_attributes(),
     ] {
         assert!(matches!(
@@ -2393,7 +2896,7 @@ fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
     ));
 
     let migrated_json = serde_json::to_value(&state).expect("migrated state serializes");
-    let current = &migrated_json["resources"][0]["attributes"];
+    let current = &migrated_json["resources"][0]["current"]["attributes"];
     let deposed = &migrated_json["resources"][0]["deposed"][0]["attributes"];
     let exports = &migrated_json["exports"];
     for tree in [current, deposed, exports] {
@@ -2415,14 +2918,18 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
 
     assert_eq!(
         outcome.migration(),
-        Some(MigrationInfo { from: 13, to: 14 })
+        Some(MigrationInfo {
+            from: 13,
+            to: StateFile::CURRENT_VERSION,
+        })
     );
     let state = outcome.into_state();
     let row = state
         .find_resource("mock", "test.Resource", "main")
         .expect("fixture resource exists");
     for attributes in [
-        row.persisted_attributes(),
+        row.persisted_attributes()
+            .expect("migrated row has persisted attributes"),
         row.deposed[0].persisted_attributes(),
     ] {
         assert!(matches!(
@@ -2435,12 +2942,16 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
         ));
     }
     assert!(matches!(
-        row.persisted_attributes().get("malformed"),
+        row.persisted_attributes()
+            .expect("migrated row has persisted attributes")
+            .get("malformed"),
         Some(Value::Concrete(ConcreteValue::String(value)))
             if value.expose_plaintext() == "_secret:argon2:not-a-hash"
     ));
     assert!(matches!(
-        row.persisted_attributes().get("nested"),
+        row.persisted_attributes()
+            .expect("migrated row has persisted attributes")
+            .get("nested"),
         Some(Value::Concrete(ConcreteValue::Map(values)))
             if matches!(
                 values.get("$secret"),
@@ -2450,7 +2961,7 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
     ));
 
     let encoded = serde_json::to_value(&state).expect("migrated state serializes");
-    let current = &encoded["resources"][0]["attributes"];
+    let current = &encoded["resources"][0]["current"]["attributes"];
     let deposed = &encoded["resources"][0]["deposed"][0]["attributes"];
     assert_eq!(
         current["self_contained"],
@@ -2522,12 +3033,13 @@ fn v13_raw_row_salted_secret_still_verifies_after_structural_migration() {
         .into_state();
     let hash = state.resources()[0]
         .persisted_attributes()
+        .expect("migrated row has persisted attributes")
         .redacted_secret_hash("raw_legacy")
         .expect("raw legacy value remains typed");
 
     assert!(hash.verify(&material));
     assert!(
-        serde_json::to_value(&state).expect("serialize migrated state")["resources"][0]
+        serde_json::to_value(&state).expect("serialize migrated state")["resources"][0]["current"]
             ["attributes"]["raw_legacy"]
             .get("$secret")
             .is_some()
@@ -2551,8 +3063,11 @@ fn current_state_rejects_unknown_reserved_payloads_in_attributes_and_exports() {
         "resource_type": "test.Resource",
         "identity": "main",
         "provider": "mock",
-        "identifier": "current-id",
-        "attributes": {"bad": invalid.clone()},
+        "current": {
+            "kind": "applied",
+            "identifier": "current-id",
+            "attributes": {"bad": invalid.clone()}
+        },
     }]);
 
     let mut export_state = base;
@@ -2582,8 +3097,11 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
             "resource_type": "test.Resource",
             "identity": "main",
             "provider": "mock",
-            "identifier": "current-id",
-            "attributes": {"event_pattern": {"$foo": 1}},
+            "current": {
+                "kind": "applied",
+                "identifier": "current-id",
+                "attributes": {"event_pattern": {"$foo": 1}}
+            },
         }],
         "exports": {},
     });
@@ -2596,7 +3114,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
     assert!(message.contains("host-reserved"), "{message}");
     assert!(message.contains("$foo"), "{message}");
 
-    state["resources"][0]["attributes"] = serde_json::json!({});
+    state["resources"][0]["current"]["attributes"] = serde_json::json!({});
     state["resources"][0]["deposed"] = serde_json::json!([{
         "key": "old-generation",
         "identifier": "old-id",
@@ -2683,7 +3201,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 14);
+    assert_eq!(StateFile::CURRENT_VERSION, 15);
     let json = format!(
         r#"{{
         "version": 11,
@@ -2720,6 +3238,7 @@ fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
         .expect("legacy row should survive migration");
     let encoded = row
         .persisted_attributes()
+        .expect("migrated row has persisted attributes")
         .encoded_value("comment")
         .expect("legacy secret should remain persisted")
         .as_json();
@@ -2742,6 +3261,7 @@ fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
         .expect("fixture resource exists");
     let settings = row
         .persisted_attributes()
+        .expect("migrated row has persisted attributes")
         .get("settings")
         .expect("settings should decode");
     let Value::Concrete(ConcreteValue::Map(settings)) = settings else {
@@ -2773,6 +3293,7 @@ fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
 
     let encoded = row
         .persisted_attributes()
+        .expect("migrated row has persisted attributes")
         .encoded_value("settings")
         .expect("settings should remain persisted")
         .as_json();
@@ -2923,8 +3444,8 @@ fn test_build_orphans_excludes_desired() {
     use carina_core::resource::ResourceId;
 
     let mut state = StateFile::new();
-    let mut rs =
-        ResourceState::new("ec2.Subnet", "kept-subnet", "awscc").with_identifier("subnet-456");
+    let mut rs = ResourceState::try_applied("ec2.Subnet", "kept-subnet", "awscc", "subnet-456")
+        .expect("fixture identifier is non-empty");
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
     state
         .upsert_resource(rs)
@@ -2950,6 +3471,23 @@ fn test_check_and_migrate_current_version() {
 }
 
 fn persisted_resource(provider: &str, resource_type: &str, identity: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resource_type": resource_type,
+        "identity": identity,
+        "provider": provider,
+        "current": {
+            "kind": "applied",
+            "identifier": format!("{provider}-{resource_type}-{identity}"),
+            "attributes": {}
+        }
+    })
+}
+
+fn legacy_persisted_resource(
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "resource_type": resource_type,
         "identity": identity,
@@ -2981,7 +3519,7 @@ fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> Str
 fn check_and_migrate_rejects_empty_identity_with_actionable_row_context() {
     let valid = persisted_resource("mock", "test.resource", "valid");
     let mut invalid = persisted_resource("mock", "test.resource", "");
-    invalid["identifier"] = serde_json::json!("legacy-resource-123");
+    invalid["current"]["identifier"] = serde_json::json!("legacy-resource-123");
     let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![valid, invalid]);
 
     let error = check_and_migrate(&json).expect_err("empty identities must be rejected on load");
@@ -3139,10 +3677,10 @@ fn check_and_migrate_bytes_rejects_duplicate_resource_identity() {
 }
 
 fn assert_migration_rejects_canonicalized_duplicate(version: u32) {
-    let mut legacy = persisted_resource("awscc", "sso.Assignment", "placeholder");
+    let mut legacy = legacy_persisted_resource("awscc", "sso.Assignment", "placeholder");
     legacy["name"] = serde_json::json!("_accounts[\"registry_prod\"]");
     legacy.as_object_mut().unwrap().remove("identity");
-    let current = persisted_resource("awscc", "sso.Assignment", "_accounts.registry_prod");
+    let current = legacy_persisted_resource("awscc", "sso.Assignment", "_accounts.registry_prod");
     let json = state_json_with_resources(version, vec![legacy, current]);
 
     let message = invalid_state_message(check_and_migrate(&json));
@@ -3432,14 +3970,22 @@ fn test_merge_write_only_attributes() {
 
     // The write-only attribute should be persisted in state
     assert_eq!(
-        persisted_json_attribute(&rs.attributes, "ipv4_netmask_length"),
+        persisted_json_attribute(
+            rs.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "ipv4_netmask_length",
+        ),
         Some(serde_json::json!(16))
     );
-    assert_eq!(rs.write_only_attributes, vec!["ipv4_netmask_length"]);
+    assert_eq!(rs.write_only_attributes(), ["ipv4_netmask_length"]);
 
     // The regular attribute should still be there
     assert_eq!(
-        persisted_json_attribute(&rs.attributes, "cidr_block"),
+        persisted_json_attribute(
+            rs.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "cidr_block",
+        ),
         Some(serde_json::json!("10.0.0.0/16"))
     );
 }
@@ -3516,13 +4062,18 @@ fn write_only_merge_does_not_persist_desired_redacted_secret() {
     ])));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("settings", desired);
-    let mut row = ResourceState::new("test.Resource", "main", "mock");
+    let mut row = ResourceState::try_applied("test.Resource", "main", "mock", "main-id")
+        .expect("fixture identifier is non-empty");
 
     row.merge_write_only_attributes(&resource, &["settings".to_string()])
         .expect("unencodable desired write-only values are skipped");
 
-    assert!(!row.persisted_attributes().contains_key("settings"));
-    assert!(row.write_only_attributes.is_empty());
+    assert!(
+        !row.persisted_attributes()
+            .expect("fixture has persisted attributes")
+            .contains_key("settings")
+    );
+    assert!(row.write_only_attributes().is_empty());
 }
 
 #[test]
@@ -3566,8 +4117,12 @@ fn test_merge_write_only_attributes_not_in_desired() {
         .unwrap();
 
     // Should NOT be in state since user didn't specify it
-    assert!(!rs.attributes.contains_key("ipv4_netmask_length"));
-    assert!(rs.write_only_attributes.is_empty());
+    assert!(
+        !rs.persisted_attributes()
+            .expect("provider row has persisted attributes")
+            .contains_key("ipv4_netmask_length")
+    );
+    assert!(rs.write_only_attributes().is_empty());
 }
 
 #[test]
@@ -3612,30 +4167,39 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
 
     // Should keep the API-returned value, not overwrite with desired
     assert_eq!(
-        persisted_json_attribute(&rs.attributes, "some_attr"),
+        persisted_json_attribute(
+            rs.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "some_attr",
+        ),
         Some(serde_json::json!("from-api"))
     );
     // Should NOT be recorded as write-only since the API returned it
-    assert!(rs.write_only_attributes.is_empty());
+    assert!(rs.write_only_attributes().is_empty());
 }
 
 #[test]
 fn test_write_only_attributes_serialization() {
-    let mut rs = ResourceState::new("ec2.Vpc", "my-vpc", "awscc")
-        .with_identifier("vpc-123")
+    let mut rs = ResourceState::try_applied("ec2.Vpc", "my-vpc", "awscc", "vpc-123")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))
         .with_attribute("ipv4_netmask_length".to_string(), serde_json::json!(16));
-    rs.write_only_attributes = vec!["ipv4_netmask_length".to_string()];
+    rs.set_write_only_attributes_for_test(vec!["ipv4_netmask_length".to_string()]);
 
     let json = serde_json::to_string_pretty(&rs).unwrap();
     let deserialized: ResourceState = serde_json::from_str(&json).unwrap();
 
     assert_eq!(
-        deserialized.write_only_attributes,
-        vec!["ipv4_netmask_length"]
+        deserialized.write_only_attributes(),
+        ["ipv4_netmask_length"]
     );
     assert_eq!(
-        persisted_json_attribute(&deserialized.attributes, "ipv4_netmask_length"),
+        persisted_json_attribute(
+            deserialized
+                .persisted_attributes()
+                .expect("deserialized row has persisted attributes"),
+            "ipv4_netmask_length",
+        ),
         Some(serde_json::json!(16))
     );
 }
@@ -3692,8 +4256,12 @@ fn test_from_provider_state_secret_stored_as_hash() {
     .unwrap();
 
     // State should store the hash, not the plain password
-    let stored_json = persisted_json_attribute(&rs.attributes, "master_password")
-        .expect("master_password should be stored");
+    let stored_json = persisted_json_attribute(
+        rs.persisted_attributes()
+            .expect("provider row has persisted attributes"),
+        "master_password",
+    )
+    .expect("master_password should be stored");
     let stored = structural_secret_digest(&stored_json);
     assert!(
         !stored.contains("my-password"),
@@ -3706,8 +4274,8 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let existing = ResourceState::new("db.Instance", "main", "awscc")
-        .with_identifier("db-old")
+    let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -3732,8 +4300,12 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         None,
     )
     .expect("provider state should serialize");
-    let stored_json =
-        persisted_json_attribute(&rs.attributes, "password").expect("password should be stored");
+    let stored_json = persisted_json_attribute(
+        rs.persisted_attributes()
+            .expect("provider row has persisted attributes"),
+        "password",
+    )
+    .expect("password should be stored");
     let stored = structural_secret_digest(&stored_json);
 
     assert!(stored.starts_with("$argon2id$"), "got {stored}");
@@ -3777,15 +4349,29 @@ fn with_attributes_from_state_reuses_matching_secret_digest() {
         ConcreteValue::String("stable-secret".into()),
     ))));
     let provider_state = State::existing(id, HashMap::from([("comment".to_string(), secret)]));
-    let first = ResourceState::new("test.resource", "stable", "mock")
+    let first =
+        ResourceState::from_provider_state("test.resource", "stable", "mock", &provider_state)
+            .unwrap();
+    let first_encoded = persisted_json_attribute(
+        first
+            .persisted_attributes()
+            .expect("first row has persisted attributes"),
+        "comment",
+    )
+    .expect("first encoded secret");
+
+    let second = first
+        .into_writable()
+        .expect("fixture is not in flight")
         .with_attributes_from_state(&provider_state)
         .unwrap();
-    let first_encoded =
-        persisted_json_attribute(&first.attributes, "comment").expect("first encoded secret");
-
-    let second = first.with_attributes_from_state(&provider_state).unwrap();
-    let second_encoded =
-        persisted_json_attribute(&second.attributes, "comment").expect("second encoded secret");
+    let second_encoded = persisted_json_attribute(
+        second
+            .persisted_attributes()
+            .expect("second row has persisted attributes"),
+        "comment",
+    )
+    .expect("second encoded secret");
 
     assert_eq!(
         first_encoded, second_encoded,
@@ -3807,11 +4393,14 @@ fn with_attributes_from_state_keeps_raw_legacy_shaped_text_plain() {
         )]),
     );
 
-    let row = ResourceState::new("test.resource", "plain", "mock")
-        .with_attributes_from_state(&provider_state)
+    let row = ResourceState::from_provider_state("test.resource", "plain", "mock", &provider_state)
         .expect("marker-shaped provider plaintext is ordinary text");
     assert_eq!(
-        persisted_json_attribute(row.persisted_attributes(), "comment"),
+        persisted_json_attribute(
+            row.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "comment",
+        ),
         Some(serde_json::json!(marker)),
     );
 }
@@ -3825,12 +4414,17 @@ fn merge_write_only_attributes_keeps_raw_legacy_shaped_text_plain() {
         "password",
         Value::Concrete(ConcreteValue::String(marker.clone().into())),
     );
-    let mut row = ResourceState::new("test.resource", "plain", "mock");
+    let mut row = ResourceState::try_applied("test.resource", "plain", "mock", "plain-id")
+        .expect("fixture identifier is non-empty");
 
     row.merge_write_only_attributes(&resource, &["password".to_string()])
         .expect("marker-shaped desired plaintext is ordinary text");
     assert_eq!(
-        persisted_json_attribute(row.persisted_attributes(), "password"),
+        persisted_json_attribute(
+            row.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "password",
+        ),
         Some(serde_json::json!(marker)),
     );
 }
@@ -3875,8 +4469,8 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         "password",
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
-    let existing = ResourceState::new("db.Instance", "main", "awscc")
-        .with_identifier("db-old")
+    let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -3903,7 +4497,11 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     .expect("provider state should serialize");
 
     assert_eq!(
-        persisted_json_attribute(&rs.attributes, "password"),
+        persisted_json_attribute(
+            rs.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "password",
+        ),
         Some(serde_json::json!("plain-secret"))
     );
 }
@@ -3916,8 +4514,8 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         "password",
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
-    let existing = ResourceState::new("db.Instance", "main", "awscc")
-        .with_identifier("db-old")
+    let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     let provider_state = ProviderState {
         id: resource.id.clone(),
@@ -3941,10 +4539,14 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         .unwrap();
 
     assert_eq!(
-        persisted_json_attribute(&rs.attributes, "password"),
+        persisted_json_attribute(
+            rs.persisted_attributes()
+                .expect("provider row has persisted attributes"),
+            "password",
+        ),
         Some(serde_json::json!("plain-secret"))
     );
-    assert_eq!(rs.write_only_attributes, vec!["password"]);
+    assert_eq!(rs.write_only_attributes(), ["password"]);
 }
 
 #[test]
@@ -4171,7 +4773,12 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     .unwrap();
 
     // The tags map in state should have the hash for SecretTag
-    let tags_json = persisted_json_attribute(&rs.attributes, "tags").unwrap();
+    let tags_json = persisted_json_attribute(
+        rs.persisted_attributes()
+            .expect("provider row has persisted attributes"),
+        "tags",
+    )
+    .unwrap();
     let tags_obj = tags_json.as_object().unwrap();
 
     // Name should be plain
@@ -4244,7 +4851,12 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     )
     .unwrap();
 
-    let tags_json = persisted_json_attribute(&rs.attributes, "tags").unwrap();
+    let tags_json = persisted_json_attribute(
+        rs.persisted_attributes()
+            .expect("provider row has persisted attributes"),
+        "tags",
+    )
+    .unwrap();
     let tags_obj = tags_json.as_object().unwrap();
 
     // Provider-only keys should be preserved from the provider state
@@ -4306,7 +4918,12 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     )
     .unwrap();
 
-    let values_json = persisted_json_attribute(&rs.attributes, "values").unwrap();
+    let values_json = persisted_json_attribute(
+        rs.persisted_attributes()
+            .expect("provider row has persisted attributes"),
+        "values",
+    )
+    .unwrap();
     let values_arr = values_json.as_array().unwrap();
 
     // First item should be plain
@@ -4364,27 +4981,12 @@ fn build_remote_bindings_empty_when_no_exports() {
 fn build_remote_bindings_ignores_resource_bindings() {
     let mut state = StateFile::new();
     // Add a resource with a binding — should NOT appear in remote bindings
+    let mut resource = ResourceState::try_applied("ec2.Vpc", "vpc_123", "awscc", "vpc-123")
+        .expect("fixture identifier is non-empty")
+        .with_attribute("vpc_id", serde_json::Value::String("vpc-123".to_string()));
+    resource.binding = Some("vpc".to_string());
     state
-        .upsert_resource(ResourceState {
-            resource_type: "ec2.Vpc".to_string(),
-            identity: ResourceIdentity::from("vpc_123"),
-            provider: "awscc".to_string(),
-            identifier: Some("vpc-123".to_string()),
-            attributes: persisted_attributes_from_state_json(&HashMap::from([(
-                "vpc_id".to_string(),
-                serde_json::Value::String("vpc-123".to_string()),
-            )])),
-            deposed: Vec::new(),
-            protected: false,
-            directives: carina_core::resource::Directives::default(),
-            prefixes: HashMap::new(),
-            name_overrides: HashMap::new(),
-            explicit: ExplicitFields::default(),
-            binding: Some("vpc".to_string()),
-            dependency_bindings: BTreeSet::new(),
-            write_only_attributes: vec![],
-            partial_read: None,
-        })
+        .upsert_resource(resource)
         .expect("test state setup must be valid");
     let bindings = state.build_remote_bindings();
     assert!(
@@ -4419,7 +5021,7 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
                 }}
             ]
         }}"#,
-        ver = StateFile::CURRENT_VERSION,
+        ver = 14,
     );
     let state = check_and_migrate(&json).expect("load state").into_state();
     let r = &state.resources[0];
@@ -4530,7 +5132,8 @@ fn current_state_writes_and_reads_full_explicit_tree() {
     // carina#3266: current managed rows carry an identifier from the provider's
     // applied result. Identifier-less historical data-source artifacts are
     // removed only at the typed configuration/state boundary, not by serde.
-    let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "aws").with_identifier("my-bucket");
+    let mut rs = ResourceState::try_applied("s3.Bucket", "my-bucket", "aws", "my-bucket")
+        .expect("fixture identifier is non-empty");
     rs.explicit = ExplicitFields::Struct {
         children: HashMap::from([(
             "lifecycle_configuration".into(),
@@ -4559,8 +5162,8 @@ fn current_state_writes_and_reads_full_explicit_tree() {
 #[test]
 fn current_list_elements_state_round_trip_preserves_empty_and_populated_vectors() {
     let mut state = StateFile::new();
-    let mut populated =
-        ResourceState::new("listener.Listener", "populated", "mock").with_identifier("one");
+    let mut populated = ResourceState::try_applied("listener.Listener", "populated", "mock", "one")
+        .expect("fixture identifier is non-empty");
     populated.explicit = ExplicitFields::Struct {
         children: HashMap::from([(
             "rules".to_string(),
@@ -4569,7 +5172,8 @@ fn current_list_elements_state_round_trip_preserves_empty_and_populated_vectors(
             },
         )]),
     };
-    let mut empty = ResourceState::new("listener.Listener", "empty", "mock").with_identifier("two");
+    let mut empty = ResourceState::try_applied("listener.Listener", "empty", "mock", "two")
+        .expect("fixture identifier is non-empty");
     empty.explicit = ExplicitFields::ListElements {
         elements: Vec::new(),
     };
@@ -4821,8 +5425,13 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         None,
     )
     .unwrap();
-    let stored_json = persisted_json_attribute(&second_row.attributes, "rules")
-        .expect("stored reordered rules attribute");
+    let stored_json = persisted_json_attribute(
+        second_row
+            .persisted_attributes()
+            .expect("provider row has persisted attributes"),
+        "rules",
+    )
+    .expect("stored reordered rules attribute");
     let stored = stored_json.as_array().expect("stored reordered rules");
     assert_eq!(stored[0]["port"], 443);
     assert_eq!(stored[1]["port"], 80);
@@ -4893,11 +5502,12 @@ fn build_directives_keys_include_provider_instance() {
 #[test]
 fn partial_read_marker_round_trips_through_state_json() {
     let mut state = StateFile::new();
-    let mut rs = ResourceState::new("test.resource", "r1", "mock").with_identifier("mock-id");
-    rs.partial_read = Some(PartialReadMarker {
+    let mut rs = ResourceState::try_applied("test.resource", "r1", "mock", "mock-id")
+        .expect("fixture identifier is non-empty");
+    rs.set_partial_read_for_test(Some(PartialReadMarker {
         detail: "mock partial create".to_string(),
         missing_attributes: ["a".to_string(), "b".to_string()].into_iter().collect(),
-    });
+    }));
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -4906,8 +5516,8 @@ fn partial_read_marker_round_trips_through_state_json() {
     let back = check_and_migrate(&json).expect("read").into_state();
 
     assert_eq!(
-        back.resources[0].partial_read,
-        state.resources[0].partial_read
+        back.resources[0].partial_read(),
+        state.resources[0].partial_read()
     );
 }
 
@@ -4939,5 +5549,5 @@ fn missing_partial_read_field_defaults_to_none() {
     let state = check_and_migrate(json).expect("read").into_state();
 
     assert_eq!(state.resources.len(), 1);
-    assert_eq!(state.resources[0].partial_read, None);
+    assert_eq!(state.resources[0].partial_read(), None);
 }

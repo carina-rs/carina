@@ -89,9 +89,14 @@ provider mock {}
         state.serial = 1;
         state
             .upsert_resource(
-                ResourceState::new("test.resource", "validation_records[0]", "mock")
-                    .with_identifier("old-validation-id")
-                    .with_attribute("name", serde_json::json!("old-validation-token")),
+                ResourceState::try_applied(
+                    "test.resource",
+                    "validation_records[0]",
+                    "mock",
+                    "old-validation-id",
+                )
+                .expect("fixture identifier is non-empty")
+                .with_attribute("name", serde_json::json!("old-validation-token")),
             )
             .expect("test state setup must be valid");
         fs::write(
@@ -283,12 +288,18 @@ fn apply_saved_plan_deferred_replace_persists_new_child_and_siblings() {
     let validation = saved
         .find_resource("mock", "test.resource", "validation_records[0]")
         .expect("new validation record state must be persisted");
-    assert_eq!(validation.identifier.as_deref(), Some("mock-id"));
+    assert_eq!(
+        validation.identifier().map(|value| value.as_str()),
+        Some("mock-id")
+    );
     for name in ["load_balancer", "cert", "alias_record"] {
         let row = saved
             .find_resource("mock", "test.resource", name)
             .unwrap_or_else(|| panic!("sibling resource {name} must be persisted"));
-        assert_eq!(row.identifier.as_deref(), Some("mock-id"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("mock-id")
+        );
     }
 }
 
@@ -301,8 +312,8 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
     let deposed_key = DeposedKey::new_unique();
     let mut state = StateFile::new();
     state.serial = 1;
-    let mut row = ResourceState::new("test.resource", "main", "mock")
-        .with_identifier("main-current")
+    let mut row = ResourceState::try_applied("test.resource", "main", "mock", "main-current")
+        .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("main-current"))
         .with_attribute("status", serde_json::json!("ACTIVE"));
     row.binding = Some("main".to_string());

@@ -960,6 +960,72 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
     ));
 }
 
+fn post_create_unknown() -> Value {
+    Value::Deferred(DeferredValue::Unknown(
+        crate::resource::UnknownReason::PostCreateReadIncomplete {
+            detail: "producer read-back was incomplete".to_string(),
+        },
+    ))
+}
+
+#[test]
+fn nested_post_create_read_unknown_cannot_enter_a_patch() {
+    let current = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("old.example".into())),
+    )])));
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "Name".to_string(),
+        post_create_unknown(),
+    )])));
+
+    assert!(
+        !key_should_enter_patch(
+            "tags",
+            None,
+            AttrComparison {
+                from: Some(&current),
+                to: &desired,
+                saved: None,
+                type_info: None,
+            },
+        ),
+        "a nested incomplete post-create observation is not a provider payload"
+    );
+}
+
+#[test]
+fn dependent_nested_post_create_read_unknown_cannot_force_replacement() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "Name".to_string(),
+        post_create_unknown(),
+    )])));
+    let desired = Resource::new("test.Consumer", "dependent").with_attribute("tags", desired_tags);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "Name".to_string(),
+                Value::Concrete(ConcreteValue::String("old.example".into())),
+            )]))),
+        )]),
+    );
+    let mut schema = ResourceSchema::new("test.Consumer");
+    schema.attributes.insert(
+        "tags".to_string(),
+        AttributeSchema::new("tags", AttributeType::map(AttributeType::string())).create_only(),
+    );
+
+    let result = diff_test(&desired, &current, None, None, Some(&schema));
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "dependent state must wait for the producer's next refresh, got {result:?}"
+    );
+}
+
 #[test]
 fn secret_in_map_no_change_when_hash_matches() {
     // Desired: tags map with a secret value
@@ -1473,6 +1539,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     let current = match &current {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(&resources[0], current, None, None, Some(&schema));
@@ -1562,6 +1629,7 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     let current = match states.get(&id).unwrap() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(
@@ -1904,6 +1972,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let current = match &current {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(
@@ -2037,6 +2106,7 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     let current = match &current {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(

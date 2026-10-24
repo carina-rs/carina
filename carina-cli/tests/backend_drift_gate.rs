@@ -60,8 +60,8 @@ fn state_json(lineage: &str) -> String {
     state.lineage = lineage.to_string();
     state
         .upsert_resource(
-            ResourceState::new("test.resource", "r1", "mock")
-                .with_identifier("mock-id")
+            ResourceState::try_applied("test.resource", "r1", "mock", "mock-id")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("name", serde_json::json!("r1")),
         )
         .expect("test state setup must be valid");

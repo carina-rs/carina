@@ -1261,9 +1261,12 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
             prefixes: vec![("bucket_name".to_string(), "my-app-".to_string())]
                 .into_iter()
                 .collect(),
-            attribute_values: vec![("bucket_name".to_string(), "my-app-existing1".to_string())]
-                .into_iter()
-                .collect(),
+            attribute_values: vec![(
+                "bucket_name".to_string(),
+                PrefixStateValue::Known("my-app-existing1".to_string()),
+            )]
+            .into_iter()
+            .collect(),
         })
     });
 
@@ -1295,7 +1298,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
                 .collect(),
             attribute_values: vec![(
                 "bucket_name".to_string(),
-                "old-prefix-existing1".to_string(),
+                PrefixStateValue::Known("old-prefix-existing1".to_string()),
             )]
             .into_iter()
             .collect(),

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::detail_rows::HistoricalDisplayAttributes;
+use carina_core::differ::rebind_current_for_move;
 use carina_core::effect::{Effect, EffectGeneration};
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
@@ -25,7 +26,9 @@ use carina_core::value::{
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
-use carina_state::{BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend};
+use carina_state::{
+    BackendConfig as StateBackendConfig, ResourceState, StateBackend, StateFile, create_backend,
+};
 
 use super::{BackendDriftStatus, drift_warning, inspect_backend_drift};
 use crate::DetailLevel;
@@ -47,7 +50,7 @@ pub struct PlanFile {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 20 explicitly tags managed and data-source current-state
+    /// Plan format 21 explicitly tags managed and data-source current-state
     /// entries, and explicitly tags each managed [`Current`] variant. A
     /// serialized `Present` row is classified again through
     /// [`Current::from_state`] when decoded, so the tag cannot mint an invalid
@@ -161,7 +164,113 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 20;
+    pub const CURRENT_VERSION: u32 = 21;
+
+    /// Reload state-owned create continuations after the saved-plan apply has
+    /// acquired its state lock. The plan contains only an address and marker;
+    /// any status change in either direction invalidates it.
+    pub(crate) fn reload_in_flight_from_locked_state(
+        mut self,
+        state_file: Option<&StateFile>,
+    ) -> Result<ReloadedPlanFile, String> {
+        let moved_origins = MovedOrigins::from_plan(&self.plan);
+        let planned_in_flight_origins: HashSet<_> = self
+            .current_states
+            .iter()
+            .filter_map(|entry| match entry {
+                CurrentStateEntry::Managed { id, current } if current.planned_in_flight() => {
+                    Some(moved_origins.origin_for(id).clone())
+                }
+                CurrentStateEntry::Managed {
+                    id: _id,
+                    current: _,
+                }
+                | CurrentStateEntry::DataSource { id: _id, state: _ } => None,
+            })
+            .collect();
+
+        if let Some(state_file) = state_file {
+            for row in state_file.resources() {
+                let row_in_flight = match row.current() {
+                    carina_state::CurrentInstance::CreateInFlight { pending: _pending } => true,
+                    carina_state::CurrentInstance::None => false,
+                    carina_state::CurrentInstance::Applied {
+                        identifier: _identifier,
+                        attributes: _attributes,
+                        write_only_attributes: _write_only_attributes,
+                        partial_read: _partial_read,
+                    } => false,
+                    carina_state::CurrentInstance::MissingIdentifier {
+                        attributes: _attributes,
+                        write_only_attributes: _write_only_attributes,
+                        partial_read: _partial_read,
+                    } => false,
+                };
+                if !row_in_flight {
+                    continue;
+                }
+                let locked_id = ResourceId::with_provider_identity(
+                    row.provider.clone(),
+                    row.resource_type.clone(),
+                    row.identity.clone(),
+                    row.directives.provider_instance.clone(),
+                );
+                if !planned_in_flight_origins.contains(&locked_id) {
+                    return Err(format!(
+                        "saved plan is stale for {locked_id}: create-in-flight status changed from false to true; create a new plan before applying"
+                    ));
+                }
+            }
+        }
+
+        let mut current_states = Vec::with_capacity(self.current_states.len());
+        for entry in std::mem::take(&mut self.current_states) {
+            match entry {
+                CurrentStateEntry::Managed { id, current } => {
+                    let persisted_id = moved_origins.origin_for(&id);
+                    let mut locked_current = state_file
+                        .map(|state| state.build_state_for_resource(persisted_id))
+                        .unwrap_or_else(|| Current::absent(id.clone()));
+                    if persisted_id != &id {
+                        let authority =
+                            self.plan.move_authority(persisted_id, &id).ok_or_else(|| {
+                                format!("saved plan has no move edge from {persisted_id} to {id}")
+                            })?;
+                        locked_current = rebind_current_for_move(locked_current, &authority)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let current = match (current.into_reload_kind(), locked_current) {
+                        (
+                            ReloadSavedManagedCurrent::CreateInFlightMarker,
+                            locked @ Current::CreateInFlight(_),
+                        ) => Box::new(locked),
+                        (ReloadSavedManagedCurrent::CreateInFlightMarker, _locked) => {
+                            return Err(format!(
+                                "saved plan is stale for {id}: create-in-flight status changed from true to false; create a new plan before applying"
+                            ));
+                        }
+                        (
+                            ReloadSavedManagedCurrent::Snapshot(_saved),
+                            Current::CreateInFlight(_pending),
+                        ) => {
+                            return Err(format!(
+                                "saved plan is stale for {id}: create-in-flight status changed from false to true; create a new plan before applying"
+                            ));
+                        }
+                        (ReloadSavedManagedCurrent::Snapshot(saved), _locked) => saved,
+                    };
+                    current_states.push(ReloadedCurrentStateEntry::Managed { id, current });
+                }
+                CurrentStateEntry::DataSource { id, state } => {
+                    current_states.push(ReloadedCurrentStateEntry::DataSource { id, state });
+                }
+            }
+        }
+        Ok(ReloadedPlanFile {
+            plan_file: self,
+            current_states,
+        })
+    }
 
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
@@ -241,12 +350,7 @@ impl PlanFile {
         fn current_state_contains(entry: &CurrentStateEntry) -> bool {
             match entry {
                 CurrentStateEntry::Managed { id: _id, current } => {
-                    let state = match current {
-                        Current::Absent(state) => state.state(),
-                        Current::Present(present) => present.state(),
-                        Current::MissingIdentifier(state) => state.state(),
-                    };
-                    state_contains(state)
+                    current.contains_redacted_secret(state_contains)
                 }
                 CurrentStateEntry::DataSource { id: _id, state } => state_contains(state),
             }
@@ -325,22 +429,25 @@ impl PlanFile {
         }
         for (index, entry) in self.current_states.iter().enumerate() {
             require_identity(entry.id(), &format!("current_states[{index}].id"))?;
-            let state = match entry {
-                CurrentStateEntry::Managed { id: _id, current } => match current {
-                    Current::Absent(state) => state.state(),
-                    Current::Present(present) => present.state(),
-                    Current::MissingIdentifier(state) => state.state(),
-                },
-                CurrentStateEntry::DataSource { id: _id, state } => state,
-            };
-            require_identity(&state.id, &format!("current_states[{index}].state.id"))?;
+            match entry {
+                CurrentStateEntry::Managed { id: _id, current } => {
+                    if let Some(nested_id) = current.nested_id() {
+                        require_identity(nested_id, &format!("current_states[{index}].state.id"))?;
+                    }
+                }
+                CurrentStateEntry::DataSource { id: _id, state } => {
+                    require_identity(&state.id, &format!("current_states[{index}].state.id"))?;
+                }
+            }
         }
 
         for (index, effect) in self.plan.effects().iter().enumerate() {
             let location = format!("plan.effects[{index}]");
             match effect {
                 Effect::Read { resource } => require_identity(&resource.id, &location)?,
-                Effect::Create(resource) => require_identity(&resource.id, &location)?,
+                Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
+                    require_identity(&resource.id, &location)?
+                }
                 Effect::Update { from, to, .. } => {
                     require_identity(&from.id, &format!("{location}.from"))?;
                     require_identity(&to.id, &format!("{location}.to"))?;
@@ -473,12 +580,13 @@ pub(crate) fn collect_historical_display_attributes(
                         let state = match current {
                             Current::Absent(state) => state.state(),
                             Current::Present(present) => present.state(),
+                            Current::CreateInFlight(_pending) => continue,
                             Current::MissingIdentifier(state) => state.state(),
                         };
                         let persisted_id = moved_origins.origin_for(key.id());
                         let persisted = state_file
                             .and_then(|file| file.find_resource_for_id(persisted_id))
-                            .map(|resource| resource.persisted_attributes());
+                            .and_then(ResourceState::persisted_attributes);
                         display.set_delete_from_provider_and_persisted(
                             key,
                             &state.attributes,
@@ -504,7 +612,7 @@ pub(crate) fn collect_historical_display_attributes(
             let persisted_id = moved_origins.origin_for(&from.id);
             let persisted = state_file
                 .and_then(|file| file.find_resource_for_id(persisted_id))
-                .map(|resource| resource.persisted_attributes());
+                .and_then(ResourceState::persisted_attributes);
             display.set_update_from_provider_and_persisted(
                 from.id.clone(),
                 &from.attributes,
@@ -692,59 +800,219 @@ pub enum CurrentStateEntry {
     Managed {
         id: ResourceId,
         #[serde(with = "managed_current_serde")]
-        current: Current,
+        current: SavedManagedCurrent,
     },
     DataSource {
         id: ResourceId,
-        state: State,
+        state: Box<State>,
     },
 }
 
+/// Current-state snapshots after every create-in-flight marker has been
+/// reconciled with the locked state file. Only this type exposes a managed
+/// [`Current`].
+#[derive(Debug, Clone)]
+pub(crate) enum ReloadedCurrentStateEntry {
+    Managed {
+        id: ResourceId,
+        current: Box<Current>,
+    },
+    DataSource {
+        id: ResourceId,
+        state: Box<State>,
+    },
+}
+
+#[cfg(test)]
+impl ReloadedCurrentStateEntry {
+    pub(crate) fn managed(id: ResourceId, state: State) -> Self {
+        Self::Managed {
+            id,
+            current: Box::new(Current::from_state(state)),
+        }
+    }
+
+    pub(crate) fn managed_current(id: ResourceId, current: Current) -> Self {
+        Self::Managed {
+            id,
+            current: Box::new(current),
+        }
+    }
+}
+
+/// A decoded saved plan that has crossed the locked-state reload boundary.
+#[derive(Debug)]
+pub(crate) struct ReloadedPlanFile {
+    plan_file: PlanFile,
+    current_states: Vec<ReloadedCurrentStateEntry>,
+}
+
+impl ReloadedPlanFile {
+    pub(crate) fn plan_file(&self) -> &PlanFile {
+        &self.plan_file
+    }
+
+    pub(crate) fn plan_file_mut(&mut self) -> &mut PlanFile {
+        &mut self.plan_file
+    }
+
+    pub(crate) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+        &self.current_states
+    }
+
+    pub(crate) fn current_states_mut(&mut self) -> &mut [ReloadedCurrentStateEntry] {
+        &mut self.current_states
+    }
+}
+
+/// Opaque managed current-state snapshot stored in a saved plan. It never
+/// exposes a [`Current`]: the consuming locked-state reload is the only
+/// conversion into runtime current state.
+#[derive(Debug, Clone)]
+pub struct SavedManagedCurrent(SavedManagedCurrentKind);
+
+#[derive(Debug, Clone)]
+enum SavedManagedCurrentKind {
+    Absent(Box<State>),
+    Present(Box<State>),
+    MissingIdentifier(Box<State>),
+    CreateInFlightMarker,
+}
+
+enum ReloadSavedManagedCurrent {
+    Snapshot(Box<Current>),
+    CreateInFlightMarker,
+}
+
+impl SavedManagedCurrent {
+    pub fn from_current(current: Current) -> Self {
+        let saved = match current {
+            Current::Absent(state) => {
+                SavedManagedCurrentKind::Absent(Box::new(state.state().clone()))
+            }
+            Current::Present(present) => {
+                let mut state = present.state().clone();
+                state.identifier = Some(present.identifier().as_str().to_owned());
+                SavedManagedCurrentKind::Present(Box::new(state))
+            }
+            Current::CreateInFlight(_pending) => SavedManagedCurrentKind::CreateInFlightMarker,
+            Current::MissingIdentifier(state) => {
+                SavedManagedCurrentKind::MissingIdentifier(Box::new(state.state().clone()))
+            }
+        };
+        Self(saved)
+    }
+
+    fn planned_in_flight(&self) -> bool {
+        matches!(self.0, SavedManagedCurrentKind::CreateInFlightMarker)
+    }
+
+    fn into_reload_kind(self) -> ReloadSavedManagedCurrent {
+        match self.0 {
+            SavedManagedCurrentKind::Absent(state)
+            | SavedManagedCurrentKind::Present(state)
+            | SavedManagedCurrentKind::MissingIdentifier(state) => {
+                ReloadSavedManagedCurrent::Snapshot(Box::new(Current::from_state(*state)))
+            }
+            SavedManagedCurrentKind::CreateInFlightMarker => {
+                ReloadSavedManagedCurrent::CreateInFlightMarker
+            }
+        }
+    }
+
+    fn contains_redacted_secret(&self, state_contains: impl FnOnce(&State) -> bool) -> bool {
+        match &self.0 {
+            SavedManagedCurrentKind::Absent(state)
+            | SavedManagedCurrentKind::Present(state)
+            | SavedManagedCurrentKind::MissingIdentifier(state) => state_contains(state),
+            SavedManagedCurrentKind::CreateInFlightMarker => false,
+        }
+    }
+
+    fn nested_id(&self) -> Option<&ResourceId> {
+        match &self.0 {
+            SavedManagedCurrentKind::Absent(state)
+            | SavedManagedCurrentKind::Present(state)
+            | SavedManagedCurrentKind::MissingIdentifier(state) => Some(&state.id),
+            SavedManagedCurrentKind::CreateInFlightMarker => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn create_in_flight_marker() -> Self {
+        Self(SavedManagedCurrentKind::CreateInFlightMarker)
+    }
+}
+
 mod managed_current_serde {
+    use super::{SavedManagedCurrent, SavedManagedCurrentKind};
     use carina_core::resource::{Current, State};
     use serde::de::Error as _;
     use serde::ser::SerializeStruct as _;
     use serde::{Deserialize, Deserializer, Serializer};
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Wire {
         status: String,
-        state: State,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<State>,
     }
 
-    pub fn serialize<S>(current: &Current, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(current: &SavedManagedCurrent, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         let mut wire = serializer.serialize_struct("Current", 2)?;
-        match current {
-            Current::Absent(state) => {
+        match &current.0 {
+            SavedManagedCurrentKind::CreateInFlightMarker => {
+                wire.serialize_field("status", "create_in_flight")?;
+            }
+            SavedManagedCurrentKind::Absent(state) => {
                 wire.serialize_field("status", "absent")?;
-                wire.serialize_field("state", state.state())?;
+                wire.serialize_field("state", state)?;
             }
-            Current::Present(present) => {
-                let mut state = present.state().clone();
-                state.identifier = Some(present.identifier().as_str().to_owned());
+            SavedManagedCurrentKind::Present(state) => {
                 wire.serialize_field("status", "present")?;
-                wire.serialize_field("state", &state)?;
+                wire.serialize_field("state", state)?;
             }
-            Current::MissingIdentifier(state) => {
+            SavedManagedCurrentKind::MissingIdentifier(state) => {
                 wire.serialize_field("status", "missing_identifier")?;
-                wire.serialize_field("state", state.state())?;
+                wire.serialize_field("state", state)?;
             }
         }
         wire.end()
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Current, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SavedManagedCurrent, D::Error>
     where
         D: Deserializer<'de>,
     {
         let Wire { status, state } = Wire::deserialize(deserializer)?;
+        if status == "create_in_flight" {
+            if state.is_some() {
+                return Err(D::Error::custom(
+                    "create-in-flight saved-plan markers must not contain state or a provider token",
+                ));
+            }
+            return Ok(SavedManagedCurrent(
+                SavedManagedCurrentKind::CreateInFlightMarker,
+            ));
+        }
+        let state = state.ok_or_else(|| {
+            D::Error::custom(format!(
+                "managed current-state tag {status:?} requires a state payload"
+            ))
+        })?;
         let current = Current::from_state(state);
         let classified_status = match &current {
             Current::Absent(_state) => "absent",
             Current::Present(_present) => "present",
+            Current::CreateInFlight(_pending) => {
+                return Err(D::Error::custom(
+                    "saved-plan state payload cannot construct an in-flight create",
+                ));
+            }
             Current::MissingIdentifier(_state) => "missing_identifier",
         };
         if status != classified_status {
@@ -752,15 +1020,45 @@ mod managed_current_serde {
                 "managed current-state tag {status:?} does not match classified state {classified_status:?}"
             )));
         }
-        Ok(current)
+        Ok(SavedManagedCurrent::from_current(current))
     }
 }
 
 #[cfg(test)]
 mod managed_current_serde_tests {
-    use super::CurrentStateEntry;
-    use carina_core::provider::AppliedIdentifier;
-    use carina_core::resource::{Current, ResourceId, State, fixture_present_current};
+    use super::{
+        CurrentStateEntry, PlanFile, ReloadSavedManagedCurrent, ReloadedCurrentStateEntry,
+        SavedManagedCurrent,
+    };
+    use carina_core::provider::{AppliedIdentifier, Sent};
+    use carina_core::resource::{
+        Current, ResolvedResource, Resource, ResourceId, State, fixture_present_current,
+    };
+    use carina_state::{ResourceState, StateFile};
+
+    fn plan_file_with_current(id: ResourceId, current: SavedManagedCurrent) -> PlanFile {
+        PlanFile {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-23T08:00:00Z".to_string(),
+            source_path: "test.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: serde_json::from_value(serde_json::json!([]))
+                .expect("empty saved provider configs"),
+            backend_config: None,
+            plan: carina_core::plan::Plan::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            current_states: vec![CurrentStateEntry::Managed { id, current }],
+            upstream_snapshot: Default::default(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        }
+    }
 
     #[test]
     fn present_round_trip_uses_typed_identifier_when_raw_identifier_differs() {
@@ -771,7 +1069,7 @@ mod managed_current_serde_tests {
             .expect("fixture identifier is non-empty");
         let entry = CurrentStateEntry::Managed {
             id: id.clone(),
-            current: fixture_present_current(raw, typed),
+            current: SavedManagedCurrent::from_current(fixture_present_current(raw, typed)),
         };
 
         let encoded = serde_json::to_value(entry).expect("managed current serializes");
@@ -789,7 +1087,11 @@ mod managed_current_serde_tests {
                 current,
             } => {
                 assert_eq!(decoded_id, id);
-                match current {
+                let ReloadSavedManagedCurrent::Snapshot(current) = current.into_reload_kind()
+                else {
+                    panic!("Present serialized as an in-flight marker")
+                };
+                match *current {
                     Current::Present(present) => {
                         assert_eq!(present.identifier().as_str(), "typed-provider-identifier");
                         assert_eq!(
@@ -799,6 +1101,9 @@ mod managed_current_serde_tests {
                     }
                     Current::Absent(state) => {
                         panic!("Present serialized as Absent: {state:?}")
+                    }
+                    Current::CreateInFlight(pending) => {
+                        panic!("Present serialized as in flight: {pending:?}")
                     }
                     Current::MissingIdentifier(state) => {
                         panic!("Present serialized without an identifier: {state:?}")
@@ -811,18 +1116,145 @@ mod managed_current_serde_tests {
             } => panic!("Managed serialized as DataSource: {decoded_id:?} {state:?}"),
         }
     }
+
+    #[test]
+    fn saved_plan_rejects_in_flight_status_change_in_both_directions() {
+        let resource = ResolvedResource::new(Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "pending",
+            None,
+        ));
+        let id = resource.id.clone();
+        let pending = crate::fixture_in_flight_create(
+            &id,
+            "state-owned-token",
+            None,
+            Sent::AllRequestAttributes,
+        );
+        let row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
+            .expect("in-flight fixture must encode");
+        let mut locked_in_flight = StateFile::new();
+        locked_in_flight
+            .upsert_resource(row)
+            .expect("state fixture must be valid");
+
+        let planned_absent = plan_file_with_current(
+            id.clone(),
+            SavedManagedCurrent::from_current(Current::absent(id.clone())),
+        );
+        let became_in_flight = planned_absent
+            .reload_in_flight_from_locked_state(Some(&locked_in_flight))
+            .expect_err("absent to in-flight must invalidate the saved plan");
+        assert!(
+            became_in_flight.contains("false to true"),
+            "{became_in_flight}"
+        );
+
+        let planned_in_flight =
+            plan_file_with_current(id, SavedManagedCurrent::create_in_flight_marker());
+        let ended = planned_in_flight
+            .reload_in_flight_from_locked_state(None)
+            .expect_err("in-flight to absent must invalidate the saved plan");
+        assert!(ended.contains("true to false"), "{ended}");
+    }
+
+    #[test]
+    fn saved_plan_rejects_new_in_flight_address_missing_from_snapshot() {
+        let planned_id =
+            ResourceId::with_provider_identity("mock", "test.Resource", "planned", None);
+        let unexpected_resource = ResolvedResource::new(Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "unexpected",
+            None,
+        ));
+        let unexpected_id = unexpected_resource.id.clone();
+        let pending = crate::fixture_in_flight_create(
+            &unexpected_id,
+            "state-owned-token",
+            None,
+            Sent::AllRequestAttributes,
+        );
+        let row = ResourceState::from_in_flight(&unexpected_resource, &pending, None, None, None)
+            .expect("in-flight fixture must encode");
+        let mut locked = StateFile::new();
+        locked
+            .upsert_resource(row)
+            .expect("state fixture must be valid");
+        let plan = plan_file_with_current(
+            planned_id.clone(),
+            SavedManagedCurrent::from_current(Current::absent(planned_id)),
+        );
+
+        let error = plan
+            .reload_in_flight_from_locked_state(Some(&locked))
+            .expect_err("a new in-flight address must invalidate the saved plan");
+        assert!(error.contains(&unexpected_id.to_string()), "{error}");
+        assert!(error.contains("false to true"), "{error}");
+    }
+
+    #[test]
+    fn saved_plan_reloads_moved_in_flight_row_from_its_source_address() {
+        use carina_core::effect::Effect;
+        use carina_core::resource::ResolvedResourceId;
+
+        let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
+        let destination =
+            ResourceId::with_provider_identity("mock", "test.Resource", "destination", None);
+        let source_resource = ResolvedResource::new(Resource::from_id(source.clone()));
+        let pending = crate::fixture_in_flight_create(
+            &source,
+            "state-owned-token",
+            None,
+            Sent::AllRequestAttributes,
+        );
+        let row = ResourceState::from_in_flight(&source_resource, &pending, None, None, None)
+            .expect("in-flight fixture must encode");
+        let mut locked = StateFile::new();
+        locked
+            .upsert_resource(row)
+            .expect("state fixture must be valid");
+        let mut plan = plan_file_with_current(
+            destination.clone(),
+            SavedManagedCurrent::create_in_flight_marker(),
+        );
+        plan.plan.add(Effect::Move {
+            from: ResolvedResourceId::new(source),
+            to: ResolvedResourceId::new(destination.clone()),
+        });
+
+        let plan = plan
+            .reload_in_flight_from_locked_state(Some(&locked))
+            .expect("a moved continuation must reload from its source row");
+        let ReloadedCurrentStateEntry::Managed { id, current } = &plan.current_states()[0] else {
+            panic!("fixture current state must remain managed");
+        };
+        assert_eq!(id, &destination);
+        let Current::CreateInFlight(pending) = current.as_ref() else {
+            panic!("moved marker must reload the state-owned continuation");
+        };
+        assert_eq!(pending.id(), &destination);
+        assert_eq!(
+            pending.token().expose_for_provider_call(),
+            "state-owned-token"
+        );
+    }
 }
 
 impl CurrentStateEntry {
     pub fn managed(id: ResourceId, state: State) -> Self {
         Self::Managed {
             id,
-            current: Current::from_state(state),
+            current: SavedManagedCurrent::from_current(Current::from_state(state)),
         }
     }
 
     pub fn data_source(id: ResourceId, state: State) -> Self {
-        Self::DataSource { id, state }
+        Self::DataSource {
+            id,
+            state: Box::new(state),
+        }
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -903,9 +1335,8 @@ fn build_plan_file<E>(
             persisted_resource_for_plan_address(persisted_resources.as_ref(), &moved_origins, id);
         // A moved resource's previous state row still lives at its source
         // address until execution writes the destination row.
-        let redacted = match persisted {
-            Some(persisted) => {
-                let persisted_attributes = persisted.persisted_attributes();
+        let redacted = match persisted.and_then(ResourceState::persisted_attributes) {
+            Some(persisted_attributes) => {
                 redact_secrets_in_state_using_persisted(state, persisted_attributes)?
             }
             None => state.clone(),
@@ -920,13 +1351,14 @@ fn build_plan_file<E>(
     let redacted_managed_states = ctx
         .managed_current
         .iter()
-        .map(|(id, current)| {
+        .filter_map(|(id, current)| {
             let state = match current {
-                Current::Absent(state) => state.state(),
-                Current::Present(present) => present.state(),
-                Current::MissingIdentifier(state) => state.state(),
+                Current::Absent(state) => Some(state.state()),
+                Current::Present(present) => Some(present.state()),
+                Current::CreateInFlight(_pending) => None,
+                Current::MissingIdentifier(state) => Some(state.state()),
             };
-            Ok((id.clone(), redact_current_state(id, state)?))
+            state.map(|state| redact_current_state(id, state).map(|state| (id.clone(), state)))
         })
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
     let redacted_managed_current = ctx
@@ -934,7 +1366,9 @@ fn build_plan_file<E>(
         .iter()
         .map(|(id, current)| {
             let mut current = current.clone();
-            *current.attributes_mut() = redacted_managed_states[id].attributes.clone();
+            if let Some(attributes) = current.attributes_mut() {
+                *attributes = redacted_managed_states[id].attributes.clone();
+            }
             (id.clone(), current)
         })
         .collect::<HashMap<_, _>>();
@@ -953,10 +1387,12 @@ fn build_plan_file<E>(
                 &resource.id,
             );
             match persisted {
-                Some(persisted) => redact_secrets_in_resource_reusing_persisted_hashes(
-                    resource,
-                    persisted.persisted_attributes(),
-                ),
+                Some(persisted) => match persisted.persisted_attributes() {
+                    Some(attributes) => {
+                        redact_secrets_in_resource_reusing_persisted_hashes(resource, attributes)
+                    }
+                    None => redact_secrets_in_resource(resource),
+                },
                 None => redact_secrets_in_resource(resource),
             }
         })
@@ -967,7 +1403,11 @@ fn build_plan_file<E>(
         .collect();
 
     Ok(PlanFile {
-        // carina#3909: bumped 19→20 — saved current-state entries now carry
+        // carina#3909: bumped 20→21 — in-flight create snapshots store only
+        // their resource address and a marker. Apply reloads the continuation
+        // token from locked state and rejects either direction of status change.
+        //
+        // carina#3909 preparation: bumped 19→20 — saved current-state entries now carry
         // explicit managed/data-source ownership and managed lifecycle tags.
         // V19 inferred ownership from `data_sources`, which could silently
         // reinterpret an entry whose id was absent from that list.
@@ -1084,14 +1524,14 @@ fn build_plan_file<E>(
             .keys()
             .map(|id| CurrentStateEntry::Managed {
                 id: id.clone(),
-                current: redacted_managed_current[id].clone(),
+                current: SavedManagedCurrent::from_current(redacted_managed_current[id].clone()),
             })
             .chain(
                 ctx.data_source_states
                     .keys()
                     .map(|id| CurrentStateEntry::DataSource {
                         id: id.clone(),
-                        state: redacted_data_source_states[id].clone(),
+                        state: Box::new(redacted_data_source_states[id].clone()),
                     }),
             )
             .collect(),
@@ -1767,12 +2207,16 @@ pub(crate) fn check_exports_pre_apply(
                 continue;
             };
             let persisted_attributes = persisted.persisted_attributes();
-            for (key, value) in current.attributes_mut() {
-                *value = carina_core::value::mask_plaintext_using_persisted_attribute(
-                    value,
-                    persisted_attributes,
-                    key,
-                );
+            if let (Some(persisted_attributes), Some(attributes)) =
+                (persisted_attributes, current.attributes_mut())
+            {
+                for (key, value) in attributes {
+                    *value = carina_core::value::mask_plaintext_using_persisted_attribute(
+                        value,
+                        persisted_attributes,
+                        key,
+                    );
+                }
             }
         }
     }
@@ -3048,9 +3492,14 @@ mod run_plan_out_tests {
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(
-                carina_state::ResourceState::new("test.resource", "updated", "mock")
-                    .with_identifier("updated-id")
-                    .with_attribute("comment", persisted_update_marker.as_json().clone()),
+                carina_state::ResourceState::try_applied(
+                    "test.resource",
+                    "updated",
+                    "mock",
+                    "updated-id",
+                )
+                .expect("fixture identifier is non-empty")
+                .with_attribute("comment", persisted_update_marker.as_json().clone()),
             )
             .expect("persisted update row");
         let mut plan = Plan::new();
@@ -3149,8 +3598,13 @@ mod run_plan_out_tests {
         .unwrap();
 
         let mut state = StateFile::new();
-        let mut bucket = carina_state::ResourceState::new("test.resource", "bucket", "mock")
-            .with_identifier("pref-existing");
+        let mut bucket = carina_state::ResourceState::try_applied(
+            "test.resource",
+            "bucket",
+            "mock",
+            "pref-existing",
+        )
+        .expect("fixture identifier is non-empty");
         bucket.set_persisted_attribute("name".to_string(), serde_json::json!("pref-existing"));
         bucket
             .prefixes

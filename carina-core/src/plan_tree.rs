@@ -169,7 +169,10 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                 // all carry a typestate struct — reach them through the
                 // shared `ResourceRef` view, and assemble the dependency
                 // set from value refs + the effect's explicit depends_on.
-                Effect::Create(_) | Effect::Update { .. } | Effect::Read { .. } => {
+                Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Read { .. } => {
                     let rl = effect
                         .as_resource_ref()
                         .expect("variant carries a resource");

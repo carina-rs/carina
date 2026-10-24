@@ -106,8 +106,10 @@ let roles = read mock.iam.Roles {
                 "resource_type": "iam.Roles",
                 "identity": "roles",
                 "provider": "mock",
-                "identifier": null,
-                "attributes": { "names": ["old-role"] },
+                "current": {
+                    "kind": "missing_identifier",
+                    "attributes": { "names": ["old-role"] }
+                },
                 "binding": "roles"
             }]);
         });
@@ -119,8 +121,11 @@ let roles = read mock.iam.Roles {
                 "resource_type": "iam.Roles",
                 "identity": "roles",
                 "provider": "mock",
-                "identifier": "managed-provider-id",
-                "attributes": { "names": ["old-managed-value"] },
+                "current": {
+                    "kind": "applied",
+                    "identifier": "managed-provider-id",
+                    "attributes": { "names": ["old-managed-value"] }
+                },
                 "binding": "roles"
             }]);
         });
@@ -144,7 +149,11 @@ let roles = read mock.iam.Roles {
                 .as_array_mut()
                 .expect("state resources must be an array")
             {
-                row["identifier"] = serde_json::Value::Null;
+                let current = row["current"]
+                    .as_object_mut()
+                    .expect("state current instance must be an object");
+                current.insert("kind".to_string(), serde_json::json!("missing_identifier"));
+                current.remove("identifier");
             }
         });
     }
@@ -164,8 +173,7 @@ let roles = read mock.iam.Roles {
                 "resource_type": "test.resource",
                 "identity": "r1",
                 "provider": "mock",
-                "identifier": null,
-                "attributes": {},
+                "current": { "kind": "none" },
                 "deposed": [{
                     "key": "broken-deposed",
                     "identifier": "",
@@ -179,7 +187,16 @@ let roles = read mock.iam.Roles {
     fn add_deposed_generation(&self, current_identifier: serde_json::Value) {
         self.mutate_state(|state| {
             let row = &mut state["resources"][0];
-            row["identifier"] = current_identifier;
+            let current = row["current"]
+                .as_object_mut()
+                .expect("state current instance must be an object");
+            if current_identifier.is_null() || current_identifier.as_str() == Some("") {
+                current.insert("kind".to_string(), serde_json::json!("missing_identifier"));
+                current.remove("identifier");
+            } else {
+                current.insert("kind".to_string(), serde_json::json!("applied"));
+                current.insert("identifier".to_string(), current_identifier);
+            }
             row["deposed"] = serde_json::json!([{
                 "key": "old-generation",
                 "identifier": "mock-old-id",
@@ -330,9 +347,13 @@ fn state_refresh_preserves_declared_row_without_identifier_byte_for_byte() {
     let scenario = Scenario::new(1);
     scenario.mutate_state(|state| {
         let row = &mut state["resources"][0];
-        row["identifier"] = serde_json::Value::Null;
+        let current = row["current"]
+            .as_object_mut()
+            .expect("state current instance must be an object");
+        current.insert("kind".to_string(), serde_json::json!("missing_identifier"));
+        current.remove("identifier");
         row["binding"] = serde_json::json!("legacy-binding-sentinel");
-        row["attributes"]["legacy_only"] = serde_json::json!("must-survive");
+        row["current"]["attributes"]["legacy_only"] = serde_json::json!("must-survive");
     });
     let before = scenario.state_resource_json(0);
 
@@ -501,7 +522,10 @@ fn removed_then_import_recovers_missing_identifier_with_and_without_refresh() {
         let row = state
             .find_resource("mock", "test.resource", "r1")
             .expect("imported row must exist");
-        assert_eq!(row.identifier.as_deref(), Some("mock-id"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("mock-id")
+        );
     }
 }
 

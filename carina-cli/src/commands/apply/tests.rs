@@ -4,7 +4,7 @@ use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult, ReadOutcome,
-    ReadRequest, UpdateRequest, fixture_read_outcome,
+    ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{
     Composition, CompositionArgument, DataSource, DeferredValue, ModuleConstraintId, ModuleSource,
@@ -25,6 +25,21 @@ mod cancellation_fixture;
 use cancellation_fixture::ApplyCancellationFixture;
 
 use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
+use crate::fixture_read_outcome;
+
+macro_rules! unexpected_resume_create {
+    () => {
+        fn resume_create(
+            &self,
+            _request: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            Box::pin(async { panic!("unexpected resume_create") })
+        }
+    };
+}
 
 #[test]
 fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
@@ -137,6 +152,9 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         carina_core::resource::Current::Absent(state) => state.into_state(),
         carina_core::resource::Current::Present(present) => present.into_parts().0,
         carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
+        carina_core::resource::Current::CreateInFlight(_) => {
+            panic!("legacy fixture must not produce an in-flight create")
+        }
     };
     assert_eq!(
         planned_state.attributes.keys().collect::<Vec<_>>(),
@@ -150,7 +168,7 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
     );
     let result = detect_drift(
         &[resource],
-        &[crate::commands::plan::CurrentStateEntry::managed(
+        &[crate::commands::plan::ReloadedCurrentStateEntry::managed(
             id,
             planned_state,
         )],
@@ -329,7 +347,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     )
     .await
     .expect("resolve empty provider config");
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
@@ -351,7 +369,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     };
 
     let result = rehydrate_desired_plan_file(
-        plan_file,
+        &mut plan_file,
         &parsed,
         &provider_inputs,
         ApplyTarget::SavedPlan {
@@ -857,19 +875,29 @@ impl Provider for FailBCreateProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+    > {
         let id = id.clone();
         Box::pin(async move {
             if id.identity_str().expect("resolved identity") == "b" {
-                return Err(ProviderError::api_error("create failed").for_resource(id));
+                return Err(
+                    attempt.untracked(ProviderError::api_error("create failed").for_resource(id))
+                );
             }
             let resource = request.resource().as_resource().clone();
-            Ok(carina_core::provider::CreateOutcome::Success {
-                state: AppliedState::new(id, "mock-id", resource.resolved_attributes())
-                    .expect("fixture identifier is non-empty"),
-            })
+            Ok(attempt
+                .issued(
+                    AppliedIdentifier::new("mock-id").expect("fixture identifier is non-empty"),
+                    carina_core::provider::Sent::AllRequestAttributes,
+                )
+                .succeeded(resource.resolved_attributes()))
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1138,7 +1166,11 @@ impl Provider for ApplyCascadeProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+    > {
         let id = id.clone();
         let attrs = request.resource().as_resource().resolved_attributes();
         self.shared
@@ -1149,26 +1181,34 @@ impl Provider for ApplyCascadeProvider {
 
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "ec2.Vpc" => Ok(carina_core::provider::CreateOutcome::Success {
-                    state: AppliedState::new(
-                        id,
-                        "vpc-new",
-                        HashMap::from([("vpc_id".to_string(), string_value("vpc-new"))]),
+                "ec2.Vpc" => Ok(attempt
+                    .issued(
+                        AppliedIdentifier::new("vpc-new").expect("fixture identifier is non-empty"),
+                        carina_core::provider::Sent::AllRequestAttributes,
                     )
-                    .expect("fixture identifier is non-empty"),
-                }),
-                "ec2.Subnet" => Ok(carina_core::provider::CreateOutcome::Success {
-                    state: AppliedState::new(
-                        id,
-                        "subnet-new",
-                        HashMap::from([("subnet_id".to_string(), string_value("subnet-new"))]),
+                    .succeeded(HashMap::from([(
+                        "vpc_id".to_string(),
+                        string_value("vpc-new"),
+                    )]))),
+                "ec2.Subnet" => Ok(attempt
+                    .issued(
+                        AppliedIdentifier::new("subnet-new")
+                            .expect("fixture identifier is non-empty"),
+                        carina_core::provider::Sent::AllRequestAttributes,
                     )
-                    .expect("fixture identifier is non-empty"),
-                }),
-                _ => Err(ProviderError::internal(format!("unexpected create {id}"))),
+                    .succeeded(HashMap::from([(
+                        "subnet_id".to_string(),
+                        string_value("subnet-new"),
+                    )]))),
+                _ => {
+                    Err(attempt
+                        .untracked(ProviderError::internal(format!("unexpected create {id}"))))
+                }
             }
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1279,8 +1319,8 @@ fn seed_apply_cascade_state(
     providers: &[ProviderConfig],
     include_subnet: bool,
 ) {
-    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
-        .with_identifier("vpc-old")
+    let mut vpc_state = ResourceState::try_applied("ec2.Vpc", "vpc", "awscc", "vpc-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
     vpc_state.binding = Some("vpc".to_string());
@@ -1291,12 +1331,13 @@ fn seed_apply_cascade_state(
         .expect("test state setup must be valid");
 
     if include_subnet {
-        let mut subnet_state = ResourceState::new(
+        let mut subnet_state = ResourceState::try_applied(
             "ec2.Subnet",
             concrete_subnet_identity(ctx, providers),
             "awscc",
+            "subnet-old",
         )
-        .with_identifier("subnet-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("vpc_id", serde_json::json!("vpc-old"))
         .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
         .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
@@ -1313,8 +1354,8 @@ fn seed_apply_cascade_state_with_deposed(
     fixture: &ApplyCancellationFixture,
     deposed_identifiers: &[&str],
 ) {
-    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
-        .with_identifier("vpc-new")
+    let mut vpc_state = ResourceState::try_applied("ec2.Vpc", "vpc", "awscc", "vpc-new")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.221.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-new"));
     vpc_state.binding = Some("vpc".to_string());
@@ -1429,7 +1470,7 @@ fn assert_vpc_new_current_and_old_deposed(state_path: &std::path::Path) {
     let raw = std::fs::read_to_string(state_path).expect("state file must be written");
     let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
     let vpc = state_json_resource(&state, "awscc", "ec2.Vpc", "vpc");
-    assert_eq!(vpc["identifier"], serde_json::json!("vpc-new"));
+    assert_eq!(vpc["current"]["identifier"], serde_json::json!("vpc-new"));
 
     let deposed = vpc
         .get("deposed")
@@ -1509,7 +1550,11 @@ impl Provider for ApplyTimeReadProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+    > {
         let id = id.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
@@ -1534,12 +1579,16 @@ impl Provider for ApplyTimeReadProvider {
                 id.identity_str().expect("resolved identity")
             ));
 
-            Ok(carina_core::provider::CreateOutcome::Success {
-                state: AppliedState::new(id, "mock-id", attrs)
-                    .expect("fixture identifier is non-empty"),
-            })
+            Ok(attempt
+                .issued(
+                    AppliedIdentifier::new("mock-id").expect("fixture identifier is non-empty"),
+                    carina_core::provider::Sent::AllRequestAttributes,
+                )
+                .succeeded(attrs))
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1832,8 +1881,8 @@ fn apply_parallelism_default_is_eight() {
 
 fn legacy_override_state() -> StateFile {
     let mut state = StateFile::new();
-    let mut resource =
-        ResourceState::new("test.resource", "legacy", "mock").with_identifier("legacy-id");
+    let mut resource = ResourceState::try_applied("test.resource", "legacy", "mock", "legacy-id")
+        .expect("fixture identifier is non-empty");
     resource.name_overrides.insert(
         "name".to_string(),
         NameOverride {
@@ -2058,7 +2107,10 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         .find_resource("mock", "test.resource", "consumer")
         .expect("consumer should be persisted");
     assert_eq!(
-        consumer.persisted_attributes().get("comment"),
+        consumer
+            .persisted_attributes()
+            .expect("consumer has applied attributes")
+            .get("comment"),
         carina_core::value::json_to_dsl_value(&serde_json::json!("target")),
         "consumer must receive the value published by the apply-time read"
     );
@@ -2593,7 +2645,10 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
         )]),
     )
     .with_identifier("legacy-id");
-    let applied_states = HashMap::from([(id.clone(), applied_state)]);
+    let applied_states = HashMap::from([(
+        id.clone(),
+        carina_core::executor::Applied::Complete(applied_state),
+    )]);
     let plan = plan_with_name_override(&id, "legacy-temp", "legacy");
 
     let migrated = build_state_after_apply(
@@ -3217,7 +3272,10 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
     let subnet_identity = concrete_subnet_identity(&ctx, &parsed.providers);
     let subnet = state_json_resource(&state, "awscc", "ec2.Subnet", subnet_identity.as_str());
-    assert_eq!(subnet["identifier"], serde_json::json!("subnet-new"));
+    assert_eq!(
+        subnet["current"]["identifier"],
+        serde_json::json!("subnet-new")
+    );
     let subnet_deposed = subnet
         .get("deposed")
         .and_then(serde_json::Value::as_array)
@@ -3256,7 +3314,10 @@ async fn run_apply_locked_deletes_successful_deposed_generation_and_keeps_curren
     let row = state
         .find_resource("awscc", "ec2.Vpc", "vpc")
         .expect("current row must survive a successful deposed delete");
-    assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+    assert_eq!(
+        row.identifier().map(|value| value.as_str()),
+        Some("vpc-new")
+    );
     assert!(
         row.deposed.is_empty(),
         "successful deposed delete should remove exactly that generation"
@@ -3387,18 +3448,19 @@ awscc.ec2.Subnet {{
         "fixture must validate, got: {validation_errors:?}"
     );
 
-    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
-        .with_identifier("vpc-old")
+    let mut vpc_state = ResourceState::try_applied("ec2.Vpc", "vpc", "awscc", "vpc-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
     vpc_state.binding = Some("vpc".to_string());
 
-    let mut subnet_state = ResourceState::new(
+    let mut subnet_state = ResourceState::try_applied(
         "ec2.Subnet",
         concrete_subnet_identity(&ctx, &parsed.providers),
         "awscc",
+        "subnet-old",
     )
-    .with_identifier("subnet-old")
+    .expect("fixture identifier is non-empty")
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
@@ -3535,13 +3597,17 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         .and_then(|state| state.find_resource("mock", "iam.Role", "target_role"))
         .expect("target role must be persisted before post-apply plan");
     assert_eq!(
-        target_state.persisted_attributes().get("path"),
+        target_state
+            .persisted_attributes()
+            .expect("target has applied attributes")
+            .get("path"),
         carina_core::value::json_to_dsl_value(&serde_json::json!("/")),
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
     assert_eq!(
         target_state
             .persisted_attributes()
+            .expect("target has applied attributes")
             .get("max_session_duration"),
         carina_core::value::json_to_dsl_value(&serde_json::json!(3600)),
         "fixture must mirror AWS read-back defaults that are absent from config"
@@ -3701,9 +3767,17 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Backend
     }
 }
 
+#[derive(Clone, Copy)]
+enum BootstrapCreateBehavior {
+    Success,
+    Untracked,
+    Created,
+    InFlight,
+}
+
 struct BootstrapRecordingProvider {
     create_calls: AtomicUsize,
-    fail_create: bool,
+    behavior: BootstrapCreateBehavior,
 }
 
 impl Provider for BootstrapRecordingProvider {
@@ -3733,15 +3807,66 @@ impl Provider for BootstrapRecordingProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+    > {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_create {
-            return Box::pin(async { Err(ProviderError::internal("bootstrap create failed")) });
+        let id = id.clone();
+        match self.behavior {
+            BootstrapCreateBehavior::Success => {
+                let identifier =
+                    AppliedIdentifier::new("bucket-id").expect("fixture identifier is non-empty");
+                Box::pin(async move {
+                    Ok(attempt
+                        .issued(
+                            identifier,
+                            carina_core::provider::Sent::AllRequestAttributes,
+                        )
+                        .succeeded(HashMap::new()))
+                })
+            }
+            BootstrapCreateBehavior::Untracked => Box::pin(async move {
+                Err(attempt.untracked(ProviderError::internal("bootstrap create failed")))
+            }),
+            BootstrapCreateBehavior::Created => {
+                let identifier =
+                    AppliedIdentifier::new("bucket-id").expect("fixture identifier is non-empty");
+                let issued = attempt.issued(
+                    identifier,
+                    carina_core::provider::Sent::AllRequestAttributes,
+                );
+                let observed = AppliedState::new(
+                    id,
+                    "bucket-id",
+                    HashMap::from([(
+                        "observed".to_string(),
+                        Value::Concrete(ConcreteValue::String("yes".into())),
+                    )]),
+                )
+                .expect("fixture identifier is non-empty");
+                Box::pin(async move {
+                    Err(issued.failed(
+                        carina_core::provider::Observation::Read(ReadOutcome::found(observed)),
+                        ProviderError::internal("bootstrap created then failed"),
+                    ))
+                })
+            }
+            BootstrapCreateBehavior::InFlight => {
+                let pending = attempt.pending(
+                    carina_core::provider::PendingToken::new("bootstrap-token"),
+                    carina_core::provider::Sent::AllRequestAttributes,
+                    1,
+                );
+                Box::pin(async move {
+                    Err(pending.preserve(ProviderError::internal("bootstrap still in flight")))
+                })
+            }
         }
-        let state = AppliedState::new(id.clone(), "bucket-id", HashMap::new())
-            .expect("fixture identifier is non-empty");
-        Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -3770,11 +3895,78 @@ impl Provider for BootstrapRecordingProvider {
     }
 }
 
+fn bootstrap_test_backend() -> (tempfile::TempDir, carina_state::LocalBackend) {
+    let temp = tempfile::tempdir().expect("bootstrap state tempdir");
+    let backend = carina_state::LocalBackend::with_path(temp.path().join("carina.state.json"));
+    (temp, backend)
+}
+
+struct BootstrapWriteFailureBackend;
+
+#[async_trait::async_trait]
+impl StateBackend for BootstrapWriteFailureBackend {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
+        Ok(None)
+    }
+
+    async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
+        Err(carina_state::BackendError::Configuration(
+            "seed write failed".to_string(),
+        ))
+    }
+
+    async fn acquire_lock(&self, _operation: &str) -> carina_state::BackendResult<LockInfo> {
+        Err(carina_state::BackendError::Configuration(
+            "lock is not used by bootstrap fixture".to_string(),
+        ))
+    }
+
+    async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
+        Err(carina_state::BackendError::Configuration(
+            "lock is not used by bootstrap fixture".to_string(),
+        ))
+    }
+
+    async fn renew_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
+        Err(carina_state::BackendError::Configuration(
+            "lock is not used by bootstrap fixture".to_string(),
+        ))
+    }
+
+    async fn write_state_locked(
+        &self,
+        _state: &StateFile,
+        _lock: &LockInfo,
+    ) -> carina_state::BackendResult<()> {
+        Err(carina_state::BackendError::Configuration(
+            "locked write is not used by bootstrap fixture".to_string(),
+        ))
+    }
+
+    async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
+        Err(carina_state::BackendError::Configuration(
+            "lock is not used by bootstrap fixture".to_string(),
+        ))
+    }
+
+    async fn init(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+
+    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
+        Ok(true)
+    }
+
+    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create() {
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
-        fail_create: false,
+        behavior: BootstrapCreateBehavior::Success,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
@@ -3792,14 +3984,18 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
 
     let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
-        &parsed,
-        &provider_configs,
-        &NoopNormalizer,
-        &[],
-        &schemas,
+        BootstrapCreateContext {
+            backend: &backend,
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
     )
     .await
     .expect_err("invalid bootstrap bucket must fail its value constraint");
@@ -3841,7 +4037,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
 async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
-        fail_create: true,
+        behavior: BootstrapCreateBehavior::Untracked,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
@@ -3856,36 +4052,38 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     );
 
     let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
-        &carina_core::parser::InferredFile::default(),
-        &provider_configs,
-        &NoopNormalizer,
-        &[],
-        &schemas,
+        BootstrapCreateContext {
+            backend: &backend,
+            parsed: &carina_core::parser::InferredFile::default(),
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
     )
     .await
     .expect_err("provider create failure must escape bootstrap");
 
-    assert_eq!(
-        error.to_string(),
-        "Failed to create state bucket: bootstrap create failed"
-    );
-    assert!(matches!(&error, AppError::StateBucketCreate { error }
-        if error.detail().context() == "bootstrap create failed"));
-    assert_eq!(
-        error.to_string().matches("bootstrap create failed").count(),
-        1
-    );
-    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(error.to_string(), "Failed to create state bucket");
+    assert!(matches!(&error, AppError::StateBucketCreate(error)
+        if error.create_failure().provider_error().detail().context() == "bootstrap create failed"));
+    let AppError::StateBucketCreate(create_error) = &error else {
+        panic!("typed create failure was erased: {error:?}");
+    };
+    let provider_error = std::error::Error::source(create_error.create_failure())
+        .expect("create failure must preserve the provider error");
+    assert_eq!(provider_error.to_string(), "bootstrap create failed");
 }
 
 #[tokio::test]
 async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
-        fail_create: false,
+        behavior: BootstrapCreateBehavior::Success,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
@@ -3907,14 +4105,18 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     );
 
     let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
     let result = create_checked_bootstrap_resource(
         &provider,
         resource,
-        &parsed,
-        &provider_configs,
-        &NoopNormalizer,
-        &[],
-        &schemas,
+        BootstrapCreateContext {
+            backend: &backend,
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
     )
     .await;
 
@@ -3926,6 +4128,211 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let error = result.expect_err("the violating constraint must fail bootstrap preparation");
     assert!(matches!(&error, AppError::ModuleConstraint(_)), "{error:?}");
     assert!(error.to_string().contains("value must not be forbidden"));
+}
+
+#[tokio::test]
+async fn bootstrap_created_failure_seeds_observed_state_before_error() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Created,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
+    resource.set_attr(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    let id = resource.id.clone();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string()))
+            .attribute(AttributeSchema::new("observed", AttributeType::string())),
+    );
+    let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
+
+    let error = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            backend: &backend,
+            parsed: &carina_core::parser::InferredFile::default(),
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("created failure must still be reported");
+
+    assert!(matches!(
+        &error,
+        AppError::StateBucketCreate(error)
+            if matches!(
+                error.create_failure().kind(),
+                carina_core::provider::CreateFailureKind::Created {
+                    created: _created,
+                    error: _provider_error,
+                }
+            )
+    ));
+    let state = backend
+        .read_state()
+        .await
+        .expect("seed state read")
+        .expect("seed state exists")
+        .into_state();
+    let row = state
+        .find_resource_for_id(&id)
+        .expect("created row must be seeded before the error returns");
+    assert!(row.protected);
+    let carina_state::CurrentInstance::Applied {
+        identifier,
+        attributes,
+        ..
+    } = row.current()
+    else {
+        panic!("created bootstrap failure must seed an applied row");
+    };
+    assert_eq!(identifier.as_str(), "bucket-id");
+    assert_eq!(
+        attributes.decoded_json_value("observed"),
+        Some(serde_json::json!("yes"))
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::InFlight,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
+    resource.set_attr(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    let id = resource.id.clone();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+    );
+    let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
+
+    let error = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            backend: &backend,
+            parsed: &carina_core::parser::InferredFile::default(),
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("in-flight failure must still be reported");
+
+    assert!(matches!(
+        &error,
+        AppError::StateBucketCreate(error)
+            if matches!(
+                error.create_failure().kind(),
+                carina_core::provider::CreateFailureKind::InFlight {
+                    pending: _pending,
+                    error: _provider_error,
+                }
+            )
+    ));
+    let state = backend
+        .read_state()
+        .await
+        .expect("seed state read")
+        .expect("seed state exists")
+        .into_state();
+    let row = state
+        .find_resource_for_id(&id)
+        .expect("in-flight row must be seeded before the error returns");
+    assert!(row.protected);
+    let carina_state::CurrentInstance::CreateInFlight { pending } = row.current() else {
+        panic!("in-flight bootstrap failure must seed a continuation row");
+    };
+    assert_eq!(
+        pending.token().expose_for_provider_call(),
+        "bootstrap-token"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::InFlight,
+    };
+    let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+    );
+    let provider_configs = empty_resolved_provider_configs();
+
+    let error = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            backend: &BootstrapWriteFailureBackend,
+            parsed: &carina_core::parser::InferredFile::default(),
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("the classified create failure remains primary when seeding fails");
+
+    let AppError::StateBucketCreate(error) = &error else {
+        panic!("classified create failure was replaced: {error:?}");
+    };
+    let carina_core::provider::CreateFailureKind::InFlight { pending, error: _ } =
+        error.create_failure().kind()
+    else {
+        panic!("in-flight classification was lost: {error:?}");
+    };
+    assert_eq!(
+        pending.token().expose_for_provider_call(),
+        "bootstrap-token"
+    );
+    assert!(matches!(
+        error.seed_error(),
+        Some(AppError::Backend(carina_state::BackendError::Configuration(message)))
+            if message == "seed write failed"
+    ));
+    assert_eq!(error.to_string(), "Failed to create state bucket");
+    let seed_error = std::error::Error::source(error)
+        .expect("the recovery-row failure remains in the source chain");
+    assert!(seed_error.downcast_ref::<AppError>().is_some());
+    assert_eq!(
+        seed_error.to_string(),
+        "Backend configuration error: seed write failed"
+    );
+    assert_eq!(
+        std::error::Error::source(error.create_failure())
+            .expect("the classified create failure retains its provider source")
+            .to_string(),
+        "bootstrap still in flight"
+    );
 }
 
 #[test]
@@ -4016,7 +4423,10 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     );
     let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs);
     let mut applied_states = HashMap::new();
-    applied_states.insert(sorted_resources[0].id.clone(), applied_state);
+    applied_states.insert(
+        sorted_resources[0].id.clone(),
+        carina_core::executor::Applied::Complete(applied_state),
+    );
 
     let current_states = HashMap::new();
     let plan = Plan::new();
@@ -4044,7 +4454,10 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
         .find_resource("awscc", "ec2.Vpc", "my-vpc")
         .expect("resource should exist in state");
     assert_eq!(
-        saved.persisted_attributes().get("ipv4_netmask_length"),
+        saved
+            .persisted_attributes()
+            .expect("saved resource has applied attributes")
+            .get("ipv4_netmask_length"),
         carina_core::value::json_to_dsl_value(&serde_json::Value::String("16".to_string())),
         "write-only attribute should be persisted in state"
     );
@@ -4133,7 +4546,10 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs)
         .with_identifier("some-identifier");
     let mut applied_states = HashMap::new();
-    applied_states.insert(sorted_resources[0].id.clone(), applied_state);
+    applied_states.insert(
+        sorted_resources[0].id.clone(),
+        carina_core::executor::Applied::Complete(applied_state),
+    );
 
     let current_states = HashMap::new();
     let plan = Plan::new();
@@ -4161,7 +4577,10 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
         .find_resource("awscc", "iam.role", "test-role")
         .expect("resource should exist in state");
     assert!(
-        saved.persisted_attributes().contains_key("policies"),
+        saved
+            .persisted_attributes()
+            .expect("saved resource has applied attributes")
+            .contains_key("policies"),
         "state should contain 'policies' attribute (carried over from desired)"
     );
 
@@ -4375,7 +4794,10 @@ fn block_unique_name_attribute_state_roundtrip() {
     let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs)
         .with_identifier("ipam-12345");
     let mut applied_states = HashMap::new();
-    applied_states.insert(sorted_resources[0].id.clone(), applied_state);
+    applied_states.insert(
+        sorted_resources[0].id.clone(),
+        carina_core::executor::Applied::Complete(applied_state),
+    );
 
     let state = build_state_after_apply(
         ApplyStateSave {
@@ -4400,6 +4822,7 @@ fn block_unique_name_attribute_state_roundtrip() {
     assert!(
         saved_rs
             .persisted_attributes()
+            .expect("saved resource has applied attributes")
             .contains_key("operating_regions"),
         "state should contain 'operating_regions'"
     );
@@ -4485,11 +4908,14 @@ fn move_plus_update_keeps_post_update_attributes() {
     );
     let applied = State::existing(new_id.clone(), applied_attrs).with_identifier("tag-abc");
     let mut applied_states = HashMap::new();
-    applied_states.insert(new_id.clone(), applied);
+    applied_states.insert(
+        new_id.clone(),
+        carina_core::executor::Applied::Complete(applied),
+    );
 
     // Old state row carries the pre-Update value.
-    let old_row = ResourceState::new("ec2.Tag", "tag_old", "awscc")
-        .with_identifier("tag-abc")
+    let old_row = ResourceState::try_applied("ec2.Tag", "tag_old", "awscc", "tag-abc")
+        .expect("fixture identifier is non-empty")
         .with_attribute("key", serde_json::Value::String("env".to_string()))
         .with_attribute("value", serde_json::Value::String("staging".to_string()));
     let mut state_file = StateFile::default();
@@ -4534,7 +4960,10 @@ fn move_plus_update_keeps_post_update_attributes() {
         .find_resource("awscc", "ec2.Tag", "tag_new")
         .expect("new row must exist");
     assert_eq!(
-        new_row.persisted_attributes().get("value"),
+        new_row
+            .persisted_attributes()
+            .expect("new row has applied attributes")
+            .get("value"),
         carina_core::value::json_to_dsl_value(&serde_json::Value::String("prod".to_string())),
         "Move must not overwrite Update's post-apply value",
     );
@@ -4578,8 +5007,8 @@ fn move_alone_carries_attributes_via_managed_current() {
     // State file still has the pre-move address — that's what the
     // Move's `from` cleanup targets.
     let from_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "bucket_old", None);
-    let old_row = ResourceState::new("s3.Bucket", "bucket_old", "awscc")
-        .with_identifier("my-bucket")
+    let old_row = ResourceState::try_applied("s3.Bucket", "bucket_old", "awscc", "my-bucket")
+        .expect("fixture identifier is non-empty")
         .with_attribute("bucket_name", serde_json::Value::String("my-bucket".into()));
     let mut state_file = StateFile::default();
     state_file
@@ -4618,12 +5047,15 @@ fn move_alone_carries_attributes_via_managed_current() {
         .find_resource("awscc", "s3.Bucket", "bucket_new")
         .expect("new row must exist");
     assert_eq!(
-        new_row.identifier.as_deref(),
+        new_row.identifier().map(|value| value.as_str()),
         Some("my-bucket"),
         "identifier carried over via managed_current",
     );
     assert_eq!(
-        new_row.persisted_attributes().get("bucket_name"),
+        new_row
+            .persisted_attributes()
+            .expect("new row has applied attributes")
+            .get("bucket_name"),
         carina_core::value::json_to_dsl_value(&serde_json::Value::String("my-bucket".to_string(),)),
     );
 }
@@ -4690,8 +5122,8 @@ fn failed_refresh_preserves_existing_row() {
     let mut failed_refreshes = HashSet::new();
     failed_refreshes.insert(id.clone());
 
-    let existing = ResourceState::new("s3.Bucket", "stuck", "awscc")
-        .with_identifier("preserved-id")
+    let existing = ResourceState::try_applied("s3.Bucket", "stuck", "awscc", "preserved-id")
+        .expect("fixture identifier is non-empty")
         .with_attribute(
             "bucket_name",
             serde_json::Value::String("preserved".to_string()),
@@ -4720,7 +5152,10 @@ fn failed_refresh_preserves_existing_row() {
     let row = saved
         .find_resource("awscc", "s3.Bucket", "stuck")
         .expect("row must be preserved");
-    assert_eq!(row.identifier.as_deref(), Some("preserved-id"));
+    assert_eq!(
+        row.identifier().map(|value| value.as_str()),
+        Some("preserved-id")
+    );
 }
 
 /// A `Move` whose `from` collides with a desired resource at the
@@ -4751,7 +5186,9 @@ fn move_from_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+        carina_core::executor::Applied::Complete(
+            State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+        ),
     );
 
     let to_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "elsewhere", None);
@@ -4811,7 +5248,9 @@ fn remove_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+        carina_core::executor::Applied::Complete(
+            State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+        ),
     );
 
     let mut plan = Plan::new();
@@ -4867,7 +5306,9 @@ fn self_move_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+        carina_core::executor::Applied::Complete(
+            State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+        ),
     );
 
     let mut plan = Plan::new();

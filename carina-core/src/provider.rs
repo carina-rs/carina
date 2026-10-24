@@ -10,13 +10,16 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
-pub use carina_provider_protocol::types::{AppliedIdentifier, EmptyAppliedIdentifier};
+use carina_provider_protocol::types as protocol_types;
+pub use carina_provider_protocol::types::{
+    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, Sent,
+};
 use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
 };
 
 use crate::effect::PlanOp;
-use crate::parser::ProviderConfig;
+use crate::parser::{ProviderConfig, StateBlockAddress};
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker,
     ResolvedResource, Resource, ResourceId, State, Value, ValueString,
@@ -37,9 +40,8 @@ pub use crate::executor::provider_ready::{
 
 /// Construct a validated provider identifier for fixtures shared by workspace
 /// crates.
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-pub fn fixture_applied_identifier(identifier: impl Into<String>) -> AppliedIdentifier {
+#[cfg(test)]
+pub(crate) fn fixture_applied_identifier(identifier: impl Into<String>) -> AppliedIdentifier {
     AppliedIdentifier::new(identifier).expect("fixture provider identifier must be non-empty")
 }
 
@@ -930,6 +932,18 @@ impl<'a> PreviousSecretHashAuthority<'a> {
     }
 }
 
+/// Select the saved-plan hash for an attribute, falling back to the current
+/// state's hash when the plan did not capture one.
+pub fn previous_hash<'a>(
+    preferred: Option<&'a PersistedAttributes>,
+    current: Option<&'a PersistedAttributes>,
+    key: &str,
+) -> Option<&'a PersistedValue> {
+    preferred
+        .and_then(|attributes| attributes.encoded_value(key))
+        .or_else(|| current.and_then(|attributes| attributes.encoded_value(key)))
+}
+
 impl PersistedAttributes {
     /// Encode the typed placeholders captured in a saved-plan resource into
     /// their structural persisted representation.
@@ -1136,6 +1150,62 @@ impl PersistedAttributes {
         )
     }
 
+    /// Protect values selected for a created-then-failed row without adding
+    /// any value that was neither observed nor actually sent.
+    ///
+    /// This differs deliberately from complete-state writeback: desired
+    /// values decide which existing values are masked, but a missing desired
+    /// value is never copied into the row merely because it is secret.
+    pub fn try_protect_observation_for_resource_and_schema(
+        self,
+        resource: &ResolvedResource,
+        schema: Option<&ResourceSchema>,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        preferred: Option<&PersistedAttributes>,
+        sent_write_only: &std::collections::HashSet<String>,
+    ) -> Result<Self, crate::value::SerializationError> {
+        let Self {
+            encoded: mut serialized,
+        } = self;
+        let mut protected_secret_keys = std::collections::HashSet::new();
+
+        for (key, desired_value) in &resource.attributes {
+            if !crate::value::contains_unredacted_secret(desired_value) {
+                continue;
+            }
+            let Some(provider_or_sent_value) = serialized.get(key).cloned() else {
+                continue;
+            };
+            let previous = previous_hash(preferred, previous_hash_authority.attributes(), key);
+            let masked = crate::value::merge_secrets_into_observation_json(
+                desired_value,
+                &provider_or_sent_value,
+                previous,
+            )?;
+            serialized.insert(key.clone(), masked);
+            protected_secret_keys.insert(key.clone());
+        }
+
+        let present_keys = serialized
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        protect_previously_hashed_secrets(
+            |key| resource.attributes.contains_key(key),
+            previous_hash_authority,
+            &mut serialized,
+            &mut protected_secret_keys,
+        );
+        let mut retained_write_only = protected_secret_keys;
+        retained_write_only.extend(sent_write_only.iter().cloned());
+        remove_unprotected_write_only_attributes(schema, &retained_write_only, &mut serialized);
+        serialized.retain(|key, _value| present_keys.contains(key));
+
+        Ok(Self {
+            encoded: serialized,
+        })
+    }
+
     /// Protect a provider read for an orphan, where no desired resource is
     /// available to supply secrets. Previously hashed values remain opaque and
     /// schema write-only plaintext is not persisted.
@@ -1172,13 +1242,7 @@ impl PersistedAttributes {
             if !crate::value::contains_unredacted_secret(desired_value) {
                 continue;
             }
-            let previous = preferred
-                .and_then(|attributes| attributes.encoded().get(key))
-                .or_else(|| {
-                    previous_hash_authority
-                        .attributes()
-                        .and_then(|attributes| attributes.encoded().get(key))
-                });
+            let previous = previous_hash(preferred, previous_hash_authority.attributes(), key);
             let masked = if let Some(provider_value) = serialized.get(key).cloned() {
                 crate::value::merge_secrets_into_provider_json(
                     desired_value,
@@ -1290,7 +1354,9 @@ fn protect_previously_hashed_secrets(
             (SecretHashShape::Nested, provider_json) => {
                 merge_previous_secret_hashes_into_provider_json(previous_value, provider_json)
             }
-            (SecretHashShape::None, _) => unreachable!("None shape is filtered above"),
+            // The guard above keeps this arm out of ordinary execution, but
+            // handling it explicitly keeps the totality of the match local.
+            (SecretHashShape::None, _) => continue,
         };
         serialized.insert(key.clone(), masked);
         protected_secret_keys.insert(key.clone());
@@ -1592,6 +1658,10 @@ impl AppliedState {
         &self.attributes
     }
 
+    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, HashMap<String, Value>) {
+        (self.id, self.identifier, self.attributes)
+    }
+
     /// Convert a successful managed-resource observation to the generic state
     /// persisted by the executor. This is the sole applied-state to read-state
     /// conversion seam.
@@ -1635,9 +1705,8 @@ impl ReadOutcome {
 }
 
 /// Convert a generic state fixture into the typed managed-read outcome.
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-pub fn fixture_read_outcome(state: State) -> ReadOutcome {
+#[cfg(test)]
+pub(crate) fn fixture_read_outcome(state: State) -> ReadOutcome {
     if !state.exists {
         return ReadOutcome::not_found(state.id);
     }
@@ -1652,9 +1721,8 @@ pub fn fixture_read_outcome(state: State) -> ReadOutcome {
 
 /// Convert a generic state fixture into a managed-read outcome, using the
 /// provider identifier supplied to the read when the fixture omits one.
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-pub fn fixture_read_outcome_for_identifier(
+#[cfg(test)]
+pub(crate) fn fixture_read_outcome_for_identifier(
     state: State,
     identifier: &AppliedIdentifier,
 ) -> ReadOutcome {
@@ -1674,8 +1742,23 @@ pub fn fixture_read_outcome_for_identifier(
 }
 
 /// Result of a provider create operation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CreateOutcome {
+///
+/// Providers must finish the executor-issued attempt instead of constructing
+/// a success-shaped value directly.
+///
+/// ```compile_fail
+/// use carina_core::provider::{AppliedState, CreateOutcome};
+///
+/// fn forge_success(state: AppliedState) -> CreateOutcome {
+///     CreateOutcome::Success { state }
+/// }
+/// ```
+#[derive(Debug, PartialEq, Serialize)]
+pub struct CreateOutcome(CreateOutcomeKind);
+
+/// Read-only classification exposed by an opaque [`CreateOutcome`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum CreateOutcomeKind {
     /// Create completed and the returned state is complete.
     Success { state: AppliedState },
     /// Create completed but the provider could not fully observe state.
@@ -1704,32 +1787,1714 @@ pub struct PartialReadDiagnostic {
     missing_attributes: Vec<String>,
 }
 
+/// Validated UTC RFC3339 timestamp used only to describe when a persisted
+/// create first entered the in-flight state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Timestamp(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("timestamp must be a valid UTC RFC3339 value")]
+pub struct InvalidTimestamp;
+
+impl Timestamp {
+    pub fn now() -> Self {
+        Self(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Timestamp {
+    type Error = InvalidTimestamp;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_utc_rfc3339(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<&str> for Timestamp {
+    type Error = InvalidTimestamp;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from(value.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn validate_utc_rfc3339(value: &str) -> Result<(), InvalidTimestamp> {
+    if !value.ends_with('Z') {
+        return Err(InvalidTimestamp);
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|_timestamp| ())
+        .map_err(|_error| InvalidTimestamp)
+}
+
+/// An unfinished create step minted only by core create typestate handles.
+/// Linear pending-create authority. Polling or classifying it consumes the
+/// value, and it cannot be duplicated.
+///
+/// ```compile_fail
+/// use carina_core::provider::PendingCreate;
+///
+/// fn duplicate(pending: PendingCreate) {
+///     let _second_authority = pending.clone();
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct PendingCreate {
+    id: ResourceId,
+    token: PendingToken,
+    identifier: Option<AppliedIdentifier>,
+    sent: Sent,
+    poll_after_secs: u32,
+    /// Time the current create request first returned a pending step. A
+    /// re-pend preserves it; a create sent after `resend` receives a new one.
+    started_at: Timestamp,
+}
+
+/// Read-only record retained after a provider returns a fresh pending create.
+/// Unlike [`PendingCreate`], this is storage, not transition authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshPendingCreate {
+    id: ResourceId,
+    token: PendingToken,
+    identifier: Option<AppliedIdentifier>,
+    sent: Sent,
+    poll_after_secs: u32,
+    started_at: Timestamp,
+}
+
+impl From<PendingCreate> for FreshPendingCreate {
+    fn from(pending: PendingCreate) -> Self {
+        Self {
+            id: pending.id,
+            token: pending.token,
+            identifier: pending.identifier,
+            sent: pending.sent,
+            poll_after_secs: pending.poll_after_secs,
+            started_at: pending.started_at,
+        }
+    }
+}
+
+impl FreshPendingCreate {
+    pub fn token(&self) -> &PendingToken {
+        &self.token
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        self.identifier.as_ref()
+    }
+
+    pub fn sent(&self) -> &Sent {
+        &self.sent
+    }
+
+    pub fn poll_after_secs(&self) -> u32 {
+        self.poll_after_secs
+    }
+
+    pub fn started_at(&self) -> &Timestamp {
+        &self.started_at
+    }
+
+    pub fn persist(
+        &self,
+        write_only: PersistedAttributes,
+        secrets: PersistedAttributes,
+    ) -> InFlightCreate {
+        InFlightCreate {
+            id: self.id.clone(),
+            pending: PendingRecord::Persisted(PendingEnvelope::new(
+                self.token.clone(),
+                self.identifier.clone(),
+                write_only,
+                secrets,
+            )),
+            started_at: self.started_at.clone(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn into_authority(self) -> PendingCreate {
+        PendingCreate {
+            id: self.id,
+            token: self.token,
+            identifier: self.identifier,
+            sent: self.sent,
+            poll_after_secs: self.poll_after_secs,
+            started_at: self.started_at,
+        }
+    }
+}
+
+impl PendingCreate {
+    fn new(
+        id: ResourceId,
+        token: PendingToken,
+        identifier: Option<AppliedIdentifier>,
+        sent: Sent,
+        poll_after_secs: u32,
+        started_at: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            token,
+            identifier,
+            sent,
+            poll_after_secs,
+            started_at,
+        }
+    }
+
+    pub fn token(&self) -> &PendingToken {
+        &self.token
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        self.identifier.as_ref()
+    }
+
+    pub fn sent(&self) -> &Sent {
+        &self.sent
+    }
+
+    pub fn poll_after_secs(&self) -> u32 {
+        self.poll_after_secs
+    }
+
+    pub fn started_at(&self) -> &Timestamp {
+        &self.started_at
+    }
+
+    /// Preserve an issued pending create and end an identifier-less pending
+    /// create when the provider reports that it can no longer track it.
+    /// Consuming the witness makes the two outcomes mutually exclusive.
+    pub fn untracked(self, error: ProviderError) -> CreateFailure {
+        if self.identifier.is_some() {
+            InFlightCreate::from_pending(self).into_create_failure(error)
+        } else {
+            CreateFailure(CreateFailureKind::Untracked(error))
+        }
+    }
+
+    pub fn preserve(self, error: ProviderError) -> CreateFailure {
+        InFlightCreate::from_pending(self).into_create_failure(error)
+    }
+
+    /// Bind the state-file encoding of this continuation to the same route
+    /// that minted the pending witness.
+    pub fn persist(
+        &self,
+        write_only: PersistedAttributes,
+        secrets: PersistedAttributes,
+    ) -> InFlightCreate {
+        InFlightCreate {
+            id: self.id.clone(),
+            pending: PendingRecord::Persisted(PendingEnvelope::new(
+                self.token.clone(),
+                self.identifier.clone(),
+                write_only,
+                secrets,
+            )),
+            started_at: self.started_at.clone(),
+        }
+    }
+
+    /// Consume the continuation and recover the only poll witness valid for
+    /// its identifier state.
+    pub fn into_poll(self) -> Poll {
+        match self.identifier {
+            Some(identifier) => Poll::Issued(IssuedCreate {
+                id: self.id,
+                identifier,
+                sent: self.sent,
+                started_at: Some(self.started_at),
+            }),
+            None => Poll::Unissued(PollAttempt {
+                id: self.id,
+                sent: self.sent,
+                started_at: self.started_at,
+            }),
+        }
+    }
+}
+
+/// Typestate selected from a pending create immediately before polling.
+#[derive(Debug)]
+pub enum Poll {
+    Unissued(PollAttempt),
+    Issued(IssuedCreate),
+}
+
+/// Provider-facing poll witness for a create without an identifier.
+///
+/// ```compile_fail
+/// use carina_core::provider::PollAttempt;
+///
+/// let _ = PollAttempt::new();
+/// ```
+#[derive(Debug)]
+pub struct PollAttempt {
+    id: ResourceId,
+    sent: Sent,
+    started_at: Timestamp,
+}
+
+impl PollAttempt {
+    pub fn untracked(self, error: ProviderError) -> CreateFailure {
+        CreateFailure(CreateFailureKind::Untracked(error))
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier) -> IssuedCreate {
+        IssuedCreate {
+            id: self.id,
+            identifier,
+            sent: self.sent,
+            started_at: Some(self.started_at),
+        }
+    }
+
+    pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> PendingCreate {
+        PendingCreate::new(
+            self.id,
+            token,
+            None,
+            self.sent,
+            poll_after_secs,
+            self.started_at,
+        )
+    }
+}
+
+/// Persisted continuation and sent-value encoding for an unfinished create.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingEnvelope {
+    token: PendingToken,
+    identifier: Option<AppliedIdentifier>,
+    write_only: PersistedAttributes,
+    secrets: PersistedAttributes,
+}
+
+impl PendingEnvelope {
+    pub(crate) fn new(
+        token: PendingToken,
+        identifier: Option<AppliedIdentifier>,
+        write_only: PersistedAttributes,
+        secrets: PersistedAttributes,
+    ) -> Self {
+        Self {
+            token,
+            identifier,
+            write_only,
+            secrets,
+        }
+    }
+
+    pub fn token(&self) -> &PendingToken {
+        &self.token
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        self.identifier.as_ref()
+    }
+
+    pub fn write_only(&self) -> &PersistedAttributes {
+        &self.write_only
+    }
+
+    pub fn secrets(&self) -> &PersistedAttributes {
+        &self.secrets
+    }
+
+    fn with_pending_record(
+        mut self,
+        token: PendingToken,
+        identifier: Option<AppliedIdentifier>,
+    ) -> Self {
+        self.token = token;
+        self.identifier = identifier;
+        self
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedPendingEnvelope {
+    token: PendingToken,
+    #[serde(default)]
+    identifier: Option<AppliedIdentifier>,
+    write_only: HashMap<String, serde_json::Value>,
+    secrets: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum EncodedStateRowCurrent {
+    CreateInFlight {
+        envelope: EncodedPendingEnvelope,
+        started_at: Timestamp,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct EncodedStateRowWithCurrent {
+    resource_type: String,
+    identity: crate::resource::ResourceIdentity,
+    provider: String,
+    #[serde(default)]
+    directives: Directives,
+    current: EncodedStateRowCurrent,
+}
+
+struct ProviderErrorSourceChain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ProviderErrorSourceChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(error) = source {
+            write!(f, ": {error}")?;
+            source = error.source();
+        }
+        Ok(())
+    }
+}
+
+/// Values known to have been sent by the accepted create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SentRecord {
+    Request(Sent),
+    Persisted(PendingEnvelope),
+}
+
+/// Provider observation plus the accepted create's sent values.
+#[derive(Debug)]
+pub struct ObservedCreate {
+    id: ResourceId,
+    identifier: AppliedIdentifier,
+    observation: Observation,
+    sent: SentRecord,
+}
+
+impl ObservedCreate {
+    pub fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        &self.identifier
+    }
+
+    pub fn observation(&self) -> &Observation {
+        &self.observation
+    }
+
+    pub fn sent(&self) -> &SentRecord {
+        &self.sent
+    }
+
+    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, Observation, SentRecord) {
+        (self.id, self.identifier, self.observation, self.sent)
+    }
+
+    pub(crate) fn validate_request_sent(
+        mut self,
+        request_attributes: &std::collections::BTreeSet<String>,
+    ) -> (Self, bool) {
+        let valid = match &mut self.sent {
+            SentRecord::Request(sent) => sent.clip_to(request_attributes),
+            SentRecord::Persisted(_envelope) => true,
+        };
+        (self, valid)
+    }
+
+    /// Materialize only the provider observation for runtime publication.
+    /// Sent desired values are intentionally excluded.
+    pub fn observed_state(&self) -> State {
+        let attributes = match &self.observation {
+            Observation::Read(ReadOutcome::Found { state }) => state.attributes().clone(),
+            Observation::Read(ReadOutcome::NotFound { id: _id }) => HashMap::new(),
+            Observation::ReadFailed(_error) => HashMap::new(),
+        };
+        State::existing(self.id.clone(), attributes)
+            .with_identifier(self.identifier.as_str().to_string())
+    }
+}
+
+pub type Observation = protocol_types::Observation<ReadOutcome, ProviderError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingRecord {
+    Fresh(FreshPendingCreate),
+    Persisted(PendingEnvelope),
+}
+
+/// Exhaustive borrowed view of how an in-flight create entered this process.
+pub enum InFlightPersistence<'a> {
+    /// Produced by a provider call in this process and not encoded yet.
+    Fresh(&'a FreshPendingCreate),
+    /// Loaded from a validated persisted-state row.
+    Persisted,
+}
+
+/// A create continuation bound to the exact resource route it was issued for.
+///
+/// Persisted continuations are produced only by decoding their complete state
+/// row, so no API can bind an already-decoded envelope to an arbitrary route.
+///
+/// ```compile_fail
+/// use carina_core::provider::{InFlightCreate, PendingEnvelope, Timestamp};
+/// use carina_core::resource::ResourceId;
+///
+/// fn forge_binding(
+///     id: ResourceId,
+///     envelope: PendingEnvelope,
+///     started_at: Timestamp,
+/// ) -> InFlightCreate {
+///     InFlightCreate::from_persisted(id, envelope, started_at)
+/// }
+/// ```
+///
+/// Re-pending is likewise available only after selecting a resume witness:
+///
+/// ```compile_fail
+/// use carina_core::provider::{InFlightCreate, PendingToken};
+///
+/// fn bypass_resume_witness(pending: InFlightCreate, token: PendingToken) {
+///     let _ = pending.repend(token);
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightCreate {
+    id: ResourceId,
+    pending: PendingRecord,
+    started_at: Timestamp,
+}
+
+impl Serialize for InFlightCreate {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Encoded<'a> {
+            envelope: &'a PendingEnvelope,
+            started_at: &'a Timestamp,
+        }
+
+        let PendingRecord::Persisted(envelope) = &self.pending else {
+            return Err(serde::ser::Error::custom(
+                "a fresh create continuation must be persisted with its saved attributes first",
+            ));
+        };
+        Encoded {
+            envelope,
+            started_at: &self.started_at,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Loader-produced binding of an ID-less persisted envelope to its containing
+/// state row. The tuple field is private, and [`InFlightCreate`] itself does
+/// not implement `Deserialize`; state loaders must decode the complete row.
+///
+/// ```compile_fail
+/// use carina_core::provider::{InFlightCreate, StateRowInFlightCreate};
+///
+/// fn bypass(pending: InFlightCreate) -> StateRowInFlightCreate {
+///     StateRowInFlightCreate(pending)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct StateRowInFlightCreate(InFlightCreate);
+
+impl StateRowInFlightCreate {
+    pub fn into_inner(self) -> InFlightCreate {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StateRowInFlightCreate {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let row = EncodedStateRowWithCurrent::deserialize(deserializer)?;
+        let EncodedStateRowCurrent::CreateInFlight {
+            envelope,
+            started_at,
+        } = row.current
+        else {
+            return Err(serde::de::Error::custom(
+                "state row does not contain an in-flight create",
+            ));
+        };
+        let write_only = PersistedAttributes::from_encoded(envelope.write_only)
+            .map_err(|error| serde::de::Error::custom(ProviderErrorSourceChain(&error)))?;
+        let secrets = PersistedAttributes::from_encoded(envelope.secrets)
+            .map_err(|error| serde::de::Error::custom(ProviderErrorSourceChain(&error)))?;
+        let id = ResourceId::with_provider_identity(
+            row.provider,
+            row.resource_type,
+            row.identity,
+            row.directives.provider_instance,
+        );
+        Ok(Self(InFlightCreate {
+            id,
+            pending: PendingRecord::Persisted(PendingEnvelope::new(
+                envelope.token,
+                envelope.identifier,
+                write_only,
+                secrets,
+            )),
+            started_at,
+        }))
+    }
+}
+
+impl InFlightCreate {
+    pub(crate) fn from_pending(pending: PendingCreate) -> Self {
+        let id = pending.id.clone();
+        let started_at = pending.started_at.clone();
+        Self {
+            id,
+            pending: PendingRecord::Fresh(pending.into()),
+            started_at,
+        }
+    }
+
+    /// Convert a continuation produced by a native provider or host adapter
+    /// into the classified failure channel for an initial create.
+    pub(crate) fn into_create_failure(self, error: ProviderError) -> CreateFailure {
+        CreateFailure(CreateFailureKind::InFlight {
+            pending: self,
+            error,
+        })
+    }
+
+    /// Preserve this continuation in the classified resume failure channel.
+    pub(crate) fn into_resume_failure(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure(ResumeFailureKind::InFlight {
+            pending: self,
+            error,
+        })
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        match &self.pending {
+            PendingRecord::Fresh(pending) => pending.identifier(),
+            PendingRecord::Persisted(envelope) => envelope.identifier(),
+        }
+    }
+
+    pub fn token(&self) -> &PendingToken {
+        match &self.pending {
+            PendingRecord::Fresh(pending) => pending.token(),
+            PendingRecord::Persisted(envelope) => envelope.token(),
+        }
+    }
+
+    pub fn sent(&self) -> SentRecord {
+        match &self.pending {
+            PendingRecord::Fresh(pending) => SentRecord::Request(pending.sent().clone()),
+            PendingRecord::Persisted(envelope) => SentRecord::Persisted(envelope.clone()),
+        }
+    }
+
+    pub fn started_at(&self) -> &Timestamp {
+        &self.started_at
+    }
+
+    pub fn persistence(&self) -> InFlightPersistence<'_> {
+        match &self.pending {
+            PendingRecord::Fresh(pending) => InFlightPersistence::Fresh(pending),
+            PendingRecord::Persisted(_envelope) => InFlightPersistence::Persisted,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn into_fresh(self) -> Result<PendingCreate, Box<Self>> {
+        match self.pending {
+            PendingRecord::Fresh(pending) => Ok(pending.into_authority()),
+            PendingRecord::Persisted(envelope) => Err(Box::new(Self {
+                id: self.id,
+                pending: PendingRecord::Persisted(envelope),
+                started_at: self.started_at,
+            })),
+        }
+    }
+
+    fn repend_preserving_identifier(self, token: PendingToken) -> Self {
+        let pending = match self.pending {
+            PendingRecord::Fresh(FreshPendingCreate {
+                id,
+                token: _old_token,
+                identifier,
+                sent,
+                poll_after_secs,
+                started_at,
+            }) => PendingRecord::Fresh(FreshPendingCreate {
+                id,
+                token,
+                identifier,
+                sent,
+                poll_after_secs,
+                started_at,
+            }),
+            PendingRecord::Persisted(envelope) => {
+                let identifier = envelope.identifier().cloned();
+                PendingRecord::Persisted(envelope.with_pending_record(token, identifier))
+            }
+        };
+        Self {
+            id: self.id,
+            pending,
+            started_at: self.started_at,
+        }
+    }
+
+    fn record_identifier(self, identifier: AppliedIdentifier) -> Self {
+        let pending = match self.pending {
+            PendingRecord::Fresh(FreshPendingCreate {
+                id,
+                token,
+                identifier: _old_identifier,
+                sent,
+                poll_after_secs,
+                started_at,
+            }) => PendingRecord::Fresh(FreshPendingCreate {
+                id,
+                token,
+                identifier: Some(identifier),
+                sent,
+                poll_after_secs,
+                started_at,
+            }),
+            PendingRecord::Persisted(envelope) => {
+                let token = envelope.token().clone();
+                PendingRecord::Persisted(envelope.with_pending_record(token, Some(identifier)))
+            }
+        };
+        Self {
+            id: self.id,
+            pending,
+            started_at: self.started_at,
+        }
+    }
+
+    /// Re-key a continuation only inside core's checked move seams.
+    ///
+    /// `StateBlockAddress` has no provider-instance field. The issuing route
+    /// is therefore preserved by construction while the persisted address is
+    /// changed.
+    ///
+    /// ```compile_fail
+    /// use carina_core::provider::InFlightCreate;
+    /// use carina_core::parser::StateBlockAddress;
+    /// fn bypass_route_check(pending: InFlightCreate, to: StateBlockAddress) {
+    ///     let _ = pending.rebind_for_move(to);
+    /// }
+    /// ```
+    pub(crate) fn rebind_for_move(mut self, to: StateBlockAddress) -> Self {
+        let to = ResourceId::with_provider_identity(
+            to.provider,
+            to.resource_type,
+            to.name,
+            self.id.provider_instance.clone(),
+        );
+        self.id = to.clone();
+        if let PendingRecord::Fresh(pending) = &mut self.pending {
+            pending.id = to;
+        }
+        self
+    }
+
+    pub(crate) fn validate_fresh_sent(
+        mut self,
+        request_attributes: &std::collections::BTreeSet<String>,
+    ) -> (Self, bool) {
+        let valid = match &mut self.pending {
+            PendingRecord::Fresh(pending) => pending.sent.clip_to(request_attributes),
+            PendingRecord::Persisted(_envelope) => true,
+        };
+        (self, valid)
+    }
+}
+
+/// Inspectable classification carried by an opaque [`CreateFailure`].
+#[derive(Debug)]
+pub enum CreateFailureKind {
+    Untracked(ProviderError),
+    Created {
+        created: ObservedCreate,
+        error: ProviderError,
+    },
+    InFlight {
+        pending: InFlightCreate,
+        error: ProviderError,
+    },
+}
+
+/// Failure from an initial create, classified by what can safely be retained.
+///
+/// The wrapper is intentionally opaque: provider implementations can obtain
+/// an `Untracked` failure only by consuming the executor-minted
+/// [`CreateAttempt`]. Constructing the public inspection enum is not enough to
+/// return a failure.
+///
+/// ```compile_fail
+/// use carina_core::provider::{CreateFailure, CreateFailureKind, ProviderError};
+///
+/// let kind = CreateFailureKind::Untracked(ProviderError::internal("lost"));
+/// let _failure = CreateFailure(kind);
+/// ```
+#[derive(Debug)]
+pub struct CreateFailure(CreateFailureKind);
+
+impl std::fmt::Display for CreateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self(CreateFailureKind::Untracked(_error)) => {
+                f.write_str("create failed before it could be tracked")
+            }
+            Self(CreateFailureKind::Created {
+                created: _created,
+                error: _error,
+            }) => f.write_str("create reached the provider but did not complete"),
+            Self(CreateFailureKind::InFlight {
+                pending: _pending,
+                error: _error,
+            }) => f.write_str("create is still in progress"),
+        }
+    }
+}
+
+impl std::error::Error for CreateFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self(CreateFailureKind::Untracked(error)) => Some(error),
+            Self(CreateFailureKind::Created {
+                created: _created,
+                error,
+            }) => Some(error),
+            Self(CreateFailureKind::InFlight {
+                pending: _pending,
+                error,
+            }) => Some(error),
+        }
+    }
+}
+
+impl CreateFailure {
+    pub fn kind(&self) -> &CreateFailureKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> CreateFailureKind {
+        self.0
+    }
+
+    pub fn provider_error(&self) -> &ProviderError {
+        match &self.0 {
+            CreateFailureKind::Untracked(error) => error,
+            CreateFailureKind::Created {
+                created: _created,
+                error,
+            } => error,
+            CreateFailureKind::InFlight {
+                pending: _pending,
+                error,
+            } => error,
+        }
+    }
+
+    /// Convert a classified failure from a create begun by `resend` into the
+    /// corresponding resume failure. Only a real create typestate can produce
+    /// the `Untracked` input that becomes `Ended` here.
+    fn into_resent(self) -> ResumeFailure {
+        match self.0 {
+            CreateFailureKind::Untracked(error) => ResumeFailure::ended_from_verdict(error),
+            CreateFailureKind::Created { created, error } => ResumeFailure::created(created, error),
+            CreateFailureKind::InFlight { pending, error } => {
+                ResumeFailure::in_flight(pending, error)
+            }
+        }
+    }
+
+    pub(crate) fn created(created: ObservedCreate, error: ProviderError) -> Self {
+        Self(CreateFailureKind::Created { created, error })
+    }
+
+    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
+        Self(CreateFailureKind::InFlight { pending, error })
+    }
+
+    pub(crate) fn untracked_at_dispatch(error: ProviderError) -> Self {
+        Self(CreateFailureKind::Untracked(error))
+    }
+}
+
+/// Successful result from resuming a persisted create.
+///
+/// A resent success must be finished through the resend attempt minted by the
+/// matching resume witness.
+///
+/// ```compile_fail
+/// use carina_core::provider::{CreateOutcome, ResumeOutcome};
+///
+/// fn forge_resent(outcome: CreateOutcome) -> ResumeOutcome {
+///     ResumeOutcome::Resent(Box::new(outcome))
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ResumeOutcome(ResumeOutcomeKind);
+
+/// Read-only classification exposed by an opaque [`ResumeOutcome`].
+#[derive(Debug)]
+pub enum ResumeOutcomeKind {
+    Resumed(Box<ObservedCreate>),
+    Resent(Box<CreateOutcome>),
+}
+
+impl ResumeOutcome {
+    fn resumed(created: ObservedCreate) -> Self {
+        Self(ResumeOutcomeKind::Resumed(Box::new(created)))
+    }
+
+    fn resent(outcome: CreateOutcome) -> Self {
+        Self(ResumeOutcomeKind::Resent(Box::new(outcome)))
+    }
+
+    pub fn kind(&self) -> &ResumeOutcomeKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> ResumeOutcomeKind {
+        self.0
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        match &self.0 {
+            ResumeOutcomeKind::Resumed(created) => created.id(),
+            ResumeOutcomeKind::Resent(outcome) => outcome.id(),
+        }
+    }
+}
+
+/// Inspectable classification carried by an opaque [`ResumeFailure`].
+#[derive(Debug)]
+pub enum ResumeFailureKind {
+    Ended(ProviderError),
+    Created {
+        created: ObservedCreate,
+        error: ProviderError,
+    },
+    InFlight {
+        pending: InFlightCreate,
+        error: ProviderError,
+    },
+}
+
+/// Failure from resuming a persisted create.
+///
+/// Like [`CreateFailure`], this is opaque so an ordinary provider cannot
+/// synthesize an `Ended` verdict by naming an enum variant.
+///
+/// ```compile_fail
+/// use carina_core::provider::{ProviderError, ResumeFailure, ResumeFailureKind};
+///
+/// let kind = ResumeFailureKind::Ended(ProviderError::internal("lost"));
+/// let _failure = ResumeFailure(kind);
+/// ```
+#[derive(Debug)]
+pub struct ResumeFailure(ResumeFailureKind);
+
+impl std::fmt::Display for ResumeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self(ResumeFailureKind::Ended(_error)) => {
+                f.write_str("resumed create ended without a resource")
+            }
+            Self(ResumeFailureKind::Created {
+                created: _created,
+                error: _error,
+            }) => f.write_str("resumed create reached the provider but did not complete"),
+            Self(ResumeFailureKind::InFlight {
+                pending: _pending,
+                error: _error,
+            }) => f.write_str("resumed create is still in progress"),
+        }
+    }
+}
+
+impl std::error::Error for ResumeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self(ResumeFailureKind::Ended(error)) => Some(error),
+            Self(ResumeFailureKind::Created {
+                created: _created,
+                error,
+            }) => Some(error),
+            Self(ResumeFailureKind::InFlight {
+                pending: _pending,
+                error,
+            }) => Some(error),
+        }
+    }
+}
+
+impl ResumeFailure {
+    pub fn kind(&self) -> &ResumeFailureKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> ResumeFailureKind {
+        self.0
+    }
+
+    pub fn provider_error(&self) -> &ProviderError {
+        match &self.0 {
+            ResumeFailureKind::Ended(error) => error,
+            ResumeFailureKind::Created {
+                created: _created,
+                error,
+            } => error,
+            ResumeFailureKind::InFlight {
+                pending: _pending,
+                error,
+            } => error,
+        }
+    }
+
+    pub(crate) fn ended_from_verdict(error: ProviderError) -> Self {
+        Self(ResumeFailureKind::Ended(error))
+    }
+
+    pub(crate) fn created(created: ObservedCreate, error: ProviderError) -> Self {
+        Self(ResumeFailureKind::Created { created, error })
+    }
+
+    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
+        Self(ResumeFailureKind::InFlight { pending, error })
+    }
+}
+
+/// Provider-facing initial-create witness. Its constructor is core-private;
+/// implementations can only consume the value supplied by the executor.
+///
+/// A provider cannot mint a fresh attempt after consuming the real one:
+///
+/// ```compile_fail
+/// use carina_core::provider::{
+///     AppliedIdentifier, CreateAttempt, CreateFailure, ProviderError, Sent,
+/// };
+/// use carina_core::resource::ResourceId;
+///
+/// fn lose_after_issue(
+///     attempt: CreateAttempt,
+///     identifier: AppliedIdentifier,
+///     error: ProviderError,
+/// ) -> CreateFailure {
+///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
+///     CreateAttempt::new(ResourceId::new("p", "t", "n")).untracked(error)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct CreateAttempt {
+    id: ResourceId,
+}
+
+impl CreateAttempt {
+    pub(crate) fn new(id: ResourceId) -> Self {
+        Self { id }
+    }
+
+    pub fn untracked(self, error: ProviderError) -> CreateFailure {
+        CreateFailure(CreateFailureKind::Untracked(error))
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> IssuedCreate {
+        IssuedCreate {
+            id: self.id,
+            identifier,
+            sent,
+            started_at: None,
+        }
+    }
+
+    pub fn pending(self, token: PendingToken, sent: Sent, poll_after_secs: u32) -> PendingCreate {
+        PendingCreate::new(
+            self.id,
+            token,
+            None,
+            sent,
+            poll_after_secs,
+            Timestamp::now(),
+        )
+    }
+}
+
+/// Provider-facing issued-create witness.
+#[derive(Debug)]
+pub struct IssuedCreate {
+    id: ResourceId,
+    identifier: AppliedIdentifier,
+    sent: Sent,
+    started_at: Option<Timestamp>,
+}
+
+impl IssuedCreate {
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        &self.identifier
+    }
+
+    pub fn canonicalize(self, identifier: AppliedIdentifier) -> FinishingCreate {
+        FinishingCreate {
+            id: self.id,
+            identifier,
+            sent: self.sent,
+        }
+    }
+
+    pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> PendingCreate {
+        PendingCreate::new(
+            self.id,
+            token,
+            Some(self.identifier),
+            self.sent,
+            poll_after_secs,
+            self.started_at.unwrap_or_else(Timestamp::now),
+        )
+    }
+
+    pub fn succeeded(self, attributes: HashMap<String, Value>) -> CreateOutcome {
+        CreateOutcome(CreateOutcomeKind::Success {
+            state: AppliedState::from_identifier(self.id, self.identifier, attributes),
+        })
+    }
+
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> CreateOutcome {
+        CreateOutcome(CreateOutcomeKind::PartialSuccess {
+            state: AppliedState::from_identifier(self.id, self.identifier, attributes),
+            diagnostic,
+        })
+    }
+
+    pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
+        CreateFailure(CreateFailureKind::Created {
+            created: ObservedCreate {
+                id: self.id,
+                identifier: self.identifier,
+                observation,
+                sent: SentRecord::Request(self.sent),
+            },
+            error,
+        })
+    }
+
+    pub fn discarded(self, error: ProviderError) -> CreateFailure {
+        CreateFailure(CreateFailureKind::Untracked(error))
+    }
+}
+
+/// Canonicalized issued-create witness. It intentionally has no `pending`.
+#[derive(Debug)]
+pub struct FinishingCreate {
+    id: ResourceId,
+    identifier: AppliedIdentifier,
+    sent: Sent,
+}
+
+impl FinishingCreate {
+    pub fn succeeded(self, attributes: HashMap<String, Value>) -> CreateOutcome {
+        CreateOutcome(CreateOutcomeKind::Success {
+            state: AppliedState::from_identifier(self.id, self.identifier, attributes),
+        })
+    }
+
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> CreateOutcome {
+        CreateOutcome(CreateOutcomeKind::PartialSuccess {
+            state: AppliedState::from_identifier(self.id, self.identifier, attributes),
+            diagnostic,
+        })
+    }
+
+    pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
+        CreateFailure(CreateFailureKind::Created {
+            created: ObservedCreate {
+                id: self.id,
+                identifier: self.identifier,
+                observation,
+                sent: SentRecord::Request(self.sent),
+            },
+            error,
+        })
+    }
+
+    pub fn discarded(self, error: ProviderError) -> CreateFailure {
+        CreateFailure(CreateFailureKind::Untracked(error))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cannot resume create for {desired}; persisted operation belongs to {persisted}")]
+pub struct ResumeRoutingMismatch {
+    persisted: Box<ResourceId>,
+    desired: Box<ResourceId>,
+}
+
+/// A checked pairing of one persisted continuation and the desired request
+/// for the same complete provider route.
+///
+/// The resume witness itself owns the only authority to preserve or finish
+/// the persisted continuation; no second re-pend handle is handed out.
+///
+/// ```compile_fail
+/// use carina_core::provider::{Repend, ResumeCreateRequest};
+///
+/// fn split_authority(request: ResumeCreateRequest) -> Repend {
+///     let (_resume, _create_request, repend) = request.into_parts();
+///     repend
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ResumeCreateRequest {
+    pending: InFlightCreate,
+    request: CreateRequest,
+}
+
+/// Resume typestate selected from the persisted continuation.
+#[derive(Debug)]
+pub enum Resume {
+    Unissued(ResumeAttempt),
+    Issued(ResumedCreate),
+}
+
+impl Resume {
+    pub fn id(&self) -> &ResourceId {
+        match self {
+            Self::Unissued(attempt) => attempt.id(),
+            Self::Issued(resumed) => resumed.id(),
+        }
+    }
+
+    pub fn token(&self) -> &PendingToken {
+        match self {
+            Self::Unissued(attempt) => attempt.token(),
+            Self::Issued(resumed) => resumed.token(),
+        }
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        match self {
+            Self::Unissued(_attempt) => None,
+            Self::Issued(resumed) => Some(resumed.identifier()),
+        }
+    }
+
+    pub fn preserve(self, error: ProviderError) -> ResumeFailure {
+        match self {
+            Self::Unissued(attempt) => attempt.preserve(error),
+            Self::Issued(resumed) => resumed.preserve(error),
+        }
+    }
+
+    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+        match self {
+            Self::Unissued(attempt) => attempt.untracked(error),
+            Self::Issued(resumed) => resumed.untracked(error),
+        }
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
+        match self {
+            Self::Unissued(attempt) => attempt.discarded(error),
+            Self::Issued(resumed) => resumed.discarded(error),
+        }
+    }
+}
+
+/// Resume witness for a persisted create without an identifier.
+///
+/// ```compile_fail
+/// use carina_core::provider::ResumeAttempt;
+///
+/// let _ = ResumeAttempt::new();
+/// ```
+#[derive(Debug)]
+pub struct ResumeAttempt {
+    pending: InFlightCreate,
+}
+
+impl ResumeAttempt {
+    pub fn id(&self) -> &ResourceId {
+        self.pending.id()
+    }
+
+    pub fn token(&self) -> &PendingToken {
+        self.pending.token()
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier) -> ResumedCreate {
+        let pending = self.pending.record_identifier(identifier.clone());
+        ResumedCreate {
+            pending,
+            identifier,
+        }
+    }
+
+    pub fn repend(self, token: PendingToken) -> Resume {
+        Resume::Unissued(Self {
+            pending: self.pending.repend_preserving_identifier(token),
+        })
+    }
+
+    pub fn preserve(self, error: ProviderError) -> ResumeFailure {
+        self.pending.into_resume_failure(error)
+    }
+
+    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::ended_from_verdict(error)
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::ended_from_verdict(error)
+    }
+
+    pub fn resend(self) -> ResentCreateAttempt {
+        ResentCreateAttempt {
+            previous: self.pending,
+        }
+    }
+}
+
+/// Resume witness for a persisted create whose identifier is known.
+///
+/// Completion consumes the continuation owned by this exact witness; a
+/// continuation from another request cannot be supplied.
+///
+/// ```compile_fail
+/// use carina_core::provider::{AppliedState, Repend, ResumedCreate, ResumeOutcome};
+///
+/// fn mix_requests(
+///     resumed: ResumedCreate,
+///     state: AppliedState,
+///     other: Repend,
+/// ) -> ResumeOutcome {
+///     resumed.completed(state, other)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ResumedCreate {
+    pending: InFlightCreate,
+    identifier: AppliedIdentifier,
+}
+
+impl ResumedCreate {
+    pub fn id(&self) -> &ResourceId {
+        self.pending.id()
+    }
+
+    pub fn token(&self) -> &PendingToken {
+        self.pending.token()
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        &self.identifier
+    }
+
+    pub fn canonicalize(self, identifier: AppliedIdentifier) -> FinishingResume {
+        FinishingResume {
+            pending: self.pending.record_identifier(identifier.clone()),
+            identifier,
+        }
+    }
+
+    pub fn repend(self, token: PendingToken) -> Resume {
+        Resume::Issued(Self {
+            pending: self.pending.repend_preserving_identifier(token),
+            identifier: self.identifier,
+        })
+    }
+
+    pub fn completed(self, state: AppliedState) -> ResumeOutcome {
+        let (_state_id, _observed_identifier, attributes) = state.into_parts();
+        let state = AppliedState::from_identifier(
+            self.pending.id().clone(),
+            self.identifier.clone(),
+            attributes,
+        );
+        let observed = self.observed(Observation::Read(ReadOutcome::found(state)));
+        ResumeOutcome::resumed(observed)
+    }
+
+    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+        let created = self.observed(observation);
+        ResumeFailure::created(created, error)
+    }
+
+    pub fn preserve(self, error: ProviderError) -> ResumeFailure {
+        self.pending.into_resume_failure(error)
+    }
+
+    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+        self.preserve(error)
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::ended_from_verdict(error)
+    }
+
+    fn observed(self, observation: Observation) -> ObservedCreate {
+        observed_from_resume(self.pending, self.identifier, observation)
+    }
+}
+
+/// Canonicalized resumed-create witness. It intentionally cannot re-pend.
+#[derive(Debug)]
+pub struct FinishingResume {
+    pending: InFlightCreate,
+    identifier: AppliedIdentifier,
+}
+
+impl FinishingResume {
+    pub fn completed(self, state: AppliedState) -> ResumeOutcome {
+        let (_state_id, _observed_identifier, attributes) = state.into_parts();
+        let state = AppliedState::from_identifier(
+            self.pending.id().clone(),
+            self.identifier.clone(),
+            attributes,
+        );
+        let observed = observed_from_resume(
+            self.pending,
+            self.identifier,
+            Observation::Read(ReadOutcome::found(state)),
+        );
+        ResumeOutcome::resumed(observed)
+    }
+
+    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::created(
+            observed_from_resume(self.pending, self.identifier, observation),
+            error,
+        )
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::ended_from_verdict(error)
+    }
+}
+
+fn observed_from_resume(
+    pending: InFlightCreate,
+    identifier: AppliedIdentifier,
+    observation: Observation,
+) -> ObservedCreate {
+    let sent = pending.sent();
+    ObservedCreate {
+        id: pending.id,
+        identifier,
+        observation,
+        sent,
+    }
+}
+
+impl ResumeCreateRequest {
+    pub(crate) fn new(
+        pending: InFlightCreate,
+        request: CreateRequest,
+    ) -> Result<Self, ResumeRoutingMismatch> {
+        let desired = request.resource().id.clone();
+        if pending.id != desired {
+            return Err(ResumeRoutingMismatch {
+                persisted: Box::new(pending.id),
+                desired: Box::new(desired),
+            });
+        }
+        Ok(Self { pending, request })
+    }
+
+    /// Construct a checked resume request in cross-crate tests.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn for_test(
+        pending: InFlightCreate,
+        request: CreateRequest,
+    ) -> Result<Self, ResumeRoutingMismatch> {
+        Self::new(pending, request)
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        self.pending.id()
+    }
+
+    pub(crate) fn request(&self) -> &CreateRequest {
+        &self.request
+    }
+
+    pub(crate) fn pending_for_dispatch(&self) -> InFlightCreate {
+        self.pending.clone()
+    }
+
+    pub fn into_parts(self) -> (Resume, CreateRequest) {
+        let resume = match self.pending.identifier().cloned() {
+            Some(identifier) => Resume::Issued(ResumedCreate {
+                pending: self.pending,
+                identifier,
+            }),
+            None => Resume::Unissued(ResumeAttempt {
+                pending: self.pending,
+            }),
+        };
+        (resume, self.request)
+    }
+
+    pub(crate) fn into_in_flight(self) -> InFlightCreate {
+        self.pending
+    }
+}
+
+/// Linear attempt for a create explicitly re-sent by an unissued resume.
+#[derive(Debug)]
+pub struct ResentCreateAttempt {
+    previous: InFlightCreate,
+}
+
+impl ResentCreateAttempt {
+    pub fn id(&self) -> &ResourceId {
+        self.previous.id()
+    }
+
+    pub fn preserve(self, error: ProviderError) -> ResumeFailure {
+        self.previous.into_resume_failure(error)
+    }
+
+    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::ended_from_verdict(error)
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> ResentIssuedCreate {
+        ResentIssuedCreate(CreateAttempt::new(self.previous.id().clone()).issued(identifier, sent))
+    }
+
+    pub fn pending(
+        self,
+        token: PendingToken,
+        sent: Sent,
+        poll_after_secs: u32,
+    ) -> ResentPendingCreate {
+        ResentPendingCreate(CreateAttempt::new(self.previous.id().clone()).pending(
+            token,
+            sent,
+            poll_after_secs,
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ResentIssuedCreate(IssuedCreate);
+
+impl ResentIssuedCreate {
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        self.0.identifier()
+    }
+
+    pub fn canonicalize(self, identifier: AppliedIdentifier) -> ResentFinishingCreate {
+        ResentFinishingCreate(self.0.canonicalize(identifier))
+    }
+
+    pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> ResentPendingCreate {
+        ResentPendingCreate(self.0.pending(token, poll_after_secs))
+    }
+
+    pub fn succeeded(self, attributes: HashMap<String, Value>) -> ResumeOutcome {
+        ResumeOutcome::resent(self.0.succeeded(attributes))
+    }
+
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> ResumeOutcome {
+        ResumeOutcome::resent(self.0.partial(attributes, diagnostic))
+    }
+
+    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+        self.0.failed(observation, error).into_resent()
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::ended_from_verdict(error)
+    }
+}
+
+#[derive(Debug)]
+pub struct ResentFinishingCreate(FinishingCreate);
+
+impl ResentFinishingCreate {
+    pub fn succeeded(self, attributes: HashMap<String, Value>) -> ResumeOutcome {
+        ResumeOutcome::resent(self.0.succeeded(attributes))
+    }
+
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> ResumeOutcome {
+        ResumeOutcome::resent(self.0.partial(attributes, diagnostic))
+    }
+
+    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+        self.0.failed(observation, error).into_resent()
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::ended_from_verdict(error)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResentPendingCreate(PendingCreate);
+
+impl ResentPendingCreate {
+    pub fn id(&self) -> &ResourceId {
+        &self.0.id
+    }
+
+    pub fn token(&self) -> &PendingToken {
+        self.0.token()
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        self.0.identifier()
+    }
+
+    pub fn sent(&self) -> &Sent {
+        self.0.sent()
+    }
+
+    pub fn poll_after_secs(&self) -> u32 {
+        self.0.poll_after_secs()
+    }
+
+    pub fn into_poll(self) -> ResentPoll {
+        match self.0.into_poll() {
+            Poll::Unissued(attempt) => ResentPoll::Unissued(ResentPollAttempt(attempt)),
+            Poll::Issued(issued) => ResentPoll::Issued(ResentIssuedCreate(issued)),
+        }
+    }
+
+    pub fn preserve(self, error: ProviderError) -> ResumeFailure {
+        InFlightCreate::from_pending(self.0).into_resume_failure(error)
+    }
+
+    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+        self.0.untracked(error).into_resent()
+    }
+}
+
+#[derive(Debug)]
+pub enum ResentPoll {
+    Unissued(ResentPollAttempt),
+    Issued(ResentIssuedCreate),
+}
+
+#[derive(Debug)]
+pub struct ResentPollAttempt(PollAttempt);
+
+impl ResentPollAttempt {
+    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+        let _attempt = self.0;
+        ResumeFailure::ended_from_verdict(error)
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier) -> ResentIssuedCreate {
+        ResentIssuedCreate(self.0.issued(identifier))
+    }
+
+    pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> ResentPendingCreate {
+        ResentPendingCreate(self.0.pending(token, poll_after_secs))
+    }
+}
+
 impl CreateOutcome {
-    pub fn partial_success(
+    #[cfg(test)]
+    pub(crate) fn fixture_success(state: AppliedState) -> Self {
+        Self(CreateOutcomeKind::Success { state })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn partial_success(
         state: AppliedState,
         reason: String,
         missing_attributes: Vec<String>,
     ) -> Self {
         match PartialReadDiagnostic::new(reason, missing_attributes) {
-            Some(diagnostic) => CreateOutcome::PartialSuccess { state, diagnostic },
-            None => CreateOutcome::Success { state },
+            Some(diagnostic) => Self(CreateOutcomeKind::PartialSuccess { state, diagnostic }),
+            None => Self(CreateOutcomeKind::Success { state }),
+        }
+    }
+
+    pub fn kind(&self) -> &CreateOutcomeKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> CreateOutcomeKind {
+        self.0
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        match &self.0 {
+            CreateOutcomeKind::Success { state }
+            | CreateOutcomeKind::PartialSuccess {
+                state,
+                diagnostic: _,
+            } => state.id(),
         }
     }
 
     /// Consume the outcome and produce a State ready for writeback.
     pub fn into_state_for_writeback(self) -> State {
-        match self {
-            CreateOutcome::Success { state } => state.into_state_for_writeback(),
-            CreateOutcome::PartialSuccess { state, diagnostic } => {
+        match self.0 {
+            CreateOutcomeKind::Success { state } => state.into_state_for_writeback(),
+            CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
                 diagnostic.into_state_for_writeback(state.into_state_for_writeback())
             }
         }
     }
 
     pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
-        match self {
-            CreateOutcome::Success { .. } => None,
-            CreateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        match &self.0 {
+            CreateOutcomeKind::Success { .. } => None,
+            CreateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
         }
     }
 }
@@ -1907,7 +3672,14 @@ pub trait Provider: Send + Sync {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>>;
+        attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>>;
+
+    /// Resume a create continuation loaded from state.
+    fn resume_create(
+        &self,
+        request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>>;
 
     /// Update an existing resource by applying `request.patch()`.
     ///
@@ -1968,6 +3740,91 @@ pub fn ready_noop<'a>() -> BoxFuture<'a, ProviderResult<()>> {
     Box::pin(async { Ok(()) })
 }
 
+/// Provider-transformable states with a fixed set of resource keys.
+///
+/// Normalizers can mutate every state value, but the API deliberately has no
+/// insertion, removal, or mutable-key operation. This makes preservation of
+/// the host-owned route set a type guarantee rather than a post-call assert.
+///
+/// ```compile_fail
+/// use carina_core::provider::StateTransformMap;
+/// use carina_core::resource::{ResourceId, State};
+///
+/// fn add_route(states: &mut StateTransformMap, id: ResourceId) {
+///     states.insert(id.clone(), State::not_found(id));
+/// }
+/// ```
+#[derive(Debug, PartialEq)]
+pub struct StateTransformMap(HashMap<ResourceId, State>);
+
+impl StateTransformMap {
+    pub(crate) fn from_states(states: HashMap<ResourceId, State>) -> Self {
+        Self(states)
+    }
+
+    pub(crate) fn into_states(self) -> HashMap<ResourceId, State> {
+        self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &State)> {
+        self.0.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&ResourceId, &mut State)> {
+        self.0.iter_mut()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &State> {
+        self.0.values()
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut State> {
+        self.0.values_mut()
+    }
+
+    pub fn get(&self, id: &ResourceId) -> Option<&State> {
+        self.0.get(id)
+    }
+
+    pub fn get_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+        self.0.get_mut(id)
+    }
+}
+
+impl std::ops::Deref for StateTransformMap {
+    type Target = HashMap<ResourceId, State>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a StateTransformMap {
+    type Item = (&'a ResourceId, &'a State);
+    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, State>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut StateTransformMap {
+    type Item = (&'a ResourceId, &'a mut State);
+    type IntoIter = std::collections::hash_map::IterMut<'a, ResourceId, State>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
 /// Plan-time normalizer for a provider.
 ///
 /// Normalizes desired state and read state so that diffs produce correct
@@ -2006,7 +3863,7 @@ pub trait ProviderNormalizer: Send + Sync {
     /// Providers without enum types return [`ready_noop`].
     fn normalize_state<'a>(
         &'a self,
-        current_states: &'a mut HashMap<ResourceId, State>,
+        current_states: &'a mut StateTransformMap,
     ) -> BoxFuture<'a, ProviderResult<()>>;
 
     /// Hydrate read state with saved attributes that APIs don't return.
@@ -2018,9 +3875,47 @@ pub trait ProviderNormalizer: Send + Sync {
     /// Providers that don't hydrate return [`ready_noop`].
     fn hydrate_read_state<'a>(
         &'a self,
-        current_states: &'a mut HashMap<ResourceId, State>,
+        current_states: &'a mut StateTransformMap,
         saved_attrs: &'a SavedAttrs,
     ) -> BoxFuture<'a, ProviderResult<()>>;
+}
+
+/// Normalize state values while keeping the caller-owned route set fixed.
+///
+/// The provider receives only the non-constructible [`StateTransformMap`]
+/// view. Changes commit atomically after a successful call; on error the
+/// caller's map is unchanged.
+pub async fn normalize_provider_states<N>(
+    normalizer: &N,
+    states: &mut HashMap<ResourceId, State>,
+) -> ProviderResult<()>
+where
+    N: ProviderNormalizer + ?Sized,
+{
+    let mut transformed = StateTransformMap::from_states(states.clone());
+    normalizer.normalize_state(&mut transformed).await?;
+    *states = transformed.into_states();
+    Ok(())
+}
+
+/// Hydrate state values while keeping the caller-owned route set fixed.
+///
+/// Like [`normalize_provider_states`], this commits only a successful
+/// transformation and leaves the input unchanged after an error.
+pub async fn hydrate_provider_states<N>(
+    normalizer: &N,
+    states: &mut HashMap<ResourceId, State>,
+    saved_attrs: &SavedAttrs,
+) -> ProviderResult<()>
+where
+    N: ProviderNormalizer + ?Sized,
+{
+    let mut transformed = StateTransformMap::from_states(states.clone());
+    normalizer
+        .hydrate_read_state(&mut transformed, saved_attrs)
+        .await?;
+    *states = transformed.into_states();
+    Ok(())
 }
 
 /// A no-op normalizer for providers that don't need plan-time normalization.
@@ -2036,14 +3931,14 @@ impl ProviderNormalizer for NoopNormalizer {
 
     fn normalize_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut StateTransformMap,
     ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
 
     fn hydrate_read_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut StateTransformMap,
         _saved_attrs: &'a SavedAttrs,
     ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
@@ -2362,10 +4257,24 @@ impl Provider for ProviderRouter {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+        attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
         match self.get_provider_or_error(id) {
-            Ok(provider) => provider.create(id, request),
-            Err(e) => Box::pin(async move { Err(e) }),
+            Ok(provider) => provider.create(id, request, attempt),
+            Err(error) => Box::pin(async move { Err(attempt.untracked(error)) }),
+        }
+    }
+
+    fn resume_create(
+        &self,
+        request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        match self.get_provider_or_error(request.id()) {
+            Ok(provider) => provider.resume_create(request),
+            Err(error) => {
+                let pending = request.into_in_flight();
+                Box::pin(async move { Err(ResumeFailure::in_flight(pending, error)) })
+            }
         }
     }
 
@@ -2430,7 +4339,7 @@ impl ProviderNormalizer for ProviderRouter {
 
     fn normalize_state<'a>(
         &'a self,
-        current_states: &'a mut HashMap<ResourceId, State>,
+        current_states: &'a mut StateTransformMap,
     ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             for (provider_name, ext) in &self.normalizers {
@@ -2444,7 +4353,7 @@ impl ProviderNormalizer for ProviderRouter {
 
     fn hydrate_read_state<'a>(
         &'a self,
-        current_states: &'a mut HashMap<ResourceId, State>,
+        current_states: &'a mut StateTransformMap,
         saved_attrs: &'a SavedAttrs,
     ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
@@ -2929,8 +4838,16 @@ impl Provider for Box<dyn Provider> {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
-        (**self).create(id, request)
+        attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+        (**self).create(id, request, attempt)
+    }
+
+    fn resume_create(
+        &self,
+        request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        (**self).resume_create(request)
     }
 
     fn update(
@@ -2967,6 +4884,106 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! unexpected_resume_create {
+        () => {
+            fn resume_create(
+                &self,
+                _request: ResumeCreateRequest,
+            ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+                Box::pin(async { panic!("unexpected resume_create") })
+            }
+        };
+    }
+
+    #[test]
+    fn fresh_pending_keeps_the_first_accepted_timestamp_through_poll_and_persistence() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started_at =
+            Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
+        let first = PendingCreate::new(
+            id,
+            PendingToken::new("first-token"),
+            None,
+            Sent::AllRequestAttributes,
+            1,
+            started_at.clone(),
+        );
+        let second = match first.into_poll() {
+            Poll::Unissued(attempt) => attempt.pending(PendingToken::new("second-token"), 1),
+            Poll::Issued(issued) => {
+                panic!("identifier-less pending fixture became issued: {issued:?}")
+            }
+        };
+
+        let persisted = InFlightCreate::from_pending(second);
+
+        assert_eq!(persisted.started_at(), &started_at);
+    }
+
+    #[test]
+    fn issued_resume_repend_cannot_replace_the_recorded_identifier() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started_at =
+            Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
+        let original = AppliedIdentifier::new("original-id").expect("valid identifier");
+        let pending = PendingCreate::new(
+            id,
+            PendingToken::new("first-token"),
+            Some(original.clone()),
+            Sent::AllRequestAttributes,
+            1,
+            started_at,
+        );
+        let resumed = ResumedCreate {
+            pending: InFlightCreate::from_pending(pending),
+            identifier: original.clone(),
+        };
+        let Resume::Issued(repended) = resumed.repend(PendingToken::new("second-token")) else {
+            panic!("issued fixture must remain an issued resume witness")
+        };
+
+        assert_eq!(
+            repended.pending.identifier(),
+            Some(&original),
+            "an issued continuation must keep the identifier it was issued with"
+        );
+    }
+
+    #[test]
+    fn classified_create_failure_display_is_context_only() {
+        use std::error::Error as _;
+
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let failure =
+            CreateAttempt::new(id).untracked(ProviderError::api_error("leaf create failure"));
+
+        assert_eq!(
+            failure.to_string(),
+            "create failed before it could be tracked"
+        );
+        assert_eq!(
+            failure.source().map(ToString::to_string).as_deref(),
+            Some("leaf create failure")
+        );
+    }
+
+    #[test]
+    fn classified_resume_failure_display_is_context_only() {
+        use std::error::Error as _;
+
+        let failure =
+            ResumeFailure::ended_from_verdict(ProviderError::not_found("leaf resume failure"));
+
+        assert_eq!(
+            failure.to_string(),
+            "resumed create ended without a resource"
+        );
+        assert_eq!(
+            failure.source().map(ToString::to_string).as_deref(),
+            Some("leaf resume failure")
+        );
+    }
 
     #[test]
     fn enum_canonicalization_error_renders_its_reason_once() {
@@ -3807,16 +5824,19 @@ mod tests {
             &self,
             id: &ResourceId,
             request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+            _attempt: CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
             let id = id.clone();
             let attrs = request.resource().as_resource().attributes.clone();
             Box::pin(async move {
                 let state =
                     AppliedState::new(id, "mock-id-123", crate::resource::attrs_to_hashmap(&attrs))
                         .expect("fixture identifier is non-empty");
-                Ok(CreateOutcome::Success { state })
+                Ok(CreateOutcome::fixture_success(state))
             })
         }
+
+        unexpected_resume_create!();
 
         fn update(
             &self,
@@ -3892,9 +5912,7 @@ mod tests {
         )
         .expect("missing attributes are non-empty");
 
-        let success = CreateOutcome::Success {
-            state: state.clone(),
-        };
+        let success = CreateOutcome::fixture_success(state.clone());
         assert_eq!(success.diagnostic(), None);
         assert_eq!(success.into_state_for_writeback(), expected);
 
@@ -4036,9 +6054,14 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
-            Box::pin(async { Err(ProviderError::internal("not supported")) })
+            attempt: CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            Box::pin(
+                async move { Err(attempt.untracked(ProviderError::internal("not supported"))) },
+            )
         }
+
+        unexpected_resume_create!();
 
         fn update(
             &self,
@@ -4158,11 +6181,14 @@ mod tests {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
         let id = resource.id.clone();
-        let state = provider
-            .create(&id, CreateRequest::checked(resolved_for_test(resource)))
-            .await
-            .unwrap()
-            .into_state_for_writeback();
+        let state = crate::executor::dispatch_create(
+            &provider,
+            &id,
+            CreateRequest::checked(resolved_for_test(resource)),
+        )
+        .await
+        .unwrap()
+        .into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -4196,14 +6222,14 @@ mod tests {
 
             fn normalize_state<'a>(
                 &'a self,
-                _current_states: &'a mut HashMap<ResourceId, State>,
+                _current_states: &'a mut StateTransformMap,
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async { Err(ProviderError::internal("normalization failed")) })
             }
 
             fn hydrate_read_state<'a>(
                 &'a self,
-                _current_states: &'a mut HashMap<ResourceId, State>,
+                _current_states: &'a mut StateTransformMap,
                 _saved_attrs: &'a SavedAttrs,
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
@@ -4213,8 +6239,9 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_normalizer("awscc", Box::new(FailingNormalizer));
 
+        let mut states = StateTransformMap::from_states(HashMap::new());
         let error = router
-            .normalize_state(&mut HashMap::new())
+            .normalize_state(&mut states)
             .await
             .expect_err("normalizer failure must propagate");
 
@@ -4228,11 +6255,14 @@ mod tests {
 
         let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
-        let state = router
-            .create(&id, CreateRequest::checked(resolved_for_test(resource)))
-            .await
-            .unwrap()
-            .into_state_for_writeback();
+        let state = crate::executor::dispatch_create(
+            &router,
+            &id,
+            CreateRequest::checked(resolved_for_test(resource)),
+        )
+        .await
+        .unwrap()
+        .into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -4794,9 +6824,14 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
-            Box::pin(async { Err(ProviderError::internal("not supported")) })
+            attempt: CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            Box::pin(
+                async move { Err(attempt.untracked(ProviderError::internal("not supported"))) },
+            )
         }
+
+        unexpected_resume_create!();
         fn update(
             &self,
             _id: &ResourceId,
@@ -5074,14 +7109,14 @@ mod tests {
 
             fn normalize_state<'a>(
                 &'a self,
-                _current_states: &'a mut HashMap<ResourceId, State>,
+                _current_states: &'a mut StateTransformMap,
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
 
             fn hydrate_read_state<'a>(
                 &'a self,
-                states: &'a mut HashMap<ResourceId, State>,
+                states: &'a mut StateTransformMap,
                 saved: &'a SavedAttrs,
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async move {
@@ -5116,8 +7151,10 @@ mod tests {
 
         // Test hydrate_read_state
         let id = ResourceId::with_identity("test", "example");
-        let mut states = HashMap::new();
-        states.insert(id.clone(), State::existing(id.clone(), HashMap::new()));
+        let mut states = StateTransformMap::from_states(HashMap::from([(
+            id.clone(),
+            State::existing(id.clone(), HashMap::new()),
+        )]));
         let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([(
@@ -5167,15 +7204,18 @@ mod tests {
                 &self,
                 id: &ResourceId,
                 _request: CreateRequest,
-            ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+                _attempt: CreateAttempt,
+            ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
                 let id = id.clone();
                 Box::pin(async move {
-                    Ok(CreateOutcome::Success {
-                        state: AppliedState::new(id, "normalizing-id", HashMap::new())
+                    Ok(CreateOutcome::fixture_success(
+                        AppliedState::new(id, "normalizing-id", HashMap::new())
                             .expect("fixture identifier is non-empty"),
-                    })
+                    ))
                 })
             }
+
+            unexpected_resume_create!();
 
             fn update(
                 &self,
@@ -5242,14 +7282,14 @@ mod tests {
 
             fn normalize_state<'a>(
                 &'a self,
-                _current_states: &'a mut HashMap<ResourceId, State>,
+                _current_states: &'a mut StateTransformMap,
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
 
             fn hydrate_read_state<'a>(
                 &'a self,
-                _current_states: &'a mut HashMap<ResourceId, State>,
+                _current_states: &'a mut StateTransformMap,
                 _saved_attrs: &'a SavedAttrs,
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()

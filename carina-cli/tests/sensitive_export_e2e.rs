@@ -339,7 +339,7 @@ exports {
         Some(&serde_json::json!("v2")),
     );
     assert_eq!(
-        state.pointer("/resources/0/attributes/identifier"),
+        state.pointer("/resources/0/current/attributes/identifier"),
         Some(&serde_json::json!("beta-id")),
     );
 }

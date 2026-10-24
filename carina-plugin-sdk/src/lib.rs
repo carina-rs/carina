@@ -1,13 +1,11 @@
-//! Carina provider SDK for building external process providers.
+//! Carina provider SDK for building WebAssembly component providers.
 //!
-//! Implement the `CarinaProvider` trait and call `carina_plugin_sdk::run(provider)`
-//! in your `main()` to start the JSON-RPC server loop.
+//! Implement [`CarinaProvider`] and export it with [`export_provider!`].
 
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 
 #[cfg(any(target_arch = "wasm32", test))]
-#[doc(hidden)]
 pub mod wasm_guest;
 
 #[cfg(target_arch = "wasm32")]
@@ -53,16 +51,12 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
     }
 }
 
-use carina_provider_protocol::jsonrpc::{Notification, Request, Response};
-use carina_provider_protocol::methods;
 use carina_provider_protocol::types::{
-    AppliedIdentifier, AttributeType, CompletionValue, CreateRequest, DeleteRequest,
-    OperationConfig, PersistedState, PersistedValue, ProviderError, ProviderErrorKind,
-    ProviderInfo, ReadOutcome, ReadRequest, Resource, ResourceId, ResourceSchema, State,
-    TypeIdentity, UpdateRequest, Value,
+    AppliedIdentifier, AppliedState, AttributeType, CompletionValue, CreateRequest, DeleteRequest,
+    PersistedState, PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest,
+    Resource, ResourceId, ResourceSchema, State, TypeIdentity, UpdateRequest, Value,
 };
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanOp {
@@ -98,11 +92,570 @@ pub struct Pending<T> {
     pub poll_after_secs: u32,
 }
 
-/// SDK result of one create step.
+pub use carina_provider_protocol::types::{PendingToken, Sent};
+
+/// Initial-create typestate minted only by the guest transport.
+///
+/// Provider implementations cannot forge an initial attempt:
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{CreateAttempt, CreateVerdict, Sent};
+/// use carina_plugin_sdk::types::{AppliedIdentifier, ProviderError};
+///
+/// fn lose_after_issue(
+///     attempt: CreateAttempt,
+///     identifier: AppliedIdentifier,
+///     error: ProviderError,
+/// ) -> CreateVerdict {
+///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
+///     CreateAttempt::new().untracked(error)
+/// }
+/// ```
 #[derive(Debug)]
-pub enum CreateOutcome<T> {
-    Done(carina_provider_protocol::CreateOutcome),
-    Pending(Pending<T>),
+pub struct CreateAttempt(());
+
+impl CreateAttempt {
+    fn new() -> Self {
+        Self(())
+    }
+
+    pub fn untracked(self, error: ProviderError) -> CreateVerdict {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Untracked(
+            error,
+        ))
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> IssuedCreate {
+        IssuedCreate { identifier, sent }
+    }
+
+    pub fn pending<T>(self, token: T, sent: Sent, poll_after_secs: u32) -> CreateStep<T> {
+        CreateStep(carina_provider_protocol::types::CreateStep::Pending(
+            carina_provider_protocol::types::PendingCreate {
+                token,
+                identifier: None,
+                sent,
+                poll_after_secs,
+            },
+        ))
+    }
+}
+
+/// Poll typestate for a create that has not issued an identifier.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PollAttempt, Sent};
+///
+/// let _ = PollAttempt::from_sent(Sent::AllRequestAttributes);
+/// ```
+#[derive(Debug)]
+pub struct PollAttempt {
+    sent: Sent,
+}
+
+impl PollAttempt {
+    fn from_sent(sent: Sent) -> Self {
+        Self { sent }
+    }
+
+    pub fn untracked(self, error: ProviderError) -> PollVerdict {
+        PollVerdict(carina_provider_protocol::types::PollVerdict::Untracked(
+            error,
+        ))
+    }
+
+    pub fn undetermined(self, error: ProviderError) -> PollVerdict {
+        PollVerdict(carina_provider_protocol::types::PollVerdict::Undetermined(
+            error,
+        ))
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier) -> IssuedCreate {
+        IssuedCreate {
+            identifier,
+            sent: self.sent,
+        }
+    }
+
+    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+        CreateStep(carina_provider_protocol::types::CreateStep::Pending(
+            carina_provider_protocol::types::PendingCreate {
+                token,
+                identifier: None,
+                sent: self.sent,
+                poll_after_secs,
+            },
+        ))
+    }
+}
+
+/// Create typestate after the provider has observed a cloud identifier.
+#[derive(Debug)]
+pub struct IssuedCreate {
+    identifier: AppliedIdentifier,
+    sent: Sent,
+}
+
+impl IssuedCreate {
+    fn from_parts(identifier: AppliedIdentifier, sent: Sent) -> Self {
+        Self { identifier, sent }
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        &self.identifier
+    }
+
+    pub fn canonicalize(self, identifier: AppliedIdentifier) -> FinishingCreate {
+        FinishingCreate {
+            identifier,
+            sent: self.sent,
+        }
+    }
+
+    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+        CreateStep(carina_provider_protocol::types::CreateStep::Pending(
+            carina_provider_protocol::types::PendingCreate {
+                token,
+                identifier: Some(self.identifier),
+                sent: self.sent,
+                poll_after_secs,
+            },
+        ))
+    }
+
+    pub fn succeeded<T>(self, attributes: HashMap<String, Value>) -> CreateStep<T> {
+        CreateStep(carina_provider_protocol::types::CreateStep::Success {
+            identifier: self.identifier,
+            attributes,
+        })
+    }
+
+    pub fn partial<T>(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+    ) -> CreateStep<T> {
+        CreateStep(
+            carina_provider_protocol::types::CreateStep::PartialSuccess {
+                identifier: self.identifier,
+                attributes,
+                diagnostic,
+            },
+        )
+    }
+
+    pub fn failed(
+        self,
+        observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
+        error: ProviderError,
+    ) -> CreateVerdict {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
+            carina_provider_protocol::types::CreatedFailure {
+                identifier: self.identifier,
+                observation,
+                sent: self.sent,
+                error,
+            },
+        ))
+    }
+
+    pub fn discarded(self, error: ProviderError) -> CreateVerdict {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
+            error,
+        ))
+    }
+}
+
+/// Canonicalized issued create. Canonicalization deliberately removes the
+/// ability to return to pending.
+#[derive(Debug)]
+pub struct FinishingCreate {
+    identifier: AppliedIdentifier,
+    sent: Sent,
+}
+
+impl FinishingCreate {
+    pub fn succeeded<T>(self, attributes: HashMap<String, Value>) -> CreateStep<T> {
+        CreateStep(carina_provider_protocol::types::CreateStep::Success {
+            identifier: self.identifier,
+            attributes,
+        })
+    }
+
+    pub fn partial<T>(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+    ) -> CreateStep<T> {
+        CreateStep(
+            carina_provider_protocol::types::CreateStep::PartialSuccess {
+                identifier: self.identifier,
+                attributes,
+                diagnostic,
+            },
+        )
+    }
+
+    pub fn failed(
+        self,
+        observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
+        error: ProviderError,
+    ) -> CreateVerdict {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
+            carina_provider_protocol::types::CreatedFailure {
+                identifier: self.identifier,
+                observation,
+                sent: self.sent,
+                error,
+            },
+        ))
+    }
+
+    pub fn discarded(self, error: ProviderError) -> CreateVerdict {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
+            error,
+        ))
+    }
+}
+
+/// Resume typestate for a persisted create without an identifier.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::ResumeAttempt;
+///
+/// let _ = ResumeAttempt::new();
+/// ```
+#[derive(Debug)]
+pub struct ResumeAttempt(());
+
+impl ResumeAttempt {
+    fn new() -> Self {
+        Self(())
+    }
+
+    pub fn untracked(self, error: ProviderError) -> ResumeVerdict {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Untracked(
+            error,
+        ))
+    }
+
+    pub fn undetermined(self, error: ProviderError) -> ResumeVerdict {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Undetermined(error))
+    }
+
+    pub fn issued(self, identifier: AppliedIdentifier) -> ResumedCreate {
+        ResumedCreate { identifier }
+    }
+
+    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+        ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
+            carina_provider_protocol::types::ResumePending {
+                token,
+                identifier: None,
+                poll_after_secs,
+            },
+        ))
+    }
+
+    pub fn resend(self) -> CreateAttempt {
+        CreateAttempt::new()
+    }
+}
+
+/// A successful read with the absence case eliminated. It can only be
+/// obtained by consuming [`ReadOutcome::Found`].
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::FoundRead;
+/// use std::collections::HashMap;
+///
+/// let _ = FoundRead { attributes: HashMap::new() };
+/// ```
+#[derive(Debug)]
+pub struct FoundRead {
+    attributes: HashMap<String, Value>,
+}
+
+impl FoundRead {
+    /// Narrow an already-found read by taking its success payload directly.
+    pub fn from_applied_state(state: AppliedState) -> Self {
+        Self {
+            attributes: state.attributes,
+        }
+    }
+}
+
+impl TryFrom<ReadOutcome> for FoundRead {
+    type Error = ReadOutcome;
+
+    fn try_from(outcome: ReadOutcome) -> Result<Self, Self::Error> {
+        match outcome {
+            ReadOutcome::Found { state } => Ok(Self::from_applied_state(state)),
+            ReadOutcome::NotFound { id } => Err(ReadOutcome::NotFound { id }),
+        }
+    }
+}
+
+/// Resume typestate for a persisted create with an identifier.
+#[derive(Debug)]
+pub struct ResumedCreate {
+    identifier: AppliedIdentifier,
+}
+
+impl ResumedCreate {
+    fn new(identifier: AppliedIdentifier) -> Self {
+        Self { identifier }
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        &self.identifier
+    }
+
+    pub fn canonicalize(self, identifier: AppliedIdentifier) -> FinishingResume {
+        FinishingResume { identifier }
+    }
+
+    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+        ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
+            carina_provider_protocol::types::ResumePending {
+                token,
+                identifier: Some(self.identifier),
+                poll_after_secs,
+            },
+        ))
+    }
+
+    pub fn completed<T>(self, read: FoundRead) -> ResumeStep<T> {
+        ResumeStep(carina_provider_protocol::types::ResumeStep::Completed {
+            identifier: self.identifier,
+            attributes: read.attributes,
+        })
+    }
+
+    pub fn failed(
+        self,
+        observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
+        error: ProviderError,
+    ) -> ResumeVerdict {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
+            carina_provider_protocol::types::ResumedFailure {
+                identifier: self.identifier,
+                observation,
+                error,
+            },
+        ))
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeVerdict {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
+            error,
+        ))
+    }
+}
+
+/// Canonicalized resumed create. It cannot return to pending.
+#[derive(Debug)]
+pub struct FinishingResume {
+    identifier: AppliedIdentifier,
+}
+
+impl FinishingResume {
+    pub fn completed<T>(self, read: FoundRead) -> ResumeStep<T> {
+        ResumeStep(carina_provider_protocol::types::ResumeStep::Completed {
+            identifier: self.identifier,
+            attributes: read.attributes,
+        })
+    }
+
+    pub fn failed(
+        self,
+        observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
+        error: ProviderError,
+    ) -> ResumeVerdict {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
+            carina_provider_protocol::types::ResumedFailure {
+                identifier: self.identifier,
+                observation,
+                error,
+            },
+        ))
+    }
+
+    pub fn discarded(self, error: ProviderError) -> ResumeVerdict {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
+            error,
+        ))
+    }
+}
+
+/// Typestate and provider-owned token passed to a create poll.
+#[derive(Debug)]
+pub enum Poll<T> {
+    Unissued(PollAttempt, T),
+    Issued(IssuedCreate, T),
+}
+
+/// Typestate and provider-owned token passed to a persisted create resume.
+#[derive(Debug)]
+pub enum Resume<T> {
+    Unissued(ResumeAttempt, T),
+    Issued(ResumedCreate, T),
+}
+
+pub type ProtocolCreateStep<T> = carina_provider_protocol::types::CreateStep<
+    HashMap<String, Value>,
+    carina_provider_protocol::types::PartialReadDiagnostic,
+    T,
+>;
+
+/// SDK result of one create step. Its private field keeps identifier-bearing
+/// outcomes reachable only through an issued typestate handle.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{CreateStep, types::{AppliedIdentifier, Value}};
+/// use std::collections::HashMap;
+///
+/// fn bypass(identifier: AppliedIdentifier) -> CreateStep<()> {
+///     CreateStep::Success {
+///         identifier,
+///         attributes: HashMap::<String, Value>::new(),
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct CreateStep<T>(ProtocolCreateStep<T>);
+
+impl<T> CreateStep<T> {
+    fn into_protocol(self) -> ProtocolCreateStep<T> {
+        self.0
+    }
+}
+
+pub type ProtocolCreateVerdict =
+    carina_provider_protocol::types::CreateVerdict<ReadOutcome, ProviderError>;
+pub type ProtocolPollVerdict =
+    carina_provider_protocol::types::PollVerdict<ReadOutcome, ProviderError>;
+pub type ProtocolResumeVerdict =
+    carina_provider_protocol::types::ResumeVerdict<ReadOutcome, ProviderError>;
+
+/// SDK verdict from the initial create call.
+///
+/// Plain operation errors do not convert into a create verdict, so provider
+/// code must explicitly classify every failure through its typestate handle.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{CreateVerdict, types::{ProviderError, ProviderErrorKind}};
+///
+/// fn classify() -> Result<(), CreateVerdict> {
+///     Err::<(), ProviderError>(ProviderError {
+///         kind: ProviderErrorKind::Internal,
+///         message: "failed".to_string(),
+///         resource_id: None,
+///         cause: None,
+///         provider_name: None,
+///         operation: None,
+///         status: None,
+///         code: None,
+///         request_id: None,
+///     })?;
+///     Ok(())
+/// }
+/// ```
+///
+/// A raw verdict variant cannot bypass the SDK facade either:
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{CreateVerdict, types::ProviderError};
+///
+/// fn bypass(error: ProviderError) -> CreateVerdict {
+///     CreateVerdict::Untracked(error)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct CreateVerdict(ProtocolCreateVerdict);
+
+impl CreateVerdict {
+    fn into_protocol(self) -> ProtocolCreateVerdict {
+        self.0
+    }
+}
+
+/// SDK verdict from polling a create.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PollVerdict, ProtocolPollVerdict};
+///
+/// fn bypass(raw: ProtocolPollVerdict) -> PollVerdict {
+///     PollVerdict(raw)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct PollVerdict(ProtocolPollVerdict);
+
+impl PollVerdict {
+    fn into_protocol(self) -> ProtocolPollVerdict {
+        self.0
+    }
+}
+
+impl From<CreateVerdict> for PollVerdict {
+    fn from(verdict: CreateVerdict) -> Self {
+        Self(verdict.0.into())
+    }
+}
+
+pub type ProtocolResumeStep<T> = carina_provider_protocol::types::ResumeStep<
+    HashMap<String, Value>,
+    carina_provider_protocol::types::PartialReadDiagnostic,
+    T,
+>;
+
+/// SDK result of one resumed-create step.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{ProtocolResumeStep, ResumeStep};
+///
+/// fn bypass(raw: ProtocolResumeStep<()>) -> ResumeStep<()> {
+///     ResumeStep(raw)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ResumeStep<T>(ProtocolResumeStep<T>);
+
+impl<T> ResumeStep<T> {
+    fn into_protocol(self) -> ProtocolResumeStep<T> {
+        self.0
+    }
+}
+
+impl<T> From<CreateStep<T>> for ResumeStep<T> {
+    fn from(step: CreateStep<T>) -> Self {
+        Self(step.0.into())
+    }
+}
+
+/// SDK verdict from resuming a persisted create.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{ProtocolResumeVerdict, ResumeVerdict};
+///
+/// fn bypass(raw: ProtocolResumeVerdict) -> ResumeVerdict {
+///     ResumeVerdict(raw)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ResumeVerdict(ProtocolResumeVerdict);
+
+impl ResumeVerdict {
+    fn into_protocol(self) -> ProtocolResumeVerdict {
+        self.0
+    }
+}
+
+impl From<CreateVerdict> for ResumeVerdict {
+    fn from(verdict: CreateVerdict) -> Self {
+        Self(verdict.0.into())
+    }
 }
 
 /// SDK result of one update step.
@@ -214,7 +767,8 @@ pub trait CarinaProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError>;
+        attempt: CreateAttempt,
+    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict>;
 
     /// Perform one short poll step for a pending create operation.
     ///
@@ -224,8 +778,16 @@ pub trait CarinaProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-        pending: Pending<Self::CreateToken>,
-    ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError>;
+        poll: Poll<Self::CreateToken>,
+    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict>;
+
+    /// Continue a create operation loaded from state.
+    fn resume_create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+        resume: Resume<Self::CreateToken>,
+    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict>;
 
     /// Perform one short update step.
     ///
@@ -345,391 +907,59 @@ pub trait CarinaProvider {
     }
 }
 
-/// Start the JSON-RPC server loop.
-///
-/// Reads JSON-RPC requests from stdin (one per line), dispatches to the
-/// provider, and writes JSON-RPC responses to stdout (one per line).
-///
-/// Call this from `main()`:
-/// ```ignore
-/// fn main() {
-///     carina_plugin_sdk::run(MyProvider::default());
-/// }
-/// ```
-pub fn run(mut provider: impl CarinaProvider) {
-    let operation_configs = operation_config_map(provider.schemas());
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = stdin.lock();
-    let mut writer = stdout.lock();
-
-    // Send ready notification
-    let ready = Notification::ready();
-    let ready_json = serde_json::to_string(&ready).expect("Failed to serialize ready");
-    writeln!(writer, "{ready_json}").expect("Failed to write ready");
-    writer.flush().expect("Failed to flush");
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF — host closed stdin
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Failed to read stdin: {e}");
-                break;
-            }
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let request: Request = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Failed to parse JSON-RPC request: {e}");
-                continue;
-            }
-        };
-
-        let response = dispatch(&mut provider, &operation_configs, &request);
-
-        let resp_json = serde_json::to_string(&response).expect("Failed to serialize response");
-        writeln!(writer, "{resp_json}").expect("Failed to write response");
-        writer.flush().expect("Failed to flush");
-
-        // Exit after shutdown
-        if request.method == "shutdown" {
-            break;
-        }
-    }
-}
-
-fn operation_config_map(schemas: Vec<ResourceSchema>) -> HashMap<String, OperationConfig> {
-    schemas
-        .into_iter()
-        .map(|schema| {
-            (
-                schema.resource_type,
-                schema.operation_config.unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-fn operation_budget(
-    operation_configs: &HashMap<String, OperationConfig>,
+/// Fixed guest-transport seam for an initial create. This is a free function,
+/// not an overridable provider method, so only SDK glue can mint the attempt.
+pub fn dispatch_create<P: CarinaProvider + ?Sized>(
+    provider: &P,
     id: &ResourceId,
-    kind: carina_provider_protocol::OperationKind,
-) -> std::time::Duration {
-    operation_configs.get(&id.resource_type).map_or(
-        carina_provider_protocol::DEFAULT_OPERATION_BUDGET,
-        |config| config.budget(kind),
-    )
+    request: CreateRequest,
+) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolCreateVerdict>> {
+    provider
+        .create(id, request, CreateAttempt::new())
+        .map(CreateStep::into_protocol)
+        .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
 
-fn operation_timeout(id: &ResourceId, operation: &'static str) -> ProviderError {
-    ProviderError {
-        kind: ProviderErrorKind::Timeout,
-        message: format!("provider {operation} operation exceeded its schema budget"),
-        resource_id: Some(id.clone()),
-        cause: None,
-        provider_name: None,
-        operation: Some(operation.to_string()),
-        status: None,
-        code: None,
-        request_id: None,
-    }
-}
-
-trait DrivenOutcome {
-    type Output;
-    type PendingState;
-
-    fn into_step(self)
-    -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState>;
-}
-
-impl<T> DrivenOutcome for CreateOutcome<T> {
-    type Output = carina_provider_protocol::CreateOutcome;
-    type PendingState = Pending<T>;
-
-    fn into_step(
-        self,
-    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
-        match self {
-            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(outcome),
-            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
-                poll_after_secs: pending.poll_after_secs,
-                pending,
-            },
-        }
-    }
-}
-
-impl<T> DrivenOutcome for UpdateOutcome<T> {
-    type Output = carina_provider_protocol::UpdateOutcome;
-    type PendingState = Pending<T>;
-
-    fn into_step(
-        self,
-    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
-        match self {
-            Self::Done(outcome) => carina_provider_protocol::OperationStep::Done(outcome),
-            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
-                poll_after_secs: pending.poll_after_secs,
-                pending,
-            },
-        }
-    }
-}
-
-impl<T> DrivenOutcome for DeleteOutcome<T> {
-    type Output = ();
-    type PendingState = Pending<T>;
-
-    fn into_step(
-        self,
-    ) -> carina_provider_protocol::OperationStep<Self::Output, Self::PendingState> {
-        match self {
-            Self::Deleted => carina_provider_protocol::OperationStep::Done(()),
-            Self::Pending(pending) => carina_provider_protocol::OperationStep::Pending {
-                poll_after_secs: pending.poll_after_secs,
-                pending,
-            },
-        }
-    }
-}
-
-fn block_on_ready<F: std::future::Future>(future: F) -> F::Output {
-    let waker = std::task::Waker::noop();
-    let mut context = std::task::Context::from_waker(waker);
-    let mut future = std::pin::pin!(future);
-    match std::future::Future::poll(future.as_mut(), &mut context) {
-        std::task::Poll::Ready(output) => output,
-        std::task::Poll::Pending => {
-            unreachable!("the blocking JSON-RPC driver only supplies ready futures")
-        }
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn drive_operation<Outcome, Initial, Poll>(
+/// Fixed guest-transport seam for polling a host-owned continuation.
+pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
+    provider: &P,
     id: &ResourceId,
-    operation: &'static str,
-    budget: std::time::Duration,
-    initial: Initial,
-    mut poll: Poll,
-) -> Result<Outcome::Output, ProviderError>
-where
-    Outcome: DrivenOutcome,
-    Initial: FnOnce() -> Result<Outcome, ProviderError>,
-    Poll: FnMut(Outcome::PendingState) -> Result<Outcome, ProviderError>,
-{
-    let outcome = block_on_ready(carina_provider_protocol::drive_pending(
-        budget,
-        async move { initial().map(DrivenOutcome::into_step) },
-        |pending| std::future::ready(poll(pending).map(DrivenOutcome::into_step)),
-        |delay| {
-            std::thread::sleep(delay);
-            std::future::ready(())
-        },
-    ))?;
-    match outcome {
-        carina_provider_protocol::DriveOutcome::Done(output) => Ok(output),
-        carina_provider_protocol::DriveOutcome::OverBudget => Err(operation_timeout(id, operation)),
-    }
+    request: CreateRequest,
+    identifier: Option<AppliedIdentifier>,
+    sent: Sent,
+    token: P::CreateToken,
+) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict>> {
+    let poll = match identifier {
+        Some(identifier) => Poll::Issued(IssuedCreate::from_parts(identifier, sent), token),
+        None => Poll::Unissued(PollAttempt::from_sent(sent), token),
+    };
+    provider
+        .poll_create(id, request, poll)
+        .map(CreateStep::into_protocol)
+        .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
 
-#[allow(clippy::result_large_err)]
-fn dispatch(
-    provider: &mut impl CarinaProvider,
-    operation_configs: &HashMap<String, OperationConfig>,
-    request: &Request,
-) -> Response {
-    let id = request.id;
-
-    match request.method.as_str() {
-        "provider_info" => {
-            let mut info = provider.info();
-            info.capabilities = provider.capabilities();
-            Response::success(id, methods::ProviderInfoResult { info })
-        }
-
-        "validate_config" => {
-            let params: methods::ValidateConfigParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            let error = provider.validate_config(&params.attributes).err();
-            Response::success(id, methods::ValidateConfigResult { error })
-        }
-
-        "schemas" => {
-            let schemas = provider.schemas();
-            Response::success(id, methods::SchemasResult { schemas })
-        }
-
-        "initialize" => {
-            let params: methods::InitializeParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            match provider.initialize(&params.attributes) {
-                Ok(()) => Response::success(id, methods::InitializeResult { ok: true }),
-                Err(e) => Response::error(id, -1, e),
-            }
-        }
-
-        "read" => {
-            let params: methods::ReadParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            match provider.read(&params.id, &params.identifier, params.request) {
-                Ok(outcome) => Response::success(id, methods::ReadResult { outcome }),
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "create" => {
-            let params: methods::CreateParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            let budget = operation_budget(
-                operation_configs,
-                &params.id,
-                carina_provider_protocol::OperationKind::Create,
-            );
-            match drive_operation(
-                &params.id,
-                "create",
-                budget,
-                || provider.create(&params.id, params.request.clone()),
-                |pending| provider.poll_create(&params.id, params.request.clone(), pending),
-            ) {
-                Ok(outcome) => Response::success(id, methods::CreateResult { outcome }),
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "update" => {
-            let params: methods::UpdateParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            let budget = operation_budget(
-                operation_configs,
-                &params.id,
-                carina_provider_protocol::OperationKind::Update,
-            );
-            match drive_operation(
-                &params.id,
-                "update",
-                budget,
-                || provider.update(&params.id, &params.identifier, params.request.clone()),
-                |pending| {
-                    provider.poll_update(
-                        &params.id,
-                        &params.identifier,
-                        params.request.clone(),
-                        pending,
-                    )
-                },
-            ) {
-                Ok(outcome) => Response::success(id, methods::UpdateResult { outcome }),
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "delete" => {
-            let params: methods::DeleteParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            let budget = operation_budget(
-                operation_configs,
-                &params.id,
-                carina_provider_protocol::OperationKind::Delete,
-            );
-            match drive_operation(
-                &params.id,
-                "delete",
-                budget,
-                || provider.delete(&params.id, &params.identifier, params.request.clone()),
-                |pending| {
-                    provider.poll_delete(
-                        &params.id,
-                        &params.identifier,
-                        params.request.clone(),
-                        pending,
-                    )
-                },
-            ) {
-                Ok(()) => Response::success(id, methods::DeleteResult { ok: true }),
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "normalize_desired" => {
-            let params: methods::NormalizeDesiredParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            match provider.normalize_desired(params.resources) {
-                Ok(resources) => {
-                    Response::success(id, methods::NormalizeDesiredResult { resources })
-                }
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "normalize_state" => {
-            let params: methods::NormalizeStateParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            match provider.normalize_state(params.states) {
-                Ok(states) => Response::success(id, methods::NormalizeStateResult { states }),
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "hydrate_read_state" => {
-            let params: methods::HydrateReadStateParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            let mut states = params.states;
-            match provider.hydrate_read_state(&mut states, &params.saved_attrs) {
-                Ok(()) => Response::success(id, methods::HydrateReadStateResult { states }),
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "shutdown" => Response::success(id, serde_json::json!({"ok": true})),
-
-        _ => Response::error(id, -32601, format!("Unknown method: {}", request.method)),
-    }
-}
-
-fn parse_params<T: serde::de::DeserializeOwned>(
-    params: &Option<serde_json::Value>,
-) -> Result<T, String> {
-    match params {
-        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("Invalid params: {e}")),
-        None => serde_json::from_value(serde_json::json!({}))
-            .map_err(|e| format!("Missing params: {e}")),
-    }
+/// Fixed guest-transport seam for resuming a state-owned continuation.
+pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
+    provider: &P,
+    id: &ResourceId,
+    request: CreateRequest,
+    identifier: Option<AppliedIdentifier>,
+    token: P::CreateToken,
+) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict>> {
+    let resume = match identifier {
+        Some(identifier) => Resume::Issued(ResumedCreate::new(identifier), token),
+        None => Resume::Unissued(ResumeAttempt::new(), token),
+    };
+    provider
+        .resume_create(id, request, resume)
+        .map(ResumeStep::into_protocol)
+        .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_provider_protocol::types::{AppliedIdentifier, AppliedState};
 
     #[test]
     fn never_token_decode_always_fails() {
@@ -740,336 +970,6 @@ mod tests {
             serde_json::from_str::<Pending<Never>>(r#"{"token":null,"poll_after_secs":1}"#,)
                 .is_err()
         );
-    }
-
-    struct PendingDispatchProvider {
-        create_polls: std::cell::Cell<usize>,
-        create_pending_polls: u8,
-        schemas: Vec<ResourceSchema>,
-    }
-
-    impl Default for PendingDispatchProvider {
-        fn default() -> Self {
-            Self {
-                create_polls: std::cell::Cell::new(0),
-                create_pending_polls: 1,
-                schemas: Vec::new(),
-            }
-        }
-    }
-
-    impl PendingDispatchProvider {
-        fn with_pending_polls_and_schemas(
-            create_pending_polls: u8,
-            schemas: Vec<ResourceSchema>,
-        ) -> Self {
-            Self {
-                create_polls: std::cell::Cell::new(0),
-                create_pending_polls,
-                schemas,
-            }
-        }
-
-        fn completed_create(id: &ResourceId) -> CreateOutcome<u8> {
-            CreateOutcome::Done(protocol::CreateOutcome::Success {
-                state: AppliedState {
-                    id: id.clone(),
-                    identifier: AppliedIdentifier::new("created")
-                        .expect("the test identifier is non-empty"),
-                    attributes: HashMap::new(),
-                },
-            })
-        }
-    }
-
-    impl CarinaProvider for PendingDispatchProvider {
-        type CreateToken = u8;
-        type UpdateToken = Never;
-        type DeleteToken = Never;
-
-        fn info(&self) -> ProviderInfo {
-            ProviderInfo {
-                name: "pending-dispatch".to_string(),
-                display_name: "Pending Dispatch".to_string(),
-                capabilities: Vec::new(),
-                version: "0.0.0".to_string(),
-            }
-        }
-
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            self.schemas.clone()
-        }
-
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
-        }
-
-        fn validate_config(&self, _attrs: &HashMap<String, Value>) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn read(
-            &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: ReadRequest,
-        ) -> Result<ReadOutcome, ProviderError> {
-            unreachable!("read is not used by this test")
-        }
-
-        fn read_data_source(&self, _resource: &Resource) -> Result<State, ProviderError> {
-            unreachable!("read_data_source is not used by this test")
-        }
-
-        fn create(
-            &self,
-            id: &ResourceId,
-            _request: CreateRequest,
-        ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError> {
-            if self.create_pending_polls == 0 {
-                return Ok(Self::completed_create(id));
-            }
-            Ok(CreateOutcome::Pending(Pending {
-                token: self.create_pending_polls,
-                poll_after_secs: 1,
-            }))
-        }
-
-        fn poll_create(
-            &self,
-            id: &ResourceId,
-            _request: CreateRequest,
-            pending: Pending<Self::CreateToken>,
-        ) -> Result<CreateOutcome<Self::CreateToken>, ProviderError> {
-            self.create_polls.set(self.create_polls.get() + 1);
-            if pending.token > 1 {
-                return Ok(CreateOutcome::Pending(Pending {
-                    token: pending.token - 1,
-                    poll_after_secs: 1,
-                }));
-            }
-            Ok(Self::completed_create(id))
-        }
-
-        fn update(
-            &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: UpdateRequest,
-        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
-            unreachable!("update is not used by this test")
-        }
-
-        fn poll_update(
-            &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: UpdateRequest,
-            pending: Pending<Self::UpdateToken>,
-        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
-            match pending.token {}
-        }
-
-        fn delete(
-            &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
-        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
-            unreachable!("delete is not used by this test")
-        }
-
-        fn poll_delete(
-            &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
-            pending: Pending<Self::DeleteToken>,
-        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
-            match pending.token {}
-        }
-
-        fn required_permissions(
-            &self,
-            _id: &ResourceId,
-            _op: PlanOp,
-        ) -> Result<Vec<String>, ProviderError> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn operation_schema(resource_type: &str, create_timeout_secs: u64) -> ResourceSchema {
-        ResourceSchema {
-            resource_type: resource_type.to_string(),
-            attributes: HashMap::new(),
-            description: None,
-            kind: types::SchemaKind::Managed,
-            unique_name: types::UniqueNameSpec::default(),
-            operation_config: Some(OperationConfig {
-                create_timeout_secs: Some(create_timeout_secs),
-                ..OperationConfig::default()
-            }),
-            validators: Vec::new(),
-            exclusive_required: Vec::new(),
-            defs: std::collections::BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn json_rpc_dispatch_drives_pending_create_to_settled_wire_outcome() {
-        let mut provider = PendingDispatchProvider::default();
-        let operation_configs = operation_config_map(provider.schemas());
-        let id = ResourceId {
-            provider: "mock".to_string(),
-            resource_type: "test.resource".to_string(),
-            identity: "one".to_string(),
-        };
-        let request = Request::new(
-            7,
-            "create",
-            methods::CreateParams {
-                id: id.clone(),
-                request: CreateRequest {
-                    resource: Resource {
-                        id,
-                        attributes: HashMap::new(),
-                        directives: protocol::Directives::default(),
-                    },
-                },
-            },
-        );
-
-        let response = dispatch(&mut provider, &operation_configs, &request);
-
-        assert!(response.error.is_none(), "{response:?}");
-        let result: methods::CreateResult = serde_json::from_value(
-            response
-                .result
-                .expect("successful response must have a result"),
-        )
-        .expect("JSON-RPC create result must retain the settled wire shape");
-        assert!(matches!(
-            result.outcome,
-            protocol::CreateOutcome::Success { .. }
-        ));
-        assert_eq!(provider.create_polls.get(), 1);
-    }
-
-    #[test]
-    fn json_rpc_dispatch_allows_create_to_settle_on_final_poll_at_deadline() {
-        let resource_type = "test.short_budget";
-        let mut provider = PendingDispatchProvider::with_pending_polls_and_schemas(
-            2,
-            vec![operation_schema(resource_type, 2)],
-        );
-        let operation_configs = operation_config_map(provider.schemas());
-        let id = ResourceId {
-            provider: "mock".to_string(),
-            resource_type: resource_type.to_string(),
-            identity: "final-deadline-poll".to_string(),
-        };
-        let request = Request::new(
-            8,
-            "create",
-            methods::CreateParams {
-                id: id.clone(),
-                request: CreateRequest {
-                    resource: Resource {
-                        id,
-                        attributes: HashMap::new(),
-                        directives: protocol::Directives::default(),
-                    },
-                },
-            },
-        );
-
-        let response = dispatch(&mut provider, &operation_configs, &request);
-
-        assert!(response.error.is_none(), "{response:?}");
-        let result: methods::CreateResult = serde_json::from_value(
-            response
-                .result
-                .expect("successful response must have a result"),
-        )
-        .expect("JSON-RPC create result must retain the settled wire shape");
-        assert!(matches!(
-            result.outcome,
-            protocol::CreateOutcome::Success { .. }
-        ));
-        assert_eq!(provider.create_polls.get(), 2);
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn schemas_configure_operation_budget_lookup_for_resource_type() {
-        let resource_type = "test.short_budget";
-        let provider = PendingDispatchProvider::with_pending_polls_and_schemas(
-            2,
-            vec![operation_schema(resource_type, 1)],
-        );
-        let operation_configs = operation_config_map(provider.schemas());
-        let id = ResourceId {
-            provider: "mock".to_string(),
-            resource_type: resource_type.to_string(),
-            identity: "over-budget".to_string(),
-        };
-        let request = CreateRequest {
-            resource: Resource {
-                id: id.clone(),
-                attributes: HashMap::new(),
-                directives: protocol::Directives::default(),
-            },
-        };
-        let budget = operation_budget(
-            &operation_configs,
-            &id,
-            carina_provider_protocol::OperationKind::Create,
-        );
-
-        assert_eq!(budget, std::time::Duration::from_secs(1));
-        let error = drive_operation::<CreateOutcome<u8>, _, _>(
-            &id,
-            "create",
-            budget,
-            || provider.create(&id, request.clone()),
-            |pending| provider.poll_create(&id, request.clone(), pending),
-        )
-        .expect_err("the schema-configured budget should expire before the second poll");
-
-        assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        assert_eq!(provider.create_polls.get(), 1);
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn json_rpc_operation_budget_includes_initial_call() {
-        let id = ResourceId {
-            provider: "mock".to_string(),
-            resource_type: "test.resource".to_string(),
-            identity: "slow-initial-call".to_string(),
-        };
-        let polls = std::cell::Cell::new(0);
-
-        let error = drive_operation::<CreateOutcome<u8>, _, _>(
-            &id,
-            "create",
-            std::time::Duration::from_millis(1),
-            || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                Ok(CreateOutcome::Pending(Pending {
-                    token: 1,
-                    poll_after_secs: 0,
-                }))
-            },
-            |pending| {
-                polls.set(polls.get() + 1);
-                Ok(CreateOutcome::Pending(pending))
-            },
-        )
-        .expect_err("the initial call should consume the whole operation budget");
-
-        assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        assert_eq!(polls.get(), 0, "an over-budget operation must not poll");
     }
 
     #[test]

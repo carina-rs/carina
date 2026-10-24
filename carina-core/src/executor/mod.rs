@@ -32,7 +32,7 @@ pub use provider_ready::{
 };
 pub use replace::compute_full_diff_patch;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -40,7 +40,9 @@ use crate::binding_index::ResolvedBindings;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{
+    CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest, InFlightCreate, ObservedCreate,
     PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer, ProviderReadyDataSource,
+    ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
 };
 use crate::resource::{
     AccessPath, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
@@ -52,6 +54,164 @@ use crate::shutdown::ShutdownToken;
 use parallel::execute_effects_sequential;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
+
+/// Dispatch an already checked create request while minting the unforgeable
+/// initial-attempt witness inside core.
+pub async fn dispatch_create<P: Provider + ?Sized>(
+    provider: &P,
+    id: &ResourceId,
+    request: CreateRequest,
+) -> Result<CreateOutcome, CreateFailure> {
+    let request_attributes: BTreeSet<_> = request
+        .resource()
+        .as_resource()
+        .attributes
+        .keys()
+        .cloned()
+        .collect();
+    match provider
+        .create(id, request, crate::provider::CreateAttempt::new(id.clone()))
+        .await
+    {
+        Ok(outcome) if outcome.id() == id => Ok(outcome),
+        Ok(_outcome) => Err(CreateFailure::untracked_at_dispatch(
+            ProviderError::internal("provider returned a create outcome for another resource")
+                .for_resource(id.clone()),
+        )),
+        Err(failure) => match failure.into_kind() {
+            CreateFailureKind::Created { created, error } => {
+                if created.id() != id {
+                    return Err(CreateFailure::untracked_at_dispatch(
+                        ProviderError::internal_caused_by(
+                            "provider returned a created failure for another resource",
+                            error,
+                        )
+                        .for_resource(id.clone()),
+                    ));
+                }
+                let (created, valid) = created.validate_request_sent(&request_attributes);
+                let error = if valid {
+                    error
+                } else {
+                    ProviderError::internal_caused_by(
+                        "provider returned sent attributes outside the checked create request",
+                        error,
+                    )
+                    .for_resource(id.clone())
+                };
+                Err(CreateFailure::created(created, error))
+            }
+            CreateFailureKind::InFlight { pending, error } => {
+                if pending.id() != id {
+                    return Err(CreateFailure::untracked_at_dispatch(
+                        ProviderError::internal_caused_by(
+                            "provider returned an in-flight create for another resource",
+                            error,
+                        )
+                        .for_resource(id.clone()),
+                    ));
+                }
+                let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
+                let error = if valid {
+                    error
+                } else {
+                    ProviderError::internal_caused_by(
+                        "provider returned sent attributes outside the checked create request",
+                        error,
+                    )
+                    .for_resource(id.clone())
+                };
+                Err(CreateFailure::in_flight(pending, error))
+            }
+            CreateFailureKind::Untracked(error) => Err(CreateFailure::untracked_at_dispatch(error)),
+        },
+    }
+}
+
+/// Dispatch a checked resume request through the same sent-attribute
+/// validation seam as an initial create.
+pub async fn dispatch_resume_create<P: Provider + ?Sized>(
+    provider: &P,
+    request: ResumeCreateRequest,
+) -> Result<ResumeOutcome, ResumeFailure> {
+    let id = request.id().clone();
+    let starting = request.pending_for_dispatch();
+    let request_attributes: BTreeSet<_> = request
+        .request()
+        .resource()
+        .as_resource()
+        .attributes
+        .keys()
+        .cloned()
+        .collect();
+    match provider.resume_create(request).await {
+        Ok(outcome) if outcome.id() == &id => Ok(outcome),
+        Ok(_outcome) => Err(starting.into_resume_failure(
+            ProviderError::internal("provider returned a resume outcome for another resource")
+                .for_resource(id),
+        )),
+        Err(failure) => match failure.into_kind() {
+            ResumeFailureKind::Created { created, error } => {
+                if created.id() != &id {
+                    return Err(starting.into_resume_failure(
+                        ProviderError::internal_caused_by(
+                            "provider returned a resumed failure for another resource",
+                            error,
+                        )
+                        .for_resource(id),
+                    ));
+                }
+                let (created, valid) = created.validate_request_sent(&request_attributes);
+                let error = if valid {
+                    error
+                } else {
+                    ProviderError::internal_caused_by(
+                        "provider returned sent attributes outside the checked create request",
+                        error,
+                    )
+                    .for_resource(id)
+                };
+                Err(ResumeFailure::created(created, error))
+            }
+            ResumeFailureKind::InFlight { pending, error } => {
+                if pending.id() != &id {
+                    return Err(starting.into_resume_failure(
+                        ProviderError::internal_caused_by(
+                            "provider returned a resumed continuation for another resource",
+                            error,
+                        )
+                        .for_resource(id),
+                    ));
+                }
+                let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
+                let error = if valid {
+                    error
+                } else {
+                    ProviderError::internal_caused_by(
+                        "provider returned sent attributes outside the checked create request",
+                        error,
+                    )
+                    .for_resource(id)
+                };
+                Err(ResumeFailure::in_flight(pending, error))
+            }
+            ResumeFailureKind::Ended(error) => Err(ResumeFailure::ended_from_verdict(error)),
+        },
+    }
+}
+
+/// Provenance-preserving result of one effect. State writeback must classify
+/// every arm explicitly instead of treating every state-shaped value alike.
+#[derive(Debug)]
+pub enum Applied {
+    Complete(State),
+    Observed(ObservedCreate),
+    CreateInFlight(InFlightCreate),
+    CreateEnded,
+    Imported(State),
+    DataSource(State),
+    WaitSnapshot(State),
+}
 
 /// Input data required to execute a plan.
 pub struct ExecutionInput<'a> {
@@ -317,7 +477,7 @@ pub struct ExecutionResult {
     pub partial_count: usize,
     pub partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub skip_count: usize,
-    pub applied_states: std::collections::HashMap<ResourceId, State>,
+    pub applied_states: std::collections::HashMap<ResourceId, Applied>,
     pub runtime_synthesized_resources: Vec<ResolvedResource>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,

@@ -185,8 +185,9 @@ async fn write_then_read_state_round_trips() {
         "aws",
         "s3.Bucket",
         "aws_s3_bucket_a3f2b1c8",
-        "my-state-bucket",
-    );
+        carina_core::provider::AppliedIdentifier::new("my-state-bucket").unwrap(),
+    )
+    .unwrap();
     written.increment_serial();
     written.increment_serial();
     assert_eq!(
@@ -235,7 +236,8 @@ async fn write_then_read_state_round_trips() {
         "the round-tripped resource must keep its type",
     );
     assert_eq!(
-        read_res.identifier, written_res.identifier,
+        read_res.identifier(),
+        written_res.identifier(),
         "the round-tripped resource must keep its identifier",
     );
     assert_eq!(

@@ -130,7 +130,8 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, carina_core::provider::CreateFailure>> {
         let id = id.clone();
         Box::pin(async move {
             let mut attrs = HashMap::new();
@@ -144,11 +145,25 @@ impl Provider for MockProvider {
                 "id".to_string(),
                 Value::Concrete(ConcreteValue::String("id-123".into())),
             );
-            Ok(CreateOutcome::Success {
-                state: AppliedState::new(id, "id-123", attrs)
-                    .expect("fixture identifier is non-empty"),
-            })
+            let identifier =
+                AppliedIdentifier::new("id-123").expect("fixture identifier is non-empty");
+            Ok(attempt
+                .issued(
+                    identifier,
+                    carina_core::provider::Sent::AllRequestAttributes,
+                )
+                .succeeded(attrs))
         })
+    }
+
+    fn resume_create(
+        &self,
+        _request: carina_core::provider::ResumeCreateRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+    > {
+        Box::pin(async { panic!("unexpected resume_create") })
     }
 
     fn update(

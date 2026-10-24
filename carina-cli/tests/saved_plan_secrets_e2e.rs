@@ -278,14 +278,15 @@ fn provider_resources_mut(provider: &mut Value) -> &mut serde_json::Map<String, 
 }
 
 fn state_resource_by_name<'a>(state: &'a Value, name: &str) -> &'a Value {
-    state["resources"]
+    let resource = state["resources"]
         .as_array()
         .expect("state resources array")
         .iter()
         .find(|resource| {
-            resource.pointer("/attributes/name") == Some(&Value::String(name.to_string()))
+            resource.pointer("/current/attributes/name") == Some(&Value::String(name.to_string()))
         })
-        .unwrap_or_else(|| panic!("Carina state has no resource named {name}: {state:#}"))
+        .unwrap_or_else(|| panic!("Carina state has no resource named {name}: {state:#}"));
+    &resource["current"]
 }
 
 fn plan_resource_by_name<'a>(plan: &'a Value, name: &str) -> &'a Value {
@@ -1163,7 +1164,7 @@ let item = mock.test.resource {
         .and_then(|resources| resources.first())
         .expect("CBD state row");
     assert_eq!(row["identity"], "item");
-    assert_secret_hash(&row["attributes"]["comment"]);
+    assert_secret_hash(&row["current"]["attributes"]["comment"]);
 }
 
 #[test]
@@ -1430,15 +1431,16 @@ mock.test.resource {{
         .to_string();
     let reconciled_identity = "state_preserved_anonymous_identity_3861";
     state["resources"][0]["identity"] = Value::String(reconciled_identity.to_string());
-    state["resources"][0]["attributes"]["comment"] = PersistedValue::encode_provider_value(
-        &CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into()),
-        )))),
-        None,
-    )
-    .expect("rehash state secret for the reconciled identity")
-    .as_json()
-    .clone();
+    state["resources"][0]["current"]["attributes"]["comment"] =
+        PersistedValue::encode_provider_value(
+            &CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+                ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into()),
+            )))),
+            None,
+        )
+        .expect("rehash state secret for the reconciled identity")
+        .as_json()
+        .clone();
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&state).expect("serialize reconciled state"),

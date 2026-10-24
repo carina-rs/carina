@@ -134,16 +134,31 @@ impl Provider for NoopProvider {
     }
     fn create(
         &self,
-        id: &carina_core::resource::ResourceId,
+        _id: &carina_core::resource::ResourceId,
         _request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-        let id = id.clone();
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+    > {
         Box::pin(async move {
-            Ok(carina_core::provider::CreateOutcome::Success {
-                state: carina_core::provider::AppliedState::new(id, "mock-id", HashMap::new())
-                    .expect("fixture identifier is non-empty"),
-            })
+            Ok(attempt
+                .issued(
+                    carina_core::provider::AppliedIdentifier::new("mock-id")
+                        .expect("fixture identifier is non-empty"),
+                    carina_core::provider::Sent::AllRequestAttributes,
+                )
+                .succeeded(HashMap::new()))
         })
+    }
+    fn resume_create(
+        &self,
+        _request: carina_core::provider::ResumeCreateRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+    > {
+        Box::pin(async { panic!("validation fixture never resumes a create") })
     }
     fn update(
         &self,

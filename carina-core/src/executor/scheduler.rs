@@ -11,8 +11,14 @@ use super::parallel::apply_deferred_replace_delete_deps;
 use super::wait::SKIP_REASON_CANCELLED;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 use crate::effect::deps::{
-    ScheduleInputs, build_effect_dependency_analysis, relax_update_update_edges,
+    ScheduleInputs, UnresolvedRequiredDependency, build_effect_dependency_analysis,
+    relax_update_update_edges,
 };
+
+pub(super) struct SchedulerDeps {
+    pub(super) deps_of: HashMap<usize, HashSet<usize>>,
+    pub(super) unresolved: Vec<UnresolvedRequiredDependency>,
+}
 
 pub(super) struct PureMetaStep<'a> {
     effect: &'a Effect,
@@ -38,6 +44,7 @@ impl<'a> PureMetaStep<'a> {
                 template: payload.template.as_ref(),
             }),
             Effect::Create(_)
+            | Effect::ResumeCreate { .. }
             | Effect::Update { .. }
             | Effect::Delete { .. }
             | Effect::Wait { .. }
@@ -89,17 +96,23 @@ pub(super) fn build_scheduler_deps(
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
     deferred_replace_delete_deps: &[(usize, usize)],
-) -> HashMap<usize, HashSet<usize>> {
-    let mut analysis = build_effect_dependency_analysis(
+) -> SchedulerDeps {
+    let (mut analysis, unresolved) = match build_effect_dependency_analysis(
         effects,
         unresolved_resources,
         compositions,
         ScheduleInputs::Apply,
-    );
+    ) {
+        Ok(analysis) => (analysis, Vec::new()),
+        Err(failure) => failure.into_parts(),
+    };
     relax_update_update_edges(effects, &mut analysis);
     let mut deps_of = analysis.into_deps_of();
     apply_deferred_replace_delete_deps(effects, &mut deps_of, deferred_replace_delete_deps);
-    deps_of
+    SchedulerDeps {
+        deps_of,
+        unresolved,
+    }
 }
 
 /// Format the user-facing skip reason for a non-Wait effect whose

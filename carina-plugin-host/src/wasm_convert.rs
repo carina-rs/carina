@@ -5,10 +5,12 @@ use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
-    AppliedState as CoreAppliedState, CreateOutcome as CoreCreateOutcome,
-    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
-    PatchOp as CorePatchOp, PatchOpKind as CorePatchOpKind, ProviderError as CoreProviderError,
-    ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    AppliedState as CoreAppliedState, CreateRequest as CoreCreateRequest,
+    DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
+    PartialReadDiagnostic as CorePartialReadDiagnostic, PatchOp as CorePatchOp,
+    PatchOpKind as CorePatchOpKind, PendingCreate as CorePendingCreate,
+    ProviderError as CoreProviderError, ReadOutcome as CoreReadOutcome,
+    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
     UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
     UpdateRequest as CoreUpdateRequest,
 };
@@ -1114,6 +1116,7 @@ pub(crate) fn wit_to_core_read_outcome(
     }
 }
 
+#[derive(Clone)]
 struct PendingToken(String);
 
 impl fmt::Debug for PendingToken {
@@ -1122,7 +1125,7 @@ impl fmt::Debug for PendingToken {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PendingOperation {
     token: PendingToken,
     poll_after_secs: u32,
@@ -1156,18 +1159,7 @@ impl PendingOperation {
     }
 }
 
-pub(crate) struct CreatePendingOperation(PendingOperation);
-
-impl CreatePendingOperation {
-    pub(crate) fn poll_after_secs(&self) -> u32 {
-        self.0.poll_after_secs()
-    }
-
-    pub(crate) fn into_wit(self) -> wit::PendingOperation {
-        self.0.into_wit()
-    }
-}
-
+#[derive(Clone)]
 pub(crate) struct UpdatePendingOperation(PendingOperation);
 
 impl UpdatePendingOperation {
@@ -1180,6 +1172,7 @@ impl UpdatePendingOperation {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DeletePendingOperation(PendingOperation);
 
 impl DeletePendingOperation {
@@ -1192,9 +1185,61 @@ impl DeletePendingOperation {
     }
 }
 
-pub(crate) enum WasmCreateOutcome {
-    Done(Box<CoreCreateOutcome>),
-    Pending(CreatePendingOperation),
+pub(crate) type DecodedCreateStep =
+    proto::CreateStep<HashMap<String, CoreValue>, CorePartialReadDiagnostic, proto::PendingToken>;
+pub(crate) type DecodedCreateVerdict = proto::CreateVerdict<CoreReadOutcome, CoreProviderError>;
+pub(crate) type DecodedPollVerdict = proto::PollVerdict<CoreReadOutcome, CoreProviderError>;
+pub(crate) type DecodedResumeStep =
+    proto::ResumeStep<HashMap<String, CoreValue>, CorePartialReadDiagnostic, proto::PendingToken>;
+pub(crate) type DecodedResumeVerdict = proto::ResumeVerdict<CoreReadOutcome, CoreProviderError>;
+type DecodedCreatedState = DecodedIssued<(proto::AppliedIdentifier, HashMap<String, CoreValue>)>;
+
+/// Result of decoding a create-bearing WIT value after its provider
+/// identifier may have become known.
+///
+/// `Err` is reserved for values that never yielded a valid identifier. Once
+/// the identifier decodes, malformed attributes or observations can only
+/// become `CreatedReadFailed`, so callers cannot accidentally downgrade the
+/// resource to an untracked create.
+#[derive(Debug)]
+pub(crate) enum DecodedIssued<T> {
+    Decoded(T),
+    CreatedReadFailed(CreatedReadDecodeFailure),
+}
+
+impl<T> DecodedIssued<T> {
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> DecodedIssued<U> {
+        match self {
+            Self::Decoded(value) => DecodedIssued::Decoded(map(value)),
+            Self::CreatedReadFailed(failure) => DecodedIssued::CreatedReadFailed(failure),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CreatedReadDecodeFailure {
+    identifier: proto::AppliedIdentifier,
+    sent: Option<proto::Sent>,
+    declared_error: Option<CoreProviderError>,
+    decode_error: WasmAppliedStateDecodeError,
+}
+
+impl CreatedReadDecodeFailure {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        proto::AppliedIdentifier,
+        Option<proto::Sent>,
+        Option<CoreProviderError>,
+        WasmAppliedStateDecodeError,
+    ) {
+        (
+            self.identifier,
+            self.sent,
+            self.declared_error,
+            self.decode_error,
+        )
+    }
 }
 
 pub(crate) enum WasmUpdateOutcome {
@@ -1207,41 +1252,328 @@ pub(crate) enum WasmDeleteOutcome {
     Pending(DeletePendingOperation),
 }
 
-pub(crate) fn wit_to_core_create_outcome(
-    outcome: wit::CreateOutcome,
+fn wit_to_core_sent(sent: wit::SentAttributes) -> proto::Sent {
+    match sent {
+        wit::SentAttributes::All => proto::Sent::AllRequestAttributes,
+        wit::SentAttributes::Only(attributes) => proto::Sent::only(attributes),
+    }
+}
+
+fn decode_create_identifier(
+    identifier: String,
     id: &CoreResourceId,
-) -> Result<WasmCreateOutcome, WasmAppliedStateDecodeError> {
-    match outcome {
-        wit::CreateOutcome::Success(state) => Ok(WasmCreateOutcome::Done(Box::new(
-            CoreCreateOutcome::Success {
-                state: wit_to_core_applied_state_for_operation(
-                    state,
-                    id,
-                    AppliedStateOperation::Create,
-                )?,
-            },
-        ))),
-        wit::CreateOutcome::PartialSuccess(partial) => {
+) -> Result<proto::AppliedIdentifier, WasmAppliedStateDecodeError> {
+    proto::AppliedIdentifier::new(identifier).map_err(|source| {
+        WasmAppliedStateDecodeError::identifier(AppliedStateOperation::Create, id, source)
+    })
+}
+
+fn decode_created_attributes(
+    state: wit::AppliedState,
+    id: &CoreResourceId,
+    sent: Option<proto::Sent>,
+    declared_error: Option<CoreProviderError>,
+) -> Result<DecodedCreatedState, WasmAppliedStateDecodeError> {
+    let wit::AppliedState {
+        identifier,
+        attributes,
+    } = state;
+    let identifier = decode_create_identifier(identifier, id)?;
+    match wit_to_core_value_map(&attributes) {
+        Ok(attributes) => Ok(DecodedIssued::Decoded((identifier, attributes))),
+        Err(source) => Ok(DecodedIssued::CreatedReadFailed(CreatedReadDecodeFailure {
+            identifier,
+            sent,
+            declared_error,
+            decode_error: WasmAppliedStateDecodeError::attributes(
+                AppliedStateOperation::Create,
+                id,
+                source,
+            ),
+        })),
+    }
+}
+
+pub(crate) fn core_to_wit_pending_create(pending: &CorePendingCreate) -> wit::PendingCreate {
+    core_to_wit_pending_create_parts(
+        pending.token(),
+        pending.identifier(),
+        pending.sent(),
+        pending.poll_after_secs(),
+    )
+}
+
+pub(crate) fn core_to_wit_pending_create_parts(
+    token: &proto::PendingToken,
+    identifier: Option<&proto::AppliedIdentifier>,
+    sent: &proto::Sent,
+    poll_after_secs: u32,
+) -> wit::PendingCreate {
+    let sent = match sent {
+        proto::Sent::AllRequestAttributes => wit::SentAttributes::All,
+        proto::Sent::Only(attributes) => {
+            wit::SentAttributes::Only(attributes.iter().cloned().collect())
+        }
+    };
+    wit::PendingCreate {
+        operation: wit::PendingOperation {
+            token: token.expose_for_provider_call().to_string(),
+            poll_after_secs,
+        },
+        identifier: identifier.map(ToString::to_string),
+        sent,
+    }
+}
+
+pub(crate) fn core_to_wit_resume_pending(
+    token: &proto::PendingToken,
+    identifier: Option<&proto::AppliedIdentifier>,
+) -> wit::ResumePending {
+    wit::ResumePending {
+        operation: wit::PendingOperation {
+            token: token.expose_for_provider_call().to_string(),
+            poll_after_secs: 1,
+        },
+        identifier: identifier.map(ToString::to_string),
+    }
+}
+
+fn wit_to_core_pending_create(
+    pending: wit::PendingCreate,
+    id: &CoreResourceId,
+) -> Result<proto::PendingCreate<proto::PendingToken>, WasmAppliedStateDecodeError> {
+    let wit::PendingCreate {
+        operation,
+        identifier,
+        sent,
+    } = pending;
+    let wit::PendingOperation {
+        token,
+        poll_after_secs,
+    } = operation;
+    let identifier = identifier
+        .map(|identifier| decode_create_identifier(identifier, id))
+        .transpose()?;
+    Ok(proto::PendingCreate {
+        token: proto::PendingToken::new(token),
+        identifier,
+        sent: wit_to_core_sent(sent),
+        poll_after_secs,
+    })
+}
+
+fn wit_to_core_observation(
+    observation: wit::Observation,
+    id: &CoreResourceId,
+) -> Result<proto::Observation<CoreReadOutcome, CoreProviderError>, WasmAppliedStateDecodeError> {
+    match observation {
+        wit::Observation::Read(read) => {
+            wit_to_core_read_outcome(read, id).map(proto::Observation::Read)
+        }
+        wit::Observation::ReadFailed(error) => Ok(proto::Observation::ReadFailed(
+            wit_to_core_provider_error(error),
+        )),
+    }
+}
+
+pub(crate) fn wit_to_core_create_step(
+    step: wit::CreateStep,
+    id: &CoreResourceId,
+) -> Result<DecodedIssued<DecodedCreateStep>, WasmAppliedStateDecodeError> {
+    match step {
+        wit::CreateStep::Success(state) => {
+            decode_created_attributes(state, id, Some(proto::Sent::AllRequestAttributes), None).map(
+                |decoded| {
+                    decoded.map(|(identifier, attributes)| proto::CreateStep::Success {
+                        identifier,
+                        attributes,
+                    })
+                },
+            )
+        }
+        wit::CreateStep::PartialSuccess(partial) => {
             let wit::CreatePartialSuccess { state, diagnostic } = partial;
             let wit::PartialReadDiagnostic {
                 reason,
                 missing_attributes,
             } = diagnostic;
-            Ok(WasmCreateOutcome::Done(Box::new(
-                CoreCreateOutcome::partial_success(
-                    wit_to_core_applied_state_for_operation(
-                        state,
-                        id,
-                        AppliedStateOperation::Create,
-                    )?,
-                    reason,
-                    missing_attributes,
-                ),
+            decode_created_attributes(state, id, Some(proto::Sent::AllRequestAttributes), None).map(
+                |decoded| {
+                    decoded.map(|(identifier, attributes)| {
+                        match CorePartialReadDiagnostic::new(reason, missing_attributes) {
+                            Some(diagnostic) => proto::CreateStep::PartialSuccess {
+                                identifier,
+                                attributes,
+                                diagnostic,
+                            },
+                            None => proto::CreateStep::Success {
+                                identifier,
+                                attributes,
+                            },
+                        }
+                    })
+                },
+            )
+        }
+        wit::CreateStep::Pending(pending) => wit_to_core_pending_create(pending, id)
+            .map(proto::CreateStep::Pending)
+            .map(DecodedIssued::Decoded),
+    }
+}
+
+fn wit_to_core_created_failure(
+    created: wit::CreatedFailure,
+    id: &CoreResourceId,
+) -> Result<
+    DecodedIssued<proto::CreatedFailure<CoreReadOutcome, CoreProviderError>>,
+    WasmAppliedStateDecodeError,
+> {
+    let wit::CreatedFailure {
+        identifier,
+        read,
+        sent,
+        error,
+    } = created;
+    let identifier = decode_create_identifier(identifier, id)?;
+    let sent = wit_to_core_sent(sent);
+    let error = wit_to_core_provider_error(error);
+    match wit_to_core_observation(read, id) {
+        Ok(observation) => Ok(DecodedIssued::Decoded(proto::CreatedFailure {
+            identifier,
+            observation,
+            sent,
+            error,
+        })),
+        Err(decode_error) => Ok(DecodedIssued::CreatedReadFailed(CreatedReadDecodeFailure {
+            identifier,
+            sent: Some(sent),
+            declared_error: Some(error),
+            decode_error,
+        })),
+    }
+}
+
+pub(crate) fn wit_to_core_create_verdict(
+    verdict: wit::CreateVerdict,
+    id: &CoreResourceId,
+) -> Result<DecodedIssued<DecodedCreateVerdict>, WasmAppliedStateDecodeError> {
+    match verdict {
+        wit::CreateVerdict::Untracked(error) => Ok(DecodedIssued::Decoded(
+            proto::CreateVerdict::Untracked(wit_to_core_provider_error(error)),
+        )),
+        wit::CreateVerdict::Created(created) => wit_to_core_created_failure(created, id)
+            .map(|decoded| decoded.map(proto::CreateVerdict::Created)),
+        wit::CreateVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
+            proto::CreateVerdict::Discarded(wit_to_core_provider_error(error)),
+        )),
+    }
+}
+
+pub(crate) fn wit_to_core_poll_verdict(
+    verdict: wit::PollVerdict,
+    id: &CoreResourceId,
+) -> Result<DecodedIssued<DecodedPollVerdict>, WasmAppliedStateDecodeError> {
+    match verdict {
+        wit::PollVerdict::Untracked(error) => Ok(DecodedIssued::Decoded(
+            proto::PollVerdict::Untracked(wit_to_core_provider_error(error)),
+        )),
+        wit::PollVerdict::Created(created) => wit_to_core_created_failure(created, id)
+            .map(|decoded| decoded.map(proto::PollVerdict::Created)),
+        wit::PollVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
+            proto::PollVerdict::Discarded(wit_to_core_provider_error(error)),
+        )),
+        wit::PollVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
+            proto::PollVerdict::Undetermined(wit_to_core_provider_error(error)),
+        )),
+    }
+}
+
+pub(crate) fn wit_to_core_resume_step(
+    step: wit::ResumeStep,
+    id: &CoreResourceId,
+) -> Result<DecodedIssued<DecodedResumeStep>, WasmAppliedStateDecodeError> {
+    match step {
+        wit::ResumeStep::Completed(state) => {
+            decode_created_attributes(state, id, None, None).map(|decoded| {
+                decoded.map(|(identifier, attributes)| proto::ResumeStep::Completed {
+                    identifier,
+                    attributes,
+                })
+            })
+        }
+        wit::ResumeStep::Pending(pending) => {
+            let wit::ResumePending {
+                operation,
+                identifier,
+            } = pending;
+            let wit::PendingOperation {
+                token,
+                poll_after_secs,
+            } = operation;
+            let identifier = identifier
+                .map(|identifier| decode_create_identifier(identifier, id))
+                .transpose()?;
+            Ok(DecodedIssued::Decoded(proto::ResumeStep::Pending(
+                proto::ResumePending {
+                    token: proto::PendingToken::new(token),
+                    identifier,
+                    poll_after_secs,
+                },
             )))
         }
-        wit::CreateOutcome::Pending(pending) => Ok(WasmCreateOutcome::Pending(
-            CreatePendingOperation(PendingOperation::from_wit(pending)),
+        wit::ResumeStep::Resent(step) => {
+            wit_to_core_create_step(step, id).map(|decoded| decoded.map(proto::ResumeStep::Resent))
+        }
+    }
+}
+
+fn wit_to_core_resumed_failure(
+    created: wit::ResumedFailure,
+    id: &CoreResourceId,
+) -> Result<
+    DecodedIssued<proto::ResumedFailure<CoreReadOutcome, CoreProviderError>>,
+    WasmAppliedStateDecodeError,
+> {
+    let wit::ResumedFailure {
+        identifier,
+        read,
+        error,
+    } = created;
+    let identifier = decode_create_identifier(identifier, id)?;
+    let error = wit_to_core_provider_error(error);
+    match wit_to_core_observation(read, id) {
+        Ok(observation) => Ok(DecodedIssued::Decoded(proto::ResumedFailure {
+            identifier,
+            observation,
+            error,
+        })),
+        Err(decode_error) => Ok(DecodedIssued::CreatedReadFailed(CreatedReadDecodeFailure {
+            identifier,
+            sent: None,
+            declared_error: Some(error),
+            decode_error,
+        })),
+    }
+}
+
+pub(crate) fn wit_to_core_resume_verdict(
+    verdict: wit::ResumeVerdict,
+    id: &CoreResourceId,
+) -> Result<DecodedIssued<DecodedResumeVerdict>, WasmAppliedStateDecodeError> {
+    match verdict {
+        wit::ResumeVerdict::Untracked(error) => Ok(DecodedIssued::Decoded(
+            proto::ResumeVerdict::Untracked(wit_to_core_provider_error(error)),
         )),
+        wit::ResumeVerdict::Created(created) => wit_to_core_resumed_failure(created, id)
+            .map(|decoded| decoded.map(proto::ResumeVerdict::Created)),
+        wit::ResumeVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
+            proto::ResumeVerdict::Discarded(wit_to_core_provider_error(error)),
+        )),
+        wit::ResumeVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
+            proto::ResumeVerdict::Undetermined(wit_to_core_provider_error(error)),
+        )),
+        wit::ResumeVerdict::Resent(verdict) => wit_to_core_create_verdict(verdict, id)
+            .map(|decoded| decoded.map(proto::ResumeVerdict::Resent)),
     }
 }
 
@@ -1998,14 +2330,14 @@ mod tests {
     }
 
     #[test]
-    fn create_outcome_rejects_empty_applied_identifier_with_typed_context() {
+    fn create_step_rejects_empty_applied_identifier_with_typed_context() {
         let id = CoreResourceId::with_identity("test", "example");
-        let outcome = wit::CreateOutcome::Success(wit::AppliedState {
+        let step = wit::CreateStep::Success(wit::AppliedState {
             identifier: String::new(),
             attributes: Vec::new(),
         });
 
-        let error = match wit_to_core_create_outcome(outcome, &id) {
+        let error = match wit_to_core_create_step(step, &id) {
             Err(error) => error,
             Ok(_) => panic!("a successful create must not accept an empty identifier"),
         };
@@ -2018,6 +2350,64 @@ mod tests {
             WasmAppliedStateDecodeErrorKind::Identifier(EmptyAppliedIdentifier)
         ));
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    fn malformed_created_attributes() -> Vec<(String, wit::Value)> {
+        vec![(
+            "broken".to_string(),
+            wit::Value::ListVal("not-json".to_string()),
+        )]
+    }
+
+    fn wit_internal_error(message: &str) -> wit::ProviderError {
+        wire_to_wit_provider_error(CoreProviderError::internal(message).to_wire())
+    }
+
+    #[test]
+    fn create_success_decode_failure_after_identifier_is_recoverable() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let step = wit::CreateStep::Success(wit::AppliedState {
+            identifier: "created-id".to_string(),
+            attributes: malformed_created_attributes(),
+        });
+
+        assert!(
+            wit_to_core_create_step(step, &id).is_ok(),
+            "a valid created identifier must survive an attribute decode failure"
+        );
+    }
+
+    #[test]
+    fn created_verdict_decode_failure_after_identifier_is_recoverable() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let verdict = wit::CreateVerdict::Created(wit::CreatedFailure {
+            identifier: "created-id".to_string(),
+            read: wit::Observation::Read(wit::ReadOutcome::Found(wit::AppliedState {
+                identifier: "created-id".to_string(),
+                attributes: malformed_created_attributes(),
+            })),
+            sent: wit::SentAttributes::All,
+            error: wit_internal_error("guest create failure"),
+        });
+
+        assert!(
+            wit_to_core_create_verdict(verdict, &id).is_ok(),
+            "a valid created identifier must survive an observation decode failure"
+        );
+    }
+
+    #[test]
+    fn resume_completed_decode_failure_after_identifier_is_recoverable() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let step = wit::ResumeStep::Completed(wit::AppliedState {
+            identifier: "created-id".to_string(),
+            attributes: malformed_created_attributes(),
+        });
+
+        assert!(
+            wit_to_core_resume_step(step, &id).is_ok(),
+            "a valid resumed identifier must survive an attribute decode failure"
+        );
     }
 
     #[test]
@@ -3748,9 +4138,9 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v9_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 9);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 9);
+    fn test_protocol_version_range_is_v10_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 10);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 10);
     }
 
     #[test]

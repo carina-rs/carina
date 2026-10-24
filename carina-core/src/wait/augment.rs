@@ -88,11 +88,22 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: crate::provider::CreateRequest,
+            _attempt: crate::provider::CreateAttempt,
         ) -> crate::provider::BoxFuture<
             '_,
-            crate::provider::ProviderResult<crate::provider::CreateOutcome>,
+            Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>,
         > {
             Box::pin(async { panic!("unexpected create") })
+        }
+
+        fn resume_create(
+            &self,
+            _request: crate::provider::ResumeCreateRequest,
+        ) -> crate::provider::BoxFuture<
+            '_,
+            Result<crate::provider::ResumeOutcome, crate::provider::ResumeFailure>,
+        > {
+            Box::pin(async { panic!("unexpected resume_create") })
         }
 
         fn update(

@@ -5,12 +5,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::effect::ResolvedMove;
 #[cfg(test)]
 use crate::parser::ProviderConfig;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, Value, ValueString,
+    ResourceIdentity, UnknownReason, Value, ValueString,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
@@ -453,8 +454,15 @@ pub fn resolve_attr_prefixes(
 pub struct PrefixStateInfo {
     /// Attribute prefixes stored in state (e.g., {"bucket_name": "my-app-"})
     pub prefixes: HashMap<String, String>,
-    /// Attribute string values from state (e.g., {"bucket_name": "my-app-existing1"})
-    pub attribute_values: HashMap<String, String>,
+    /// Attribute values available for prefix reconciliation.
+    pub attribute_values: HashMap<String, PrefixStateValue>,
+}
+
+/// Persisted prefix value, including the typed case where a completed create
+/// could not read the generated name back yet.
+pub enum PrefixStateValue {
+    Known(String),
+    PostCreateReadIncomplete { detail: String },
 }
 
 /// Reconcile prefixed names with existing state.
@@ -488,11 +496,20 @@ pub fn reconcile_prefixed_names(
                 if let Some(state_prefix) = state_info.prefixes.get(attr_name)
                     && state_prefix == prefix
                 {
-                    state_info.attribute_values.get(attr_name).map(|name_str| {
-                        (
-                            attr_name.clone(),
-                            Value::Concrete(ConcreteValue::String(name_str.clone().into())),
-                        )
+                    state_info.attribute_values.get(attr_name).map(|value| {
+                        let value = match value {
+                            PrefixStateValue::Known(name) => {
+                                Value::Concrete(ConcreteValue::String(name.clone().into()))
+                            }
+                            PrefixStateValue::PostCreateReadIncomplete { detail } => {
+                                Value::Deferred(DeferredValue::Unknown(
+                                    UnknownReason::PostCreateReadIncomplete {
+                                        detail: detail.clone(),
+                                    },
+                                ))
+                            }
+                        };
+                        (attr_name.clone(), value)
                     })
                 } else {
                     None
@@ -1349,7 +1366,7 @@ pub fn detect_anonymous_to_named_renames(
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
+) -> Vec<ResolvedMove> {
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -1367,7 +1384,7 @@ pub fn detect_anonymous_to_named_renames(
             .insert(identity.to_string());
     }
 
-    let mut renames: Vec<(ResolvedResourceId, ResolvedResourceId)> = Vec::new();
+    let mut renames = Vec::new();
 
     for resource in resources {
         // Only rename let-bound resources whose binding was previously anonymous.
@@ -1466,7 +1483,7 @@ pub fn detect_anonymous_to_named_renames(
             let Some(to) = ResolvedResourceId::try_new(resource.id.clone()) else {
                 continue;
             };
-            renames.push((from, to));
+            renames.push(ResolvedMove::from_detected_rename(from, to));
         }
     }
 
@@ -1491,6 +1508,9 @@ pub fn detect_anonymous_to_named_renames_for_test(
         identity_attributes_fn,
         claims,
     )
+    .into_iter()
+    .map(ResolvedMove::into_parts)
+    .collect()
 }
 
 #[cfg(test)]

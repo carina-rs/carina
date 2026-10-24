@@ -17,7 +17,12 @@ mod test_utils;
 mod tui_snapshot_tests;
 
 #[cfg(test)]
-use carina_core::provider::fixture_applied_identifier;
+fn fixture_applied_identifier(
+    identifier: impl Into<String>,
+) -> carina_core::provider::AppliedIdentifier {
+    carina_core::provider::AppliedIdentifier::new(identifier)
+        .expect("fixture provider identifier must be non-empty")
+}
 
 use std::io;
 
