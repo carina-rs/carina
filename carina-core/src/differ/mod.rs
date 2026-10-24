@@ -6,10 +6,11 @@
 mod comparison;
 mod plan;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Index;
 
-use crate::provider::ProviderError;
+use crate::effect::MoveAuthority;
+use crate::provider::{ProviderError, StateTransformMap};
 use crate::resource::{
     Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
     ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
@@ -65,6 +66,18 @@ impl Orphan {
         }
     }
 
+    pub fn create_in_flight(
+        pending: crate::provider::InFlightCreate,
+        binding: Option<String>,
+        directives: Directives,
+    ) -> Self {
+        Self {
+            current: Current::CreateInFlight(pending),
+            binding,
+            directives,
+        }
+    }
+
     pub fn current(&self) -> &Current {
         &self.current
     }
@@ -85,13 +98,9 @@ impl Orphan {
         self.current
     }
 
-    fn with_id(mut self, id: ResourceId) -> Self {
-        self.current.set_id(id);
+    fn rebound_for_move(mut self, authority: &MoveAuthority<'_>) -> Self {
+        self.current.rebind_for_move(authority);
         self
-    }
-
-    pub fn into_current_with_id(self, id: ResourceId) -> Current {
-        self.with_id(id).into_current()
     }
 
     /// Replace only provider-observed state while retaining the dependency
@@ -101,6 +110,7 @@ impl Orphan {
         let prior = match &self.current {
             Current::Absent(state) => state.state(),
             Current::Present(present) => present.state(),
+            Current::CreateInFlight(_pending) => return self,
             Current::MissingIdentifier(state) => state.state(),
         };
         fresh.id = prior.id.clone();
@@ -120,6 +130,62 @@ pub struct Orphans {
     by_id: HashMap<ResourceId, Orphan>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cannot move current state for {actual}; expected source route {expected}")]
+pub struct CurrentMoveRoutingMismatch {
+    actual: Box<ResourceId>,
+    expected: Box<ResourceId>,
+}
+
+/// Rebind current state through the explicit move seam while checking that
+/// the caller named its actual source route.
+///
+/// A caller-supplied pair of ids is not move authority.
+///
+/// ```compile_fail
+/// use carina_core::differ::rebind_current_for_move;
+/// use carina_core::resource::{Current, ResourceId};
+///
+/// fn bypass(current: Current, from: &ResourceId, to: ResourceId) {
+///     let _ = rebind_current_for_move(current, from, to);
+/// }
+/// ```
+pub fn rebind_current_for_move(
+    mut current: Current,
+    authority: &MoveAuthority<'_>,
+) -> Result<Current, CurrentMoveRoutingMismatch> {
+    if current.id() != authority.from() {
+        return Err(CurrentMoveRoutingMismatch {
+            actual: Box::new(current.id().clone()),
+            expected: Box::new(authority.from().clone()),
+        });
+    }
+    current.rebind_for_move(authority);
+    Ok(current)
+}
+
+/// Atomically move one keyed current-state entry through the checked move
+/// seam. A missing source is not an error and leaves the map unchanged.
+pub fn rekey_current_for_move(
+    current: &mut HashMap<ResourceId, Current>,
+    authority: &MoveAuthority<'_>,
+) -> Result<bool, CurrentMoveRoutingMismatch> {
+    let Some(mut value) = current.remove(authority.from()) else {
+        return Ok(false);
+    };
+    if value.id() != authority.from() {
+        let actual = value.id().clone();
+        current.insert(authority.from().clone(), value);
+        return Err(CurrentMoveRoutingMismatch {
+            actual: Box::new(actual),
+            expected: Box::new(authority.from().clone()),
+        });
+    }
+    value.rebind_for_move(authority);
+    current.insert(authority.to().clone(), value);
+    Ok(true)
+}
+
 impl Orphans {
     pub fn new() -> Self {
         Self::default()
@@ -129,6 +195,7 @@ impl Orphans {
         let id = match &orphan.current {
             Current::Absent(state) => state.state().id.clone(),
             Current::Present(present) => present.state().id.clone(),
+            Current::CreateInFlight(pending) => pending.id().clone(),
             Current::MissingIdentifier(state) => state.state().id.clone(),
         };
         self.by_id.insert(id, orphan);
@@ -138,12 +205,19 @@ impl Orphans {
         self.by_id.remove(id)
     }
 
-    pub fn rekey(&mut self, from: &ResourceId, to: ResourceId) -> bool {
-        let Some(orphan) = self.remove(from) else {
+    pub fn rekey(&mut self, authority: &MoveAuthority<'_>) -> bool {
+        let Some(orphan) = self.remove(authority.from()) else {
             return false;
         };
-        self.insert(orphan.with_id(to));
+        self.insert(orphan.rebound_for_move(authority));
         true
+    }
+
+    /// Consume an orphan under the move's source route and return its current
+    /// instance already rebound to the destination route.
+    pub fn take_rebound(&mut self, authority: &MoveAuthority<'_>) -> Option<Current> {
+        self.remove(authority.from())
+            .map(|orphan| orphan.rebound_for_move(authority).into_current())
     }
 
     pub fn get(&self, id: &ResourceId) -> Option<&Orphan> {
@@ -327,75 +401,58 @@ pub async fn transform_prior_provider_states(
     current_states: &mut HashMap<ResourceId, Current>,
     data_source_states: &mut HashMap<ResourceId, State>,
     orphans: &mut Orphans,
-    mut transform_managed_orphans: impl AsyncFnMut(
-        &mut HashMap<ResourceId, State>,
-    ) -> Result<(), ProviderError>,
-    mut transform_data_sources: impl AsyncFnMut(
-        &mut HashMap<ResourceId, State>,
-    ) -> Result<(), ProviderError>,
+    mut transform_managed_orphans: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
+    mut transform_data_sources: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
     let mut managed_states: HashMap<ResourceId, State> = current_states
         .iter()
-        .map(|(id, current)| {
+        .filter_map(|(id, current)| {
             let state = match current {
                 Current::Absent(state) => state.state(),
                 Current::Present(present) => present.state(),
+                Current::CreateInFlight(_pending) => return None,
                 Current::MissingIdentifier(state) => state.state(),
             };
-            (id.clone(), state.clone())
+            Some((id.clone(), state.clone()))
         })
         .collect();
     let orphan_states = orphans
         .iter()
-        .map(|(id, orphan)| {
+        .filter_map(|(id, orphan)| {
             let state = match &orphan.current {
                 Current::Absent(state) => state.state(),
                 Current::Present(present) => present.state(),
+                Current::CreateInFlight(_pending) => return None,
                 Current::MissingIdentifier(state) => state.state(),
             };
-            (id.clone(), state.clone())
+            Some((id.clone(), state.clone()))
         })
         .collect();
     extend_disjoint_states(&mut managed_states, orphan_states);
-    let expected_managed_ids: HashSet<ResourceId> = managed_states.keys().cloned().collect();
-    let mut transformed_data_sources = data_source_states.clone();
-    let expected_data_source_ids: HashSet<ResourceId> =
-        transformed_data_sources.keys().cloned().collect();
+    let mut managed_states = StateTransformMap::from_states(managed_states);
+    let mut transformed_data_sources = StateTransformMap::from_states(data_source_states.clone());
 
     transform_managed_orphans(&mut managed_states).await?;
     if !transformed_data_sources.is_empty() {
         transform_data_sources(&mut transformed_data_sources).await?;
     }
 
-    assert_eq!(
-        managed_states.keys().cloned().collect::<HashSet<_>>(),
-        expected_managed_ids,
-        "provider transform must preserve the managed/orphan prior-state key set"
-    );
-    assert_eq!(
-        transformed_data_sources
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>(),
-        expected_data_source_ids,
-        "provider transform must preserve the data-source state key set"
-    );
+    let mut managed_states = managed_states.into_states();
     for (id, orphan) in orphans.iter_mut() {
-        if let Some(state) = managed_states.remove(id) {
-            orphan.current.apply_transformed_state(state);
+        if let Some(state) = managed_states.remove(id)
+            && let Some(target) = orphan.current.state_bearing_mut()
+        {
+            target.apply_transformed_state(state);
         }
     }
     for (id, current) in current_states {
-        let state = managed_states
-            .remove(id)
-            .expect("provider transform preserved the managed state key");
-        current.apply_transformed_state(state);
+        if let Some(state) = managed_states.remove(id)
+            && let Some(target) = current.state_bearing_mut()
+        {
+            target.apply_transformed_state(state);
+        }
     }
-    assert!(
-        managed_states.is_empty(),
-        "every transformed managed/orphan state must return to its typed owner"
-    );
-    *data_source_states = transformed_data_sources;
+    *data_source_states = transformed_data_sources.into_states();
     Ok(())
 }
 
@@ -413,11 +470,11 @@ pub fn lift_prior_state_enum_leaves(
         };
         let attributes = current_states
             .get_mut(&resource.id)
-            .map(Current::attributes_mut)
+            .and_then(Current::attributes_mut)
             .or_else(|| {
                 orphans
                     .get_mut(&resource.id)
-                    .map(|orphan| orphan.current_mut().attributes_mut())
+                    .and_then(|orphan| orphan.current_mut().attributes_mut())
             });
         if let Some(attributes) = attributes {
             crate::utils::lift_state_enum_leaves(attributes, schema);

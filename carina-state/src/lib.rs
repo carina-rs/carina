@@ -50,7 +50,12 @@
 //! ```
 
 #[cfg(test)]
-use carina_core::provider::fixture_applied_identifier;
+fn fixture_applied_identifier(
+    identifier: impl Into<String>,
+) -> carina_core::provider::AppliedIdentifier {
+    carina_core::provider::AppliedIdentifier::new(identifier)
+        .expect("fixture provider identifier must be non-empty")
+}
 
 pub mod backend;
 mod backend_config;
@@ -77,8 +82,8 @@ pub use backends::{
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost};
 pub use lock::LockInfo;
 pub use state::{
-    ApplyDecision, DeposedInstance, DeposedKey, LoadedOrphans, LoadedState, MigratedStateFile,
-    MigrationInfo, NameOverride, PreviousSecretHashAuthority, ResourceState,
+    ApplyDecision, CurrentInstance, DeposedInstance, DeposedKey, LoadedOrphans, LoadedState,
+    MigratedStateFile, MigrationInfo, NameOverride, PreviousSecretHashAuthority, ResourceState,
     ResourceStateEncodingError, StateFile, check_and_migrate, check_and_migrate_bytes,
     log_state_migration_once, should_apply_override,
 };

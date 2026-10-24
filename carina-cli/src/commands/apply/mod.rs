@@ -24,7 +24,6 @@ use carina_core::executor::{
 };
 use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
-#[cfg(test)]
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
@@ -82,7 +81,7 @@ use crate::wiring::{
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
     DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, PlannedSecretHashes,
-    RehydratedPlanFile,
+    RehydratedPlanFile, ReloadedInspectedPlanFile,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -176,15 +175,28 @@ fn format_total_apply_line(elapsed: Duration) -> String {
     format!("Done in {}.", format_duration(elapsed))
 }
 
+struct BootstrapCreateContext<'a> {
+    backend: &'a dyn StateBackend,
+    parsed: &'a carina_core::parser::InferredFile,
+    provider_configs: &'a ResolvedProviderConfigs,
+    normalizer: &'a dyn ProviderNormalizer,
+    factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &'a carina_core::schema::SchemaRegistry,
+}
+
 async fn create_checked_bootstrap_resource(
     provider: &dyn Provider,
     resource: Resource,
-    parsed: &carina_core::parser::InferredFile,
-    provider_configs: &ResolvedProviderConfigs,
-    normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
-    schemas: &carina_core::schema::SchemaRegistry,
+    context: BootstrapCreateContext<'_>,
 ) -> Result<(), AppError> {
+    let BootstrapCreateContext {
+        backend,
+        parsed,
+        provider_configs,
+        normalizer,
+        factories,
+        schemas,
+    } = context;
     let id = resource.id.clone();
     let bindings = bootstrap_resolved_bindings(parsed);
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
@@ -199,11 +211,58 @@ async fn create_checked_bootstrap_resource(
     let request = carina_core::executor::prepare_create_request(resource, &preparation)
         .await
         .map_err(AppError::from_state_bucket_preparation)?;
-    provider
-        .create(&id, request)
-        .await
-        .map_err(|error| AppError::StateBucketCreate { error })?;
-    Ok(())
+    let resolved = ResolvedResource::new(request.resource().as_resource().clone());
+    match carina_core::executor::dispatch_create(provider, &id, request).await {
+        Ok(_outcome) => Ok(()),
+        Err(error) => {
+            let row = match error.kind() {
+                carina_core::provider::CreateFailureKind::Untracked(_error) => Ok(None),
+                carina_core::provider::CreateFailureKind::Created {
+                    created,
+                    error: _provider_error,
+                } => carina_state::ResourceState::from_observation(
+                    &resolved,
+                    created,
+                    None,
+                    schemas.get_for(resolved.as_resource()),
+                    None,
+                )
+                .map(Some)
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
+                carina_core::provider::CreateFailureKind::InFlight {
+                    pending,
+                    error: _provider_error,
+                } => carina_state::ResourceState::from_in_flight(
+                    &resolved,
+                    pending,
+                    None,
+                    schemas.get_for(resolved.as_resource()),
+                    None,
+                )
+                .map(Some)
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
+            };
+            let seed_error = match row {
+                Ok(Some(mut row)) => {
+                    row.protected = true;
+                    let mut seed = StateFile::new();
+                    match seed.upsert_resource(row) {
+                        Ok(()) => backend
+                            .write_state(&seed)
+                            .await
+                            .map_err(AppError::Backend)
+                            .err(),
+                        Err(seed_error) => Some(AppError::Backend(seed_error)),
+                    }
+                }
+                Ok(None) => None,
+                Err(seed_error) => Some(seed_error),
+            };
+            Err(AppError::StateBucketCreate(
+                crate::error::StateBucketCreateError::new(error, seed_error),
+            ))
+        }
+    }
 }
 
 fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
@@ -1038,7 +1097,7 @@ impl DriftCheckResult {
 /// verification pass for the saved-plan gate.
 pub(crate) async fn detect_drift(
     sorted_resources: &[Resource],
-    planned_state_entries: &[crate::commands::plan::CurrentStateEntry],
+    planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
     provider: &dyn Provider,
     apply_target: ApplyTarget<'_>,
@@ -1050,10 +1109,10 @@ pub(crate) async fn detect_drift(
     let planned_states: HashMap<_, _> = planned_state_entries
         .iter()
         .filter_map(|entry| match entry {
-            crate::commands::plan::CurrentStateEntry::Managed { id, current } => {
+            crate::commands::plan::ReloadedCurrentStateEntry::Managed { id, current } => {
                 Some((id, current))
             }
-            crate::commands::plan::CurrentStateEntry::DataSource {
+            crate::commands::plan::ReloadedCurrentStateEntry::DataSource {
                 id: _id,
                 state: _state,
             } => None,
@@ -1064,16 +1123,19 @@ pub(crate) async fn detect_drift(
         // carina#3181: `sorted_resources` is managed-only — drift
         // detection only operates over provider-backed managed
         // resources.
-        let planned_current = planned_states.get(&resource.id).copied();
-        let planned_state = planned_current.map(|current| match current {
-            Current::Absent(state) => state.state(),
-            Current::Present(present) => present.state(),
-            Current::MissingIdentifier(state) => state.state(),
+        let planned_snapshot = planned_states.get(&resource.id).copied();
+        let planned_current = planned_snapshot.map(|snapshot| snapshot.as_ref());
+        let planned_state = planned_current.and_then(|current| match current {
+            Current::Absent(state) => Some(state.state()),
+            Current::Present(present) => Some(present.state()),
+            Current::CreateInFlight(_pending) => None,
+            Current::MissingIdentifier(state) => Some(state.state()),
         });
-        let planned_exists = planned_current.map(|current| match current {
-            Current::Absent(_absent) => false,
-            Current::Present(_present) => true,
-            Current::MissingIdentifier(_unidentified) => true,
+        let planned_exists = planned_current.and_then(|current| match current {
+            Current::Absent(_absent) => Some(false),
+            Current::Present(_present) => Some(true),
+            Current::CreateInFlight(_pending) => None,
+            Current::MissingIdentifier(_unidentified) => Some(true),
         });
         let historical_id = planned_current
             .map(|_| historical_addresses.origin_for(&resource.id))
@@ -1091,6 +1153,7 @@ pub(crate) async fn detect_drift(
                     resource.id
                 )));
             }
+            Some(Current::CreateInFlight(_pending)) => State::not_found(historical_id.clone()),
             Some(Current::Absent(_state)) => State::not_found(historical_id.clone()),
             None => State::not_found(historical_id.clone()),
         };
@@ -1342,11 +1405,14 @@ async fn run_apply_with_observer_factory(
                 create_checked_bootstrap_resource(
                     bucket_provider.as_ref(),
                     bucket_resource.clone(),
-                    &parsed,
-                    bootstrap_provider_inputs.configs(),
-                    bucket_normalizer.as_ref(),
-                    ctx.factories(),
-                    ctx.schemas(),
+                    BootstrapCreateContext {
+                        backend: backend.as_ref(),
+                        parsed: &parsed,
+                        provider_configs: bootstrap_provider_inputs.configs(),
+                        normalizer: bucket_normalizer.as_ref(),
+                        factories: ctx.factories(),
+                        schemas: ctx.schemas(),
+                    },
                 )
                 .await?;
                 println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
@@ -1420,8 +1486,15 @@ async fn run_apply_with_observer_factory(
                         backend_provider_name,
                         backend_resource_type,
                         bucket_resource_name,
-                        &bucket_name,
-                    );
+                        AppliedIdentifier::new(&bucket_name).map_err(|source| {
+                            AppError::Config(format!(
+                                "State bucket has an invalid provider identifier: {source}"
+                            ))
+                        })?,
+                    )
+                    .map_err(|source| {
+                        AppError::Config(format!("Failed to encode initial state bucket: {source}"))
+                    })?;
                     backend
                         .write_state(&initial_state)
                         .await
@@ -1832,6 +1905,7 @@ async fn run_apply_locked_owned(
                     let exists = match loaded.current() {
                         Current::Absent(_state) => false,
                         Current::Present(_present) => true,
+                        Current::CreateInFlight(_pending) => true,
                         Current::MissingIdentifier(_state) => true,
                     };
                     if exists {
@@ -1861,7 +1935,7 @@ async fn run_apply_locked_owned(
                     &mut saved_attrs,
                     &parsed.state_blocks,
                     &state_file,
-                );
+                )?;
                 pairs.extend(crate::wiring::apply_anonymous_to_named_renames(
                     ctx,
                     &sorted_resources,
@@ -2189,7 +2263,7 @@ async fn run_apply_locked_owned(
                 &prev_explicit,
                 &wait_bindings,
             )?;
-            crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
+            crate::wiring::add_deposed_delete_effects(&mut plan, &state_file, &moved_pairs);
             block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
 
             // Add state block effects (import/removed/moved) only after both
@@ -2741,11 +2815,11 @@ async fn prepare_saved_plan_secret_candidates(
 }
 
 fn rehydrate_desired_plan_file(
-    mut plan_file: PlanFile,
+    plan_file: &mut PlanFile,
     parsed: &carina_core::parser::InferredFile,
     provider_inputs: &ResolvedProviderInputs,
     apply_target: ApplyTarget<'_>,
-) -> Result<PlanFile, AppError> {
+) -> Result<(), AppError> {
     let mut resource_candidates = HashMap::new();
     for saved in &plan_file.sorted_resources {
         if let Some(fresh) = matching_resource_like(saved, &parsed.resources) {
@@ -2845,7 +2919,7 @@ fn rehydrate_desired_plan_file(
         }
     }
 
-    Ok(plan_file)
+    Ok(())
 }
 
 pub async fn run_apply_from_plan(
@@ -2918,10 +2992,14 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 20 explicitly tags
-    // current-state ownership and managed lifecycle classification. Version 19
-    // inferred ownership from the saved data-source list and must be
-    // regenerated. Version 19 guarantees that mutation effects carry validated
+    // Validate version compatibility. Plan-file version 21 represents an
+    // in-flight managed current instance as an address-level marker and never
+    // serializes its provider token; apply reloads that continuation from
+    // locked state. Version 20 explicitly tags current-state ownership and
+    // managed lifecycle classification but cannot represent the marker and
+    // must be regenerated. Version 19 inferred ownership from the saved
+    // data-source list and must likewise be regenerated. Version 19 guarantees
+    // that mutation effects carry validated
     // provider identifiers, update effects persist their identifier explicitly,
     // and `removed` can record malformed deposed generations it abandons by key
     // without serializing their known-invalid identifier. Version 18 included
@@ -3224,6 +3302,9 @@ async fn run_apply_from_plan_locked_owned(
         }
     }
 
+    let inspected_plan =
+        try_with_lock!(inspected_plan.reload_in_flight_from_locked_state(state_file.as_ref()));
+
     // A typed `read` address plus an identifier-less row shape distinguishes
     // historical pre-#3181 data-source rows without erasing an identifier-
     // bearing managed orphan at the same address. Normalize those artifacts
@@ -3249,8 +3330,10 @@ async fn run_apply_from_plan_locked_owned(
     let heartbeat_outcome =
         with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
             let (desired_plan, prepared_wiring) = match inspected_plan {
-                InspectedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), None),
-                InspectedPlanFile::NeedsSecretVerification(plan) => {
+                ReloadedInspectedPlanFile::Verified(plan) => {
+                    (DesiredPlanFile::Verified(plan), None)
+                }
+                ReloadedInspectedPlanFile::NeedsSecretVerification(plan) => {
                     let parsed = current_parsed.ok_or_else(|| {
                         saved_plan_secret_evaluation_error(
                             AppError::Config(
@@ -3355,11 +3438,11 @@ async fn run_apply_from_plan_locked_owned(
             let mut data_source_states = HashMap::new();
             for entry in rehydrated_plan_file.current_states() {
                 match entry {
-                    crate::commands::plan::CurrentStateEntry::Managed { id, current } => {
-                        managed_current.insert(id.clone(), current.clone());
+                    crate::commands::plan::ReloadedCurrentStateEntry::Managed { id, current } => {
+                        managed_current.insert(id.clone(), current.as_ref().clone());
                     }
-                    crate::commands::plan::CurrentStateEntry::DataSource { id, state } => {
-                        data_source_states.insert(id.clone(), state.clone());
+                    crate::commands::plan::ReloadedCurrentStateEntry::DataSource { id, state } => {
+                        data_source_states.insert(id.clone(), state.as_ref().clone());
                     }
                 }
             }

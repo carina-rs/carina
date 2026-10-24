@@ -23,7 +23,7 @@ use super::deferred_dispatch::PureMetaCtx;
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
-    FailureView, PureMetaOutcome, build_scheduler_deps, dependency_failed_reason,
+    FailureView, PureMetaOutcome, SchedulerDeps, build_scheduler_deps, dependency_failed_reason,
     emit_cancelled_skips_with_progress, failure_binding_name, try_dispatch_pure_meta,
     wait_dependency_failed_reason,
 };
@@ -166,6 +166,7 @@ pub(super) fn build_dependency_levels(
         compositions,
         crate::effect::deps::ScheduleInputs::Apply,
     )
+    .expect("dependency analysis must resolve")
     .into_deps_of();
 
     // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
@@ -250,7 +251,10 @@ pub(super) async fn execute_effects_sequential(
         .provider_check_inputs
         .resource_origins()
         .unwrap_or(&empty_resource_origins);
-    let mut deps_of = build_scheduler_deps(
+    let SchedulerDeps {
+        mut deps_of,
+        unresolved: scheduler_dependency_errors,
+    } = build_scheduler_deps(
         &effects,
         resource_origins,
         input.compositions,
@@ -270,6 +274,25 @@ pub(super) async fn execute_effects_sequential(
     let mut failed_indices: HashSet<usize> = HashSet::new();
     // Track which effect indices have been dispatched (spawned or skipped)
     let mut dispatched: HashSet<usize> = HashSet::new();
+
+    for dependency in scheduler_dependency_errors {
+        let idx = dependency.effect_index();
+        let message = dependency.to_string();
+        let progress = ProgressInfo {
+            completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+            total,
+        };
+        observer.on_event(&ExecutionEvent::EffectFailed {
+            effect: &effects[idx],
+            error: &message,
+            duration: std::time::Duration::ZERO,
+            progress,
+        });
+        failure_count += 1;
+        completed_indices.insert(idx);
+        failed_indices.insert(idx);
+        dispatched.insert(idx);
+    }
     // All actionable effect indices (excluding Read and state operations)
     let mut actionable_indices: Vec<usize> = (0..effects.len())
         .filter(|&idx| is_runtime_dispatchable(&effects[idx], &input.deferred_data_source_reads))
@@ -414,12 +437,33 @@ pub(super) async fn execute_effects_sequential(
                             effects.push(child);
                             actionable_indices.push(child_idx);
                         }
-                        deps_of = build_scheduler_deps(
+                        let rebuilt = build_scheduler_deps(
                             &effects,
                             resource_origins,
                             input.compositions,
                             &deferred_replace_delete_deps,
                         );
+                        deps_of = rebuilt.deps_of;
+                        for dependency in rebuilt.unresolved {
+                            let failed_idx = dependency.effect_index();
+                            if !dispatched.insert(failed_idx) {
+                                continue;
+                            }
+                            let message = dependency.to_string();
+                            let progress = ProgressInfo {
+                                completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                total,
+                            };
+                            observer.on_event(&ExecutionEvent::EffectFailed {
+                                effect: &effects[failed_idx],
+                                error: &message,
+                                duration: std::time::Duration::ZERO,
+                                progress,
+                            });
+                            failure_count += 1;
+                            completed_indices.insert(failed_idx);
+                            failed_indices.insert(failed_idx);
+                        }
                     }
                     completed_indices.insert(idx);
                     completed_synchronous_dispatch = true;
@@ -437,6 +481,7 @@ pub(super) async fn execute_effects_sequential(
             let provider_configs = input.provider_configs;
             let factories = input.factories;
             let schemas = input.schemas;
+            let managed_current = &input.managed_current;
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
@@ -458,7 +503,7 @@ pub(super) async fn execute_effects_sequential(
                     // be dispatched (carina#3164). The compiler enforces
                     // exhaustiveness on the outer `match effect { ... }`
                     // below.
-                    Some(basic) => SingleEffectResult::Basic(
+                    Some(basic) => SingleEffectResult::Basic(Box::new(
                         execute_basic_effect(
                             basic,
                             &BasicEffectCtx {
@@ -466,15 +511,19 @@ pub(super) async fn execute_effects_sequential(
                                 provider_check_inputs,
                                 runtime_authored,
                                 preparation: &preparation,
+                                managed_current,
                                 completed: completed_ref,
                                 total,
                             },
                             observer,
                         )
                         .await,
-                    ),
+                    )),
                     None => match &effect_for_future {
-                        Effect::Create(_) | Effect::Update { .. } | Effect::Delete { .. } => {
+                        Effect::Create(_)
+                        | Effect::ResumeCreate { .. }
+                        | Effect::Update { .. }
+                        | Effect::Delete { .. } => {
                             // `as_basic()` returns `Some` for exactly these
                             // three variants; they're handled by the `Some`
                             // arm above.
@@ -694,7 +743,7 @@ pub(super) async fn execute_effects_sequential(
         match result {
             SingleEffectResult::Basic(basic) => {
                 process_basic_result(
-                    basic,
+                    *basic,
                     &mut ExecutionState {
                         idx: finished_idx,
                         success_count: &mut success_count,
@@ -733,7 +782,11 @@ pub(super) async fn execute_effects_sequential(
                     input
                         .data_source_states
                         .insert(resource.id.clone(), state.clone());
-                    applied_states.insert(resource.id.clone(), state);
+                    applied_states.insert_published(
+                        resource.id.clone(),
+                        crate::executor::Applied::DataSource(state.clone()),
+                        &state,
+                    );
                 }
                 Err(error) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -777,7 +830,11 @@ pub(super) async fn execute_effects_sequential(
                     input
                         .bindings
                         .record_applied(Some(&binding), &attrs, &state);
-                    applied_states.insert(synthetic, state);
+                    applied_states.insert_published(
+                        synthetic,
+                        crate::executor::Applied::WaitSnapshot(state.clone()),
+                        &state,
+                    );
                 }
                 WaitOutcome::Unsatisfiable(reason) => {
                     let detail = unsatisfiable_reason_message(&reason);
@@ -963,7 +1020,9 @@ mod tests {
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+            attempt: crate::provider::CreateAttempt,
+        ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>>
+        {
             self.create_log
                 .lock()
                 .unwrap()
@@ -972,14 +1031,22 @@ mod tests {
             Box::pin(async move {
                 if id.identity_str().expect("resolved identity") == "alb" {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    Err(ProviderError::api_error("alb create failed"))
+                    Err(attempt.untracked(ProviderError::api_error("alb create failed")))
                 } else {
-                    Ok(crate::provider::CreateOutcome::Success {
-                        state: AppliedState::new(id, "cert-id", HashMap::new())
+                    Ok(crate::provider::CreateOutcome::fixture_success(
+                        AppliedState::new(id, "cert-id", HashMap::new())
                             .expect("fixture identifier is non-empty"),
-                    })
+                    ))
                 }
             })
+        }
+
+        fn resume_create(
+            &self,
+            _request: crate::provider::ResumeCreateRequest,
+        ) -> BoxFuture<'_, Result<crate::provider::ResumeOutcome, crate::provider::ResumeFailure>>
+        {
+            Box::pin(async { panic!("unexpected resume_create") })
         }
 
         fn update(
@@ -1077,7 +1144,8 @@ mod tests {
             })
             .collect();
         let mut analysis =
-            build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply);
+            build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         analysis.into_deps_of().remove(&1).unwrap()
     }
@@ -1227,6 +1295,7 @@ mod tests {
         ]);
         let deps =
             build_dependency_analysis(plan.effects(), &unresolved, &[], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve")
                 .into_deps_of();
         assert!(
             deps.get(&3).is_some_and(|listener_deps| {
@@ -1401,7 +1470,8 @@ mod tests {
             (child_id, UnresolvedResource::from_pre_resolve(child)),
         ]);
 
-        let analysis = build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply);
+        let analysis = build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+            .expect("dependency analysis must resolve");
         assert!(
             analysis
                 .reads_for_edge(1, 0)
@@ -1490,7 +1560,8 @@ mod tests {
             (child_id, UnresolvedResource::from_pre_resolve(child)),
         ]);
         let mut analysis =
-            build_dependency_analysis(&effects, &unresolved, &[virt], ScheduleInputs::Apply);
+            build_dependency_analysis(&effects, &unresolved, &[virt], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         let deps_of = analysis.into_deps_of();
 
@@ -1504,7 +1575,8 @@ mod tests {
     fn relax_update_update_edges_handles_empty_plan() {
         let effects = Vec::new();
         let mut analysis =
-            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply);
+            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of().is_empty());
     }
@@ -1514,7 +1586,8 @@ mod tests {
         let effect = update_effect("only", &[], &["tags"]);
         let effects = vec![effect];
         let mut analysis =
-            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply);
+            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -1527,7 +1600,8 @@ mod tests {
             Effect::Create(resolved(child)),
         ];
         let mut analysis =
-            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply);
+            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -1593,6 +1667,7 @@ mod tests {
 
         let deps_of =
             build_dependency_analysis(&effects, &unresolved, &[virt], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve")
                 .into_deps_of();
 
         assert!(

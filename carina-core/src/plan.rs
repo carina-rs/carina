@@ -7,11 +7,11 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
+use crate::effect::{ChangedCreateOnly, Effect, MoveAuthority, TemporaryName};
 use crate::module::DependencyGraph;
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
-use crate::provider::AppliedIdentifier;
+use crate::provider::{AppliedIdentifier, Timestamp};
 pub use crate::resource::ModuleSource;
 use crate::resource::{
     DeposedKey, Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity,
@@ -75,6 +75,16 @@ pub enum PlanErrorKind {
     /// An existing state row cannot safely be mutated because it has no
     /// provider identifier.
     MissingProviderIdentifier,
+    /// An unfinished create is no longer present in configuration and cannot
+    /// be resumed or safely deleted without its request.
+    CreateInFlightOrphan,
+    /// Destroy cannot identify an unfinished create yet; apply must resume it.
+    DestroyCreateInFlight,
+    /// Desired provider routing no longer matches the route that issued the
+    /// persisted create.
+    ResumeCreateRoutingMismatch {
+        persisted: ResourceId,
+    },
     /// An import cannot identify a provider resource with an empty string.
     InvalidImportProviderIdentifier,
     /// A historical replacement generation cannot be destroyed because its
@@ -175,6 +185,19 @@ impl std::fmt::Display for PlanErrorKind {
             Self::MissingProviderIdentifier => f.write_str(
                 "saved state has no provider identifier; add a `removed` block for this resource and apply it, then add an `import` block with the provider identifier to restore management",
             ),
+            Self::CreateInFlightOrphan => f.write_str(
+                "saved state contains a create still in progress, but the resource is absent from configuration; restore the resource and apply to resume it, or add a `removed` block to forget it (the cloud resource may remain)",
+            ),
+            Self::DestroyCreateInFlight => f.write_str(
+                "saved state contains a create still in progress; run apply first to resume it before destroying",
+            ),
+            Self::ResumeCreateRoutingMismatch { persisted } => {
+                let route = persisted.provider_instance.as_deref().unwrap_or("default");
+                write!(
+                    f,
+                    "saved create continuation belongs to provider route `{route}` for `{persisted}`, but the desired resource uses a different route; restore the original provider selection or forget the row with a `removed` block"
+                )
+            }
             Self::InvalidImportProviderIdentifier => f.write_str(
                 "import id must be a non-empty provider identifier; set `id` in the `import` block to the identifier used by the provider",
             ),
@@ -418,6 +441,15 @@ impl Plan {
         self.effects.push(effect);
     }
 
+    /// Add a token-free resume effect and retain only its non-secret display
+    /// timestamp. The provider token is joined from locked state at dispatch.
+    pub fn add_resume_create(&mut self, resource: ResolvedResource, started_at: Timestamp) {
+        self.effects.push(Effect::ResumeCreate {
+            resource,
+            started_at,
+        });
+    }
+
     pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
         let delete = group.delete;
         let delete_effect = Effect::Delete {
@@ -462,6 +494,15 @@ impl Plan {
 
     pub fn effects(&self) -> &[Effect] {
         &self.effects
+    }
+
+    /// Return the move capability for an exact route pair present in this
+    /// plan.
+    pub fn move_authority(&self, from: &ResourceId, to: &ResourceId) -> Option<MoveAuthority<'_>> {
+        self.effects.iter().find_map(|effect| {
+            let authority = effect.move_authority()?;
+            (authority.from() == from && authority.to() == to).then_some(authority)
+        })
     }
 
     /// Whether any typed value-bearing field contains a saved-plan secret
@@ -670,6 +711,7 @@ impl Plan {
                         summary.create += 1;
                     }
                 }
+                Effect::ResumeCreate { .. } => summary.create += 1,
                 Effect::Update { .. } => summary.update += 1,
                 Effect::Delete { .. } => {
                     if !replacement_delete_indices.contains(&idx) {
@@ -831,7 +873,9 @@ impl ModularPlan {
         // Extract module sources from effect resources
         for (idx, effect) in plan.effects().iter().enumerate() {
             let source = match effect {
-                Effect::Create(r) => Self::extract_source(&r.module_source),
+                Effect::Create(r) | Effect::ResumeCreate { resource: r, .. } => {
+                    Self::extract_source(&r.module_source)
+                }
                 Effect::Update { to, .. } => Self::extract_source(&to.module_source),
                 Effect::Read { resource } => Self::extract_source(&resource.module_source),
                 Effect::Delete { .. }
@@ -936,6 +980,9 @@ impl ModularPlan {
 fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("{} {}", effect.display_glyph(), r.id),
+        Effect::ResumeCreate { resource: r, .. } => {
+            format!("{} resume create {}", effect.display_glyph(), r.id)
+        }
         Effect::Update { to, .. } => format!("{} {}", effect.display_glyph(), to.id),
         Effect::Delete {
             id,

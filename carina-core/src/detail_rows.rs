@@ -507,7 +507,7 @@ pub fn build_detail_rows_by_instance(
     // `DataSource`. Schema lookup routes through the matching
     // `get_for` / `get_for_data_source` registry method.
     match effect {
-        Effect::Create(r) => {
+        Effect::Create(r) | Effect::ResumeCreate { resource: r, .. } => {
             let schema = registry.and_then(|reg| reg.get_for(r));
             build_create_rows(&r.attributes, &r.default_tag_keys, schema, detail)
         }

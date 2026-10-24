@@ -1461,6 +1461,7 @@ impl ResolvedBindings {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
                         }
                     }
+                    crate::resource::Current::CreateInFlight(_pending) => {}
                     crate::resource::Current::MissingIdentifier(unidentified) => {
                         for (k, v) in &unidentified.state().attributes {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());

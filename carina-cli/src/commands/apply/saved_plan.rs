@@ -7,8 +7,8 @@ use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    CurrentStateEntry, MovedOrigins, PlanFile, PlanWaitBinding, ResolvedProviderInputs,
-    UpstreamSource,
+    MovedOrigins, PlanFile, PlanWaitBinding, ReloadedCurrentStateEntry, ReloadedPlanFile,
+    ResolvedProviderInputs, UpstreamSource,
 };
 use crate::error::AppError;
 
@@ -102,8 +102,14 @@ impl HistoricalStateVerifier<'_> {
 /// the metadata needed to select a backend; it cannot recover a raw
 /// deserialized `PlanFile` and route it to execution.
 pub(super) enum InspectedPlanFile {
-    Verified(RehydratedPlanFile),
+    Verified(VerifiedPlanFile),
     NeedsSecretVerification(PendingPlanFile),
+}
+
+/// Decoded placeholder-free plan. It still cannot expose managed current
+/// state until its in-flight markers are reconciled under the state lock.
+pub(super) struct VerifiedPlanFile {
+    plan_file: PlanFile,
 }
 
 impl InspectedPlanFile {
@@ -111,16 +117,13 @@ impl InspectedPlanFile {
         if plan_file.contains_redacted_secret_placeholders() {
             Self::NeedsSecretVerification(PendingPlanFile { plan_file })
         } else {
-            Self::Verified(RehydratedPlanFile {
-                plan_file,
-                planned_secret_hashes: HashMap::new(),
-            })
+            Self::Verified(VerifiedPlanFile { plan_file })
         }
     }
 
     pub(super) fn backend_config(&self) -> Option<&BackendConfig> {
         match self {
-            Self::Verified(plan) => plan.backend_config(),
+            Self::Verified(plan) => plan.plan_file.backend_config.as_ref(),
             Self::NeedsSecretVerification(plan) => plan.plan_file.backend_config.as_ref(),
         }
     }
@@ -131,24 +134,57 @@ impl InspectedPlanFile {
 
     pub(super) fn state_lineage(&self) -> Option<&str> {
         match self {
-            Self::Verified(plan) => plan.state_lineage(),
+            Self::Verified(plan) => plan.plan_file.state_lineage.as_deref(),
             Self::NeedsSecretVerification(plan) => plan.plan_file.state_lineage.as_deref(),
         }
     }
 
     pub(super) fn state_serial(&self) -> Option<u64> {
         match self {
-            Self::Verified(plan) => plan.state_serial(),
+            Self::Verified(plan) => plan.plan_file.state_serial,
             Self::NeedsSecretVerification(plan) => plan.plan_file.state_serial,
         }
     }
 
     pub(super) fn data_source_origins(&self) -> &[DataSource] {
         match self {
-            Self::Verified(plan) => plan.data_source_origins(),
+            Self::Verified(plan) => &plan.plan_file.data_source_origins,
             Self::NeedsSecretVerification(plan) => &plan.plan_file.data_source_origins,
         }
     }
+
+    pub(super) fn reload_in_flight_from_locked_state(
+        self,
+        state_file: Option<&carina_state::StateFile>,
+    ) -> Result<ReloadedInspectedPlanFile, AppError> {
+        match self {
+            Self::Verified(plan) => plan
+                .plan_file
+                .reload_in_flight_from_locked_state(state_file)
+                .map(|plan_file| {
+                    ReloadedInspectedPlanFile::Verified(RehydratedPlanFile {
+                        plan_file,
+                        planned_secret_hashes: HashMap::new(),
+                    })
+                })
+                .map_err(AppError::Config),
+            Self::NeedsSecretVerification(plan) => plan
+                .plan_file
+                .reload_in_flight_from_locked_state(state_file)
+                .map(|plan_file| {
+                    ReloadedInspectedPlanFile::NeedsSecretVerification(ReloadedPendingPlanFile {
+                        plan_file,
+                    })
+                })
+                .map_err(AppError::Config),
+        }
+    }
+}
+
+/// Saved-plan state after the only locked-state reload transition.
+pub(super) enum ReloadedInspectedPlanFile {
+    Verified(RehydratedPlanFile),
+    NeedsSecretVerification(ReloadedPendingPlanFile),
 }
 
 /// Deserialized saved plan whose typed placeholders still need fresh desired
@@ -157,16 +193,24 @@ pub(super) struct PendingPlanFile {
     plan_file: PlanFile,
 }
 
-impl PendingPlanFile {
+/// Reloaded saved plan whose desired secret placeholders still need fresh
+/// source values.
+pub(super) struct ReloadedPendingPlanFile {
+    plan_file: ReloadedPlanFile,
+}
+
+impl ReloadedPendingPlanFile {
     pub(super) fn verify_desired(
         self,
         parsed: &carina_core::parser::InferredFile,
         provider_inputs: &ResolvedProviderInputs,
         apply_target: ApplyTarget<'_>,
     ) -> Result<DesiredPlanFile, AppError> {
-        let planned_secret_hashes = planned_secret_hashes(&self.plan_file.sorted_resources);
-        let plan_file = super::rehydrate_desired_plan_file(
-            self.plan_file,
+        let planned_secret_hashes =
+            planned_secret_hashes(&self.plan_file.plan_file().sorted_resources);
+        let mut plan_file = self.plan_file;
+        super::rehydrate_desired_plan_file(
+            plan_file.plan_file_mut(),
             parsed,
             provider_inputs,
             apply_target,
@@ -202,7 +246,7 @@ impl DesiredPlanFile {
         }
     }
 
-    pub(super) fn current_states(&self) -> &[CurrentStateEntry] {
+    pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
         match self {
             Self::Verified(plan) => plan.current_states(),
             Self::NeedsHistoricalVerification(plan) => plan.current_states(),
@@ -212,7 +256,7 @@ impl DesiredPlanFile {
     pub(super) fn historical_resource_addresses(&self) -> HistoricalResourceAddresses {
         let plan = match self {
             Self::Verified(plan) => plan.plan(),
-            Self::NeedsHistoricalVerification(plan) => &plan.plan_file.plan,
+            Self::NeedsHistoricalVerification(plan) => &plan.plan_file.plan_file().plan,
         };
         MovedOrigins::from_plan(plan)
     }
@@ -245,21 +289,21 @@ impl DesiredPlanFile {
 /// configuration have been verified. Historical placeholders may still need
 /// fresh provider reads, so this type deliberately cannot reach the executor.
 pub(super) struct DesiredVerifiedPlanFile {
-    plan_file: PlanFile,
+    plan_file: ReloadedPlanFile,
     planned_secret_hashes: PlannedSecretHashes,
 }
 
 impl DesiredVerifiedPlanFile {
     pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
-        &self.plan_file.provider_configs
+        &self.plan_file.plan_file().provider_configs
     }
 
     pub(super) fn sorted_resources(&self) -> &[Resource] {
-        &self.plan_file.sorted_resources
+        &self.plan_file.plan_file().sorted_resources
     }
 
-    pub(super) fn current_states(&self) -> &[CurrentStateEntry] {
-        &self.plan_file.current_states
+    pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+        self.plan_file.current_states()
     }
 
     /// Verify every historical placeholder against a fresh provider read and
@@ -272,22 +316,26 @@ impl DesiredVerifiedPlanFile {
         historical_addresses: &HistoricalResourceAddresses,
         apply_target: ApplyTarget<'_>,
     ) -> Result<RehydratedPlanFile, AppError> {
-        let redacted_states: HashMap<_, _> = self
-            .plan_file
-            .current_states
-            .iter()
-            .map(|entry| match entry {
-                CurrentStateEntry::Managed { id, current } => {
-                    let state = match current {
-                        carina_core::resource::Current::Absent(state) => state.state(),
-                        carina_core::resource::Current::Present(present) => present.state(),
-                        carina_core::resource::Current::MissingIdentifier(state) => state.state(),
-                    };
-                    (id.clone(), state.clone())
+        let mut redacted_states = HashMap::new();
+        for entry in self.plan_file.current_states() {
+            match entry {
+                ReloadedCurrentStateEntry::Managed { id, current } => match current.as_ref() {
+                    carina_core::resource::Current::Absent(state) => {
+                        redacted_states.insert(id.clone(), state.state().clone());
+                    }
+                    carina_core::resource::Current::Present(present) => {
+                        redacted_states.insert(id.clone(), present.state().clone());
+                    }
+                    carina_core::resource::Current::CreateInFlight(_pending) => {}
+                    carina_core::resource::Current::MissingIdentifier(state) => {
+                        redacted_states.insert(id.clone(), state.state().clone());
+                    }
+                },
+                ReloadedCurrentStateEntry::DataSource { id, state } => {
+                    redacted_states.insert(id.clone(), state.as_ref().clone());
                 }
-                CurrentStateEntry::DataSource { id, state } => (id.clone(), state.clone()),
-            })
-            .collect();
+            }
+        }
         {
             let mut verifier = HistoricalStateVerifier {
                 provider,
@@ -296,10 +344,10 @@ impl DesiredVerifiedPlanFile {
                 historical_addresses,
                 apply_target,
             };
-            for entry in &mut self.plan_file.current_states {
+            for entry in self.plan_file.current_states_mut() {
                 match entry {
-                    CurrentStateEntry::Managed { id, current } => {
-                        let verified = match &*current {
+                    ReloadedCurrentStateEntry::Managed { id, current } => {
+                        let verified = match current.as_ref() {
                             carina_core::resource::Current::Absent(state) => {
                                 verifier.verify(id, state.state(), None).await?
                             }
@@ -308,15 +356,18 @@ impl DesiredVerifiedPlanFile {
                                     .verify(id, present.state(), Some(present.identifier()))
                                     .await?
                             }
+                            carina_core::resource::Current::CreateInFlight(_pending) => None,
                             carina_core::resource::Current::MissingIdentifier(state) => {
                                 verifier.verify(id, state.state(), None).await?
                             }
                         };
-                        if let Some(verified) = verified {
-                            *current.attributes_mut() = verified.attributes;
+                        if let Some(verified) = verified
+                            && let Some(mut state) = current.state_bearing_mut()
+                        {
+                            *state.attributes_mut() = verified.attributes;
                         }
                     }
-                    CurrentStateEntry::DataSource { id, state } => {
+                    ReloadedCurrentStateEntry::DataSource { id, state } => {
                         let identifier = state
                             .identifier
                             .as_deref()
@@ -324,19 +375,20 @@ impl DesiredVerifiedPlanFile {
                         if let Some(verified) =
                             verifier.verify(id, state, identifier.as_ref()).await?
                         {
-                            *state = verified;
+                            **state = verified;
                         }
                     }
                 }
             }
         }
-        self.plan_file.plan =
+        let rehydrated_plan =
             carina_core::value::rehydrate_plan_historical_secrets_from_verified_states(
-                &self.plan_file.plan,
+                &self.plan_file.plan_file().plan,
                 &redacted_states,
                 verified_planned_states,
             )
             .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+        self.plan_file.plan_file_mut().plan = rehydrated_plan;
 
         Ok(RehydratedPlanFile {
             plan_file: self.plan_file,
@@ -350,33 +402,21 @@ impl DesiredVerifiedPlanFile {
 /// The payload is deliberately private to this child module. This is the only
 /// type accepted by the saved-plan executor gateway.
 pub(super) struct RehydratedPlanFile {
-    plan_file: PlanFile,
+    plan_file: ReloadedPlanFile,
     planned_secret_hashes: PlannedSecretHashes,
 }
 
 impl RehydratedPlanFile {
     pub(super) fn plan(&self) -> &Plan {
-        &self.plan_file.plan
+        &self.plan_file.plan_file().plan
     }
 
     pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
-        &self.plan_file.provider_configs
-    }
-
-    pub(super) fn backend_config(&self) -> Option<&BackendConfig> {
-        self.plan_file.backend_config.as_ref()
-    }
-
-    pub(super) fn state_lineage(&self) -> Option<&str> {
-        self.plan_file.state_lineage.as_deref()
-    }
-
-    pub(super) fn state_serial(&self) -> Option<u64> {
-        self.plan_file.state_serial
+        &self.plan_file.plan_file().provider_configs
     }
 
     pub(super) fn sorted_resources(&self) -> &[Resource] {
-        &self.plan_file.sorted_resources
+        &self.plan_file.plan_file().sorted_resources
     }
 
     pub(super) fn planned_secret_hashes(&self) -> &PlannedSecretHashes {
@@ -384,34 +424,34 @@ impl RehydratedPlanFile {
     }
 
     pub(super) fn unresolved_resources(&self) -> &[Resource] {
-        &self.plan_file.unresolved_resources
+        &self.plan_file.plan_file().unresolved_resources
     }
 
     pub(super) fn compositions(&self) -> &[Composition] {
-        &self.plan_file.compositions
+        &self.plan_file.plan_file().compositions
     }
 
     pub(super) fn data_sources(&self) -> &[DataSource] {
-        &self.plan_file.data_sources
+        &self.plan_file.plan_file().data_sources
     }
 
     pub(super) fn data_source_origins(&self) -> &[DataSource] {
-        &self.plan_file.data_source_origins
+        &self.plan_file.plan_file().data_source_origins
     }
 
-    pub(super) fn current_states(&self) -> &[CurrentStateEntry] {
-        &self.plan_file.current_states
+    pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+        self.plan_file.current_states()
     }
 
     pub(super) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
-        &self.plan_file.upstream_snapshot
+        &self.plan_file.plan_file().upstream_snapshot
     }
 
     pub(super) fn upstream_sources(&self) -> &[UpstreamSource] {
-        &self.plan_file.upstream_sources
+        &self.plan_file.plan_file().upstream_sources
     }
 
     pub(super) fn wait_bindings(&self) -> &[PlanWaitBinding] {
-        &self.plan_file.wait_bindings
+        &self.plan_file.plan_file().wait_bindings
     }
 }

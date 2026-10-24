@@ -161,7 +161,7 @@ fn partial_update_records_state_and_next_plan_surfaces_unknown_reason() {
         .find_resource("mock", "test.resource", "r1")
         .expect("updated resource must have a state row");
     assert_eq!(
-        updated.identifier.as_deref(),
+        updated.identifier().map(|value| value.as_str()),
         Some("mock-updated-id"),
         "the updated resource row must contain the identifier returned by update:\n{state_text}"
     );

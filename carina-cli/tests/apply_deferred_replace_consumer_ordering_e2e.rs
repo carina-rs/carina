@@ -93,21 +93,27 @@ provider mock {}
         let mut state = StateFile::new();
         state.serial = 1;
 
-        let mut validation = ResourceState::new("test.resource", "validation_records[0]", "mock")
-            .with_identifier("old-validation-id")
-            .with_attribute("name", serde_json::json!("old-validation-token"))
-            .with_attribute("identifier", serde_json::json!("old-validation-id"));
+        let mut validation = ResourceState::try_applied(
+            "test.resource",
+            "validation_records[0]",
+            "mock",
+            "old-validation-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("name", serde_json::json!("old-validation-token"))
+        .with_attribute("identifier", serde_json::json!("old-validation-id"));
         validation.binding = Some("validation_records[0]".to_string());
         validation.dependency_bindings.insert("cert".to_string());
         state
             .upsert_resource(validation)
             .expect("test state setup must be valid");
 
-        let mut consumer = ResourceState::new("test.resource", "consumer", "mock")
-            .with_identifier("mock-id")
-            .with_attribute("name", serde_json::json!("consumer"))
-            .with_attribute("identifier", serde_json::json!("consumer-id"))
-            .with_attribute("web_acl_arn", serde_json::json!("old-validation-id"));
+        let mut consumer =
+            ResourceState::try_applied("test.resource", "consumer", "mock", "mock-id")
+                .expect("fixture identifier is non-empty")
+                .with_attribute("name", serde_json::json!("consumer"))
+                .with_attribute("identifier", serde_json::json!("consumer-id"))
+                .with_attribute("web_acl_arn", serde_json::json!("old-validation-id"));
         consumer.binding = Some("consumer".to_string());
         consumer
             .dependency_bindings

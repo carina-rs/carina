@@ -55,7 +55,8 @@ impl DestroyCancellationFixture {
             let identity = carina_core::resource::ResourceIdentity::try_from(name.to_owned())
                 .expect("test identity is non-empty");
             let mut resource =
-                ResourceState::new("test.resource", identity, "mock").with_identifier("mock-id");
+                ResourceState::try_applied("test.resource", identity, "mock", "mock-id")
+                    .expect("fixture identifier is non-empty");
             resource.binding = Some(name.to_string());
             resource.set_persisted_attribute("name".to_string(), serde_json::json!(name));
             state
@@ -82,7 +83,8 @@ impl DestroyCancellationFixture {
             let identity = carina_core::resource::ResourceIdentity::try_from(name.to_owned())
                 .expect("test identity is non-empty");
             let mut resource =
-                ResourceState::new("test.resource", identity, "mock").with_identifier("mock-id");
+                ResourceState::try_applied("test.resource", identity, "mock", "mock-id")
+                    .expect("fixture identifier is non-empty");
             resource.binding = Some(name.to_string());
             resource.set_persisted_attribute("name".to_string(), serde_json::json!(name));
             state

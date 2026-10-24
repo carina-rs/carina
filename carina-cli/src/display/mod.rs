@@ -98,6 +98,7 @@ impl Sigil {
         let raw = effect.display_glyph();
         let rendered = match effect {
             Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
+            Effect::ResumeCreate { .. } => raw.cyan().bold(),
             Effect::Update { .. } => raw.yellow().bold(),
             Effect::DeferredReplace(_) => raw.magenta().bold(),
             Effect::Delete { .. } => raw.red().bold(),
@@ -634,6 +635,21 @@ impl<'a> TreeRenderContext<'a> {
                     .unwrap();
                 }
             }
+            Effect::ResumeCreate {
+                resource,
+                started_at,
+            } => {
+                let since = format!("(in flight since {started_at})");
+                writeln!(
+                    self.out,
+                    "{}{} {} {}",
+                    line_prefix,
+                    "resume create".cyan().bold(),
+                    resource.id.human().to_string().cyan().bold(),
+                    since.dimmed(),
+                )
+                .unwrap();
+            }
             Effect::Update { to, .. } => {
                 let id = &to.id;
                 let moved_note = self
@@ -994,6 +1010,7 @@ impl<'a> TreeRenderContext<'a> {
         match effect {
             Effect::Move { to, .. } => !self.update_or_replace_targets.contains(to),
             Effect::Create(_)
+            | Effect::ResumeCreate { .. }
             | Effect::Update { .. }
             | Effect::Delete { .. }
             | Effect::Read { .. }
@@ -2037,6 +2054,9 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
 pub fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
+        Effect::ResumeCreate { resource, .. } => {
+            format!("Resume create {}", resource.id.human())
+        }
         Effect::Update { to, .. } => format!("Update {}", to.id.human()),
         Effect::Delete {
             id,

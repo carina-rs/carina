@@ -278,13 +278,14 @@ mod tests {
             // historical data-source artifacts are removed only after parsing
             // supplies their exact typed `read` addresses (carina#3266).
             s.upsert_resource(
-                ResourceState::new(
+                ResourceState::try_applied(
                     "s3.Bucket",
                     carina_core::resource::ResourceIdentity::try_from(format!("r{i}"))
                         .expect("formatted test identity is non-empty"),
                     "aws",
+                    format!("bucket-{i}"),
                 )
-                .with_identifier(format!("bucket-{i}")),
+                .expect("fixture identifier is non-empty"),
             )
             .expect("test state setup must be valid");
         }

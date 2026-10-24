@@ -64,22 +64,24 @@ let distribution = mock.test.resource {{
 
     fn seed_carina_state(&self) {
         let mut state = StateFile::new();
-        let mut web_acl = ResourceState::new("test.resource", "web_acl", "mock")
-            .with_identifier("web-acl-old-id")
-            .with_attribute("name", serde_json::json!("web-acl-old"))
-            .with_attribute("identifier", serde_json::json!("web-acl-old-id"))
-            .with_attribute("comment", serde_json::json!("v1"));
+        let mut web_acl =
+            ResourceState::try_applied("test.resource", "web_acl", "mock", "web-acl-old-id")
+                .expect("fixture identifier is non-empty")
+                .with_attribute("name", serde_json::json!("web-acl-old"))
+                .with_attribute("identifier", serde_json::json!("web-acl-old-id"))
+                .with_attribute("comment", serde_json::json!("v1"));
         web_acl.binding = Some("web_acl".to_string());
         state
             .upsert_resource(web_acl)
             .expect("test state setup must be valid");
 
-        let mut distribution = ResourceState::new("test.resource", "distribution", "mock")
-            .with_identifier("dist-id")
-            .with_attribute("name", serde_json::json!("dist"))
-            .with_attribute("identifier", serde_json::json!("dist-id"))
-            .with_attribute("comment", serde_json::json!("dist-v1"))
-            .with_attribute("web_acl_arn", serde_json::json!("web-acl-old-id"));
+        let mut distribution =
+            ResourceState::try_applied("test.resource", "distribution", "mock", "dist-id")
+                .expect("fixture identifier is non-empty")
+                .with_attribute("name", serde_json::json!("dist"))
+                .with_attribute("identifier", serde_json::json!("dist-id"))
+                .with_attribute("comment", serde_json::json!("dist-v1"))
+                .with_attribute("web_acl_arn", serde_json::json!("web-acl-old-id"));
         distribution.binding = Some("distribution".to_string());
         distribution
             .dependency_bindings

@@ -17,7 +17,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::non_empty::NonEmptyVec;
-use crate::parser::DeferredForExpression;
+use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::{DataSource, Resource};
@@ -42,6 +42,9 @@ pub enum PlanOp {
 pub enum ScheduleEdge {
     /// This effect must wait for the resource identity to complete.
     DependsOn(ResourceIdentity),
+    /// This effect must wait for the resource identity to complete, and the
+    /// plan is invalid if no current effect owns that identity.
+    RequiredDependsOn(ResourceIdentity),
     /// This effect must complete before the resource identity can proceed.
     BlockedBy(ResourceIdentity),
     /// This effect must complete before the resource identity can proceed, but
@@ -346,6 +349,137 @@ impl From<ChangedCreateOnly> for Vec<String> {
     }
 }
 
+/// Capability to rebind persisted state along a validated move edge.
+///
+/// The route pair is private: callers obtain this value from an
+/// [`Effect::Move`] rather than supplying unchecked `from` and `to` ids to
+/// the state-rebinding APIs.
+#[derive(Debug, Clone, Copy)]
+pub struct MoveAuthority<'a> {
+    from: &'a ResolvedResourceId,
+    to: &'a ResolvedResourceId,
+}
+
+impl MoveAuthority<'_> {
+    pub fn from(&self) -> &ResourceId {
+        self.from.as_inner()
+    }
+
+    pub fn to(&self) -> &ResourceId {
+        self.to.as_inner()
+    }
+
+    /// Project the destination to the routing-free address that an in-flight
+    /// continuation may adopt. Provider-instance routing is deliberately
+    /// absent, so rebinding cannot rewrite the route that issued the create.
+    pub(crate) fn destination_address(&self) -> StateBlockAddress {
+        StateBlockAddress::new(
+            self.to.provider().to_string(),
+            self.to.resource_type().to_string(),
+            self.to.identity().clone(),
+        )
+    }
+}
+
+/// A move whose source and destination identities have both crossed the
+/// resolved-resource boundary. This is the pre-plan form used while state is
+/// being transferred; it mints the same route authority as [`Effect::Move`]
+/// without narrowing a general effect at runtime.
+///
+/// Arbitrary resolved IDs are not sufficient to mint move authority:
+///
+/// ```compile_fail
+/// use carina_core::effect::ResolvedMove;
+/// use carina_core::resource::{ResolvedResourceId, ResourceId};
+///
+/// fn forge(from: ResourceId, to: ResourceId) -> ResolvedMove {
+///     ResolvedMove::new(
+///         ResolvedResourceId::new(from),
+///         ResolvedResourceId::new(to),
+///     )
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMove {
+    from: ResolvedResourceId,
+    to: ResolvedResourceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "resolved move route {resolved_from} -> {resolved_to} does not match moved block {declared_from} -> {declared_to}"
+)]
+pub struct ResolvedMoveMismatch {
+    resolved_from: Box<ResolvedResourceId>,
+    resolved_to: Box<ResolvedResourceId>,
+    declared_from: Box<StateBlockAddress>,
+    declared_to: Box<StateBlockAddress>,
+}
+
+impl ResolvedMove {
+    /// Validate routed source and destination ids against one parsed `moved`
+    /// block, then mint the capability used by state-rebinding APIs.
+    ///
+    /// Provider-instance routing is deliberately inherited from the resolved
+    /// ids because the DSL addresses do not carry it. Provider, resource type,
+    /// and identity must agree with the block on both sides.
+    pub fn from_moved_block(
+        addresses: &MovedAddresses,
+        from: ResolvedResourceId,
+        to: ResolvedResourceId,
+    ) -> Result<Self, ResolvedMoveMismatch> {
+        let declared_from = addresses.from();
+        let declared_to = addresses.to();
+        if !Self::matches_address(&from, &declared_from)
+            || !Self::matches_address(&to, &declared_to)
+        {
+            return Err(ResolvedMoveMismatch {
+                resolved_from: Box::new(from),
+                resolved_to: Box::new(to),
+                declared_from: Box::new(declared_from),
+                declared_to: Box::new(declared_to),
+            });
+        }
+        Ok(Self { from, to })
+    }
+
+    pub(crate) fn from_detected_rename(from: ResolvedResourceId, to: ResolvedResourceId) -> Self {
+        Self { from, to }
+    }
+
+    fn matches_address(resolved: &ResolvedResourceId, declared: &StateBlockAddress) -> bool {
+        resolved.provider() == declared.provider
+            && resolved.resource_type() == declared.resource_type
+            && resolved.identity() == &declared.name
+    }
+
+    pub fn from(&self) -> &ResolvedResourceId {
+        &self.from
+    }
+
+    pub fn to(&self) -> &ResolvedResourceId {
+        &self.to
+    }
+
+    pub fn authority(&self) -> MoveAuthority<'_> {
+        MoveAuthority {
+            from: &self.from,
+            to: &self.to,
+        }
+    }
+
+    pub fn into_parts(self) -> (ResolvedResourceId, ResolvedResourceId) {
+        (self.from, self.to)
+    }
+
+    pub fn into_effect(self) -> Effect {
+        Effect::Move {
+            from: self.from,
+            to: self.to,
+        }
+    }
+}
+
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
@@ -354,6 +488,14 @@ pub enum Effect {
 
     /// Create a new resource
     Create(ResolvedResource),
+
+    /// Resume a create continuation loaded from locked state. The token is
+    /// deliberately absent from the serializable plan and is joined from
+    /// `Current::CreateInFlight` immediately before provider dispatch.
+    ResumeCreate {
+        resource: ResolvedResource,
+        started_at: crate::provider::Timestamp,
+    },
 
     /// Update an existing resource
     Update {
@@ -516,6 +658,10 @@ pub enum BasicEffect<'a> {
         effect: &'a Effect,
         resource: &'a ResolvedResource,
     },
+    ResumeCreate {
+        effect: &'a Effect,
+        resource: &'a ResolvedResource,
+    },
     Update {
         effect: &'a Effect,
         from: &'a State,
@@ -540,6 +686,7 @@ impl<'a> BasicEffect<'a> {
     pub fn as_effect(&self) -> &'a Effect {
         match *self {
             BasicEffect::Create { effect, .. }
+            | BasicEffect::ResumeCreate { effect, .. }
             | BasicEffect::Update { effect, .. }
             | BasicEffect::Delete { effect, .. } => effect,
         }
@@ -547,6 +694,14 @@ impl<'a> BasicEffect<'a> {
 }
 
 impl Effect {
+    /// Mint route-rebinding authority only from a resolved move effect.
+    pub fn move_authority(&self) -> Option<MoveAuthority<'_>> {
+        match self {
+            Self::Move { from, to } => Some(MoveAuthority { from, to }),
+            _ => None,
+        }
+    }
+
     pub const fn replace_display_glyph(create_before_destroy: bool) -> &'static str {
         if create_before_destroy { "+/-" } else { "-/+" }
     }
@@ -582,7 +737,7 @@ impl Effect {
                 }
                 assert_eq!(
                     effects.len(),
-                    10,
+                    11,
                     "display_glyph_effects must list every Effect variant exactly once"
                 );
                 effects
@@ -599,6 +754,14 @@ impl Effect {
             (
                 Effect::Create(ResolvedResource::new(Resource::new("test", "x"))),
                 Effect::Create(_)
+            ),
+            (
+                Effect::ResumeCreate {
+                    resource: ResolvedResource::new(Resource::new("test", "x")),
+                    started_at: crate::provider::Timestamp::try_from("2026-10-23T08:00:00Z")
+                        .expect("valid timestamp"),
+                },
+                Effect::ResumeCreate { .. }
             ),
             (
                 Effect::Update {
@@ -730,6 +893,7 @@ impl Effect {
     pub fn display_glyph(&self) -> &'static str {
         match self {
             Effect::Create(_) => "+",
+            Effect::ResumeCreate { .. } => "↻",
             Effect::Update { .. } => "~",
             Effect::Delete { .. } => "-",
             Effect::Read { .. } => "<=",
@@ -771,6 +935,13 @@ impl Effect {
     pub fn as_basic(&self) -> Option<BasicEffect<'_>> {
         match self {
             Effect::Create(resource) => Some(BasicEffect::Create {
+                effect: self,
+                resource,
+            }),
+            Effect::ResumeCreate {
+                resource,
+                started_at: _started_at,
+            } => Some(BasicEffect::ResumeCreate {
                 effect: self,
                 resource,
             }),
@@ -822,6 +993,7 @@ impl Effect {
         match self {
             Effect::Read { .. } => "read",
             Effect::Create(_) => "create",
+            Effect::ResumeCreate { .. } => "resume_create",
             Effect::Update { .. } => "update",
             Effect::Delete { .. } => "delete",
             Effect::Import { .. } => "import",
@@ -838,6 +1010,7 @@ impl Effect {
         match self {
             Effect::Read { .. } => false,
             Effect::Create(_) => true,
+            Effect::ResumeCreate { .. } => true,
             Effect::Update { .. } => true,
             Effect::Delete { .. } => true,
             Effect::Import { .. } => true,
@@ -854,6 +1027,7 @@ impl Effect {
         match self {
             Effect::Read { .. } => false,
             Effect::Create(_) => false,
+            Effect::ResumeCreate { .. } => false,
             Effect::Update { .. } => false,
             Effect::Delete { .. } => false,
             Effect::Import { .. } => true,
@@ -871,6 +1045,7 @@ impl Effect {
         match self {
             Effect::Read { .. } => false,
             Effect::Create(_) => false,
+            Effect::ResumeCreate { .. } => false,
             Effect::Update { .. } => false,
             Effect::Delete { .. } => false,
             Effect::Import { .. } => false,
@@ -887,6 +1062,7 @@ impl Effect {
         match self {
             Effect::Read { resource } => &resource.id,
             Effect::Create(r) => &r.id,
+            Effect::ResumeCreate { resource, .. } => &resource.id,
             Effect::Update { to, .. } => &to.id,
             Effect::Delete { id, .. } => id,
             Effect::Import { id, .. } => id,
@@ -907,6 +1083,7 @@ impl Effect {
         match self {
             Effect::Read { resource } => resource.identity().clone(),
             Effect::Create(resource) => resource.identity().clone(),
+            Effect::ResumeCreate { resource, .. } => resource.identity().clone(),
             Effect::Update { to, .. } => to.identity().clone(),
             Effect::Delete { id, .. }
             | Effect::Import { id, .. }
@@ -944,6 +1121,9 @@ impl Effect {
     pub fn as_resource_ref(&self) -> Option<crate::parser::ResourceRef<'_>> {
         match self {
             Effect::Create(resource) => Some(crate::parser::ResourceRef::Resource(resource)),
+            Effect::ResumeCreate { resource, .. } => {
+                Some(crate::parser::ResourceRef::Resource(resource))
+            }
             Effect::Update { to, .. } => Some(crate::parser::ResourceRef::Resource(to)),
             Effect::Read { resource } => Some(crate::parser::ResourceRef::DataSource(resource)),
             Effect::Delete { .. }
@@ -961,6 +1141,7 @@ impl Effect {
         match self {
             Effect::Read { resource } => resource.binding.clone(),
             Effect::Create(resource) => resource.binding.clone(),
+            Effect::ResumeCreate { resource, .. } => resource.binding.clone(),
             Effect::Update { to, .. } => to.binding.clone(),
             Effect::Delete { binding, .. } => binding.clone(),
             Effect::Import { .. } => None,
@@ -992,6 +1173,7 @@ impl Effect {
         match self {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
+            Effect::ResumeCreate { .. } => Vec::new(),
             Effect::Update { .. } => Vec::new(),
             Effect::Delete {
                 id,
@@ -1031,6 +1213,7 @@ impl Effect {
         match self {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
+            Effect::ResumeCreate { .. } => Vec::new(),
             Effect::Update { .. } => Vec::new(),
             Effect::Delete {
                 id,
@@ -1080,6 +1263,9 @@ impl Effect {
         match self {
             Effect::Read { resource } => resource.directives.depends_on.iter().cloned().collect(),
             Effect::Create(resource) => resource.directives.depends_on.iter().cloned().collect(),
+            Effect::ResumeCreate { resource, .. } => {
+                resource.directives.depends_on.iter().cloned().collect()
+            }
             Effect::Update { to, .. } => to.directives.depends_on.iter().cloned().collect(),
             Effect::Delete {
                 explicit_dependencies,
@@ -1130,6 +1316,7 @@ impl Effect {
             }
             Effect::Read { .. }
             | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
             | Effect::Update { .. }
             | Effect::Delete { .. }
             | Effect::Import { .. }
@@ -1175,7 +1362,7 @@ impl Effect {
                     blocked_by_updates
                         .iter()
                         .cloned()
-                        .map(ScheduleEdge::DependsOn),
+                        .map(ScheduleEdge::RequiredDependsOn),
                 );
                 edges
             }
@@ -1188,6 +1375,7 @@ impl Effect {
             }
             Effect::Read { .. }
             | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
             | Effect::Update { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
@@ -1210,6 +1398,7 @@ impl Effect {
                 .collect(),
             Effect::Read { .. }
             | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
             | Effect::Update { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
@@ -1299,6 +1488,32 @@ mod tests {
     use std::collections::HashSet;
 
     const EFFECT_VARIANT_COUNT: usize = 10;
+
+    #[test]
+    fn resolved_move_requires_routes_matching_the_moved_block() {
+        let addresses = MovedAddresses::new("awscc", "s3.Bucket", "old", "new");
+        let from = ResolvedResourceId::with_provider_identity(
+            "awscc",
+            "s3.Bucket",
+            "old",
+            Some("source".to_string()),
+        );
+        let to = ResolvedResourceId::with_provider_identity(
+            "awscc",
+            "s3.Bucket",
+            "new",
+            Some("destination".to_string()),
+        );
+
+        let validated = ResolvedMove::from_moved_block(&addresses, from.clone(), to)
+            .expect("routing instances may differ while the declared addresses agree");
+        assert_eq!(validated.from().provider_instance(), Some("source"));
+        assert_eq!(validated.to().provider_instance(), Some("destination"));
+
+        let wrong_to =
+            ResolvedResourceId::with_provider_identity("awscc", "s3.Bucket", "another", None);
+        assert!(ResolvedMove::from_moved_block(&addresses, from, wrong_to).is_err());
+    }
 
     fn deferred_for_template() -> crate::parser::DeferredForExpression {
         crate::parser::DeferredForExpression {

@@ -66,7 +66,7 @@ pub fn compute_full_diff_patch(
 /// Result of executing a single effect.
 pub(super) enum SingleEffectResult {
     /// Create/Update/Delete completed (wraps BasicEffectResult)
-    Basic(BasicEffectResult),
+    Basic(Box<BasicEffectResult>),
     ReadNoOp,
     /// Apply-time data-source read outcome. Successful reads publish
     /// their returned state under the data-source binding before

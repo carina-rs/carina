@@ -2,11 +2,16 @@
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::differ::Orphan;
+use carina_core::effect::MoveAuthority;
 use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
 pub use carina_core::provider::PreviousSecretHashAuthority;
-use carina_core::provider::{PersistedAttributes, PersistedAttributesError, RawSavedAttrs};
+use carina_core::provider::{
+    AppliedIdentifier, EmptyAppliedIdentifier, InFlightCreate, InFlightPersistence, Observation,
+    ObservedCreate, PersistedAttributes, PersistedAttributesError, RawSavedAttrs, Sent, SentRecord,
+    StateRowInFlightCreate, StateTransformMap, previous_hash,
+};
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, Directives, PartialReadMarker, ResolvedResource, Resource,
@@ -34,6 +39,8 @@ pub enum ResourceStateEncodingError {
     Serialization(#[from] SerializationError),
     #[error(transparent)]
     PersistedAttributes(#[from] PersistedAttributesError),
+    #[error("provider reported sent create attributes outside the checked request: {attributes:?}")]
+    InvalidSentAttributes { attributes: Vec<String> },
 }
 
 /// The main state file structure that persists to the backend
@@ -69,6 +76,7 @@ impl LoadedOrphans {
         let id = match orphan.current() {
             Current::Absent(state) => state.state().id.clone(),
             Current::Present(present) => present.state().id.clone(),
+            Current::CreateInFlight(pending) => pending.id().clone(),
             Current::MissingIdentifier(state) => state.state().id.clone(),
         };
         self.by_id.insert(id, orphan);
@@ -195,7 +203,8 @@ impl StateFile {
                         .unwrap_or("<missing>")
                         .to_owned();
                     let identifier = value
-                        .get("identifier")
+                        .get("current")
+                        .and_then(|current| current.get("identifier"))
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned);
                     return Err(StateFileDecodeError::InvalidResourceIdentity(
@@ -265,7 +274,9 @@ impl StateFile {
     ///      user map keys beginning with `$` are escaped with one extra `$`.
     /// v14: Redacted secrets use the host-reserved `$secret` tag. Legacy
     ///      marker strings are migrated only in resource attribute trees.
-    pub const CURRENT_VERSION: u32 = 14;
+    /// v15: Current instance is a tagged union. An applied identifier and a
+    ///      pending create continuation cannot coexist in one row.
+    pub const CURRENT_VERSION: u32 = 15;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -297,12 +308,14 @@ impl StateFile {
     /// ```
     /// use carina_state::StateFile;
     ///
+    /// use carina_core::provider::AppliedIdentifier;
+    ///
     /// let state = StateFile::with_managed_state_bucket(
     ///     "aws",
     ///     "s3.Bucket",
     ///     "aws_s3_bucket_a3f2b1c8",
-    ///     "my-state-bucket",
-    /// );
+    ///     AppliedIdentifier::new("my-state-bucket").unwrap(),
+    /// ).unwrap();
     /// assert_eq!(state.resources().len(), 1);
     /// assert_eq!(state.resources()[0].identity.as_str(), "aws_s3_bucket_a3f2b1c8");
     /// ```
@@ -310,18 +323,16 @@ impl StateFile {
         provider: impl Into<String>,
         resource_type: impl Into<String>,
         resource_identity: impl Into<ResourceIdentity>,
-        bucket_name: impl Into<String>,
-    ) -> Self {
+        bucket_name: AppliedIdentifier,
+    ) -> Result<Self, ResourceStateEncodingError> {
         let mut state = Self::new();
-        state
-            .upsert_resource(ResourceState::managed_state_bucket(
-                provider,
-                resource_type,
-                resource_identity,
-                bucket_name,
-            ))
-            .expect("fresh state file cannot contain duplicates");
-        state
+        state.resources.push(ResourceState::managed_state_bucket(
+            provider,
+            resource_type,
+            resource_identity,
+            bucket_name,
+        )?);
+        Ok(state)
     }
 
     /// Create a new state file with a specific lineage (for initialization)
@@ -574,7 +585,9 @@ impl StateFile {
         let mut result = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            result.insert(id, rs.persisted_attributes().clone());
+            if let Some(attributes) = rs.persisted_attributes() {
+                result.insert(id, attributes.clone());
+            }
         }
         RawSavedAttrs::from_persisted(result)
     }
@@ -589,13 +602,16 @@ impl StateFile {
         let data_source_ids: HashSet<_> = data_sources.iter().map(|source| &source.id).collect();
         let original_len = self.resources.len();
         self.resources.retain(|row| {
-            row.identifier.is_some() || !data_source_ids.contains(&Self::id_for_resource_state(row))
+            matches!(
+                row.current(),
+                CurrentInstance::Applied { .. } | CurrentInstance::CreateInFlight { .. }
+            ) || !data_source_ids.contains(&Self::id_for_resource_state(row))
         });
         original_len - self.resources.len()
     }
 
     /// Restore partial-read markers from the state file onto refreshed states.
-    pub fn restore_partial_read_markers(&self, states: &mut HashMap<ResourceId, State>) {
+    pub fn restore_partial_read_markers(&self, states: &mut StateTransformMap) {
         for (id, current) in states.iter_mut() {
             if !current.exists {
                 current.partial_read = None;
@@ -604,7 +620,8 @@ impl StateFile {
             let marker = id
                 .identity_str()
                 .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity))
-                .and_then(|rs| rs.partial_read.clone());
+                .and_then(ResourceState::partial_read)
+                .cloned();
             if let Some(mut marker) = marker {
                 marker
                     .missing_attributes
@@ -635,13 +652,10 @@ impl StateFile {
 
     /// Load the current-instance state for a managed resource.
     ///
-    /// Missing and empty identifiers are returned as the typed
-    /// [`Current::MissingIdentifier`] condition. A row whose
-    /// current instance is absent but which retains deposed generations is the
-    /// sole legitimate identifier-less row and returns [`Current::Absent`].
-    /// Such a shell must have no current-instance attributes, binding, or
-    /// related metadata; otherwise it is a malformed current instance rather
-    /// than a shell.
+    /// Missing and empty identifiers in [`CurrentInstance::MissingIdentifier`]
+    /// are returned as the typed [`Current::MissingIdentifier`] condition.
+    /// [`CurrentInstance::None`] always means that the current instance is
+    /// absent; address metadata and deposed generations do not reclassify it.
     /// Data sources never enter `StateFile::resources`; their provider results
     /// are transient and therefore are not a second identifier-less row kind.
     pub fn build_state_for_resource(&self, id: &ResourceId) -> Current {
@@ -651,19 +665,37 @@ impl StateFile {
         let Some(rs) = rs else {
             return Current::absent(id.clone());
         };
-        if !rs.has_current_instance() {
-            return Current::absent(id.clone());
+        match rs.current() {
+            CurrentInstance::None => Current::absent(id.clone()),
+            CurrentInstance::Applied {
+                identifier,
+                attributes,
+                partial_read,
+                ..
+            } => Current::from_state(State {
+                id: id.clone(),
+                identifier: Some(identifier.as_str().to_string()),
+                attributes: attributes.to_values(),
+                exists: true,
+                dependency_bindings: rs.dependency_bindings.clone(),
+                partial_read: partial_read.clone(),
+            }),
+            CurrentInstance::CreateInFlight { pending } => {
+                Current::create_in_flight(pending.clone())
+            }
+            CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes: _write_only_attributes,
+                partial_read,
+            } => Current::from_state(State {
+                id: id.clone(),
+                identifier: None,
+                attributes: attributes.to_values(),
+                exists: true,
+                dependency_bindings: rs.dependency_bindings.clone(),
+                partial_read: partial_read.clone(),
+            }),
         }
-
-        let state = State {
-            id: id.clone(),
-            identifier: rs.identifier.clone(),
-            attributes: rs.persisted_attributes().to_values(),
-            exists: true,
-            dependency_bindings: rs.dependency_bindings.clone(),
-            partial_read: rs.partial_read.clone(),
-        };
-        Current::from_state(state)
     }
 
     /// Build each persisted orphan as one typed value containing its
@@ -682,6 +714,9 @@ impl StateFile {
                 Current::Absent(_state) => continue,
                 Current::Present(present) => {
                     Orphan::present(present, rs.binding.clone(), rs.directives.clone())
+                }
+                Current::CreateInFlight(pending) => {
+                    Orphan::create_in_flight(pending, rs.binding.clone(), rs.directives.clone())
                 }
                 Current::MissingIdentifier(state) => {
                     Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
@@ -803,6 +838,111 @@ impl StateFile {
             None
         }
     }
+
+    /// Remove the entire persisted row, including deposed generations.
+    ///
+    /// This is reserved for address moves after the complete row has already
+    /// been written at its destination. Ordinary current-instance cleanup must
+    /// use [`Self::remove_resource`] so historical generations stay tracked.
+    pub fn remove_resource_row(
+        &mut self,
+        provider: &str,
+        resource_type: &str,
+        identity: &str,
+    ) -> Option<ResourceState> {
+        let pos = self.resources.iter().position(|resource| {
+            resource.provider == provider
+                && resource.resource_type == resource_type
+                && resource.identity.as_str() == identity
+        })?;
+        Some(self.resources.remove(pos))
+    }
+
+    /// Complete one validated address move after all writes and successful
+    /// deposed-generation Deletes for the apply have been recorded.
+    ///
+    /// The destination's current instance and address metadata win. Every
+    /// still-live deposed generation remaining at the source is merged into
+    /// that destination before the source row is removed. If no destination
+    /// row was written (for example, a resumed create ended), a deposed-only
+    /// destination shell is derived from the source row. Accepting only
+    /// [`MoveAuthority`] keeps this destructive whole-row cleanup coupled to
+    /// a validated move edge.
+    pub fn complete_resource_move(
+        &mut self,
+        authority: MoveAuthority<'_>,
+    ) -> Result<Option<ResourceState>, BackendError> {
+        let from = authority.from();
+        let to = authority.to();
+        let Some(from_identity) = from.identity() else {
+            return Ok(None);
+        };
+        let Some(to_identity) = to.identity() else {
+            return Ok(None);
+        };
+        let Some(source) = self
+            .find_resource(&from.provider, &from.resource_type, from_identity.as_str())
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        // Build the complete result on a clone so a conflicting historical
+        // generation cannot leave the caller with a half-applied move.
+        let mut next = self.clone();
+        next.remove_resource_row(&from.provider, &from.resource_type, from_identity.as_str());
+
+        if !source.deposed.is_empty() {
+            let mut destination = next
+                .find_resource(&to.provider, &to.resource_type, to_identity.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut shell = source.clone();
+                    shell.provider = to.provider.clone();
+                    shell.resource_type = to.resource_type.clone();
+                    shell.identity = to_identity.clone();
+                    shell.directives.provider_instance = to.provider_instance.clone();
+                    shell.current = CurrentInstance::None;
+                    shell.deposed.clear();
+                    shell
+                });
+            merge_deposed_generations(&mut destination, source.deposed.clone())
+                .map_err(BackendError::InvalidState)?;
+            remove_current_identifier_from_deposed(&mut destination);
+            next.upsert_resource(destination)?;
+        }
+
+        *self = next;
+        Ok(Some(source))
+    }
+
+    /// Clear only the current instance after a provider verdict says a
+    /// recorded create ended without a resource.
+    ///
+    /// If deposed generations remain, retain every address-level field
+    /// byte-for-byte. Those generations still belong to this address, and a
+    /// later writeback must not lose routing, dependency, or name-override
+    /// metadata merely because the replacement create ended. With no
+    /// deposed generations there is no remaining row to retain.
+    pub fn clear_current_instance_preserving_address_metadata(
+        &mut self,
+        provider: &str,
+        resource_type: &str,
+        identity: &str,
+    ) -> Option<ResourceState> {
+        let pos = self.resources.iter().position(|resource| {
+            resource.provider == provider
+                && resource.resource_type == resource_type
+                && resource.identity.as_str() == identity
+        })?;
+        if self.resources[pos].deposed.is_empty() {
+            return Some(self.resources.remove(pos));
+        }
+
+        let previous = self.resources[pos].clone();
+        self.resources[pos].current = CurrentInstance::None;
+        Some(previous)
+    }
 }
 
 impl Default for StateFile {
@@ -897,7 +1037,11 @@ fn merge_deposed_generations(
 }
 
 fn remove_current_identifier_from_deposed(resource: &mut ResourceState) {
-    if let Some(identifier) = resource.identifier.as_deref() {
+    if let Some(identifier) = resource
+        .identifier()
+        .map(AppliedIdentifier::as_str)
+        .map(str::to_owned)
+    {
         let provider_instance = resource.directives.provider_instance.clone();
         resource.deposed.retain(|deposed| {
             deposed.identifier != identifier || deposed.provider_instance != provider_instance
@@ -1119,8 +1263,9 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             } else {
                 None
             };
-            let parse_content = migrated_v13.as_deref().unwrap_or(pre_secret_migration);
-            let mut state = StateFile::from_json_str(parse_content)
+            let pre_current_migration = migrated_v13.as_deref().unwrap_or(pre_secret_migration);
+            let migrated_v14 = migrate_v14_current_instance(pre_current_migration)?;
+            let mut state = StateFile::from_json_str(&migrated_v14)
                 .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
             // v5 → v6: lift the flat `desired_keys: Vec<String>` field
             // (already discarded by serde because the v6 struct no longer
@@ -1267,6 +1412,64 @@ impl DeposedInstance {
     }
 }
 
+/// The mutually exclusive state of a row's current resource instance.
+///
+/// The tagged shape is the persistence invariant for state v15: an applied
+/// identifier and provider continuation token cannot be represented together.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CurrentInstance {
+    /// The row retains only deposed generations.
+    None,
+    /// A completed resource instance.
+    Applied {
+        identifier: AppliedIdentifier,
+        attributes: PersistedAttributes,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        write_only_attributes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial_read: Option<PartialReadMarker>,
+    },
+    /// A create operation accepted by the provider but not yet ended.
+    CreateInFlight {
+        #[serde(flatten)]
+        pending: InFlightCreate,
+    },
+    /// A legacy current instance whose provider identifier is absent.
+    MissingIdentifier {
+        attributes: PersistedAttributes,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        write_only_attributes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial_read: Option<PartialReadMarker>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum EncodedCurrentInstance {
+    None,
+    Applied {
+        identifier: AppliedIdentifier,
+        attributes: HashMap<String, serde_json::Value>,
+        #[serde(default)]
+        write_only_attributes: Vec<String>,
+        #[serde(default)]
+        partial_read: Option<PartialReadMarker>,
+    },
+    CreateInFlight {
+        envelope: serde_json::Value,
+        started_at: serde_json::Value,
+    },
+    MissingIdentifier {
+        attributes: HashMap<String, serde_json::Value>,
+        #[serde(default)]
+        write_only_attributes: Vec<String>,
+        #[serde(default)]
+        partial_read: Option<PartialReadMarker>,
+    },
+}
+
 /// State of a single managed resource.
 ///
 /// Persisted attributes cannot be read as ordinary JSON values. Callers must
@@ -1288,13 +1491,8 @@ pub struct ResourceState {
     pub identity: ResourceIdentity,
     /// Provider name (e.g., "aws")
     pub provider: String,
-    /// AWS internal identifier (e.g., vpc-xxx, subnet-xxx).
-    /// `None` is valid only for a deposed-only shell with no current instance;
-    /// otherwise the loader surfaces a missing-provider-identifier condition.
-    #[serde(default)]
-    pub identifier: Option<String>,
-    /// Attributes in their state-file JSON representation.
-    attributes: PersistedAttributes,
+    /// The current resource instance, if any.
+    current: CurrentInstance,
     /// Old replacement generations that still need a successful Delete.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deposed: Vec<DeposedInstance>,
@@ -1337,15 +1535,24 @@ pub struct ResourceState {
     /// duplicates and re-serializing in sorted order on next write).
     #[serde(default)]
     pub dependency_bindings: BTreeSet<String>,
-    /// Attribute names that are write-only (not returned by the provider API).
-    /// Their values are persisted from the user's desired state so that changes
-    /// to write-only attributes can be detected on subsequent plans.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub write_only_attributes: Vec<String>,
-    /// Marker for a state produced by a partial-success create.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partial_read: Option<PartialReadMarker>,
 }
+
+/// Owned resource row proven not to contain a create continuation.
+#[derive(Debug)]
+pub struct WritableResourceState(ResourceState);
+
+/// An attempted writable projection that retained its in-flight row.
+#[derive(Debug)]
+pub struct CreateInFlightResourceState(Box<ResourceState>);
+
+impl CreateInFlightResourceState {
+    pub fn into_inner(self) -> ResourceState {
+        *self.0
+    }
+}
+
+/// Borrowed resource row proven not to contain a create continuation.
+pub struct RefreshableResourceState<'a>(&'a ResourceState);
 
 #[derive(Deserialize)]
 struct EncodedDeposedInstance {
@@ -1363,9 +1570,7 @@ struct EncodedResourceState {
     #[serde(alias = "name")]
     identity: ResourceIdentity,
     provider: String,
-    attributes: HashMap<String, serde_json::Value>,
-    #[serde(default)]
-    identifier: Option<String>,
+    current: EncodedCurrentInstance,
     #[serde(default)]
     deposed: Vec<EncodedDeposedInstance>,
     #[serde(default)]
@@ -1382,17 +1587,47 @@ struct EncodedResourceState {
     binding: Option<String>,
     #[serde(default)]
     dependency_bindings: BTreeSet<String>,
-    #[serde(default)]
-    write_only_attributes: Vec<String>,
-    #[serde(default)]
-    partial_read: Option<PartialReadMarker>,
 }
 
 impl<'de> Deserialize<'de> for ResourceState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let encoded = EncodedResourceState::deserialize(deserializer)?;
-        let attributes = PersistedAttributes::from_encoded(encoded.attributes)
-            .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?;
+        let row = serde_json::Value::deserialize(deserializer)?;
+        let encoded = serde_json::from_value::<EncodedResourceState>(row.clone())
+            .map_err(serde::de::Error::custom)?;
+        let current = match encoded.current {
+            EncodedCurrentInstance::None => CurrentInstance::None,
+            EncodedCurrentInstance::Applied {
+                identifier,
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => CurrentInstance::Applied {
+                identifier,
+                attributes: PersistedAttributes::from_encoded(attributes)
+                    .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
+                write_only_attributes,
+                partial_read,
+            },
+            EncodedCurrentInstance::CreateInFlight {
+                envelope: _envelope,
+                started_at: _started_at,
+            } => {
+                let pending = serde_json::from_value::<StateRowInFlightCreate>(row)
+                    .map_err(serde::de::Error::custom)?
+                    .into_inner();
+                CurrentInstance::CreateInFlight { pending }
+            }
+            EncodedCurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => CurrentInstance::MissingIdentifier {
+                attributes: PersistedAttributes::from_encoded(attributes)
+                    .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
+                write_only_attributes,
+                partial_read,
+            },
+        };
         let deposed = encoded
             .deposed
             .into_iter()
@@ -1411,8 +1646,7 @@ impl<'de> Deserialize<'de> for ResourceState {
             resource_type: encoded.resource_type,
             identity: encoded.identity,
             provider: encoded.provider,
-            identifier: encoded.identifier,
-            attributes,
+            current,
             deposed,
             protected: encoded.protected,
             directives: encoded.directives,
@@ -1421,8 +1655,6 @@ impl<'de> Deserialize<'de> for ResourceState {
             explicit: encoded.explicit,
             binding: encoded.binding,
             dependency_bindings: encoded.dependency_bindings,
-            write_only_attributes: encoded.write_only_attributes,
-            partial_read: encoded.partial_read,
         })
     }
 }
@@ -1450,32 +1682,154 @@ fn refreshed_explicit_without_desired_values(
     }
 }
 
+impl WritableResourceState {
+    pub fn with_attributes_from_state(
+        mut self,
+        state: &State,
+    ) -> Result<ResourceState, ResourceStateEncodingError> {
+        let previous = self.0.persisted_attributes().cloned().unwrap_or_default();
+        let encoded = state
+            .attributes
+            .iter()
+            .filter_map(|(key, value)| {
+                PersistedValue::encode_provider_value(value, previous.encoded_value(key))
+                    .ok()
+                    .map(|value| (key.clone(), value))
+            })
+            .collect();
+        let attributes = PersistedAttributes::from_persisted_values(encoded)?;
+        self.0.current = match state
+            .identifier
+            .as_deref()
+            .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
+        {
+            Some(identifier) => CurrentInstance::Applied {
+                identifier,
+                attributes,
+                write_only_attributes: Vec::new(),
+                partial_read: state.partial_read.clone(),
+            },
+            None => CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes: Vec::new(),
+                partial_read: state.partial_read.clone(),
+            },
+        };
+        Ok(self.0)
+    }
+}
+
+impl RefreshableResourceState<'_> {
+    /// Replace the provider-observed portion of an orphan row while retaining
+    /// every host-owned field from the existing state entry.
+    pub fn refreshed_from_provider_state(
+        self,
+        state: &State,
+        schema: Option<&ResourceSchema>,
+    ) -> Result<ResourceState, ResourceStateEncodingError> {
+        let source = self.0;
+        let mut refreshed = source.clone();
+        let previous = source.persisted_attributes().cloned().unwrap_or_default();
+
+        let mut serialized = HashMap::new();
+        for (key, value) in &state.attributes {
+            serialized.insert(
+                key.clone(),
+                PersistedValue::encode_provider_value(value, previous.encoded_value(key))?,
+            );
+        }
+        let attributes = PersistedAttributes::from_persisted_values(serialized)?
+            .protect_for_orphan_refresh(schema, &previous);
+        refreshed.current = match state
+            .identifier
+            .as_deref()
+            .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
+        {
+            Some(identifier) => CurrentInstance::Applied {
+                identifier,
+                attributes,
+                write_only_attributes: source.write_only_attributes().to_vec(),
+                partial_read: state.partial_read.clone(),
+            },
+            None => CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes: source.write_only_attributes().to_vec(),
+                partial_read: state.partial_read.clone(),
+            },
+        };
+        refreshed.explicit =
+            refreshed_explicit_without_desired_values(Some(&source.explicit), &state.attributes);
+        Ok(refreshed)
+    }
+}
+
 impl ResourceState {
-    /// Borrow this row's attributes through the persisted decode seam.
-    pub fn persisted_attributes(&self) -> &PersistedAttributes {
-        &self.attributes
+    /// Borrow the typed current-instance payload.
+    pub fn current(&self) -> &CurrentInstance {
+        &self.current
+    }
+
+    /// Borrow persisted resource attributes when this row has an attribute-
+    /// bearing current instance. In-flight and deposed-only rows deliberately
+    /// return `None` rather than presenting a continuation envelope as state.
+    pub fn persisted_attributes(&self) -> Option<&PersistedAttributes> {
+        match &self.current {
+            CurrentInstance::Applied { attributes, .. }
+            | CurrentInstance::MissingIdentifier { attributes, .. } => Some(attributes),
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => None,
+        }
+    }
+
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        match &self.current {
+            CurrentInstance::Applied { identifier, .. } => Some(identifier),
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::MissingIdentifier { .. } => None,
+        }
+    }
+
+    pub fn write_only_attributes(&self) -> &[String] {
+        match &self.current {
+            CurrentInstance::Applied {
+                write_only_attributes,
+                ..
+            }
+            | CurrentInstance::MissingIdentifier {
+                write_only_attributes,
+                ..
+            } => write_only_attributes,
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => &[],
+        }
+    }
+
+    pub fn partial_read(&self) -> Option<&PartialReadMarker> {
+        match &self.current {
+            CurrentInstance::Applied { partial_read, .. }
+            | CurrentInstance::MissingIdentifier { partial_read, .. } => partial_read.as_ref(),
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => None,
+        }
     }
 
     /// Whether this row contains a current instance in addition to any
     /// historical deposed generations.
     ///
-    /// An identifier-less row is still a malformed current instance unless it
-    /// has the exact deposed-only shell shape produced by state writeback.
+    /// Address-level metadata and deposed generations do not change the typed
+    /// current-instance state.
     pub fn has_current_instance(&self) -> bool {
-        !self.is_deposed_only_shell()
+        !matches!(self.current, CurrentInstance::None)
     }
 
-    /// Whether this row contains only deposed generations and no current
-    /// instance. This mirrors the exact shell shape produced by
-    /// [`StateFile::remove_resource`] and [`StateFile::upsert_deposed_generation`].
+    /// Whether this row is the minimal shell produced solely to retain
+    /// deposed generations. This controls removal of an empty shell only; it
+    /// must not be used to classify [`CurrentInstance::None`] while loading.
     fn is_deposed_only_shell(&self) -> bool {
         let shell_directives = Directives {
             provider_instance: self.directives.provider_instance.clone(),
             ..Directives::default()
         };
-        self.identifier.is_none()
+        matches!(self.current, CurrentInstance::None)
             && !self.deposed.is_empty()
-            && self.attributes.is_empty()
             && !self.protected
             && self.directives == shell_directives
             && self.prefixes.is_empty()
@@ -1483,8 +1837,6 @@ impl ResourceState {
             && is_empty_explicit(&self.explicit)
             && self.binding.is_none()
             && self.dependency_bindings.is_empty()
-            && self.write_only_attributes.is_empty()
-            && self.partial_read.is_none()
     }
 
     /// Set one raw persisted attribute in tests.
@@ -1493,33 +1845,83 @@ impl ResourceState {
     pub fn set_persisted_attribute(&mut self, key: impl Into<String>, value: serde_json::Value) {
         let key = key.into();
         let upgraded = persisted_attributes_from_test_json(HashMap::from([(key.clone(), value)]));
-        self.attributes.extend(upgraded);
+        match &mut self.current {
+            CurrentInstance::Applied { attributes, .. }
+            | CurrentInstance::MissingIdentifier { attributes, .. } => attributes.extend(upgraded),
+            CurrentInstance::None => {
+                self.current = CurrentInstance::MissingIdentifier {
+                    attributes: upgraded,
+                    write_only_attributes: Vec::new(),
+                    partial_read: None,
+                };
+            }
+            CurrentInstance::CreateInFlight { .. } => {
+                panic!("cannot add resource attributes to an in-flight row")
+            }
+        }
+    }
+
+    /// Replace current-instance write-only metadata in fixtures.
+    #[cfg(test)]
+    pub(crate) fn set_write_only_attributes_for_test(&mut self, value: Vec<String>) {
+        match &mut self.current {
+            CurrentInstance::Applied {
+                write_only_attributes,
+                ..
+            }
+            | CurrentInstance::MissingIdentifier {
+                write_only_attributes,
+                ..
+            } => *write_only_attributes = value,
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {
+                panic!("test fixture has no attribute-bearing current instance")
+            }
+        }
+    }
+
+    /// Replace current-instance partial-read metadata in fixtures.
+    #[cfg(test)]
+    pub(crate) fn set_partial_read_for_test(&mut self, value: Option<PartialReadMarker>) {
+        match &mut self.current {
+            CurrentInstance::Applied { partial_read, .. }
+            | CurrentInstance::MissingIdentifier { partial_read, .. } => *partial_read = value,
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {
+                panic!("test fixture has no attribute-bearing current instance")
+            }
+        }
     }
 
     /// Render the sorted attribute map for `carina state show` without
     /// exposing the encoded values to value-layer callers.
     pub fn format_attributes_for_state_show(&self) -> String {
-        let sorted: std::collections::BTreeMap<String, serde_json::Value> =
-            self.attributes.to_decoded_json().into_iter().collect();
+        let sorted: std::collections::BTreeMap<String, serde_json::Value> = self
+            .persisted_attributes()
+            .map(PersistedAttributes::to_decoded_json)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         serde_json::to_string_pretty(&sorted).expect("state JSON values are serializable")
     }
 
     /// Render one stored attribute for `carina state show`.
     pub fn format_attribute_for_state_show(&self, key: &str, json_output: bool) -> Option<String> {
-        self.attributes.decoded_json_value(key).map(|value| {
-            if json_output {
-                serde_json::to_string_pretty(&value).expect("state JSON values are serializable")
-            } else {
-                match &value {
-                    serde_json::Value::String(value) => value.clone(),
-                    serde_json::Value::Bool(value) => value.to_string(),
-                    serde_json::Value::Number(value) => value.to_string(),
-                    serde_json::Value::Null => "null".to_string(),
-                    other => serde_json::to_string_pretty(other)
-                        .expect("state JSON values are serializable"),
+        self.persisted_attributes()?
+            .decoded_json_value(key)
+            .map(|value| {
+                if json_output {
+                    serde_json::to_string_pretty(&value)
+                        .expect("state JSON values are serializable")
+                } else {
+                    match &value {
+                        serde_json::Value::String(value) => value.clone(),
+                        serde_json::Value::Bool(value) => value.to_string(),
+                        serde_json::Value::Number(value) => value.to_string(),
+                        serde_json::Value::Null => "null".to_string(),
+                        other => serde_json::to_string_pretty(other)
+                            .expect("state JSON values are serializable"),
+                    }
                 }
-            }
-        })
+            })
     }
 
     /// Render current and deposed generations for `carina state show`.
@@ -1530,13 +1932,30 @@ impl ResourceState {
             serde_json::to_value(sorted).expect("state JSON values are serializable")
         }
 
-        let current = if self.is_deposed_only_shell() {
-            serde_json::Value::Null
-        } else {
-            serde_json::json!({
-                "identifier": self.identifier.as_ref(),
-                "attributes": sorted_attributes(&self.attributes),
-            })
+        let current = match &self.current {
+            CurrentInstance::None => serde_json::Value::Null,
+            CurrentInstance::Applied {
+                identifier,
+                attributes,
+                ..
+            } => serde_json::json!({
+                "status": "applied",
+                "identifier": identifier.as_str(),
+                "attributes": sorted_attributes(attributes),
+            }),
+            CurrentInstance::CreateInFlight { pending } => serde_json::json!({
+                "status": "create_in_flight",
+                "started_at": pending.started_at().as_str(),
+            }),
+            CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes: _write_only_attributes,
+                partial_read: _partial_read,
+            } => serde_json::json!({
+                "status": "missing_identifier",
+                "identifier": serde_json::Value::Null,
+                "attributes": sorted_attributes(attributes),
+            }),
         };
         let deposed: Vec<_> = self
             .deposed
@@ -1571,8 +1990,7 @@ impl ResourceState {
             resource_type,
             identity,
             provider,
-            identifier: None,
-            attributes: PersistedAttributes::default(),
+            current: CurrentInstance::None,
             deposed: Vec::new(),
             protected: false,
             directives: Directives::default(),
@@ -1581,15 +1999,67 @@ impl ResourceState {
             explicit: ExplicitFields::default(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
-            write_only_attributes: Vec::new(),
-            partial_read: None,
         }
     }
 
-    /// Set the identifier (AWS internal ID like vpc-xxx)
-    pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
-        self.identifier = Some(identifier.into());
-        self
+    /// Construct a completed current instance from a validated identifier.
+    pub fn applied(
+        resource_type: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
+        provider: impl Into<String>,
+        identifier: AppliedIdentifier,
+    ) -> Self {
+        let mut row = Self::new(resource_type, identity, provider);
+        row.current = CurrentInstance::Applied {
+            identifier,
+            attributes: PersistedAttributes::default(),
+            write_only_attributes: Vec::new(),
+            partial_read: None,
+        };
+        row
+    }
+
+    /// Validate an identifier and construct a completed current instance.
+    pub fn try_applied(
+        resource_type: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
+        provider: impl Into<String>,
+        identifier: impl Into<String>,
+    ) -> Result<Self, EmptyAppliedIdentifier> {
+        Ok(Self::applied(
+            resource_type,
+            identity,
+            provider,
+            AppliedIdentifier::new(identifier)?,
+        ))
+    }
+
+    /// Set the identifier (AWS internal ID like vpc-xxx).
+    ///
+    /// Applied rows are constructed directly; an arbitrary row cannot be
+    /// converted to applied state and thereby overwrite an in-flight create.
+    ///
+    /// ```compile_fail
+    /// use carina_state::ResourceState;
+    ///
+    /// fn overwrite(row: ResourceState) -> ResourceState {
+    ///     row.with_identifier("provider-id")
+    /// }
+    /// ```
+    pub fn into_writable(self) -> Result<WritableResourceState, CreateInFlightResourceState> {
+        match self.current {
+            CurrentInstance::CreateInFlight { .. } => {
+                Err(CreateInFlightResourceState(Box::new(self)))
+            }
+            _ => Ok(WritableResourceState(self)),
+        }
+    }
+
+    pub fn refreshable(&self) -> Option<RefreshableResourceState<'_>> {
+        match self.current {
+            CurrentInstance::CreateInFlight { .. } => None,
+            _ => Some(RefreshableResourceState(self)),
+        }
     }
 
     /// Set a raw persisted attribute in tests.
@@ -1600,27 +2070,24 @@ impl ResourceState {
         self
     }
 
-    /// Populate attributes from a provider-returned State
-    pub fn with_attributes_from_state(
-        mut self,
+    /// Populate attributes from a provider-returned State.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::State;
+    /// use carina_state::ResourceState;
+    ///
+    /// fn overwrite(row: ResourceState, state: &State) {
+    ///     let _ = row.with_attributes_from_state(state);
+    /// }
+    /// ```
+    pub fn from_provider_state(
+        resource_type: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
+        provider: impl Into<String>,
         state: &State,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let encoded = state
-            .attributes
-            .iter()
-            .filter_map(|(key, value)| {
-                PersistedValue::encode_provider_value(value, self.attributes.encoded_value(key))
-                    .ok()
-                    .map(|value| (key.clone(), value))
-            })
-            .collect();
-        let attributes = PersistedAttributes::from_persisted_values(encoded)?;
-        self.attributes.extend(attributes);
-        if let Some(identifier) = &state.identifier {
-            self.identifier = Some(identifier.clone());
-        }
-        self.partial_read = state.partial_read.clone();
-        Ok(self)
+        WritableResourceState(Self::new(resource_type, identity, provider))
+            .with_attributes_from_state(state)
     }
 
     /// Mark this resource as protected
@@ -1648,23 +2115,26 @@ impl ResourceState {
         provider: impl Into<String>,
         resource_type: impl Into<String>,
         resource_identity: impl Into<ResourceIdentity>,
-        bucket_name: impl Into<String>,
-    ) -> Self {
-        let bucket_name = bucket_name.into();
-        let mut state = Self::new(resource_type, resource_identity, provider)
-            .with_identifier(&bucket_name)
-            .with_protected(true);
+        bucket_name: AppliedIdentifier,
+    ) -> Result<Self, ResourceStateEncodingError> {
         let attributes = PersistedAttributes::from_persisted_values(HashMap::from([(
             "bucket".to_string(),
             PersistedValue::encode_provider_value(
-                &Value::Concrete(ConcreteValue::String(bucket_name.into())),
+                &Value::Concrete(ConcreteValue::String(
+                    bucket_name.as_str().to_string().into(),
+                )),
                 None,
-            )
-            .expect("a backend bucket name is persistable"),
-        )]))
-        .expect("encoded backend bucket attributes are valid");
-        state.attributes.extend(attributes);
-        state
+            )?,
+        )]))?;
+        let mut state = Self::new(resource_type, resource_identity, provider);
+        state.current = CurrentInstance::Applied {
+            identifier: bucket_name,
+            attributes,
+            write_only_attributes: Vec::new(),
+            partial_read: None,
+        };
+        state.protected = true;
+        Ok(state)
     }
 
     /// Merge write-only attribute values from the desired resource into this state.
@@ -1687,7 +2157,9 @@ impl ResourceState {
             // Only merge if the user specified this attribute and it's not already
             // in the provider-returned state
             if let Some(value) = resource.attributes.get(key)
-                && !self.attributes.contains_key(key)
+                && !self
+                    .persisted_attributes()
+                    .is_some_and(|attributes| attributes.contains_key(key))
                 && let Ok(json_value) = PersistedValue::encode_desired_value(value, None)
             {
                 encoded.insert(key.clone(), json_value);
@@ -1695,9 +2167,22 @@ impl ResourceState {
             }
         }
         let attributes = PersistedAttributes::from_persisted_values(encoded)?;
-        self.attributes.extend(attributes);
         merged.sort();
-        self.write_only_attributes = merged;
+        let (current_attributes, write_only_attributes) = match &mut self.current {
+            CurrentInstance::Applied {
+                attributes,
+                write_only_attributes,
+                ..
+            }
+            | CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes,
+                ..
+            } => (attributes, write_only_attributes),
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => return Ok(()),
+        };
+        current_attributes.extend(attributes);
+        *write_only_attributes = merged;
         Ok(())
     }
 
@@ -1733,37 +2218,248 @@ impl ResourceState {
         serialized.protect_for_resource_and_schema(resource, schema, previous_hash_authority)
     }
 
-    /// Replace the provider-observed portion of an orphan row while retaining
-    /// every host-owned field from the existing state entry.
-    ///
-    /// Unlike desired-resource writeback, this path has no `Resource` from the
-    /// current configuration. Directives, prefixes, binding metadata,
-    /// write-only metadata, protection flags, name overrides, and deposed
-    /// generations therefore remain untouched. The explicit-authoring tree is
-    /// refreshed through the same conservative no-desired-values path as a
-    /// desired row: aligned list elements are demoted to a union, and legacy
-    /// `Unrecorded` rows self-heal from the provider attributes.
-    pub fn refreshed_from_provider_state(
-        &self,
-        state: &State,
-        schema: Option<&ResourceSchema>,
-    ) -> Result<Self, ResourceStateEncodingError> {
-        let mut refreshed = self.clone();
-        refreshed.identifier = state.identifier.clone();
-        refreshed.partial_read = state.partial_read.clone();
-
-        let mut serialized = HashMap::new();
-        for (key, value) in &state.attributes {
-            serialized.insert(
+    fn selected_sent_attributes(
+        resource: &ResolvedResource,
+        sent: &Sent,
+        existing: Option<&ResourceState>,
+        preferred_hashes: Option<&PersistedAttributes>,
+    ) -> Result<PersistedAttributes, ResourceStateEncodingError> {
+        let request_keys = resource.attributes.keys().cloned().collect::<BTreeSet<_>>();
+        if !sent.is_valid_for(&request_keys) {
+            let attributes = match sent {
+                Sent::AllRequestAttributes => Vec::new(),
+                Sent::Only(attributes) => attributes
+                    .difference(&request_keys)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            };
+            return Err(ResourceStateEncodingError::InvalidSentAttributes { attributes });
+        }
+        let selected = sent.names(&request_keys);
+        let previous = existing.and_then(ResourceState::persisted_attributes);
+        let mut encoded = HashMap::with_capacity(selected.len());
+        for key in selected {
+            let Some(value) = resource.attributes.get(key) else {
+                return Err(ResourceStateEncodingError::InvalidSentAttributes {
+                    attributes: vec![key.clone()],
+                });
+            };
+            let previous_value = previous_hash(preferred_hashes, previous, key);
+            encoded.insert(
                 key.clone(),
-                PersistedValue::encode_provider_value(value, self.attributes.encoded_value(key))?,
+                PersistedValue::encode_desired_value(value, previous_value)?,
             );
         }
-        let attributes = PersistedAttributes::from_persisted_values(serialized)?;
-        refreshed.attributes = attributes.protect_for_orphan_refresh(schema, &self.attributes);
-        refreshed.explicit =
-            refreshed_explicit_without_desired_values(Some(&self.explicit), &state.attributes);
-        Ok(refreshed)
+        Ok(PersistedAttributes::from_persisted_values(encoded)?)
+    }
+
+    fn sent_write_only_keys(
+        schema: Option<&ResourceSchema>,
+        attributes: &PersistedAttributes,
+    ) -> HashSet<String> {
+        schema
+            .into_iter()
+            .flat_map(|schema| schema.attributes.iter())
+            .filter(|(key, attribute)| attribute.write_only && attributes.contains_key(key))
+            .map(|(key, _attribute)| key.clone())
+            .collect()
+    }
+
+    fn populate_desired_metadata(
+        &mut self,
+        resource: &ResolvedResource,
+        existing: Option<&ResourceState>,
+        stored_attributes: &HashMap<String, Value>,
+        schema: Option<&ResourceSchema>,
+    ) {
+        if let Some(existing) = existing {
+            self.protected = existing.protected;
+            self.name_overrides = existing.name_overrides.clone();
+        }
+        self.directives = resource.directives.clone();
+        if self.directives.provider_instance.is_none() {
+            self.directives.provider_instance = resource.id.provider_instance.clone();
+        }
+        self.prefixes = resource.prefixes.clone();
+        // carina#3280: an empty top-level Struct used to double as the
+        // legacy-corruption marker. Preserve or rebuild an existing authoring
+        // record when possible; otherwise use the typed Unrecorded signal.
+        let built =
+            explicit::build_from_resource_for_stored_values(resource, stored_attributes, schema);
+        self.explicit = match built {
+            ExplicitFields::Struct { ref children } if children.is_empty() => {
+                refreshed_explicit_without_desired_values(
+                    existing.map(|entry| &entry.explicit),
+                    stored_attributes,
+                )
+            }
+            other => other,
+        };
+        self.binding = resource.binding.clone();
+        let dependencies = get_resource_dependencies(resource);
+        if !dependencies.is_empty() {
+            self.dependency_bindings = dependencies.into_iter().collect();
+        }
+    }
+
+    /// Build an applied row for a create that exists but whose finishing step
+    /// failed. Values are selected strictly as observed, then sent, then
+    /// absent. Desired state controls masking but cannot introduce an unsent
+    /// value.
+    pub fn from_observation(
+        resource: &ResolvedResource,
+        created: &ObservedCreate,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        preferred_hashes: Option<&PersistedAttributes>,
+    ) -> Result<Self, ResourceStateEncodingError> {
+        let previous = existing.and_then(ResourceState::persisted_attributes);
+        let no_observed_values = HashMap::new();
+        let (observed_values, incomplete_detail) = match created.observation() {
+            Observation::Read(carina_core::provider::ReadOutcome::Found { state }) => {
+                (state.attributes(), None)
+            }
+            Observation::Read(carina_core::provider::ReadOutcome::NotFound { id: _id }) => (
+                &no_observed_values,
+                Some("provider read after create returned not found".to_string()),
+            ),
+            Observation::ReadFailed(error) => (&no_observed_values, Some(error.to_string())),
+        };
+        let observed = observed_values
+            .iter()
+            .map(|(key, value)| {
+                let previous_value = previous_hash(preferred_hashes, previous, key);
+                PersistedValue::encode_provider_value(value, previous_value)
+                    .map(|value| (key.clone(), value))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let observed = PersistedAttributes::from_persisted_values(observed)?;
+
+        let (mut sent_values, sent_write_only) = match created.sent() {
+            SentRecord::Request(sent) => {
+                let sent_values =
+                    Self::selected_sent_attributes(resource, sent, existing, preferred_hashes)?;
+                let write_only = Self::sent_write_only_keys(schema, &sent_values);
+                (sent_values, write_only)
+            }
+            SentRecord::Persisted(envelope) => {
+                let mut sent_values = envelope.write_only().clone();
+                sent_values.extend(envelope.secrets().clone());
+                let write_only = envelope.write_only().keys().cloned().collect();
+                (sent_values, write_only)
+            }
+        };
+        sent_values.extend(observed);
+        let previous_hash_authority = previous
+            .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
+            .unwrap_or(PreviousSecretHashAuthority::None);
+        let attributes = sent_values.try_protect_observation_for_resource_and_schema(
+            resource,
+            schema,
+            previous_hash_authority,
+            preferred_hashes,
+            &sent_write_only,
+        )?;
+        let partial_read = incomplete_detail.and_then(|detail| {
+            let missing_attributes = resource
+                .attributes
+                .keys()
+                .chain(
+                    schema
+                        .into_iter()
+                        .flat_map(|schema| schema.attributes.keys()),
+                )
+                .filter(|key| !attributes.contains_key(key))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            (!missing_attributes.is_empty()).then_some(PartialReadMarker {
+                detail,
+                missing_attributes,
+            })
+        });
+        let stored_attributes = attributes.to_values();
+
+        let mut row = Self::new(
+            &resource.id.resource_type,
+            resource.identity().clone(),
+            resource.id.provider.clone(),
+        );
+        let mut write_only_attributes = sent_write_only.into_iter().collect::<Vec<_>>();
+        write_only_attributes.sort();
+        row.current = CurrentInstance::Applied {
+            identifier: created.identifier().clone(),
+            attributes,
+            write_only_attributes,
+            partial_read,
+        };
+        row.populate_desired_metadata(resource, existing, &stored_attributes, schema);
+        Ok(row)
+    }
+
+    /// Build the mutually-exclusive v15 continuation row. A re-pend loaded
+    /// from state keeps the prior envelope, timestamp, and host metadata; a
+    /// newly sent create encodes only sent write-only and secret values.
+    pub fn from_in_flight(
+        resource: &ResolvedResource,
+        pending: &InFlightCreate,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        preferred_hashes: Option<&PersistedAttributes>,
+    ) -> Result<Self, ResourceStateEncodingError> {
+        let persisted = match pending.persistence() {
+            InFlightPersistence::Persisted => {
+                if let Some(existing) = existing {
+                    let mut row = existing.clone();
+                    // A re-pend normally keeps the loaded row byte-for-byte,
+                    // but a `moved` block deliberately changes the address
+                    // that owns it. Write the cloned metadata under the
+                    // desired/pending address so Move cleanup cannot delete
+                    // the continuation we just preserved.
+                    row.provider = resource.id.provider.clone();
+                    row.resource_type = resource.id.resource_type.clone();
+                    row.identity = resource.identity().clone();
+                    // A persisted envelope intentionally contains no route.
+                    // Persist the route carried by the rebound continuation,
+                    // which is also the route ResumeCreate just used, so the
+                    // next load cannot silently bind it back to stale row
+                    // directives after a move.
+                    row.directives.provider_instance = pending.id().provider_instance.clone();
+                    row.current = CurrentInstance::CreateInFlight {
+                        pending: pending.clone(),
+                    };
+                    return Ok(row);
+                }
+                pending.clone()
+            }
+            InFlightPersistence::Fresh(fresh) => {
+                let selected = Self::selected_sent_attributes(
+                    resource,
+                    fresh.sent(),
+                    existing,
+                    preferred_hashes,
+                )?;
+                let mut write_only = selected.clone();
+                let sent_write_only = Self::sent_write_only_keys(schema, &selected);
+                write_only.retain_keys(|key| sent_write_only.contains(key));
+                let mut secrets = selected;
+                secrets.retain_keys(|key| {
+                    resource
+                        .attributes
+                        .get(key)
+                        .is_some_and(carina_core::value::contains_secret)
+                });
+                fresh.persist(write_only, secrets)
+            }
+        };
+
+        let mut row = Self::new(
+            &resource.id.resource_type,
+            resource.identity().clone(),
+            resource.id.provider.clone(),
+        );
+        row.current = CurrentInstance::CreateInFlight { pending: persisted };
+        row.populate_desired_metadata(resource, existing, &HashMap::new(), schema);
+        Ok(row)
     }
 
     /// Build a `ResourceState` from a desired resource, provider-returned
@@ -1790,93 +2486,49 @@ impl ResourceState {
             resource.identity().clone(),
             resource.id.provider.clone(),
         );
-        rs.identifier = state.identifier.clone();
-        rs.partial_read = state.partial_read.clone();
         let mut serialized = HashMap::new();
         for (k, v) in &state.attributes {
             serialized.insert(
                 k.clone(),
                 PersistedValue::encode_provider_value(
                     v,
-                    preferred_hashes
-                        .and_then(|attributes| attributes.encoded_value(k))
-                        .or_else(|| existing.and_then(|row| row.attributes.encoded_value(k))),
+                    previous_hash(
+                        preferred_hashes,
+                        existing.and_then(ResourceState::persisted_attributes),
+                        k,
+                    ),
                 )?,
             );
         }
         let previous_hash_authority = existing
-            .map(ResourceState::persisted_attributes)
+            .and_then(ResourceState::persisted_attributes)
             .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
             .unwrap_or(PreviousSecretHashAuthority::None);
-        if let Some(existing) = existing {
-            rs.protected = existing.protected;
-            rs.name_overrides = existing.name_overrides.clone();
-        }
-        rs.attributes = PersistedAttributes::from_persisted_values(serialized)?
+        let attributes = PersistedAttributes::from_persisted_values(serialized)?
             .try_protect_for_resource_and_schema(
                 resource,
                 schema,
                 previous_hash_authority,
                 preferred_hashes,
             )?;
-        rs.directives = resource.directives.clone();
-        if rs.directives.provider_instance.is_none() {
-            rs.directives.provider_instance = resource.id.provider_instance.clone();
-        }
-        rs.prefixes = resource.prefixes.clone();
-        // Record the structural shape the user wrote in their .crn,
-        // so the differ can project actual-state through it and skip
-        // server-side defaults the user never authored (refs awscc#206).
-        // carina#3280: when the aligned resource builder would produce an
-        // empty top-level `Struct` (the user authored no attributes —
-        // bodyless resource like `aws.sts.CallerIdentity {}`, or the
-        // `carina state import` path that constructs a `Resource`
-        // with no DSL attributes), emit `Unrecorded` instead. The
-        // empty-Struct-at-top-level shape used to double as the
-        // legacy-corruption marker, which forced callers to
-        // disambiguate by runtime convention; `Unrecorded` is the
-        // typed signal for "no authoring record".
-        let built =
-            explicit::build_from_resource_for_stored_values(resource, &state.attributes, schema);
-        rs.explicit = match built {
-            ExplicitFields::Struct { ref children } if children.is_empty() => {
-                // Three sub-cases when `resource.attributes` is empty:
-                //
-                // 1. Self-heal: prior on-disk row is `Unrecorded` (the
-                //    legacy-corruption marker, possibly from the v6→v7
-                //    migration). Promote freshly-read state attributes
-                //    back into an authoring record so the next plan
-                //    sees a populated `Struct` and the runtime
-                //    pass-through path no longer fires for this row.
-                //
-                // 2. Idempotent re-apply: prior on-disk row already
-                //    carries a populated `Struct` (e.g. the row was
-                //    self-healed in a previous apply, or the resource
-                //    legitimately has no DSL body but was applied
-                //    once before and recorded an authoring tree from
-                //    the provider's read). Preserve its authoring
-                //    restriction, demoting aligned lists to unions;
-                //    collapsing the whole tree to `Unrecorded` would
-                //    flip-flop the row on every apply.
-                //
-                // 3. Green-field write: prior row is `None` or
-                //    `Leaf`. There is genuinely no authoring record
-                //    yet. Emit `Unrecorded`.
-                refreshed_explicit_without_desired_values(
-                    existing.map(|entry| &entry.explicit),
-                    &state.attributes,
-                )
-            }
-            other => other,
+        rs.current = match state
+            .identifier
+            .as_deref()
+            .and_then(|identifier| AppliedIdentifier::new(identifier).ok())
+        {
+            Some(identifier) => CurrentInstance::Applied {
+                identifier,
+                attributes,
+                write_only_attributes: Vec::new(),
+                partial_read: state.partial_read.clone(),
+            },
+            None => CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes: Vec::new(),
+                partial_read: state.partial_read.clone(),
+            },
         };
-        // Store binding name for tree structure in orphan Delete effects
-        rs.binding = resource.binding.clone();
-        // Store dependency bindings for tree structure in orphan Delete effects.
-        // BTreeSet gives us dedup and sorted iteration for free (#2228).
-        let deps = get_resource_dependencies(resource);
-        if !deps.is_empty() {
-            rs.dependency_bindings = deps.into_iter().collect();
-        }
+        rs.populate_desired_metadata(resource, existing, &state.attributes, schema);
         Ok(rs)
     }
 }
@@ -1888,6 +2540,108 @@ impl ResourceState {
 /// line.
 fn is_empty_explicit(e: &ExplicitFields) -> bool {
     matches!(e, ExplicitFields::Leaf)
+}
+
+/// Exact v14 row shape used only at the v14 → v15 migration boundary.
+/// Keeping this DTO separate from [`ResourceState`] prevents the current
+/// loader from accepting the legacy parallel identifier/attribute fields.
+#[derive(Deserialize)]
+struct ResourceStateV14CurrentDto {
+    #[serde(default)]
+    identifier: Option<String>,
+    #[serde(default)]
+    attributes: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    deposed: Vec<serde_json::Value>,
+    #[serde(default)]
+    protected: bool,
+    #[serde(default)]
+    directives: Directives,
+    #[serde(default)]
+    prefixes: HashMap<String, String>,
+    #[serde(default)]
+    name_overrides: HashMap<String, NameOverride>,
+    #[serde(default)]
+    explicit: ExplicitFields,
+    #[serde(default)]
+    binding: Option<String>,
+    #[serde(default)]
+    dependency_bindings: BTreeSet<String>,
+    #[serde(default)]
+    write_only_attributes: Vec<String>,
+    #[serde(default)]
+    partial_read: Option<PartialReadMarker>,
+}
+
+fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
+    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v14: {error}"))
+    })?;
+    let resources = root
+        .get_mut("resources")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v14: resources must be an array".to_string(),
+            )
+        })?;
+    for resource in resources {
+        let legacy: ResourceStateV14CurrentDto =
+            serde_json::from_value(resource.clone()).map_err(|error| {
+                BackendError::InvalidState(format!(
+                    "Failed to migrate state file from v14: {error}"
+                ))
+            })?;
+        let shell_directives = Directives {
+            provider_instance: legacy.directives.provider_instance.clone(),
+            ..Directives::default()
+        };
+        let is_deposed_only_shell = legacy.identifier.is_none()
+            && !legacy.deposed.is_empty()
+            && legacy.attributes.is_empty()
+            && !legacy.protected
+            && legacy.directives == shell_directives
+            && legacy.prefixes.is_empty()
+            && legacy.name_overrides.is_empty()
+            && is_empty_explicit(&legacy.explicit)
+            && legacy.binding.is_none()
+            && legacy.dependency_bindings.is_empty()
+            && legacy.write_only_attributes.is_empty()
+            && legacy.partial_read.is_none();
+        let current = match legacy
+            .identifier
+            .filter(|identifier| !identifier.is_empty())
+        {
+            Some(identifier) => serde_json::json!({
+                "kind": "applied",
+                "identifier": identifier,
+                "attributes": legacy.attributes,
+                "write_only_attributes": legacy.write_only_attributes,
+                "partial_read": legacy.partial_read,
+            }),
+            None if is_deposed_only_shell => serde_json::json!({ "kind": "none" }),
+            None => serde_json::json!({
+                "kind": "missing_identifier",
+                "attributes": legacy.attributes,
+                "write_only_attributes": legacy.write_only_attributes,
+                "partial_read": legacy.partial_read,
+            }),
+        };
+        let object = resource.as_object_mut().ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v14: resource must be an object".to_string(),
+            )
+        })?;
+        object.remove("identifier");
+        object.remove("attributes");
+        object.remove("write_only_attributes");
+        object.remove("partial_read");
+        object.insert("current".to_string(), current);
+    }
+    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    serde_json::to_string(&root).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v14: {error}"))
+    })
 }
 
 /// v12 → v13: migrate every JSON tree that is later decoded as a Carina
@@ -2047,7 +2801,13 @@ fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {
 /// Carina versions and the built-in mock provider.
 fn migrate_v10_reserved_attributes(state: &mut StateFile) {
     for resource in &mut state.resources {
-        resource.attributes.retain_keys(|key| !key.starts_with('_'));
+        match &mut resource.current {
+            CurrentInstance::Applied { attributes, .. }
+            | CurrentInstance::MissingIdentifier { attributes, .. } => {
+                attributes.retain_keys(|key| !key.starts_with('_'));
+            }
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {}
+        }
         for deposed in &mut resource.deposed {
             deposed.attributes.retain_keys(|key| !key.starts_with('_'));
         }

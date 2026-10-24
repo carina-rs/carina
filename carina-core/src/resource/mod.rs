@@ -18,9 +18,10 @@ use subtle::ConstantTimeEq;
 
 use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
+use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
-use crate::provider::AppliedIdentifier;
+use crate::provider::{AppliedIdentifier, InFlightCreate};
 use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
 pub use enum_value::{
@@ -6645,11 +6646,48 @@ impl UnidentifiedState {
 /// let state = State::existing(id, Default::default());
 /// let current = Current::MissingIdentifier(state);
 /// ```
+///
+/// Resource routes cannot be reassigned directly outside the checked move
+/// seam:
+///
+/// ```compile_fail
+/// use carina_core::effect::MoveAuthority;
+/// use carina_core::resource::Current;
+/// fn bypass_resume_route(mut current: Current, authority: &MoveAuthority<'_>) {
+///     current.rebind_for_move(authority);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum Current {
     Absent(AbsentState),
     Present(PresentResourceState),
+    CreateInFlight(InFlightCreate),
     MissingIdentifier(UnidentifiedState),
+}
+
+/// Mutable projection of a [`Current`] variant that carries provider state.
+pub struct StateBearingCurrentMut<'a> {
+    state: &'a mut State,
+}
+
+impl StateBearingCurrentMut<'_> {
+    pub fn attributes_mut(&mut self) -> &mut HashMap<String, Value> {
+        &mut self.state.attributes
+    }
+
+    pub fn apply_transformed_state(self, transformed: State) {
+        let State {
+            id: _id,
+            identifier: _identifier,
+            attributes,
+            exists: _exists,
+            dependency_bindings,
+            partial_read,
+        } = transformed;
+        self.state.attributes = attributes;
+        self.state.dependency_bindings = dependency_bindings;
+        self.state.partial_read = partial_read;
+    }
 }
 
 impl Current {
@@ -6671,19 +6709,59 @@ impl Current {
         Self::Present(PresentResourceState { state, identifier })
     }
 
-    pub fn attributes_mut(&mut self) -> &mut HashMap<String, Value> {
+    pub fn create_in_flight(pending: InFlightCreate) -> Self {
+        Self::CreateInFlight(pending)
+    }
+
+    pub fn id(&self) -> &ResourceId {
         match self {
-            Self::Absent(state) => &mut state.0.attributes,
-            Self::Present(present) => &mut present.state.attributes,
-            Self::MissingIdentifier(state) => &mut state.0.attributes,
+            Self::Absent(state) => &state.0.id,
+            Self::Present(present) => &present.state.id,
+            Self::CreateInFlight(pending) => pending.id(),
+            Self::MissingIdentifier(state) => &state.0.id,
         }
     }
 
-    pub fn set_id(&mut self, id: ResourceId) {
+    /// Narrow to variants that carry provider-observed state.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{Current, State};
+    ///
+    /// fn overwrite(current: &mut Current, transformed: State) {
+    ///     current.apply_transformed_state(transformed);
+    /// }
+    /// ```
+    pub fn state_bearing_mut(&mut self) -> Option<StateBearingCurrentMut<'_>> {
         match self {
-            Self::Absent(state) => state.0.id = id,
-            Self::Present(present) => present.state.id = id,
-            Self::MissingIdentifier(state) => state.0.id = id,
+            Self::Absent(state) => Some(StateBearingCurrentMut {
+                state: &mut state.0,
+            }),
+            Self::Present(present) => Some(StateBearingCurrentMut {
+                state: &mut present.state,
+            }),
+            Self::CreateInFlight(_pending) => None,
+            Self::MissingIdentifier(state) => Some(StateBearingCurrentMut {
+                state: &mut state.0,
+            }),
+        }
+    }
+
+    pub fn attributes_mut(&mut self) -> Option<&mut HashMap<String, Value>> {
+        self.state_bearing_mut()
+            .map(|projection| &mut projection.state.attributes)
+    }
+
+    pub(crate) fn rebind_for_move(&mut self, authority: &MoveAuthority<'_>) {
+        let to = authority.to();
+        match self {
+            Self::Absent(state) => state.0.id = to.clone(),
+            Self::Present(present) => present.state.id = to.clone(),
+            Self::CreateInFlight(pending) => {
+                *pending = pending
+                    .clone()
+                    .rebind_for_move(authority.destination_address());
+            }
+            Self::MissingIdentifier(state) => state.0.id = to.clone(),
         }
     }
 
@@ -6693,42 +6771,18 @@ impl Current {
             Self::Present(present) => {
                 present.state.dependency_bindings = dependency_bindings;
             }
+            Self::CreateInFlight(_pending) => {}
             Self::MissingIdentifier(state) => {
                 state.0.dependency_bindings = dependency_bindings;
             }
         }
     }
 
-    /// Apply the value-bearing fields returned by provider normalization or
-    /// hydration without letting that raw-state bridge reclassify this row.
-    ///
-    /// The managed lifecycle fields (`id`, `exists`, and `identifier`) remain
-    /// owned by this typed value. Provider transforms operate on attributes
-    /// and may restore host metadata such as dependency bindings and partial
-    /// read markers, but they cannot mint or discard a validated identifier.
-    pub fn apply_transformed_state(&mut self, transformed: State) {
-        let State {
-            id: _id,
-            identifier: _identifier,
-            attributes,
-            exists: _exists,
-            dependency_bindings,
-            partial_read,
-        } = transformed;
-        let state = match self {
-            Self::Absent(state) => &mut state.0,
-            Self::Present(present) => &mut present.state,
-            Self::MissingIdentifier(state) => &mut state.0,
-        };
-        state.attributes = attributes;
-        state.dependency_bindings = dependency_bindings;
-        state.partial_read = partial_read;
-    }
-
     fn into_plan_input(mut self) -> PlanInputCurrent {
         match &mut self {
             Self::Absent(state) => state.0.materialize_partial_read_unknowns(),
             Self::Present(present) => present.state.materialize_partial_read_unknowns(),
+            Self::CreateInFlight(_pending) => {}
             Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
         }
         PlanInputCurrent(self)

@@ -7,7 +7,7 @@ use crate::explicit::ExplicitFields;
 use crate::plan::{
     PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
-use crate::resource::{ConcreteValue, Resource, ResourceIdentity};
+use crate::resource::{ConcreteValue, ResolvedResourceId, Resource, ResourceIdentity};
 
 fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     let identifier = id
@@ -106,6 +106,176 @@ fn current_variant_determines_create_update_or_plan_error() {
     );
 }
 
+#[test]
+fn desired_in_flight_plans_resume_never_create() {
+    use crate::effect::Effect;
+    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+
+    let desired = Resource::new("test.resource", "managed");
+    let id = desired.id.clone();
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+        PendingToken::new("secret-provider-token"),
+        Sent::AllRequestAttributes,
+        1,
+    ));
+    let started_at = pending.started_at().clone();
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(id.clone(), Current::create_in_flight(pending))]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(matches!(
+        plan.effects(),
+        [Effect::ResumeCreate { resource, started_at: effect_started_at }]
+            if resource.id == id && effect_started_at == &started_at
+    ));
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Create(_)))
+    );
+}
+
+#[test]
+fn saved_resume_contains_no_token() {
+    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+
+    let desired = Resource::new("test.resource", "managed");
+    let id = desired.id.clone();
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+        PendingToken::new("must-not-enter-plan"),
+        Sent::AllRequestAttributes,
+        1,
+    ));
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(id, Current::create_in_flight(pending))]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&desired),
+    );
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    let encoded = serde_json::to_string(&plan).expect("plan serializes");
+    assert!(!encoded.contains("must-not-enter-plan"), "{encoded}");
+}
+
+#[test]
+fn in_flight_orphan_is_create_in_flight_orphan_error() {
+    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+
+    let id = ResourceId::with_identity("test.resource", "orphan");
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+        PendingToken::new("opaque"),
+        Sent::AllRequestAttributes,
+        1,
+    ));
+    let orphans = Orphans::from([Orphan::create_in_flight(
+        pending,
+        Some("orphan".to_string()),
+        Directives::default(),
+    )]);
+    let plan = create_plan(
+        &[],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+
+    assert!(plan.effects().is_empty());
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(plan.errors()[0].resource_id, id);
+    assert_eq!(plan.errors()[0].kind, PlanErrorKind::CreateInFlightOrphan);
+}
+
+#[test]
+fn changed_provider_instance_rejects_resume() {
+    use crate::effect::Effect;
+    use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
+
+    let desired = Resource::with_provider(
+        "mock",
+        "test.resource",
+        "managed",
+        Some("new-route".to_string()),
+    );
+    let desired_id = desired.id.clone();
+    let persisted_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "managed",
+        Some("issuing-route".to_string()),
+    );
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(persisted_id.clone()).pending(
+        PendingToken::new("opaque"),
+        Sent::AllRequestAttributes,
+        1,
+    ));
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(desired_id.clone(), Current::create_in_flight(pending))]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Create(_) | Effect::ResumeCreate { .. })),
+        "a routing mismatch must leave the persisted continuation untouched"
+    );
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(
+        plan.errors()[0].kind,
+        PlanErrorKind::ResumeCreateRoutingMismatch {
+            persisted: persisted_id,
+        }
+    );
+}
+
 fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::new(&[]);
@@ -167,11 +337,22 @@ impl crate::provider::Provider for HintProvider {
         &self,
         _id: &ResourceId,
         _request: crate::provider::CreateRequest,
+        _attempt: crate::provider::CreateAttempt,
     ) -> crate::provider::BoxFuture<
         '_,
-        crate::provider::ProviderResult<crate::provider::CreateOutcome>,
+        Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>,
     > {
         Box::pin(async { panic!("unexpected create") })
+    }
+
+    fn resume_create(
+        &self,
+        _request: crate::provider::ResumeCreateRequest,
+    ) -> crate::provider::BoxFuture<
+        '_,
+        Result<crate::provider::ResumeOutcome, crate::provider::ResumeFailure>,
+    > {
+        Box::pin(async { panic!("unexpected resume_create") })
     }
 
     fn update(
@@ -1513,54 +1694,22 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
     );
     let mut orphans: Orphans = [orphan].into_iter().collect();
 
-    assert!(orphans.rekey(&old_id, new_id.clone()));
+    let move_effect = Effect::Move {
+        from: ResolvedResourceId::new(old_id.clone()),
+        to: ResolvedResourceId::new(new_id.clone()),
+    };
+    let authority = move_effect
+        .move_authority()
+        .expect("the fixture effect is a move");
+    assert!(orphans.rekey(&authority));
     assert!(!orphans.contains_key(&old_id));
     let moved = match orphans.get(&new_id).unwrap().current() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(moved.id, new_id);
-}
-
-#[tokio::test]
-#[should_panic(
-    expected = "provider transform must preserve the managed/orphan prior-state key set"
-)]
-async fn prior_state_transform_rejects_current_state_key_changes() {
-    let current_id = ResourceId::with_identity("example.Service", "current");
-    let orphan_id = ResourceId::with_identity("example.Service", "orphan");
-    let inserted_id = ResourceId::with_identity("example.Service", "inserted");
-    let mut current_states = crate::resource::current_map_from_states(HashMap::from([(
-        current_id.clone(),
-        existing_state(current_id.clone(), HashMap::new()),
-    )]));
-    let mut orphans = Orphans::from([Orphan::from_state(
-        existing_state(orphan_id, HashMap::new()),
-        Some("orphan".to_string()),
-        Directives::default(),
-    )]);
-    let mut data_source_states = HashMap::new();
-
-    transform_prior_provider_states(
-        &mut current_states,
-        &mut data_source_states,
-        &mut orphans,
-        async |states| {
-            states.remove(&current_id);
-            states.insert(
-                inserted_id.clone(),
-                existing_state(inserted_id.clone(), HashMap::new()),
-            );
-            Ok::<(), crate::provider::ProviderError>(())
-        },
-        async |states| {
-            assert!(states.is_empty());
-            Ok::<(), crate::provider::ProviderError>(())
-        },
-    )
-    .await
-    .unwrap();
 }
 
 #[tokio::test]
@@ -1661,6 +1810,7 @@ async fn prior_state_transform_rebuilds_managed_current_after_provider_transform
     let state = match current {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
+        Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(

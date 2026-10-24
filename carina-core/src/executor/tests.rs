@@ -1,4 +1,15 @@
 use super::*;
+
+macro_rules! unexpected_resume_create {
+    () => {
+        fn resume_create(
+            &self,
+            _request: crate::provider::ResumeCreateRequest,
+        ) -> BoxFuture<'_, Result<crate::provider::ResumeOutcome, crate::provider::ResumeFailure>> {
+            Box::pin(async { panic!("unexpected resume_create") })
+        }
+    };
+}
 use crate::effect::deps::{
     ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
 };
@@ -102,6 +113,8 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
 
 struct MockProvider {
     create_results: Mutex<Vec<ProviderResult<crate::provider::CreateOutcome>>>,
+    classified_create_results: Mutex<Vec<ClassifiedCreateFixture>>,
+    resume_results: Mutex<Vec<ResumeFixture>>,
     delete_results: Mutex<Vec<ProviderResult<()>>>,
     update_results: Mutex<Vec<ProviderResult<crate::provider::UpdateOutcome>>>,
     read_results: Mutex<Vec<ProviderResult<State>>>,
@@ -118,10 +131,23 @@ struct MockProvider {
     data_source_reads: Arc<Mutex<Vec<DataSource>>>,
 }
 
+enum ClassifiedCreateFixture {
+    Created,
+    InFlight,
+}
+
+enum ResumeFixture {
+    Resumed,
+    Ended,
+    ResentInFlightWithInvalidSent,
+}
+
 impl MockProvider {
     fn new() -> Self {
         Self {
             create_results: Mutex::new(Vec::new()),
+            classified_create_results: Mutex::new(Vec::new()),
+            resume_results: Mutex::new(Vec::new()),
             delete_results: Mutex::new(Vec::new()),
             update_results: Mutex::new(Vec::new()),
             read_results: Mutex::new(Vec::new()),
@@ -136,13 +162,21 @@ impl MockProvider {
         self.create_results
             .lock()
             .unwrap()
-            .push(result.map(|state| crate::provider::CreateOutcome::Success {
-                state: applied_state_for_test(state),
+            .push(result.map(|state| {
+                crate::provider::CreateOutcome::fixture_success(applied_state_for_test(state))
             }));
     }
 
     fn push_create_outcome(&self, result: ProviderResult<crate::provider::CreateOutcome>) {
         self.create_results.lock().unwrap().push(result);
+    }
+
+    fn push_classified_create(&self, result: ClassifiedCreateFixture) {
+        self.classified_create_results.lock().unwrap().push(result);
+    }
+
+    fn push_resume(&self, result: ResumeFixture) {
+        self.resume_results.lock().unwrap().push(result);
     }
 
     fn push_delete(&self, result: ProviderResult<()>) {
@@ -234,7 +268,8 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let id_str = id.to_string();
         self.call_log
             .lock()
@@ -244,8 +279,103 @@ impl Provider for MockProvider {
             .lock()
             .unwrap()
             .push(request.resource().as_resource().clone());
+        let classified = {
+            let mut results = self.classified_create_results.lock().unwrap();
+            (!results.is_empty()).then(|| results.remove(0))
+        };
+        if let Some(classified) = classified {
+            let id = id.clone();
+            return Box::pin(async move {
+                match classified {
+                    ClassifiedCreateFixture::Created => {
+                        let identifier = AppliedIdentifier::new("created-id")
+                            .expect("fixture identifier is non-empty");
+                        let observed = AppliedState::from_identifier(
+                            id.clone(),
+                            identifier.clone(),
+                            HashMap::from([(
+                                "id".to_string(),
+                                Value::Concrete(ConcreteValue::String("created-id".into())),
+                            )]),
+                        );
+                        Err(attempt
+                            .issued(identifier, crate::provider::Sent::AllRequestAttributes)
+                            .failed(
+                                crate::provider::Observation::Read(ReadOutcome::found(observed)),
+                                ProviderError::api_error("post-create fixture failed"),
+                            ))
+                    }
+                    ClassifiedCreateFixture::InFlight => {
+                        let pending = attempt.pending(
+                            crate::provider::PendingToken::new("fixture-create-token"),
+                            crate::provider::Sent::AllRequestAttributes,
+                            1,
+                        );
+                        Err(crate::provider::InFlightCreate::from_pending(pending)
+                            .into_create_failure(ProviderError::timeout(
+                                "create fixture remains in flight",
+                            )))
+                    }
+                }
+            });
+        }
         let result = self.create_results.lock().unwrap().remove(0);
-        Box::pin(async move { result })
+        Box::pin(async move { result.map_err(|error| attempt.untracked(error)) })
+    }
+
+    fn resume_create(
+        &self,
+        request: crate::provider::ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<crate::provider::ResumeOutcome, crate::provider::ResumeFailure>> {
+        let result = {
+            let mut results = self.resume_results.lock().unwrap();
+            (!results.is_empty()).then(|| results.remove(0))
+        };
+        Box::pin(async move {
+            match result.expect("unexpected resume_create") {
+                ResumeFixture::Resumed => {
+                    let (resume, _create_request) = request.into_parts();
+                    let crate::provider::Resume::Issued(resumed) = resume else {
+                        return Err(resume.preserve(ProviderError::internal(
+                            "resumed fixture requires an issued continuation",
+                        )));
+                    };
+                    let id = resumed.id().clone();
+                    let identifier = resumed.identifier().clone();
+                    let identifier_value = identifier.as_str().into();
+                    let observed = AppliedState::from_identifier(
+                        id,
+                        identifier,
+                        HashMap::from([(
+                            "id".to_string(),
+                            Value::Concrete(ConcreteValue::String(identifier_value)),
+                        )]),
+                    );
+                    Ok(resumed.completed(observed))
+                }
+                ResumeFixture::Ended => {
+                    let (resume, _create_request) = request.into_parts();
+                    Err(resume.discarded(ProviderError::not_found("recorded create ended")))
+                }
+                ResumeFixture::ResentInFlightWithInvalidSent => {
+                    let (resume, _create_request) = request.into_parts();
+                    let attempt = match resume {
+                        crate::provider::Resume::Unissued(attempt) => attempt.resend(),
+                        crate::provider::Resume::Issued(resumed) => {
+                            return Err(resumed.preserve(ProviderError::internal(
+                                "invalid-sent fixture requires an unissued continuation",
+                            )));
+                        }
+                    };
+                    let pending = attempt.pending(
+                        crate::provider::PendingToken::new("resent-token"),
+                        crate::provider::Sent::only(["outside_request"]),
+                        1,
+                    );
+                    Err(pending.preserve(ProviderError::timeout("resent create is pending")))
+                }
+            }
+        })
     }
 
     fn update(
@@ -514,14 +644,14 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
 
     fn normalize_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut crate::provider::StateTransformMap,
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
     fn hydrate_read_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut crate::provider::StateTransformMap,
         _saved_attrs: &'a crate::provider::SavedAttrs,
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
@@ -553,14 +683,14 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
 
     fn normalize_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut crate::provider::StateTransformMap,
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
     fn hydrate_read_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut crate::provider::StateTransformMap,
         _saved_attrs: &'a crate::provider::SavedAttrs,
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
@@ -844,7 +974,8 @@ impl Provider for DelayedCountingProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        _attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let id = id.clone();
         let delay = self.delay_for(&id);
         let started = self.started.clone();
@@ -854,11 +985,13 @@ impl Provider for DelayedCountingProvider {
                 .unwrap()
                 .push(id.identity_str().expect("resolved identity").to_string());
             tokio::time::sleep(delay).await;
-            Ok(crate::provider::CreateOutcome::Success {
-                state: applied_state_for_test(ok_state(&id)),
-            })
+            Ok(crate::provider::CreateOutcome::fixture_success(
+                applied_state_for_test(ok_state(&id)),
+            ))
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -963,14 +1096,17 @@ impl Provider for PendingWaitProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        _attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let id = id.clone();
         Box::pin(async move {
-            Ok(crate::provider::CreateOutcome::Success {
-                state: applied_state_for_test(ok_state(&id)),
-            })
+            Ok(crate::provider::CreateOutcome::fixture_success(
+                applied_state_for_test(ok_state(&id)),
+            ))
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1187,9 +1323,12 @@ impl Provider for PendingRefreshProvider {
         &self,
         _id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
-        Box::pin(async { Err(ProviderError::internal("create not used")) })
+        attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
+        Box::pin(async move { Err(attempt.untracked(ProviderError::internal("create not used"))) })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1278,7 +1417,8 @@ impl Provider for ControlledReadyCreateProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        _attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let id = id.clone();
         let ready = Arc::clone(&self.ready);
         let started = Arc::clone(&self.started);
@@ -1286,15 +1426,17 @@ impl Provider for ControlledReadyCreateProvider {
         Box::pin(std::future::poll_fn(move |cx| {
             started.notify_one();
             if ready.load(Ordering::SeqCst) {
-                std::task::Poll::Ready(Ok(crate::provider::CreateOutcome::Success {
-                    state: applied_state_for_test(ok_state(&id)),
-                }))
+                std::task::Poll::Ready(Ok(crate::provider::CreateOutcome::fixture_success(
+                    applied_state_for_test(ok_state(&id)),
+                )))
             } else {
                 *waker.lock().unwrap() = Some(cx.waker().clone());
                 std::task::Poll::Pending
             }
         }))
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1387,6 +1529,401 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
         }
         ExecutionOutcome::Cancelled(_) => panic!("uncancelled execution returned Cancelled"),
     }
+}
+
+fn persisted_create_for_executor(id: &ResourceId) -> crate::provider::InFlightCreate {
+    let pending = crate::provider::CreateAttempt::new(id.clone())
+        .issued(
+            AppliedIdentifier::new("created-id").expect("fixture identifier must be non-empty"),
+            crate::provider::Sent::AllRequestAttributes,
+        )
+        .pending(
+            crate::provider::PendingToken::new("persisted-create-token"),
+            1,
+        );
+    pending.persist(
+        crate::provider::PersistedAttributes::default(),
+        crate::provider::PersistedAttributes::default(),
+    )
+}
+
+fn persisted_unissued_create_for_executor(id: &ResourceId) -> crate::provider::InFlightCreate {
+    let pending = crate::provider::CreateAttempt::new(id.clone()).pending(
+        crate::provider::PendingToken::new("persisted-create-token"),
+        crate::provider::Sent::AllRequestAttributes,
+        1,
+    );
+    pending.persist(
+        crate::provider::PersistedAttributes::default(),
+        crate::provider::PersistedAttributes::default(),
+    )
+}
+
+async fn execute_lifecycle_fixture(
+    provider: &MockProvider,
+    plan: &Plan,
+    managed_current: HashMap<ResourceId, Current>,
+) -> ExecutionResult {
+    let input = ExecutionInput {
+        plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current,
+        data_source_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+    completed_result(
+        execute_plan(
+            provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn create_success_publishes_complete() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(source));
+    plan.add(create_effect(dependent));
+    provider.push_create(Ok(ok_state(&source_id)));
+    provider.push_create(Ok(ok_state(&dependent_id)));
+
+    let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (2, 0, 0)
+    );
+    assert!(matches!(
+        result.applied_states.get(&source_id),
+        Some(Applied::Complete(_))
+    ));
+    assert!(matches!(
+        result.applied_states.get(&dependent_id),
+        Some(Applied::Complete(_))
+    ));
+}
+
+#[tokio::test]
+async fn resume_resumed_publishes_observed() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let started_at = pending.started_at().clone();
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), started_at);
+    plan.add(create_effect(dependent));
+    provider.push_resume(ResumeFixture::Resumed);
+    provider.push_create(Ok(ok_state(&dependent_id)));
+
+    let result = execute_lifecycle_fixture(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+    )
+    .await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (2, 0, 0)
+    );
+    assert!(matches!(
+        result.applied_states.get(&source_id),
+        Some(Applied::Observed(_))
+    ));
+    assert!(matches!(
+        result.applied_states.get(&dependent_id),
+        Some(Applied::Complete(_))
+    ));
+}
+
+#[tokio::test]
+async fn resume_dispatch_validates_resent_sent_against_checked_request() {
+    let provider = MockProvider::new();
+    provider.push_resume(ResumeFixture::ResentInFlightWithInvalidSent);
+    let resource = make_resource("source", &[]);
+    let id = resource.id.clone();
+    let pending = persisted_unissued_create_for_executor(&id);
+    let bindings = ResolvedBindings::default();
+    let module_gate = crate::executor::ModuleConstraintGate::new(&[]);
+    let preparation = crate::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &[],
+        &NoopNormalizer,
+        &[],
+        &TEST_SCHEMAS,
+    );
+    let request = crate::executor::prepare_create_request(resource, &preparation)
+        .await
+        .expect("fixture request passes provider preparation");
+    let request = crate::provider::ResumeCreateRequest::new(pending, request)
+        .expect("fixture continuation and request share a route");
+
+    let failure = crate::executor::dispatch_resume_create(&provider, request)
+        .await
+        .expect_err("resent pending fixture returns a classified failure");
+    let crate::provider::ResumeFailureKind::InFlight { pending, error } = failure.into_kind()
+    else {
+        panic!("resent pending classification was not preserved");
+    };
+    assert_eq!(
+        pending.sent(),
+        crate::provider::SentRecord::Request(crate::provider::Sent::only(Vec::<String>::new()))
+    );
+    assert_eq!(
+        error.detail().context(),
+        "provider returned sent attributes outside the checked create request"
+    );
+    assert_eq!(
+        error
+            .detail()
+            .cause()
+            .expect("boundary validation retains the typed provider cause")
+            .to_string(),
+        "resent create is pending"
+    );
+}
+
+#[tokio::test]
+async fn create_dispatch_rejects_an_outcome_bound_to_another_resource() {
+    let provider = MockProvider::new();
+    let resource = make_resource("source", &[]);
+    let id = resource.id.clone();
+    let other_id = make_resource("other", &[]).id;
+    provider.push_create(Ok(ok_state(&other_id)));
+    let bindings = ResolvedBindings::default();
+    let module_gate = crate::executor::ModuleConstraintGate::new(&[]);
+    let preparation = crate::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &[],
+        &NoopNormalizer,
+        &[],
+        &TEST_SCHEMAS,
+    );
+    let request = crate::executor::prepare_create_request(resource, &preparation)
+        .await
+        .expect("fixture request passes provider preparation");
+
+    let failure = crate::executor::dispatch_create(&provider, &id, request)
+        .await
+        .expect_err("a provider outcome for another route must be rejected");
+    let crate::provider::CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        panic!("the mismatched provider outcome must not carry foreign state");
+    };
+    assert_eq!(
+        error.detail().context(),
+        "provider returned a create outcome for another resource"
+    );
+    assert!(error.to_string().starts_with("[test.source]"));
+}
+
+#[tokio::test]
+async fn create_untracked_skips_dependents_and_writes_nothing() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(source));
+    plan.add(create_effect(dependent));
+    provider.push_create(Err(ProviderError::api_error("create rejected")));
+
+    let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    assert!(!result.applied_states.contains_key(&source_id));
+    assert!(!result.applied_states.contains_key(&dependent_id));
+}
+
+#[tokio::test]
+async fn resume_ended_skips_dependents_and_marks_create_ended() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), pending.started_at().clone());
+    plan.add(create_effect(dependent));
+    provider.push_resume(ResumeFixture::Ended);
+
+    let result = execute_lifecycle_fixture(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+    )
+    .await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    assert!(matches!(
+        result.applied_states.get(&source_id),
+        Some(Applied::CreateEnded)
+    ));
+    assert!(!result.applied_states.contains_key(&dependent_id));
+}
+
+#[tokio::test]
+async fn created_failure_records_observation() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(source));
+    plan.add(create_effect(dependent));
+    provider.push_classified_create(ClassifiedCreateFixture::Created);
+
+    let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    assert!(matches!(
+        result.applied_states.get(&source_id),
+        Some(Applied::Observed(_))
+    ));
+    assert!(!result.applied_states.contains_key(&dependent_id));
+}
+
+#[tokio::test]
+async fn in_flight_failure_records_pending() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(source));
+    plan.add(create_effect(dependent));
+    provider.push_classified_create(ClassifiedCreateFixture::InFlight);
+
+    let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    assert!(matches!(
+        result.applied_states.get(&source_id),
+        Some(Applied::CreateInFlight(_))
+    ));
+    assert!(!result.applied_states.contains_key(&dependent_id));
+}
+
+#[tokio::test]
+async fn resume_resolution_failure_has_no_applied_entry() {
+    let provider = MockProvider::new();
+    let mut source = make_resource("source", &[]);
+    source.set_attr(
+        "unresolved",
+        Value::resource_ref("missing".to_string(), "id".to_string(), vec![]),
+    );
+    let source_id = source.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), pending.started_at().clone());
+
+    let result = execute_lifecycle_fixture(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+    )
+    .await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (0, 1, 0)
+    );
+    assert!(!result.applied_states.contains_key(&source_id));
+}
+
+#[tokio::test]
+async fn skipped_or_cancelled_resume_has_no_applied_entry() {
+    let provider = MockProvider::new();
+    let failed = make_resource("failed", &[]);
+    let resume = make_resource("resume", &["failed"]);
+    let failed_id = failed.id.clone();
+    let resume_id = resume.id.clone();
+    let pending = persisted_create_for_executor(&resume_id);
+    let mut plan = Plan::new();
+    plan.add(create_effect(failed));
+    plan.add_resume_create(resolved(resume), pending.started_at().clone());
+    provider.push_create(Err(ProviderError::api_error("dependency failed")));
+
+    let result = execute_lifecycle_fixture(
+        &provider,
+        &plan,
+        HashMap::from([(resume_id.clone(), Current::CreateInFlight(pending))]),
+    )
+    .await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    assert!(!result.applied_states.contains_key(&failed_id));
+    assert!(!result.applied_states.contains_key(&resume_id));
 }
 
 fn provider_boundary_constraint_schemas() -> SchemaRegistry {
@@ -1552,14 +2089,14 @@ impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
 
     fn normalize_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut crate::provider::StateTransformMap,
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
     fn hydrate_read_state<'a>(
         &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
+        _current_states: &'a mut crate::provider::StateTransformMap,
         _saved_attrs: &'a crate::provider::SavedAttrs,
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
@@ -4828,14 +5365,14 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             crate::provider::ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             crate::provider::ready_noop()
@@ -5375,7 +5912,9 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+            _attempt: crate::provider::CreateAttempt,
+        ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>>
+        {
             let id_clone = id.clone();
             let name = id.identity_str().expect("resolved identity").to_string();
             let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
@@ -5394,12 +5933,14 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
                     "id".to_string(),
                     Value::Concrete(ConcreteValue::String("id-123".into())),
                 );
-                Ok(crate::provider::CreateOutcome::Success {
-                    state: AppliedState::new(id_clone, "id-123", attrs)
+                Ok(crate::provider::CreateOutcome::fixture_success(
+                    AppliedState::new(id_clone, "id-123", attrs)
                         .expect("fixture identifier is non-empty"),
-                })
+                ))
             })
         }
+
+        unexpected_resume_create!();
 
         fn update(
             &self,
@@ -5538,9 +6079,12 @@ impl Provider for YieldingUpdateProvider {
         &self,
         _id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
-        Box::pin(async { Err(ProviderError::internal("not implemented")) })
+        attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
+        Box::pin(async move { Err(attempt.untracked(ProviderError::internal("not implemented"))) })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -6048,6 +6592,7 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
     let dep_map =
         build_dependency_analysis(plan.effects(), &HashMap::new(), &[], ScheduleInputs::Apply)
+            .expect("dependency analysis must resolve")
             .into_deps_of();
 
     // Verify levels are consistent with the dependency map:
@@ -6155,6 +6700,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
 
     let deps =
         build_dependency_analysis(plan.effects(), &HashMap::new(), &[], ScheduleInputs::Apply)
+            .expect("dependency analysis must resolve")
             .into_deps_of();
 
     // vpc delete (idx 0) must depend on subnet delete (idx 1)
@@ -6291,8 +6837,8 @@ impl RecordingMockProvider {
         self.create_results
             .lock()
             .unwrap()
-            .push(result.map(|state| crate::provider::CreateOutcome::Success {
-                state: applied_state_for_test(state),
+            .push(result.map(|state| {
+                crate::provider::CreateOutcome::fixture_success(applied_state_for_test(state))
             }));
     }
 
@@ -6326,13 +6872,16 @@ impl Provider for RecordingMockProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let id_str = id.to_string();
         let attrs = request.resource().as_resource().resolved_attributes();
         self.create_log.lock().unwrap().push((id_str, attrs));
         let result = self.create_results.lock().unwrap().remove(0);
-        Box::pin(async move { result })
+        Box::pin(async move { result.map_err(|error| attempt.untracked(error)) })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -6408,7 +6957,8 @@ impl Provider for CascadeReplaceProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let id = id.clone();
         let attrs = request.resource().as_resource().resolved_attributes();
         self.call_log
@@ -6423,8 +6973,8 @@ impl Provider for CascadeReplaceProvider {
         Box::pin(async move {
             if id.resource_type == "ec2.Vpc" {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                return Ok(crate::provider::CreateOutcome::Success {
-                    state: AppliedState::new(
+                return Ok(crate::provider::CreateOutcome::fixture_success(
+                    AppliedState::new(
                         id,
                         "vpc-new",
                         HashMap::from([(
@@ -6433,12 +6983,12 @@ impl Provider for CascadeReplaceProvider {
                         )]),
                     )
                     .expect("fixture identifier is non-empty"),
-                });
+                ));
             }
 
             if id.resource_type == "ec2.Subnet" {
-                return Ok(crate::provider::CreateOutcome::Success {
-                    state: AppliedState::new(
+                return Ok(crate::provider::CreateOutcome::fixture_success(
+                    AppliedState::new(
                         id,
                         "subnet-new",
                         HashMap::from([(
@@ -6447,12 +6997,14 @@ impl Provider for CascadeReplaceProvider {
                         )]),
                     )
                     .expect("fixture identifier is non-empty"),
-                });
+                ));
             }
 
-            Err(ProviderError::internal(format!("unexpected create {id}")))
+            Err(attempt.untracked(ProviderError::internal(format!("unexpected create {id}"))))
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -6613,6 +7165,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &[],
         ScheduleInputs::Apply,
     )
+    .expect("dependency analysis must resolve")
     .into_deps_of();
     let vpc_create_idx = plan
         .effects()
@@ -7514,16 +8067,21 @@ impl Provider for IdentifierAwareProvider {
         &self,
         _id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let state = self.created_state.lock().unwrap().clone();
         Box::pin(async move {
             state
-                .map(|state| crate::provider::CreateOutcome::Success {
-                    state: applied_state_for_test(state),
+                .map(|state| {
+                    crate::provider::CreateOutcome::fixture_success(applied_state_for_test(state))
                 })
-                .ok_or_else(|| ProviderError::api_error("no canned create state"))
+                .ok_or_else(|| {
+                    attempt.untracked(ProviderError::api_error("no canned create state"))
+                })
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -8038,14 +8596,14 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             crate::provider::ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             crate::provider::ready_noop()
@@ -8066,24 +8624,24 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             if id.identity_str().expect("resolved identity") == "cert" {
                 let _provider_lock = self.scenario.awscc_shared.lock().await;
                 self.scenario.alb_waiting_for_awscc.notified().await;
-                return Ok(crate::provider::CreateOutcome::Success {
-                    state: applied_state_for_test(cert_state_for_deferred_replace_deadlock(id)),
-                });
+                return Ok(crate::provider::CreateOutcome::fixture_success(
+                    applied_state_for_test(cert_state_for_deferred_replace_deadlock(id)),
+                ));
             }
 
             if id.identity_str().expect("resolved identity") == "alb" {
                 let _provider_lock = self.scenario.awscc_shared.lock().await;
-                return Ok(crate::provider::CreateOutcome::Success {
-                    state: AppliedState::new(id.clone(), "alb-id", HashMap::new())
+                return Ok(crate::provider::CreateOutcome::fixture_success(
+                    AppliedState::new(id.clone(), "alb-id", HashMap::new())
                         .expect("fixture identifier is non-empty"),
-                });
+                ));
             }
 
             let identifier = format!("{}-id", id.identity_str().expect("resolved identity"));
-            Ok(crate::provider::CreateOutcome::Success {
-                state: AppliedState::new(id.clone(), identifier, HashMap::new())
+            Ok(crate::provider::CreateOutcome::fixture_success(
+                AppliedState::new(id.clone(), identifier, HashMap::new())
                     .expect("derived fixture identifier is non-empty"),
-            })
+            ))
         }
 
         async fn delete_id(&self, id: &ResourceId) -> ProviderResult<()> {
@@ -8125,10 +8683,18 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+            attempt: crate::provider::CreateAttempt,
+        ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>>
+        {
             let id = id.clone();
-            Box::pin(async move { self.create_state(&id).await })
+            Box::pin(async move {
+                self.create_state(&id)
+                    .await
+                    .map_err(|error| attempt.untracked(error))
+            })
         }
+
+        unexpected_resume_create!();
 
         fn update(
             &self,

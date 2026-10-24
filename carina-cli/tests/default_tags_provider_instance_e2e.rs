@@ -267,7 +267,7 @@ fn saved_plan_apply_preserves_default_tag_annotation_without_persisting_provenan
             .expect("read persisted state"),
     )
     .expect("parse persisted state");
-    let attributes = state["resources"][0]["attributes"]
+    let attributes = state["resources"][0]["current"]["attributes"]
         .as_object()
         .expect("persisted resource attributes must be an object");
     assert!(
@@ -313,7 +313,7 @@ fn apply_updates_default_tags_without_persisting_host_metadata() {
                 .expect("read persisted state"),
         )
         .expect("parse persisted state");
-        let attributes = state["resources"][0]["attributes"]
+        let attributes = state["resources"][0]["current"]["attributes"]
             .as_object()
             .expect("persisted resource attributes must be an object");
         assert!(

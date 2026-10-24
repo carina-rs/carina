@@ -6,8 +6,11 @@ use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    AppliedIdentifier, CreateRequest, DeleteRequest, Provider, ProviderFactory,
-    ProviderReadyConfig, RawSavedAttrs, ReadRequest, SavedAttrs, UpdateRequest,
+    AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateOutcome,
+    CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Observation, Provider,
+    ProviderFactory, ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest,
+    ResumeFailure, ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind, SavedAttrs, Sent,
+    SentRecord, UpdateRequest, hydrate_provider_states, normalize_provider_states,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, EnumValueResolver, RawEnumIdentifier,
@@ -92,6 +95,27 @@ async fn create_request_for_test(resource: Resource) -> CreateRequest {
         .expect("test resource should pass checked create preparation")
 }
 
+trait DispatchCreateForTest {
+    fn create_for_test<'a>(
+        &'a self,
+        id: &'a ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>>;
+}
+
+impl<T> DispatchCreateForTest for T
+where
+    T: Provider + ?Sized,
+{
+    fn create_for_test<'a>(
+        &'a self,
+        id: &'a ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
+        Box::pin(carina_core::executor::dispatch_create(self, id, request))
+    }
+}
+
 async fn update_request_for_test(
     resource: Resource,
     from: State,
@@ -170,6 +194,67 @@ fn resource_with_int_attribute(
     resource
 }
 
+fn resource_with_string_attribute(
+    resource_type: &str,
+    identity: &str,
+    attribute: &str,
+    value: &str,
+) -> Resource {
+    let identity = carina_core::resource::ResourceIdentity::try_from(identity.to_string())
+        .expect("test identity must be non-empty");
+    let mut resource = Resource::with_provider("mock", resource_type, identity, None);
+    resource.attributes.insert(
+        attribute.into(),
+        Value::Concrete(ConcreteValue::String(value.to_string().into())),
+    );
+    resource
+}
+
+fn persisted_create_for_resume(
+    id: &ResourceId,
+    token: &str,
+    identifier: Option<&str>,
+) -> InFlightCreate {
+    let identity = id
+        .identity()
+        .cloned()
+        .expect("resume fixture identity is resolved");
+    let mut row = serde_json::to_value(carina_state::ResourceState::new(
+        &id.resource_type,
+        identity,
+        &id.provider,
+    ))
+    .expect("fixture row serializes");
+    row["current"] = serde_json::json!({
+        "kind": "create_in_flight",
+        "envelope": {
+            "token": token,
+            "identifier": identifier,
+            "write_only": {},
+            "secrets": {},
+        },
+        "started_at": "2026-10-23T08:00:00Z",
+    });
+    let mut document =
+        serde_json::to_value(carina_state::StateFile::new()).expect("fixture state serializes");
+    document["resources"] = serde_json::json!([row]);
+    let loaded = carina_state::state::check_and_migrate(&document.to_string())
+        .expect("v15 fixture passes the public state loader")
+        .into_state();
+    match loaded.build_state_for_resource(id) {
+        carina_core::resource::Current::CreateInFlight(pending) => pending,
+        carina_core::resource::Current::Absent(state) => {
+            panic!("resume fixture loaded as absent: {state:?}")
+        }
+        carina_core::resource::Current::Present(state) => {
+            panic!("resume fixture loaded as present: {state:?}")
+        }
+        carina_core::resource::Current::MissingIdentifier(state) => {
+            panic!("resume fixture loaded without an identifier: {state:?}")
+        }
+    }
+}
+
 fn ready_config(
     factory: &dyn ProviderFactory,
     attributes: &indexmap::IndexMap<String, Value>,
@@ -246,7 +331,7 @@ async fn test_wasm_pending_create_polls_until_success() {
     );
 
     let state = provider
-        .create(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("pending create should settle")
         .into_state_for_writeback();
@@ -274,7 +359,7 @@ async fn test_wasm_pending_update_polls_until_success() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-update", None);
     let mut resource = resource_with_int_attribute("test.resource", "pending-update", "value", 1);
     let created = provider
-        .create(&id, create_request_for_test(resource.clone()).await)
+        .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("setup create should succeed")
         .into_state_for_writeback();
@@ -326,7 +411,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
         i64::from(PENDING_POLLS),
     );
     provider
-        .create(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("setup create should succeed");
 
@@ -372,7 +457,7 @@ async fn test_wasm_pending_create_can_settle_on_final_poll_at_deadline() {
     );
 
     let state = provider
-        .create(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("the final poll at the schema deadline should be allowed")
         .into_state_for_writeback();
@@ -404,7 +489,7 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
 
     tokio::time::timeout(
         Duration::from_millis(750),
-        provider.create(&pending_id, create_request_for_test(pending).await),
+        provider.create_for_test(&pending_id, create_request_for_test(pending).await),
     )
     .await
     .expect_err("the caller timeout should drop the operation between polls");
@@ -413,7 +498,7 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
         ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
     let healthy = resource_with_int_attribute("test.resource", "after-cancel", "value", 1);
     provider
-        .create(&healthy_id, create_request_for_test(healthy).await)
+        .create_for_test(&healthy_id, create_request_for_test(healthy).await)
         .await
         .expect("cancellation between polls must not poison the WASM instance");
 }
@@ -435,21 +520,585 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
     );
 
     let error = provider
-        .create(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, create_request_for_test(resource).await)
         .await
-        .expect_err("pending create should exhaust its schema budget");
-    assert!(matches!(
-        error,
-        carina_core::provider::ProviderError::Timeout(_)
-    ));
+        .expect_err("pending create should exhaust its schema budget")
+        .into_kind();
+    match error {
+        CreateFailureKind::InFlight { pending, error } => {
+            assert_eq!(pending.id(), &id);
+            assert_eq!(error.variant_name(), "timeout");
+        }
+        CreateFailureKind::Untracked(error) => {
+            panic!("pending create was downgraded to untracked: {error}")
+        }
+        CreateFailureKind::Created { created, error } => panic!(
+            "pending create was classified as created for {}: {error}",
+            created.identifier()
+        ),
+    }
 
     let healthy_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-timeout", None);
     let healthy = resource_with_int_attribute("test.resource", "after-timeout", "value", 1);
     provider
-        .create(&healthy_id, create_request_for_test(healthy).await)
+        .create_for_test(&healthy_id, create_request_for_test(healthy).await)
         .await
         .expect("budget exhaustion must not poison the WASM instance");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+
+    let untracked_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "mode-untracked", None);
+    let untracked = resource_with_string_attribute(
+        "test.resource",
+        "mode-untracked",
+        "create_mode",
+        "untracked",
+    );
+    let untracked = provider
+        .create_for_test(&untracked_id, create_request_for_test(untracked).await)
+        .await
+        .expect_err("untracked mode must return a classified failure")
+        .into_kind();
+    assert!(matches!(untracked, CreateFailureKind::Untracked(_error)));
+
+    let created_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "mode-created", None);
+    let mut created =
+        resource_with_string_attribute("test.resource", "mode-created", "create_mode", "created");
+    created.set_attr(
+        "name",
+        Value::Concrete(ConcreteValue::String("created-name".into())),
+    );
+    created.set_attr(
+        "create_sent",
+        Value::Concrete(ConcreteValue::String("name".into())),
+    );
+    let created = provider
+        .create_for_test(&created_id, create_request_for_test(created).await)
+        .await
+        .expect_err("created mode must preserve its observed resource")
+        .into_kind();
+    let CreateFailureKind::Created { created, error } = created else {
+        panic!("created mode returned the wrong failure variant");
+    };
+    drop(error);
+    assert_eq!(created.identifier().as_str(), "mock-id");
+    match created.sent() {
+        SentRecord::Request(Sent::Only(attributes)) => {
+            assert_eq!(
+                attributes,
+                &std::collections::BTreeSet::from(["name".to_string()])
+            );
+        }
+        SentRecord::Request(Sent::AllRequestAttributes) => {
+            panic!("created mode ignored its sent subset")
+        }
+        SentRecord::Persisted(envelope) => {
+            panic!("fresh created verdict unexpectedly used a persisted envelope: {envelope:?}")
+        }
+    }
+
+    let malformed_id =
+        ResourceId::with_provider_identity("mock", "test.short_budget", "mode-malformed", None);
+    let malformed = resource_with_string_attribute(
+        "test.short_budget",
+        "mode-malformed",
+        "create_mode",
+        "malformed_pending",
+    );
+    let malformed = provider
+        .create_for_test(&malformed_id, create_request_for_test(malformed).await)
+        .await
+        .expect_err("an undecodable poll token must remain in flight")
+        .into_kind();
+    match malformed {
+        CreateFailureKind::InFlight { pending, error } => {
+            assert_eq!(pending.id(), &malformed_id);
+            drop(error);
+        }
+        CreateFailureKind::Untracked(error) => {
+            panic!("undecodable token was downgraded to untracked: {error}")
+        }
+        CreateFailureKind::Created { created, error } => panic!(
+            "undecodable token was classified as created for {}: {error}",
+            created.identifier()
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_issued_encode_failure_is_created_never_untracked() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id =
+        ResourceId::with_provider_identity("mock", "test.resource", "unencodable-created", None);
+    let resource = resource_with_string_attribute(
+        "test.resource",
+        "unencodable-created",
+        "create_mode",
+        "unencodable_created",
+    );
+
+    let failure = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("guest encoding failure must remain classified")
+        .into_kind();
+    match failure {
+        CreateFailureKind::Created { created, error } => {
+            assert_eq!(created.identifier().as_str(), "mock-id");
+            assert!(!error.to_string().is_empty());
+        }
+        CreateFailureKind::Untracked(error) => {
+            panic!("issued create was lost as untracked: {error}")
+        }
+        CreateFailureKind::InFlight { pending, error } => {
+            panic!("finished create unexpectedly remained in flight {pending:?}: {error}")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_unissued_pending_token_encode_failure_is_untracked() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "unencodable-pending",
+        None,
+    );
+    let resource = resource_with_string_attribute(
+        "test.short_budget",
+        "unencodable-pending",
+        "create_mode",
+        "unencodable_pending",
+    );
+
+    match provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("an unissued unencodable continuation cannot be tracked")
+        .into_kind()
+    {
+        CreateFailureKind::Untracked(error) => {
+            assert!(error.to_string().contains("pending token"));
+        }
+        CreateFailureKind::Created { created, error } => panic!(
+            "unissued create unexpectedly retained identifier {}: {error}",
+            created.identifier()
+        ),
+        CreateFailureKind::InFlight { pending, error } => {
+            panic!("unencodable token entered in-flight state {pending:?}: {error}")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_issued_pending_token_encode_failure_is_created() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "unencodable-issued-pending",
+        None,
+    );
+    let resource = resource_with_string_attribute(
+        "test.short_budget",
+        "unencodable-issued-pending",
+        "create_mode",
+        "unencodable_pending_issued",
+    );
+
+    match provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("an issued create with no encodable continuation must be retained")
+        .into_kind()
+    {
+        CreateFailureKind::Created { created, error } => {
+            assert_eq!(created.identifier().as_str(), "mock-id");
+            let Observation::ReadFailed(read_error) = created.observation() else {
+                panic!("token encoding failure must be recorded as a failed observation")
+            };
+            assert!(read_error.to_string().contains("pending token"));
+            assert!(matches!(
+                created.sent(),
+                SentRecord::Request(Sent::AllRequestAttributes)
+            ));
+            assert!(error.to_string().contains("pending token"));
+        }
+        CreateFailureKind::Untracked(error) => {
+            panic!("issued create was lost as untracked: {error}")
+        }
+        CreateFailureKind::InFlight { pending, error } => {
+            panic!("unencodable token entered in-flight state {pending:?}: {error}")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id =
+        ResourceId::with_provider_identity("mock", "test.short_budget", "unencodable-poll", None);
+    let resource = resource_with_string_attribute(
+        "test.short_budget",
+        "unencodable-poll",
+        "create_mode",
+        "unencodable_poll",
+    );
+
+    match provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("an unissued poll with no replacement token must remain in flight")
+        .into_kind()
+    {
+        CreateFailureKind::InFlight { pending, error } => {
+            let token: serde_json::Value =
+                serde_json::from_str(pending.token().expose_for_provider_call())
+                    .expect("the previous continuation must remain decodable");
+            assert_eq!(token["polls_served"], 0);
+            assert!(error.to_string().contains("poll_create pending token"));
+        }
+        CreateFailureKind::Untracked(error) => {
+            panic!("poll token encoding failure lost the previous continuation: {error}")
+        }
+        CreateFailureKind::Created { created, error } => panic!(
+            "unissued poll unexpectedly retained identifier {}: {error}",
+            created.identifier()
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "unencodable-issued-poll",
+        None,
+    );
+    let resource = resource_with_string_attribute(
+        "test.short_budget",
+        "unencodable-issued-poll",
+        "create_mode",
+        "unencodable_poll_issued",
+    );
+
+    match provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("an issued poll with no encodable replacement must remain in flight")
+        .into_kind()
+    {
+        CreateFailureKind::InFlight { pending, error } => {
+            let token: serde_json::Value =
+                serde_json::from_str(pending.token().expose_for_provider_call())
+                    .expect("the previous continuation must remain decodable");
+            assert_eq!(token["polls_served"], 0);
+            assert_eq!(
+                pending.identifier().map(AppliedIdentifier::as_str),
+                Some("mock-id")
+            );
+            assert!(error.to_string().contains("poll_create pending token"));
+        }
+        CreateFailureKind::Untracked(error) => {
+            panic!("issued poll was lost as untracked: {error}")
+        }
+        CreateFailureKind::Created { created, error } => panic!(
+            "issued poll ended the in-flight operation for {}: {error}",
+            created.identifier()
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "unencodable-repending",
+        None,
+    );
+    let previous_token = serde_json::json!({
+        "remaining": 100,
+        "polls_served": 0,
+        "mode": "pending",
+    })
+    .to_string();
+    let pending = persisted_create_for_resume(&id, &previous_token, Some("mock-id"));
+    let resource = resource_with_string_attribute(
+        "test.short_budget",
+        "unencodable-repending",
+        "create_mode",
+        "unencodable_repending",
+    );
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+
+    match provider
+        .resume_create(request)
+        .await
+        .map(ResumeOutcome::into_kind)
+        .map_err(ResumeFailure::into_kind)
+    {
+        Err(ResumeFailureKind::InFlight { pending, error }) => {
+            assert_eq!(
+                pending.identifier().map(AppliedIdentifier::as_str),
+                Some("mock-id")
+            );
+            assert_eq!(
+                pending.token().expose_for_provider_call(),
+                previous_token,
+                "a failed token encode must keep the last decodable continuation"
+            );
+            assert!(error.to_string().contains("pending token"));
+        }
+        Err(ResumeFailureKind::Ended(error)) => {
+            panic!("token encoding failure incorrectly ended the create: {error}")
+        }
+        Err(ResumeFailureKind::Created { created, error }) => panic!(
+            "token encoding failure unexpectedly finalized {}: {error}",
+            created.identifier()
+        ),
+        Ok(ResumeOutcomeKind::Resumed(created)) => {
+            panic!("token encoding failure unexpectedly resumed {created:?}")
+        }
+        Ok(ResumeOutcomeKind::Resent(outcome)) => {
+            panic!("token encoding failure unexpectedly resent {outcome:?}")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+
+    for (mode, identifier, expected) in [
+        ("resumed", Some("mock-id"), "resumed"),
+        ("discarded", Some("mock-id"), "ended"),
+        ("undetermined", None, "in_flight"),
+        ("pending", None, "in_flight"),
+        ("resend", None, "resent"),
+    ] {
+        let identity = format!("resume-{mode}");
+        let id = ResourceId::with_provider_identity(
+            "mock",
+            "test.short_budget",
+            carina_core::resource::ResourceIdentity::try_from(identity.clone())
+                .expect("resume fixture identity is non-empty"),
+            None,
+        );
+        let token = serde_json::json!({
+            "remaining": 100,
+            "polls_served": 0,
+            "mode": mode,
+        })
+        .to_string();
+        let pending = persisted_create_for_resume(&id, &token, identifier);
+        let resource =
+            resource_with_string_attribute("test.short_budget", &identity, "name", &identity);
+        let request =
+            ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+                .expect("resume fixture route must match");
+        let result = provider
+            .resume_create(request)
+            .await
+            .map(ResumeOutcome::into_kind)
+            .map_err(ResumeFailure::into_kind);
+
+        match (expected, result) {
+            ("resumed", Ok(ResumeOutcomeKind::Resumed(created))) => {
+                assert_eq!(created.identifier().as_str(), "mock-id");
+            }
+            ("resent", Ok(ResumeOutcomeKind::Resent(outcome))) => match outcome.into_kind() {
+                CreateOutcomeKind::Success { state } => {
+                    assert_eq!(state.identifier().as_str(), "mock-id");
+                }
+                CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
+                    panic!(
+                        "resend unexpectedly returned partial state {state:?} with {diagnostic:?}"
+                    )
+                }
+            },
+            ("ended", Err(ResumeFailureKind::Ended(error))) => drop(error),
+            ("in_flight", Err(ResumeFailureKind::InFlight { pending, error })) => {
+                assert_eq!(pending.id(), &id);
+                drop(error);
+            }
+            (expected, Ok(ResumeOutcomeKind::Resumed(created))) => {
+                panic!("expected {expected}, got resumed {created:?}")
+            }
+            (expected, Ok(ResumeOutcomeKind::Resent(outcome))) => {
+                panic!("expected {expected}, got resent {outcome:?}")
+            }
+            (expected, Err(ResumeFailureKind::Ended(error))) => {
+                panic!("expected {expected}, got ended {error}")
+            }
+            (expected, Err(ResumeFailureKind::Created { created, error })) => {
+                panic!("expected {expected}, got created {created:?}: {error}")
+            }
+            (expected, Err(ResumeFailureKind::InFlight { pending, error })) => {
+                panic!("expected {expected}, got in flight {pending:?}: {error}")
+            }
+        }
+    }
+
+    let malformed_id =
+        ResourceId::with_provider_identity("mock", "test.short_budget", "resume-malformed", None);
+    let malformed = persisted_create_for_resume(&malformed_id, "not-json", None);
+    let malformed_resource = resource_with_string_attribute(
+        "test.short_budget",
+        "resume-malformed",
+        "name",
+        "resume-malformed",
+    );
+    let malformed_request =
+        ResumeCreateRequest::for_test(malformed, create_request_for_test(malformed_resource).await)
+            .expect("malformed-token fixture route must match");
+    match provider
+        .resume_create(malformed_request)
+        .await
+        .map(ResumeOutcome::into_kind)
+        .map_err(ResumeFailure::into_kind)
+    {
+        Err(ResumeFailureKind::InFlight { pending, error }) => {
+            assert_eq!(pending.id(), &malformed_id);
+            drop(error);
+        }
+        Err(ResumeFailureKind::Ended(error)) => {
+            panic!("undecodable resume token incorrectly ended the row: {error}")
+        }
+        Err(ResumeFailureKind::Created { created, error }) => panic!(
+            "undecodable resume token was classified as created for {}: {error}",
+            created.identifier()
+        ),
+        Ok(ResumeOutcomeKind::Resumed(created)) => panic!(
+            "undecodable resume token unexpectedly resumed {}",
+            created.identifier()
+        ),
+        Ok(ResumeOutcomeKind::Resent(outcome)) => {
+            panic!("undecodable resume token unexpectedly resent: {outcome:?}")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let canonical = "part-a|part-b";
+
+    let finished_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "canonical-finished", None);
+    let finished = resource_with_string_attribute(
+        "test.resource",
+        "canonical-finished",
+        "canonical_identifier",
+        canonical,
+    );
+    let finished = provider
+        .create_for_test(&finished_id, create_request_for_test(finished).await)
+        .await
+        .expect("canonicalized finished create should succeed")
+        .into_kind();
+    match finished {
+        CreateOutcomeKind::Success { state } => {
+            assert_eq!(state.identifier().as_str(), canonical)
+        }
+        CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
+            panic!("unexpected partial canonical create {state:?}: {diagnostic:?}")
+        }
+    }
+
+    let resumed_id =
+        ResourceId::with_provider_identity("mock", "test.short_budget", "canonical-resumed", None);
+    let token = serde_json::json!({
+        "remaining": 100,
+        "polls_served": 0,
+        "mode": "resumed",
+    })
+    .to_string();
+    let pending = persisted_create_for_resume(&resumed_id, &token, Some("provisional-id"));
+    let resumed = resource_with_string_attribute(
+        "test.short_budget",
+        "canonical-resumed",
+        "canonical_identifier",
+        canonical,
+    );
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resumed).await)
+        .expect("resume fixture route must match");
+    match provider
+        .resume_create(request)
+        .await
+        .map(ResumeOutcome::into_kind)
+        .map_err(ResumeFailure::into_kind)
+    {
+        Ok(ResumeOutcomeKind::Resumed(created)) => {
+            assert_eq!(created.identifier().as_str(), canonical);
+        }
+        Ok(ResumeOutcomeKind::Resent(outcome)) => {
+            panic!("expected resumed canonical identifier, got resent {outcome:?}")
+        }
+        Err(ResumeFailureKind::Ended(error)) => panic!("canonical resume ended: {error}"),
+        Err(ResumeFailureKind::Created { created, error }) => {
+            panic!("canonical resume failed after create {created:?}: {error}")
+        }
+        Err(ResumeFailureKind::InFlight { pending, error }) => {
+            panic!("canonical resume stayed in flight {pending:?}: {error}")
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -474,14 +1123,26 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     );
 
     let error = provider
-        .create(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the slow initial guest call should exhaust the schema budget");
 
-    assert!(matches!(
-        error,
-        carina_core::provider::ProviderError::Timeout(_)
-    ));
+    match error.into_kind() {
+        CreateFailureKind::InFlight {
+            pending: _pending,
+            error,
+        } => assert!(matches!(
+            error,
+            carina_core::provider::ProviderError::Timeout(_timeout)
+        )),
+        CreateFailureKind::Untracked(error) => {
+            panic!("slow initial call was classified as untracked: {error}")
+        }
+        CreateFailureKind::Created { created, error } => panic!(
+            "slow initial call was classified as created for {}: {error}",
+            created.identifier()
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -500,7 +1161,7 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let sibling_id =
         ResourceId::with_provider_identity("mock", "test.resource", "sibling-read", None);
 
-    let pending_operation = provider.create(&pending_id, request);
+    let pending_operation = provider.create_for_test(&pending_id, request);
     let sibling_operation = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         tokio::time::timeout(
@@ -553,15 +1214,15 @@ async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     ))
     .await;
 
-    let first_operation = provider.create(&first_id, first);
+    let first_operation = provider.create_for_test(&first_id, first);
     let second_operation = async {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        provider.create(&second_id, second).await
+        provider.create_for_test(&second_id, second).await
     };
     let fast_operation = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let queued_at = Instant::now();
-        let result = provider.create(&fast_id, fast).await;
+        let result = provider.create_for_test(&fast_id, fast).await;
         (result, queued_at.elapsed())
     };
     let (first_result, second_result, (fast_result, fast_elapsed)) =
@@ -612,7 +1273,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     ]);
 
     let created = provider
-        .create(&id, create_request_for_test(resource.clone()).await)
+        .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should succeed")
         .into_state_for_writeback();
@@ -702,7 +1363,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     ]);
 
     let created = provider
-        .create(&id, create_request_for_test(resource.clone()).await)
+        .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should succeed")
         .into_state_for_writeback();
@@ -901,7 +1562,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
         ("payload".into(), cloud_payload.clone()),
     ]);
     provider
-        .create(&id, create_request_for_test(resource.clone()).await)
+        .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should seed the mock cloud store");
 
@@ -981,7 +1642,9 @@ async fn test_wasm_mock_provider_normalizer() {
     ]);
     let state = carina_core::resource::State::existing(id.clone(), attrs.clone());
     let mut states = HashMap::from([(id.clone(), state)]);
-    normalizer.normalize_state(&mut states).await.unwrap();
+    normalize_provider_states(normalizer.as_ref(), &mut states)
+        .await
+        .unwrap();
     let result_state = states.values().next().unwrap();
     assert_eq!(
         result_state.attributes.get("key"),
@@ -1020,9 +1683,7 @@ async fn test_wasm_mock_provider_normalizer() {
             ),
         ),
     ]);
-
-    normalizer
-        .normalize_state(&mut pending_states)
+    normalize_provider_states(normalizer.as_ref(), &mut pending_states)
         .await
         .unwrap();
 
@@ -1180,9 +1841,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
             ]),
         ),
     )]);
-
-    normalizer
-        .normalize_state(&mut rekeyed_states)
+    normalize_provider_states(normalizer.as_ref(), &mut rekeyed_states)
         .await
         .expect("a single pending result is correlated by position, not guest key");
     assert_eq!(
@@ -1204,8 +1863,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
         ),
     )]);
     assert!(
-        normalizer
-            .normalize_state(&mut dropped_states)
+        normalize_provider_states(normalizer.as_ref(), &mut dropped_states)
             .await
             .is_err(),
         "a pending call returning zero entries must fail"
@@ -1229,10 +1887,13 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
             Value::Concrete(ConcreteValue::String("hydrated".into())),
         )]),
     )]);
-    normalizer
-        .hydrate_read_state(&mut hydrate_states, saved_attrs.as_provider_saved_attrs())
-        .await
-        .expect("a single pending hydrate result is correlated by position, not guest key");
+    hydrate_provider_states(
+        normalizer.as_ref(),
+        &mut hydrate_states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await
+    .expect("a single pending hydrate result is correlated by position, not guest key");
     assert_eq!(
         hydrate_states[&hydrate_id]
             .attributes
@@ -1252,10 +1913,13 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
         ),
     )]);
     assert!(
-        normalizer
-            .hydrate_read_state(&mut dropped_hydrate_states, &SavedAttrs::new())
-            .await
-            .is_err(),
+        hydrate_provider_states(
+            normalizer.as_ref(),
+            &mut dropped_hydrate_states,
+            &SavedAttrs::new()
+        )
+        .await
+        .is_err(),
         "a pending hydrate call returning zero entries must fail"
     );
 }
@@ -1303,8 +1967,9 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
             ),
         ),
     ]);
-
-    normalizer.normalize_state(&mut states).await.unwrap();
+    normalize_provider_states(normalizer.as_ref(), &mut states)
+        .await
+        .unwrap();
 
     for (id, expected) in [(&first_id, "first"), (&second_id, "second")] {
         assert_eq!(
@@ -1342,11 +2007,13 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
             )]),
         ),
     ]);
-
-    normalizer
-        .hydrate_read_state(&mut hydrate_states, saved_attrs.as_provider_saved_attrs())
-        .await
-        .unwrap();
+    hydrate_provider_states(
+        normalizer.as_ref(),
+        &mut hydrate_states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await
+    .unwrap();
 
     for (id, expected) in [(&first_id, "first"), (&second_id, "second")] {
         assert_eq!(
@@ -1447,7 +2114,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
         ]);
         let before = states.clone();
 
-        let result = normalizer.normalize_state(&mut states).await;
+        let result = normalize_provider_states(normalizer.as_ref(), &mut states).await;
 
         assert!(result.is_err(), "{identity} must be rejected");
         assert_eq!(states, before, "key mismatches must be atomic");
@@ -1484,10 +2151,12 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
                 Value::Concrete(ConcreteValue::String("would-change".into())),
             )]),
         )]);
-
-        let result = normalizer
-            .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-            .await;
+        let result = hydrate_provider_states(
+            normalizer.as_ref(),
+            &mut states,
+            saved_attrs.as_provider_saved_attrs(),
+        )
+        .await;
 
         assert!(result.is_err(), "{identity} must be rejected");
         assert_eq!(states, before, "key mismatches must be atomic");
@@ -1524,11 +2193,13 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
         id.clone(),
         HashMap::from([("__mock_hydrate_read_state__".to_string(), persisted_secret)]),
     )]);
-
-    normalizer
-        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-        .await
-        .expect("persisted secret must cross the typed guest wire");
+    hydrate_provider_states(
+        normalizer.as_ref(),
+        &mut states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await
+    .expect("persisted secret must cross the typed guest wire");
 
     assert!(matches!(
         states[&id].attributes.get("__mock_hydrated_read_state__"),
@@ -1588,11 +2259,13 @@ async fn test_wasm_hydrate_keeps_marker_strings_plain_top_level_and_nested() {
             HashMap::from([("__mock_hydrate_read_state__".to_string(), nested.clone())]),
         ),
     ]);
-
-    normalizer
-        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-        .await
-        .expect("hydrate persisted strings and typed secrets");
+    hydrate_provider_states(
+        normalizer.as_ref(),
+        &mut states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await
+    .expect("hydrate persisted strings and typed secrets");
 
     assert_eq!(
         states[&top_plain_id]
@@ -1647,11 +2320,13 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
         HashMap::from([("__mock_write_only_secret__".to_string(), typed)]),
     )]);
     let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
-
-    normalizer
-        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-        .await
-        .expect("hydrate write-only legacy secret");
+    hydrate_provider_states(
+        normalizer.as_ref(),
+        &mut states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await
+    .expect("hydrate write-only legacy secret");
 
     let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
         states[&id].attributes.get("__mock_write_only_secret__")
@@ -1713,8 +2388,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     )]);
     let before = states.clone();
 
-    let error = normalizer
-        .normalize_state(&mut states)
+    let error = normalize_provider_states(normalizer.as_ref(), &mut states)
         .await
         .expect_err("a guest normalizer trap must become a normalizer error");
 
@@ -1724,10 +2398,16 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let create_id = ResourceId::with_provider_identity("mock", "test.resource", "after-trap", None);
     let resource = Resource::with_provider("mock", "test.resource", "after-trap", None);
     let error = provider
-        .create(&create_id, create_request_for_test(resource).await)
+        .create_for_test(&create_id, create_request_for_test(resource).await)
         .await
         .expect_err("the shared provider instance must remain poisoned after a normalizer trap");
-    let rendered = error.to_string();
+    assert_eq!(
+        error.to_string(),
+        "create failed before it could be tracked"
+    );
+    let rendered = std::error::Error::source(&error)
+        .expect("classified create failure retains the poisoned provider error")
+        .to_string();
 
     assert!(
         rendered.contains("provider instance unusable after trap in normalize_state"),
@@ -1754,14 +2434,19 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
         Resource::with_provider("mock", "test.resource", "__mock_create_trap__", None);
 
     let initial_error = provider
-        .create(&trap_id, create_request_for_test(trap_resource).await)
+        .create_for_test(&trap_id, create_request_for_test(trap_resource).await)
         .await
         .expect_err("the mock create hook must trap");
+    assert_eq!(
+        initial_error.to_string(),
+        "create failed before it could be tracked"
+    );
+    let initial_source = std::error::Error::source(&initial_error)
+        .expect("classified create failure retains the trap")
+        .to_string();
     assert!(
-        initial_error
-            .to_string()
-            .contains("WASM guest trapped: create call failed"),
-        "the initial error must name the trapping operation: {initial_error}"
+        initial_source.contains("WASM guest trapped: create call failed"),
+        "the initial error source must name the trapping operation: {initial_source}"
     );
 
     let followup_id =
@@ -1799,10 +2484,19 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
         Resource::with_provider("mock", "test.resource", "__mock_create_error__", None);
 
     let error = provider
-        .create(&error_id, create_request_for_test(error_resource).await)
+        .create_for_test(&error_id, create_request_for_test(error_resource).await)
         .await
         .expect_err("the mock create hook must return a provider error");
-    assert!(error.to_string().contains("intentional mock create error"));
+    assert_eq!(
+        error.to_string(),
+        "create failed before it could be tracked"
+    );
+    assert!(
+        std::error::Error::source(&error)
+            .expect("classified create failure retains the guest provider error")
+            .to_string()
+            .contains("intentional mock create error")
+    );
 
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-create-error", None);
@@ -1894,8 +2588,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     )]);
     let before = states.clone();
 
-    let error = normalizer
-        .normalize_state(&mut states)
+    let error = normalize_provider_states(normalizer.as_ref(), &mut states)
         .await
         .expect_err("a guest normalize_state error must cross the structured error channel");
 
@@ -1929,10 +2622,10 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         ),
     )]);
     let hydrate_before = hydrate_states.clone();
-    let error = normalizer
-        .hydrate_read_state(&mut hydrate_states, &SavedAttrs::new())
-        .await
-        .expect_err("a guest hydrate_read_state error must cross the structured error channel");
+    let error =
+        hydrate_provider_states(normalizer.as_ref(), &mut hydrate_states, &SavedAttrs::new())
+            .await
+            .expect_err("a guest hydrate_read_state error must cross the structured error channel");
     assert_eq!(error.variant_name(), "internal");
     assert_eq!(
         error.detail().context(),
@@ -2015,8 +2708,7 @@ async fn test_wasm_normalize_state_rejects_nested_non_finite_float_without_mutat
     )]);
     let before = states.clone();
 
-    let error = normalizer
-        .normalize_state(&mut states)
+    let error = normalize_provider_states(normalizer.as_ref(), &mut states)
         .await
         .expect_err("non-finite state values must fail boundary encoding");
 
@@ -2044,11 +2736,13 @@ async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation()
             )])),
         )]),
     )]);
-
-    let error = normalizer
-        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-        .await
-        .expect_err("non-finite saved attributes must fail boundary encoding");
+    let error = hydrate_provider_states(
+        normalizer.as_ref(),
+        &mut states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await
+    .expect_err("non-finite saved attributes must fail boundary encoding");
 
     assert!(error.to_string().contains("non-finite float"));
     assert_eq!(states, before, "failed encoding must be atomic");
@@ -2108,11 +2802,13 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
             )]),
         )
     }));
-
-    normalizer
-        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-        .await
-        .unwrap();
+    hydrate_provider_states(
+        normalizer.as_ref(),
+        &mut states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(states.len(), ids.len());
     for (index, id) in ids.iter().enumerate() {

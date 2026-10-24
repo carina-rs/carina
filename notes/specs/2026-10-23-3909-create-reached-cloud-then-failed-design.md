@@ -129,6 +129,11 @@ three things apart:
     calls ran after the identifier was known;
   - a trap during a resume call that had already re-sent the create
     (`resend`). The next apply re-sends from the old envelope.
+  - an unissued initial `pending` whose token cannot be encoded. The WIT create
+    verdict has no better arm, so the guest reports it as `untracked`. The same
+    failure after `resend` is `Resent(Untracked)` and the host reports `Ended`,
+    unlike a trap during resend, which keeps the old envelope because no
+    provider verdict arrived.
 - Process termination between a provider's answer and the end-of-apply state
   save. This covers the second Ctrl+C, a kill, a CI timeout and
   `StateLockLost`. State is written once, after execution, so today such a
@@ -432,8 +437,13 @@ and awscc native impls already do. On over budget it builds `InFlight` with
 `from_pending` and the `over_budget` timeout as the error.
 
 `ResumeFailure::Ended` exists only as the conversion of a provider's
-`untracked` or `discarded` resume verdict. Every host-side error during a
-resume becomes `InFlight` with the record it started from. That includes:
+`untracked` or `discarded` resume verdict. A provider `completed` step or
+`created` resume verdict whose attributes fail host-side decoding becomes
+`Created` with `ReadFailed`: the provider's verdict established that the
+resource exists, and only its attributes are unreadable. This is the same rule
+as an initial create result whose identifier decoded before its attributes.
+Every other host-side error during a resume becomes `InFlight` with the record
+it started from. That includes:
 
 - a routing error;
 - a WASM trap or timeout;

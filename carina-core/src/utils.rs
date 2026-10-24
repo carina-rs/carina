@@ -640,8 +640,9 @@ pub fn lift_current_state_enum_leaves(
     for resource in resources {
         if let Some(schema) = registry.get_for(resource)
             && let Some(state) = current_states.get_mut(&resource.id)
+            && let Some(attributes) = state.attributes_mut()
         {
-            lift_state_enum_leaves(state.attributes_mut(), schema);
+            lift_state_enum_leaves(attributes, schema);
         }
     }
 }
@@ -1915,6 +1916,7 @@ mod tests {
         let state = match &current[&role.id] {
             Current::Absent(state) => state.state(),
             Current::Present(present) => present.state(),
+            Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
             Current::MissingIdentifier(state) => state.state(),
         };
         let Value::Concrete(ConcreteValue::Map(pd)) =

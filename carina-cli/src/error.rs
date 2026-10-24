@@ -137,6 +137,49 @@ impl std::fmt::Display for StateBucketPreparationError {
 
 impl std::error::Error for StateBucketPreparationError {}
 
+/// A classified state-bucket create failure, optionally accompanied by the
+/// failure to persist the recovery row. Both classified failures remain
+/// available as typed values; when recovery persistence also fails, that
+/// later failure is the error-chain source and the create failure remains
+/// available through [`StateBucketCreateError::create_failure`].
+#[derive(Debug)]
+pub struct StateBucketCreateError {
+    create: Box<carina_core::provider::CreateFailure>,
+    seed: Option<Box<AppError>>,
+}
+
+impl StateBucketCreateError {
+    pub fn new(create: carina_core::provider::CreateFailure, seed: Option<AppError>) -> Self {
+        Self {
+            create: Box::new(create),
+            seed: seed.map(Box::new),
+        }
+    }
+
+    pub fn create_failure(&self) -> &carina_core::provider::CreateFailure {
+        &self.create
+    }
+
+    pub fn seed_error(&self) -> Option<&AppError> {
+        self.seed.as_deref()
+    }
+}
+
+impl std::fmt::Display for StateBucketCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Failed to create state bucket")
+    }
+}
+
+impl std::error::Error for StateBucketCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.seed
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| Some(self.create.as_ref()))
+    }
+}
+
 fn apply_input_expectation() -> String {
     format!(
         "`{}` expects a project directory or a plan file written by `{}`.",
@@ -306,6 +349,30 @@ pub enum SavedPlanSecretVerificationError {
     },
 }
 
+/// Destroy dependency analysis failure with CLI-level context.
+#[derive(Debug)]
+pub struct DestroyDependencyAnalysisError {
+    source: carina_core::effect::deps::DependencyAnalysisFailure,
+}
+
+impl DestroyDependencyAnalysisError {
+    pub fn new(source: carina_core::effect::deps::DependencyAnalysisFailure) -> Self {
+        Self { source }
+    }
+}
+
+impl std::fmt::Display for DestroyDependencyAnalysisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Failed to analyze destroy dependencies")
+    }
+}
+
+impl std::error::Error for DestroyDependencyAnalysisError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -331,6 +398,14 @@ pub enum AppError {
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
 
+    /// Persisted current state did not agree with the validated move source.
+    #[error(transparent)]
+    CurrentMoveRouting(#[from] carina_core::differ::CurrentMoveRoutingMismatch),
+
+    /// Routed ids did not agree with the operator-authored `moved` block.
+    #[error(transparent)]
+    ResolvedMove(#[from] carina_core::effect::ResolvedMoveMismatch),
+
     /// State backend errors (lock contention, I/O, serialization, etc.)
     #[error(transparent)]
     Backend(#[from] BackendError),
@@ -350,6 +425,10 @@ pub enum AppError {
     /// A module argument constraint became decidable during an operation.
     #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
+
+    /// Destroy scheduling could not resolve a required dependency target.
+    #[error(transparent)]
+    DestroyDependencyAnalysis(#[from] DestroyDependencyAnalysisError),
 
     /// Distinct desired resources resolved to the same execution identity.
     #[error(transparent)]
@@ -413,8 +492,8 @@ pub enum AppError {
     StateBucketPreparation(StateBucketPreparationError),
 
     /// The provider rejected state-backend bootstrap creation.
-    #[error("Failed to create state bucket: {error}")]
-    StateBucketCreate { error: ProviderError },
+    #[error(transparent)]
+    StateBucketCreate(StateBucketCreateError),
 
     /// Provider lock-file loading or constraint errors.
     #[error(transparent)]
@@ -598,6 +677,36 @@ impl From<carina_core::value::SerializationError> for AppError {
 mod tests {
     use super::*;
 
+    fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {
+        use std::collections::{HashMap, HashSet};
+
+        use carina_core::effect::deps::{
+            ScheduleInputs, UnresolvedResource, build_effect_dependency_analysis,
+        };
+        use carina_core::effect::{Effect, EffectGeneration};
+        use carina_core::resource::ResolvedResourceId;
+
+        let id = ResourceId::with_provider_identity("mock", "test.Widget", "example", None);
+        let effect = Effect::Delete {
+            id: ResolvedResourceId::try_new(id).expect("fixture identity is resolved"),
+            identifier: carina_core::provider::AppliedIdentifier::new("provider-id")
+                .expect("fixture provider identifier is non-empty"),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: Some("example".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::from(["missing-consumer".into()]),
+        };
+        build_effect_dependency_analysis(
+            &[effect],
+            &HashMap::<ResourceId, UnresolvedResource>::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .expect_err("missing required target must fail dependency analysis")
+    }
+
     #[test]
     fn from_backend_error() {
         let backend_err = BackendError::Configuration("missing bucket".to_string());
@@ -621,6 +730,26 @@ mod tests {
     fn validation_error() {
         let app_err = AppError::Validation("invalid region".to_string());
         assert_eq!(app_err.to_string(), "invalid region");
+    }
+
+    #[test]
+    fn destroy_dependency_analysis_keeps_typed_source_and_context_only_display() {
+        let app_err = AppError::DestroyDependencyAnalysis(DestroyDependencyAnalysisError::new(
+            dependency_analysis_failure(),
+        ));
+
+        assert_eq!(
+            app_err.to_string(),
+            "Failed to analyze destroy dependencies"
+        );
+        let source = std::error::Error::source(&app_err)
+            .expect("dependency analysis failure must remain in the source chain");
+        assert!(
+            source
+                .downcast_ref::<carina_core::effect::deps::DependencyAnalysisFailure>()
+                .is_some()
+        );
+        assert!(source.to_string().contains("missing-consumer"));
     }
 
     #[test]
@@ -661,6 +790,33 @@ mod tests {
     fn interrupted_error() {
         let app_err = AppError::Interrupted;
         assert_eq!(app_err.to_string(), "Operation cancelled by user");
+    }
+
+    #[test]
+    fn state_bucket_create_display_is_context_only_and_seed_is_in_source_chain() {
+        use std::error::Error as _;
+
+        let id = ResourceId::with_provider_identity("mock", "s3.Bucket", "state", None);
+        let create = crate::dispatch_fixture_create(
+            &id,
+            crate::FixtureCreateResult::Untracked {
+                error: ProviderError::api_error("create leaf"),
+            },
+        );
+        let error =
+            StateBucketCreateError::new(create, Some(AppError::Config("seed leaf".to_string())));
+
+        assert_eq!(error.to_string(), "Failed to create state bucket");
+        let mut source = error.source();
+        let mut found_seed = false;
+        while let Some(current) = source {
+            found_seed |= current.downcast_ref::<AppError>().is_some();
+            source = current.source();
+        }
+        assert!(
+            found_seed,
+            "the recovery-row failure must remain typed in the source chain"
+        );
     }
 
     #[test]

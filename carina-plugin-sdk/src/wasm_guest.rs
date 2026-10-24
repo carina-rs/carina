@@ -803,27 +803,6 @@ macro_rules! export_provider {
                 })
             }
 
-            fn proto_to_wit_create_outcome(
-                outcome: &proto::CreateOutcome,
-            ) -> Result<wit_types::CreateOutcome, helpers::WasmValueEncodeError> {
-                Ok(match outcome {
-                    proto::CreateOutcome::Success { state } => {
-                        wit_types::CreateOutcome::Success(proto_to_wit_applied_state(state)?)
-                    }
-                    proto::CreateOutcome::PartialSuccess { state, diagnostic } => {
-                        wit_types::CreateOutcome::PartialSuccess(
-                            wit_types::CreatePartialSuccess {
-                                state: proto_to_wit_applied_state(state)?,
-                                diagnostic: wit_types::PartialReadDiagnostic {
-                                    reason: diagnostic.reason.clone(),
-                                    missing_attributes: diagnostic.missing_attributes.clone(),
-                                },
-                            },
-                        )
-                    }
-                })
-            }
-
             fn proto_to_wit_update_outcome(
                 outcome: &proto::UpdateOutcome,
             ) -> Result<wit_types::UpdateOutcome, helpers::WasmValueEncodeError> {
@@ -865,22 +844,440 @@ macro_rules! export_provider {
                 })
             }
 
-            fn sdk_to_wit_create_outcome<T: serde::Serialize>(
-                outcome: &$crate::CreateOutcome<T>,
-                operation: &'static str,
-            ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
-                match outcome {
-                    $crate::CreateOutcome::Done(outcome) => {
-                        proto_to_wit_create_outcome(outcome).map_err(|error| {
-                            boundary_encode_to_provider_error(operation, None, error)
-                        })
+            fn proto_to_wit_sent(sent: &proto::Sent) -> wit_types::SentAttributes {
+                match sent {
+                    proto::Sent::AllRequestAttributes => wit_types::SentAttributes::All,
+                    proto::Sent::Only(attributes) => {
+                        wit_types::SentAttributes::Only(attributes.iter().cloned().collect())
                     }
-                    $crate::CreateOutcome::Pending(pending) => sdk_to_wit_pending(pending)
-                        .map(wit_types::CreateOutcome::Pending)
-                        .map_err(|error| {
-                            boundary_token_encode_to_provider_error(operation, error)
-                        }),
                 }
+            }
+
+            fn wit_to_proto_sent(sent: wit_types::SentAttributes) -> proto::Sent {
+                match sent {
+                    wit_types::SentAttributes::All => proto::Sent::AllRequestAttributes,
+                    wit_types::SentAttributes::Only(attributes) => {
+                        proto::Sent::only(attributes)
+                    }
+                }
+            }
+
+            fn proto_to_wit_partial_read_diagnostic(
+                diagnostic: proto::PartialReadDiagnostic,
+            ) -> wit_types::PartialReadDiagnostic {
+                let proto::PartialReadDiagnostic {
+                    reason,
+                    missing_attributes,
+                } = diagnostic;
+                wit_types::PartialReadDiagnostic {
+                    reason,
+                    missing_attributes,
+                }
+            }
+
+            fn proto_to_wit_created_state(
+                identifier: proto::AppliedIdentifier,
+                attributes: HashMap<String, proto::Value>,
+            ) -> Result<wit_types::AppliedState, helpers::WasmValueEncodeError> {
+                Ok(wit_types::AppliedState {
+                    identifier: identifier.into_inner(),
+                    attributes: proto_to_wit_value_map(&attributes)?,
+                })
+            }
+
+            enum CreateStepEncodeFailure {
+                /// An initial create has no prior continuation to retain. A
+                /// poll does, so either pending-token failure is
+                /// undetermined there regardless of identifier issuance.
+                UnissuedPendingToken(wit_types::ProviderError),
+                IssuedPendingToken(wit_types::CreatedFailure),
+                /// A finished result established that the resource exists;
+                /// only its returned attributes failed to cross the boundary.
+                CreatedAttributes(wit_types::CreatedFailure),
+            }
+
+            impl CreateStepEncodeFailure {
+                fn created_failure(
+                    identifier: proto::AppliedIdentifier,
+                    sent: wit_types::SentAttributes,
+                    error: wit_types::ProviderError,
+                ) -> wit_types::CreatedFailure {
+                    wit_types::CreatedFailure {
+                        identifier: identifier.into_inner(),
+                        read: wit_types::Observation::ReadFailed(error.clone()),
+                        sent,
+                        error,
+                    }
+                }
+
+                fn into_create_verdict(self) -> wit_types::CreateVerdict {
+                    match self {
+                        Self::UnissuedPendingToken(error) => {
+                            wit_types::CreateVerdict::Untracked(error)
+                        }
+                        Self::IssuedPendingToken(created)
+                        | Self::CreatedAttributes(created) => {
+                            wit_types::CreateVerdict::Created(created)
+                        }
+                    }
+                }
+
+                fn into_poll_verdict(self) -> wit_types::PollVerdict {
+                    match self {
+                        Self::UnissuedPendingToken(error) => {
+                            wit_types::PollVerdict::Undetermined(error)
+                        }
+                        Self::IssuedPendingToken(created) => {
+                            wit_types::PollVerdict::Undetermined(created.error)
+                        }
+                        Self::CreatedAttributes(created) => {
+                            wit_types::PollVerdict::Created(created)
+                        }
+                    }
+                }
+            }
+
+            enum ResumeStepEncodeFailure {
+                /// A resume already has a persisted, decodable token. Report
+                /// the replacement-token failure as undetermined so the host
+                /// keeps that previous continuation instead of persisting an
+                /// undecodable replacement.
+                Preserve(wit_types::ProviderError),
+                Created(wit_types::ResumedFailure),
+                Resent(CreateStepEncodeFailure),
+            }
+
+            impl ResumeStepEncodeFailure {
+                fn created(
+                    identifier: proto::AppliedIdentifier,
+                    error: wit_types::ProviderError,
+                ) -> Self {
+                    Self::Created(wit_types::ResumedFailure {
+                        identifier: identifier.into_inner(),
+                        read: wit_types::Observation::ReadFailed(error.clone()),
+                        error,
+                    })
+                }
+
+                fn into_resume_verdict(self) -> wit_types::ResumeVerdict {
+                    match self {
+                        Self::Preserve(error) => wit_types::ResumeVerdict::Undetermined(error),
+                        Self::Created(created) => wit_types::ResumeVerdict::Created(created),
+                        Self::Resent(error) => wit_types::ResumeVerdict::Resent(
+                            error.into_create_verdict(),
+                        ),
+                    }
+                }
+            }
+
+            fn sdk_to_wit_pending_create<T: serde::Serialize>(
+                pending: proto::PendingCreate<T>,
+                operation: &'static str,
+            ) -> Result<wit_types::PendingCreate, CreateStepEncodeFailure> {
+                let (token, identifier, sent, poll_after_secs) = pending.into_parts();
+                let sent = proto_to_wit_sent(&sent);
+                let token = match serde_json::to_string(&token) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        let error = boundary_token_encode_to_provider_error(operation, error);
+                        return Err(match identifier {
+                            Some(identifier) => CreateStepEncodeFailure::IssuedPendingToken(
+                                CreateStepEncodeFailure::created_failure(identifier, sent, error),
+                            ),
+                            None => CreateStepEncodeFailure::UnissuedPendingToken(error),
+                        });
+                    }
+                };
+                Ok(wit_types::PendingCreate {
+                    operation: wit_types::PendingOperation {
+                        token,
+                        poll_after_secs,
+                    },
+                    identifier: identifier.map(proto::AppliedIdentifier::into_inner),
+                    sent,
+                })
+            }
+
+            fn sdk_to_wit_resume_pending<T: serde::Serialize>(
+                pending: proto::ResumePending<T>,
+                operation: &'static str,
+            ) -> Result<wit_types::ResumePending, ResumeStepEncodeFailure> {
+                let (token, identifier, poll_after_secs) = pending.into_parts();
+                let token = serde_json::to_string(&token).map_err(|error| {
+                    ResumeStepEncodeFailure::Preserve(boundary_token_encode_to_provider_error(
+                        operation, error,
+                    ))
+                })?;
+                Ok(wit_types::ResumePending {
+                    operation: wit_types::PendingOperation {
+                        token,
+                        poll_after_secs,
+                    },
+                    identifier: identifier.map(proto::AppliedIdentifier::into_inner),
+                })
+            }
+
+            fn sdk_to_wit_create_step<T: serde::Serialize>(
+                step: $crate::ProtocolCreateStep<T>,
+                operation: &'static str,
+            ) -> Result<wit_types::CreateStep, CreateStepEncodeFailure> {
+                sdk_to_wit_protocol_create_step(step, operation)
+            }
+
+            fn sdk_to_wit_protocol_create_step<T: serde::Serialize>(
+                step: proto::CreateStep<
+                    HashMap<String, proto::Value>,
+                    proto::PartialReadDiagnostic,
+                    T,
+                >,
+                operation: &'static str,
+            ) -> Result<wit_types::CreateStep, CreateStepEncodeFailure> {
+                match step {
+                    proto::CreateStep::Success {
+                        identifier,
+                        attributes,
+                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
+                        Ok(state) => Ok(wit_types::CreateStep::Success(state)),
+                        Err(error) => {
+                            let error =
+                                boundary_encode_to_provider_error(operation, None, error);
+                            Err(CreateStepEncodeFailure::CreatedAttributes(
+                                CreateStepEncodeFailure::created_failure(
+                                    identifier,
+                                    wit_types::SentAttributes::All,
+                                    error,
+                                ),
+                            ))
+                        }
+                    },
+                    proto::CreateStep::PartialSuccess {
+                        identifier,
+                        attributes,
+                        diagnostic,
+                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
+                        Ok(state) => Ok(wit_types::CreateStep::PartialSuccess(
+                                wit_types::CreatePartialSuccess {
+                                    state,
+                                    diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic),
+                                },
+                            )),
+                        Err(error) => {
+                            let error =
+                                boundary_encode_to_provider_error(operation, None, error);
+                            Err(CreateStepEncodeFailure::CreatedAttributes(
+                                CreateStepEncodeFailure::created_failure(
+                                    identifier,
+                                    wit_types::SentAttributes::All,
+                                    error,
+                                ),
+                            ))
+                        }
+                    },
+                    proto::CreateStep::Pending(pending) => sdk_to_wit_pending_create(
+                        pending,
+                        operation,
+                    )
+                    .map(wit_types::CreateStep::Pending),
+                }
+            }
+
+            fn proto_to_wit_observation(
+                observation: proto::Observation<proto::ReadOutcome, proto::ProviderError>,
+                operation: &'static str,
+            ) -> wit_types::Observation {
+                match observation {
+                    proto::Observation::Read(read) => match proto_to_wit_read_outcome(&read) {
+                        Ok(read) => wit_types::Observation::Read(read),
+                        Err(error) => wit_types::Observation::ReadFailed(
+                            boundary_encode_to_provider_error(operation, Some("observation"), error),
+                        ),
+                    },
+                    proto::Observation::ReadFailed(error) => {
+                        wit_types::Observation::ReadFailed(proto_to_wit_provider_error(error))
+                    }
+                }
+            }
+
+            fn sdk_to_wit_created_failure(
+                created: proto::CreatedFailure<proto::ReadOutcome, proto::ProviderError>,
+                operation: &'static str,
+            ) -> wit_types::CreatedFailure {
+                let (identifier, observation, sent, error) = created.into_parts();
+                wit_types::CreatedFailure {
+                    identifier: identifier.into_inner(),
+                    read: proto_to_wit_observation(observation, operation),
+                    sent: proto_to_wit_sent(&sent),
+                    error: proto_to_wit_provider_error(error),
+                }
+            }
+
+            fn sdk_to_wit_resumed_failure(
+                created: proto::ResumedFailure<proto::ReadOutcome, proto::ProviderError>,
+                operation: &'static str,
+            ) -> wit_types::ResumedFailure {
+                let (identifier, observation, error) = created.into_parts();
+                wit_types::ResumedFailure {
+                    identifier: identifier.into_inner(),
+                    read: proto_to_wit_observation(observation, operation),
+                    error: proto_to_wit_provider_error(error),
+                }
+            }
+
+            fn sdk_to_wit_create_verdict(
+                verdict: proto::CreateVerdict<proto::ReadOutcome, proto::ProviderError>,
+                operation: &'static str,
+            ) -> wit_types::CreateVerdict {
+                match verdict {
+                    proto::CreateVerdict::Untracked(error) => {
+                        wit_types::CreateVerdict::Untracked(proto_to_wit_provider_error(error))
+                    }
+                    proto::CreateVerdict::Created(created) => wit_types::CreateVerdict::Created(
+                        sdk_to_wit_created_failure(created, operation),
+                    ),
+                    proto::CreateVerdict::Discarded(error) => {
+                        wit_types::CreateVerdict::Discarded(proto_to_wit_provider_error(error))
+                    }
+                }
+            }
+
+            fn sdk_to_wit_poll_verdict(
+                verdict: $crate::ProtocolPollVerdict,
+                operation: &'static str,
+            ) -> wit_types::PollVerdict {
+                match verdict {
+                    proto::PollVerdict::Untracked(error) => {
+                        wit_types::PollVerdict::Untracked(proto_to_wit_provider_error(error))
+                    }
+                    proto::PollVerdict::Created(created) => wit_types::PollVerdict::Created(
+                        sdk_to_wit_created_failure(created, operation),
+                    ),
+                    proto::PollVerdict::Discarded(error) => {
+                        wit_types::PollVerdict::Discarded(proto_to_wit_provider_error(error))
+                    }
+                    proto::PollVerdict::Undetermined(error) => {
+                        wit_types::PollVerdict::Undetermined(proto_to_wit_provider_error(error))
+                    }
+                }
+            }
+
+            fn sdk_to_wit_resume_step<T: serde::Serialize>(
+                step: $crate::ProtocolResumeStep<T>,
+                operation: &'static str,
+            ) -> Result<wit_types::ResumeStep, ResumeStepEncodeFailure> {
+                match step {
+                    proto::ResumeStep::Completed {
+                        identifier,
+                        attributes,
+                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
+                        Ok(state) => Ok(wit_types::ResumeStep::Completed(state)),
+                        Err(error) => {
+                            let error =
+                                boundary_encode_to_provider_error(operation, None, error);
+                            Err(ResumeStepEncodeFailure::created(identifier, error))
+                        }
+                    },
+                    proto::ResumeStep::Pending(pending) => {
+                        sdk_to_wit_resume_pending(pending, operation)
+                            .map(wit_types::ResumeStep::Pending)
+                    }
+                    proto::ResumeStep::Resent(step) => {
+                        sdk_to_wit_protocol_create_step(step, operation)
+                            .map(wit_types::ResumeStep::Resent)
+                            .map_err(ResumeStepEncodeFailure::Resent)
+                    }
+                }
+            }
+
+            fn sdk_to_wit_resume_verdict(
+                verdict: $crate::ProtocolResumeVerdict,
+                operation: &'static str,
+            ) -> wit_types::ResumeVerdict {
+                match verdict {
+                    proto::ResumeVerdict::Untracked(error) => {
+                        wit_types::ResumeVerdict::Untracked(proto_to_wit_provider_error(error))
+                    }
+                    proto::ResumeVerdict::Created(created) => wit_types::ResumeVerdict::Created(
+                        sdk_to_wit_resumed_failure(created, operation),
+                    ),
+                    proto::ResumeVerdict::Discarded(error) => {
+                        wit_types::ResumeVerdict::Discarded(proto_to_wit_provider_error(error))
+                    }
+                    proto::ResumeVerdict::Undetermined(error) => {
+                        wit_types::ResumeVerdict::Undetermined(proto_to_wit_provider_error(error))
+                    }
+                    proto::ResumeVerdict::Resent(verdict) => wit_types::ResumeVerdict::Resent(
+                        sdk_to_wit_create_verdict(verdict, operation),
+                    ),
+                }
+            }
+
+            fn decode_create_identifier(
+                operation: &'static str,
+                identifier: Option<String>,
+            ) -> Result<Option<proto::AppliedIdentifier>, wit_types::ProviderError> {
+                identifier
+                    .map(proto::AppliedIdentifier::new)
+                    .transpose()
+                    .map_err(|error| {
+                        boundary_applied_identifier_decode_to_provider_error(operation, error)
+                    })
+            }
+
+            fn wit_to_sdk_poll<T: serde::de::DeserializeOwned>(
+                pending: wit_types::PendingCreate,
+                request: &proto::CreateRequest,
+            ) -> Result<(Option<proto::AppliedIdentifier>, proto::Sent, T), wit_types::ProviderError> {
+                let wit_types::PendingCreate {
+                    operation,
+                    identifier,
+                    sent,
+                } = pending;
+                let wit_types::PendingOperation {
+                    token,
+                    poll_after_secs: _poll_after_secs,
+                } = operation;
+                let sent = wit_to_proto_sent(sent);
+                let request_attributes = request
+                    .resource
+                    .attributes
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                if !sent.is_valid_for(&request_attributes) {
+                    return Err(wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                        message: "WASM boundary rejected pending create with sent attributes outside the request".to_string(),
+                        resource_id: None,
+                        cause: None,
+                        provider_name: None,
+                        operation: Some("poll_create".to_string()),
+                        status: None,
+                        code: None,
+                        request_id: None,
+                    }));
+                }
+                let token = serde_json::from_str(&token).map_err(|error| {
+                    boundary_token_decode_to_provider_error("poll_create", error)
+                })?;
+                let identifier = decode_create_identifier("poll_create", identifier)?;
+                Ok((identifier, sent, token))
+            }
+
+            fn wit_to_sdk_resume<T: serde::de::DeserializeOwned>(
+                pending: wit_types::ResumePending,
+            ) -> Result<(Option<proto::AppliedIdentifier>, T), wit_types::ProviderError> {
+                let wit_types::ResumePending {
+                    operation,
+                    identifier,
+                } = pending;
+                let wit_types::PendingOperation {
+                    token,
+                    poll_after_secs: _poll_after_secs,
+                } = operation;
+                let token = serde_json::from_str(&token).map_err(|error| {
+                    boundary_token_decode_to_provider_error("resume_create", error)
+                })?;
+                let identifier = decode_create_identifier("resume_create", identifier)?;
+                Ok((identifier, token))
             }
 
             fn sdk_to_wit_update_outcome<T: serde::Serialize>(
@@ -1280,44 +1677,102 @@ macro_rules! export_provider {
                 fn create(
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
-                ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
+                ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_request = wit_to_proto_create_request(request)
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error("create", None, error)
-                        })?;
+                    let proto_request = match wit_to_proto_create_request(request) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return Err(wit_types::CreateVerdict::Untracked(
+                                boundary_decode_to_provider_error("create", None, error),
+                            ));
+                        }
+                    };
                     let provider = get_provider().lock().unwrap();
-                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
-                        Ok(outcome) => sdk_to_wit_create_outcome(&outcome, "create"),
-                        Err(e) => Err(proto_to_wit_provider_error(e)),
+                    match $crate::dispatch_create(
+                        &*provider,
+                        &proto_id,
+                        proto_request,
+                    ) {
+                        Ok(step) => sdk_to_wit_create_step(step, "create")
+                            .map_err(CreateStepEncodeFailure::into_create_verdict),
+                        Err(verdict) => Err(sdk_to_wit_create_verdict(*verdict, "create")),
                     }
                 }
 
                 fn poll_create(
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
-                    pending: wit_types::PendingOperation,
-                ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
+                    pending: wit_types::PendingCreate,
+                ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_request = wit_to_proto_create_request(request)
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error("poll_create", None, error)
-                        })?;
-                    let pending = wit_to_sdk_pending::<
+                    let proto_request = match wit_to_proto_create_request(request) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return Err(wit_types::PollVerdict::Undetermined(
+                                boundary_decode_to_provider_error("poll_create", None, error),
+                            ));
+                        }
+                    };
+                    let (identifier, sent, token) = match wit_to_sdk_poll::<
                         <$provider_type as $crate::CarinaProvider>::CreateToken,
-                    >(pending)
-                    .map_err(|error| {
-                        boundary_token_decode_to_provider_error("poll_create", error)
-                    })?;
+                    >(pending, &proto_request) {
+                        Ok(poll) => poll,
+                        Err(error) => {
+                            return Err(wit_types::PollVerdict::Undetermined(error));
+                        }
+                    };
                     let provider = get_provider().lock().unwrap();
-                    match $crate::CarinaProvider::poll_create(
+                    match $crate::dispatch_poll_create(
                         &*provider,
                         &proto_id,
                         proto_request,
-                        pending,
+                        identifier,
+                        sent,
+                        token,
                     ) {
-                        Ok(outcome) => sdk_to_wit_create_outcome(&outcome, "poll_create"),
-                        Err(e) => Err(proto_to_wit_provider_error(e)),
+                        Ok(step) => sdk_to_wit_create_step(step, "poll_create")
+                            .map_err(CreateStepEncodeFailure::into_poll_verdict),
+                        Err(verdict) => {
+                            Err(sdk_to_wit_poll_verdict(*verdict, "poll_create"))
+                        }
+                    }
+                }
+
+                fn resume_create(
+                    id: wit_types::ResourceId,
+                    request: wit_types::CreateRequest,
+                    pending: wit_types::ResumePending,
+                ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    let proto_request = match wit_to_proto_create_request(request) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return Err(wit_types::ResumeVerdict::Undetermined(
+                                boundary_decode_to_provider_error("resume_create", None, error),
+                            ));
+                        }
+                    };
+                    let (identifier, token) = match wit_to_sdk_resume::<
+                        <$provider_type as $crate::CarinaProvider>::CreateToken,
+                    >(pending) {
+                        Ok(resume) => resume,
+                        Err(error) => {
+                            return Err(wit_types::ResumeVerdict::Undetermined(error));
+                        }
+                    };
+                    let provider = get_provider().lock().unwrap();
+                    match $crate::dispatch_resume_create(
+                        &*provider,
+                        &proto_id,
+                        proto_request,
+                        identifier,
+                        token,
+                    ) {
+                        Ok(step) => sdk_to_wit_resume_step(step, "resume_create")
+                            .map_err(ResumeStepEncodeFailure::into_resume_verdict),
+                        Err(verdict) => {
+                            Err(sdk_to_wit_resume_verdict(*verdict, "resume_create"))
+                        }
                     }
                 }
 

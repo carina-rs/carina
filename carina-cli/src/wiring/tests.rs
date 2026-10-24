@@ -9,12 +9,26 @@ use carina_core::executor::{
 };
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
-    ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
+    ProviderResult, ReadOutcome, ReadRequest, Sent, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
     Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
 use carina_core::value::canonicalize_resources_with_schemas;
+
+macro_rules! unexpected_resume_create {
+    () => {
+        fn resume_create(
+            &self,
+            _request: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            Box::pin(async { panic!("unexpected resume_create") })
+        }
+    };
+}
 
 enum ReadBehavior {
     Success,
@@ -314,7 +328,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut carina_core::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 self.state_called.store(true, Ordering::SeqCst);
@@ -324,7 +338,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut carina_core::provider::StateTransformMap,
             _saved_attrs: &'a carina_core::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             carina_core::provider::ready_noop()
@@ -412,7 +426,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
 
         fn normalize_state<'a>(
             &'a self,
-            states: &'a mut HashMap<ResourceId, State>,
+            states: &'a mut carina_core::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             for state in states.values_mut().filter(|state| state.exists) {
                 if state.attributes.get("status")
@@ -431,7 +445,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
 
         fn hydrate_read_state<'a>(
             &'a self,
-            states: &'a mut HashMap<ResourceId, State>,
+            states: &'a mut carina_core::provider::StateTransformMap,
             _saved_attrs: &'a carina_core::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             for state in states.values_mut().filter(|state| state.exists) {
@@ -492,6 +506,9 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         Current::MissingIdentifier(state) => {
             panic!("test orphan lacks a provider identifier: {state:?}")
         }
+        Current::CreateInFlight(pending) => {
+            panic!("test orphan unexpectedly has an in-flight create: {pending:?}")
+        }
     };
     let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
         present,
@@ -548,7 +565,14 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     );
     assert!(data_source_state.identifier.is_none());
 
-    assert!(orphans.rekey(&old_id, target_id.clone()));
+    let move_effect = Effect::Move {
+        from: ResolvedResourceId::new(old_id.clone()),
+        to: ResolvedResourceId::new(target_id.clone()),
+    };
+    let authority = move_effect
+        .move_authority()
+        .expect("the fixture effect is a move");
+    assert!(orphans.rekey(&authority));
 
     let provider_states =
         carina_core::differ::provider_states_for(&current_states, &orphans, resources.resources());
@@ -606,16 +630,20 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         detail: "provider read omitted token".to_string(),
         missing_attributes: BTreeSet::from(["token".to_string()]),
     };
-    let mut row = carina_state::ResourceState::new(
+    let mut row = carina_state::ResourceState::try_applied(
         &id.resource_type,
         id.identity().expect("resolved test id").clone(),
         &id.provider,
+        "resource-123",
     )
-    .with_identifier("resource-123");
+    .expect("fixture identifier is non-empty");
     row.binding = Some("orphan".to_string());
     row.set_persisted_attribute("managed_saved", serde_json::json!("saved-value"));
-    row.write_only_attributes.push("managed_saved".to_string());
-    row.partial_read = Some(marker.clone());
+    row = crate::fixture_resource_state_metadata(
+        row,
+        Some(vec!["managed_saved".to_string()]),
+        Some(Some(marker.clone())),
+    );
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(row)
@@ -632,6 +660,9 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::MissingIdentifier(state) => state.state(),
+        Current::CreateInFlight(pending) => {
+            panic!("orphan unexpectedly remained in flight: {pending:?}")
+        }
     };
     assert_eq!(state.partial_read, None);
 
@@ -653,6 +684,9 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::MissingIdentifier(state) => state.state(),
+        Current::CreateInFlight(pending) => {
+            panic!("orphan unexpectedly remained in flight: {pending:?}")
+        }
     };
     assert_eq!(state.partial_read, Some(marker));
     assert_eq!(
@@ -1076,7 +1110,8 @@ impl Provider for CascadeCreateProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, carina_core::provider::CreateFailure>> {
         let id = id.clone();
         let attrs = request.resource().as_resource().resolved_attributes();
         self.creates
@@ -1086,36 +1121,35 @@ impl Provider for CascadeCreateProvider {
 
         Box::pin(async move {
             if id.resource_type == "ec2.Vpc" {
-                return Ok(CreateOutcome::Success {
-                    state: AppliedState::new(
-                        id,
-                        "vpc-new",
-                        HashMap::from([(
-                            "vpc_id".to_string(),
-                            Value::Concrete(ConcreteValue::String("vpc-new".into())),
-                        )]),
+                return Ok(attempt
+                    .issued(
+                        AppliedIdentifier::new("vpc-new").expect("fixture identifier is non-empty"),
+                        Sent::AllRequestAttributes,
                     )
-                    .expect("fixture identifier is non-empty"),
-                });
+                    .succeeded(HashMap::from([(
+                        "vpc_id".to_string(),
+                        Value::Concrete(ConcreteValue::String("vpc-new".into())),
+                    )])));
             }
 
             if id.resource_type == "ec2.Subnet" {
-                return Ok(CreateOutcome::Success {
-                    state: AppliedState::new(
-                        id,
-                        "subnet-new",
-                        HashMap::from([(
-                            "subnet_id".to_string(),
-                            Value::Concrete(ConcreteValue::String("subnet-new".into())),
-                        )]),
+                return Ok(attempt
+                    .issued(
+                        AppliedIdentifier::new("subnet-new")
+                            .expect("fixture identifier is non-empty"),
+                        Sent::AllRequestAttributes,
                     )
-                    .expect("fixture identifier is non-empty"),
-                });
+                    .succeeded(HashMap::from([(
+                        "subnet_id".to_string(),
+                        Value::Concrete(ConcreteValue::String("subnet-new".into())),
+                    )])));
             }
 
-            Err(ProviderError::internal(format!("unexpected create {id}")))
+            Err(attempt.untracked(ProviderError::internal(format!("unexpected create {id}"))))
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1202,17 +1236,21 @@ impl Provider for ReadWithRetryProvider {
 
     fn create(
         &self,
-        id: &ResourceId,
+        _id: &ResourceId,
         _request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
-        let id = id.clone();
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, carina_core::provider::CreateFailure>> {
         Box::pin(async move {
-            Ok(CreateOutcome::Success {
-                state: AppliedState::new(id, "mock-id", HashMap::new())
-                    .expect("fixture identifier is non-empty"),
-            })
+            Ok(attempt
+                .issued(
+                    AppliedIdentifier::new("mock-id").expect("fixture identifier is non-empty"),
+                    Sent::AllRequestAttributes,
+                )
+                .succeeded(HashMap::new()))
         })
     }
+
+    unexpected_resume_create!();
 
     fn update(
         &self,
@@ -1258,14 +1296,14 @@ impl ProviderNormalizer for SavedAttrsHydratingNormalizer {
 
     fn normalize_state<'a>(
         &'a self,
-        _states: &'a mut HashMap<ResourceId, State>,
+        _states: &'a mut carina_core::provider::StateTransformMap,
     ) -> BoxFuture<'a, ProviderResult<()>> {
         carina_core::provider::ready_noop()
     }
 
     fn hydrate_read_state<'a>(
         &'a self,
-        states: &'a mut HashMap<ResourceId, State>,
+        states: &'a mut carina_core::provider::StateTransformMap,
         saved_attrs: &'a carina_core::provider::SavedAttrs,
     ) -> BoxFuture<'a, ProviderResult<()>> {
         for (id, state) in states {
@@ -1353,25 +1391,27 @@ let shared = read test.shared.Type {}
         .identity()
         .expect("let-bound data source identity is resolved")
         .clone();
-    let mut prior_row = ResourceState::new(
+    let mut prior_row = ResourceState::try_applied(
         data_source_id.resource_type.clone(),
         identity,
         data_source_id.provider.clone(),
+        "managed-provider-id",
     )
-    .with_identifier("managed-provider-id");
+    .expect("fixture identifier is non-empty");
     prior_row.binding = Some("shared".to_string());
     prior_row.set_persisted_attribute(
         "managed_saved",
         serde_json::json!("managed-write-only-value"),
     );
-    prior_row
-        .write_only_attributes
-        .push("managed_saved".to_string());
     let partial_read = carina_core::resource::PartialReadMarker {
         detail: "managed read omitted an attribute".to_string(),
         missing_attributes: BTreeSet::from(["managed_missing".to_string()]),
     };
-    prior_row.partial_read = Some(partial_read.clone());
+    prior_row = crate::fixture_resource_state_metadata(
+        prior_row,
+        Some(vec!["managed_saved".to_string()]),
+        Some(Some(partial_read.clone())),
+    );
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(prior_row)
@@ -1410,6 +1450,9 @@ let shared = read test.shared.Type {}
         Current::Absent(absent) => panic!("managed orphan unexpectedly absent: {absent:?}"),
         Current::MissingIdentifier(unidentified) => {
             panic!("managed orphan unexpectedly lacks an identifier: {unidentified:?}")
+        }
+        Current::CreateInFlight(pending) => {
+            panic!("managed orphan unexpectedly has an in-flight create: {pending:?}")
         }
     };
     assert_eq!(
@@ -1947,7 +1990,8 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
         &mut saved_attrs,
         &state_blocks,
         &Some(state_file),
-    );
+    )
+    .expect("fixture move routes must agree with current state");
 
     // The pair must inherit `from`'s routing so the downstream
     // `suppress_delete` lookup matches the orphan Delete's id.
@@ -1991,7 +2035,8 @@ fn same_type_moved_block_parses_and_materializes_state() {
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "old_bucket", "awscc").with_identifier("bucket-123"),
+            ResourceState::try_applied("s3.Bucket", "old_bucket", "awscc", "bucket-123")
+                .expect("fixture identifier is non-empty"),
         )
         .expect("test state setup must be valid");
     let mut orphans = state_file
@@ -2005,7 +2050,8 @@ fn same_type_moved_block_parses_and_materializes_state() {
         &mut crate::empty_lifted_saved_attrs(),
         &parsed.state_blocks,
         &Some(state_file),
-    );
+    )
+    .expect("fixture move routes must agree with current state");
 
     assert_eq!(
         moved_pairs,
@@ -2022,10 +2068,96 @@ fn same_type_moved_block_parses_and_materializes_state() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::MissingIdentifier(state) => state.state(),
+        Current::CreateInFlight(pending) => {
+            panic!("moved test state unexpectedly remained in flight: {pending:?}")
+        }
     };
     assert_eq!(moved.id, to);
     assert_eq!(moved.identifier.as_deref(), Some("bucket-123"));
     assert!(orphans.is_empty());
+}
+
+#[test]
+fn moved_in_flight_rebinds_resume_to_destination() {
+    use carina_core::effect::Effect;
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::provider::Sent;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let parsed = parse(
+        r#"
+            moved {
+                from = mock.test.resource 'old_name'
+                to   = mock.test.resource 'new_name'
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("same-type moved block must parse");
+    let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
+    let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
+    let desired = Resource::with_provider("mock", "test.resource", "new_name", None);
+    let old_resource = ResolvedResource::new(Resource::with_provider(
+        "mock",
+        "test.resource",
+        "old_name",
+        None,
+    ));
+    let pending =
+        crate::fixture_in_flight_create(&from, "opaque-token", None, Sent::AllRequestAttributes);
+    let row = ResourceState::from_in_flight(&old_resource, &pending, None, None, None)
+        .expect("in-flight fixture must encode");
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+    let mut current_states = HashMap::from([(to.clone(), Current::absent(to.clone()))]);
+    let mut orphans = state_file
+        .build_orphans(&HashSet::from([to.clone()]))
+        .into_plan_orphans();
+
+    let moved_pairs = materialize_moved_states(
+        &mut current_states,
+        &mut orphans,
+        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
+        &parsed.state_blocks,
+        &Some(state_file),
+    )
+    .expect("fixture move routes must agree with current state");
+
+    assert_eq!(
+        moved_pairs,
+        vec![(
+            ResolvedResourceId::new(from),
+            ResolvedResourceId::new(to.clone())
+        )]
+    );
+    let Current::CreateInFlight(rebound) = &current_states[&to] else {
+        panic!("moved continuation must retain its in-flight type");
+    };
+    assert_eq!(rebound.id(), &to);
+    let plan_current = carina_core::resource::into_plan_input_current_map(
+        current_states,
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&desired),
+    );
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        &plan_current,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &crate::empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+    assert!(matches!(
+        plan.effects(),
+        [Effect::ResumeCreate { resource, .. }] if resource.id == to
+    ));
 }
 
 #[test]
@@ -2047,8 +2179,8 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
 
     let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
     let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
-    let mut row =
-        ResourceState::new("test.resource", "old_name", "mock").with_identifier("object-123");
+    let mut row = ResourceState::try_applied("test.resource", "old_name", "mock", "object-123")
+        .expect("fixture identifier is non-empty");
     row.binding = Some("retired".to_string());
     let mut state_file = StateFile::new();
     state_file.upsert_resource(row).unwrap();
@@ -2064,7 +2196,8 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
         &mut crate::empty_lifted_saved_attrs(),
         &parsed.state_blocks,
         &Some(state_file.clone()),
-    );
+    )
+    .expect("fixture move routes must agree with current state");
     assert_eq!(
         moved_pairs,
         vec![(
@@ -2197,8 +2330,13 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
 
     let deposed_key = DeposedKey::new_unique();
     let mut state_file = StateFile::new();
-    let mut rs = ResourceState::new("route53.RecordSet", "r.delegation_ns", "aws")
-        .with_identifier("record-current");
+    let mut rs = ResourceState::try_applied(
+        "route53.RecordSet",
+        "r.delegation_ns",
+        "aws",
+        "record-current",
+    )
+    .expect("fixture identifier is non-empty");
     rs.deposed.push(DeposedInstance::from_persisted_json(
         deposed_key.clone(),
         "record-deposed".to_string(),
@@ -2223,7 +2361,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: std::collections::HashSet::new(),
     });
-    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()));
+    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
 
     let state_blocks = vec![StateBlock::Removed {
         from: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
@@ -2274,6 +2412,92 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
 }
 
 #[test]
+fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
+    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::provider::Sent;
+    use carina_core::resource::{ResolvedResource, Resource};
+    use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    let resource = ResolvedResource::new(Resource::with_provider(
+        "mock",
+        "example.Widget",
+        "pending",
+        None,
+    ));
+    let pending = crate::fixture_in_flight_create(
+        &resource.id,
+        "opaque-token",
+        None,
+        Sent::AllRequestAttributes,
+    );
+    let mut row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
+        .expect("in-flight fixture must encode");
+    let deposed_key = DeposedKey::new_unique();
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        deposed_key.clone(),
+        "old-id".to_string(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+
+    let orphans = state_file
+        .build_orphans(&HashSet::new())
+        .into_plan_orphans();
+    let mut plan = create_plan(
+        &[],
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        &HashMap::new(),
+        &state_file.build_directives(),
+        &SchemaRegistry::new(),
+        &crate::empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+    assert!(matches!(
+        plan.errors(),
+        [carina_core::plan::PlanError {
+            kind: carina_core::plan::PlanErrorKind::CreateInFlightOrphan,
+            ..
+        }]
+    ));
+    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
+
+    add_state_block_effects(
+        &mut plan,
+        &[StateBlock::Removed {
+            from: StateBlockAddress::new("mock", "example.Widget", "pending"),
+        }],
+        &Some(state_file),
+        &[],
+        &[],
+        &carina_core::binding_index::ResolvedBindings::default(),
+        &HashSet::new(),
+    );
+
+    assert!(plan.errors().is_empty());
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Remove { id } if id.as_inner() == &resource.id))
+    );
+    assert!(plan.effects().iter().any(|effect| matches!(
+        effect,
+        Effect::Delete {
+            generation: EffectGeneration::Deposed(key),
+            ..
+        } if key == &deposed_key
+    )));
+}
+
+#[test]
 fn deposed_delete_without_provider_identifier_becomes_plan_error() {
     use carina_core::plan::{Plan, PlanErrorKind};
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
@@ -2294,7 +2518,7 @@ fn deposed_delete_without_provider_identifier_becomes_plan_error() {
         .expect("test state setup must be valid");
     let mut plan = Plan::new();
 
-    add_deposed_delete_effects(&mut plan, &Some(state_file));
+    add_deposed_delete_effects(&mut plan, &Some(state_file), &[]);
 
     assert!(plan.effects().is_empty());
     assert_eq!(plan.errors().len(), 1);
@@ -2317,8 +2541,9 @@ fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimpor
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
     use std::collections::{BTreeSet, HashMap};
 
-    let mut row = ResourceState::new("example.Widget", "healthy-current", "mock")
-        .with_identifier("current-id");
+    let mut row =
+        ResourceState::try_applied("example.Widget", "healthy-current", "mock", "current-id")
+            .expect("fixture identifier is non-empty");
     row.deposed.push(DeposedInstance::from_persisted_json(
         DeposedKey::new_unique(),
         String::new(),
@@ -2332,7 +2557,7 @@ fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimpor
         .expect("test state setup must be valid");
     let mut plan = Plan::new();
 
-    add_deposed_delete_effects(&mut plan, &Some(state_file));
+    add_deposed_delete_effects(&mut plan, &Some(state_file), &[]);
 
     let message = plan.errors()[0].to_string();
     assert!(message.contains("`removed` block"), "{message}");
@@ -2390,7 +2615,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
         changed_attributes: vec!["version".to_string()],
     });
 
-    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()));
+    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
     carina_core::differ::block_deletes_on_prior_consumer_updates(
         &mut plan,
         &state_file.build_directives(),
@@ -2418,6 +2643,52 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
         blocked_by_updates
             .iter()
             .any(|identity| identity.as_str() == "consumer-id")
+    );
+}
+
+#[test]
+fn deposed_delete_waits_for_the_rows_in_flight_create() {
+    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::provider::Sent;
+    use carina_state::state::{DeposedInstance, DeposedKey, ResourceState};
+    use std::collections::{BTreeSet, HashMap};
+
+    let resource = ResolvedResource::new(Resource::with_provider(
+        "mock",
+        "example.Widget",
+        "pending",
+        None,
+    ));
+    let pending =
+        crate::fixture_in_flight_create(&resource.id, "opaque", None, Sent::AllRequestAttributes);
+    let mut row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
+        .expect("in-flight fixture must encode");
+    let key = DeposedKey::new_unique();
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        key.clone(),
+        "old-id".to_string(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+
+    let (effects, errors) = deposed_delete_effects_for_row(&row, &[]);
+
+    assert!(errors.is_empty());
+    let [
+        Effect::Delete {
+            generation: EffectGeneration::Deposed(actual_key),
+            blocked_by_updates,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected one deposed delete, got {effects:?}");
+    };
+    assert_eq!(actual_key, &key);
+    assert_eq!(
+        blocked_by_updates,
+        &std::collections::HashSet::from([resource.identity().clone()])
     );
 }
 
@@ -2508,7 +2779,8 @@ fn test_materialize_moved_states_warns_on_missing_from() {
         &state_blocks,
         &Some(StateFile::new()),
         &mut |warning| warnings.push(warning),
-    );
+    )
+    .expect("empty fixture has no mismatched move route");
     assert!(moved_pairs.is_empty());
     assert_eq!(
         warnings,
@@ -2531,7 +2803,8 @@ fn test_materialize_moved_states_warns_on_missing_from() {
         &state_blocks,
         &Some(state_file),
         &mut |warning| warnings.push(warning),
-    );
+    )
+    .expect("fixture move routes must agree with current state");
     assert!(moved_pairs.is_empty());
     assert!(
         warnings.is_empty(),
@@ -2664,8 +2937,8 @@ removed {
     let state_file = {
         let mut sf = StateFile::new();
         sf.upsert_resource(
-            ResourceState::new("acm.Certificate", "cert", "aws")
-                .with_identifier("cert-arn")
+            ResourceState::try_applied("acm.Certificate", "cert", "aws", "cert-arn")
+                .expect("fixture identifier is non-empty")
                 .with_attribute(
                     "domain_validation_options",
                     serde_json::json!([
@@ -2680,8 +2953,8 @@ removed {
         )
         .expect("test state setup must be valid");
         sf.upsert_resource(
-            ResourceState::new("route53.RecordSet", "records[0]", "aws")
-                .with_identifier("record-set-id"),
+            ResourceState::try_applied("route53.RecordSet", "records[0]", "aws", "record-set-id")
+                .expect("fixture identifier is non-empty"),
         )
         .expect("test state setup must be valid");
         Some(sf)
@@ -2861,7 +3134,8 @@ fn test_plan_allows_from_absent_to_present_idempotent_noop() {
         &state_blocks,
         &state_file,
         &mut |warning| warnings.push(warning),
-    );
+    )
+    .expect("fixture move routes must agree with current state");
     assert!(
         moved_pairs.is_empty(),
         "already-applied moved block must not produce a move pair"
@@ -3388,7 +3662,8 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
         &Some(state_file),
-    );
+    )
+    .expect("fixture move routes must agree with current state");
     assert_eq!(moved_pairs.len(), 5);
     for (idx, (from, to)) in moved_pairs.iter().enumerate() {
         assert_eq!(from.identity_str(), old_names[idx]);
@@ -3491,18 +3766,22 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .clone();
     let state_subnet_identity = concrete_subnet_identity(&ctx, &parsed.providers);
 
-    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
-        .with_identifier("vpc-old")
+    let mut vpc_state = ResourceState::try_applied("ec2.Vpc", "vpc", "awscc", "vpc-old")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
     vpc_state.binding = Some("vpc".to_string());
 
-    let mut subnet_state =
-        ResourceState::new("ec2.Subnet", test_identity(&state_subnet_identity), "awscc")
-            .with_identifier("subnet-old")
-            .with_attribute("vpc_id", serde_json::json!("vpc-old"))
-            .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
-            .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
+    let mut subnet_state = ResourceState::try_applied(
+        "ec2.Subnet",
+        test_identity(&state_subnet_identity),
+        "awscc",
+        "subnet-old",
+    )
+    .expect("fixture identifier is non-empty")
+    .with_attribute("vpc_id", serde_json::json!("vpc-old"))
+    .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
+    .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
     subnet_state.dependency_bindings.insert("vpc".to_string());
 
     let mut state_file = StateFile::new();
@@ -3659,12 +3938,13 @@ moved {{
 
         state_file
             .upsert_resource(
-                ResourceState::new(
+                ResourceState::try_applied(
                     "ec2.SubnetRouteTableAssociation",
                     test_identity(old_name),
                     "awscc",
+                    format!("assoc-{idx}"),
                 )
-                .with_identifier(format!("assoc-{idx}"))
+                .expect("fixture identifier is non-empty")
                 .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
                 .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
             )
@@ -4594,8 +4874,8 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(
-            ResourceState::new("ec2.Route", test_identity(&old_name), "awscc")
-                .with_identifier("route-123"),
+            ResourceState::try_applied("ec2.Route", test_identity(&old_name), "awscc", "route-123")
+                .expect("fixture identifier is non-empty"),
         )
         .expect("test state setup must be valid");
     let mut current_states = HashMap::new();
@@ -4636,6 +4916,9 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::MissingIdentifier(state) => state.state(),
+        Current::CreateInFlight(pending) => {
+            panic!("renamed test state unexpectedly remained in flight: {pending:?}")
+        }
     };
     assert_eq!(state.identifier.as_deref(), Some("route-123"));
 }
@@ -4949,17 +5232,25 @@ mod read_with_retry_identifier_tests {
 
         fn create(
             &self,
-            id: &ResourceId,
+            _id: &ResourceId,
             _request: carina_core::provider::CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-            let id = id.clone();
+            attempt: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
             Box::pin(async move {
-                Ok(carina_core::provider::CreateOutcome::Success {
-                    state: AppliedState::new(id, "recording-id", HashMap::new())
-                        .expect("fixture identifier is non-empty"),
-                })
+                Ok(attempt
+                    .issued(
+                        AppliedIdentifier::new("recording-id")
+                            .expect("fixture identifier is non-empty"),
+                        Sent::AllRequestAttributes,
+                    )
+                    .succeeded(HashMap::new()))
             })
         }
+
+        unexpected_resume_create!();
 
         fn update(
             &self,
@@ -5395,6 +5686,9 @@ mod expand_same_config_deferred_for_tests {
             Current::Present(present) => present,
             Current::MissingIdentifier(state) => {
                 panic!("test orphan lacks a provider identifier: {state:?}")
+            }
+            Current::CreateInFlight(pending) => {
+                panic!("test orphan unexpectedly has an in-flight create: {pending:?}")
             }
         };
         let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(
@@ -6889,9 +7183,14 @@ mod resolved_value_constraint_gate {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
-            Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+            attempt: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, carina_core::provider::CreateFailure>> {
+            Box::pin(
+                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
+            )
         }
+
+        unexpected_resume_create!();
 
         fn update(
             &self,
@@ -6941,14 +7240,14 @@ mod resolved_value_constraint_gate {
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut carina_core::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut carina_core::provider::StateTransformMap,
             _saved_attrs: &'a carina_core::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()

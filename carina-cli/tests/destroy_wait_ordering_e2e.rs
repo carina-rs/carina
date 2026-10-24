@@ -94,8 +94,8 @@ let lst = mock.test.resource {{
 
     fn seed_carina_state_with_cert_name(&self, cert_name: &str) {
         let mut state = StateFile::new();
-        let mut cert = ResourceState::new("test.resource", "cert", "mock")
-            .with_identifier("mock-id")
+        let mut cert = ResourceState::try_applied("test.resource", "cert", "mock", "mock-id")
+            .expect("fixture identifier is non-empty")
             .with_attribute("name", serde_json::json!(cert_name))
             .with_attribute("id", serde_json::json!("cert-id"))
             .with_attribute("status", serde_json::json!("ISSUED"));
@@ -104,8 +104,8 @@ let lst = mock.test.resource {{
             .upsert_resource(cert)
             .expect("test state setup must be valid");
 
-        let mut lst = ResourceState::new("test.resource", "lst", "mock")
-            .with_identifier("mock-id")
+        let mut lst = ResourceState::try_applied("test.resource", "lst", "mock", "mock-id")
+            .expect("fixture identifier is non-empty")
             .with_attribute("name", serde_json::json!("lst"))
             .with_attribute("id", serde_json::json!("lst-id"))
             .with_attribute("upstream", serde_json::json!("cert-id"));
@@ -148,8 +148,8 @@ let lst = mock.test.resource {{
 
     fn seed_single_resource_state_with_deposed(&self) {
         let mut state = StateFile::new();
-        let mut main = ResourceState::new("test.resource", "main", "mock")
-            .with_identifier("main-current")
+        let mut main = ResourceState::try_applied("test.resource", "main", "mock", "main-current")
+            .expect("fixture identifier is non-empty")
             .with_attribute("name", serde_json::json!("main"))
             .with_attribute("id", serde_json::json!("main-current"))
             .with_attribute("status", serde_json::json!("ACTIVE"));
@@ -411,7 +411,7 @@ fn destroy_failed_deposed_delete_survives_after_current_delete_succeeds() {
         .find_resource("mock", "test.resource", "main")
         .expect("row shell should remain for failed deposed generation");
     assert!(
-        row.identifier.is_none(),
+        row.identifier().is_none(),
         "successful current delete should still be applied to state"
     );
     assert_eq!(row.deposed.len(), 1);

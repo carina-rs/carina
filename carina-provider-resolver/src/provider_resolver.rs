@@ -20,6 +20,18 @@ use crate::signing::{self, ExpectedIdentity};
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
 
+fn link_or_copy_with(
+    link: impl Fn(&Path, &Path) -> io::Result<()>,
+    src: &Path,
+    dest: &Path,
+) -> io::Result<()> {
+    link(src, dest).or_else(|_| fs::copy(src, dest).map(|_| ()))
+}
+
+pub(crate) fn link_or_copy(src: &Path, dest: &Path) -> io::Result<()> {
+    link_or_copy_with(|src, dest| fs::hard_link(src, dest), src, dest)
+}
+
 /// Return the provider lock-file path for a project directory.
 pub fn provider_lock_path(project_dir: &Path) -> PathBuf {
     project_dir.join(PROVIDER_LOCK_FILE_NAME)
@@ -4453,8 +4465,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
         if let Some(parent) = wasm_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::hard_link(&global_wasm, &wasm_path)
-            .or_else(|_| fs::copy(&global_wasm, &wasm_path).map(|_| ()))
+        link_or_copy(&global_wasm, &wasm_path)
             .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
         let hash =
             sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
@@ -4497,8 +4508,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
                 if let Some(parent) = global_wasm.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                let _ = fs::hard_link(&wasm_path, &global_wasm)
-                    .or_else(|_| fs::copy(&wasm_path, &global_wasm).map(|_| ()));
+                let _ = link_or_copy(&wasm_path, &global_wasm);
             }
             eprintln!(
                 "Installed WASM provider '{}' ({}@{})",
@@ -5252,7 +5262,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
             }
             // Remove existing file before hard-linking (hard_link fails if dest exists)
             let _ = fs::remove_file(&dest);
-            fs::hard_link(&src_path, &dest)
+            link_or_copy(&src_path, &dest)
                 .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
             let sha = sha256_file(&dest)
                 .map_err(|e| format!("Failed to compute SHA256 for file:// provider: {e}"))?;
@@ -5388,6 +5398,23 @@ mod tests {
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions";
     const REGISTRY_DOWNLOAD_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download";
+
+    #[test]
+    fn link_or_copy_falls_back_to_copy_when_link_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.wasm");
+        let dest = dir.path().join("dest.wasm");
+        fs::write(&src, b"provider wasm").unwrap();
+
+        link_or_copy_with(
+            |_, _| Err(io::Error::other("injected hard-link failure")),
+            &src,
+            &dest,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(dest).unwrap(), b"provider wasm");
+    }
 
     fn resolve_registry<H: RegistryHttp>(
         source: &RegistrySource,

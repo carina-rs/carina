@@ -59,7 +59,7 @@ use crate::commands::shared::state_writeback::{
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
-use crate::error::AppError;
+use crate::error::{AppError, DestroyDependencyAnalysisError};
 use crate::wiring::{
     WiringContext, build_factories_from_providers, get_provider_with_ctx,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
@@ -512,6 +512,7 @@ async fn run_destroy_locked_with_ctx_owned(
                 let exists = match &current {
                     Current::Absent(_state) => false,
                     Current::Present(_present) => true,
+                    Current::CreateInFlight(_pending) => true,
                     Current::MissingIdentifier(_state) => true,
                 };
                 if exists
@@ -560,6 +561,7 @@ async fn run_destroy_locked_with_ctx_owned(
                 .is_some_and(|current| match current {
                     Current::Absent(_state) => false,
                     Current::Present(_present) => true,
+                    Current::CreateInFlight(_pending) => true,
                     Current::MissingIdentifier(_state) => true,
                 });
             if !exists {
@@ -630,7 +632,8 @@ async fn run_destroy_locked_with_ctx_owned(
         ScheduleInputs::Destroy {
             aliases: &wait_aliases,
         },
-    );
+    )
+    .map_err(DestroyDependencyAnalysisError::new)?;
     let delete_count = delete_effects.len();
     let deletion_deps = transitive_delete_deps(&dependency_analysis, delete_count);
     let delete_depths = compute_delete_depths(delete_count, &deletion_deps);
@@ -1482,6 +1485,13 @@ fn build_destroy_delete_effects(
                 ));
                 continue;
             }
+            Some(Current::CreateInFlight(_pending)) => {
+                errors.push(PlanError::new(
+                    resource.id.clone(),
+                    carina_core::plan::PlanErrorKind::DestroyCreateInFlight,
+                ));
+                continue;
+            }
             None => {
                 errors.push(PlanError::new(
                     resource.id.clone(),
@@ -1512,7 +1522,7 @@ fn build_destroy_delete_effects(
             )) {
                 continue;
             }
-            let (effects, row_errors) = crate::wiring::deposed_delete_effects_for_row(row);
+            let (effects, row_errors) = crate::wiring::deposed_delete_effects_for_row(row, &[]);
             delete_effects.extend(effects);
             errors.extend(row_errors);
         }
@@ -1832,8 +1842,8 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                carina_state::ResourceState::new("thing", "orphan", "test")
-                    .with_identifier("orphan"),
+                carina_state::ResourceState::try_applied("thing", "orphan", "test", "orphan")
+                    .expect("fixture identifier is non-empty"),
             )
             .unwrap();
         let state_path = downstream.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
@@ -2446,7 +2456,7 @@ mod tests {
     fn destroy_delete_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Widget", "current", None);
         let state = State::existing(resource.id.clone(), HashMap::new());
-        let identifier = carina_core::provider::fixture_applied_identifier("typed-provider-id");
+        let identifier = crate::fixture_applied_identifier("typed-provider-id");
         let current_states = HashMap::from([(
             resource.id.clone(),
             carina_core::resource::fixture_present_current(state, identifier),
@@ -2497,8 +2507,10 @@ mod tests {
                     "provider": "mock",
                     "resource_type": "test.Widget",
                     "identity": "broken",
-                    "identifier": null,
-                    "attributes": {}
+                    "current": {
+                        "kind": "missing_identifier",
+                        "attributes": {}
+                    }
                 }],
                 "exports": {}
             })
@@ -2528,15 +2540,59 @@ mod tests {
     }
 
     #[test]
+    fn destroy_rejects_in_flight_current() {
+        use carina_core::provider::Sent;
+
+        let first = Resource::with_provider("mock", "test.Widget", "first", None);
+        let second = Resource::with_provider("mock", "test.Widget", "second", None);
+        let first_pending = crate::fixture_in_flight_create(
+            &first.id,
+            "opaque-token",
+            None,
+            Sent::AllRequestAttributes,
+        );
+        let second_pending = crate::fixture_in_flight_create(
+            &second.id,
+            "other-opaque-token",
+            None,
+            Sent::AllRequestAttributes,
+        );
+        let current_states = HashMap::from([
+            (first.id.clone(), Current::create_in_flight(first_pending)),
+            (second.id.clone(), Current::create_in_flight(second_pending)),
+        ]);
+
+        let (effects, errors) = build_destroy_delete_effects(
+            &[&first, &second],
+            &current_states,
+            None,
+            &HashSet::new(),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(errors.len(), 2);
+        for (error, expected_id) in errors.iter().zip([&first.id, &second.id]) {
+            assert_eq!(&error.resource_id, expected_id);
+            assert_eq!(
+                error.kind,
+                carina_core::plan::PlanErrorKind::DestroyCreateInFlight
+            );
+            let message = error.to_string();
+            assert!(message.contains(&expected_id.to_string()), "{message}");
+            assert!(message.contains("run apply first"), "{message}");
+        }
+    }
+
+    #[test]
     fn orphan_destroy_uses_row_binding_and_depends_on_for_delete_ordering() {
         use carina_state::ResourceState;
         use std::collections::{BTreeSet, HashMap};
 
-        let mut parent =
-            ResourceState::new("test.Parent", "parent", "mock").with_identifier("parent-123");
+        let mut parent = ResourceState::try_applied("test.Parent", "parent", "mock", "parent-123")
+            .expect("fixture identifier is non-empty");
         parent.binding = Some("parent".to_string());
-        let mut child =
-            ResourceState::new("test.Child", "child", "mock").with_identifier("child-123");
+        let mut child = ResourceState::try_applied("test.Child", "child", "mock", "child-123")
+            .expect("fixture identifier is non-empty");
         child.binding = Some("child".to_string());
         child.directives.depends_on = vec!["parent".to_string()];
         child.dependency_bindings = BTreeSet::from(["network".to_string()]);
@@ -2587,7 +2643,8 @@ mod tests {
             &HashMap::<ResourceId, UnresolvedResource>::new(),
             &[],
             ScheduleInputs::Destroy { aliases: &[] },
-        );
+        )
+        .expect("destroy dependency analysis must resolve");
         let deletion_deps = transitive_delete_deps(&analysis, effects.len());
         let depths = compute_delete_depths(effects.len(), &deletion_deps);
         let names = effects
@@ -2754,8 +2811,8 @@ mod tests {
         use std::collections::{BTreeSet, HashMap};
 
         let mut state = carina_state::StateFile::new();
-        let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-new")
+        let mut resource = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-new")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
         resource.deposed.push(DeposedInstance::from_persisted_json(
             DeposedKey::new_unique(),
@@ -2778,8 +2835,8 @@ mod tests {
         let retained = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("row with deposed generations should be retained");
-        assert_eq!(retained.identifier, None);
-        assert!(retained.persisted_attributes().is_empty());
+        assert_eq!(retained.identifier(), None);
+        assert!(retained.persisted_attributes().is_none());
         assert_eq!(retained.deposed.len(), 1);
         assert_eq!(retained.deposed[0].identifier, "vpc-old");
         assert!(state.exports.is_empty(), "exports should be cleared");
@@ -2793,8 +2850,8 @@ mod tests {
         let removed_key = DeposedKey::new_unique();
         let retained_key = DeposedKey::new_unique();
         let mut state = carina_state::StateFile::new();
-        let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-new")
+        let mut resource = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-new")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
         resource.deposed.push(DeposedInstance::from_persisted_json(
             removed_key.clone(),
@@ -2823,7 +2880,10 @@ mod tests {
         let retained = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain after deposed-only destroy result");
-        assert_eq!(retained.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(
+            retained.identifier().map(ToString::to_string).as_deref(),
+            Some("vpc-new")
+        );
         assert_eq!(retained.deposed.len(), 1);
         assert_eq!(retained.deposed[0].key, retained_key);
         assert_eq!(retained.deposed[0].identifier, "vpc-older");
@@ -2836,8 +2896,8 @@ mod tests {
 
         let deposed_key = DeposedKey::new_unique();
         let mut state = carina_state::StateFile::new();
-        let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-new")
+        let mut resource = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-new")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
         resource.deposed.push(DeposedInstance::from_persisted_json(
             deposed_key.clone(),

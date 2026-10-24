@@ -17,8 +17,8 @@ use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, PersistedAttributes, Provider, ProviderError,
-    ProviderNormalizer, RawSavedAttrs,
+    self as provider_mod, AppliedIdentifier, InFlightCreate, PersistedAttributes, Provider,
+    ProviderError, ProviderNormalizer, RawSavedAttrs,
 };
 use carina_core::resource::{
     Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
@@ -189,7 +189,8 @@ fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<Completio
     {
         let persisted = rs.persisted_attributes();
         return persisted
-            .keys()
+            .into_iter()
+            .flat_map(PersistedAttributes::keys)
             .filter(|key| {
                 let full = format!("{}.{}", before_dot, key);
                 full.starts_with(current)
@@ -471,26 +472,85 @@ fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a Re
         })
 }
 
+#[derive(Clone, Copy)]
+enum StateCommandStateKind {
+    Absent,
+    Present,
+    MissingIdentifier,
+}
+
+/// State-command presentation boundary for a managed current instance.
+///
+/// Keeping the exhaustive [`Current`] match here prevents state subcommands
+/// from flattening an in-flight create into an empty attribute-bearing state.
+enum StateCommandCurrent<'a> {
+    State {
+        state: &'a State,
+        kind: StateCommandStateKind,
+    },
+    CreateInFlight(&'a InFlightCreate),
+}
+
+impl<'a> From<&'a Current> for StateCommandCurrent<'a> {
+    fn from(current: &'a Current) -> Self {
+        match current {
+            Current::Absent(absent) => Self::State {
+                state: absent.state(),
+                kind: StateCommandStateKind::Absent,
+            },
+            Current::Present(present) => Self::State {
+                state: present.state(),
+                kind: StateCommandStateKind::Present,
+            },
+            Current::CreateInFlight(pending) => Self::CreateInFlight(pending),
+            Current::MissingIdentifier(unidentified) => Self::State {
+                state: unidentified.state(),
+                kind: StateCommandStateKind::MissingIdentifier,
+            },
+        }
+    }
+}
+
+fn current_for_state_command(state: &StateFile, row: &ResourceState) -> Current {
+    let id = ResourceId::with_provider_identity(
+        row.provider.clone(),
+        row.resource_type.clone(),
+        row.identity.clone(),
+        row.directives.provider_instance.clone(),
+    );
+    state.build_state_for_resource(&id)
+}
+
+fn create_in_flight_status(pending: &InFlightCreate) -> String {
+    format!("create in flight since {}", pending.started_at().as_str())
+}
+
 /// Format state list output. Returns each line as a string.
 fn format_state_list(state: &StateFile) -> Vec<String> {
     let mut lines = Vec::new();
     for rs in state.resources() {
         let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
         let row_prefix = format!("{}.{} {}", rs.provider, rs.resource_type, display_name);
-        let id = ResourceId::with_provider_identity(
-            rs.provider.clone(),
-            rs.resource_type.clone(),
-            rs.identity.clone(),
-            rs.directives.provider_instance.clone(),
-        );
-        match state.build_state_for_resource(&id) {
-            Current::Absent(_state) => {
-                lines.push(format!("{row_prefix}  (no current instance)"));
+        let current = current_for_state_command(state, rs);
+        match StateCommandCurrent::from(&current) {
+            StateCommandCurrent::State {
+                state: _state,
+                kind,
+            } => match kind {
+                StateCommandStateKind::Absent => {
+                    lines.push(format!("{row_prefix}  (no current instance)"));
+                }
+                StateCommandStateKind::Present => lines.push(row_prefix.clone()),
+                StateCommandStateKind::MissingIdentifier => {
+                    lines.push(format!("{row_prefix}  (missing provider identifier)"));
+                }
+            },
+            StateCommandCurrent::CreateInFlight(pending) => {
+                lines.push(format!(
+                    "{row_prefix}  ({})",
+                    create_in_flight_status(pending)
+                ));
             }
-            Current::MissingIdentifier(_state) => {
-                lines.push(format!("{row_prefix}  (missing provider identifier)"));
-            }
-            Current::Present(_present) => lines.push(row_prefix.clone()),
         }
         for deposed in &rs.deposed {
             lines.push(format!(
@@ -554,7 +614,8 @@ fn format_state_lookup(
 ) -> Result<String, AppError> {
     // (1) Longest-binding-prefix match against resources.
     if let Some((rs, attribute)) = resolve_resource_address(state, query) {
-        return format_resource_value(rs, attribute, json_output);
+        let current = current_for_state_command(state, rs);
+        return format_resource_value(rs, &current, attribute, json_output);
     }
 
     // (2) Exports — only when no resource named `exports` shadowed
@@ -668,13 +729,37 @@ fn query_starts_with_address(query: &str, address: &str) -> bool {
 /// historically produced.
 fn format_resource_value(
     rs: &ResourceState,
+    current: &Current,
     attribute: Option<&str>,
     json_output: bool,
 ) -> Result<String, AppError> {
-    match attribute {
-        Some(attr) => format_resource_attribute_value(rs, attr, json_output),
-        None if !rs.deposed.is_empty() => format_resource_full_value_with_deposed(rs),
-        None => Ok(rs.format_attributes_for_state_show()),
+    match StateCommandCurrent::from(current) {
+        StateCommandCurrent::State {
+            state: _state,
+            kind: _kind,
+        } => match attribute {
+            Some(attr) => format_resource_attribute_value(rs, attr, json_output),
+            None if !rs.deposed.is_empty() => format_resource_full_value_with_deposed(rs),
+            None => Ok(rs.format_attributes_for_state_show()),
+        },
+        StateCommandCurrent::CreateInFlight(pending) => match attribute {
+            Some(attr) => {
+                let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+                Err(AppError::Config(format!(
+                    "Cannot look up attribute '{attr}' on resource '{display_name}': {}.",
+                    create_in_flight_status(pending)
+                )))
+            }
+            None => {
+                let status = create_in_flight_status(pending);
+                if json_output {
+                    Ok(serde_json::to_string_pretty(&status)
+                        .expect("in-flight status is serializable"))
+                } else {
+                    Ok(status)
+                }
+            }
+        },
     }
 }
 
@@ -737,7 +822,11 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
         resource.dependency_bindings = rs.dependency_bindings.clone();
 
         // Convert persisted JSON attributes through the state-only decoder.
-        for (key, value) in rs.persisted_attributes().to_values() {
+        for (key, value) in rs
+            .persisted_attributes()
+            .map(PersistedAttributes::to_values)
+            .unwrap_or_default()
+        {
             resource.set_attr(key, value);
         }
 
@@ -763,7 +852,22 @@ fn format_state_show(state: &StateFile) -> String {
             rs.provider, rs.resource_type, display_name
         ));
 
-        format_attributes_for_show(&mut output, rs.persisted_attributes().to_values(), "  ");
+        let current = current_for_state_command(state, rs);
+        match StateCommandCurrent::from(&current) {
+            StateCommandCurrent::State {
+                state: _state,
+                kind: _kind,
+            } => format_attributes_for_show(
+                &mut output,
+                rs.persisted_attributes()
+                    .map(PersistedAttributes::to_values)
+                    .unwrap_or_default(),
+                "  ",
+            ),
+            StateCommandCurrent::CreateInFlight(pending) => {
+                output.push_str(&format!("  {}\n", create_in_flight_status(pending)));
+            }
+        }
         for deposed in &rs.deposed {
             output.push_str(&format!(
                 "  {}\n",
@@ -1198,6 +1302,9 @@ async fn run_state_refresh_locked_with_ctx(
                     missing_provider_identifier_ids.insert(resource.id.clone());
                     managed_current.insert(resource.id.clone(), Current::MissingIdentifier(state));
                 }
+                Current::CreateInFlight(pending) => {
+                    managed_current.insert(resource.id.clone(), Current::CreateInFlight(pending));
+                }
                 Current::Absent(_state) => {}
             }
         }
@@ -1228,6 +1335,7 @@ async fn run_state_refresh_locked_with_ctx(
         match loaded.current() {
             Current::Absent(_state) => {}
             Current::Present(_present) => {}
+            Current::CreateInFlight(_pending) => {}
             Current::MissingIdentifier(_state) => {
                 warn_missing_provider_identifier(id);
                 missing_provider_identifier_ids.insert(id.clone());
@@ -1751,6 +1859,7 @@ async fn refresh_orphans_until_cancelled(
             let provider_read = match loaded.current() {
                 Current::Absent(_state) => false,
                 Current::Present(_present) => true,
+                Current::CreateInFlight(_pending) => false,
                 Current::MissingIdentifier(_state) => false,
             };
             in_flight.push(async move {
@@ -2075,9 +2184,12 @@ where
 {
     let mut states = HashMap::from([(target.id.as_inner().clone(), fresh_state.clone())]);
     let saved_attrs = deposed_saved_attrs(target).lift(schemas);
-    provider
-        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-        .await?;
+    carina_core::provider::hydrate_provider_states(
+        provider,
+        &mut states,
+        saved_attrs.as_provider_saved_attrs(),
+    )
+    .await?;
 
     if let Some(normalized) = states.remove(target.id.as_inner()) {
         *fresh_state = normalized;
@@ -2118,16 +2230,32 @@ fn diff_display_update_resource(
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
-    let (fresh_state, exists) = match fresh_current {
-        Current::Absent(absent) => (absent.state(), false),
-        Current::Present(present) => (present.state(), true),
-        Current::MissingIdentifier(unidentified) => (unidentified.state(), true),
-    };
     let identity = id.identity();
     let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_str());
     let existing_rs = match existing {
         Some(rs) => rs,
         None => return Ok(()),
+    };
+    let (fresh_state, exists) = match StateCommandCurrent::from(fresh_current) {
+        StateCommandCurrent::State { state, kind } => {
+            let exists = match kind {
+                StateCommandStateKind::Absent => false,
+                StateCommandStateKind::Present | StateCommandStateKind::MissingIdentifier => true,
+            };
+            (state, exists)
+        }
+        StateCommandCurrent::CreateInFlight(pending) => {
+            counts.unchanged += 1;
+            println!(
+                "  {} \"{}\"{}:",
+                id.display_type().cyan(),
+                identity,
+                label_suffix,
+            );
+            println!("    {}", create_in_flight_status(pending));
+            println!();
+            return Ok(());
+        }
     };
 
     let refreshed_resource_state = if exists {
@@ -2170,8 +2298,14 @@ fn diff_display_update_resource(
                     &id.resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 );
+                let refreshable = existing_rs.refreshable().ok_or_else(|| {
+                    AppError::Config(format!(
+                        "Cannot refresh in-flight resource state for {}",
+                        id.as_inner()
+                    ))
+                })?;
                 Some(
-                    existing_rs
+                    refreshable
                         .refreshed_from_provider_state(fresh_state, schema)
                         .map_err(|source| {
                             AppError::from_resource_state_encoding(id.as_inner().clone(), source)
@@ -2184,10 +2318,14 @@ fn diff_display_update_resource(
     };
 
     // Build old attributes as DSL values for comparison
-    let old_attrs = existing_rs.persisted_attributes().to_values();
+    let old_attrs = existing_rs
+        .persisted_attributes()
+        .map(PersistedAttributes::to_values)
+        .unwrap_or_default();
     let refreshed_attrs: HashMap<String, Value> = refreshed_resource_state
         .as_ref()
-        .map(|rs| rs.persisted_attributes().to_values())
+        .and_then(ResourceState::persisted_attributes)
+        .map(PersistedAttributes::to_values)
         .unwrap_or_default();
 
     let mut has_changes = false;
@@ -2327,7 +2465,8 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                ResourceState::new("thing", "orphan", provider).with_identifier("orphan"),
+                ResourceState::try_applied("thing", "orphan", provider, "orphan")
+                    .expect("fixture identifier is non-empty"),
             )
             .unwrap();
         ModuleConstraintRefreshBackend { state }
@@ -2777,8 +2916,24 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-            Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+            attempt: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
+            Box::pin(
+                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
+            )
+        }
+
+        fn resume_create(
+            &self,
+            _request: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            Box::pin(async { panic!("unexpected resume_create") })
         }
 
         fn update(
@@ -2862,7 +3017,10 @@ mod tests {
 
         let mut state = StateFile::new();
         state
-            .upsert_resource(ResourceState::new("orphan", "old", "test").with_identifier("old-id"))
+            .upsert_resource(
+                ResourceState::try_applied("orphan", "old", "test", "old-id")
+                    .expect("fixture identifier is non-empty"),
+            )
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2964,7 +3122,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing deposed refresh result for {:?}", key));
             Box::pin(async move {
                 result
-                    .map(carina_core::provider::fixture_read_outcome)
+                    .map(crate::fixture_read_outcome)
                     .map_err(ProviderError::internal)
             })
         }
@@ -2980,8 +3138,24 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-            Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+            attempt: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
+            Box::pin(
+                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
+            )
+        }
+
+        fn resume_create(
+            &self,
+            _request: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            Box::pin(async { panic!("unexpected resume_create") })
         }
 
         fn update(
@@ -3021,14 +3195,14 @@ mod tests {
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut carina_core::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            current_states: &'a mut HashMap<ResourceId, State>,
+            current_states: &'a mut carina_core::provider::StateTransformMap,
             saved_attrs: &'a carina_core::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
@@ -3095,8 +3269,8 @@ mod tests {
         fixture.write_backend_lock();
 
         let mut initial_state = StateFile::new();
-        let mut managed =
-            ResourceState::new("test.resource", "managed", "mock").with_identifier("mock-id");
+        let mut managed = ResourceState::try_applied("test.resource", "managed", "mock", "mock-id")
+            .expect("fixture identifier is non-empty");
         managed.binding = Some("managed".to_string());
         managed.set_persisted_attribute("name".to_string(), serde_json::json!("managed"));
         initial_state
@@ -3241,12 +3415,13 @@ mod tests {
         assert_eq!(preview.new_child_ids, HashSet::from([child.id.clone()]));
 
         let mut state_file = StateFile::new();
-        let mut child_state = ResourceState::new(
+        let mut child_state = ResourceState::try_applied(
             &child.id.resource_type,
             child.id.identity().expect("resolved identity").clone(),
             &child.id.provider,
+            "widget-1",
         )
-        .with_identifier("widget-1")
+        .expect("fixture identifier is non-empty")
         .with_attribute("status", json!("Enabled"));
         child_state.directives.provider_instance = child.id.provider_instance.clone();
         state_file
@@ -3336,8 +3511,8 @@ mod tests {
 
     fn deposed_format_state() -> StateFile {
         let mut state = StateFile::new();
-        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-new")
+        let mut row = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-new")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", json!("10.0.0.0/16"))
             .with_attribute("vpc_id", json!("vpc-new"));
         row.binding = Some("main".to_string());
@@ -3879,8 +4054,8 @@ mod tests {
         let gone_key = deposed_key("gone-key");
         let alive_key = deposed_key("alive-key");
         let mut state = StateFile::new();
-        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-current")
+        let mut row = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-current")
+            .expect("fixture identifier is non-empty")
             .with_attribute("vpc_id", json!("vpc-current"))
             .with_attribute("cidr_block", json!("10.0.0.0/16"));
         row.deposed.push(deposed_instance(
@@ -3933,9 +4108,14 @@ mod tests {
         .unwrap();
 
         let row = state.find_resource("awscc", "ec2.Vpc", "main").unwrap();
-        assert_eq!(row.identifier.as_deref(), Some("vpc-current"));
         assert_eq!(
-            row.persisted_attributes().get("vpc_id"),
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-current")
+        );
+        assert_eq!(
+            row.persisted_attributes()
+                .expect("row has applied attributes")
+                .get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-current"))
         );
         assert_eq!(row.deposed.len(), 1);
@@ -4268,8 +4448,8 @@ mod tests {
             "main",
             Some("west".to_string()),
         );
-        let mut row =
-            ResourceState::new("ec2.Subnet", "main", "awscc").with_identifier("subnet-current");
+        let mut row = ResourceState::try_applied("ec2.Subnet", "main", "awscc", "subnet-current")
+            .expect("fixture identifier is non-empty");
         row.directives = carina_core::resource::Directives {
             force_delete: true,
             create_before_destroy: true,
@@ -4294,7 +4474,7 @@ mod tests {
                 carina_core::explicit::ExplicitFields::Leaf,
             )]),
         };
-        row.write_only_attributes = vec!["token".to_string()];
+        row = crate::fixture_resource_state_metadata(row, Some(vec!["token".to_string()]), None);
         let deposed_key = deposed_key("prior-generation");
         row.deposed.push(deposed_instance(
             deposed_key.clone(),
@@ -4352,7 +4532,7 @@ mod tests {
             carina_core::explicit::ExplicitFields::Struct { children }
                 if children.contains_key("cidr_block")
         ));
-        assert_eq!(refreshed.write_only_attributes, vec!["token".to_string()]);
+        assert_eq!(refreshed.write_only_attributes(), ["token"]);
         assert!(refreshed.protected);
         assert_eq!(
             refreshed.name_overrides.get("name"),
@@ -4394,8 +4574,8 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                ResourceState::new("db.Instance", "main", "awscc")
-                    .with_identifier("db-current")
+                ResourceState::try_applied("db.Instance", "main", "awscc", "db-current")
+                    .expect("fixture identifier is non-empty")
                     .with_attribute("password", structural_legacy_secret(&"ab".repeat(32))),
             )
             .expect("test state setup must be valid");
@@ -4421,7 +4601,9 @@ mod tests {
             .find_resource("awscc", "db.Instance", "main")
             .unwrap()
             .persisted_attributes();
-        let encoded = encoded_persisted_attributes(persisted);
+        let encoded = encoded_persisted_attributes(
+            persisted.expect("refreshed current row has applied attributes"),
+        );
         let stored = structural_secret_digest(
             encoded
                 .get("password")
@@ -4443,8 +4625,8 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                ResourceState::new("ec2.Vpc", "main", "awscc")
-                    .with_identifier("vpc-current")
+                ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-current")
+                    .expect("fixture identifier is non-empty")
                     .with_attribute("tags", previous_tags),
             )
             .expect("test state setup must be valid");
@@ -4476,7 +4658,9 @@ mod tests {
             .find_resource("awscc", "ec2.Vpc", "main")
             .unwrap()
             .persisted_attributes();
-        let encoded = encoded_persisted_attributes(persisted);
+        let encoded = encoded_persisted_attributes(
+            persisted.expect("refreshed current row has applied attributes"),
+        );
         let stored_tags = encoded.get("tags").expect("tags should be stored");
         assert_eq!(stored_tags["Name"], json!("new-name"));
         let secret = structural_secret_digest(&stored_tags["SecretTag"]);
@@ -4500,7 +4684,9 @@ mod tests {
             .find_resource("awscc", "ec2.Vpc", "main")
             .unwrap()
             .persisted_attributes();
-        let encoded_again = encoded_persisted_attributes(persisted_again);
+        let encoded_again = encoded_persisted_attributes(
+            persisted_again.expect("refreshed current row has applied attributes"),
+        );
         let stored_again = encoded_again
             .get("tags")
             .expect("tags should still be stored");
@@ -4516,7 +4702,8 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                ResourceState::new("db.Instance", "main", "awscc").with_identifier("db-current"),
+                ResourceState::try_applied("db.Instance", "main", "awscc", "db-current")
+                    .expect("fixture identifier is non-empty"),
             )
             .expect("test state setup must be valid");
         let fresh = State::existing(
@@ -4545,7 +4732,9 @@ mod tests {
 
         let row = state.find_resource("awscc", "db.Instance", "main").unwrap();
         assert!(
-            !row.persisted_attributes().contains_key("password"),
+            !row.persisted_attributes()
+                .expect("row has applied attributes")
+                .contains_key("password"),
             "write-only plaintext must not be persisted by refresh"
         );
         assert_eq!(counts.updated, 0);
@@ -4561,7 +4750,8 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                ResourceState::new("db.Instance", "main", "awscc").with_identifier("db-current"),
+                ResourceState::try_applied("db.Instance", "main", "awscc", "db-current")
+                    .expect("fixture identifier is non-empty"),
             )
             .expect("test state setup must be valid");
         let fresh = State::existing(id.clone(), HashMap::new()).with_identifier("db-current");
@@ -4587,7 +4777,9 @@ mod tests {
             .find_resource("awscc", "db.Instance", "main")
             .expect("refreshed row must remain");
         assert_eq!(
-            row.persisted_attributes().get("password"),
+            row.persisted_attributes()
+                .expect("row has applied attributes")
+                .get("password"),
             carina_core::value::json_to_dsl_value(&json!(marker))
         );
     }
@@ -4870,8 +5062,8 @@ mod tests {
         let key = deposed_key("old-key");
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let mut state = StateFile::new();
-        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-current")
+        let mut row = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-current")
+            .expect("fixture identifier is non-empty")
             .with_attribute("vpc_id", json!("vpc-current"));
         row.deposed.push(deposed_instance(
             key.clone(),

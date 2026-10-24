@@ -80,7 +80,10 @@ pub(crate) async fn execute_import_effects(
                     let state = outcome.into_state();
                     if state.exists {
                         println!("  {} Imported {}", "✓".green(), id);
-                        result.applied_states.insert(id.clone().into_inner(), state);
+                        result.applied_states.insert(
+                            id.clone().into_inner(),
+                            carina_core::executor::Applied::Imported(state),
+                        );
                         result.success_count += 1;
                     } else {
                         println!(
@@ -214,8 +217,22 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+            _attempt: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
             unreachable!("import path must not call create")
+        }
+
+        fn resume_create(
+            &self,
+            _request: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            unreachable!("import path must not call resume_create")
         }
 
         fn update(

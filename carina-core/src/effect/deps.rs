@@ -179,10 +179,12 @@ pub(crate) mod reads {
 
 use reads::{KnownReads, ReadsSet};
 
+#[derive(Debug)]
 pub struct DependencyAnalysis {
     deps_of: HashMap<usize, HashSet<usize>>,
     dependents_of: HashMap<usize, HashSet<usize>>,
     reads_by_edge: HashMap<usize, HashMap<usize, ReadsSet>>,
+    unresolved_required: Vec<UnresolvedRequiredDependency>,
 }
 
 impl DependencyAnalysis {
@@ -193,6 +195,7 @@ impl DependencyAnalysis {
             deps_of,
             dependents_of,
             reads_by_edge: HashMap::new(),
+            unresolved_required: Vec::new(),
         }
     }
 
@@ -237,6 +240,65 @@ impl DependencyAnalysis {
         self.deps_of
     }
 }
+
+/// A scheduling edge whose producer is required by construction but absent
+/// from the effect set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedRequiredDependency {
+    effect_index: usize,
+    identity: ResourceIdentity,
+}
+
+impl UnresolvedRequiredDependency {
+    pub fn effect_index(&self) -> usize {
+        self.effect_index
+    }
+
+    pub fn identity(&self) -> &ResourceIdentity {
+        &self.identity
+    }
+}
+
+impl std::fmt::Display for UnresolvedRequiredDependency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "effect {} requires missing scheduling target `{}`",
+            self.effect_index, self.identity
+        )
+    }
+}
+
+/// Dependency analysis failed because one or more required scheduling targets
+/// could not be resolved. The partial analysis is retained so the executor can
+/// fail only the affected effects without discarding unrelated ordering.
+#[derive(Debug)]
+pub struct DependencyAnalysisFailure(Box<DependencyAnalysis>);
+
+impl DependencyAnalysisFailure {
+    pub fn unresolved(&self) -> &[UnresolvedRequiredDependency] {
+        &self.0.unresolved_required
+    }
+
+    pub fn into_parts(mut self) -> (DependencyAnalysis, Vec<UnresolvedRequiredDependency>) {
+        let unresolved = std::mem::take(&mut self.0.unresolved_required);
+        (*self.0, unresolved)
+    }
+}
+
+impl std::fmt::Display for DependencyAnalysisFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unresolved = self
+            .unresolved()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "invalid effect dependency graph: {unresolved}")
+    }
+}
+
+impl std::error::Error for DependencyAnalysisFailure {}
 
 #[derive(Debug, Clone, Default)]
 struct IdentityTargets {
@@ -331,6 +393,18 @@ impl DependencyAnalyzer {
                 ScheduleEdge::DependsOn(identity) => {
                     if let Some(parent) = self.lookup_by_identity(&identity) {
                         analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                    }
+                }
+                ScheduleEdge::RequiredDependsOn(identity) => {
+                    if let Some(parent) = self.lookup_by_identity(&identity) {
+                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                    } else {
+                        analysis
+                            .unresolved_required
+                            .push(UnresolvedRequiredDependency {
+                                effect_index: self_idx,
+                                identity,
+                            });
                     }
                 }
                 ScheduleEdge::BlockedBy(identity) => {
@@ -462,7 +536,7 @@ pub fn build_effect_dependency_analysis(
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
     inputs: ScheduleInputs<'_>,
-) -> DependencyAnalysis {
+) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
     let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
@@ -557,7 +631,11 @@ pub fn build_effect_dependency_analysis(
         }
     }
 
-    analysis
+    if analysis.unresolved_required.is_empty() {
+        Ok(analysis)
+    } else {
+        Err(DependencyAnalysisFailure(Box::new(analysis)))
+    }
 }
 
 fn add_same_identity_replacement_order_edges(
@@ -755,6 +833,7 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert_eq!(total_edges(&deps), 1);
@@ -771,6 +850,7 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
         assert_eq!(
             total_edges(&deps),
@@ -786,6 +866,7 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
         assert_eq!(
             total_edges(&deps),
@@ -805,6 +886,7 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(
@@ -824,12 +906,33 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert_eq!(total_edges(&deps), 1);
         assert!(
             deps[&1].contains(&0),
             "delete must wait for the consumer update"
+        );
+    }
+
+    #[test]
+    fn delete_apply_edge_for_blocked_by_updates_rejects_missing_target() {
+        let delete = delete_effect("old_web_acl", &[], &["missing_consumer"]);
+
+        let failure = build_effect_dependency_analysis(
+            &[delete],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .expect_err("a required delete gate must not be silently dropped");
+
+        assert_eq!(failure.unresolved().len(), 1);
+        assert_eq!(failure.unresolved()[0].effect_index(), 0);
+        assert_eq!(
+            failure.unresolved()[0].identity(),
+            &ResourceIdentity::new("missing_consumer")
         );
     }
 
@@ -845,6 +948,7 @@ mod tests {
             &[],
             ScheduleInputs::Destroy { aliases: &[] },
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert_eq!(total_edges(&deps), 1);
@@ -870,6 +974,7 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(
@@ -947,6 +1052,7 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(
@@ -989,6 +1095,7 @@ mod tests {
             &[],
             ScheduleInputs::Destroy { aliases: &[] },
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(deps[&0].contains(&1), "parent delete must wait for child");
@@ -1033,6 +1140,7 @@ mod tests {
             &[],
             ScheduleInputs::Destroy { aliases: &[wait] },
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(deps[&2].contains(&1), "wait must wait for listener");
@@ -1058,6 +1166,7 @@ mod tests {
             &[],
             ScheduleInputs::Destroy { aliases: &[wait] },
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(
@@ -1089,6 +1198,7 @@ mod tests {
             &[],
             ScheduleInputs::Destroy { aliases: &[wait] },
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(deps[&2].contains(&1), "wait must wait for listener");
@@ -1123,6 +1233,7 @@ mod tests {
             &[],
             ScheduleInputs::Destroy { aliases: &[] },
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(deps[&0].is_empty());
@@ -1150,6 +1261,7 @@ mod tests {
             &[],
             ScheduleInputs::Apply,
         )
+        .expect("dependency analysis must resolve")
         .into_deps_of();
 
         assert!(
@@ -1175,7 +1287,8 @@ mod tests {
             })
             .collect();
         let mut analysis =
-            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply);
+            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
 
         assert!(!analysis.into_deps_of()[&1].contains(&0));

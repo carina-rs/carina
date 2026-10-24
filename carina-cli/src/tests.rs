@@ -7,10 +7,11 @@ use indexmap::IndexMap;
 use serde_json::json;
 
 use carina_core::effect::Effect;
+use carina_core::executor::Applied;
 use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, ProviderError, ProviderResult, ReadOutcome, fixture_read_outcome,
+    AppliedIdentifier, BoxFuture, ProviderError, ProviderResult, ReadOutcome,
 };
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, ResolvedDataSource,
@@ -26,7 +27,7 @@ use crate::commands::apply::{
     ApplyResult, ApplyTarget, detect_drift, finalize_apply, refresh_pending_states,
     save_state_locked,
 };
-use crate::commands::plan::{CurrentStateEntry, MovedOrigins, PlanFile};
+use crate::commands::plan::{CurrentStateEntry, MovedOrigins, PlanFile, ReloadedCurrentStateEntry};
 use crate::commands::shared::finalize::StatePersistence;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::state_writeback::{
@@ -34,6 +35,7 @@ use crate::commands::shared::state_writeback::{
     queue_state_refresh,
 };
 use crate::commands::state::run_state_refresh_locked;
+use crate::fixture_read_outcome;
 use crate::wiring::{
     WiringContext, compute_anonymous_identifiers, reconcile_prefixed_names, resolve_attr_prefixes,
     resolve_names, validate_resources,
@@ -132,8 +134,24 @@ impl Provider for TestProvider {
         &self,
         _id: &ResourceId,
         _request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-        Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+        attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+    > {
+        Box::pin(
+            async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
+        )
+    }
+
+    fn resume_create(
+        &self,
+        _request: carina_core::provider::ResumeCreateRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+    > {
+        Box::pin(async { panic!("unexpected resume_create") })
     }
 
     fn update(
@@ -205,8 +223,8 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     let mut existing_state = StateFile::new();
     existing_state
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "bucket", "aws")
-                .with_identifier(identifier)
+            ResourceState::try_applied("s3.Bucket", "bucket", "aws", identifier)
+                .expect("fixture identifier is non-empty")
                 .with_attribute("status", json!("before")),
         )
         .expect("test state setup must be valid");
@@ -229,7 +247,10 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
     let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
     assert_eq!(
-        saved_resource.persisted_attributes().get("status"),
+        saved_resource
+            .persisted_attributes()
+            .expect("saved resource has applied attributes")
+            .get("status"),
         carina_core::value::json_to_dsl_value(&json!("after"))
     );
 }
@@ -265,8 +286,8 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     let mut existing_state = StateFile::new();
     existing_state
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "bucket", "aws")
-                .with_identifier(identifier)
+            ResourceState::try_applied("s3.Bucket", "bucket", "aws", identifier)
+                .expect("fixture identifier is non-empty")
                 .with_attribute("status", json!("before")),
         )
         .expect("test state setup must be valid");
@@ -321,8 +342,8 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     let mut existing_state = StateFile::new();
     existing_state
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "bucket", "aws")
-                .with_identifier(identifier)
+            ResourceState::try_applied("s3.Bucket", "bucket", "aws", identifier)
+                .expect("fixture identifier is non-empty")
                 .with_attribute("status", json!("saved")),
         )
         .expect("test state setup must be valid");
@@ -345,7 +366,10 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
 
     let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
     assert_eq!(
-        saved_resource.persisted_attributes().get("status"),
+        saved_resource
+            .persisted_attributes()
+            .expect("saved resource has applied attributes")
+            .get("status"),
         carina_core::value::json_to_dsl_value(&json!("saved"))
     );
 }
@@ -456,7 +480,7 @@ fn plan_file_serde_round_trip() {
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(wire["version"], serde_json::json!(20));
+    assert_eq!(wire["version"], serde_json::json!(21));
     assert_eq!(wire["current_states"][0]["kind"], "managed");
     assert_eq!(wire["current_states"][0]["current"]["status"], "absent");
     assert_eq!(wire["current_states"][1]["kind"], "managed");
@@ -494,25 +518,36 @@ fn plan_file_serde_round_trip() {
     assert_eq!(deserialized.plan.effects().len(), 2);
     assert_eq!(deserialized.sorted_resources.len(), 1);
     assert_eq!(deserialized.unresolved_resources.len(), 1);
-    match deserialized.current_states.as_slice() {
+    let reloaded = deserialized
+        .reload_in_flight_from_locked_state(None)
+        .expect("a plan without in-flight markers reloads");
+    match reloaded.current_states() {
         [
-            CurrentStateEntry::Managed {
+            ReloadedCurrentStateEntry::Managed {
                 id: loaded_absent_id,
-                current: Current::Absent(_absent),
+                current: loaded_absent,
             },
-            CurrentStateEntry::Managed {
+            ReloadedCurrentStateEntry::Managed {
                 id: loaded_present_id,
-                current: Current::Present(present),
+                current: loaded_present,
             },
-            CurrentStateEntry::Managed {
+            ReloadedCurrentStateEntry::Managed {
                 id: loaded_missing_id,
-                current: Current::MissingIdentifier(_missing),
+                current: loaded_missing,
             },
-            CurrentStateEntry::DataSource {
+            ReloadedCurrentStateEntry::DataSource {
                 id: loaded_data_source_id,
                 state: data_source_state,
             },
         ] => {
+            assert!(matches!(loaded_absent.as_ref(), Current::Absent(_absent)));
+            let Current::Present(present) = loaded_present.as_ref() else {
+                panic!("present fixture did not deserialize as Present");
+            };
+            assert!(matches!(
+                loaded_missing.as_ref(),
+                Current::MissingIdentifier(_missing)
+            ));
             assert_eq!(loaded_absent_id, &absent_id);
             assert_eq!(loaded_present_id, &present_id);
             assert_eq!(present.identifier().as_str(), "present-provider-id");
@@ -1143,6 +1178,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         }
         carina_core::resource::Current::Absent(_state) => None,
         carina_core::resource::Current::MissingIdentifier(_state) => None,
+        carina_core::resource::Current::CreateInFlight(_pending) => None,
     };
     assert_eq!(
         identifier,
@@ -1268,6 +1304,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         }
         carina_core::resource::Current::Absent(_state) => None,
         carina_core::resource::Current::MissingIdentifier(_state) => None,
+        carina_core::resource::Current::CreateInFlight(_pending) => None,
     };
     assert!(
         identifier.is_some(),
@@ -1323,7 +1360,7 @@ async fn detect_drift_returns_none_when_no_drift() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, state.clone());
-    let planned_states = vec![CurrentStateEntry::managed(id.clone(), state)];
+    let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), state)];
 
     let result = detect_drift(
         &[resource],
@@ -1347,10 +1384,10 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
     let planned = State::existing(id.clone(), HashMap::new());
     let actual = State::existing(id.clone(), HashMap::new()).with_identifier("typed-provider-id");
     let provider = TestProvider::with_read_state(&id, "typed-provider-id", actual);
-    let planned_states = vec![CurrentStateEntry::Managed {
-        id: id.clone(),
-        current: carina_core::resource::fixture_present_current(planned, identifier),
-    }];
+    let planned_states = vec![ReloadedCurrentStateEntry::managed_current(
+        id.clone(),
+        carina_core::resource::fixture_present_current(planned, identifier),
+    )];
 
     let result = detect_drift(
         &[resource],
@@ -1391,7 +1428,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, actual);
-    let planned_states = vec![CurrentStateEntry::managed(id.clone(), planned)];
+    let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
     let result = detect_drift(
         &[resource],
@@ -1419,15 +1456,15 @@ fn orphaned_state_resource_produces_delete_effect() {
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "keep-bucket", "aws")
-                .with_identifier("keep-bucket")
+            ResourceState::try_applied("s3.Bucket", "keep-bucket", "aws", "keep-bucket")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("bucket", json!("keep-bucket")),
         )
         .expect("test state setup must be valid");
     state_file
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "removed-bucket", "aws")
-                .with_identifier("removed-bucket")
+            ResourceState::try_applied("s3.Bucket", "removed-bucket", "aws", "removed-bucket")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("bucket", json!("removed-bucket")),
         )
         .expect("test state setup must be valid");
@@ -1863,15 +1900,15 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let mut state = StateFile::new();
     state
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "keep-bucket", "")
-                .with_identifier("keep-bucket")
+            ResourceState::try_applied("s3.Bucket", "keep-bucket", "", "keep-bucket")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("bucket", json!("keep-bucket")),
         )
         .expect("test state setup must be valid");
     state
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "orphan-bucket", "")
-                .with_identifier("orphan-bucket")
+            ResourceState::try_applied("s3.Bucket", "orphan-bucket", "", "orphan-bucket")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("bucket", json!("orphan-bucket")),
         )
         .expect("test state setup must be valid");
@@ -2177,8 +2214,8 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "removed-bucket", "aws")
-                .with_identifier("removed-bucket")
+            ResourceState::try_applied("s3.Bucket", "removed-bucket", "aws", "removed-bucket")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("bucket", json!("removed-bucket")),
         )
         .expect("test state setup must be valid");
@@ -2258,8 +2295,8 @@ fn refresh_false_uses_cached_state_from_state_file() {
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "my-bucket", "awscc")
-                .with_identifier("my-bucket-id")
+            ResourceState::try_applied("s3.Bucket", "my-bucket", "awscc", "my-bucket-id")
+                .expect("fixture identifier is non-empty")
                 .with_attribute("bucket_name", json!("my-bucket"))
                 .with_attribute("region", json!("ap-northeast-1")),
         )
@@ -2291,6 +2328,9 @@ fn refresh_false_uses_cached_state_from_state_file() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::MissingIdentifier(state) => state.state(),
+        Current::CreateInFlight(pending) => {
+            panic!("fixture unexpectedly loaded an in-flight create: {pending:?}")
+        }
     };
     assert!(cached_state.exists, "State should exist from state file");
     assert_eq!(
@@ -2346,9 +2386,14 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(
-            ResourceState::new("s3.Bucket", "orphaned-bucket", "awscc")
-                .with_identifier("orphaned-bucket-id")
-                .with_attribute("bucket_name", json!("orphaned-bucket")),
+            ResourceState::try_applied(
+                "s3.Bucket",
+                "orphaned-bucket",
+                "awscc",
+                "orphaned-bucket-id",
+            )
+            .expect("fixture identifier is non-empty")
+            .with_attribute("bucket_name", json!("orphaned-bucket")),
         )
         .expect("test state setup must be valid");
 
@@ -2486,7 +2531,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     .with_identifier(identifier);
 
     let mut applied_states = HashMap::new();
-    applied_states.insert(id.clone(), imported_state);
+    applied_states.insert(id.clone(), Applied::Imported(imported_state));
 
     // Build a plan with an Import effect
     let mut plan = Plan::new();
@@ -2542,8 +2587,8 @@ fn import_effect_preserves_resource_metadata_in_state() {
         "binding should be preserved after import"
     );
     assert_eq!(
-        saved_resource.identifier,
-        Some("vpc-0abc123".to_string()),
+        saved_resource.identifier().map(|value| value.as_str()),
+        Some("vpc-0abc123"),
         "identifier should be preserved after import"
     );
 }
@@ -2568,7 +2613,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
     // Provider returns state WITHOUT the write-only attribute (API doesn't return it)
     let applied_states = HashMap::from([(
         id.clone(),
-        State {
+        Applied::Complete(State {
             id: id.clone(),
             identifier: Some("vpc-123".to_string()),
             attributes: HashMap::from([(
@@ -2578,7 +2623,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
             exists: true,
             dependency_bindings: BTreeSet::new(),
             partial_read: None,
-        },
+        }),
     )]);
 
     // Build schema with write-only attribute.
@@ -2615,19 +2660,23 @@ fn build_state_after_apply_persists_write_only_attributes() {
     assert_eq!(
         saved_resource
             .persisted_attributes()
+            .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
         carina_core::value::json_to_dsl_value(&json!(16)),
         "write-only attribute should be persisted in state"
     );
     assert_eq!(
-        saved_resource.write_only_attributes,
-        vec!["ipv4_netmask_length"],
+        saved_resource.write_only_attributes(),
+        ["ipv4_netmask_length"],
         "write-only attribute names should be recorded"
     );
 
     // The regular attribute should also be there
     assert_eq!(
-        saved_resource.persisted_attributes().get("cidr_block"),
+        saved_resource
+            .persisted_attributes()
+            .expect("saved resource has applied attributes")
+            .get("cidr_block"),
         carina_core::value::json_to_dsl_value(&json!("10.0.0.0/16"))
     );
 }
@@ -2656,13 +2705,13 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let id = resource.id.clone();
     let applied_states = HashMap::from([(
         id.clone(),
-        State::existing(
+        Applied::Complete(State::existing(
             id,
             HashMap::from([(
                 "allocation_id".to_string(),
                 Value::Concrete(ConcreteValue::String("eipalloc-123".into())),
             )]),
-        ),
+        )),
     )]);
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -2741,7 +2790,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
     // Provider returns updated state (after apply) without write-only attribute
     let applied_states = HashMap::from([(
         id.clone(),
-        State {
+        Applied::Complete(State {
             id: id.clone(),
             identifier: Some("vpc-123".to_string()),
             attributes: HashMap::from([(
@@ -2751,16 +2800,20 @@ fn build_state_after_apply_write_only_detects_value_change() {
             exists: true,
             dependency_bindings: BTreeSet::new(),
             partial_read: None,
-        },
+        }),
     )]);
 
     // Previous state had old write-only value
     let mut existing_state = StateFile::new();
-    let mut old_rs = ResourceState::new("ec2.Vpc", "my-vpc", "awscc")
-        .with_identifier("vpc-123")
+    let mut old_rs = ResourceState::try_applied("ec2.Vpc", "my-vpc", "awscc", "vpc-123")
+        .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block".to_string(), json!("10.0.0.0/16"))
         .with_attribute("ipv4_netmask_length".to_string(), json!(16));
-    old_rs.write_only_attributes = vec!["ipv4_netmask_length".to_string()];
+    old_rs = crate::fixture_resource_state_metadata(
+        old_rs,
+        Some(vec!["ipv4_netmask_length".to_string()]),
+        None,
+    );
     existing_state
         .upsert_resource(old_rs)
         .expect("test state setup must be valid");
@@ -2797,6 +2850,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
     assert_eq!(
         saved_resource
             .persisted_attributes()
+            .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
         carina_core::value::json_to_dsl_value(&json!(24)),
         "write-only attribute should reflect the updated desired value"
@@ -3329,7 +3383,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
-        applied_states: HashMap::from([(a_id.clone(), a_state.clone())]),
+        applied_states: HashMap::from([(a_id.clone(), Applied::Complete(a_state.clone()))]),
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
@@ -3445,7 +3499,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
-        applied_states: HashMap::from([(resource_id.clone(), state.clone())]),
+        applied_states: HashMap::from([(resource_id.clone(), Applied::Complete(state.clone()))]),
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),

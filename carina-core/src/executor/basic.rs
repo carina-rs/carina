@@ -15,8 +15,9 @@ use crate::executor::provider_ready::{
     prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
-    AppliedIdentifier, CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider,
-    ProviderReadyResource, ReadRequest, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, CreateFailureKind, CreateRequest, DeleteRequest, PartialReadDiagnostic,
+    Provider, ProviderReadyResource, ReadRequest, ResumeCreateRequest, ResumeFailureKind,
+    ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -25,7 +26,7 @@ use crate::resource::{
 use crate::value::{SerializationContext, SerializationError};
 
 use super::wait::AppliedStates;
-use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
+use super::{Applied, ExecutionEvent, ExecutionObserver, ProgressInfo};
 
 /// Result of executing a basic effect (Create, Update, or Delete).
 ///
@@ -47,6 +48,16 @@ pub(super) enum BasicEffectResult {
     },
     Failure {
         refresh: Option<(ResourceId, AppliedIdentifier)>,
+    },
+    ResumeSuccess {
+        created: crate::provider::ObservedCreate,
+        resource_id: ResourceId,
+        resolved_attrs: HashMap<String, Value>,
+        binding: Option<String>,
+    },
+    ClassifiedFailure {
+        resource_id: ResourceId,
+        applied: Applied,
     },
     Deleted {
         instance_key: DeletedInstanceKey,
@@ -516,7 +527,12 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
                 if let Some(attrs) = &resolved_attrs {
                     exec.bindings.record_applied(binding.as_deref(), attrs, &s);
                 }
-                exec.applied_states.insert(resource_id, *s);
+                let state = *s;
+                exec.applied_states.insert_published(
+                    resource_id,
+                    Applied::Complete(state.clone()),
+                    &state,
+                );
             }
         }
         BasicEffectResult::Failure { refresh } => {
@@ -525,6 +541,27 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             if let Some((id, identifier)) = &refresh {
                 queue_state_refresh(exec.pending_refreshes, id, identifier);
             }
+        }
+        BasicEffectResult::ResumeSuccess {
+            created,
+            resource_id,
+            resolved_attrs,
+            binding,
+        } => {
+            *exec.success_count += 1;
+            let state = created.observed_state();
+            exec.bindings
+                .record_applied(binding.as_deref(), &resolved_attrs, &state);
+            exec.applied_states
+                .insert_published(resource_id, Applied::Observed(created), &state);
+        }
+        BasicEffectResult::ClassifiedFailure {
+            resource_id,
+            applied,
+        } => {
+            *exec.failure_count += 1;
+            exec.failed_indices.insert(exec.idx);
+            exec.applied_states.insert_unpublished(resource_id, applied);
         }
         BasicEffectResult::PartialSuccess {
             state,
@@ -538,7 +575,12 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
                 exec.bindings
                     .record_applied(binding.as_deref(), attrs, &state);
             }
-            exec.applied_states.insert(resource_id.clone(), *state);
+            let state = *state;
+            exec.applied_states.insert_published(
+                resource_id.clone(),
+                Applied::Complete(state.clone()),
+                &state,
+            );
             exec.partial_diagnostics.push((resource_id, diagnostic));
         }
         BasicEffectResult::Deleted { instance_key } => {
@@ -566,6 +608,7 @@ pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a>,
     pub(super) runtime_authored: bool,
     pub(super) preparation: &'a ProviderPreparationContext<'a>,
+    pub(super) managed_current: &'a HashMap<ResourceId, Current>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
 }
@@ -619,8 +662,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             };
             let resolved_attrs = resolved.as_resource().resolved_attributes();
-            match provider
-                .create(&resource.id, CreateRequest::checked(resolved))
+            match super::dispatch_create(provider, &resource.id, CreateRequest::checked(resolved))
                 .await
             {
                 Ok(outcome) => {
@@ -656,16 +698,195 @@ pub(super) async fn execute_basic_effect<'a>(
                         }
                     }
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
+                Err(failure) => match failure.into_kind() {
+                    CreateFailureKind::Untracked(error) => {
+                        let error_str = error.to_string();
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &error_str,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::Failure { refresh: None }
+                    }
+                    CreateFailureKind::Created { created, error } => {
+                        let error_str = format!(
+                            "{error}\nresource created; recorded in state, the next apply completes it"
+                        );
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &error_str,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::ClassifiedFailure {
+                            resource_id: resource.id.clone(),
+                            applied: Applied::Observed(created),
+                        }
+                    }
+                    CreateFailureKind::InFlight { pending, error } => {
+                        let error_str =
+                            format!("{error}\ncreate still in progress; the next apply resumes it");
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &error_str,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::ClassifiedFailure {
+                            resource_id: resource.id.clone(),
+                            applied: Applied::CreateInFlight(pending),
+                        }
+                    }
+                },
+            }
+        }
+        BasicEffect::ResumeCreate { resource, .. } => {
+            let check_input = ctx
+                .provider_check_inputs
+                .resource_input(resource.as_inner(), ctx.runtime_authored);
+            let resolved = match resolve_resource(check_input, preparation).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
                         effect,
-                        error: &error_str,
+                        error: &error,
                         duration: started.elapsed(),
                         progress,
                     });
-                    BasicEffectResult::Failure { refresh: None }
+                    return BasicEffectResult::Failure { refresh: None };
                 }
+            };
+            let resolved_attrs = resolved.as_resource().resolved_attributes();
+            let pending = match ctx.managed_current.get(&resource.id) {
+                Some(Current::CreateInFlight(pending)) => pending.clone(),
+                Some(Current::Absent(_))
+                | Some(Current::Present(_))
+                | Some(Current::MissingIdentifier(_))
+                | None => {
+                    let error = format!(
+                        "saved create continuation for {} changed before dispatch",
+                        resource.id
+                    );
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &error,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    return BasicEffectResult::Failure { refresh: None };
+                }
+            };
+            let request = match ResumeCreateRequest::new(pending, CreateRequest::checked(resolved))
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    let error = error.to_string();
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &error,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    return BasicEffectResult::Failure { refresh: None };
+                }
+            };
+            match super::dispatch_resume_create(provider, request)
+                .await
+                .map(crate::provider::ResumeOutcome::into_kind)
+            {
+                Ok(ResumeOutcomeKind::Resumed(created)) => {
+                    let state = created.observed_state();
+                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                        effect,
+                        state: Some(&state),
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::ResumeSuccess {
+                        created: *created,
+                        resource_id: resource.id.clone(),
+                        resolved_attrs,
+                        binding: resource.binding.clone(),
+                    }
+                }
+                Ok(ResumeOutcomeKind::Resent(outcome)) => {
+                    let diagnostic = outcome.diagnostic().cloned();
+                    let state = (*outcome).into_state_for_writeback();
+                    if let Some(diagnostic) = diagnostic {
+                        observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
+                            effect,
+                            state: &state,
+                            diagnostic: &diagnostic,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::PartialSuccess {
+                            state: Box::new(state),
+                            resource_id: resource.id.clone(),
+                            diagnostic,
+                            resolved_attrs: Some(resolved_attrs),
+                            binding: resource.binding.clone(),
+                        }
+                    } else {
+                        observer.on_event(&ExecutionEvent::EffectSucceeded {
+                            effect,
+                            state: Some(&state),
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::Success {
+                            state: Some(Box::new(state)),
+                            resource_id: resource.id.clone(),
+                            resolved_attrs: Some(resolved_attrs),
+                            binding: resource.binding.clone(),
+                        }
+                    }
+                }
+                Err(failure) => match failure.into_kind() {
+                    ResumeFailureKind::Ended(error) => {
+                        let error = error.to_string();
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &error,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::ClassifiedFailure {
+                            resource_id: resource.id.clone(),
+                            applied: Applied::CreateEnded,
+                        }
+                    }
+                    ResumeFailureKind::Created { created, error } => {
+                        let error = format!(
+                            "{error}\nresource created; recorded in state, the next apply completes it"
+                        );
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &error,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::ClassifiedFailure {
+                            resource_id: resource.id.clone(),
+                            applied: Applied::Observed(created),
+                        }
+                    }
+                    ResumeFailureKind::InFlight { pending, error } => {
+                        let error =
+                            format!("{error}\ncreate still in progress; the next apply resumes it");
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &error,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::ClassifiedFailure {
+                            resource_id: resource.id.clone(),
+                            applied: Applied::CreateInFlight(pending),
+                        }
+                    }
+                },
             }
         }
         BasicEffect::Update {
@@ -902,6 +1123,15 @@ mod process_basic_result_tests {
         assert_eq!(partial_diagnostics, vec![(id.clone(), diagnostic)]);
         let states = applied_states.into_inner();
         let applied = states.get(&id).expect("partial state must be recorded");
+        let applied = match applied {
+            Applied::Complete(state) => state,
+            Applied::Observed(_created) => panic!("unexpected observed create"),
+            Applied::CreateInFlight(_pending) => panic!("unexpected in-flight create"),
+            Applied::CreateEnded => panic!("unexpected ended create"),
+            Applied::Imported(_state) => panic!("unexpected import"),
+            Applied::DataSource(_state) => panic!("unexpected data source"),
+            Applied::WaitSnapshot(_state) => panic!("unexpected wait snapshot"),
+        };
         assert_eq!(applied.identifier, state.identifier);
         assert_eq!(applied.attributes, state.attributes);
         assert_eq!(

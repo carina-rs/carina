@@ -1924,6 +1924,111 @@ pub fn merge_secrets_into_provider_json(
     Ok(PersistedValue { encoded })
 }
 
+/// Mask an observed value using the desired value's secret shape without
+/// replacing any observed material with desired material.
+///
+/// Complete mutation writeback intentionally keeps its historical
+/// desired-driven fallback in [`merge_secrets_into_provider_json`]. A
+/// created-then-failed row has a stricter provenance rule: observed wins,
+/// then a value actually sent, then absence. This walker therefore hashes a
+/// top-level observed secret even when the desired secret is a literal, and
+/// never inserts a desired map child that the selected observed/sent value
+/// did not contain.
+pub(crate) fn merge_secrets_into_observation_json(
+    desired: &Value,
+    observed: &PersistedValue,
+    previous: Option<&PersistedValue>,
+) -> Result<PersistedValue, SerializationError> {
+    let encoded = merge_secrets_into_observation_json_inner(
+        desired,
+        observed.view(),
+        previous.map(PersistedValue::view),
+    )?;
+    Ok(PersistedValue { encoded })
+}
+
+fn merge_secrets_into_observation_json_inner(
+    desired: &Value,
+    observed: PersistedView<'_>,
+    previous: Option<PersistedView<'_>>,
+) -> Result<serde_json::Value, SerializationError> {
+    match desired {
+        Value::Deferred(DeferredValue::Secret(_inner)) => {
+            if observed.is_redacted_secret() {
+                return Ok(observed.to_owned_json());
+            }
+            let observed_value =
+                observed
+                    .decode_value()
+                    .ok_or(SerializationError::SecretNotAllowed {
+                        context: SerializationContext::StateWriteback,
+                    })?;
+            persist_secret_json(&observed_value, previous)
+        }
+        Value::Concrete(ConcreteValue::Map(desired_map)) => {
+            let Some(observed_map) = observed.as_map() else {
+                return mask_mismatched_observation_shape(desired, observed, previous);
+            };
+            let previous_map = previous.and_then(PersistedView::as_map);
+            let replacements = desired_map
+                .iter()
+                .filter(|(_key, desired_value)| contains_secret(desired_value))
+                .filter_map(|(key, desired_value)| {
+                    observed_map.get(key).map(|observed_value| {
+                        merge_secrets_into_observation_json_inner(
+                            desired_value,
+                            observed_value,
+                            previous_map.and_then(|previous| previous.get(key)),
+                        )
+                        .map(|masked| (key.clone(), masked))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(observed_map.replacing_children(replacements))
+        }
+        Value::Concrete(ConcreteValue::List(desired_items)) => {
+            let Some(observed_items) = observed.as_list() else {
+                return mask_mismatched_observation_shape(desired, observed, previous);
+            };
+            let previous_items = previous.and_then(PersistedView::as_list);
+            let replacements = observed_items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, observed_value)| {
+                    desired_items.get(index).and_then(|desired_value| {
+                        contains_secret(desired_value).then(|| {
+                            merge_secrets_into_observation_json_inner(
+                                desired_value,
+                                observed_value,
+                                previous_items.and_then(|previous| previous.get(index)),
+                            )
+                            .map(|masked| (index, masked))
+                        })
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(observed_items.replacing_children(replacements))
+        }
+        _ => Ok(observed.to_owned_json()),
+    }
+}
+
+fn mask_mismatched_observation_shape(
+    desired: &Value,
+    observed: PersistedView<'_>,
+    previous: Option<PersistedView<'_>>,
+) -> Result<serde_json::Value, SerializationError> {
+    if !contains_secret(desired) {
+        return Ok(observed.to_owned_json());
+    }
+    let observed_value = observed
+        .decode_value()
+        .ok_or(SerializationError::SecretNotAllowed {
+            context: SerializationContext::StateWriteback,
+        })?;
+    persist_secret_json(&observed_value, previous)
+}
+
 fn merge_secrets_into_provider_json_inner(
     desired: &Value,
     provider: PersistedView<'_>,
@@ -2348,6 +2453,9 @@ pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) ->
             attributes_contain_redacted_secret(resource.attributes.values())
         }
         Effect::Create(resource) => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        Effect::ResumeCreate { resource, .. } => {
             attributes_contain_redacted_secret(resource.attributes.values())
         }
         Effect::Update {
@@ -3513,6 +3621,13 @@ pub fn redact_secrets_in_effect(
         Effect::Create(resource) => Effect::Create(crate::resource::ResolvedResource::new(
             redact_secrets_in_resource(resource)?,
         )),
+        Effect::ResumeCreate {
+            resource,
+            started_at,
+        } => Effect::ResumeCreate {
+            resource: crate::resource::ResolvedResource::new(redact_secrets_in_resource(resource)?),
+            started_at: started_at.clone(),
+        },
         Effect::Update {
             from,
             identifier,
@@ -5735,6 +5850,7 @@ pub fn canonicalize_states_with_schemas(
         let state = match current {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => continue,
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         let kind = if state.id.resource_type.is_empty() {
@@ -5749,7 +5865,9 @@ pub fn canonicalize_states_with_schemas(
         let Some(schema) = kind else {
             continue;
         };
-        canonicalize_state_attribute_map_with_schema(current.attributes_mut(), schema);
+        if let Some(attributes) = current.attributes_mut() {
+            canonicalize_state_attribute_map_with_schema(attributes, schema);
+        }
     }
 }
 
@@ -11206,6 +11324,9 @@ mod tests {
         let state = match states.values().next().unwrap() {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => {
+                panic!("test fixture cannot be in flight")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -11231,6 +11352,9 @@ mod tests {
         let state = match states.values().next().unwrap() {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => {
+                panic!("test fixture cannot be in flight")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -11257,6 +11381,9 @@ mod tests {
         let state = match states.values().next().unwrap() {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => {
+                panic!("test fixture cannot be in flight")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -11278,6 +11405,9 @@ mod tests {
         let state = match states.values().next().unwrap() {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => {
+                panic!("test fixture cannot be in flight")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -11313,6 +11443,9 @@ mod tests {
         let state = match states.values().next().unwrap() {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => {
+                panic!("test fixture cannot be in flight")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -11366,6 +11499,9 @@ mod tests {
         let current = match states.values().next().expect("state exists") {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => {
+                panic!("test fixture cannot be in flight")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         let result = diff_test(&desired[0], current, None, None, Some(&schema));
@@ -11434,6 +11570,9 @@ mod tests {
         let state = match states.values().next().unwrap() {
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
+            crate::resource::Current::CreateInFlight(_pending) => {
+                panic!("test fixture cannot be in flight")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         let expected = {

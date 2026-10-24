@@ -1,5 +1,54 @@
 # Provider protocol versions
 
+## Version 10
+
+Protocol v10's SDK and native core adapters make create recovery an explicit
+typestate protocol. Initial create, poll, and resume calls receive different,
+opaque attempt handles. Once a provider calls `issued`, that handle has been
+consumed and the remaining API cannot report that nothing reached the cloud.
+There is deliberately no `From<ProviderError>` into an SDK or core create
+verdict, so provider code must classify every failure as untracked, created,
+discarded, undetermined, or still pending. The protocol crate itself contains
+only plain wire records and enums; it does not claim those typestate guarantees.
+
+Create steps carry a redacted `PendingToken`, an optional non-empty provider
+identifier, and `Sent`, which names the top-level attributes actually sent in
+the accepted request. `Sent::Only` must be a subset of the checked create
+request. A provider can canonicalize an issued identifier only while finishing
+the create. Polling and resumption cannot drop an issued identifier or change
+the accepted request's `Sent` set.
+
+The driver keeps provider verdicts separate from call failures and returns the
+last pending record on poll failure or budget exhaustion. WIT adds
+`poll-create` and `resume-create` steps and verdicts. A guest-side request or
+token decode failure is `undetermined`, so upgrading a provider cannot erase a
+continuation it no longer understands. Guest-side encoding failures are
+classified by call phase and by what the provider established: an initial
+unissued pending token is `untracked`; an initial issued pending token is
+`created` with a failed read; a pending-token failure during either an issued
+or unissued poll is `undetermined`, preserving the previous continuation; and a
+pending-token failure during resume is likewise `undetermined`, preserving the
+starting envelope. If the attributes of a successful or partially successful
+result cannot be encoded, the result is `created` with a failed read because
+its identifier already established existence. The SDK's JSON-RPC/native-binary
+transport has been removed; v10 providers use the component-model export.
+
+State format 15 stores managed current instances as one tagged value:
+`none`, `applied`, `create_in_flight`, or `missing_identifier`. An in-flight
+instance contains its opaque envelope and the UTC `started_at` timestamp, and
+cannot simultaneously contain applied attributes or an applied identifier.
+State format 14 is migrated through an explicit DTO. An unfinished create is
+planned as token-free `ResumeCreate`; the token is joined from locked state
+immediately before dispatch. Only a terminal provider verdict may clear that
+row.
+
+Saved-plan format 21 records the address and in-flight marker, never the
+provider token. Apply reloads the envelope from locked state and rejects the
+saved plan if any address changed in-flight status in either direction.
+
+Hosts and providers must both use protocol v10. The minimum supported protocol
+version is 10.
+
 ## Version 9
 
 Protocol v9 separates successful create and update observations from generic
@@ -64,5 +113,5 @@ format also records validated mutation identifiers directly and records the key
 generation explicitly abandoned by a `removed` block. Format 19 and older plans
 are rejected with re-plan guidance.
 
-Hosts and providers must both use protocol v9; the minimum supported protocol
-version is 9.
+Protocol v9 required a v9 host and provider. It is no longer accepted by a v10
+host.

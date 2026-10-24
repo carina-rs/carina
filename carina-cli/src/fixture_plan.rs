@@ -499,7 +499,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &mut saved_attrs,
         &parsed.state_blocks,
         &state_file,
-    );
+    )
+    .expect("fixture move routes must match their loaded current states");
     crate::wiring::validate_plan_time_state_block_collisions(
         &resolved_desired_ids,
         &moved_pairs,
@@ -584,7 +585,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &wait_bindings,
     )
     .expect("fixture providers must return valid satisfier hints");
-    crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
+    crate::wiring::add_deposed_delete_effects(&mut plan, &state_file, &moved_pairs);
 
     // Keep this after both identifier-error producers. The
     // `removed_missing_identifier` fixture pins the fixture planner's copy of

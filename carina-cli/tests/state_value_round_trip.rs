@@ -79,7 +79,9 @@ fn fixture_attributes_round_trip_through_value_codec() {
                 "{}.{}.{}",
                 resource.provider, resource.resource_type, resource.identity,
             );
-            let persisted = resource.persisted_attributes();
+            let persisted = resource
+                .persisted_attributes()
+                .expect("fixture resource has persisted attributes");
             total_attrs += persisted.keys().count();
             for (attr_name, value_pass1) in persisted.to_values() {
                 // Lower: Value → JSON via the production codec.

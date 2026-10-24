@@ -790,6 +790,23 @@ fn effect_to_node(
             depth: 0,
             parent: None,
         },
+        Effect::ResumeCreate {
+            resource,
+            started_at,
+        } => TreeNode {
+            effect_label: format!(
+                "resume create {} (in flight since {started_at})",
+                resource.id.human()
+            ),
+            resource_type: resource.id.display_type(),
+            name_part: resource.id.identity_display().to_string(),
+            symbol: effect.display_glyph().to_string(),
+            kind: EffectKind::Create,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
         Effect::Update { to, .. } => {
             let id = &to.id;
             TreeNode {

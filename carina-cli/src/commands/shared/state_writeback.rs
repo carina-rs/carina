@@ -7,11 +7,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
-use carina_core::executor::ExecutionResult;
+use carina_core::executor::{Applied, ExecutionResult};
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
 #[cfg(test)]
-use carina_core::provider::AppliedIdentifier;
-use carina_core::provider::PersistedAttributes;
+use carina_core::provider::SentRecord;
+use carina_core::provider::{
+    AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
+};
 use carina_core::resource::{
     ConcreteValue, Current, DefaultTagKeys, ResolvedResource, ResolvedResourceId, Resource,
     ResourceId, State, Value,
@@ -122,16 +124,7 @@ impl PostApplyStates {
                 identity,
                 rs.directives.provider_instance.clone(),
             );
-            let current = if rs.has_current_instance() {
-                let mut row_state =
-                    State::existing(id.clone(), rs.persisted_attributes().to_values());
-                if let Some(identifier) = &rs.identifier {
-                    row_state.identifier = Some(identifier.clone());
-                }
-                Current::from_state(row_state)
-            } else {
-                Current::absent(id.clone())
-            };
+            let current = state.build_state_for_resource(&id);
             managed_current.insert(id, current);
         }
         Self {
@@ -548,7 +541,7 @@ pub(crate) struct ApplyStateSave<'a> {
     pub sorted_resources: &'a [ResolvedResource],
     pub runtime_synthesized_resources: &'a [ResolvedResource],
     pub managed_current: &'a HashMap<ResourceId, Current>,
-    pub applied_states: &'a HashMap<ResourceId, State>,
+    pub applied_states: &'a HashMap<ResourceId, Applied>,
     pub plan: &'a Plan,
     pub successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
@@ -564,20 +557,22 @@ pub(crate) struct ApplyStateSave<'a> {
 /// upserts and before cleanups, and are merged by identifier plus
 /// provider-instance routing.
 ///
-/// `Effect::Move` is a cleanup operation only — the `to` row's
-/// contents always come from Phase 1's `add_upsert`. For
+/// `Effect::Move` finalizes the address transfer after Phase 1 writes the
+/// `to` row. For
 /// Move+Replace / Move+Update / Move+Create the `to` row is fed by
 /// `applied_states[to]` (the provider's post-apply State); for a pure
 /// rename, by `managed_current[to]` (which `materialize_moved_states`
-/// has already populated from the `from` row before writeback runs).
-/// Either way, Move's only writeback responsibility is dropping the
-/// stale `from` address. See carina#3170 for the bug class this
-/// prevents.
+/// has already populated from the `from` row before writeback runs). The
+/// final typed move operation merges every source-side deposed generation
+/// not deleted by this apply into `to`, then drops the stale `from` row. See
+/// carina#3170 for the overwrite bug class this prevents.
 pub(crate) struct WritebackPlan<'a> {
     upserts: indexmap::IndexMap<ResourceId, PlannedUpsert<'a>>,
     deposes: Vec<PlannedDepose>,
     remove_deposed: Vec<PlannedRemoveDeposed>,
+    clear_currents: HashSet<ResolvedResourceId>,
     cleanups: HashSet<ResolvedResourceId>,
+    moved_from_rows: HashSet<ResolvedResourceId>,
 }
 
 /// One planned upsert. Carrying the desired `&ResolvedResource` here (rather
@@ -590,23 +585,58 @@ struct PlannedUpsert<'a> {
     source: UpsertSource<'a>,
 }
 
-/// Source of the post-apply `State` that feeds the `to` row of a
-/// planned upsert. `Applied` (provider returned a result) is gated to
-/// receive `permanent_name_overrides`; `CurrentState` is not.
+/// Provenance of a row write. Keeping these cases separate prevents an
+/// observed failure or continuation from taking the complete-state path.
 enum UpsertSource<'a> {
-    Applied(&'a State),
-    CurrentState(&'a State),
+    Complete(&'a State),
+    Observed(&'a ObservedCreate),
+    CreateInFlight(&'a InFlightCreate),
+    Imported(&'a State),
+    CurrentPresent(&'a State),
+    CurrentCreateInFlight(&'a InFlightCreate),
+    CurrentMissingIdentifier(&'a State),
 }
 
 impl<'a> UpsertSource<'a> {
-    fn state(&self) -> &'a State {
+    fn created_identifier(&self) -> Option<&str> {
         match self {
-            Self::Applied(state) | Self::CurrentState(state) => state,
+            Self::Complete(state) | Self::Imported(state) => state.identifier.as_deref(),
+            Self::Observed(created) => Some(created.identifier().as_str()),
+            Self::CreateInFlight(pending) => pending.identifier().map(|value| value.as_str()),
+            Self::CurrentPresent(_state) => None,
+            Self::CurrentCreateInFlight(_pending) => None,
+            Self::CurrentMissingIdentifier(_state) => None,
         }
     }
 
-    fn is_applied(&self) -> bool {
-        matches!(self, Self::Applied(_))
+    fn is_create_result(&self) -> bool {
+        match self {
+            Self::Complete(_state) => true,
+            Self::Observed(_created) => true,
+            Self::CreateInFlight(pending) => {
+                matches!(pending.persistence(), InFlightPersistence::Fresh(_))
+            }
+            Self::Imported(_state) => true,
+            Self::CurrentPresent(_state) => false,
+            Self::CurrentCreateInFlight(_pending) => false,
+            Self::CurrentMissingIdentifier(_state) => false,
+        }
+    }
+
+    fn preserves_row_after_delete(&self) -> bool {
+        match self {
+            Self::Observed(_created) => true,
+            Self::CreateInFlight(_pending) => true,
+            Self::CurrentCreateInFlight(_pending) => true,
+            Self::Complete(_state) => false,
+            Self::Imported(_state) => false,
+            Self::CurrentPresent(_state) => false,
+            Self::CurrentMissingIdentifier(_state) => false,
+        }
+    }
+
+    fn records_name_overrides(&self) -> bool {
+        self.is_create_result()
     }
 }
 
@@ -625,6 +655,12 @@ enum ReplacementOutcome {
     CreateAppliedDeposeOld(PlannedDepose),
     DeleteSucceededCreateAbsent(ResolvedResourceId),
     KeepOld,
+}
+
+enum ReplacementCreateResult<'upsert, 'resource> {
+    Upsert(&'upsert PlannedUpsert<'resource>),
+    Ended,
+    Absent,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -651,8 +687,26 @@ impl<'a> WritebackPlan<'a> {
             upserts: indexmap::IndexMap::new(),
             deposes: Vec::new(),
             remove_deposed: Vec::new(),
+            clear_currents: HashSet::new(),
             cleanups: HashSet::new(),
+            moved_from_rows: HashSet::new(),
         }
+    }
+
+    fn claims(&self, id: &ResourceId, except: WriteClaim) -> bool {
+        (except != WriteClaim::Upsert && self.upserts.contains_key(id))
+            || (except != WriteClaim::ClearCurrent
+                && self
+                    .clear_currents
+                    .iter()
+                    .any(|claimed| claimed.as_inner() == id))
+            || (except != WriteClaim::Cleanup
+                && self.cleanups.iter().any(|claimed| claimed.as_inner() == id))
+            || (except != WriteClaim::MovedFromRow
+                && self
+                    .moved_from_rows
+                    .iter()
+                    .any(|claimed| claimed.as_inner() == id))
     }
 
     /// Register an upsert for `resource` with `source`. The first call
@@ -665,11 +719,7 @@ impl<'a> WritebackPlan<'a> {
         source: UpsertSource<'a>,
     ) -> Result<(), WritebackConflict> {
         let id = resource.resolved_id();
-        if self
-            .cleanups
-            .iter()
-            .any(|cleanup| cleanup.as_inner() == id.as_inner())
-        {
+        if self.claims(id.as_inner(), WriteClaim::Upsert) {
             return Err(WritebackConflict::UpsertCleanupOverlap {
                 id: id.into_inner(),
             });
@@ -687,12 +737,37 @@ impl<'a> WritebackPlan<'a> {
     /// Register a cleanup against `id`. Calling after `add_upsert(id)`
     /// returns `UpsertCleanupOverlap`. Cleanup is idempotent.
     fn add_cleanup(&mut self, id: ResolvedResourceId) -> Result<(), WritebackConflict> {
-        if self.upserts.contains_key(id.as_inner()) {
+        if self.claims(id.as_inner(), WriteClaim::Cleanup) {
             return Err(WritebackConflict::UpsertCleanupOverlap {
                 id: id.into_inner(),
             });
         }
         self.cleanups.insert(id);
+        Ok(())
+    }
+
+    /// Register a provider verdict that clears the current create slot while
+    /// retaining address metadata for any deposed generations.
+    fn add_clear_current(&mut self, id: ResolvedResourceId) -> Result<(), WritebackConflict> {
+        if self.claims(id.as_inner(), WriteClaim::ClearCurrent) {
+            return Err(WritebackConflict::UpsertCleanupOverlap {
+                id: id.into_inner(),
+            });
+        }
+        self.clear_currents.insert(id);
+        Ok(())
+    }
+
+    /// Claim a move source for the final typed row transfer. Unlike ordinary
+    /// cleanup, finalization moves any still-live deposed generations to the
+    /// destination before removing this whole source row.
+    fn add_moved_from_row(&mut self, id: ResolvedResourceId) -> Result<(), WritebackConflict> {
+        if self.claims(id.as_inner(), WriteClaim::MovedFromRow) {
+            return Err(WritebackConflict::UpsertCleanupOverlap {
+                id: id.into_inner(),
+            });
+        }
+        self.moved_from_rows.insert(id);
         Ok(())
     }
 
@@ -716,6 +791,14 @@ impl<'a> WritebackPlan<'a> {
     fn add_remove_deposed(&mut self, id: ResolvedResourceId, key: DeposedKey) {
         self.remove_deposed.push(PlannedRemoveDeposed { id, key });
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteClaim {
+    Upsert,
+    ClearCurrent,
+    Cleanup,
+    MovedFromRow,
 }
 
 struct ReplacementDeleteInput<'a> {
@@ -758,16 +841,21 @@ fn identifier_was_successfully_deleted(
 
 fn classify_replacement_outcome(
     delete: ReplacementDeleteInput<'_>,
-    create_upsert: Option<&PlannedUpsert<'_>>,
+    create_result: ReplacementCreateResult<'_, '_>,
     state_file: &StateFile,
     managed_current: &HashMap<ResourceId, Current>,
     moved_origins: &MovedOrigins,
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
 ) -> ReplacementOutcome {
-    let applied_create = create_upsert.filter(|upsert| upsert.source.is_applied());
-    match applied_create {
-        Some(_)
+    let create_upsert = match create_result {
+        ReplacementCreateResult::Upsert(upsert) => Some(upsert),
+        ReplacementCreateResult::Ended => return ReplacementOutcome::CurrentRowOnly,
+        ReplacementCreateResult::Absent => None,
+    };
+    let create_result = create_upsert.filter(|upsert| upsert.source.is_create_result());
+    match create_result {
+        Some(_upsert)
             if delete_succeeded(
                 successfully_deleted,
                 delete.id,
@@ -778,7 +866,7 @@ fn classify_replacement_outcome(
             ReplacementOutcome::CurrentRowOnly
         }
         Some(upsert) => {
-            let new_identifier = upsert.source.state().identifier.as_deref();
+            let new_identifier = upsert.source.created_identifier();
             if new_identifier == Some(delete.identifier) {
                 return ReplacementOutcome::CurrentRowOnly;
             }
@@ -796,11 +884,43 @@ fn classify_replacement_outcome(
             delete.id,
             delete.generation,
             delete.identifier,
+        ) && create_upsert
+            .is_some_and(|upsert| upsert.source.preserves_row_after_delete()) =>
+        {
+            ReplacementOutcome::CurrentRowOnly
+        }
+        None if delete_succeeded(
+            successfully_deleted,
+            delete.id,
+            delete.generation,
+            delete.identifier,
         ) =>
         {
             ReplacementOutcome::DeleteSucceededCreateAbsent(delete.id.clone())
         }
         None => ReplacementOutcome::KeepOld,
+    }
+}
+
+fn replacement_create_result<'upsert, 'resource>(
+    id: &ResourceId,
+    upserts: &'upsert indexmap::IndexMap<ResourceId, PlannedUpsert<'resource>>,
+    applied_states: &HashMap<ResourceId, Applied>,
+) -> ReplacementCreateResult<'upsert, 'resource> {
+    if let Some(upsert) = upserts.get(id) {
+        return ReplacementCreateResult::Upsert(upsert);
+    }
+    match applied_states.get(id) {
+        Some(Applied::CreateEnded) => ReplacementCreateResult::Ended,
+        Some(
+            Applied::Complete(_)
+            | Applied::Observed(_)
+            | Applied::CreateInFlight(_)
+            | Applied::Imported(_)
+            | Applied::DataSource(_)
+            | Applied::WaitSnapshot(_),
+        ) => ReplacementCreateResult::Absent,
+        None => ReplacementCreateResult::Absent,
     }
 }
 
@@ -814,15 +934,16 @@ fn planned_depose(
 ) -> PlannedDepose {
     let existing = moved_origins.find_persisted_row_at_address(state_file, delete.id.as_inner());
     let current = managed_current.get(delete.id.as_inner());
-    let current_state = current.map(|current| match current {
-        Current::Absent(state) => state.state(),
-        Current::Present(present) => present.state(),
-        Current::MissingIdentifier(state) => state.state(),
+    let current_state = current.and_then(|current| match current {
+        Current::Absent(state) => Some(state.state()),
+        Current::Present(present) => Some(present.state()),
+        Current::CreateInFlight(_pending) => None,
+        Current::MissingIdentifier(state) => Some(state.state()),
     });
-    let existing_attributes = existing.map(ResourceState::persisted_attributes);
+    let existing_attributes = existing.and_then(ResourceState::persisted_attributes);
 
     let attributes = if let Some(existing) = existing
-        && existing.identifier.as_deref() == Some(delete.identifier)
+        && existing.identifier().map(AppliedIdentifier::as_str) == Some(delete.identifier)
     {
         // Re-merging desired secrets can store the new secret's hash
         // on the old snapshot. That is the safe direction: hashes are
@@ -914,6 +1035,9 @@ fn create_side_upsert_ids(plan: &Plan) -> HashSet<ResourceId> {
             Effect::Create(resource) => {
                 ids.insert(resource.id.clone());
             }
+            Effect::ResumeCreate { resource, .. } => {
+                ids.insert(resource.id.clone());
+            }
             Effect::DeferredReplace(payload) => {
                 ids.extend(
                     payload
@@ -922,7 +1046,14 @@ fn create_side_upsert_ids(plan: &Plan) -> HashSet<ResourceId> {
                         .map(|delete| delete.id.clone().into_inner()),
                 );
             }
-            _ => {}
+            Effect::Read { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Import { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::Wait { .. } => {}
         }
     }
     ids
@@ -935,7 +1066,7 @@ fn plan_displaced_identifier_deposes(
 ) {
     let create_side_ids = create_side_upsert_ids(input.plan);
     for (id, upsert) in &wb.upserts {
-        if !upsert.source.is_applied() {
+        if !upsert.source.is_create_result() {
             continue;
         }
         if !create_side_ids.contains(id) {
@@ -947,7 +1078,8 @@ fn plan_displaced_identifier_deposes(
         else {
             continue;
         };
-        let Some(displaced_identifier) = existing.identifier.as_deref() else {
+        let Some(displaced_identifier) = existing.identifier().map(AppliedIdentifier::as_str)
+        else {
             continue;
         };
         if !input.failed_refreshes.contains(id.as_inner())
@@ -957,12 +1089,13 @@ fn plan_displaced_identifier_deposes(
                 .is_some_and(|current| match current {
                     Current::Absent(_state) => true,
                     Current::Present(_present) => false,
+                    Current::CreateInFlight(_pending) => false,
                     Current::MissingIdentifier(_state) => false,
                 })
         {
             continue;
         }
-        let new_identifier = upsert.source.state().identifier.as_deref();
+        let new_identifier = upsert.source.created_identifier();
         if new_identifier == Some(displaced_identifier) {
             continue;
         }
@@ -1015,7 +1148,7 @@ struct DecomposeInput<'a, 's> {
     sorted_resources: &'a [ResolvedResource],
     runtime_synthesized_resources: &'a [ResolvedResource],
     managed_current: &'a HashMap<ResourceId, Current>,
-    applied_states: &'a HashMap<ResourceId, State>,
+    applied_states: &'a HashMap<ResourceId, Applied>,
     plan: &'a Plan,
     successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     failed_refreshes: &'a HashSet<ResourceId>,
@@ -1047,9 +1180,26 @@ fn decompose_with_moved_origins<'a>(
         wb.add_remove_deposed(id.clone(), key.clone());
     }
 
+    fn add_applied<'a>(
+        wb: &mut WritebackPlan<'a>,
+        resource: &'a ResolvedResource,
+        applied: &'a Applied,
+    ) -> Result<(), WritebackConflict> {
+        match applied {
+            Applied::Complete(state) => wb.add_upsert(resource, UpsertSource::Complete(state)),
+            Applied::Observed(created) => wb.add_upsert(resource, UpsertSource::Observed(created)),
+            Applied::CreateInFlight(pending) => {
+                wb.add_upsert(resource, UpsertSource::CreateInFlight(pending))
+            }
+            Applied::CreateEnded => wb.add_clear_current(resource.resolved_id()),
+            Applied::Imported(state) => wb.add_upsert(resource, UpsertSource::Imported(state)),
+            Applied::DataSource(_state) | Applied::WaitSnapshot(_state) => Ok(()),
+        }
+    }
+
     for resource in sorted_resources {
         if let Some(applied) = applied_states.get(&resource.id) {
-            wb.add_upsert(resource, UpsertSource::Applied(applied))?;
+            add_applied(&mut wb, resource, applied)?;
         } else if failed_refreshes.contains(&resource.id) {
             // Refresh failed; we don't know whether the live resource
             // still exists, so leave any pre-existing row untouched.
@@ -1058,18 +1208,22 @@ fn decompose_with_moved_origins<'a>(
             match current {
                 Current::Absent(_state) => wb.add_cleanup(resource.resolved_id())?,
                 Current::Present(present) => {
-                    wb.add_upsert(resource, UpsertSource::CurrentState(present.state()))?
+                    wb.add_upsert(resource, UpsertSource::CurrentPresent(present.state()))?
                 }
-                Current::MissingIdentifier(state) => {
-                    wb.add_upsert(resource, UpsertSource::CurrentState(state.state()))?
+                Current::CreateInFlight(pending) => {
+                    wb.add_upsert(resource, UpsertSource::CurrentCreateInFlight(pending))?
                 }
+                Current::MissingIdentifier(state) => wb.add_upsert(
+                    resource,
+                    UpsertSource::CurrentMissingIdentifier(state.state()),
+                )?,
             }
         }
     }
 
     for resource in runtime_synthesized_resources {
         if let Some(applied) = applied_states.get(&resource.id) {
-            wb.add_upsert(resource, UpsertSource::Applied(applied))?;
+            add_applied(&mut wb, resource, applied)?;
         }
     }
 
@@ -1086,7 +1240,7 @@ fn decompose_with_moved_origins<'a>(
                 let create_id = plan.effects()[replacement.create_idx].resource_id();
                 let outcome = classify_replacement_outcome(
                     delete,
-                    wb.upserts.get(create_id),
+                    replacement_create_result(create_id, &wb.upserts, applied_states),
                     state_file,
                     managed_current,
                     moved_origins,
@@ -1101,10 +1255,11 @@ fn decompose_with_moved_origins<'a>(
         if let Effect::DeferredReplace(payload) = effect {
             for delete in &payload.deletes {
                 let delete = delete_input_from_deferred(delete);
-                let create_upsert = wb.upserts.get(delete.id.as_inner());
+                let create_result =
+                    replacement_create_result(delete.id.as_inner(), &wb.upserts, applied_states);
                 let outcome = classify_replacement_outcome(
                     delete,
-                    create_upsert,
+                    create_result,
                     state_file,
                     managed_current,
                     moved_origins,
@@ -1127,8 +1282,12 @@ fn decompose_with_moved_origins<'a>(
             wb.add_remove_deposed(id.clone(), key.clone());
         }
 
-        for id in effect.writeback_cleanup_ids(successfully_deleted) {
-            wb.add_cleanup(id)?;
+        if let Effect::Move { from, .. } = effect {
+            wb.add_moved_from_row(from.clone())?;
+        } else {
+            for id in effect.writeback_cleanup_ids(successfully_deleted) {
+                wb.add_cleanup(id)?;
+            }
         }
     }
 
@@ -1185,26 +1344,47 @@ pub(crate) fn build_state_after_apply(
             })
             .unwrap_or_default();
 
-        let (applied_state, is_applied) = match planned.source {
-            UpsertSource::Applied(s) => (s, true),
-            UpsertSource::CurrentState(s) => (s, false),
-        };
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-            resource,
-            applied_state,
-            existing,
-            schemas.get_for(resource),
-            preferred_hashes,
-        )
-        .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
-        if is_applied && let Some(overrides) = permanent_name_overrides.get(id) {
-            resource_state.name_overrides = overrides.clone();
-        }
-        if !write_only_keys.is_empty() {
-            resource_state
-                .merge_write_only_attributes(resource, &write_only_keys)
+        let schema = schemas.get_for(resource);
+        let mut resource_state = match &planned.source {
+            UpsertSource::Complete(state)
+            | UpsertSource::Imported(state)
+            | UpsertSource::CurrentPresent(state)
+            | UpsertSource::CurrentMissingIdentifier(state) => {
+                let mut row = ResourceState::from_provider_state_for_resource_and_schema(
+                    resource,
+                    state,
+                    existing,
+                    schema,
+                    preferred_hashes,
+                )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
+                if !write_only_keys.is_empty() {
+                    row.merge_write_only_attributes(resource, &write_only_keys)
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?;
+                }
+                row
+            }
+            UpsertSource::Observed(created) => ResourceState::from_observation(
+                resource,
+                created,
+                existing,
+                schema,
+                preferred_hashes,
+            )
+            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
+            UpsertSource::CreateInFlight(pending)
+            | UpsertSource::CurrentCreateInFlight(pending) => {
+                ResourceState::from_in_flight(resource, pending, existing, schema, preferred_hashes)
+                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
+            }
+        };
+        if planned.source.records_name_overrides()
+            && let Some(overrides) = permanent_name_overrides.get(id)
+        {
+            resource_state.name_overrides = overrides.clone();
         }
         state.upsert_resource(resource_state)?;
     }
@@ -1222,8 +1402,22 @@ pub(crate) fn build_state_after_apply(
         );
     }
 
+    for id in &writeback.clear_currents {
+        state.clear_current_instance_preserving_address_metadata(
+            &id.provider,
+            &id.resource_type,
+            id.identity_str(),
+        );
+    }
+
     for id in &writeback.cleanups {
         state.remove_resource(&id.provider, &id.resource_type, id.identity_str());
+    }
+
+    for effect in plan.effects() {
+        if let Some(authority) = effect.move_authority() {
+            state.complete_resource_move(authority)?;
+        }
     }
 
     Ok(state)
@@ -1286,7 +1480,10 @@ pub(crate) fn build_orphan_resource(
     let rs = sf
         .find_resource(&id.provider, &id.resource_type, id.identity_str())
         .expect("orphan must exist in state file");
-    let attributes = rs.persisted_attributes().to_values();
+    let attributes = rs
+        .persisted_attributes()
+        .map(PersistedAttributes::to_values)
+        .unwrap_or_default();
     Resource {
         id: id.as_inner().clone(),
         attributes: attributes.into_iter().collect(),
@@ -1387,6 +1584,9 @@ mod post_apply_states_tests {
                 panic!("identifier row was classified absent: {state:?}")
             }
             Current::Present(present) => present,
+            Current::CreateInFlight(pending) => {
+                panic!("identifier row was classified in flight: {pending:?}")
+            }
             Current::MissingIdentifier(state) => {
                 panic!("identifier row lost its identifier: {state:?}")
             }
@@ -1430,6 +1630,9 @@ mod post_apply_states_tests {
             Current::Present(present) => {
                 panic!("deposed-only row was classified present: {present:?}")
             }
+            Current::CreateInFlight(pending) => {
+                panic!("deposed-only row was classified in flight: {pending:?}")
+            }
             Current::MissingIdentifier(state) => {
                 panic!("deposed-only row was treated as malformed current state: {state:?}")
             }
@@ -1460,6 +1663,9 @@ mod post_apply_states_tests {
             Current::Present(present) => {
                 panic!("identifierless row was classified present: {present:?}")
             }
+            Current::CreateInFlight(pending) => {
+                panic!("identifierless row was classified in flight: {pending:?}")
+            }
             Current::MissingIdentifier(state) => {
                 assert!(state.state().exists);
                 assert_eq!(
@@ -1483,10 +1689,11 @@ mod apply_state_save_tests {
     use carina_core::plan::Plan;
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
-        ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State, UnknownReason, Value,
+        ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource, ResourceId, State,
+        UnknownReason, Value,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    use carina_state::{DeposedInstance, DeposedKey, NameOverride};
+    use carina_state::{CurrentInstance, DeposedInstance, DeposedKey, NameOverride};
 
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
@@ -1525,6 +1732,1095 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier(format!("{name}-id"))
+    }
+
+    fn fresh_in_flight(
+        id: &ResourceId,
+        token: &str,
+        identifier: Option<&str>,
+        sent: carina_core::provider::Sent,
+    ) -> carina_core::provider::InFlightCreate {
+        crate::fixture_in_flight_create(id, token, identifier, sent)
+    }
+
+    fn secret_string(value: &str) -> Value {
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String(value.to_string().into()),
+        ))))
+    }
+
+    fn observed_create(
+        id: &ResourceId,
+        attributes: HashMap<String, Value>,
+        sent: carina_core::provider::Sent,
+    ) -> carina_core::provider::ObservedCreate {
+        crate::fixture_observed_create(id, attributes, sent)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReplacementAppliedKind {
+        Complete,
+        Observed,
+        CreateInFlight,
+        CreateEnded,
+    }
+
+    fn replacement_matrix_state(kind: ReplacementAppliedKind, delete_first: bool) -> StateFile {
+        let resource =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]")
+                .with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("new.example.com".into())),
+                );
+        let id = resource.id.clone();
+        let resolved_resource = resolved(resource.clone());
+
+        let mut state = match kind {
+            ReplacementAppliedKind::Complete
+            | ReplacementAppliedKind::Observed
+            | ReplacementAppliedKind::CreateInFlight => {
+                let row = ResourceState::try_applied(
+                    "route53.Record",
+                    "validation_records[0]",
+                    "aws",
+                    "old-record-id",
+                )
+                .expect("fixture identifier is non-empty")
+                .with_attribute("name", serde_json::json!("old.example.com"));
+                let mut state = StateFile::new();
+                state
+                    .upsert_resource(row)
+                    .expect("old current fixture must be valid");
+                state
+            }
+            ReplacementAppliedKind::CreateEnded => build_state_after_apply(
+                ApplyStateSave {
+                    state_file: None,
+                    sorted_resources: std::slice::from_ref(&resolved_resource),
+                    runtime_synthesized_resources: &[],
+                    managed_current: &HashMap::new(),
+                    applied_states: &HashMap::from([(
+                        id.clone(),
+                        Applied::CreateInFlight(fresh_in_flight(
+                            &id,
+                            "persisted-token",
+                            Some("pending-id"),
+                            carina_core::provider::Sent::AllRequestAttributes,
+                        )),
+                    )]),
+                    plan: &Plan::new(),
+                    successfully_deleted: &HashSet::new(),
+                    failed_refreshes: &HashSet::new(),
+                    schemas: &SchemaRegistry::new(),
+                },
+                None,
+            )
+            .expect("in-flight matrix fixture must be valid"),
+        };
+
+        state
+            .upsert_deposed_generation(
+                &id.provider,
+                &id.resource_type,
+                resolved_resource.identity(),
+                id.provider_instance.clone(),
+                DeposedInstance::from_persisted_json(
+                    DeposedKey::new_unique(),
+                    "older-deposed-id".to_string(),
+                    None,
+                    HashMap::from([("name".to_string(), serde_json::json!("older"))]),
+                    BTreeSet::new(),
+                ),
+            )
+            .expect("older deposed fixture must be valid");
+        if matches!(kind, ReplacementAppliedKind::CreateEnded) && !delete_first {
+            state
+                .upsert_deposed_generation(
+                    &id.provider,
+                    &id.resource_type,
+                    resolved_resource.identity(),
+                    id.provider_instance.clone(),
+                    DeposedInstance::from_persisted_json(
+                        DeposedKey::new_unique(),
+                        "old-record-id".to_string(),
+                        None,
+                        HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+                        BTreeSet::new(),
+                    ),
+                )
+                .expect("CBD old generation fixture must be valid");
+        }
+
+        let managed_current = HashMap::from([(id.clone(), state.build_state_for_resource(&id))]);
+        let applied = match kind {
+            ReplacementAppliedKind::Complete => Applied::Complete(
+                State::existing(
+                    id.clone(),
+                    HashMap::from([(
+                        "name".to_string(),
+                        Value::Concrete(ConcreteValue::String("complete.example.com".into())),
+                    )]),
+                )
+                .with_identifier("complete-id"),
+            ),
+            ReplacementAppliedKind::Observed => Applied::Observed(observed_create(
+                &id,
+                HashMap::from([(
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("observed.example.com".into())),
+                )]),
+                carina_core::provider::Sent::AllRequestAttributes,
+            )),
+            ReplacementAppliedKind::CreateInFlight => Applied::CreateInFlight(fresh_in_flight(
+                &id,
+                "new-token",
+                Some("pending-id"),
+                carina_core::provider::Sent::AllRequestAttributes,
+            )),
+            ReplacementAppliedKind::CreateEnded => Applied::CreateEnded,
+        };
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let successfully_deleted = if delete_first {
+            HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")])
+        } else {
+            HashSet::new()
+        };
+
+        build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved_resource),
+                managed_current: &managed_current,
+                applied_states: &HashMap::from([(id, applied)]),
+                plan: &plan,
+                successfully_deleted: &successfully_deleted,
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("replacement matrix writeback must succeed")
+    }
+
+    fn assert_applied_current(row: &ResourceState, expected_identifier: &str) {
+        match row.current() {
+            CurrentInstance::Applied {
+                identifier,
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => {
+                assert_eq!(identifier.as_str(), expected_identifier);
+                assert!(!attributes.is_empty());
+                assert!(write_only_attributes.is_empty());
+                assert!(partial_read.is_none());
+            }
+            CurrentInstance::None => panic!("expected an applied current instance, got none"),
+            CurrentInstance::CreateInFlight { pending } => panic!(
+                "expected applied current, got in-flight {:?} from {}",
+                pending,
+                pending.started_at().as_str()
+            ),
+            CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => panic!(
+                "expected applied current, got identifierless state ({attributes:?}, {write_only_attributes:?}, {partial_read:?})"
+            ),
+        }
+    }
+
+    fn assert_in_flight_current(row: &ResourceState) {
+        match row.current() {
+            CurrentInstance::CreateInFlight { pending } => {
+                assert_eq!(pending.token().expose_for_provider_call(), "new-token");
+                assert_eq!(
+                    pending.identifier().map(AppliedIdentifier::as_str),
+                    Some("pending-id")
+                );
+                assert!(!pending.started_at().as_str().is_empty());
+            }
+            CurrentInstance::None => panic!("expected an in-flight current instance, got none"),
+            CurrentInstance::Applied {
+                identifier,
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => panic!(
+                "expected in-flight current, got applied {} ({attributes:?}, {write_only_attributes:?}, {partial_read:?})",
+                identifier.as_str()
+            ),
+            CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => panic!(
+                "expected in-flight current, got identifierless state ({attributes:?}, {write_only_attributes:?}, {partial_read:?})"
+            ),
+        }
+    }
+
+    fn assert_no_current(row: &ResourceState) {
+        match row.current() {
+            CurrentInstance::None => {}
+            CurrentInstance::Applied {
+                identifier,
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => panic!(
+                "expected no current instance, got applied {} ({attributes:?}, {write_only_attributes:?}, {partial_read:?})",
+                identifier.as_str()
+            ),
+            CurrentInstance::CreateInFlight { pending } => panic!(
+                "expected no current instance, got in-flight {:?} from {}",
+                pending,
+                pending.started_at().as_str()
+            ),
+            CurrentInstance::MissingIdentifier {
+                attributes,
+                write_only_attributes,
+                partial_read,
+            } => panic!(
+                "expected no current instance, got identifierless state ({attributes:?}, {write_only_attributes:?}, {partial_read:?})"
+            ),
+        }
+    }
+
+    fn assert_replacement_matrix_case(kind: ReplacementAppliedKind, delete_first: bool) {
+        let state = replacement_matrix_state(kind, delete_first);
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("deposed sentinel keeps the replacement row");
+        match kind {
+            ReplacementAppliedKind::Complete => assert_applied_current(row, "complete-id"),
+            ReplacementAppliedKind::Observed => assert_applied_current(row, "created-id"),
+            ReplacementAppliedKind::CreateInFlight => assert_in_flight_current(row),
+            ReplacementAppliedKind::CreateEnded => assert_no_current(row),
+        }
+        assert!(
+            row.deposed
+                .iter()
+                .any(|instance| instance.identifier == "older-deposed-id"),
+            "unrelated deposed generation must survive"
+        );
+        assert_eq!(
+            row.deposed
+                .iter()
+                .any(|instance| instance.identifier == "old-record-id"),
+            !delete_first,
+            "the replaced old instance is deposed only when its delete did not succeed"
+        );
+    }
+
+    #[test]
+    fn create_before_destroy_writeback_matrix_is_lossless() {
+        for kind in [
+            ReplacementAppliedKind::Complete,
+            ReplacementAppliedKind::Observed,
+            ReplacementAppliedKind::CreateInFlight,
+            ReplacementAppliedKind::CreateEnded,
+        ] {
+            assert_replacement_matrix_case(kind, false);
+        }
+    }
+
+    #[test]
+    fn delete_first_writeback_matrix_is_lossless() {
+        for kind in [
+            ReplacementAppliedKind::Complete,
+            ReplacementAppliedKind::Observed,
+            ReplacementAppliedKind::CreateInFlight,
+            ReplacementAppliedKind::CreateEnded,
+        ] {
+            assert_replacement_matrix_case(kind, true);
+        }
+    }
+
+    #[test]
+    fn repended_cbd_replacement_does_not_reclassify_the_old_generation() {
+        let initial = replacement_matrix_state(ReplacementAppliedKind::CreateInFlight, false);
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let desired =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]")
+                .with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("changed.example.com".into())),
+                );
+        let resolved_desired = resolved(desired);
+        let before = initial
+            .find_resource_for_id(&id)
+            .expect("initial replacement row")
+            .clone();
+        let Current::CreateInFlight(pending) = initial.build_state_for_resource(&id) else {
+            panic!("matrix fixture must load an in-flight current instance");
+        };
+        let repended = crate::fixture_repend_in_flight_create(pending, "repended-token");
+        let managed_current = HashMap::from([(id.clone(), initial.build_state_for_resource(&id))]);
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(initial),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved_desired),
+                managed_current: &managed_current,
+                applied_states: &HashMap::from([(id.clone(), Applied::CreateInFlight(repended))]),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("re-pended replacement writeback");
+
+        let after = saved
+            .find_resource_for_id(&id)
+            .expect("re-pended replacement row");
+        assert_eq!(
+            serde_json::to_value(&after.deposed).expect("deposed state serializes"),
+            serde_json::to_value(&before.deposed).expect("deposed state serializes"),
+            "re-pending must not regenerate or replace the old generation"
+        );
+        let CurrentInstance::CreateInFlight { pending } = after.current() else {
+            panic!("re-pended replacement must remain in flight");
+        };
+        assert_eq!(pending.token().expose_for_provider_call(), "repended-token");
+        let CurrentInstance::CreateInFlight {
+            pending: before_pending,
+        } = before.current()
+        else {
+            panic!("initial replacement must be in flight");
+        };
+        assert_eq!(pending.identifier(), before_pending.identifier());
+        let SentRecord::Persisted(envelope) = pending.sent() else {
+            panic!("written continuation must carry persisted values");
+        };
+        let SentRecord::Persisted(before_envelope) = before_pending.sent() else {
+            panic!("loaded continuation must carry persisted values");
+        };
+        assert_eq!(envelope.write_only(), before_envelope.write_only());
+        assert_eq!(envelope.secrets(), before_envelope.secrets());
+        assert_eq!(pending.started_at(), before_pending.started_at());
+    }
+
+    fn plan_after_writeback(
+        resource: &Resource,
+        state: &StateFile,
+        schemas: &SchemaRegistry,
+    ) -> Plan {
+        let current = HashMap::from([(
+            resource.id.clone(),
+            state.build_state_for_resource(&resource.id),
+        )]);
+        let plan_input = carina_core::resource::into_plan_input_current_map(current, schemas, &[]);
+        let saved_attrs = state.build_saved_attrs().lift(schemas);
+        create_plan(
+            std::slice::from_ref(&resolved(resource.clone())),
+            &[],
+            &ProviderRouter::new(),
+            carina_core::differ::PlanPriorStates::new(
+                &plan_input,
+                &HashMap::new(),
+                &carina_core::differ::Orphans::new(),
+            ),
+            &state.build_directives(),
+            schemas,
+            &saved_attrs,
+            &state.build_explicit(),
+            &[],
+        )
+        .expect("post-writeback plan should build")
+    }
+
+    fn write_observed_fixture(
+        resource: &Resource,
+        observed_attributes: HashMap<String, Value>,
+        sent: carina_core::provider::Sent,
+        schemas: &SchemaRegistry,
+    ) -> StateFile {
+        let id = resource.id.clone();
+        let created = observed_create(&id, observed_attributes, sent);
+        build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved(resource.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id, Applied::Observed(created))]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas,
+            },
+            None,
+        )
+        .expect("observed create writeback")
+    }
+
+    fn assert_secret_matches(value: Value, plaintext: &str) {
+        let Value::Deferred(DeferredValue::RedactedSecret { hash }) = value else {
+            panic!("expected a redacted secret hash");
+        };
+        let material = serde_json::to_vec(&serde_json::json!(plaintext))
+            .expect("fixture secret material serializes");
+        assert!(
+            hash.verify(material),
+            "secret hash did not match {plaintext:?}"
+        );
+    }
+
+    #[test]
+    fn observed_attributes_are_recorded_and_secret_marked_values_are_masked() {
+        let resource = Resource::with_provider("mock", "test.resource", "observed", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("desired-name".into())),
+            )
+            .with_attribute("credential", secret_string("desired-secret"));
+        let state = write_observed_fixture(
+            &resource,
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("cloud-name".into())),
+                ),
+                (
+                    "credential".to_string(),
+                    Value::Concrete(ConcreteValue::String("cloud-secret".into())),
+                ),
+            ]),
+            carina_core::provider::Sent::AllRequestAttributes,
+            &SchemaRegistry::new(),
+        );
+        let attributes = state
+            .find_resource_for_id(&resource.id)
+            .and_then(ResourceState::persisted_attributes)
+            .expect("observed row has applied attributes");
+
+        assert_eq!(
+            attributes.get("name"),
+            Some(Value::Concrete(ConcreteValue::String("cloud-name".into())))
+        );
+        assert_secret_matches(
+            attributes
+                .get("credential")
+                .expect("observed secret is recorded"),
+            "cloud-secret",
+        );
+    }
+
+    #[test]
+    fn observation_records_only_sent_unobserved_write_only_and_secret_values() {
+        let resource = Resource::with_provider("mock", "test.resource", "sent", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("desired-name".into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("sent-password".into())),
+            )
+            .with_attribute("api_key", secret_string("sent-api-key"))
+            .with_attribute("unsent_secret", secret_string("not-sent"));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("name", AttributeType::string()))
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
+                .attribute(AttributeSchema::new("api_key", AttributeType::string()))
+                .attribute(AttributeSchema::new(
+                    "unsent_secret",
+                    AttributeType::string(),
+                )),
+        );
+        let state = write_observed_fixture(
+            &resource,
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("cloud-name".into())),
+            )]),
+            carina_core::provider::Sent::only(["password", "api_key"]),
+            &schemas,
+        );
+        let row = state
+            .find_resource_for_id(&resource.id)
+            .expect("observed row exists");
+        let attributes = row
+            .persisted_attributes()
+            .expect("observed row has attributes");
+
+        assert_eq!(
+            attributes.get("password"),
+            Some(Value::Concrete(ConcreteValue::String(
+                "sent-password".into()
+            )))
+        );
+        assert_secret_matches(
+            attributes.get("api_key").expect("sent secret is recorded"),
+            "sent-api-key",
+        );
+        assert!(!attributes.contains_key("unsent_secret"));
+        assert_eq!(row.write_only_attributes(), ["password"]);
+    }
+
+    #[test]
+    fn failed_follow_up_secret_is_absent_and_next_plan_sends_it() {
+        let resource = Resource::with_provider("mock", "test.resource", "follow-up", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("created".into())),
+            )
+            .with_attribute("tag_secret", secret_string("desired-tag"));
+        let state = write_observed_fixture(
+            &resource,
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("created".into())),
+            )]),
+            carina_core::provider::Sent::only(["name"]),
+            &SchemaRegistry::new(),
+        );
+        let attributes = state
+            .find_resource_for_id(&resource.id)
+            .and_then(ResourceState::persisted_attributes)
+            .expect("observed row has attributes");
+        assert!(!attributes.contains_key("tag_secret"));
+
+        let plan = plan_after_writeback(&resource, &state, &SchemaRegistry::new());
+        assert!(plan.effects().iter().any(|effect| matches!(
+            effect,
+            Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == "tag_secret")
+        )));
+    }
+
+    #[test]
+    fn readable_secret_records_observed_hash_and_next_plan_sends_desired() {
+        let resource = Resource::with_provider("mock", "test.resource", "readable-secret", None)
+            .with_attribute("credential", secret_string("desired-secret"));
+        let state = write_observed_fixture(
+            &resource,
+            HashMap::from([(
+                "credential".to_string(),
+                Value::Concrete(ConcreteValue::String("cloud-secret".into())),
+            )]),
+            carina_core::provider::Sent::AllRequestAttributes,
+            &SchemaRegistry::new(),
+        );
+        let attributes = state
+            .find_resource_for_id(&resource.id)
+            .and_then(ResourceState::persisted_attributes)
+            .expect("observed row has attributes");
+        assert_secret_matches(
+            attributes
+                .get("credential")
+                .expect("observed readable secret is recorded"),
+            "cloud-secret",
+        );
+
+        let plan = plan_after_writeback(&resource, &state, &SchemaRegistry::new());
+        assert!(plan.effects().iter().any(|effect| matches!(
+            effect,
+            Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == "credential")
+        )));
+    }
+
+    #[test]
+    fn sent_create_only_write_only_attribute_causes_no_replacement() {
+        let resource = Resource::with_provider("mock", "test.resource", "write-only", None)
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("sent-password".into())),
+            );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource").attribute(
+                AttributeSchema::new("password", AttributeType::string())
+                    .write_only()
+                    .create_only(),
+            ),
+        );
+        let state = write_observed_fixture(
+            &resource,
+            HashMap::new(),
+            carina_core::provider::Sent::only(["password"]),
+            &schemas,
+        );
+        let row = state
+            .find_resource_for_id(&resource.id)
+            .expect("observed row exists");
+        assert_eq!(row.write_only_attributes(), ["password"]);
+
+        let plan = plan_after_writeback(&resource, &state, &schemas);
+        assert_eq!(
+            plan.mutation_count(),
+            0,
+            "sent create-only value must converge"
+        );
+    }
+
+    #[test]
+    fn missing_applied_entry_keeps_current_in_flight_row_byte_for_byte() {
+        let resource = Resource::with_provider("mock", "test.resource", "pending", None)
+            .with_binding("pending")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("stable".into())),
+            );
+        let id = resource.id.clone();
+        let resolved_resource = resolved(resource.clone());
+        let pending = fresh_in_flight(
+            &id,
+            "first-token",
+            Some("issued-id"),
+            carina_core::provider::Sent::AllRequestAttributes,
+        );
+        let initial = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), Applied::CreateInFlight(pending))]),
+                plan: &plan_with_name_override(&id, "stable-cbd", "stable"),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("initial in-flight writeback");
+        let before = serde_json::to_value(
+            initial
+                .find_resource_for_id(&id)
+                .expect("initial in-flight row exists"),
+        )
+        .expect("row serializes");
+        let managed_current = HashMap::from([(id.clone(), initial.build_state_for_resource(&id))]);
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(initial),
+                sorted_resources: std::slice::from_ref(&resolved_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &managed_current,
+                applied_states: &HashMap::new(),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("skipped resume writeback");
+        let after = serde_json::to_value(
+            saved
+                .find_resource_for_id(&id)
+                .expect("skipped resume keeps the row"),
+        )
+        .expect("row serializes");
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn moved_in_flight_without_applied_entry_is_written_at_destination() {
+        let source =
+            ResourceId::with_provider_identity("mock", "test.resource", "old_address", None);
+        let destination =
+            ResourceId::with_provider_identity("mock", "test.resource", "new_address", None);
+        let source_resource = resolved(
+            Resource::from_id(source.clone())
+                .with_binding("old_address")
+                .with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("stable".into())),
+                ),
+        );
+        let pending = fresh_in_flight(
+            &source,
+            "original-token",
+            Some("issued-id"),
+            carina_core::provider::Sent::AllRequestAttributes,
+        );
+        let initial = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&source_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    source.clone(),
+                    Applied::CreateInFlight(pending),
+                )]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("initial source writeback");
+        let before = serde_json::to_value(
+            initial
+                .find_resource_for_id(&source)
+                .expect("source continuation exists"),
+        )
+        .expect("source row serializes");
+        let move_effect = Effect::Move {
+            from: ResolvedResourceId::new(source.clone()),
+            to: ResolvedResourceId::new(destination.clone()),
+        };
+        let authority = move_effect
+            .move_authority()
+            .expect("the fixture effect is a move");
+        let moved_current = carina_core::differ::rebind_current_for_move(
+            initial.build_state_for_resource(&source),
+            &authority,
+        )
+        .expect("fixture move source route matches");
+        let Current::CreateInFlight(rebound) = moved_current else {
+            panic!("source continuation must stay in flight while moving")
+        };
+        let destination_resource = resolved(
+            Resource::from_id(destination.clone())
+                .with_binding("new_address")
+                .with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("stable".into())),
+                ),
+        );
+        let mut plan = Plan::new();
+        plan.add(move_effect);
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(initial),
+                sorted_resources: std::slice::from_ref(&destination_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::from([(
+                    destination.clone(),
+                    Current::CreateInFlight(rebound),
+                )]),
+                applied_states: &HashMap::new(),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("skipped moved resume writeback");
+
+        assert!(
+            saved.find_resource_for_id(&source).is_none(),
+            "move cleanup must remove only the source address"
+        );
+        let after = serde_json::to_value(
+            saved
+                .find_resource_for_id(&destination)
+                .expect("unchanged continuation must land at the destination"),
+        )
+        .expect("destination row serializes");
+        let mut expected = before;
+        expected["identity"] = serde_json::Value::String("new_address".to_string());
+        assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn repend_keeps_envelope_values_started_at_and_name_overrides() {
+        let resource = Resource::with_provider("mock", "test.resource", "pending", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("stable".into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("first-password".into())),
+            )
+            .with_attribute("api_key", secret_string("first-api-key"));
+        let id = resource.id.clone();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("name", AttributeType::string()))
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
+                .attribute(AttributeSchema::new("api_key", AttributeType::string())),
+        );
+        let resolved_resource = resolved(resource.clone());
+        let pending = fresh_in_flight(
+            &id,
+            "first-token",
+            Some("issued-id"),
+            carina_core::provider::Sent::only(["password", "api_key"]),
+        );
+        let initial = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), Applied::CreateInFlight(pending))]),
+                plan: &plan_with_name_override(&id, "stable-cbd", "stable"),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("initial in-flight writeback");
+        let initial_row = initial
+            .find_resource_for_id(&id)
+            .expect("initial in-flight row");
+        let CurrentInstance::CreateInFlight {
+            pending: initial_pending,
+        } = initial_row.current()
+        else {
+            panic!("expected in-flight current slot");
+        };
+        let SentRecord::Persisted(initial_envelope) = initial_pending.sent() else {
+            panic!("written continuation must carry persisted values");
+        };
+        let initial_write_only = initial_envelope.write_only().clone();
+        let initial_secrets = initial_envelope.secrets().clone();
+        let initial_started_at = initial_pending.started_at().clone();
+        let initial_name_overrides = initial_row.name_overrides.clone();
+
+        let Current::CreateInFlight(loaded) = initial.build_state_for_resource(&id) else {
+            panic!("written pending row must load as in flight");
+        };
+        let repended = crate::fixture_repend_in_flight_create(loaded, "second-token");
+        let changed_resource = resource
+            .clone()
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("changed-password".into())),
+            )
+            .with_attribute("api_key", secret_string("changed-api-key"));
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(initial),
+                sorted_resources: std::slice::from_ref(&resolved(changed_resource)),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), Applied::CreateInFlight(repended))]),
+                plan: &plan_with_name_override(&id, "changed-cbd", "changed"),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("re-pend writeback");
+
+        let row = saved.find_resource_for_id(&id).expect("re-pended row");
+        let CurrentInstance::CreateInFlight { pending } = row.current() else {
+            panic!("expected re-pended current slot");
+        };
+        assert_eq!(pending.token().expose_for_provider_call(), "second-token");
+        let SentRecord::Persisted(envelope) = pending.sent() else {
+            panic!("re-pended continuation must carry persisted values");
+        };
+        assert_eq!(envelope.write_only(), &initial_write_only);
+        assert_eq!(envelope.secrets(), &initial_secrets);
+        assert_eq!(pending.started_at(), &initial_started_at);
+        assert_eq!(row.name_overrides, initial_name_overrides);
+    }
+
+    #[test]
+    fn moved_repend_persists_the_continuation_route_as_the_row_route() {
+        let source = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "old_address",
+            Some("east".to_string()),
+        );
+        let destination = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "new_address",
+            Some("west".to_string()),
+        );
+        let source_resource = resolved(Resource::from_id(source.clone()));
+        let destination_resource = resolved(Resource::from_id(destination.clone()));
+
+        let source_pending = fresh_in_flight(
+            &source,
+            "source-token",
+            None,
+            carina_core::provider::Sent::AllRequestAttributes,
+        );
+        let source_row =
+            ResourceState::from_in_flight(&source_resource, &source_pending, None, None, None)
+                .expect("source continuation must encode");
+        let mut initial = StateFile::new();
+        initial
+            .upsert_resource(source_row)
+            .expect("source row must be valid");
+
+        // Load a separately persisted continuation on west so this fixture
+        // exercises the writeback constructor's source of routing directly.
+        let destination_pending = fresh_in_flight(
+            &destination,
+            "destination-token",
+            None,
+            carina_core::provider::Sent::AllRequestAttributes,
+        );
+        let destination_row = ResourceState::from_in_flight(
+            &destination_resource,
+            &destination_pending,
+            None,
+            None,
+            None,
+        )
+        .expect("destination continuation must encode");
+        let mut destination_state = StateFile::new();
+        destination_state
+            .upsert_resource(destination_row)
+            .expect("destination row must be valid");
+        let Current::CreateInFlight(loaded_destination) =
+            destination_state.build_state_for_resource(&destination)
+        else {
+            panic!("destination continuation must load as in flight");
+        };
+        let repended = crate::fixture_repend_in_flight_create(
+            loaded_destination,
+            "destination-repended-token",
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: ResolvedResourceId::new(source.clone()),
+            to: ResolvedResourceId::new(destination.clone()),
+        });
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(initial),
+                sorted_resources: std::slice::from_ref(&destination_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    destination.clone(),
+                    Applied::CreateInFlight(repended),
+                )]),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("moved re-pend writeback");
+
+        let row = saved
+            .find_resource_for_id(&destination)
+            .expect("the destination route must own the persisted continuation");
+        assert_eq!(row.directives.provider_instance.as_deref(), Some("west"));
+    }
+
+    #[test]
+    fn only_create_ended_clears_current_and_keeps_deposed() {
+        let resource = Resource::with_provider("mock", "test.resource", "pending", None)
+            .with_binding("pending")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("stable".into())),
+            );
+        let id = resource.id.clone();
+        let resolved_resource = resolved(resource.clone());
+        let pending = fresh_in_flight(
+            &id,
+            "first-token",
+            Some("issued-id"),
+            carina_core::provider::Sent::AllRequestAttributes,
+        );
+        let mut initial = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), Applied::CreateInFlight(pending))]),
+                plan: &plan_with_name_override(&id, "stable-cbd", "stable"),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("initial in-flight writeback");
+        initial
+            .upsert_deposed_generation(
+                &id.provider,
+                &id.resource_type,
+                resolved_resource.identity(),
+                id.provider_instance.clone(),
+                DeposedInstance::from_persisted_json(
+                    DeposedKey::new_unique(),
+                    "old-id".to_string(),
+                    None,
+                    HashMap::from([("name".to_string(), serde_json::json!("old"))]),
+                    BTreeSet::from(["dependency".to_string()]),
+                ),
+            )
+            .expect("deposed fixture is valid");
+        let before = initial
+            .find_resource_for_id(&id)
+            .expect("row with deposed generation")
+            .clone();
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(initial),
+                sorted_resources: std::slice::from_ref(&resolved_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), Applied::CreateEnded)]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("ended create writeback");
+
+        let row = saved
+            .find_resource_for_id(&id)
+            .expect("deposed generation keeps the address row");
+        assert!(matches!(row.current(), CurrentInstance::None));
+        assert_eq!(
+            serde_json::to_value(&row.deposed).unwrap(),
+            serde_json::to_value(&before.deposed).unwrap()
+        );
+        assert_eq!(row.binding, before.binding);
+        assert_eq!(row.dependency_bindings, before.dependency_bindings);
+        assert_eq!(row.directives, before.directives);
+        assert_eq!(row.prefixes, before.prefixes);
+        assert_eq!(row.name_overrides, before.name_overrides);
+        assert_eq!(row.explicit, before.explicit);
+        assert_eq!(row.protected, before.protected);
     }
 
     #[test]
@@ -1568,7 +2864,7 @@ mod apply_state_save_tests {
                 sorted_resources: &[resolved(resource)],
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, applied_state)]),
+                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -1584,6 +2880,7 @@ mod apply_state_save_tests {
                 .expect("written listener row");
             let stored_json = PersistedValue::encode_provider_value(
                 &row.persisted_attributes()
+                    .expect("listener has applied attributes")
                     .get("rules")
                     .expect("stored rules"),
                 None,
@@ -1642,7 +2939,10 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "new-temp"))]);
+        let applied_states = HashMap::from([(
+            id.clone(),
+            Applied::Complete(applied_name_state(&id, "new-temp")),
+        )]);
         let plan = plan_with_name_override(&id, "new-temp", "dsl-new");
 
         let state = build_state_after_apply(
@@ -1695,7 +2995,10 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "legacy-temp"))]);
+        let applied_states = HashMap::from([(
+            id.clone(),
+            Applied::Complete(applied_name_state(&id, "legacy-temp")),
+        )]);
         let plan = plan_with_name_override(&id, "legacy-temp", "dsl-value");
 
         let state = build_state_after_apply(
@@ -1749,7 +3052,10 @@ mod apply_state_save_tests {
                 state_file: Some(StateFile::new()),
                 sorted_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(child_id.clone(), child_state)]),
+                applied_states: &HashMap::from([(
+                    child_id.clone(),
+                    Applied::Complete(child_state),
+                )]),
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -1775,10 +3081,10 @@ mod apply_state_save_tests {
     fn successfully_deleted_uses_full_resource_id_not_identity_only() {
         let id_a = ResourceId::with_provider_identity("mock", "type.A", "shared", None);
         let id_b = ResourceId::with_provider_identity("mock", "type.B", "shared", None);
-        let mut row_a = ResourceState::new("type.A", "shared", "mock");
-        row_a.identifier = Some("a-old".to_string());
-        let mut row_b = ResourceState::new("type.B", "shared", "mock");
-        row_b.identifier = Some("b-old".to_string());
+        let row_a = ResourceState::try_applied("type.A", "shared", "mock", "a-old")
+            .expect("fixture identifier is non-empty");
+        let row_b = ResourceState::try_applied("type.B", "shared", "mock", "b-old")
+            .expect("fixture identifier is non-empty");
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row_a)
@@ -1838,8 +3144,13 @@ mod apply_state_save_tests {
             None,
         );
         let deposed_key = DeposedKey::new_unique();
-        let mut row = ResourceState::new("route53.Record", "validation_records[0]", "aws");
-        row.identifier = Some("new-record-id".to_string());
+        let mut row = ResourceState::try_applied(
+            "route53.Record",
+            "validation_records[0]",
+            "aws",
+            "new-record-id",
+        )
+        .expect("fixture identifier is non-empty");
         row.deposed.push(DeposedInstance::from_persisted_json(
             deposed_key.clone(),
             "old-record-id".to_string(),
@@ -1913,7 +3224,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("new-record-id"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("new-record-id")
+        );
         assert!(
             row.deposed.is_empty(),
             "successful top-level deposed delete must remove its stored generation"
@@ -1979,7 +3293,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
         let failed_refreshes = HashSet::new();
@@ -2039,9 +3353,14 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("old-record-id");
-        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
-            .with_identifier("old-record-id")
-            .with_attribute("name", serde_json::json!("old.example.com"));
+        let mut existing = ResourceState::try_applied(
+            "route53.Record",
+            "validation_records[0]",
+            "aws",
+            "old-record-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("name", serde_json::json!("old.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
         existing.dependency_bindings.insert("cert".to_string());
         let mut state_file = StateFile::new();
@@ -2051,7 +3370,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -2072,7 +3391,10 @@ mod apply_state_save_tests {
         let saved = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("new child row should be persisted");
-        assert_eq!(saved.identifier.as_deref(), Some("new-record-id"));
+        assert_eq!(
+            saved.identifier().map(|value| value.as_str()),
+            Some("new-record-id")
+        );
         assert_eq!(saved.directives.provider_instance.as_deref(), Some("west"));
         let saved_json = serde_json::to_value(saved).expect("resource state should serialize");
         let deposed = saved_json
@@ -2104,7 +3426,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -2125,7 +3447,10 @@ mod apply_state_save_tests {
         let saved = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("current row should be persisted");
-        assert_eq!(saved.identifier.as_deref(), Some("old-record-id"));
+        assert_eq!(
+            saved.identifier().map(|value| value.as_str()),
+            Some("old-record-id")
+        );
         assert!(
             saved.deposed.is_empty(),
             "same remote object must not be recorded as a deposed generation"
@@ -2141,8 +3466,8 @@ mod apply_state_save_tests {
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
-        let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-canonical-old")
+        let existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-canonical-old")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         let mut state_file = StateFile::new();
         state_file
@@ -2178,7 +3503,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, applied_state)]),
+                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2191,7 +3516,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("vpc-canonical-new"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-canonical-new")
+        );
         assert!(
             row.deposed.is_empty(),
             "update-only identifier rewrites are the same live remote object"
@@ -2207,8 +3535,8 @@ mod apply_state_save_tests {
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
-        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-old")
+        let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.dependency_bindings.insert("igw".to_string());
         let mut state_file = StateFile::new();
@@ -2234,7 +3562,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, applied_state)]),
+                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2247,7 +3575,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-new")
+        );
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].identifier, "vpc-old");
         assert_eq!(
@@ -2269,8 +3600,8 @@ mod apply_state_save_tests {
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
-        let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-old")
+        let existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         let mut state_file = StateFile::new();
         state_file
@@ -2296,7 +3627,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(current_state))]),
-                applied_states: &HashMap::from([(id, applied_state)]),
+                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2309,7 +3640,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-new")
+        );
         assert!(
             row.deposed.is_empty(),
             "pre-apply exists=false proves the displaced identifier is already gone"
@@ -2326,8 +3660,8 @@ mod apply_state_save_tests {
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
                 );
         let id = desired.id.clone();
-        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-old")
+        let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.directives.provider_instance = Some("old-provider".to_string());
         let mut state_file = StateFile::new();
@@ -2353,7 +3687,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, applied_state)]),
+                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2366,7 +3700,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-new")
+        );
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].identifier, "vpc-old");
         assert_eq!(
@@ -2393,8 +3730,8 @@ mod apply_state_save_tests {
             "main",
             Some("old-provider".to_string()),
         );
-        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-old")
+        let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.directives.provider_instance = Some("old-provider".to_string());
         let mut state_file = StateFile::new();
@@ -2450,7 +3787,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(create_id, applied_state)]),
+                applied_states: &HashMap::from([(create_id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -2463,7 +3800,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-new")
+        );
         assert!(
             row.deposed.is_empty(),
             "a displaced identifier that was deleted through the old provider routing must not be phantom-deposed"
@@ -2480,8 +3820,8 @@ mod apply_state_save_tests {
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
                 );
         let create_id = desired.id.clone();
-        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("shared-name")
+        let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "shared-name")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.directives.provider_instance = Some("old-provider".to_string());
         let mut state_file = StateFile::new();
@@ -2511,7 +3851,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(create_id, applied_state)]),
+                applied_states: &HashMap::from([(create_id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -2524,7 +3864,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-new")
+        );
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].identifier, "shared-name");
         assert_eq!(
@@ -2548,9 +3891,14 @@ mod apply_state_save_tests {
             Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
         );
         let id = desired.id.clone();
-        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
-            .with_identifier("new-1-record-id")
-            .with_attribute("name", serde_json::json!("new-1.example.com"));
+        let mut existing = ResourceState::try_applied(
+            "route53.Record",
+            "validation_records[0]",
+            "aws",
+            "new-1-record-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("name", serde_json::json!("new-1.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
         existing.deposed.push(DeposedInstance::from_persisted_json(
             DeposedKey::new_unique(),
@@ -2611,7 +3959,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, applied_state)]),
+                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2624,7 +3972,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("new-2-record-id"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("new-2-record-id")
+        );
         let mut deposed: Vec<_> = row
             .deposed
             .iter()
@@ -2661,9 +4012,14 @@ mod apply_state_save_tests {
             Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
         );
         let id = desired.id.clone();
-        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
-            .with_identifier("new-1-record-id")
-            .with_attribute("name", serde_json::json!("new-1.example.com"));
+        let mut existing = ResourceState::try_applied(
+            "route53.Record",
+            "validation_records[0]",
+            "aws",
+            "new-1-record-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("name", serde_json::json!("new-1.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
         existing.deposed.push(DeposedInstance::from_persisted_json(
             DeposedKey::new_unique(),
@@ -2726,7 +4082,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, applied_state)]),
+                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -2739,7 +4095,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("new-2-record-id"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("new-2-record-id")
+        );
         let mut deposed: Vec<_> = row
             .deposed
             .iter()
@@ -2770,8 +4129,8 @@ mod apply_state_save_tests {
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
-        let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
-            .with_identifier("vpc-old")
+        let existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
+            .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         let mut state_file = StateFile::new();
         state_file
@@ -2805,7 +4164,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "ec2.Vpc", "main")
             .expect("current row should remain");
-        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("vpc-new")
+        );
         assert!(
             row.deposed.is_empty(),
             "refresh-only current-state upserts must not depose the previous identifier"
@@ -2819,8 +4181,8 @@ mod apply_state_save_tests {
             Value::Concrete(ConcreteValue::String("plain-secret".into())),
         );
         let id = desired.id.clone();
-        let existing = ResourceState::new("db.Instance", "main", "awscc")
-            .with_identifier("db-1")
+        let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-1")
+            .expect("fixture identifier is non-empty")
             .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
         let mut state_file = StateFile::new();
         state_file
@@ -2856,7 +4218,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), applied_state)]),
+                applied_states: &HashMap::from([(id.clone(), Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2870,7 +4232,9 @@ mod apply_state_save_tests {
             .find_resource("awscc", "db.Instance", "main")
             .expect("row should be saved");
         assert_eq!(
-            row.persisted_attributes().get("password"),
+            row.persisted_attributes()
+                .expect("row has applied attributes")
+                .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
         );
 
@@ -2879,6 +4243,9 @@ mod apply_state_save_tests {
             carina_core::resource::Current::Absent(state) => state.into_state(),
             carina_core::resource::Current::Present(present) => present.into_parts().0,
             carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
+            carina_core::resource::Current::CreateInFlight(pending) => {
+                panic!("saved applied row unexpectedly remained in flight: {pending:?}")
+            }
         };
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let second_plan = create_plan(
@@ -2933,7 +4300,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), applied_state)]),
+                applied_states: &HashMap::from([(id.clone(), Applied::Complete(applied_state))]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2947,7 +4314,9 @@ mod apply_state_save_tests {
             .find_resource("mock", "test.resource", "plain-marker")
             .expect("applied row must be saved");
         assert_eq!(
-            row.persisted_attributes().get("password"),
+            row.persisted_attributes()
+                .expect("row has applied attributes")
+                .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!(marker)),
         );
     }
@@ -2959,8 +4328,8 @@ mod apply_state_save_tests {
             Value::Concrete(ConcreteValue::String("plain-secret".into())),
         );
         let id = desired.id.clone();
-        let existing = ResourceState::new("db.Instance", "main", "awscc")
-            .with_identifier("db-1")
+        let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-1")
+            .expect("fixture identifier is non-empty")
             .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
         let mut state_file = StateFile::new();
         state_file
@@ -2988,7 +4357,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), applied_state)]),
+                applied_states: &HashMap::from([(id.clone(), Applied::Complete(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3002,16 +4371,21 @@ mod apply_state_save_tests {
             .find_resource("awscc", "db.Instance", "main")
             .expect("row should be saved");
         assert_eq!(
-            row.persisted_attributes().get("password"),
+            row.persisted_attributes()
+                .expect("row has applied attributes")
+                .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
         );
-        assert_eq!(row.write_only_attributes, vec!["password"]);
+        assert_eq!(row.write_only_attributes(), ["password"]);
 
         let loaded = saved.build_state_for_resource(&id);
         let current_state = match loaded {
             carina_core::resource::Current::Absent(state) => state.into_state(),
             carina_core::resource::Current::Present(present) => present.into_parts().0,
             carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
+            carina_core::resource::Current::CreateInFlight(pending) => {
+                panic!("saved applied row unexpectedly remained in flight: {pending:?}")
+            }
         };
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let second_plan = create_plan(
@@ -3074,7 +4448,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -3145,9 +4519,14 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("old-record-id");
-        let existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
-            .with_identifier("stale-record-id")
-            .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
+        let existing = ResourceState::try_applied(
+            "route53.Record",
+            "validation_records[0]",
+            "aws",
+            "stale-record-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -3155,7 +4534,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -3223,7 +4602,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
@@ -3294,8 +4673,8 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("missing row should be created for deposed instance");
-        assert_eq!(row.identifier, None);
-        assert!(row.persisted_attributes().is_empty());
+        assert_eq!(row.identifier(), None);
+        assert!(row.persisted_attributes().is_none());
         assert_eq!(row.directives.provider_instance.as_deref(), Some("west"));
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].identifier, "old-record-id");
@@ -3410,9 +4789,14 @@ mod apply_state_save_tests {
         )
         .with_identifier("old-record-id");
         let first_key = DeposedKey::new_unique();
-        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
-            .with_identifier("old-record-id")
-            .with_attribute("name", serde_json::json!("old.example.com"));
+        let mut existing = ResourceState::try_applied(
+            "route53.Record",
+            "validation_records[0]",
+            "aws",
+            "old-record-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("name", serde_json::json!("old.example.com"));
         existing.deposed.push(DeposedInstance::from_persisted_json(
             first_key.clone(),
             "older-record-id".to_string(),
@@ -3427,7 +4811,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -3448,7 +4832,10 @@ mod apply_state_save_tests {
         let saved = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("new child row should be persisted");
-        assert_eq!(saved.identifier.as_deref(), Some("new-record-id"));
+        assert_eq!(
+            saved.identifier().map(|value| value.as_str()),
+            Some("new-record-id")
+        );
         assert_eq!(saved.deposed.len(), 2);
         assert_eq!(saved.deposed[0].identifier, "older-record-id");
         assert_eq!(saved.deposed[1].identifier, "old-record-id");
@@ -3659,10 +5046,11 @@ mod apply_state_save_tests {
             None,
         )
         .expect("persist previous secret marker");
-        let mut existing = ResourceState::new("s3.Bucket", "old_bucket", "awscc")
-            .with_identifier("bucket-old-id")
-            .with_attribute("bucket_name", serde_json::json!("old-name"))
-            .with_attribute("comment", persisted_secret.as_json().clone());
+        let mut existing =
+            ResourceState::try_applied("s3.Bucket", "old_bucket", "awscc", "bucket-old-id")
+                .expect("fixture identifier is non-empty")
+                .with_attribute("bucket_name", serde_json::json!("old-name"))
+                .with_attribute("comment", persisted_secret.as_json().clone());
         existing.dependency_bindings.insert("logs".to_string());
         let mut state_file = StateFile::new();
         state_file
@@ -3676,7 +5064,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("bucket-new-id");
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -3697,7 +5085,10 @@ mod apply_state_save_tests {
         let row = state
             .find_resource("awscc", "s3.Bucket", "new_bucket")
             .expect("moved target row should be persisted");
-        assert_eq!(row.identifier.as_deref(), Some("bucket-new-id"));
+        assert_eq!(
+            row.identifier().map(|value| value.as_str()),
+            Some("bucket-new-id")
+        );
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].identifier, "bucket-old-id");
         assert_eq!(row.deposed[0].provider_instance, None);
@@ -3737,7 +5128,7 @@ mod apply_state_save_tests {
             )),
         });
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
         let successfully_deleted = HashSet::new();
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
@@ -3768,7 +5159,8 @@ mod export_writeback_tests {
     use super::*;
     use carina_core::parser::{InferredExportParam, TypeExpr};
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker, Value,
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
+        UnknownReason, Value,
     };
     use carina_state::{ResourceState, StateFile};
 
@@ -3809,16 +5201,20 @@ mod export_writeback_tests {
     }
 
     #[test]
-    fn partial_read_row_keeps_missing_post_apply_export_attribute_absent() {
+    fn partial_read_row_keeps_runtime_unknown_out_of_persisted_exports() {
         let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
         let provider_state = State::existing(id.clone(), HashMap::new()).with_identifier("main-id");
-        let mut row = ResourceState::new("test.Resource", "main", "mock")
-            .with_attributes_from_state(&provider_state)
-            .expect("partial-read fixture must encode");
-        row.partial_read = Some(PartialReadMarker {
-            detail: "provider read after create did not return every attribute".to_string(),
-            missing_attributes: BTreeSet::from(["computed".to_string()]),
-        });
+        let mut row =
+            ResourceState::from_provider_state("test.Resource", "main", "mock", &provider_state)
+                .expect("partial-read fixture must encode");
+        row = crate::fixture_resource_state_metadata(
+            row,
+            None,
+            Some(Some(PartialReadMarker {
+                detail: "provider read after create did not return every attribute".to_string(),
+                missing_attributes: BTreeSet::from(["computed".to_string()]),
+            })),
+        );
         row.dependency_bindings = BTreeSet::from(["upstream".to_string()]);
         let mut state = StateFile::new();
         state
@@ -3844,11 +5240,20 @@ mod export_writeback_tests {
         match current {
             Current::Absent(state) => panic!("partial-read row was classified absent: {state:?}"),
             Current::Present(present) => {
-                assert_eq!(present.state().partial_read, None);
-                assert!(present.state().dependency_bindings.is_empty());
+                assert!(matches!(
+                    &present.state().partial_read,
+                    Some(marker) if marker.missing_attributes.contains("computed")
+                ));
+                assert_eq!(
+                    present.state().dependency_bindings,
+                    BTreeSet::from(["upstream".to_string()])
+                );
             }
             Current::MissingIdentifier(state) => {
                 panic!("partial-read row lost its identifier: {state:?}")
+            }
+            Current::CreateInFlight(pending) => {
+                panic!("partial-read row unexpectedly remained in flight: {pending:?}")
             }
         }
 
@@ -3864,16 +5269,20 @@ mod export_writeback_tests {
         })
         .expect("post-apply export resolution should succeed");
 
-        assert_eq!(
-            values.as_slice()[0].value,
-            Some(reference),
-            "HEAD treated a missing persisted attribute as absent, not as a partial-read Unknown"
-        );
+        assert!(matches!(
+            &values.as_slice()[0].value,
+            Some(Value::Deferred(DeferredValue::Unknown(
+                UnknownReason::PostCreateReadIncomplete { detail }
+            ))) if detail == "provider read after create did not return every attribute"
+        ));
         let (_, skipped) = materialize_exports(&values)
             .expect("unresolved export must be skippable")
             .into_parts();
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].reason, "unresolved reference instance.computed");
+        assert_eq!(
+            skipped[0].reason,
+            "value not yet known (post-create read failed: provider read after create did not return every attribute)"
+        );
     }
 
     #[test]
@@ -4191,12 +5600,13 @@ mod stage4_unknown_err_tests {
         let value = enum_shaped_user_map();
         let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
         let state = State::existing(id, HashMap::from([("payload".to_string(), value.clone())]));
-        let row = ResourceState::new("test.Resource", "main", "mock")
-            .with_attributes_from_state(&state)
+        let row = ResourceState::from_provider_state("test.Resource", "main", "mock", &state)
             .expect("attribute writeback succeeds");
 
         assert_eq!(
-            row.persisted_attributes().get("payload"),
+            row.persisted_attributes()
+                .expect("row has applied attributes")
+                .get("payload"),
             Some(value.clone())
         );
 

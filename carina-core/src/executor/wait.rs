@@ -17,7 +17,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::Instant;
 
 use crate::executor::scheduler::FailureView;
-use crate::executor::{ExecutionEvent, ExecutionObserver};
+use crate::executor::{Applied, ExecutionEvent, ExecutionObserver};
 use crate::provider::{AppliedIdentifier, Provider, ProviderError, ReadRequest};
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
@@ -41,6 +41,7 @@ fn initial_wait_identifiers(
             let identifier = match current {
                 Current::Absent(_state) => None,
                 Current::Present(present) => Some(present.identifier().clone()),
+                Current::CreateInFlight(_pending) => None,
                 Current::MissingIdentifier(_state) => None,
             };
             (id.clone(), identifier)
@@ -69,7 +70,7 @@ pub(crate) fn resolve_wait_identifier(
 }
 
 pub(crate) struct AppliedStates {
-    states: HashMap<ResourceId, State>,
+    states: HashMap<ResourceId, Applied>,
     wait_identifiers: SharedWaitIdentifiers,
 }
 
@@ -86,7 +87,7 @@ impl AppliedStates {
         (applied_states, shared)
     }
 
-    pub(crate) fn insert(&mut self, id: ResourceId, state: State) {
+    pub(crate) fn insert_published(&mut self, id: ResourceId, applied: Applied, state: &State) {
         self.wait_identifiers
             .lock()
             .expect("wait identifier map poisoned")
@@ -97,10 +98,14 @@ impl AppliedStates {
                     .as_deref()
                     .and_then(|identifier| AppliedIdentifier::new(identifier).ok()),
             );
-        self.states.insert(id, state);
+        self.states.insert(id, applied);
     }
 
-    pub(crate) fn into_inner(self) -> HashMap<ResourceId, State> {
+    pub(crate) fn insert_unpublished(&mut self, id: ResourceId, applied: Applied) {
+        self.states.insert(id, applied);
+    }
+
+    pub(crate) fn into_inner(self) -> HashMap<ResourceId, Applied> {
         self.states
     }
 }
@@ -650,14 +655,24 @@ mod tests {
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+            _attempt: crate::provider::CreateAttempt,
+        ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>>
+        {
             let id = id.clone();
             Box::pin(async move {
-                Ok(crate::provider::CreateOutcome::Success {
-                    state: AppliedState::new(id, "created-id", HashMap::new())
+                Ok(crate::provider::CreateOutcome::fixture_success(
+                    AppliedState::new(id, "created-id", HashMap::new())
                         .expect("fixture identifier is non-empty"),
-                })
+                ))
             })
+        }
+
+        fn resume_create(
+            &self,
+            _request: crate::provider::ResumeCreateRequest,
+        ) -> BoxFuture<'_, Result<crate::provider::ResumeOutcome, crate::provider::ResumeFailure>>
+        {
+            Box::pin(async { panic!("unexpected resume_create") })
         }
 
         fn update(

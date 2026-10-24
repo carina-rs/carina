@@ -294,6 +294,7 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
     match effect {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
         Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
+        Effect::ResumeCreate { resource, .. } => vec![(resource.id.clone(), PlanOp::Create)],
         Effect::Update { to, .. } => vec![(to.id.clone(), PlanOp::Update)],
         Effect::Delete { id, .. } => vec![(id.clone().into_inner(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone().into_inner(), PlanOp::Read)],
@@ -319,6 +320,7 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
     match effect {
         Effect::Read { resource } => vec![&resource.id],
         Effect::Create(resource) => vec![&resource.id],
+        Effect::ResumeCreate { resource, .. } => vec![&resource.id],
         Effect::Update { to, .. } => vec![&to.id],
         Effect::Delete { id, .. } => vec![id.as_inner()],
         Effect::Import { id, .. } => vec![id.as_inner()],
@@ -796,8 +798,22 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-            Box::pin(async { Err(ProviderError::internal("unused")) })
+            attempt: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
+            Box::pin(async move { Err(attempt.untracked(ProviderError::internal("unused"))) })
+        }
+
+        fn resume_create(
+            &self,
+            _request: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            Box::pin(async { panic!("unexpected resume_create") })
         }
 
         fn update(

@@ -419,6 +419,18 @@ fn create_plan_parts(
         );
         match current.current() {
             Current::Absent(_absent) => plan.add(Effect::Create(resource.clone())),
+            Current::CreateInFlight(pending) => {
+                if pending.id() == &resource.id {
+                    plan.add_resume_create(resource.clone(), pending.started_at().clone());
+                } else {
+                    plan.add_error(PlanError::new(
+                        resource.id.clone(),
+                        PlanErrorKind::ResumeCreateRoutingMismatch {
+                            persisted: pending.id().clone(),
+                        },
+                    ));
+                }
+            }
             Current::MissingIdentifier(_unidentified) => {
                 plan.add_error(PlanError::new(
                     resource.id.clone(),
@@ -509,6 +521,13 @@ fn create_plan_parts(
         let (state, identifier) = match orphan.current() {
             Current::Absent(_state) => continue,
             Current::Present(present) => (present.state(), present.identifier().clone()),
+            Current::CreateInFlight(_pending) => {
+                plan.add_error(PlanError::new(
+                    id.clone(),
+                    PlanErrorKind::CreateInFlightOrphan,
+                ));
+                continue;
+            }
             Current::MissingIdentifier(_state) => {
                 plan.add_error(PlanError::new(
                     id.clone(),
@@ -677,6 +696,7 @@ fn create_plan_parts(
                     .and_then(|current| match current.current() {
                         Current::Absent(_absent) => None,
                         Current::Present(present) => Some(present.state()),
+                        Current::CreateInFlight(_pending) => None,
                         Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
                     })
             }
@@ -1157,6 +1177,7 @@ fn promote_resource_to_pending_replace(
                 Box::new(present.state().clone()),
                 present.identifier().clone(),
             ),
+            Current::CreateInFlight(_pending) => return None,
             Current::MissingIdentifier(_state) => {
                 plan.add_error(PlanError::new(
                     resource.id.clone(),
@@ -1243,6 +1264,7 @@ fn ensure_consumer_update(
     let (from, identifier) = match current.current() {
         Current::Absent(_state) => return false,
         Current::Present(present) => (present.state().clone(), present.identifier().clone()),
+        Current::CreateInFlight(_pending) => return false,
         Current::MissingIdentifier(_state) => {
             plan.add_error(PlanError::new(
                 resource.id.clone(),

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
@@ -9,8 +8,7 @@ use crate::provider::{
     BoxFuture, NoopNormalizer, ProviderError, ProviderNormalizer, ProviderResult, ready_noop,
 };
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, UnknownReason,
-    Value,
+    ConcreteValue, DeferredValue, InterpolationPart, Resource, UnknownReason, Value,
 };
 use crate::schema::SchemaRegistry;
 
@@ -51,14 +49,14 @@ async fn normalization_error_stops_later_stages() {
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
@@ -251,14 +249,14 @@ async fn desired_normalization_runs_stages_in_order() {
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
@@ -331,14 +329,14 @@ async fn desired_normalization_lifts_guest_string_alias_to_api_enum() {
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
@@ -389,14 +387,14 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
@@ -674,14 +672,14 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
@@ -748,14 +746,14 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
 
         fn normalize_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
-            _current_states: &'a mut HashMap<ResourceId, State>,
+            _current_states: &'a mut crate::provider::StateTransformMap,
             _saved_attrs: &'a crate::provider::SavedAttrs,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
