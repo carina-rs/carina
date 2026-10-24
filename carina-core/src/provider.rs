@@ -21,12 +21,12 @@ use carina_provider_protocol::types::{
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker,
-    ResolvedResource, Resource, ResourceId, State, Value, ValueString,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, Resource,
+    ResourceId, State, Value, ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
-use crate::schema::{ResourceSchema, SchemaRegistry, Shape, TypeIdentity};
+use crate::schema::{SchemaRegistry, Shape, TypeIdentity};
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
 };
@@ -914,24 +914,6 @@ pub enum PreviousSecretHashAuthority<'a> {
     OnlyKeysAbsentFromDesired(&'a PersistedAttributes),
 }
 
-impl<'a> PreviousSecretHashAuthority<'a> {
-    fn protects_key(self, key_is_desired: bool) -> bool {
-        match self {
-            Self::None => false,
-            Self::AllPreviouslyHashedKeys(_) => true,
-            Self::OnlyKeysAbsentFromDesired(_) => !key_is_desired,
-        }
-    }
-
-    fn attributes(self) -> Option<&'a PersistedAttributes> {
-        match self {
-            Self::None => None,
-            Self::AllPreviouslyHashedKeys(attributes)
-            | Self::OnlyKeysAbsentFromDesired(attributes) => Some(attributes),
-        }
-    }
-}
-
 /// Select the saved-plan hash for an attribute, falling back to the current
 /// state's hash when the plan did not capture one.
 pub fn previous_hash<'a>(
@@ -1083,200 +1065,6 @@ impl PersistedAttributes {
             .collect()
     }
 
-    /// Encode provider/history values for state writeback, skipping values
-    /// that cannot be represented and protecting all known secret shapes.
-    pub fn encode_values_for_resource_and_schema(
-        resource: &ResolvedResource,
-        schema: Option<&ResourceSchema>,
-        attributes: &HashMap<String, Value>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> Self {
-        let serialized = attributes
-            .iter()
-            .filter_map(|(key, value)| {
-                PersistedValue::encode_provider_value(value, None)
-                    .ok()
-                    .map(|value| (key.clone(), value))
-            })
-            .collect();
-        Self::protect_serialized(
-            resource,
-            schema,
-            serialized,
-            previous_hash_authority,
-            None,
-            false,
-        )
-        .expect("lossy secret protection does not return serialization errors")
-    }
-
-    /// Apply desired/schema/previous-state secret protection to values already
-    /// encoded in the state-file representation.
-    pub fn protect_for_resource_and_schema(
-        self,
-        resource: &ResolvedResource,
-        schema: Option<&ResourceSchema>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> Self {
-        let Self { encoded } = self;
-        Self::protect_serialized(
-            resource,
-            schema,
-            encoded,
-            previous_hash_authority,
-            None,
-            false,
-        )
-        .expect("lossy secret protection does not return serialization errors")
-    }
-
-    /// Strict protection used after a provider read has already been encoded.
-    /// `preferred` supplies same-path hashes committed by a saved plan.
-    pub fn try_protect_for_resource_and_schema(
-        self,
-        resource: &ResolvedResource,
-        schema: Option<&ResourceSchema>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
-        preferred: Option<&PersistedAttributes>,
-    ) -> Result<Self, crate::value::SerializationError> {
-        let Self { encoded } = self;
-        Self::protect_serialized(
-            resource,
-            schema,
-            encoded,
-            previous_hash_authority,
-            preferred,
-            true,
-        )
-    }
-
-    /// Protect values selected for a created-then-failed row without adding
-    /// any value that was neither observed nor actually sent.
-    ///
-    /// This differs deliberately from complete-state writeback: desired
-    /// values decide which existing values are masked, but a missing desired
-    /// value is never copied into the row merely because it is secret.
-    pub fn try_protect_observation_for_resource_and_schema(
-        self,
-        resource: &ResolvedResource,
-        schema: Option<&ResourceSchema>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
-        preferred: Option<&PersistedAttributes>,
-        sent_write_only: &std::collections::HashSet<String>,
-    ) -> Result<Self, crate::value::SerializationError> {
-        let Self {
-            encoded: mut serialized,
-        } = self;
-        let mut protected_secret_keys = std::collections::HashSet::new();
-
-        for (key, desired_value) in &resource.attributes {
-            if !crate::value::contains_unredacted_secret(desired_value) {
-                continue;
-            }
-            let Some(provider_or_sent_value) = serialized.get(key).cloned() else {
-                continue;
-            };
-            let previous = previous_hash(preferred, previous_hash_authority.attributes(), key);
-            let masked = crate::value::merge_secrets_into_observation_json(
-                desired_value,
-                &provider_or_sent_value,
-                previous,
-            )?;
-            serialized.insert(key.clone(), masked);
-            protected_secret_keys.insert(key.clone());
-        }
-
-        let present_keys = serialized
-            .keys()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        protect_previously_hashed_secrets(
-            |key| resource.attributes.contains_key(key),
-            previous_hash_authority,
-            &mut serialized,
-            &mut protected_secret_keys,
-        );
-        let mut retained_write_only = protected_secret_keys;
-        retained_write_only.extend(sent_write_only.iter().cloned());
-        remove_unprotected_write_only_attributes(schema, &retained_write_only, &mut serialized);
-        serialized.retain(|key, _value| present_keys.contains(key));
-
-        Ok(Self {
-            encoded: serialized,
-        })
-    }
-
-    /// Protect a provider read for an orphan, where no desired resource is
-    /// available to supply secrets. Previously hashed values remain opaque and
-    /// schema write-only plaintext is not persisted.
-    pub fn protect_for_orphan_refresh(
-        self,
-        schema: Option<&ResourceSchema>,
-        previous: &PersistedAttributes,
-    ) -> Self {
-        let mut serialized = self.encoded;
-        let mut protected_secret_keys = std::collections::HashSet::new();
-        protect_previously_hashed_secrets(
-            |_| false,
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
-            &mut serialized,
-            &mut protected_secret_keys,
-        );
-        remove_unprotected_write_only_attributes(schema, &protected_secret_keys, &mut serialized);
-        Self {
-            encoded: serialized,
-        }
-    }
-
-    fn protect_serialized(
-        resource: &ResolvedResource,
-        schema: Option<&ResourceSchema>,
-        mut serialized: HashMap<String, PersistedValue>,
-        previous_hash_authority: PreviousSecretHashAuthority<'_>,
-        preferred: Option<&PersistedAttributes>,
-        strict_desired: bool,
-    ) -> Result<Self, crate::value::SerializationError> {
-        let mut protected_secret_keys = std::collections::HashSet::new();
-
-        for (key, desired_value) in &resource.attributes {
-            if !crate::value::contains_unredacted_secret(desired_value) {
-                continue;
-            }
-            let previous = previous_hash(preferred, previous_hash_authority.attributes(), key);
-            let masked = if let Some(provider_value) = serialized.get(key).cloned() {
-                crate::value::merge_secrets_into_provider_json(
-                    desired_value,
-                    &provider_value,
-                    previous,
-                )
-            } else {
-                PersistedValue::encode_desired_value(desired_value, previous)
-            };
-            match masked {
-                Ok(masked) => {
-                    serialized.insert(key.clone(), masked);
-                    protected_secret_keys.insert(key.clone());
-                }
-                Err(error) if strict_desired => return Err(error),
-                Err(_) => {
-                    serialized.remove(key);
-                }
-            }
-        }
-
-        protect_previously_hashed_secrets(
-            |key| resource.attributes.contains_key(key),
-            previous_hash_authority,
-            &mut serialized,
-            &mut protected_secret_keys,
-        );
-        remove_unprotected_write_only_attributes(schema, &protected_secret_keys, &mut serialized);
-
-        Ok(Self {
-            encoded: serialized,
-        })
-    }
-
     pub(crate) fn encoded(&self) -> &HashMap<String, PersistedValue> {
         &self.encoded
     }
@@ -1323,57 +1111,28 @@ fn contains_secret_hash_view(value: PersistedView<'_>) -> bool {
     secret_hash_shape_view(value) != SecretHashShape::None
 }
 
-fn protect_previously_hashed_secrets(
-    is_desired_key: impl Fn(&str) -> bool,
-    authority: PreviousSecretHashAuthority<'_>,
-    serialized: &mut HashMap<String, PersistedValue>,
-    protected_secret_keys: &mut std::collections::HashSet<String>,
-) {
-    let Some(existing_attributes) = authority.attributes() else {
-        return;
-    };
-    for (key, previous_value) in existing_attributes.encoded() {
-        if protected_secret_keys.contains(key) || !authority.protects_key(is_desired_key(key)) {
-            continue;
+/// Preserve secret hashes from a previous persisted value while retaining
+/// provider material at every unprotected path. Returns `None` when the
+/// previous value contains no secret hash.
+pub fn merge_previous_secret_hashes_into_provider_value(
+    previous_value: &PersistedValue,
+    provider_value: Option<&PersistedValue>,
+) -> Option<PersistedValue> {
+    match (secret_hash_shape(previous_value), provider_value) {
+        (SecretHashShape::None, _) => None,
+        (SecretHashShape::TopLevel, Some(provider_value))
+            if secret_hash_shape(provider_value) == SecretHashShape::TopLevel =>
+        {
+            Some(provider_value.clone())
         }
-        let shape = secret_hash_shape(previous_value);
-        if shape == SecretHashShape::None {
-            continue;
-        }
-        let masked = match (shape, serialized.get(key)) {
-            (SecretHashShape::TopLevel, Some(provider_json))
-                if secret_hash_shape(provider_json) == SecretHashShape::TopLevel =>
-            {
-                provider_json.clone()
-            }
-            (SecretHashShape::TopLevel, Some(provider_json)) => {
-                hash_provider_json_as_secret(provider_json, Some(previous_value))
-                    .unwrap_or_else(|_| previous_value.clone())
-            }
-            (SecretHashShape::TopLevel, None) => previous_value.clone(),
-            (SecretHashShape::Nested, provider_json) => {
-                merge_previous_secret_hashes_into_provider_json(previous_value, provider_json)
-            }
-            // The guard above keeps this arm out of ordinary execution, but
-            // handling it explicitly keeps the totality of the match local.
-            (SecretHashShape::None, _) => continue,
-        };
-        serialized.insert(key.clone(), masked);
-        protected_secret_keys.insert(key.clone());
-    }
-}
-
-fn remove_unprotected_write_only_attributes(
-    schema: Option<&ResourceSchema>,
-    protected_secret_keys: &std::collections::HashSet<String>,
-    serialized: &mut HashMap<String, PersistedValue>,
-) {
-    if let Some(schema) = schema {
-        for (key, attribute) in &schema.attributes {
-            if attribute.write_only && !protected_secret_keys.contains(key) {
-                serialized.remove(key);
-            }
-        }
+        (SecretHashShape::TopLevel, Some(provider_value)) => Some(
+            hash_provider_json_as_secret(provider_value, Some(previous_value))
+                .unwrap_or_else(|_| previous_value.clone()),
+        ),
+        (SecretHashShape::TopLevel, None) => Some(previous_value.clone()),
+        (SecretHashShape::Nested, provider_value) => Some(
+            merge_previous_secret_hashes_into_provider_json(previous_value, provider_value),
+        ),
     }
 }
 

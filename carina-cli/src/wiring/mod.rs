@@ -2374,6 +2374,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
             inputs.multi,
             children,
             inputs.state_file,
+            inputs.schemas,
             inputs.saved_dep_bindings,
             inputs.managed_current,
         )
@@ -2534,6 +2535,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             &multi,
             sorted_resources.iter(),
             state_file,
+            ctx.schemas(),
             &saved_dep_bindings,
             &mut managed_current,
         )
@@ -2549,8 +2551,14 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
             let loaded_orphans = sf.build_orphans(&desired_ids);
             refresh_printed_bars |= !loaded_orphans.is_empty();
-            let refreshed =
-                refresh_loaded_orphans(provider_ref, loaded_orphans, Some(&multi)).await?;
+            let refreshed = refresh_loaded_orphans(
+                provider_ref,
+                loaded_orphans,
+                Some(&multi),
+                state_file.as_ref(),
+                ctx.schemas(),
+            )
+            .await?;
             orphan_refreshed_ids.extend(
                 refreshed
                     .iter()
@@ -2798,6 +2806,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &refresh_multi_progress(),
                 children(),
                 state_file,
+                ctx.schemas(),
                 &HashMap::new(),
                 &mut managed_current,
             )
@@ -3871,6 +3880,22 @@ pub async fn read_with_retry(
     unreachable!()
 }
 
+/// Read one managed instance and restore host-owned write-only comparison
+/// values from the persisted row when the provider omits them.
+pub(crate) async fn read_managed_state_with_retry(
+    provider: &dyn Provider,
+    id: &ResourceId,
+    identifier: &AppliedIdentifier,
+    state_file: Option<&StateFile>,
+    schemas: &SchemaRegistry,
+) -> Result<State, ProviderError> {
+    let mut state = read_with_retry(provider, id, identifier).await?;
+    if let Some(state_file) = state_file {
+        state_file.restore_recorded_write_only_attributes_in_state(&mut state, schemas);
+    }
+    Ok(state)
+}
+
 /// Refresh one managed state-file entry without erasing a malformed row.
 ///
 /// Only [`Current::Present`] may cross the provider read boundary.
@@ -3879,11 +3904,13 @@ pub async fn read_with_retry(
 pub async fn refresh_loaded_resource_with_retry(
     provider: &dyn Provider,
     loaded: Current,
+    state_file: Option<&StateFile>,
+    schemas: &SchemaRegistry,
 ) -> Result<Current, ProviderError> {
     match loaded {
         Current::Present(present) => {
             let (state, identifier) = present.into_parts();
-            read_with_retry(provider, &state.id, &identifier)
+            read_managed_state_with_retry(provider, &state.id, &identifier, state_file, schemas)
                 .await
                 .map(Current::from_state)
         }
@@ -3901,6 +3928,8 @@ pub async fn refresh_loaded_resource_with_retry(
 pub async fn refresh_loaded_orphan_with_retry(
     provider: &dyn Provider,
     loaded: Orphan,
+    state_file: Option<&StateFile>,
+    schemas: &SchemaRegistry,
 ) -> Result<Orphan, ProviderError> {
     let provider_read = match loaded.current() {
         Current::Absent(_state) => None,
@@ -3912,7 +3941,9 @@ pub async fn refresh_loaded_orphan_with_retry(
     };
     match provider_read {
         Some((id, identifier)) => {
-            let fresh = read_with_retry(provider, &id, &identifier).await?;
+            let fresh =
+                read_managed_state_with_retry(provider, &id, &identifier, state_file, schemas)
+                    .await?;
             Ok(loaded.with_refreshed_state(fresh))
         }
         None => Ok(loaded),
@@ -3923,6 +3954,8 @@ async fn refresh_loaded_orphans(
     provider: &dyn Provider,
     loaded: LoadedOrphans,
     multi: Option<&indicatif::MultiProgress>,
+    state_file: Option<&StateFile>,
+    schemas: &SchemaRegistry,
 ) -> Result<LoadedOrphans, AppError> {
     let results: Vec<Result<Orphan, AppError>> = stream::iter(loaded)
         .map(|(_id, loaded)| {
@@ -3934,9 +3967,10 @@ async fn refresh_loaded_orphans(
             };
             let progress = multi.map(|multi| RefreshProgress::begin_multi(multi, id));
             async move {
-                let refreshed = refresh_loaded_orphan_with_retry(provider, loaded)
-                    .await
-                    .map_err(AppError::Provider)?;
+                let refreshed =
+                    refresh_loaded_orphan_with_retry(provider, loaded, state_file, schemas)
+                        .await
+                        .map_err(AppError::Provider)?;
                 if let Some(progress) = progress {
                     progress.finish();
                 }
@@ -3973,6 +4007,7 @@ pub(crate) async fn refresh_resource_set<'a>(
     multi: &indicatif::MultiProgress,
     resources: impl Iterator<Item = &'a Resource>,
     state_file: &Option<StateFile>,
+    schemas: &SchemaRegistry,
     saved_dep_bindings: &HashMap<ResourceId, BTreeSet<String>>,
     managed_current: &mut HashMap<ResourceId, Current>,
 ) -> Result<bool, AppError> {
@@ -3991,9 +4026,14 @@ pub(crate) async fn refresh_resource_set<'a>(
                     .unwrap_or_else(|| Current::absent(resource.id.clone()));
                 let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                 async move {
-                    let mut current = refresh_loaded_resource_with_retry(provider, loaded)
-                        .await
-                        .map_err(AppError::Provider)?;
+                    let mut current = refresh_loaded_resource_with_retry(
+                        provider,
+                        loaded,
+                        state_file.as_ref(),
+                        schemas,
+                    )
+                    .await
+                    .map_err(AppError::Provider)?;
                     if let Some(deps) = dep_bindings {
                         current.set_dependency_bindings(deps);
                     }

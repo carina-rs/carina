@@ -28,6 +28,7 @@ use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
 use serde::{Deserialize, Serialize};
 
 pub const BUILTIN_PROVIDER_NAME: &str = "mock";
+const WRITE_ONLY_PASSWORD_ATTRIBUTE: &str = "password";
 
 const MOCK_STATE_VERSION: u32 = 2;
 
@@ -117,6 +118,10 @@ pub fn builtin_schemas() -> Vec<ResourceSchema> {
             )
             .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only())
             .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(
+                AttributeSchema::new(WRITE_ONLY_PASSWORD_ATTRIBUTE, AttributeType::string())
+                    .write_only(),
+            )
             .attribute(
                 AttributeSchema::new("replacement_key", AttributeType::string()).create_only(),
             )
@@ -452,6 +457,18 @@ impl MockProvider {
         (target == key).then(|| {
             ProviderError::internal(format!(
                 "CARINA_MOCK_CREATE_FAIL_FOR requested create failure for {key}"
+            ))
+        })
+    }
+
+    fn update_fail_error_for(id: &ResourceId) -> Option<ProviderError> {
+        let target = env::var("CARINA_MOCK_UPDATE_FAIL_FOR").ok()?;
+        let identity = id.identity_str()?;
+        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
+        let key = Self::resource_key(id)?;
+        (target == "*" || target == full || target == key).then(|| {
+            ProviderError::internal(format!(
+                "CARINA_MOCK_UPDATE_FAIL_FOR requested update failure for {key}"
             ))
         })
     }
@@ -852,6 +869,7 @@ impl MockProvider {
             states.get(&key).map(|attrs| {
                 attrs
                     .iter()
+                    .filter(|(key, _value)| key.as_str() != WRITE_ONLY_PASSWORD_ATTRIBUTE)
                     .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
                     .collect()
             })
@@ -1037,6 +1055,9 @@ impl Provider for MockProvider {
             }
             if let Some(delay) = update_delay() {
                 tokio::time::sleep(delay).await;
+            }
+            if let Some(error) = Self::update_fail_error_for(&id) {
+                return Err(error);
             }
             // Apply the patch on top of `from` to construct the post-update
             // attribute map. The mock writes only what the user changed —
@@ -1678,6 +1699,41 @@ mod tests {
             Some(Value::Concrete(ConcreteValue::Map(values)))
                 if values.get("nested") == Some(&plain)
         ));
+    }
+
+    #[test]
+    fn read_omits_write_only_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        let provider = MockProvider {
+            state_file,
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "hidden", None);
+        let resource = Resource::with_provider("mock", "test.resource", "hidden", None)
+            .with_attribute("name", string_value("hidden"))
+            .with_attribute("password", string_value("not-returned"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
+            .expect("create should persist the write-only request value");
+        let state = runtime
+            .block_on(provider.read(
+                &id,
+                &AppliedIdentifier::new("hidden-id").unwrap(),
+                ReadRequest,
+            ))
+            .expect("read should succeed")
+            .into_state();
+
+        assert!(
+            !state.attributes.contains_key(WRITE_ONLY_PASSWORD_ATTRIBUTE),
+            "provider reads must model a non-echoing write-only attribute"
+        );
     }
 
     #[test]

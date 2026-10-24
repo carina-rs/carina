@@ -25,7 +25,7 @@ use carina_core::executor::{
 use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
-use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
@@ -73,7 +73,7 @@ use crate::wiring::{
     build_factories_from_providers, create_normalizers_from_configs_with_ctx,
     create_providers_from_configs_with_ctx, data_source_refresh_bindings, get_provider_with_ctx,
     prepare_data_sources_for_plan, prepare_default_provider_ready_config,
-    prepare_desired_side_for_plan, read_data_source_with_retry,
+    prepare_desired_side_for_plan, read_data_source_with_retry, read_managed_state_with_retry,
     reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names, refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
     resolve_data_source_refs_for_refresh,
@@ -1100,6 +1100,8 @@ pub(crate) async fn detect_drift(
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
     provider: &dyn Provider,
+    state_file: Option<&StateFile>,
+    schemas: &carina_core::schema::SchemaRegistry,
     apply_target: ApplyTarget<'_>,
 ) -> Result<DriftCheckResult, AppError> {
     let mut drift_detected = false;
@@ -1142,11 +1144,15 @@ pub(crate) async fn detect_drift(
             .unwrap_or(&resource.id);
 
         let mut actual_state = match planned_current {
-            Some(Current::Present(present)) => provider
-                .read(historical_id, present.identifier(), ReadRequest)
-                .await
-                .map_err(AppError::Provider)?
-                .into_state(),
+            Some(Current::Present(present)) => read_managed_state_with_retry(
+                provider,
+                historical_id,
+                present.identifier(),
+                state_file,
+                schemas,
+            )
+            .await
+            .map_err(AppError::Provider)?,
             Some(Current::MissingIdentifier(_state)) => {
                 return Err(AppError::Validation(format!(
                     "saved plan resource {} has no valid provider identifier; create a new plan before applying",
@@ -1842,20 +1848,25 @@ async fn run_apply_locked_owned(
             // Phase 1: refresh managed resources in parallel. carina#3181:
             // `sorted_resources` is managed-only — data sources are refreshed in
             // phase 2 below.
+            let persisted_state = state_file.as_ref();
+            let schemas = ctx.schemas();
             let phase1_results: Vec<Result<(ResourceId, Current), AppError>> =
                 stream::iter(sorted_resources.iter())
                     .map(|resource| {
                         let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                        let loaded = state_file
-                            .as_ref()
+                        let loaded = persisted_state
                             .map(|sf| sf.build_state_for_resource(&resource.id))
                             .unwrap_or_else(|| Current::absent(resource.id.clone()));
                         let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                         async move {
-                            let mut current =
-                                refresh_loaded_resource_with_retry(provider_ref, loaded)
-                                    .await
-                                    .map_err(AppError::Provider)?;
+                            let mut current = refresh_loaded_resource_with_retry(
+                                provider_ref,
+                                loaded,
+                                persisted_state,
+                                schemas,
+                            )
+                            .await
+                            .map_err(AppError::Provider)?;
                             if let Some(deps) = dep_bindings {
                                 current.set_dependency_bindings(deps);
                             }
@@ -1883,7 +1894,7 @@ async fn run_apply_locked_owned(
             // post-expansion child refresh so the same address is not read twice
             // (carina#3145). Mirrors the plan path in `wiring/mod.rs`.
             let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
-            if let Some(sf) = state_file.as_ref() {
+            if let Some(sf) = persisted_state {
                 let desired_ids: HashSet<ResourceId> =
                     sorted_resources.iter().map(|r| r.id.clone()).collect();
                 let loaded_orphans = sf.build_orphans(&desired_ids);
@@ -1891,9 +1902,14 @@ async fn run_apply_locked_owned(
                     Result<(ResourceId, carina_core::differ::Orphan), AppError>,
                 > = stream::iter(loaded_orphans)
                     .map(|(id, loaded)| async move {
-                        let refreshed = refresh_loaded_orphan_with_retry(provider_ref, loaded)
-                            .await
-                            .map_err(AppError::Provider)?;
+                        let refreshed = refresh_loaded_orphan_with_retry(
+                            provider_ref,
+                            loaded,
+                            persisted_state,
+                            schemas,
+                        )
+                        .await
+                        .map_err(AppError::Provider)?;
                         Ok((id, refreshed))
                     })
                     .buffer_unordered(5)
@@ -3388,6 +3404,8 @@ async fn run_apply_from_plan_locked_owned(
                 desired_plan.current_states(),
                 &historical_addresses,
                 &provider,
+                state_file.as_ref(),
+                ctx.schemas(),
                 apply_target,
             )
             .await?;

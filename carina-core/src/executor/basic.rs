@@ -26,7 +26,12 @@ use crate::resource::{
 use crate::value::{SerializationContext, SerializationError};
 
 use super::wait::AppliedStates;
-use super::{Applied, ExecutionEvent, ExecutionObserver, ProgressInfo};
+use super::{AcceptedRequest, Applied, ExecutionEvent, ExecutionObserver, ProgressInfo};
+
+pub(super) struct CompletedEffect {
+    state: Box<State>,
+    request: AcceptedRequest,
+}
 
 /// Result of executing a basic effect (Create, Update, or Delete).
 ///
@@ -34,13 +39,13 @@ use super::{Applied, ExecutionEvent, ExecutionObserver, ProgressInfo};
 /// duplicating effect dispatch logic across sequential and phased paths.
 pub(super) enum BasicEffectResult {
     Success {
-        state: Option<Box<State>>,
+        completed: CompletedEffect,
         resource_id: ResourceId,
         resolved_attrs: Option<HashMap<String, Value>>,
         binding: Option<String>,
     },
     PartialSuccess {
-        state: Box<State>,
+        completed: CompletedEffect,
         resource_id: ResourceId,
         diagnostic: PartialReadDiagnostic,
         resolved_attrs: Option<HashMap<String, Value>>,
@@ -517,23 +522,26 @@ fn pick_unresolved_binding_for_diagnostic<'a>(
 pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut ExecutionState<'_>) {
     match result {
         BasicEffectResult::Success {
-            state: effect_state,
+            completed,
             resource_id,
             resolved_attrs,
             binding,
         } => {
             *exec.success_count += 1;
-            if let Some(s) = effect_state {
-                if let Some(attrs) = &resolved_attrs {
-                    exec.bindings.record_applied(binding.as_deref(), attrs, &s);
-                }
-                let state = *s;
-                exec.applied_states.insert_published(
-                    resource_id,
-                    Applied::Complete(state.clone()),
-                    &state,
-                );
+            let CompletedEffect { state, request } = completed;
+            if let Some(attrs) = &resolved_attrs {
+                exec.bindings
+                    .record_applied(binding.as_deref(), attrs, &state);
             }
+            let state = *state;
+            exec.applied_states.insert_published(
+                resource_id,
+                Applied::Complete {
+                    state: state.clone(),
+                    request,
+                },
+                &state,
+            );
         }
         BasicEffectResult::Failure { refresh } => {
             *exec.failure_count += 1;
@@ -564,7 +572,7 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             exec.applied_states.insert_unpublished(resource_id, applied);
         }
         BasicEffectResult::PartialSuccess {
-            state,
+            completed: CompletedEffect { state, request },
             resource_id,
             diagnostic,
             resolved_attrs,
@@ -578,7 +586,10 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             let state = *state;
             exec.applied_states.insert_published(
                 resource_id.clone(),
-                Applied::Complete(state.clone()),
+                Applied::Complete {
+                    state: state.clone(),
+                    request,
+                },
                 &state,
             );
             exec.partial_diagnostics.push((resource_id, diagnostic));
@@ -677,7 +688,10 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::PartialSuccess {
-                            state: Box::new(state),
+                            completed: CompletedEffect {
+                                state: Box::new(state),
+                                request: AcceptedRequest::create(),
+                            },
                             resource_id: resource.id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_attrs),
@@ -691,7 +705,10 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::Success {
-                            state: Some(Box::new(state)),
+                            completed: CompletedEffect {
+                                state: Box::new(state),
+                                request: AcceptedRequest::create(),
+                            },
                             resource_id: resource.id.clone(),
                             resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
@@ -822,7 +839,10 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::PartialSuccess {
-                            state: Box::new(state),
+                            completed: CompletedEffect {
+                                state: Box::new(state),
+                                request: AcceptedRequest::create(),
+                            },
                             resource_id: resource.id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_attrs),
@@ -836,7 +856,10 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::Success {
-                            state: Some(Box::new(state)),
+                            completed: CompletedEffect {
+                                state: Box::new(state),
+                                request: AcceptedRequest::create(),
+                            },
                             resource_id: resource.id.clone(),
                             resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
@@ -962,6 +985,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
             let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to);
+            let accepted_request = AcceptedRequest::from_update_request(&request);
             match provider.update(id, identifier, request).await {
                 Ok(outcome) => {
                     let diagnostic = match &outcome {
@@ -980,7 +1004,10 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::PartialSuccess {
-                            state: Box::new(state),
+                            completed: CompletedEffect {
+                                state: Box::new(state),
+                                request: accepted_request,
+                            },
                             resource_id: id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
@@ -994,7 +1021,10 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::Success {
-                            state: Some(Box::new(state)),
+                            completed: CompletedEffect {
+                                state: Box::new(state),
+                                request: accepted_request,
+                            },
                             resource_id: id.clone(),
                             resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
                             binding: to.binding.clone(),
@@ -1108,7 +1138,10 @@ mod process_basic_result_tests {
 
         process_basic_result(
             BasicEffectResult::PartialSuccess {
-                state: Box::new(writeback_state),
+                completed: CompletedEffect {
+                    state: Box::new(writeback_state),
+                    request: AcceptedRequest::create(),
+                },
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),
                 resolved_attrs: None::<HashMap<String, Value>>,
@@ -1124,7 +1157,10 @@ mod process_basic_result_tests {
         let states = applied_states.into_inner();
         let applied = states.get(&id).expect("partial state must be recorded");
         let applied = match applied {
-            Applied::Complete(state) => state,
+            Applied::Complete {
+                state,
+                request: _request,
+            } => state,
             Applied::Observed(_created) => panic!("unexpected observed create"),
             Applied::CreateInFlight(_pending) => panic!("unexpected in-flight create"),
             Applied::CreateEnded => panic!("unexpected ended create"),

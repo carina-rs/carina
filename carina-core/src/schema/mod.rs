@@ -6239,6 +6239,19 @@ pub struct ResourceSchema {
     pub defs: std::collections::BTreeMap<String, AttributeType>,
 }
 
+/// Return the top-level attribute keys the schema marks write-only.
+///
+/// Keeping this selection in the schema layer gives state persistence and
+/// provider-value protection one definition of the schema-owned key set.
+pub fn schema_write_only_keys(schema: Option<&ResourceSchema>) -> HashSet<String> {
+    schema
+        .into_iter()
+        .flat_map(|schema| schema.attributes.iter())
+        .filter(|(_key, attribute)| attribute.write_only)
+        .map(|(key, _attribute)| key.clone())
+        .collect()
+}
+
 /// Fallback total timeout when neither the user nor the resource schema
 /// declares one. Conservative — real provider workloads should declare
 /// their own (e.g. ACM Certificate at 75min, EC2 Instance Running at

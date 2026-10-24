@@ -671,10 +671,10 @@ fn type_aware_unordered_list_ignores_reorder() {
     );
 }
 
-// --- Tests for write-only attribute skip in find_changed_attributes ---
+// --- Tests for absent write-only attributes in find_changed_attributes ---
 
 #[test]
-fn write_only_attr_in_desired_not_in_current_no_diff() {
+fn non_create_only_write_only_attr_in_desired_not_in_current_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
@@ -699,9 +699,42 @@ fn write_only_attr_in_desired_not_in_current_no_diff() {
 
     let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
     assert!(
+        changed.contains(&"ipv4_netmask_length".to_string()),
+        "updatable write-only attribute absent from current should trigger a diff: {changed:?}"
+    );
+}
+
+#[test]
+fn create_only_write_only_attr_in_desired_not_in_current_has_no_diff() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let schema = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(
+            AttributeSchema::new("ipv4_netmask_length", AttributeType::int())
+                .write_only()
+                .create_only(),
+        );
+
+    let desired = HashMap::from([
+        (
+            "cidr_block".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        ),
+        (
+            "ipv4_netmask_length".to_string(),
+            Value::Concrete(ConcreteValue::Int(16)),
+        ),
+    ]);
+    let current = HashMap::from([(
+        "cidr_block".to_string(),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+    )]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    assert!(
         changed.is_empty(),
-        "Write-only attribute absent from current should not trigger a diff, got: {:?}",
-        changed
+        "create-only write-only attribute absent from current must not force replacement: {changed:?}"
     );
 }
 

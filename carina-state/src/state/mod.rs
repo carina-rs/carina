@@ -3,22 +3,30 @@
 use carina_core::deps::get_resource_dependencies;
 use carina_core::differ::Orphan;
 use carina_core::effect::MoveAuthority;
+use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
+use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
 pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
     AppliedIdentifier, EmptyAppliedIdentifier, InFlightCreate, InFlightPersistence, Observation,
     ObservedCreate, PersistedAttributes, PersistedAttributesError, RawSavedAttrs, Sent, SentRecord,
-    StateRowInFlightCreate, StateTransformMap, previous_hash,
+    StateRowInFlightCreate, StateTransformMap, merge_previous_secret_hashes_into_provider_value,
+    previous_hash,
 };
 pub use carina_core::resource::DeposedKey;
+#[cfg(test)]
+use carina_core::resource::Resource;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, ResolvedResource, Resource,
+    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, ResolvedResource,
     ResourceId, ResourceIdentity, State, Value,
 };
-use carina_core::schema::ResourceSchema;
-use carina_core::value::{PersistedExportValue, PersistedValue, SerializationError};
+use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
+use carina_core::value::{
+    PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
+    merge_secrets_into_observation_json, merge_secrets_into_provider_json,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -32,6 +40,316 @@ fn persisted_attributes_from_test_json(
         .expect("test state row contains valid persisted JSON")
 }
 
+/// Select persisted values that count as recorded write-only state.
+///
+/// Schema-backed paths infer the set from every schema write-only key present
+/// in the persisted map, including rows written before metadata was reliable.
+/// Orphan refresh additionally supplies the row's recorded list so it can
+/// preserve values when the schema is unavailable or no longer marks a key
+/// write-only.
+fn recorded_write_only_keys(
+    schema: Option<&ResourceSchema>,
+    attributes: &PersistedAttributes,
+    orphan_recorded: &[String],
+) -> HashSet<String> {
+    let mut keys = schema_write_only_keys(schema);
+    keys.extend(orphan_recorded.iter().cloned());
+    keys.retain(|key| attributes.contains_key(key));
+    keys
+}
+
+/// Provider values selected for a state row before secret protection.
+///
+/// Construction always strips every write-only key known from the schema (and
+/// any state-row metadata supplied by the orphan path). Such a key can re-enter
+/// only through the private accepted-request or persisted-generation overlay
+/// methods below. Keeping this type private prevents downstream callers from
+/// relabelling an arbitrary provider map as provenance-safe.
+#[derive(Debug)]
+struct SelectedStateAttributes {
+    encoded: HashMap<String, PersistedValue>,
+    write_only_keys: HashSet<String>,
+    retained_write_only: HashSet<String>,
+}
+
+impl SelectedStateAttributes {
+    fn write_only_keys(
+        schema: Option<&ResourceSchema>,
+        additionally_recorded: &[String],
+    ) -> HashSet<String> {
+        let mut keys = schema_write_only_keys(schema);
+        keys.extend(additionally_recorded.iter().cloned());
+        keys
+    }
+
+    fn from_provider_values_lossy(
+        attributes: &HashMap<String, Value>,
+        schema: Option<&ResourceSchema>,
+        additionally_recorded: &[String],
+    ) -> Self {
+        let write_only_keys = Self::write_only_keys(schema, additionally_recorded);
+        let encoded = attributes
+            .iter()
+            .filter(|(key, _)| !write_only_keys.contains(*key))
+            .filter_map(|(key, value)| {
+                PersistedValue::encode_provider_value(value, None)
+                    .ok()
+                    .map(|value| (key.clone(), value))
+            })
+            .collect();
+        Self {
+            encoded,
+            write_only_keys,
+            retained_write_only: HashSet::new(),
+        }
+    }
+
+    fn try_from_provider_values(
+        attributes: &HashMap<String, Value>,
+        schema: Option<&ResourceSchema>,
+        additionally_recorded: &[String],
+        preferred_hashes: Option<&PersistedAttributes>,
+        previous: Option<&PersistedAttributes>,
+    ) -> Result<Self, SerializationError> {
+        let write_only_keys = Self::write_only_keys(schema, additionally_recorded);
+        let encoded = attributes
+            .iter()
+            .filter(|(key, _)| !write_only_keys.contains(*key))
+            .map(|(key, value)| {
+                PersistedValue::encode_provider_value(
+                    value,
+                    previous_hash(preferred_hashes, previous, key),
+                )
+                .map(|value| (key.clone(), value))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            encoded,
+            write_only_keys,
+            retained_write_only: HashSet::new(),
+        })
+    }
+
+    fn from_persisted_generation(
+        attributes: &PersistedAttributes,
+        schema: Option<&ResourceSchema>,
+        additionally_recorded: &[String],
+    ) -> Self {
+        let write_only_keys = Self::write_only_keys(schema, additionally_recorded);
+        let encoded = attributes
+            .keys()
+            .filter_map(|key| {
+                attributes
+                    .encoded_value(key)
+                    .cloned()
+                    .map(|value| (key.clone(), value))
+            })
+            .collect::<HashMap<_, _>>();
+        let retained_write_only = write_only_keys
+            .iter()
+            .filter(|key| encoded.contains_key(*key))
+            .cloned()
+            .collect();
+        Self {
+            encoded,
+            write_only_keys,
+            retained_write_only,
+        }
+    }
+
+    fn insert_write_only(&mut self, key: String, value: PersistedValue) {
+        self.write_only_keys.insert(key.clone());
+        self.retained_write_only.insert(key.clone());
+        self.encoded.insert(key, value);
+    }
+
+    fn carry_write_only(
+        &mut self,
+        previous: &PersistedAttributes,
+        keys: impl IntoIterator<Item = String>,
+    ) {
+        for key in keys {
+            if let Some(value) = previous.encoded_value(&key).cloned() {
+                self.insert_write_only(key, value);
+            }
+        }
+    }
+
+    fn overlay_sent(&mut self, sent: &PersistedAttributes, sent_write_only: &HashSet<String>) {
+        for key in sent.keys() {
+            let Some(value) = sent.encoded_value(key).cloned() else {
+                continue;
+            };
+            if sent_write_only.contains(key) {
+                self.insert_write_only(key.clone(), value);
+            } else if !self.write_only_keys.contains(key) {
+                self.encoded.entry(key.clone()).or_insert(value);
+            }
+        }
+    }
+
+    fn authority_attributes(
+        authority: PreviousSecretHashAuthority<'_>,
+    ) -> Option<&PersistedAttributes> {
+        match authority {
+            PreviousSecretHashAuthority::None => None,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(attributes)
+            | PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(attributes) => {
+                Some(attributes)
+            }
+        }
+    }
+
+    fn authority_protects_key(
+        authority: PreviousSecretHashAuthority<'_>,
+        key_is_desired: bool,
+    ) -> bool {
+        match authority {
+            PreviousSecretHashAuthority::None => false,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(_) => true,
+            PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(_) => !key_is_desired,
+        }
+    }
+
+    fn protect_previous_secret_hashes(
+        &mut self,
+        authority: PreviousSecretHashAuthority<'_>,
+        mut is_desired_key: impl FnMut(&str) -> bool,
+        protected_secret_keys: &mut HashSet<String>,
+    ) {
+        let Some(previous) = Self::authority_attributes(authority) else {
+            return;
+        };
+        let keys = previous.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            if protected_secret_keys.contains(&key)
+                || !Self::authority_protects_key(authority, is_desired_key(&key))
+                || (self.write_only_keys.contains(&key) && !self.retained_write_only.contains(&key))
+            {
+                continue;
+            }
+            let Some(previous_value) = previous.encoded_value(&key) else {
+                continue;
+            };
+            let Some(masked) = merge_previous_secret_hashes_into_provider_value(
+                previous_value,
+                self.encoded.get(&key),
+            ) else {
+                continue;
+            };
+            self.encoded.insert(key.clone(), masked);
+            protected_secret_keys.insert(key);
+        }
+    }
+
+    fn protect_for_resource(
+        mut self,
+        resource: &ResolvedResource,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        preferred_hashes: Option<&PersistedAttributes>,
+        strict_desired: bool,
+    ) -> Result<Self, SerializationError> {
+        let mut protected_secret_keys = HashSet::new();
+        for (key, desired_value) in &resource.attributes {
+            let is_write_only = self.write_only_keys.contains(key);
+            let is_retained_write_only = is_write_only && self.retained_write_only.contains(key);
+            if is_write_only && !is_retained_write_only {
+                continue;
+            }
+            if !contains_unredacted_secret(desired_value) {
+                continue;
+            }
+            let previous = previous_hash(
+                preferred_hashes,
+                Self::authority_attributes(previous_hash_authority),
+                key,
+            );
+            let masked = match self.encoded.get(key).cloned() {
+                Some(selected_value) if is_retained_write_only => {
+                    merge_secrets_into_observation_json(desired_value, &selected_value, previous)
+                }
+                Some(provider_value) => {
+                    merge_secrets_into_provider_json(desired_value, &provider_value, previous)
+                }
+                None if is_write_only => continue,
+                None => PersistedValue::encode_desired_value(desired_value, previous),
+            };
+            match masked {
+                Ok(masked) => {
+                    self.encoded.insert(key.clone(), masked);
+                    protected_secret_keys.insert(key.clone());
+                }
+                Err(error) if strict_desired => return Err(error),
+                Err(_) => {
+                    self.encoded.remove(key);
+                }
+            }
+        }
+        self.protect_previous_secret_hashes(
+            previous_hash_authority,
+            |key| resource.attributes.contains_key(key),
+            &mut protected_secret_keys,
+        );
+        Ok(self)
+    }
+
+    fn protect_observation(
+        mut self,
+        resource: &ResolvedResource,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        preferred_hashes: Option<&PersistedAttributes>,
+    ) -> Result<Self, SerializationError> {
+        let mut protected_secret_keys = HashSet::new();
+        for (key, desired_value) in &resource.attributes {
+            if !contains_unredacted_secret(desired_value) {
+                continue;
+            }
+            let Some(observed_or_sent_value) = self.encoded.get(key).cloned() else {
+                continue;
+            };
+            let previous = previous_hash(
+                preferred_hashes,
+                Self::authority_attributes(previous_hash_authority),
+                key,
+            );
+            let masked = merge_secrets_into_observation_json(
+                desired_value,
+                &observed_or_sent_value,
+                previous,
+            )?;
+            self.encoded.insert(key.clone(), masked);
+            protected_secret_keys.insert(key.clone());
+        }
+
+        let present_keys = self.encoded.keys().cloned().collect::<HashSet<_>>();
+        self.protect_previous_secret_hashes(
+            previous_hash_authority,
+            |key| resource.attributes.contains_key(key),
+            &mut protected_secret_keys,
+        );
+        self.encoded.retain(|key, _| present_keys.contains(key));
+        Ok(self)
+    }
+
+    fn protect_orphan(mut self, previous: &PersistedAttributes) -> Self {
+        self.protect_previous_secret_hashes(
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
+            |_| false,
+            &mut HashSet::new(),
+        );
+        self
+    }
+
+    fn finish(mut self) -> Result<(PersistedAttributes, Vec<String>), PersistedAttributesError> {
+        self.retained_write_only
+            .retain(|key| self.encoded.contains_key(key));
+        let mut write_only_attributes = self.retained_write_only.into_iter().collect::<Vec<_>>();
+        write_only_attributes.sort();
+        let attributes = PersistedAttributes::from_persisted_values(self.encoded)?;
+        Ok((attributes, write_only_attributes))
+    }
+}
+
 /// A provider or desired value could not be encoded into persisted state.
 #[derive(Debug, thiserror::Error)]
 pub enum ResourceStateEncodingError {
@@ -39,8 +357,18 @@ pub enum ResourceStateEncodingError {
     Serialization(#[from] SerializationError),
     #[error(transparent)]
     PersistedAttributes(#[from] PersistedAttributesError),
-    #[error("provider reported sent create attributes outside the checked request: {attributes:?}")]
+    #[error("sent attributes are outside the desired resource: {attributes:?}")]
     InvalidSentAttributes { attributes: Vec<String> },
+}
+
+/// Provenance for write-only values while rebuilding a provider-backed row.
+///
+/// Every caller must state whether a provider accepted a request or no request
+/// was sent.
+#[derive(Debug, Clone, Copy)]
+pub enum WriteOnlyBasis<'a> {
+    AcceptedRequest(&'a AcceptedRequest),
+    CarryPrevious,
 }
 
 /// The main state file structure that persists to the backend
@@ -631,6 +959,46 @@ impl StateFile {
                 } else {
                     current.partial_read = Some(marker);
                 }
+            }
+        }
+    }
+
+    /// Fill provider-omitted write-only values from the persisted current row.
+    ///
+    /// Every schema write-only key present in the row's persisted attributes
+    /// is eligible; legacy metadata is not required. A value returned by the
+    /// provider wins: persisted state is the authoritative last-sent fallback,
+    /// not a replacement for a newer provider observation.
+    /// This is called at the single managed provider-read boundary shared by
+    /// planning and saved-plan drift checking.
+    pub fn restore_recorded_write_only_attributes_in_state(
+        &self,
+        current: &mut State,
+        schemas: &SchemaRegistry,
+    ) {
+        if !current.exists {
+            return;
+        }
+        let id = &current.id;
+        let Some(identity) = id.identity_str() else {
+            return;
+        };
+        let Some(row) = self.find_resource(&id.provider, &id.resource_type, identity) else {
+            return;
+        };
+        let Some(attributes) = row.persisted_attributes() else {
+            return;
+        };
+        let Some(schema) = schemas.get(&id.provider, &id.resource_type, SchemaKind::Resource)
+        else {
+            return;
+        };
+        for key in recorded_write_only_keys(Some(schema), attributes, &[]) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                current.attributes.entry(key.clone())
+                && let Some(value) = attributes.get(&key)
+            {
+                entry.insert(value);
             }
         }
     }
@@ -1368,6 +1736,33 @@ pub struct DeposedInstance {
     pub dependency_bindings: BTreeSet<String>,
 }
 
+/// Attributes admitted to a deposed generation by a state-owned writeback
+/// path.
+///
+/// The wrapper does not claim that its entire map was loaded from state. Its
+/// narrow guarantee is that a key classified as write-only by the schema used
+/// to construct it can enter only from a persisted current or deposed
+/// generation. No-previous paths may retain arbitrary ordinary or
+/// schema-unknown provider/history attributes after stripping known
+/// write-only keys. The private inner map prevents callers from relabelling
+/// arbitrary known write-only values as carried state.
+///
+/// ```compile_fail
+/// use carina_core::provider::PersistedAttributes;
+/// use carina_state::DeposedAttributes;
+///
+/// let arbitrary = PersistedAttributes::default();
+/// let _previous = DeposedAttributes(arbitrary);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeposedAttributes(PersistedAttributes);
+
+impl DeposedAttributes {
+    pub fn as_persisted(&self) -> &PersistedAttributes {
+        &self.0
+    }
+}
+
 impl DeposedInstance {
     /// Construct a deposed generation from the opaque output of the state
     /// writeback encoder.
@@ -1375,14 +1770,14 @@ impl DeposedInstance {
         key: DeposedKey,
         identifier: String,
         provider_instance: Option<String>,
-        attributes: PersistedAttributes,
+        attributes: DeposedAttributes,
         dependency_bindings: BTreeSet<String>,
     ) -> Self {
         Self {
             key,
             identifier,
             provider_instance,
-            attributes,
+            attributes: attributes.0,
             dependency_bindings,
         }
     }
@@ -1401,7 +1796,7 @@ impl DeposedInstance {
             key,
             identifier,
             provider_instance,
-            persisted_attributes_from_test_json(attributes),
+            DeposedAttributes(persisted_attributes_from_test_json(attributes)),
             dependency_bindings,
         )
     }
@@ -1409,6 +1804,38 @@ impl DeposedInstance {
     /// Borrow this generation's attributes through the persisted decode seam.
     pub fn persisted_attributes(&self) -> &PersistedAttributes {
         &self.attributes
+    }
+
+    /// Rebuild this generation from a provider read while carrying write-only
+    /// values only from this persisted generation. Provider echoes never
+    /// become provenance for a deposed row.
+    pub fn refreshed_attributes_for_resource_and_schema(
+        &self,
+        resource: &ResolvedResource,
+        schema: Option<&ResourceSchema>,
+        fresh_attributes: &HashMap<String, Value>,
+    ) -> DeposedAttributes {
+        let carried_write_only = recorded_write_only_keys(schema, &self.attributes, &[]);
+        let mut selected =
+            SelectedStateAttributes::from_provider_values_lossy(fresh_attributes, schema, &[]);
+        selected.carry_write_only(&self.attributes, carried_write_only);
+        let selected = selected
+            .protect_for_resource(
+                resource,
+                PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&self.attributes),
+                None,
+                false,
+            )
+            .expect("lossy secret protection does not return serialization errors");
+        let (selected, _write_only_attributes) = selected
+            .finish()
+            .expect("selected persisted values are already validated");
+        DeposedAttributes(selected)
+    }
+
+    pub fn with_refreshed_attributes(mut self, attributes: DeposedAttributes) -> Self {
+        self.attributes = attributes.0;
+        self
     }
 }
 
@@ -1538,13 +1965,16 @@ pub struct ResourceState {
 }
 
 /// Owned resource row proven not to contain a create continuation.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug)]
 pub struct WritableResourceState(ResourceState);
 
 /// An attempted writable projection that retained its in-flight row.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug)]
 pub struct CreateInFlightResourceState(Box<ResourceState>);
 
+#[cfg(any(test, feature = "test-utils"))]
 impl CreateInFlightResourceState {
     pub fn into_inner(self) -> ResourceState {
         *self.0
@@ -1682,7 +2112,9 @@ fn refreshed_explicit_without_desired_values(
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl WritableResourceState {
+    #[doc(hidden)]
     pub fn with_attributes_from_state(
         mut self,
         state: &State,
@@ -1730,16 +2162,17 @@ impl RefreshableResourceState<'_> {
         let source = self.0;
         let mut refreshed = source.clone();
         let previous = source.persisted_attributes().cloned().unwrap_or_default();
-
-        let mut serialized = HashMap::new();
-        for (key, value) in &state.attributes {
-            serialized.insert(
-                key.clone(),
-                PersistedValue::encode_provider_value(value, previous.encoded_value(key))?,
-            );
-        }
-        let attributes = PersistedAttributes::from_persisted_values(serialized)?
-            .protect_for_orphan_refresh(schema, &previous);
+        let write_only_keys =
+            recorded_write_only_keys(schema, &previous, source.write_only_attributes());
+        let mut selected = SelectedStateAttributes::try_from_provider_values(
+            &state.attributes,
+            schema,
+            source.write_only_attributes(),
+            None,
+            Some(&previous),
+        )?;
+        selected.carry_write_only(&previous, write_only_keys);
+        let (attributes, write_only_attributes) = selected.protect_orphan(&previous).finish()?;
         refreshed.current = match state
             .identifier
             .as_deref()
@@ -1748,12 +2181,12 @@ impl RefreshableResourceState<'_> {
             Some(identifier) => CurrentInstance::Applied {
                 identifier,
                 attributes,
-                write_only_attributes: source.write_only_attributes().to_vec(),
+                write_only_attributes,
                 partial_read: state.partial_read.clone(),
             },
             None => CurrentInstance::MissingIdentifier {
                 attributes,
-                write_only_attributes: source.write_only_attributes().to_vec(),
+                write_only_attributes,
                 partial_read: state.partial_read.clone(),
             },
         };
@@ -2046,6 +2479,8 @@ impl ResourceState {
     ///     row.with_identifier("provider-id")
     /// }
     /// ```
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn into_writable(self) -> Result<WritableResourceState, CreateInFlightResourceState> {
         match self.current {
             CurrentInstance::CreateInFlight { .. } => {
@@ -2080,6 +2515,8 @@ impl ResourceState {
     ///     let _ = row.with_attributes_from_state(state);
     /// }
     /// ```
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn from_provider_state(
         resource_type: impl Into<String>,
         identity: impl Into<ResourceIdentity>,
@@ -2137,85 +2574,64 @@ impl ResourceState {
         Ok(state)
     }
 
-    /// Merge write-only attribute values from the desired resource into this state.
-    ///
-    /// Write-only attributes are not returned by the provider API after create/update,
-    /// so their user-specified values must be persisted from the desired resource.
-    /// This enables the differ to detect changes to write-only attribute values on
-    /// subsequent plans.
-    ///
-    /// `write_only_keys` is the set of attribute names that are marked write-only
-    /// in the resource schema.
-    pub fn merge_write_only_attributes(
-        &mut self,
-        resource: &Resource,
-        write_only_keys: &[String],
-    ) -> Result<(), ResourceStateEncodingError> {
-        let mut merged = Vec::new();
-        let mut encoded = HashMap::new();
-        for key in write_only_keys {
-            // Only merge if the user specified this attribute and it's not already
-            // in the provider-returned state
-            if let Some(value) = resource.attributes.get(key)
-                && !self
-                    .persisted_attributes()
-                    .is_some_and(|attributes| attributes.contains_key(key))
-                && let Ok(json_value) = PersistedValue::encode_desired_value(value, None)
-            {
-                encoded.insert(key.clone(), json_value);
-                merged.push(key.clone());
-            }
-        }
-        let attributes = PersistedAttributes::from_persisted_values(encoded)?;
-        merged.sort();
-        let (current_attributes, write_only_attributes) = match &mut self.current {
-            CurrentInstance::Applied {
-                attributes,
-                write_only_attributes,
-                ..
-            }
-            | CurrentInstance::MissingIdentifier {
-                attributes,
-                write_only_attributes,
-                ..
-            } => (attributes, write_only_attributes),
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => return Ok(()),
-        };
-        current_attributes.extend(attributes);
-        *write_only_attributes = merged;
-        Ok(())
-    }
-
-    /// Serialize provider attributes with desired-resource and schema-derived
-    /// secret overrides.
-    ///
-    /// When the new desired resource no longer contains an old protected key,
-    /// the schema still prevents persisting provider-returned plaintext for
-    /// write-only attributes. Such keys are dropped unless the desired value
-    /// carries a `Secret(_)` wrapper that can be merged into a hash.
-    pub fn attributes_to_state_json_lossy_for_resource_and_schema(
+    /// Encode a provider/history fallback that has no persisted generation to
+    /// carry from. All schema write-only values are excluded.
+    pub fn deposed_attributes_without_previous(
         resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
         attributes: &HashMap<String, Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> PersistedAttributes {
-        PersistedAttributes::encode_values_for_resource_and_schema(
-            resource,
-            schema,
-            attributes,
-            previous_hash_authority,
-        )
+    ) -> DeposedAttributes {
+        let selected = SelectedStateAttributes::from_provider_values_lossy(attributes, schema, &[])
+            .protect_for_resource(resource, previous_hash_authority, None, false)
+            .expect("lossy secret protection does not return serialization errors");
+        let (selected, _write_only_attributes) = selected
+            .finish()
+            .expect("selected persisted values are already validated");
+        DeposedAttributes(selected)
     }
 
-    /// Apply desired-resource and schema-derived secret protection to an
-    /// opaque persisted attribute map.
-    pub fn protect_persisted_attributes_for_resource_and_schema(
+    /// Encode plan-time replacement history when no persisted generation
+    /// exists. Provider-read write-only values are deliberately excluded.
+    pub fn deposed_attributes_from_replacement_history(
         resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
-        serialized: PersistedAttributes,
+        previous: ReplacementPreviousAttributesForStateWriteback<'_>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> PersistedAttributes {
-        serialized.protect_for_resource_and_schema(resource, schema, previous_hash_authority)
+    ) -> DeposedAttributes {
+        let selected = SelectedStateAttributes::from_provider_values_lossy(
+            previous.provider_attributes(),
+            schema,
+            &[],
+        )
+        .protect_for_resource(resource, previous_hash_authority, None, false)
+        .expect("lossy secret protection does not return serialization errors");
+        let (selected, _write_only_attributes) = selected
+            .finish()
+            .expect("selected persisted values are already validated");
+        DeposedAttributes(selected)
+    }
+
+    /// Carry values from this persisted current generation into a deposed
+    /// generation. The receiver is the type-level source of provenance.
+    pub fn deposed_attributes_from_current_generation(
+        &self,
+        resource: &ResolvedResource,
+        schema: Option<&ResourceSchema>,
+    ) -> DeposedAttributes {
+        let previous = self.persisted_attributes().cloned().unwrap_or_default();
+        let selected = SelectedStateAttributes::from_persisted_generation(&previous, schema, &[])
+            .protect_for_resource(
+                resource,
+                PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+                None,
+                false,
+            )
+            .expect("lossy secret protection does not return serialization errors");
+        let (selected, _write_only_attributes) = selected
+            .finish()
+            .expect("selected persisted values are already validated");
+        DeposedAttributes(selected)
     }
 
     fn selected_sent_attributes(
@@ -2257,12 +2673,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         attributes: &PersistedAttributes,
     ) -> HashSet<String> {
-        schema
-            .into_iter()
-            .flat_map(|schema| schema.attributes.iter())
-            .filter(|(key, attribute)| attribute.write_only && attributes.contains_key(key))
-            .map(|(key, _attribute)| key.clone())
-            .collect()
+        recorded_write_only_keys(schema, attributes, &[])
     }
 
     fn populate_desired_metadata(
@@ -2325,17 +2736,15 @@ impl ResourceState {
             ),
             Observation::ReadFailed(error) => (&no_observed_values, Some(error.to_string())),
         };
-        let observed = observed_values
-            .iter()
-            .map(|(key, value)| {
-                let previous_value = previous_hash(preferred_hashes, previous, key);
-                PersistedValue::encode_provider_value(value, previous_value)
-                    .map(|value| (key.clone(), value))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
-        let observed = PersistedAttributes::from_persisted_values(observed)?;
+        let mut selected = SelectedStateAttributes::try_from_provider_values(
+            observed_values,
+            schema,
+            &[],
+            preferred_hashes,
+            previous,
+        )?;
 
-        let (mut sent_values, sent_write_only) = match created.sent() {
+        let (sent_values, sent_write_only) = match created.sent() {
             SentRecord::Request(sent) => {
                 let sent_values =
                     Self::selected_sent_attributes(resource, sent, existing, preferred_hashes)?;
@@ -2349,17 +2758,13 @@ impl ResourceState {
                 (sent_values, write_only)
             }
         };
-        sent_values.extend(observed);
+        selected.overlay_sent(&sent_values, &sent_write_only);
         let previous_hash_authority = previous
             .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
             .unwrap_or(PreviousSecretHashAuthority::None);
-        let attributes = sent_values.try_protect_observation_for_resource_and_schema(
-            resource,
-            schema,
-            previous_hash_authority,
-            preferred_hashes,
-            &sent_write_only,
-        )?;
+        let selected =
+            selected.protect_observation(resource, previous_hash_authority, preferred_hashes)?;
+        let (attributes, write_only_attributes) = selected.finish()?;
         let partial_read = incomplete_detail.and_then(|detail| {
             let missing_attributes = resource
                 .attributes
@@ -2384,8 +2789,6 @@ impl ResourceState {
             resource.identity().clone(),
             resource.id.provider.clone(),
         );
-        let mut write_only_attributes = sent_write_only.into_iter().collect::<Vec<_>>();
-        write_only_attributes.sort();
         row.current = CurrentInstance::Applied {
             identifier: created.identifier().clone(),
             attributes,
@@ -2466,11 +2869,13 @@ impl ResourceState {
     /// state, optional previous row state, and optional schema.
     ///
     /// Provider attributes are serialized into state JSON, desired secret
-    /// values are masked before storage, previously-stored secret hashes can
-    /// protect keys removed from desired state, and schema write-only
-    /// plaintext is removed unless a desired secret already supplied a masked
-    /// value. When `existing` is provided, protected/name override metadata and
-    /// existing deposed generations are preserved by the row-write path.
+    /// values are masked before storage, and previously-stored secret hashes
+    /// can protect keys removed from desired state. `write_only_basis` is
+    /// mandatory: it determines whether write-only values come from an
+    /// accepted request or the previous row. When `existing` is provided,
+    /// protected/name override
+    /// metadata and existing deposed generations are preserved by the
+    /// row-write path.
     ///
     /// Returns an error if any provider attribute value cannot be converted to
     /// JSON, such as non-finite float values.
@@ -2479,6 +2884,7 @@ impl ResourceState {
         state: &State,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
+        write_only_basis: WriteOnlyBasis<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let mut rs = Self::new(
@@ -2486,31 +2892,93 @@ impl ResourceState {
             resource.identity().clone(),
             resource.id.provider.clone(),
         );
-        let mut serialized = HashMap::new();
-        for (k, v) in &state.attributes {
-            serialized.insert(
-                k.clone(),
-                PersistedValue::encode_provider_value(
-                    v,
-                    previous_hash(
-                        preferred_hashes,
-                        existing.and_then(ResourceState::persisted_attributes),
-                        k,
-                    ),
-                )?,
-            );
+        let previous = existing.and_then(ResourceState::persisted_attributes);
+        let desired_keys = resource.attributes.keys().cloned().collect::<BTreeSet<_>>();
+        let schema_write_only = schema_write_only_keys(schema);
+        let carried_write_only = previous
+            .map(|attributes| recorded_write_only_keys(schema, attributes, &[]))
+            .unwrap_or_default();
+        let mut accepted = BTreeSet::new();
+        match write_only_basis {
+            WriteOnlyBasis::AcceptedRequest(request) => match request.kind() {
+                AcceptedRequestKind::Create => {
+                    accepted.extend(
+                        desired_keys
+                            .iter()
+                            .filter(|key| schema_write_only.contains(*key))
+                            .cloned(),
+                    );
+                }
+                AcceptedRequestKind::Update { sent, .. } => {
+                    accepted.extend(
+                        sent.iter()
+                            .filter(|key| {
+                                desired_keys.contains(*key) && schema_write_only.contains(*key)
+                            })
+                            .cloned(),
+                    );
+                }
+            },
+            WriteOnlyBasis::CarryPrevious => {}
         }
+        let desired_fallback = Sent::only(
+            accepted
+                .iter()
+                .filter(|key| !state.attributes.contains_key(*key))
+                .cloned(),
+        );
+        let desired_fallback = Self::selected_sent_attributes(
+            resource,
+            &desired_fallback,
+            existing,
+            preferred_hashes,
+        )?;
+
+        let mut selected = SelectedStateAttributes::try_from_provider_values(
+            &state.attributes,
+            schema,
+            &[],
+            preferred_hashes,
+            previous,
+        )?;
+        for key in &schema_write_only {
+            let value = if accepted.contains(key) {
+                match state.attributes.get(key) {
+                    Some(value) => Some(PersistedValue::encode_provider_value(
+                        value,
+                        previous_hash(preferred_hashes, previous, key),
+                    )?),
+                    None => desired_fallback.encoded_value(key).cloned(),
+                }
+            } else {
+                let carries_previous = match write_only_basis {
+                    WriteOnlyBasis::CarryPrevious => true,
+                    WriteOnlyBasis::AcceptedRequest(request) => match request.kind() {
+                        AcceptedRequestKind::Create => false,
+                        AcceptedRequestKind::Update { removed, .. } => !removed.contains(key),
+                    },
+                };
+                (carries_previous && carried_write_only.contains(key))
+                    .then(|| previous.and_then(|attributes| attributes.encoded_value(key)))
+                    .flatten()
+                    .cloned()
+            };
+            if let Some(value) = value {
+                selected.insert_write_only(key.clone(), value);
+            }
+        }
+
         let previous_hash_authority = existing
             .and_then(ResourceState::persisted_attributes)
             .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
             .unwrap_or(PreviousSecretHashAuthority::None);
-        let attributes = PersistedAttributes::from_persisted_values(serialized)?
-            .try_protect_for_resource_and_schema(
-                resource,
-                schema,
-                previous_hash_authority,
-                preferred_hashes,
-            )?;
+        let selected = selected.protect_for_resource(
+            resource,
+            previous_hash_authority,
+            preferred_hashes,
+            true,
+        )?;
+        let (attributes, write_only_attributes) = selected.finish()?;
         rs.current = match state
             .identifier
             .as_deref()
@@ -2519,12 +2987,12 @@ impl ResourceState {
             Some(identifier) => CurrentInstance::Applied {
                 identifier,
                 attributes,
-                write_only_attributes: Vec::new(),
+                write_only_attributes,
                 partial_read: state.partial_read.clone(),
             },
             None => CurrentInstance::MissingIdentifier {
                 attributes,
-                write_only_attributes: Vec::new(),
+                write_only_attributes,
                 partial_read: state.partial_read.clone(),
             },
         };

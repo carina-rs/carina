@@ -342,19 +342,11 @@ pub struct ReplacementPreviousAttributesForStateWriteback<'a> {
     attributes: &'a HashMap<String, Value>,
 }
 
-impl ReplacementPreviousAttributesForStateWriteback<'_> {
-    pub fn encode(
-        self,
-        resource: &ResolvedResource,
-        schema: Option<&crate::schema::ResourceSchema>,
-        previous_hash_authority: crate::provider::PreviousSecretHashAuthority<'_>,
-    ) -> crate::provider::PersistedAttributes {
-        crate::provider::PersistedAttributes::encode_values_for_resource_and_schema(
-            resource,
-            schema,
-            self.attributes,
-            previous_hash_authority,
-        )
+impl<'a> ReplacementPreviousAttributesForStateWriteback<'a> {
+    /// Borrow plan-time provider/history values for the state layer's sealed
+    /// writeback selection step.
+    pub fn provider_attributes(self) -> &'a HashMap<String, Value> {
+        self.attributes
     }
 }
 

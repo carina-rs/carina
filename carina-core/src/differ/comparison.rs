@@ -576,9 +576,12 @@ pub(crate) fn key_should_enter_patch(
     schema: Option<&ResourceSchema>,
     cmp: AttrComparison<'_>,
 ) -> bool {
+    // CloudControl reads omit write-only values. Ignore that absence only when
+    // the key cannot be updated: otherwise the value must enter an Update and
+    // exact accepted-request provenance can make subsequent plans converge.
     if schema
         .and_then(|s| s.attributes.get(key))
-        .is_some_and(|attr| attr.write_only && cmp.from.is_none())
+        .is_some_and(|attr| attr.write_only && attr.create_only && cmp.from.is_none())
     {
         return false;
     }

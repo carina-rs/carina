@@ -298,6 +298,7 @@ fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .expect("marker-shaped plaintext is valid provider state");
@@ -1191,6 +1192,7 @@ fn test_from_provider_state() {
         &provider_state,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1237,6 +1239,7 @@ fn test_from_provider_state_without_existing() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1300,6 +1303,7 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1388,6 +1392,7 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
         &provider_state,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1438,6 +1443,7 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1490,6 +1496,7 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
         &provider_state,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1526,6 +1533,7 @@ fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_
         &provider_state,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1581,6 +1589,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
         &reordered_provider,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -1643,6 +1652,7 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
         &provider_state,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -2499,6 +2509,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -3924,8 +3935,9 @@ fn typed_data_source_cleanup_preserves_managed_row_with_identifier() {
 }
 
 #[test]
-fn test_merge_write_only_attributes() {
+fn accepted_create_records_write_only_attributes() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType};
 
     // Simulate a VPC resource with a write-only attribute (ipv4_netmask_length)
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
@@ -3954,19 +3966,19 @@ fn test_merge_write_only_attributes() {
         partial_read: None,
     };
 
-    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+    let schema = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+    let request = AcceptedRequest::create_for_test();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
         None,
-        None,
+        Some(&schema),
+        WriteOnlyBasis::AcceptedRequest(&request),
         None,
     )
     .unwrap();
-
-    // Merge write-only attributes
-    let write_only_keys = vec!["ipv4_netmask_length".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys)
-        .unwrap();
 
     // The write-only attribute should be persisted in state
     assert_eq!(
@@ -4027,6 +4039,7 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
             &provider_state,
             None,
             None,
+            WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
             None,
         )
         .expect_err("desired redacted secrets must never be written as new state");
@@ -4041,8 +4054,10 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
 }
 
 #[test]
-fn write_only_merge_does_not_persist_desired_redacted_secret() {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
+fn accepted_write_only_rejects_desired_redacted_secret() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::value::SerializationError;
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
         "placeholder".to_string(),
@@ -4062,23 +4077,31 @@ fn write_only_merge_does_not_persist_desired_redacted_secret() {
     ])));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("settings", desired);
-    let mut row = ResourceState::try_applied("test.Resource", "main", "mock", "main-id")
-        .expect("fixture identifier is non-empty");
-
-    row.merge_write_only_attributes(&resource, &["settings".to_string()])
-        .expect("unencodable desired write-only values are skipped");
-
-    assert!(
-        !row.persisted_attributes()
-            .expect("fixture has persisted attributes")
-            .contains_key("settings")
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::new("settings", AttributeType::map(AttributeType::string())).write_only(),
     );
-    assert!(row.write_only_attributes().is_empty());
+    let error = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &State::existing(resource.id.clone(), HashMap::new()).with_identifier("main-id"),
+        None,
+        Some(&schema),
+        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        None,
+    )
+    .expect_err("accepted redacted values cannot be encoded as new state");
+
+    assert!(matches!(
+        error,
+        ResourceStateEncodingError::Serialization(
+            SerializationError::RedactedSecretNotAllowed { .. }
+        )
+    ));
 }
 
 #[test]
-fn test_merge_write_only_attributes_not_in_desired() {
+fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType};
 
     // Resource without write-only attribute specified
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
@@ -4102,19 +4125,17 @@ fn test_merge_write_only_attributes_not_in_desired() {
         partial_read: None,
     };
 
-    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+    let schema = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
         None,
-        None,
+        Some(&schema),
+        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();
-
-    // Try to merge a write-only attribute that the user didn't specify
-    let write_only_keys = vec!["ipv4_netmask_length".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys)
-        .unwrap();
 
     // Should NOT be in state since user didn't specify it
     assert!(
@@ -4126,14 +4147,17 @@ fn test_merge_write_only_attributes_not_in_desired() {
 }
 
 #[test]
-fn test_merge_write_only_skips_if_already_in_provider_state() {
+fn accepted_write_only_does_not_overwrite_protected_provider_value() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType};
 
     // Resource with a write-only attribute
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "some_attr".to_string(),
-        Value::Concrete(ConcreteValue::String("desired".into())),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("desired".into()),
+        )))),
     );
 
     // Provider happens to return this attribute (unusual for write-only but possible)
@@ -4152,30 +4176,31 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         partial_read: None,
     };
 
-    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+    let schema = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("some_attr", AttributeType::string()).write_only());
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
         None,
-        None,
+        Some(&schema),
+        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();
 
-    let write_only_keys = vec!["some_attr".to_string()];
-    rs.merge_write_only_attributes(&resource, &write_only_keys)
-        .unwrap();
-
-    // Should keep the API-returned value, not overwrite with desired
-    assert_eq!(
-        persisted_json_attribute(
-            rs.persisted_attributes()
-                .expect("provider row has persisted attributes"),
-            "some_attr",
-        ),
-        Some(serde_json::json!("from-api"))
-    );
-    // Should NOT be recorded as write-only since the API returned it
-    assert!(rs.write_only_attributes().is_empty());
+    let stored = rs
+        .persisted_attributes()
+        .expect("provider row has persisted attributes")
+        .redacted_secret_hash("some_attr")
+        .expect("provider-returned secret value is protected");
+    // The provider entry wins, but its value is still protected according to
+    // the desired secret shape. Provenance overlay must not replace it with
+    // the desired material or classify it as a host-carried value.
+    let material = serde_json::to_vec(&serde_json::json!("from-api")).unwrap();
+    assert!(stored.verify(material));
+    // It remains marked write-only so a later read that omits it can carry the
+    // accepted value instead of losing its provenance.
+    assert_eq!(rs.write_only_attributes(), ["some_attr"]);
 }
 
 #[test]
@@ -4251,6 +4276,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -4297,6 +4323,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         &provider_state,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .expect("provider state should serialize");
@@ -4326,13 +4353,13 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         structural_legacy_secret(&"ab".repeat(32)),
     )]));
 
-    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+    let stored = ResourceState::deposed_attributes_without_previous(
         &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
-    let stored = state_json_from_persisted_attributes(&stored);
+    let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let password =
         structural_secret_digest(stored.get("password").expect("password remains stored"));
 
@@ -4406,19 +4433,26 @@ fn with_attributes_from_state_keeps_raw_legacy_shaped_text_plain() {
 }
 
 #[test]
-fn merge_write_only_attributes_keeps_raw_legacy_shaped_text_plain() {
-    use carina_core::resource::{ConcreteValue, Resource, Value};
+fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
+    use carina_core::resource::{ConcreteValue, Resource, State, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType};
 
     let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
     let resource = Resource::with_provider("mock", "test.resource", "plain", None).with_attribute(
         "password",
         Value::Concrete(ConcreteValue::String(marker.clone().into())),
     );
-    let mut row = ResourceState::try_applied("test.resource", "plain", "mock", "plain-id")
-        .expect("fixture identifier is non-empty");
-
-    row.merge_write_only_attributes(&resource, &["password".to_string()])
-        .expect("marker-shaped desired plaintext is ordinary text");
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &State::existing(resource.id.clone(), HashMap::new()).with_identifier("plain-id"),
+        None,
+        Some(&schema),
+        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        None,
+    )
+    .expect("marker-shaped desired plaintext is ordinary text");
     assert_eq!(
         persisted_json_attribute(
             row.persisted_attributes()
@@ -4450,14 +4484,14 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
             .expect("structural secret decodes to a typed value"),
     )]);
 
-    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+    let stored = ResourceState::deposed_attributes_without_previous(
         &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
 
-    let stored = state_json_from_persisted_attributes(&stored);
+    let stored = state_json_from_persisted_attributes(stored.as_persisted());
     assert_eq!(stored.get("password"), Some(upgraded.as_json()));
 }
 
@@ -4492,6 +4526,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         &provider_state,
         Some(&existing),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .expect("provider state should serialize");
@@ -4509,14 +4544,16 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
 #[test]
 fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType};
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
-    let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
+    let mut existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
         .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
+    existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
@@ -4527,16 +4564,18 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         partial_read: None,
     };
 
-    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+    let schema = ResourceSchema::new("db.Instance")
+        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let request = AcceptedRequest::update_for_test(&["password"], &[]);
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
         Some(&existing),
-        None,
+        Some(&schema),
+        WriteOnlyBasis::AcceptedRequest(&request),
         None,
     )
     .expect("provider state should serialize");
-    rs.merge_write_only_attributes(&resource, &["password".to_string()])
-        .unwrap();
 
     assert_eq!(
         persisted_json_attribute(
@@ -4547,6 +4586,148 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         Some(serde_json::json!("plain-secret"))
     );
     assert_eq!(rs.write_only_attributes(), ["password"]);
+}
+
+#[test]
+fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resource() {
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None).with_attribute(
+        "password",
+        Value::Concrete(ConcreteValue::String("old".into())),
+    );
+    let mut existing = ResourceState::try_applied("test.Resource", "main", "mock", "resource-id")
+        .expect("fixture identifier is non-empty")
+        .with_attribute("password", serde_json::json!("old"));
+    existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
+    let schema = ResourceSchema::new("test.Resource")
+        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let request = AcceptedRequest::update_for_test(&["apply_time_normalized_key"], &[]);
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &ProviderState::existing(resource.id.clone(), HashMap::new())
+            .with_identifier("resource-id"),
+        Some(&existing),
+        Some(&schema),
+        WriteOnlyBasis::AcceptedRequest(&request),
+        None,
+    )
+    .expect("non-write-only normalized patch keys must not fail state writeback");
+
+    assert_eq!(
+        persisted_json_attribute(
+            row.persisted_attributes()
+                .expect("row has persisted attributes"),
+            "password",
+        ),
+        Some(serde_json::json!("old"))
+    );
+}
+
+#[test]
+fn orphan_refresh_without_schema_carries_recorded_write_only_value() {
+    use carina_core::resource::{ResourceId, State as ProviderState};
+
+    let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
+    let mut existing = ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-id")
+        .expect("fixture identifier is non-empty")
+        .with_attribute("password", serde_json::json!("old"));
+    existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
+    let fresh = ProviderState::existing(id, HashMap::new()).with_identifier("resource-id");
+
+    let refreshed = existing
+        .refreshable()
+        .expect("applied row can refresh")
+        .refreshed_from_provider_state(&fresh, None)
+        .expect("schema-less orphan refresh should write state");
+
+    assert_eq!(
+        persisted_json_attribute(
+            refreshed
+                .persisted_attributes()
+                .expect("refreshed row has attributes"),
+            "password",
+        ),
+        Some(serde_json::json!("old"))
+    );
+    assert_eq!(refreshed.write_only_attributes(), ["password"]);
+}
+
+#[test]
+fn orphan_refresh_drops_provider_echoed_write_only_value_absent_from_previous() {
+    use carina_core::resource::{ConcreteValue, ResourceId, State as ProviderState, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
+    let existing = ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-id")
+        .expect("fixture identifier is non-empty");
+    let schema = ResourceSchema::new("test.Resource")
+        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let fresh = ProviderState::existing(
+        id,
+        HashMap::from([(
+            "password".to_string(),
+            Value::Concrete(ConcreteValue::String("provider-plaintext".into())),
+        )]),
+    )
+    .with_identifier("resource-id");
+
+    let refreshed = existing
+        .refreshable()
+        .expect("applied row can refresh")
+        .refreshed_from_provider_state(&fresh, Some(&schema))
+        .expect("orphan refresh should write state");
+
+    assert_eq!(
+        persisted_json_attribute(
+            refreshed
+                .persisted_attributes()
+                .expect("refreshed row has attributes"),
+            "password",
+        ),
+        None
+    );
+    assert!(refreshed.write_only_attributes().is_empty());
+}
+
+#[test]
+fn managed_refresh_infers_legacy_unlisted_write_only_values_from_schema() {
+    use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "main", None);
+    let row = ResourceState::try_applied("test.resource", "main", "mock", "provider-id")
+        .expect("fixture identifier is non-empty")
+        .with_attribute("password", serde_json::json!("last-sent"));
+    assert!(row.write_only_attributes().is_empty());
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("fixture row should be valid");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+    );
+
+    let mut omitted = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+    state_file.restore_recorded_write_only_attributes_in_state(&mut omitted, &schemas);
+    assert_eq!(
+        omitted.attributes.get("password"),
+        Some(&Value::Concrete(ConcreteValue::String("last-sent".into())))
+    );
+
+    let provider_value = Value::Concrete(ConcreteValue::String("provider-value".into()));
+    let mut returned = State::existing(
+        id,
+        HashMap::from([("password".to_string(), provider_value.clone())]),
+    )
+    .with_identifier("provider-id");
+    state_file.restore_recorded_write_only_attributes_in_state(&mut returned, &schemas);
+    assert_eq!(returned.attributes.get("password"), Some(&provider_value));
 }
 
 #[test]
@@ -4577,13 +4758,13 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         previous_tags.clone(),
     )]));
 
-    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+    let stored = ResourceState::deposed_attributes_without_previous(
         &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
-    let stored_json = state_json_from_persisted_attributes(&stored);
+    let stored_json = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored_json
         .get("tags")
         .and_then(|value| value.as_object())
@@ -4605,13 +4786,16 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         "tags".to_string(),
         stored_json["tags"].clone(),
     )]));
-    let stored_again = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+    let stored_again = ResourceState::deposed_attributes_without_previous(
         &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
     );
-    assert_eq!(stored_again.get("tags"), stored.get("tags"));
+    assert_eq!(
+        stored_again.as_persisted().get("tags"),
+        stored.as_persisted().get("tags")
+    );
 }
 
 #[test]
@@ -4631,13 +4815,13 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
     let existing =
         persisted_attributes_from_state_json(&HashMap::from([("tags".to_string(), previous_tags)]));
 
-    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+    let stored = ResourceState::deposed_attributes_without_previous(
         &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
-    let stored = state_json_from_persisted_attributes(&stored);
+    let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored
         .get("tags")
         .and_then(|value| value.as_object())
@@ -4698,13 +4882,13 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         previous_items,
     )]));
 
-    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+    let stored = ResourceState::deposed_attributes_without_previous(
         &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
     );
-    let stored = state_json_from_persisted_attributes(&stored);
+    let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_items = structural_secret_digest(
         stored
             .get("items")
@@ -4768,6 +4952,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -4847,6 +5032,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -4914,6 +5100,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -5066,6 +5253,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         &provider_state,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap_err();
@@ -5277,6 +5465,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
         &current,
         Some(row),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -5319,6 +5508,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         &first_provider,
         None,
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();
@@ -5422,6 +5612,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         &reordered_provider,
         Some(&first_row),
         None,
+        WriteOnlyBasis::CarryPrevious,
         None,
     )
     .unwrap();

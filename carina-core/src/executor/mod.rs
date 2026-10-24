@@ -41,8 +41,9 @@ use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{
     CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest, InFlightCreate, ObservedCreate,
-    PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer, ProviderReadyDataSource,
-    ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
+    PartialReadDiagnostic, PatchOpKind, Provider, ProviderError, ProviderNormalizer,
+    ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
+    UpdateRequest,
 };
 use crate::resource::{
     AccessPath, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
@@ -200,11 +201,84 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
     }
 }
 
+/// The accepted provider request whose result produced a complete state.
+///
+/// Update `sent` contains exactly the attributes for which the accepted patch
+/// carried a value. Removals stay separate so writeback can drop a previously
+/// persisted write-only value without treating the absent desired value as sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedRequest {
+    kind: AcceptedRequestKind,
+}
+
+/// Read-only shape of the request accepted by the provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptedRequestKind {
+    Create,
+    Update {
+        sent: BTreeSet<String>,
+        removed: BTreeSet<String>,
+    },
+}
+
+impl AcceptedRequest {
+    /// Record a successful create from the checked executor path.
+    pub(crate) fn create() -> Self {
+        Self {
+            kind: AcceptedRequestKind::Create,
+        }
+    }
+
+    fn from_update_request(request: &UpdateRequest) -> Self {
+        let mut sent = BTreeSet::new();
+        let mut removed = BTreeSet::new();
+        for op in &request.patch().ops {
+            match op.kind {
+                PatchOpKind::Add | PatchOpKind::Replace => {
+                    sent.insert(op.key.clone());
+                }
+                PatchOpKind::Remove => {
+                    removed.insert(op.key.clone());
+                }
+            }
+        }
+        Self {
+            kind: AcceptedRequestKind::Update { sent, removed },
+        }
+    }
+
+    /// Construct create provenance for fixtures and state-boundary tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn create_for_test() -> Self {
+        Self::create()
+    }
+
+    /// Construct update provenance for fixtures and state-boundary tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn update_for_test(sent: &[&str], removed: &[&str]) -> Self {
+        Self {
+            kind: AcceptedRequestKind::Update {
+                sent: sent.iter().map(|key| (*key).to_string()).collect(),
+                removed: removed.iter().map(|key| (*key).to_string()).collect(),
+            },
+        }
+    }
+
+    pub fn kind(&self) -> &AcceptedRequestKind {
+        &self.kind
+    }
+}
+
 /// Provenance-preserving result of one effect. State writeback must classify
 /// every arm explicitly instead of treating every state-shaped value alike.
 #[derive(Debug)]
 pub enum Applied {
-    Complete(State),
+    Complete {
+        state: State,
+        request: AcceptedRequest,
+    },
     Observed(ObservedCreate),
     CreateInFlight(InFlightCreate),
     CreateEnded,

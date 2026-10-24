@@ -7,7 +7,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
-use carina_core::executor::{Applied, ExecutionResult};
+use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
 #[cfg(test)]
 use carina_core::provider::SentRecord;
@@ -23,8 +23,8 @@ use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_state::{
-    DeposedInstance, DeposedKey, PreviousSecretHashAuthority, ResourceState, StateBackend,
-    StateFile,
+    DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority, ResourceState,
+    StateBackend, StateFile, WriteOnlyBasis,
 };
 use colored::Colorize;
 
@@ -588,7 +588,10 @@ struct PlannedUpsert<'a> {
 /// Provenance of a row write. Keeping these cases separate prevents an
 /// observed failure or continuation from taking the complete-state path.
 enum UpsertSource<'a> {
-    Complete(&'a State),
+    Complete {
+        state: &'a State,
+        request: &'a AcceptedRequest,
+    },
     Observed(&'a ObservedCreate),
     CreateInFlight(&'a InFlightCreate),
     Imported(&'a State),
@@ -600,7 +603,7 @@ enum UpsertSource<'a> {
 impl<'a> UpsertSource<'a> {
     fn created_identifier(&self) -> Option<&str> {
         match self {
-            Self::Complete(state) | Self::Imported(state) => state.identifier.as_deref(),
+            Self::Complete { state, .. } | Self::Imported(state) => state.identifier.as_deref(),
             Self::Observed(created) => Some(created.identifier().as_str()),
             Self::CreateInFlight(pending) => pending.identifier().map(|value| value.as_str()),
             Self::CurrentPresent(_state) => None,
@@ -611,7 +614,7 @@ impl<'a> UpsertSource<'a> {
 
     fn is_create_result(&self) -> bool {
         match self {
-            Self::Complete(_state) => true,
+            Self::Complete { .. } => true,
             Self::Observed(_created) => true,
             Self::CreateInFlight(pending) => {
                 matches!(pending.persistence(), InFlightPersistence::Fresh(_))
@@ -628,7 +631,7 @@ impl<'a> UpsertSource<'a> {
             Self::Observed(_created) => true,
             Self::CreateInFlight(_pending) => true,
             Self::CurrentCreateInFlight(_pending) => true,
-            Self::Complete(_state) => false,
+            Self::Complete { .. } => false,
             Self::Imported(_state) => false,
             Self::CurrentPresent(_state) => false,
             Self::CurrentMissingIdentifier(_state) => false,
@@ -913,7 +916,7 @@ fn replacement_create_result<'upsert, 'resource>(
     match applied_states.get(id) {
         Some(Applied::CreateEnded) => ReplacementCreateResult::Ended,
         Some(
-            Applied::Complete(_)
+            Applied::Complete { .. }
             | Applied::Observed(_)
             | Applied::CreateInFlight(_)
             | Applied::Imported(_)
@@ -945,32 +948,30 @@ fn planned_depose(
     let attributes = if let Some(existing) = existing
         && existing.identifier().map(AppliedIdentifier::as_str) == Some(delete.identifier)
     {
-        // Re-merging desired secrets can store the new secret's hash
-        // on the old snapshot. That is the safe direction: hashes are
-        // compare-only, and this also masks keys that only became
-        // secret in the new config.
-        let persisted = existing_attributes.expect("existing row has persisted attributes");
-        ResourceState::protect_persisted_attributes_for_resource_and_schema(
-            desired_resource,
-            schema,
-            persisted.clone(),
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(persisted),
-        )
+        // Desired secret shapes only mask values carried by the old
+        // generation. Compare-only hashes never let a newly desired or
+        // provider-echoed write-only value enter this snapshot.
+        existing.deposed_attributes_from_current_generation(desired_resource, schema)
     } else {
         let previous_hash_authority = existing_attributes
             .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
             .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(previous) = delete.previous_attributes {
-            previous.encode(desired_resource, schema, previous_hash_authority)
+            ResourceState::deposed_attributes_from_replacement_history(
+                desired_resource,
+                schema,
+                previous,
+                previous_hash_authority,
+            )
         } else if let Some(current) = current_state {
-            ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+            ResourceState::deposed_attributes_without_previous(
                 desired_resource,
                 schema,
                 &current.attributes,
                 previous_hash_authority,
             )
         } else {
-            PersistedAttributes::default()
+            DeposedAttributes::default()
         }
     };
 
@@ -1186,7 +1187,9 @@ fn decompose_with_moved_origins<'a>(
         applied: &'a Applied,
     ) -> Result<(), WritebackConflict> {
         match applied {
-            Applied::Complete(state) => wb.add_upsert(resource, UpsertSource::Complete(state)),
+            Applied::Complete { state, request } => {
+                wb.add_upsert(resource, UpsertSource::Complete { state, request })
+            }
             Applied::Observed(created) => wb.add_upsert(resource, UpsertSource::Observed(created)),
             Applied::CreateInFlight(pending) => {
                 wb.add_upsert(resource, UpsertSource::CreateInFlight(pending))
@@ -1332,40 +1335,44 @@ pub(crate) fn build_state_after_apply(
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
-        let write_only_keys: Vec<String> = schemas
-            .get_for(resource)
-            .map(|schema| {
-                schema
-                    .attributes
-                    .iter()
-                    .filter(|(_, attr)| attr.write_only)
-                    .map(|(name, _)| name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
         let schema = schemas.get_for(resource);
         let mut resource_state = match &planned.source {
-            UpsertSource::Complete(state)
-            | UpsertSource::Imported(state)
-            | UpsertSource::CurrentPresent(state)
-            | UpsertSource::CurrentMissingIdentifier(state) => {
-                let mut row = ResourceState::from_provider_state_for_resource_and_schema(
+            UpsertSource::Complete { state, request } => {
+                ResourceState::from_provider_state_for_resource_and_schema(
                     resource,
                     state,
                     existing,
                     schema,
+                    WriteOnlyBasis::AcceptedRequest(request),
                     preferred_hashes,
                 )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
-                if !write_only_keys.is_empty() {
-                    row.merge_write_only_attributes(resource, &write_only_keys)
-                        .map_err(|source| {
-                            AppError::from_resource_state_encoding(id.clone(), source)
-                        })?;
-                }
-                row
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
+            }
+            UpsertSource::Imported(state) => {
+                // Import sends no resource attributes, so it establishes no
+                // write-only baseline. An updatable key is sent by the next
+                // plan; a create-only key remains subject to the #1232 guard.
+                ResourceState::from_provider_state_for_resource_and_schema(
+                    resource,
+                    state,
+                    existing,
+                    schema,
+                    WriteOnlyBasis::CarryPrevious,
+                    preferred_hashes,
+                )
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
+            }
+            UpsertSource::CurrentPresent(state) | UpsertSource::CurrentMissingIdentifier(state) => {
+                ResourceState::from_provider_state_for_resource_and_schema(
+                    resource,
+                    state,
+                    existing,
+                    schema,
+                    WriteOnlyBasis::CarryPrevious,
+                    preferred_hashes,
+                )
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
             UpsertSource::Observed(created) => ResourceState::from_observation(
                 resource,
@@ -1701,6 +1708,20 @@ mod apply_state_save_tests {
         ResolvedResource::new(resource)
     }
 
+    fn complete_create(state: State) -> Applied {
+        Applied::Complete {
+            state,
+            request: AcceptedRequest::create_for_test(),
+        }
+    }
+
+    fn complete_update(state: State, sent: &[&str], removed: &[&str]) -> Applied {
+        Applied::Complete {
+            state,
+            request: AcceptedRequest::update_for_test(sent, removed),
+        }
+    }
+
     fn structural_legacy_secret(hash_hex: &str) -> serde_json::Value {
         serde_json::json!({
             carina_core::value::PERSISTED_SECRET_KEY:
@@ -1854,7 +1875,7 @@ mod apply_state_save_tests {
 
         let managed_current = HashMap::from([(id.clone(), state.build_state_for_resource(&id))]);
         let applied = match kind {
-            ReplacementAppliedKind::Complete => Applied::Complete(
+            ReplacementAppliedKind::Complete => complete_create(
                 State::existing(
                     id.clone(),
                     HashMap::from([(
@@ -2143,6 +2164,559 @@ mod apply_state_save_tests {
             &[],
         )
         .expect("post-writeback plan should build")
+    }
+
+    fn write_only_password_schema() -> SchemaRegistry {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("comment", AttributeType::string()))
+                .attribute(
+                    AttributeSchema::new("replacement_key", AttributeType::string()).create_only(),
+                )
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+        schemas
+    }
+
+    fn state_after_accepted_create(
+        resource: &Resource,
+        provider_attributes: HashMap<String, Value>,
+        schemas: &SchemaRegistry,
+    ) -> StateFile {
+        let id = resource.id.clone();
+        build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved(resource.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_create(
+                        State::existing(id, provider_attributes).with_identifier("provider-id"),
+                    ),
+                )]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas,
+            },
+            None,
+        )
+        .expect("accepted create fixture should write state")
+    }
+
+    fn state_with_write_only_password(id: &ResourceId, password: &str) -> StateFile {
+        let row = ResourceState::try_applied(
+            id.resource_type.clone(),
+            id.identity().expect("fixture identity is resolved").clone(),
+            id.provider.clone(),
+            "provider-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("password", serde_json::json!(password));
+        let row =
+            crate::fixture_resource_state_metadata(row, Some(vec!["password".to_string()]), None);
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(row)
+            .expect("write-only fixture row is valid");
+        state
+    }
+
+    fn assert_stored_password(state: &StateFile, id: &ResourceId, expected: Option<&str>) {
+        let attributes = state
+            .find_resource_for_id(id)
+            .and_then(ResourceState::persisted_attributes)
+            .expect("fixture row has applied attributes");
+        assert_eq!(
+            attributes.get("password"),
+            expected.map(|value| Value::Concrete(ConcreteValue::String(value.into())))
+        );
+    }
+
+    #[test]
+    fn failed_update_carries_previous_write_only_value_and_next_plan_retries_it() {
+        let desired = Resource::with_provider("mock", "test.resource", "failed-update", None)
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("new".into())),
+            );
+        let id = desired.id.clone();
+        let existing = state_with_write_only_password(&id, "old");
+        let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let schemas = write_only_password_schema();
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
+                applied_states: &HashMap::new(),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("failed-update refresh should write state");
+
+        assert_stored_password(&saved, &id, Some("old"));
+        let next_plan = plan_after_writeback(&desired, &saved, &schemas);
+        assert!(next_plan.effects().iter().any(|effect| matches!(
+            effect,
+            Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == "password")
+        )));
+    }
+
+    #[test]
+    fn replacement_create_does_not_carry_removed_write_only_value() {
+        let schemas = write_only_password_schema();
+        let old = Resource::with_provider("mock", "test.resource", "replace", None)
+            .with_attribute(
+                "replacement_key",
+                Value::Concrete(ConcreteValue::String("old-key".into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("old-password".into())),
+            );
+        let id = old.id.clone();
+        let existing = state_after_accepted_create(
+            &old,
+            HashMap::from([(
+                "replacement_key".to_string(),
+                Value::Concrete(ConcreteValue::String("old-key".into())),
+            )]),
+            &schemas,
+        );
+        let desired = Resource::with_provider("mock", "test.resource", "replace", None)
+            .with_attribute(
+                "replacement_key",
+                Value::Concrete(ConcreteValue::String("new-key".into())),
+            );
+        let plan = plan_after_writeback(&desired, &existing, &schemas);
+        assert!(
+            plan.effects()
+                .iter()
+                .any(|effect| matches!(effect, Effect::Create(resource) if resource.id == id)),
+            "create-only change must plan a replacement create: {plan:#?}"
+        );
+        let managed_current = HashMap::from([(id.clone(), existing.build_state_for_resource(&id))]);
+        let applied = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "replacement_key".to_string(),
+                Value::Concrete(ConcreteValue::String("new-key".into())),
+            )]),
+        )
+        .with_identifier("replacement-id");
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                runtime_synthesized_resources: &[],
+                managed_current: &managed_current,
+                applied_states: &HashMap::from([(id.clone(), complete_create(applied))]),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("replacement create should write state");
+
+        assert_stored_password(&saved, &id, None);
+    }
+
+    #[test]
+    fn carry_previous_recovers_legacy_unmarked_write_only_value() {
+        let desired = Resource::with_provider("mock", "test.resource", "legacy-echo", None)
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("new".into())),
+            );
+        let id = desired.id.clone();
+        let legacy_row = ResourceState::try_applied(
+            id.resource_type.clone(),
+            id.identity().expect("fixture identity is resolved").clone(),
+            id.provider.clone(),
+            "provider-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("password", serde_json::json!("old"));
+        assert!(legacy_row.write_only_attributes().is_empty());
+        let mut existing = StateFile::new();
+        existing
+            .upsert_resource(legacy_row)
+            .expect("legacy provider-echo row is valid");
+        let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let schemas = write_only_password_schema();
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
+                applied_states: &HashMap::new(),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("legacy provider-echo value should carry through refresh writeback");
+
+        assert_stored_password(&saved, &id, Some("old"));
+        assert_eq!(
+            saved
+                .find_resource_for_id(&id)
+                .expect("saved row exists")
+                .write_only_attributes(),
+            ["password"]
+        );
+        let next_plan = plan_after_writeback(&desired, &saved, &schemas);
+        assert!(next_plan.effects().iter().any(|effect| matches!(
+            effect,
+            Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == "password")
+        )));
+    }
+
+    #[test]
+    fn successful_update_without_write_only_key_carries_previous_value() {
+        let desired = Resource::with_provider("mock", "test.resource", "partial-request", None)
+            .with_attribute(
+                "comment",
+                Value::Concrete(ConcreteValue::String("changed".into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("new".into())),
+            );
+        let id = desired.id.clone();
+        let existing = state_with_write_only_password(&id, "old");
+        let applied = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "comment".to_string(),
+                    Value::Concrete(ConcreteValue::String("changed".into())),
+                ),
+                (
+                    "password".to_string(),
+                    Value::Concrete(ConcreteValue::String("provider-value".into())),
+                ),
+            ]),
+        )
+        .with_identifier("provider-id");
+        let schemas = write_only_password_schema();
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_update(applied, &["comment"], &[]),
+                )]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("successful update should write state");
+
+        assert_stored_password(&saved, &id, Some("old"));
+    }
+
+    #[test]
+    fn successful_update_with_write_only_key_records_desired_value() {
+        let desired = Resource::with_provider("mock", "test.resource", "sent-password", None)
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("new".into())),
+            );
+        let id = desired.id.clone();
+        let existing = state_with_write_only_password(&id, "old");
+        let applied = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let schemas = write_only_password_schema();
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_update(applied, &["password"], &[]),
+                )]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("successful update should write state");
+
+        assert_stored_password(&saved, &id, Some("new"));
+    }
+
+    #[test]
+    fn carried_write_only_plaintext_is_hashed_when_desired_wraps_it_in_secret() {
+        let desired = Resource::with_provider("mock", "test.resource", "secret-promotion", None)
+            .with_attribute("password", secret_string("old"));
+        let id = desired.id.clone();
+        let existing = state_with_write_only_password(&id, "old");
+        let schemas = write_only_password_schema();
+
+        let next_plan = plan_after_writeback(&desired, &existing, &schemas);
+        assert_eq!(next_plan.mutation_count(), 0);
+
+        let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
+                applied_states: &HashMap::new(),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("secret promotion should protect the carried value during writeback");
+
+        let stored = saved
+            .find_resource_for_id(&id)
+            .and_then(ResourceState::persisted_attributes)
+            .and_then(|attributes| attributes.redacted_secret_hash("password"))
+            .expect("carried write-only secret must be stored as a hash");
+        assert!(stored.verify(serde_json::to_vec(&serde_json::json!("old")).unwrap()));
+    }
+
+    #[test]
+    fn successful_update_that_removed_write_only_key_drops_previous_value() {
+        let desired = Resource::with_provider("mock", "test.resource", "removed-password", None);
+        let id = desired.id.clone();
+        let existing = state_with_write_only_password(&id, "old");
+        let applied = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String("stale-provider-value".into())),
+            )]),
+        )
+        .with_identifier("provider-id");
+        let schemas = write_only_password_schema();
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired)),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_update(applied, &[], &["password"]),
+                )]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("successful removal should write state");
+
+        assert_stored_password(&saved, &id, None);
+    }
+
+    #[test]
+    fn removed_write_only_key_is_sent_dropped_and_converges() {
+        let schemas = write_only_password_schema();
+        let before = Resource::with_provider("mock", "test.resource", "remove-converges", None)
+            .with_attribute(
+                "comment",
+                Value::Concrete(ConcreteValue::String("before".into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("old-password".into())),
+            );
+        let id = before.id.clone();
+        let existing = state_after_accepted_create(
+            &before,
+            HashMap::from([(
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("before".into())),
+            )]),
+            &schemas,
+        );
+        let desired = Resource::with_provider("mock", "test.resource", "remove-converges", None)
+            .with_attribute(
+                "comment",
+                Value::Concrete(ConcreteValue::String("after".into())),
+            );
+        let plan = plan_after_writeback(&desired, &existing, &schemas);
+        let changed_attributes = plan
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Update {
+                    changed_attributes, ..
+                } => Some(changed_attributes),
+                _ => None,
+            })
+            .expect("removing a write-only key with another change should plan an update");
+        assert!(changed_attributes.iter().any(|key| key == "comment"));
+        assert!(
+            changed_attributes.iter().any(|key| key == "password"),
+            "the differ must include the removed write-only key: {changed_attributes:?}"
+        );
+        let managed_current = HashMap::from([(id.clone(), existing.build_state_for_resource(&id))]);
+        let applied = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )]),
+        )
+        .with_identifier("provider-id");
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(existing),
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &managed_current,
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_update(applied, &["comment"], &["password"]),
+                )]),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("accepted update removal should write state");
+
+        assert_stored_password(&saved, &id, None);
+        assert!(
+            !saved
+                .find_resource_for_id(&id)
+                .expect("saved row exists")
+                .write_only_attributes()
+                .iter()
+                .any(|key| key == "password")
+        );
+        let next_plan = plan_after_writeback(&desired, &saved, &schemas);
+        assert_eq!(next_plan.mutation_count(), 0, "{next_plan:#?}");
+    }
+
+    #[test]
+    fn import_records_no_write_only_value_and_next_plan_sends_updatable_key() {
+        let desired = Resource::with_provider("mock", "test.resource", "imported", None)
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("import-baseline".into())),
+            );
+        let id = desired.id.clone();
+        let imported = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let schemas = write_only_password_schema();
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), Applied::Imported(imported))]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("import should write state");
+
+        assert_stored_password(&saved, &id, None);
+        let next_plan = plan_after_writeback(&desired, &saved, &schemas);
+        assert!(next_plan.effects().iter().any(|effect| matches!(
+            effect,
+            Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == "password")
+        )));
+    }
+
+    #[test]
+    fn import_create_only_write_only_key_is_skipped_by_1232_guard() {
+        let desired =
+            Resource::with_provider("mock", "test.resource", "imported-create-only", None)
+                .with_attribute(
+                    "password",
+                    Value::Concrete(ConcreteValue::String("cannot-update".into())),
+                );
+        let id = desired.id.clone();
+        let imported = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource").attribute(
+                AttributeSchema::new("password", AttributeType::string())
+                    .write_only()
+                    .create_only(),
+            ),
+        );
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: None,
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(id.clone(), Applied::Imported(imported))]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("import should write state");
+
+        assert_stored_password(&saved, &id, None);
+        assert_eq!(
+            plan_after_writeback(&desired, &saved, &schemas).mutation_count(),
+            0
+        );
     }
 
     fn write_observed_fixture(
@@ -2864,7 +3438,7 @@ mod apply_state_save_tests {
                 sorted_resources: &[resolved(resource)],
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2941,7 +3515,7 @@ mod apply_state_save_tests {
             .expect("test state setup must be valid");
         let applied_states = HashMap::from([(
             id.clone(),
-            Applied::Complete(applied_name_state(&id, "new-temp")),
+            complete_create(applied_name_state(&id, "new-temp")),
         )]);
         let plan = plan_with_name_override(&id, "new-temp", "dsl-new");
 
@@ -2997,7 +3571,7 @@ mod apply_state_save_tests {
             .expect("test state setup must be valid");
         let applied_states = HashMap::from([(
             id.clone(),
-            Applied::Complete(applied_name_state(&id, "legacy-temp")),
+            complete_create(applied_name_state(&id, "legacy-temp")),
         )]);
         let plan = plan_with_name_override(&id, "legacy-temp", "dsl-value");
 
@@ -3052,10 +3626,7 @@ mod apply_state_save_tests {
                 state_file: Some(StateFile::new()),
                 sorted_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(
-                    child_id.clone(),
-                    Applied::Complete(child_state),
-                )]),
+                applied_states: &HashMap::from([(child_id.clone(), complete_create(child_state))]),
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
@@ -3293,7 +3864,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
         let failed_refreshes = HashSet::new();
@@ -3370,7 +3941,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -3426,7 +3997,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -3503,7 +4074,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id,
+                    complete_update(applied_state, &["cidr_block"], &[]),
+                )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3562,7 +4136,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3627,7 +4201,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(current_state))]),
-                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3687,7 +4261,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3787,7 +4361,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(create_id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(create_id, complete_create(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -3851,7 +4425,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(create_id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(create_id, complete_create(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -3959,7 +4533,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -4082,7 +4656,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
                 plan: &plan,
                 successfully_deleted: &successfully_deleted,
                 failed_refreshes: &HashSet::new(),
@@ -4218,7 +4792,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_update(applied_state, &["password"], &[]),
+                )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -4300,7 +4877,7 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(id.clone(), complete_create(applied_state))]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -4357,7 +4934,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), Applied::Complete(applied_state))]),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    complete_update(applied_state, &["password"], &[]),
+                )]),
                 plan: &plan,
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -4413,6 +4993,187 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn cbd_replacement_does_not_add_new_write_only_secret_to_deposed_old_generation() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let runtime_child =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]")
+                .with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("new.example.com".into())),
+                )
+                .with_attribute("password", secret_string("new-password"));
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("new.example.com".into())),
+            )]),
+        )
+        .with_identifier("new-record-id");
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("old.example.com".into())),
+            )]),
+        )
+        .with_identifier("old-record-id");
+        let existing = ResourceState::try_applied(
+            "route53.Record",
+            "validation_records[0]",
+            "aws",
+            "old-record-id",
+        )
+        .expect("fixture identifier is non-empty")
+        .with_attribute("name", serde_json::json!("old.example.com"));
+        let mut state_file = StateFile::new();
+        state_file
+            .upsert_resource(existing)
+            .expect("old current fixture must be valid");
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("route53.Record")
+                .attribute(AttributeSchema::new("name", AttributeType::string()))
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(state_file),
+                sorted_resources: &[],
+                runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
+                managed_current: &crate::managed_current_from_states(HashMap::from([(
+                    id.clone(),
+                    current_state,
+                )])),
+                applied_states: &HashMap::from([(id.clone(), complete_create(applied_state))]),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("create-before-destroy replacement should write state");
+
+        let deposed = state
+            .find_resource_for_id(&id)
+            .expect("replacement row should be persisted")
+            .deposed
+            .iter()
+            .find(|generation| generation.identifier == "old-record-id")
+            .expect("old generation should be deposed");
+        assert!(
+            !deposed.persisted_attributes().contains_key("password"),
+            "the old generation never received the new write-only password"
+        );
+    }
+
+    #[test]
+    fn replacement_plan_fallback_does_not_persist_provider_echoed_write_only_value() {
+        let mut desired = Resource::with_provider("mock", "test.resource", "main", None)
+            .with_attribute(
+                "replacement_key",
+                Value::Concrete(ConcreteValue::String("new".into())),
+            );
+        desired.directives.create_before_destroy = true;
+        let id = desired.id.clone();
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "replacement_key".to_string(),
+                    Value::Concrete(ConcreteValue::String("old".into())),
+                ),
+                (
+                    "password".to_string(),
+                    Value::Concrete(ConcreteValue::String("provider-echo".into())),
+                ),
+            ]),
+        )
+        .with_identifier("old-id");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource")
+                .attribute(
+                    AttributeSchema::new("replacement_key", AttributeType::string()).create_only(),
+                )
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
+                .with_coexisting_replacement(),
+        );
+        let sorted_resources = vec![resolved(desired.clone())];
+        let current_states = HashMap::from([(id.clone(), current_state.clone())]);
+        let plan = create_plan(
+            &sorted_resources,
+            &[],
+            &ProviderRouter::new(),
+            carina_core::differ::PlanPriorStates::new(
+                &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
+                &HashMap::new(),
+                &carina_core::differ::Orphans::new(),
+            ),
+            &HashMap::new(),
+            &schemas,
+            &crate::empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &[],
+        )
+        .expect("create-only change should plan a replacement");
+        assert!(
+            plan.replace_display_info()
+                .next()
+                .is_some_and(|replacement| replacement.create_before_destroy),
+            "fixture must exercise the create-before-destroy replacement fallback"
+        );
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "replacement_key".to_string(),
+                Value::Concrete(ConcreteValue::String("new".into())),
+            )]),
+        )
+        .with_identifier("new-id");
+
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: Some(StateFile::new()),
+                sorted_resources: &sorted_resources,
+                runtime_synthesized_resources: &[],
+                managed_current: &crate::managed_current_from_states(current_states),
+                applied_states: &HashMap::from([(id.clone(), complete_create(applied_state))]),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("replacement writeback should succeed");
+
+        let deposed = state
+            .find_resource_for_id(&id)
+            .expect("replacement row should be persisted")
+            .deposed
+            .iter()
+            .find(|generation| generation.identifier == "old-id")
+            .expect("failed old delete should leave a deposed generation");
+        assert!(
+            !deposed.persisted_attributes().contains_key("password"),
+            "plan-time provider echoes are not previous persisted values"
+        );
+    }
+
+    #[test]
     fn deposed_fallback_attributes_hash_secrets_and_skip_unknowns() {
         let id = ResourceId::with_provider_identity(
             "aws",
@@ -4448,7 +5209,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -4534,7 +5295,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -4602,7 +5363,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
@@ -4811,7 +5572,7 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -5064,7 +5825,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("bucket-new-id");
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -5128,7 +5889,7 @@ mod apply_state_save_tests {
             )),
         });
         let current_states = HashMap::new();
-        let applied_states = HashMap::from([(id.clone(), Applied::Complete(applied_state))]);
+        let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
         let successfully_deleted = HashSet::new();
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
