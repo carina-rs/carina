@@ -1,0 +1,13 @@
+{
+  "protocols": ["1"],
+  "filename": "carina-provider-awscc-v0.7.0.wasm",
+  "download_url": "https://registry-dev.carina-rs.dev/blob/sha256:baf9a2c0e29344d57c87b4db612cbfeccc404258692d24788d4fef3cc2a649f0",
+  "shasum": "baf9a2c0e29344d57c87b4db612cbfeccc404258692d24788d4fef3cc2a649f0",
+  "shasum_authored_by": "registry",
+  "signature": {
+    "type": "sigstore-bundle",
+    "certificate_identity": "https://github.com/carina-rs/carina-provider-awscc/.github/workflows/release.yml@refs/tags/v0.7.0",
+    "certificate_oidc_issuer": "https://token.actions.githubusercontent.com",
+    "bundle_url": "https://registry-dev.carina-rs.dev/v1/providers/carina-rs/awscc/0.7.0/sigstore.json"
+  }
+}

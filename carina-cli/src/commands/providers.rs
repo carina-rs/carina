@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use carina_provider_resolver::{LockFile, LockFileMigration, provider_lock_path};
+use carina_provider_resolver::{
+    DiscardedSignerPins, LockFile, LockFileMigration, WorkflowPins, provider_lock_path,
+};
 
 use crate::error::AppError;
 use carina_core::hint::ProjectCommand;
@@ -21,7 +23,7 @@ pub enum ProvidersCommands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Replace a registry provider's signing-identity pin on its next resolution
+    /// Replace all of a registry provider's signer pins on its next resolution
     RepinIdentity {
         /// Registry provider source: [hostname/]namespace/name
         provider: String,
@@ -162,11 +164,38 @@ fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<()
     let pin = recovery.identity_pin();
 
     eprintln!("Registry provider: {provider}");
-    eprintln!(
-        "Discarding certificate identity: {}",
-        pin.certificate_identity
-    );
-    eprintln!("Discarding OIDC issuer: {}", pin.certificate_oidc_issuer);
+    match pin {
+        DiscardedSignerPins::Legacy(pin) => {
+            eprintln!(
+                "Discarding legacy certificate identity: {}",
+                pin.certificate_san
+            );
+            eprintln!("Discarding legacy OIDC issuer: {}", pin.oidc_issuer);
+        }
+        DiscardedSignerPins::Current(pins) => {
+            eprintln!("Discarding source OIDC issuer: {}", pins.source.oidc_issuer);
+            eprintln!(
+                "Discarding source repository owner ID: {}",
+                pins.source.repository_owner_id
+            );
+            eprintln!(
+                "Discarding source repository ID: {}",
+                pins.source.repository_id
+            );
+            match &pins.workflows {
+                WorkflowPins::Stable(workflow) => {
+                    eprintln!("Discarding stable workflow: {}", workflow.0);
+                }
+                WorkflowPins::Prerelease(workflow) => {
+                    eprintln!("Discarding pre-release workflow: {}", workflow.0);
+                }
+                WorkflowPins::Both { stable, prerelease } => {
+                    eprintln!("Discarding stable workflow: {}", stable.0);
+                    eprintln!("Discarding pre-release workflow: {}", prerelease.0);
+                }
+            }
+        }
+    }
     eprintln!("The ratcheted signature requirement and all other lock state will be retained.");
     flush_preview()?;
 
@@ -178,7 +207,7 @@ fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<()
         .map_err(|error| AppError::Config(error.to_string()))?;
     save_lock(&lock, &lock_path)?;
     println!(
-        "Identity pin cleared. Run `{}` to verify a signed artifact and acquire the new pin.",
+        "Signer pins cleared. Run `{}` to verify a signed artifact and acquire new pins.",
         ProjectCommand::new("init", base_dir)
     );
     Ok(())

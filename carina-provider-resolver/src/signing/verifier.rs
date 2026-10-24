@@ -2,28 +2,40 @@ use futures::executor::block_on;
 use sha2::Sha256;
 use sigstore::bundle::Bundle;
 use sigstore::bundle::verify::Verifier;
-use sigstore::bundle::verify::policy::Identity;
 use sigstore_protobuf_specs::dev::sigstore::bundle::v1::bundle::Content;
 
 use super::trust_root::embedded_document;
-use super::{ExpectedIdentity, TRUST_ROOT_STALENESS_HINT, error_chain, verification_failure};
+use super::{
+    SignerIdentityPolicy, TRUST_ROOT_STALENESS_HINT, VerifiedSignerIdentity, error_chain,
+    verification_failure,
+};
 
 const BUNDLE_V03_COMPAT_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle+json;version=0.3";
 const BUNDLE_V03_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
 
-pub(super) fn verify(
+pub(super) fn verify_artifact(
     artifact_digest: Sha256,
     bundle_json: &[u8],
-    expected: &ExpectedIdentity,
-) -> Result<(), String> {
-    verify_inner(artifact_digest, bundle_json, expected).map_err(verification_failure)
+) -> Result<VerifiedSignerIdentity, String> {
+    verify_artifact_inner(artifact_digest, bundle_json).map_err(verification_failure)
 }
 
-fn verify_inner(
+fn verify_artifact_inner(
     artifact_digest: Sha256,
     bundle_json: &[u8],
-    expected: &ExpectedIdentity,
-) -> Result<(), String> {
+) -> Result<VerifiedSignerIdentity, String> {
+    let (bundle, verifier) = prepare_bundle(bundle_json)?;
+    let policy = SignerIdentityPolicy::new();
+    block_on(verifier.verify_digest(artifact_digest, bundle, &policy, true)).map_err(|error| {
+        format!(
+            "certificate, signer identity, artifact signature, or hashedrekord verification failed: {}; {TRUST_ROOT_STALENESS_HINT}",
+            error_chain(&error),
+        )
+    })?;
+    policy.into_verified()
+}
+
+fn prepare_bundle(bundle_json: &[u8]) -> Result<(Bundle, Verifier), String> {
     let mut bundle: Bundle = serde_json::from_slice(bundle_json)
         .map_err(|error| format!("cannot parse Sigstore bundle JSON: {error}"))?;
     ensure_message_signature_bundle(&bundle)?;
@@ -52,18 +64,7 @@ fn verify_inner(
             error_chain(&error)
         )
     })?;
-    let (identity, issuer) = expected.values();
-    let policy = Identity::new(identity, issuer);
-
-    // blocking::Verifier nests its own Tokio runtime and panics inside one. With
-    // offline=true, async verify_digest does no I/O (no awaits), so block_on
-    // completes it without any runtime.
-    block_on(verifier.verify_digest(artifact_digest, bundle, &policy, true)).map_err(|error| {
-        format!(
-            "certificate, identity, artifact signature, or hashedrekord verification failed: {}; {TRUST_ROOT_STALENESS_HINT}",
-            error_chain(&error),
-        )
-    })
+    Ok((bundle, verifier))
 }
 
 fn ensure_message_signature_bundle(bundle: &Bundle) -> Result<(), String> {
