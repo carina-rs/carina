@@ -82,6 +82,44 @@ transparency_log_present = true
     .unwrap();
 }
 
+fn write_current_signer_lock(base_dir: &Path) {
+    fs::write(
+        base_dir.join("carina-providers.lock"),
+        r#"version = 4
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+
+[registry_host."registry.carina-rs.dev".discovery_values]
+"providers.v1" = "https://registry.carina-rs.dev/v1/providers/"
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.7.0"
+sha256 = "pinned-shasum"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = true
+sequence = 7
+sequence_anchor_established = true
+sequence_anchor = 5
+valid_until_present = true
+yanked_versions = ["0.4.0"]
+signature_state = "required_current"
+source_oidc_issuer = "https://token.actions.githubusercontent.com"
+source_repository_owner_id = "260157389"
+source_repository_id = "1199024834"
+stable_workflow = "https://example.test/release.yml"
+prerelease_workflow = "https://example.test/ci.yml"
+transparency_log_present = true
+"#,
+    )
+    .unwrap();
+}
+
 fn registry_provider_config() -> ProviderConfig {
     ProviderConfig {
         name: "aws".into(),
@@ -155,12 +193,12 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         );
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
-            stderr.contains("Provider lock format migration: version 2 -> version 3"),
+            stderr.contains("Provider lock format migration: version 2 -> version 4"),
             "{operation}: {stderr}"
         );
         assert_eq!(
             stderr
-                .matches("Provider lock format migration: version 2 -> version 3")
+                .matches("Provider lock format migration: version 2 -> version 4")
                 .count(),
             1,
             "{operation} must report migration exactly once: {stderr}"
@@ -188,7 +226,7 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         );
 
         let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-        assert!(saved.starts_with("version = 3\n"), "{operation}: {saved}");
+        assert!(saved.starts_with("version = 4\n"), "{operation}: {saved}");
         assert!(
             saved.contains("discovery_pin_present = false"),
             "{operation}: {saved}"
@@ -217,7 +255,8 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
                 assert!(!saved.contains("discovery_sha256"), "{saved}");
                 assert!(saved.contains("sequence = 7"), "{saved}");
                 assert!(saved.contains("sequence_anchor = 5"), "{saved}");
-                assert!(saved.contains("certificate_identity = \"identity-a\""));
+                assert!(saved.contains("signature_state = \"required_legacy\""));
+                assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
             }
             "repin-identity" => {
                 assert!(saved.contains("migration_pending_discovery_pin"));
@@ -225,8 +264,11 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
                 assert!(saved.contains("discovery_sha256"), "{saved}");
                 assert!(saved.contains("sequence = 7"), "{saved}");
                 assert!(saved.contains("sequence_anchor = 5"), "{saved}");
-                assert!(!saved.contains("certificate_identity"), "{saved}");
-                assert!(saved.contains("signature_present = true"), "{saved}");
+                assert!(!saved.contains("legacy_certificate_identity"), "{saved}");
+                assert!(
+                    saved.contains("signature_state = \"required_unpinned\""),
+                    "{saved}"
+                );
             }
             "re-bootstrap" => {
                 assert!(saved.contains("migration_pending_discovery_pin"));
@@ -237,7 +279,8 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
                     saved.contains("sequence_anchor_established = false"),
                     "{saved}"
                 );
-                assert!(saved.contains("certificate_identity = \"identity-a\""));
+                assert!(saved.contains("signature_state = \"required_legacy\""));
+                assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
             }
             _ => unreachable!(),
         }
@@ -277,7 +320,7 @@ fn init_reports_v2_lock_migration_once_before_authorization_error() {
         "migration-pending discovery must remain blocked"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 2 -> version 3";
+    let header = "Provider lock format migration: version 2 -> version 4";
     assert!(stderr.contains(header), "{stderr}");
     let repin_command =
         ProjectCommand::new("providers repin-discovery", dir.path()).with_argument(HOST);
@@ -383,11 +426,11 @@ fn repin_discovery_prints_and_clears_consumed_host_values_only() {
     assert!(saved.contains("sequence_anchor = 5"), "{saved}");
     assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
     assert!(
-        saved.contains("certificate_identity = \"identity-a\""),
+        saved.contains("legacy_certificate_identity = \"identity-a\""),
         "{saved}"
     );
     assert!(
-        saved.contains("certificate_oidc_issuer = \"issuer-a\""),
+        saved.contains("legacy_certificate_oidc_issuer = \"issuer-a\""),
         "{saved}"
     );
     assert!(saved.contains("transparency_log_present = true"), "{saved}");
@@ -462,11 +505,11 @@ fn repin_identity_prints_discarded_pin_and_preserves_other_lock_state() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("Discarding certificate identity: identity-a"),
+        stderr.contains("Discarding legacy certificate identity: identity-a"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("Discarding OIDC issuer: issuer-a"),
+        stderr.contains("Discarding legacy OIDC issuer: issuer-a"),
         "{stderr}"
     );
     assert!(!stdout.contains("Discarding"), "{stdout}");
@@ -481,9 +524,54 @@ fn repin_identity_prints_discarded_pin_and_preserves_other_lock_state() {
     assert!(saved.contains("sequence = 7"), "{saved}");
     assert!(saved.contains("sequence_anchor = 5"), "{saved}");
     assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
-    assert!(saved.contains("signature_present = true"), "{saved}");
-    assert!(!saved.contains("certificate_identity"), "{saved}");
-    assert!(!saved.contains("certificate_oidc_issuer"), "{saved}");
+    assert!(
+        saved.contains("signature_state = \"required_unpinned\""),
+        "{saved}"
+    );
+    assert!(!saved.contains("legacy_certificate_identity"), "{saved}");
+    assert!(!saved.contains("legacy_certificate_oidc_issuer"), "{saved}");
+    assert!(saved.contains("transparency_log_present = true"), "{saved}");
+}
+
+#[test]
+fn repin_identity_prints_and_clears_every_current_signer_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    write_current_signer_lock(dir.path());
+
+    let output = carina(dir.path(), "repin-identity", true, "");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for expected in [
+        "Discarding source OIDC issuer: https://token.actions.githubusercontent.com",
+        "Discarding source repository owner ID: 260157389",
+        "Discarding source repository ID: 1199024834",
+        "Discarding stable workflow: https://example.test/release.yml",
+        "Discarding pre-release workflow: https://example.test/ci.yml",
+    ] {
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+
+    let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
+    assert!(
+        saved.contains("signature_state = \"required_unpinned\""),
+        "{saved}"
+    );
+    for removed in [
+        "source_oidc_issuer",
+        "source_repository_owner_id",
+        "source_repository_id",
+        "stable_workflow",
+        "prerelease_workflow",
+    ] {
+        assert!(!saved.contains(removed), "{removed} survived:\n{saved}");
+    }
+    assert!(saved.contains("sequence = 7"), "{saved}");
+    assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
     assert!(saved.contains("transparency_log_present = true"), "{saved}");
 }
 
@@ -523,13 +611,16 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
     assert!(!saved.contains("sequence = "), "{saved}");
     assert!(!saved.contains("sequence_anchor = "), "{saved}");
     assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
-    assert!(saved.contains("signature_present = true"), "{saved}");
     assert!(
-        saved.contains("certificate_identity = \"identity-a\""),
+        saved.contains("signature_state = \"required_legacy\""),
         "{saved}"
     );
     assert!(
-        saved.contains("certificate_oidc_issuer = \"issuer-a\""),
+        saved.contains("legacy_certificate_identity = \"identity-a\""),
+        "{saved}"
+    );
+    assert!(
+        saved.contains("legacy_certificate_oidc_issuer = \"issuer-a\""),
         "{saved}"
     );
     assert!(saved.contains("transparency_log_present = true"), "{saved}");
@@ -584,7 +675,10 @@ fn recovery_without_force_proceeds_after_exact_provider_confirmation() {
         assert!(!stdout.contains("Recovery cancelled."), "{stdout}");
         let saved = fs::read_to_string(lock_path).unwrap();
         match operation {
-            "repin-identity" => assert!(!saved.contains("certificate_identity"), "{saved}"),
+            "repin-identity" => assert!(
+                saved.contains("signature_state = \"required_unpinned\""),
+                "{saved}"
+            ),
             "re-bootstrap" => assert!(
                 saved.contains("sequence_anchor_established = false"),
                 "{saved}"

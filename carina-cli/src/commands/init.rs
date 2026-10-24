@@ -20,6 +20,32 @@ pub async fn run_init(
     migrate_state: bool,
     force: bool,
 ) -> Result<(), String> {
+    run_init_with_provider_resolver(
+        path,
+        upgrade,
+        locked,
+        migrate_state,
+        force,
+        |base_dir, providers, mode| {
+            carina_provider_resolver::resolve_all(base_dir, providers, mode)
+                .map(|resolved| resolved.len())
+        },
+    )
+    .await
+}
+
+async fn run_init_with_provider_resolver(
+    path: &Path,
+    upgrade: bool,
+    locked: bool,
+    migrate_state: bool,
+    force: bool,
+    resolve_providers: impl FnOnce(
+        &Path,
+        &[carina_core::parser::ProviderConfig],
+        LockMode,
+    ) -> Result<usize, String>,
+) -> Result<(), String> {
     if upgrade && locked {
         return Err("--upgrade and --locked are mutually exclusive".to_string());
     }
@@ -81,14 +107,13 @@ pub async fn run_init(
             .cyan()
         );
 
-        let resolved =
-            carina_provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, mode)?;
+        let resolved_count = resolve_providers(base_dir, &loaded.parsed.providers, mode)?;
 
         println!(
             "{}",
             format!(
                 "{} provider(s) installed in .carina/providers/",
-                resolved.len()
+                resolved_count
             )
             .green()
         );
@@ -169,4 +194,103 @@ pub async fn run_init(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_provider_resolver::FixtureRegistryHttp;
+    use std::fs;
+
+    const SIGNED_ARTIFACT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carina-provider-resolver/src/signing/testdata/a.txt"
+    ));
+    const SIGNED_BUNDLE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carina-provider-resolver/src/signing/testdata/bundle.sigstore.json"
+    ));
+    const SIGNED_VERSION: &str = "0.0.0-main.1";
+    const SIGNED_SHA256: &str = "a0cfc71271d6e278e57cd332ff957c3f7043fdda354c4cbb190a30d56efa01bf";
+    const SIGNED_ARTIFACT_URL: &str = "https://downloads.example.test/aws-main.wasm";
+    const SIGNED_BUNDLE_URL: &str = "https://downloads.example.test/aws-main.sigstore.json";
+
+    fn signed_fixture_registry() -> FixtureRegistryHttp {
+        FixtureRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                format!(
+                    r#"{{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{{"version":"{SIGNED_VERSION}","protocols":["1"]}}]}}"#
+                ),
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.1/download",
+                format!(
+                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"{SIGNED_ARTIFACT_URL}","shasum":"{SIGNED_SHA256}","shasum_authored_by":"registry","signature":{{"type":"sigstore-bundle","certificate_identity":"deliberately-wrong","certificate_oidc_issuer":"https://wrong.example.test","bundle_url":"{SIGNED_BUNDLE_URL}"}}}}"#
+                ),
+            )
+            .response(SIGNED_BUNDLE_URL, 200, SIGNED_BUNDLE)
+            .downloadable_bytes(SIGNED_ARTIFACT_URL, SIGNED_ARTIFACT.to_vec())
+    }
+
+    async fn assert_init_runs_real_verifier_inside_async_command() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("providers.crn"),
+            r#"provider aws {
+  source = 'carina-rs/aws'
+  version = '0.0.0-main.1'
+}
+"#,
+        )
+        .unwrap();
+        let http = signed_fixture_registry();
+
+        run_init_with_provider_resolver(
+            project.path(),
+            false,
+            false,
+            false,
+            false,
+            |base_dir, providers, mode| {
+                carina_provider_resolver::resolve_all_with_fixture_registry(
+                    base_dir, providers, mode, &http,
+                )
+                .map(|resolved| resolved.len())
+            },
+        )
+        .await
+        .unwrap();
+
+        let lock = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
+        assert!(lock.contains("version = 4"), "{lock}");
+        assert!(
+            lock.contains("signature_state = \"required_current\""),
+            "{lock}"
+        );
+        assert!(
+            lock.contains("prerelease_workflow = \"https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml\""),
+            "{lock}"
+        );
+        assert!(
+            project
+                .path()
+                .join(".carina/providers/carina-rs/aws/0.0.0-main.1/aws.wasm")
+                .is_file()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn init_real_verifier_is_safe_on_current_thread_runtime() {
+        assert_init_runs_real_verifier_inside_async_command().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn init_real_verifier_is_safe_on_multi_thread_runtime() {
+        assert_init_runs_real_verifier_inside_async_command().await;
+    }
 }

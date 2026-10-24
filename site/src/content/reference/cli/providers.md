@@ -4,9 +4,9 @@ title: providers
 
 Recover registry security state in `carina-providers.lock`.
 
-Carina records per-provider security state in the lock file: whether the registry serves signed artifacts and which signing identity is expected, an anti-rollback `sequence` observation and the reference point derived from it, and the versions the registry has reported as yanked. These are one-way ratchets — normal resolution can strengthen them but never weaken them, so a registry that stops signing, rolls its `sequence` backwards, or drops a yank flag is refused rather than accepted.
+Carina records per-provider security state in the lock file: whether the registry serves signed artifacts, the expected source identity, separate stable and pre-release workflow pins, an anti-rollback `sequence` observation and the reference point derived from it, and the versions the registry has reported as yanked. These are one-way ratchets — normal resolution can strengthen them but never weaken them, so a registry that stops signing, rolls its `sequence` backwards, or drops a yank flag is refused rather than accepted.
 
-Carina also records a discovery pin for each registry host: the verified API base URL and discovery document hash. This is host-level state, with one record shared by every provider resolved through that host.
+Carina also records a discovery pin for each registry host: the resolved value of every discovery field it consumes, currently the provider API base URL. This is host-level state, with one record shared by every provider resolved through that host.
 
 That is the correct behavior when the registry is hostile. It is also what happens when the change is legitimate: a registry changes its discovery configuration, a provider rotates its signing identity after a repository transfer or CI migration, or a registry is restored from a backup and serves an older `sequence`. In those cases the relevant pin or ratchet has to be reset deliberately, by an operator who has confirmed out-of-band that the change is genuine.
 
@@ -14,7 +14,7 @@ The three subcommands here are those deliberate resets. Two target one provider;
 
 ## repin-discovery
 
-Discards a registry host's pinned API base URL and discovery document hash so the next resolution can verify and establish a new discovery pin.
+Discards a registry host's consumed discovery values so the next resolution can verify and establish a new discovery pin.
 
 Use this when discovery fails because either value legitimately changed and you have confirmed the new registry configuration out-of-band. Because the pin belongs to the host, this command is keyed by hostname rather than provider source. Every provider entry and all per-provider security state are retained.
 
@@ -24,9 +24,9 @@ carina providers repin-discovery <HOST> [PATH] [--force]
 
 ## repin-identity
 
-Discards the pinned signing identity so the next signed artifact establishes a new one.
+Discards every signer pin for the provider — its shared source pin and both channels' workflow pins, or its legacy certificate SAN and issuer — so the next signed artifact establishes a new source and the workflow for its channel.
 
-Use this when signature verification fails because the registry's signing identity legitimately changed. The signature *requirement* survives: after re-pinning, an unsigned artifact is still refused. Only the expectation of *which* identity signs is replaced.
+Use this when signature verification fails because the signing source or workflow legitimately changed. The signature *requirement* survives: after re-pinning, an unsigned artifact is still refused. The stable source-ref rule also remains in force because it is derived from the version, not stored as a pin.
 
 Everything else is retained, including the recorded yanked versions, the `sequence` observation and reference point, and the pinned checksum.
 
@@ -40,7 +40,7 @@ Discards the `sequence` observation and its reference point, returning the provi
 
 Use this when resolution fails because the registry's `sequence` went backwards or jumped further ahead than the client will accept, and you have confirmed the registry is behaving legitimately. The next successful resolution establishes a new reference point from what it observes.
 
-The signing identity and signature requirement, the recorded yanked versions, and the pinned checksum are all retained. In particular, a yanked version stays yanked — un-yanking is not an operation Carina offers, because a genuine un-yank cannot be distinguished from an attacker stripping the flag.
+The signer source and workflow pins, signature requirement, recorded yanked versions, and pinned checksum are all retained. In particular, a yanked version stays yanked — un-yanking is not an operation Carina offers, because a genuine un-yank cannot be distinguished from an attacker stripping the flag.
 
 ```bash
 carina providers re-bootstrap <PROVIDER> [PATH] [--force]
