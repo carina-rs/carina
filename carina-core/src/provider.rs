@@ -1991,7 +1991,7 @@ impl PendingCreate {
         if self.identifier.is_some() {
             InFlightCreate::from_pending(self).into_create_failure(error)
         } else {
-            CreateFailure(CreateFailureKind::Untracked(error))
+            CreateFailure::from_kind(CreateFailureKind::Untracked(error))
         }
     }
 
@@ -2060,7 +2060,7 @@ pub struct PollAttempt {
 
 impl PollAttempt {
     pub fn untracked(self, error: ProviderError) -> CreateFailure {
-        CreateFailure(CreateFailureKind::Untracked(error))
+        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
     }
 
     pub fn issued(self, identifier: AppliedIdentifier) -> IssuedCreate {
@@ -2381,7 +2381,7 @@ impl InFlightCreate {
     /// Convert a continuation produced by a native provider or host adapter
     /// into the classified failure channel for an initial create.
     pub(crate) fn into_create_failure(self, error: ProviderError) -> CreateFailure {
-        CreateFailure(CreateFailureKind::InFlight {
+        CreateFailure::from_kind(CreateFailureKind::InFlight {
             pending: self,
             error,
         })
@@ -2389,7 +2389,7 @@ impl InFlightCreate {
 
     /// Preserve this continuation in the classified resume failure channel.
     pub(crate) fn into_resume_failure(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure(ResumeFailureKind::InFlight {
+        ResumeFailure::from_kind(ResumeFailureKind::InFlight {
             pending: self,
             error,
         })
@@ -2569,53 +2569,57 @@ pub enum CreateFailureKind {
 /// let _failure = CreateFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct CreateFailure(CreateFailureKind);
+pub struct CreateFailure(Box<CreateFailureKind>);
 
 impl std::fmt::Display for CreateFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self(CreateFailureKind::Untracked(_error)) => {
+        match self.kind() {
+            CreateFailureKind::Untracked(_error) => {
                 f.write_str("create failed before it could be tracked")
             }
-            Self(CreateFailureKind::Created {
+            CreateFailureKind::Created {
                 created: _created,
                 error: _error,
-            }) => f.write_str("create reached the provider but did not complete"),
-            Self(CreateFailureKind::InFlight {
+            } => f.write_str("create reached the provider but did not complete"),
+            CreateFailureKind::InFlight {
                 pending: _pending,
                 error: _error,
-            }) => f.write_str("create is still in progress"),
+            } => f.write_str("create is still in progress"),
         }
     }
 }
 
 impl std::error::Error for CreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self(CreateFailureKind::Untracked(error)) => Some(error),
-            Self(CreateFailureKind::Created {
+        match self.kind() {
+            CreateFailureKind::Untracked(error) => Some(error),
+            CreateFailureKind::Created {
                 created: _created,
                 error,
-            }) => Some(error),
-            Self(CreateFailureKind::InFlight {
+            } => Some(error),
+            CreateFailureKind::InFlight {
                 pending: _pending,
                 error,
-            }) => Some(error),
+            } => Some(error),
         }
     }
 }
 
 impl CreateFailure {
+    fn from_kind(kind: CreateFailureKind) -> Self {
+        Self(Box::new(kind))
+    }
+
     pub fn kind(&self) -> &CreateFailureKind {
-        &self.0
+        self.0.as_ref()
     }
 
     pub fn into_kind(self) -> CreateFailureKind {
-        self.0
+        *self.0
     }
 
     pub fn provider_error(&self) -> &ProviderError {
-        match &self.0 {
+        match self.kind() {
             CreateFailureKind::Untracked(error) => error,
             CreateFailureKind::Created {
                 created: _created,
@@ -2632,7 +2636,7 @@ impl CreateFailure {
     /// corresponding resume failure. Only a real create typestate can produce
     /// the `Untracked` input that becomes `Ended` here.
     fn into_resent(self) -> ResumeFailure {
-        match self.0 {
+        match self.into_kind() {
             CreateFailureKind::Untracked(error) => ResumeFailure::ended_from_verdict(error),
             CreateFailureKind::Created { created, error } => ResumeFailure::created(created, error),
             CreateFailureKind::InFlight { pending, error } => {
@@ -2642,15 +2646,15 @@ impl CreateFailure {
     }
 
     pub(crate) fn created(created: ObservedCreate, error: ProviderError) -> Self {
-        Self(CreateFailureKind::Created { created, error })
+        Self::from_kind(CreateFailureKind::Created { created, error })
     }
 
     pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
-        Self(CreateFailureKind::InFlight { pending, error })
+        Self::from_kind(CreateFailureKind::InFlight { pending, error })
     }
 
     pub(crate) fn untracked_at_dispatch(error: ProviderError) -> Self {
-        Self(CreateFailureKind::Untracked(error))
+        Self::from_kind(CreateFailureKind::Untracked(error))
     }
 }
 
@@ -2727,53 +2731,57 @@ pub enum ResumeFailureKind {
 /// let _failure = ResumeFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct ResumeFailure(ResumeFailureKind);
+pub struct ResumeFailure(Box<ResumeFailureKind>);
 
 impl std::fmt::Display for ResumeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self(ResumeFailureKind::Ended(_error)) => {
+        match self.kind() {
+            ResumeFailureKind::Ended(_error) => {
                 f.write_str("resumed create ended without a resource")
             }
-            Self(ResumeFailureKind::Created {
+            ResumeFailureKind::Created {
                 created: _created,
                 error: _error,
-            }) => f.write_str("resumed create reached the provider but did not complete"),
-            Self(ResumeFailureKind::InFlight {
+            } => f.write_str("resumed create reached the provider but did not complete"),
+            ResumeFailureKind::InFlight {
                 pending: _pending,
                 error: _error,
-            }) => f.write_str("resumed create is still in progress"),
+            } => f.write_str("resumed create is still in progress"),
         }
     }
 }
 
 impl std::error::Error for ResumeFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self(ResumeFailureKind::Ended(error)) => Some(error),
-            Self(ResumeFailureKind::Created {
+        match self.kind() {
+            ResumeFailureKind::Ended(error) => Some(error),
+            ResumeFailureKind::Created {
                 created: _created,
                 error,
-            }) => Some(error),
-            Self(ResumeFailureKind::InFlight {
+            } => Some(error),
+            ResumeFailureKind::InFlight {
                 pending: _pending,
                 error,
-            }) => Some(error),
+            } => Some(error),
         }
     }
 }
 
 impl ResumeFailure {
+    fn from_kind(kind: ResumeFailureKind) -> Self {
+        Self(Box::new(kind))
+    }
+
     pub fn kind(&self) -> &ResumeFailureKind {
-        &self.0
+        self.0.as_ref()
     }
 
     pub fn into_kind(self) -> ResumeFailureKind {
-        self.0
+        *self.0
     }
 
     pub fn provider_error(&self) -> &ProviderError {
-        match &self.0 {
+        match self.kind() {
             ResumeFailureKind::Ended(error) => error,
             ResumeFailureKind::Created {
                 created: _created,
@@ -2787,15 +2795,15 @@ impl ResumeFailure {
     }
 
     pub(crate) fn ended_from_verdict(error: ProviderError) -> Self {
-        Self(ResumeFailureKind::Ended(error))
+        Self::from_kind(ResumeFailureKind::Ended(error))
     }
 
     pub(crate) fn created(created: ObservedCreate, error: ProviderError) -> Self {
-        Self(ResumeFailureKind::Created { created, error })
+        Self::from_kind(ResumeFailureKind::Created { created, error })
     }
 
     pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
-        Self(ResumeFailureKind::InFlight { pending, error })
+        Self::from_kind(ResumeFailureKind::InFlight { pending, error })
     }
 }
 
@@ -2830,7 +2838,7 @@ impl CreateAttempt {
     }
 
     pub fn untracked(self, error: ProviderError) -> CreateFailure {
-        CreateFailure(CreateFailureKind::Untracked(error))
+        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
     }
 
     pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> IssuedCreate {
@@ -2905,7 +2913,7 @@ impl IssuedCreate {
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
-        CreateFailure(CreateFailureKind::Created {
+        CreateFailure::from_kind(CreateFailureKind::Created {
             created: ObservedCreate {
                 id: self.id,
                 identifier: self.identifier,
@@ -2917,7 +2925,7 @@ impl IssuedCreate {
     }
 
     pub fn discarded(self, error: ProviderError) -> CreateFailure {
-        CreateFailure(CreateFailureKind::Untracked(error))
+        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
     }
 }
 
@@ -2948,7 +2956,7 @@ impl FinishingCreate {
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
-        CreateFailure(CreateFailureKind::Created {
+        CreateFailure::from_kind(CreateFailureKind::Created {
             created: ObservedCreate {
                 id: self.id,
                 identifier: self.identifier,
@@ -2960,7 +2968,7 @@ impl FinishingCreate {
     }
 
     pub fn discarded(self, error: ProviderError) -> CreateFailure {
-        CreateFailure(CreateFailureKind::Untracked(error))
+        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
     }
 }
 

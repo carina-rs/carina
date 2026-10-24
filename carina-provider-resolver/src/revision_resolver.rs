@@ -430,8 +430,7 @@ pub fn resolve_provider_by_revision(
         if let Some(parent) = wasm_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::hard_link(&global_wasm, &wasm_path)
-            .or_else(|_| std::fs::copy(&global_wasm, &wasm_path).map(|_| ()))
+        super::provider_resolver::link_or_copy(&global_wasm, &wasm_path)
             .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
         let hash = super::provider_resolver::sha256_file(&wasm_path)
             .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
@@ -477,8 +476,7 @@ pub fn resolve_provider_by_revision(
         if let Some(parent) = global_wasm.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::hard_link(&wasm_path, &global_wasm)
-            .or_else(|_| std::fs::copy(&wasm_path, &global_wasm).map(|_| ()));
+        let _ = super::provider_resolver::link_or_copy(&wasm_path, &global_wasm);
     }
 
     let hash = super::provider_resolver::sha256_file(&wasm_path)
