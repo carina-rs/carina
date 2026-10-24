@@ -1,4 +1,4 @@
-//! Provider resolution: download, extract, cache, and verify provider binaries.
+//! Provider resolution: download, cache, and verify provider WASM components.
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2866,18 +2866,42 @@ impl<'a> PersistentLockFile<'a> {
     }
 }
 
+/// A resolved provider artifact path that is guaranteed to have a `.wasm`
+/// extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmArtifactPath(PathBuf);
+
+impl WasmArtifactPath {
+    pub(crate) fn new(path: PathBuf, provider_name: &str) -> Result<Self, String> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "wasm")
+        {
+            Ok(Self(path))
+        } else {
+            Err(format!(
+                "Provider '{provider_name}': native binaries are no longer supported. Use a .wasm component instead."
+            ))
+        }
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// An installed provider artifact together with the resolution provenance that
 /// selected it. The path is private so load callers must retain this wrapper
 /// and therefore cannot accidentally separate an artifact from its lock mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledProvider {
-    path: PathBuf,
+    path: WasmArtifactPath,
     provider_name: String,
     provenance: ProviderArtifactProvenance,
 }
 
 impl InstalledProvider {
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> &WasmArtifactPath {
         &self.path
     }
 
@@ -2909,7 +2933,7 @@ impl InstalledProvider {
         F: FnOnce(PathBuf) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        loader(self.path.clone())
+        loader(self.path.as_path().to_path_buf())
             .await
             .map_err(|error| self.with_load_error(error))
     }
@@ -3036,39 +3060,7 @@ fn missing_locked_artifact_error(
     )
 }
 
-/// Detect the current platform's target triple.
-pub fn detect_target() -> Result<String, String> {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-
-    let target = match (arch, os) {
-        ("aarch64", "macos") => "aarch64-apple-darwin",
-        ("x86_64", "macos") => "x86_64-apple-darwin",
-        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
-        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
-        _ => return Err(format!("Unsupported platform: {arch}-{os}")),
-    };
-
-    Ok(target.to_string())
-}
-
-/// Construct the download URL for a provider binary.
-pub fn download_url(source: &str, version: &str, target: &str) -> Result<String, String> {
-    let parts: Vec<&str> = source.split('/').collect();
-    if parts.len() != 3 || parts[0] != "github.com" {
-        return Err(format!(
-            "Invalid source format: {source}. Expected: github.com/{{owner}}/{{repo}}"
-        ));
-    }
-    let owner = parts[1];
-    let repo = parts[2];
-
-    Ok(format!(
-        "https://github.com/{owner}/{repo}/releases/download/v{version}/{repo}-v{version}-{target}.tar.gz"
-    ))
-}
-
-/// Construct the download URL for a WASM provider binary.
+/// Construct the download URL for a WASM provider component.
 pub fn download_url_wasm(source: &str, version: &str) -> Result<String, String> {
     let parts: Vec<&str> = source.split('/').collect();
     if parts.len() != 3 || parts[0] != "github.com" {
@@ -3951,18 +3943,7 @@ fn global_cache_path_wasm(source: &str, version: &str) -> Option<PathBuf> {
     global_cache_dir().map(|dir| dir.join(source).join(version).join(format!("{repo}.wasm")))
 }
 
-/// Resolve the cache path for a provider binary.
-pub fn cache_path(base_dir: &Path, source: &str, version: &str) -> PathBuf {
-    let repo = source.split('/').next_back().unwrap_or("provider");
-    base_dir
-        .join(".carina")
-        .join("providers")
-        .join(source)
-        .join(version)
-        .join(repo)
-}
-
-/// Resolve the cache path for a WASM provider binary.
+/// Resolve the cache path for a WASM provider component.
 pub fn cache_path_wasm(base_dir: &Path, source: &str, version: &str) -> PathBuf {
     let repo = source.split('/').next_back().unwrap_or("provider");
     base_dir
@@ -4015,87 +3996,14 @@ fn hash_and_check(
     Ok(artifact_digest)
 }
 
-/// Download a file from a URL and save it to a path.
-fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| format!("Failed to download {url}: {e}"))?;
-
-    if response.status() != 200 {
-        return Err(format!(
-            "Download failed with status {}: {url}",
-            response.status()
-        ));
-    }
-
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
-    }
-
-    let mut reader = response.into_body().into_reader();
-    let mut file = fs::File::create(dest)
-        .map_err(|e| format!("Failed to create file {}: {e}", dest.display()))?;
-    io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
-
-    Ok(())
-}
-
-/// Extract a tar.gz archive. Returns the path to the extracted binary.
-fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
-    let file = fs::File::open(archive_path)
-        .map_err(|e| format!("Failed to open archive {}: {e}", archive_path.display()))?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
-    fs::create_dir_all(dest_dir)
-        .map_err(|e| format!("Failed to create dir {}: {e}", dest_dir.display()))?;
-
-    archive
-        .unpack(dest_dir)
-        .map_err(|e| format!("Failed to extract archive: {e}"))?;
-
-    // Find the binary in the extracted directory
-    let entries = fs::read_dir(dest_dir)
-        .map_err(|e| format!("Failed to read dir {}: {e}", dest_dir.display()))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
-        let path = entry.path();
-        if path.is_file()
-            && !path
-                .extension()
-                .is_some_and(|ext| ext == "gz" || ext == "tar")
-        {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&path)
-                    .map_err(|e| format!("Failed to read metadata: {e}"))?
-                    .permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&path, perms)
-                    .map_err(|e| format!("Failed to set permissions: {e}"))?;
-            }
-            return Ok(path);
-        }
-    }
-
-    Err(format!(
-        "No binary found in archive: {}",
-        archive_path.display()
-    ))
-}
-
-/// Validate a cached version-mode binary and ensure the lock file records it.
+/// Validate a cached version-mode WASM component and ensure the lock file records it.
 ///
-/// When a previous `carina init` left a binary in `.carina/providers/`, the
+/// When a previous `carina init` left a component in `.carina/providers/`, the
 /// next run must still upsert a matching lock entry before the caller saves
 /// the lock. Otherwise an empty in-memory `LockFile` gets written back to
 /// disk and stomps the on-disk record (issue #2032).
 fn verify_or_record_version_cache(
-    binary_path: &Path,
+    wasm_path: &Path,
     source: &str,
     version: &str,
     name: &str,
@@ -4103,7 +4011,7 @@ fn verify_or_record_version_cache(
     project_dir: &Path,
 ) -> Result<(), String> {
     let actual_hash =
-        sha256_file(binary_path).map_err(|e| format!("Failed to hash binary: {e}"))?;
+        sha256_file(wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
     // Preserve any constraint already recorded; the resolver callers
     // overwrite it afterwards when the `.crn` specifies one.
     let existing_constraint = match lock_file.find(source, version) {
@@ -4255,7 +4163,7 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
     name: &str,
     lock_file: &mut LockFile,
     http: &H,
-) -> Result<PathBuf, String> {
+) -> Result<WasmArtifactPath, String> {
     let existing_host = lock_file.registry_host_lock(&source.hostname).cloned();
     let registry = resolve_registry(source, existing_host.as_ref(), base_dir, http)?;
     let mut persistent_lock = PersistentLockFile::new(lock_file, base_dir);
@@ -4327,17 +4235,22 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
         )
     });
 
-    let wasm_path = cache_path_wasm(base_dir, &source_key, version);
-    let artifact_digest = if wasm_path.exists() {
+    let wasm_path = WasmArtifactPath::new(cache_path_wasm(base_dir, &source_key, version), name)?;
+    let artifact_digest = if wasm_path.as_path().exists() {
         hash_and_check(
-            &wasm_path,
+            wasm_path.as_path(),
             &download.shasum,
             &format!("cached {provider_context}"),
             base_dir,
         )?
     } else {
-        http.download_to_file(&download_url, &wasm_path)?;
-        hash_and_check(&wasm_path, &download.shasum, &provider_context, base_dir)?
+        http.download_to_file(&download_url, wasm_path.as_path())?;
+        hash_and_check(
+            wasm_path.as_path(),
+            &download.shasum,
+            &provider_context,
+            base_dir,
+        )?
     };
 
     let verified_identity = match signed {
@@ -4347,7 +4260,7 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
             match signing::verify(artifact_digest, &bundle, &expected_identity) {
                 Ok(identity) => Some((identity, expected_identity)),
                 Err(error) => {
-                    let _ = fs::remove_file(&wasm_path);
+                    let _ = fs::remove_file(wasm_path.as_path());
                     return Err(format!("{provider_context}: {error}"));
                 }
             }
@@ -4404,16 +4317,15 @@ fn annotate_version_lock_entry(source: &str, config: &ProviderConfig, lock_file:
 ///
 /// Resolution order:
 /// 1. Check WASM cache — use it if it exists (after SHA256 verification).
-/// 2. Check native binary cache — use it if it exists (after SHA256 verification).
-/// 3. Try downloading WASM first (platform-independent).
-/// 4. Fall back to downloading the native binary as a tar.gz.
+/// 2. Check the global plugin cache for a WASM component.
+/// 3. Download the WASM component.
 pub fn resolve_provider(
     base_dir: &Path,
     source: &str,
     version: &str,
     name: &str,
     lock_file: &mut LockFile,
-) -> Result<PathBuf, String> {
+) -> Result<WasmArtifactPath, String> {
     resolve_provider_with_http(
         base_dir,
         source,
@@ -4431,7 +4343,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     name: &str,
     lock_file: &mut LockFile,
     http: &H,
-) -> Result<PathBuf, String> {
+) -> Result<WasmArtifactPath, String> {
     if let ProviderSource::Registry(registry_source) = parse_provider_source(source)? {
         return resolve_registry_provider_with_http(
             base_dir,
@@ -4444,31 +4356,31 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     }
 
     // 1. Check local WASM cache first.
-    let wasm_path = cache_path_wasm(base_dir, source, version);
-    if wasm_path.exists() {
-        verify_or_record_version_cache(&wasm_path, source, version, name, lock_file, base_dir)?;
+    let wasm_path = WasmArtifactPath::new(cache_path_wasm(base_dir, source, version), name)?;
+    if wasm_path.as_path().exists() {
+        verify_or_record_version_cache(
+            wasm_path.as_path(),
+            source,
+            version,
+            name,
+            lock_file,
+            base_dir,
+        )?;
         return Ok(wasm_path);
     }
 
-    // 2. Check native binary cache.
-    let binary_path = cache_path(base_dir, source, version);
-    if binary_path.exists() {
-        verify_or_record_version_cache(&binary_path, source, version, name, lock_file, base_dir)?;
-        return Ok(binary_path);
-    }
-
-    // 3. Check global plugin cache for WASM.
+    // 2. Check global plugin cache for WASM.
     if let Some(global_wasm) = global_cache_path_wasm(source, version)
         && global_wasm.exists()
     {
         // Copy from global cache to local project
-        if let Some(parent) = wasm_path.parent() {
+        if let Some(parent) = wasm_path.as_path().parent() {
             let _ = fs::create_dir_all(parent);
         }
-        link_or_copy(&global_wasm, &wasm_path)
+        link_or_copy(&global_wasm, wasm_path.as_path())
             .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
-        let hash =
-            sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+        let hash = sha256_file(wasm_path.as_path())
+            .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
         lock_file.upsert(LockEntry {
             name: name.to_string(),
             source: source.to_string(),
@@ -4486,13 +4398,14 @@ fn resolve_provider_with_http<H: RegistryHttp>(
         return Ok(wasm_path);
     }
 
-    // 4. Try downloading WASM first (platform-independent).
+    // 3. Download the WASM component.
     let wasm_url = download_url_wasm(source, version)?;
+    let wasm_download_url = parse_registry_resource_url(&wasm_url, "provider download URL")?;
     eprintln!("Downloading WASM provider '{}' from {}", name, wasm_url);
-    match download_to_file(&wasm_url, &wasm_path) {
+    match http.download_to_file(&wasm_download_url, wasm_path.as_path()) {
         Ok(()) => {
-            let hash =
-                sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+            let hash = sha256_file(wasm_path.as_path())
+                .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
             lock_file.upsert(LockEntry {
                 name: name.to_string(),
                 source: source.to_string(),
@@ -4508,74 +4421,29 @@ fn resolve_provider_with_http<H: RegistryHttp>(
                 if let Some(parent) = global_wasm.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                let _ = link_or_copy(&wasm_path, &global_wasm);
+                let _ = link_or_copy(wasm_path.as_path(), &global_wasm);
             }
             eprintln!(
                 "Installed WASM provider '{}' ({}@{})",
                 name, source, version
             );
-            return Ok(wasm_path);
+            Ok(wasm_path)
         }
         Err(e) => {
-            eprintln!(
-                "WASM provider not available ({}), falling back to native binary: {}",
-                wasm_url, e
-            );
             // Clean up any partial download.
-            let _ = fs::remove_file(&wasm_path);
+            let _ = fs::remove_file(wasm_path.as_path());
+            Err(e)
         }
     }
-
-    // 4. Fall back to downloading the native binary.
-    let target = detect_target()?;
-    let url = download_url(source, version, &target)?;
-
-    eprintln!("Downloading provider '{}' from {}", name, url);
-
-    let tmp_archive = base_dir
-        .join(".carina")
-        .join("providers")
-        .join("tmp_download.tar.gz");
-
-    download_to_file(&url, &tmp_archive)?;
-
-    let dest_dir = binary_path.parent().unwrap();
-    let extracted = extract_tar_gz(&tmp_archive, dest_dir)?;
-
-    let _ = fs::remove_file(&tmp_archive);
-
-    if extracted != binary_path {
-        fs::rename(&extracted, &binary_path).map_err(|e| {
-            format!(
-                "Failed to rename {} to {}: {e}",
-                extracted.display(),
-                binary_path.display()
-            )
-        })?;
-    }
-
-    let hash = sha256_file(&binary_path).map_err(|e| format!("Failed to hash binary: {e}"))?;
-
-    lock_file.upsert(LockEntry {
-        name: name.to_string(),
-        source: source.to_string(),
-        kind: LockEntryKind::Version {
-            version: version.to_string(),
-            constraint: None,
-        },
-        sha256: hash,
-        registry: None,
-    });
-
-    eprintln!("Installed provider '{}' ({}@{})", name, source, version);
-
-    Ok(binary_path)
 }
 
 /// Resolve a single provider config with lock file management.
 ///
 /// Handles version validation, lock file load/save, and delegation to `resolve_provider`.
-pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result<PathBuf, String> {
+pub fn resolve_single_config(
+    base_dir: &Path,
+    config: &ProviderConfig,
+) -> Result<WasmArtifactPath, String> {
     resolve_single_config_with_http(base_dir, config, &UreqRegistryHttp)
 }
 
@@ -4583,7 +4451,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
     base_dir: &Path,
     config: &ProviderConfig,
     http: &H,
-) -> Result<PathBuf, String> {
+) -> Result<WasmArtifactPath, String> {
     let source = config
         .source
         .as_deref()
@@ -4595,7 +4463,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
-    let binary_path = if registry_revision(&source, config)?.is_some() {
+    let artifact_path = if registry_revision(&source, config)?.is_some() {
         let version = resolve_version(base_dir, &source, config, &mut lock_file, false, http)?;
         let path = resolve_provider_with_http(
             base_dir,
@@ -4636,7 +4504,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         .save(&lock_path)
         .map_err(|e| format!("Failed to save carina-providers.lock: {e}"))?;
 
-    Ok(binary_path)
+    Ok(artifact_path)
 }
 
 /// Resolve a `file://` provider at its source path without copying it.
@@ -4655,6 +4523,7 @@ pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledPro
     if !path.exists() {
         return Err(format!("file not found: {file_path}"));
     }
+    let path = WasmArtifactPath::new(path, &config.name)?;
     Ok(InstalledProvider {
         path,
         provider_name: config.name.clone(),
@@ -4681,7 +4550,8 @@ pub fn find_installed_provider(
 
     // For file:// sources, look in .carina/providers/file/
     if let Some(file_path) = source.strip_prefix("file://") {
-        let src = std::path::Path::new(file_path);
+        let src = WasmArtifactPath::new(PathBuf::from(file_path), &config.name)?;
+        let src = src.as_path();
         let file_name = src
             .file_stem()
             .and_then(|s| s.to_str())
@@ -4698,7 +4568,7 @@ pub fn find_installed_provider(
             );
         if dest.exists() {
             return Ok(InstalledProvider {
-                path: dest,
+                path: WasmArtifactPath::new(dest, &config.name)?,
                 provider_name: config.name.clone(),
                 provenance: ProviderArtifactProvenance::File {
                     source: source.to_string(),
@@ -4731,21 +4601,13 @@ pub fn find_installed_provider(
                 && locked_revision == revision
             {
                 let wasm_path = cache_path_wasm(base_dir, &source, version);
-                let binary_path = cache_path(base_dir, &source, version);
-                let path = if wasm_path.exists() {
-                    Some(wasm_path)
-                } else if binary_path.exists() {
-                    Some(binary_path)
-                } else {
-                    None
-                };
                 let pin = LockedProviderPin::RegistryRevision {
                     revision: locked_revision.clone(),
                     version: version.clone(),
                 };
-                if let Some(path) = path {
+                if wasm_path.exists() {
                     return Ok(InstalledProvider {
-                        path,
+                        path: WasmArtifactPath::new(wasm_path, &config.name)?,
                         provider_name: config.name.clone(),
                         provenance: ProviderArtifactProvenance::LockFile {
                             project_dir: base_dir.to_path_buf(),
@@ -4774,7 +4636,7 @@ pub fn find_installed_provider(
                 };
                 if wasm_path.exists() {
                     return Ok(InstalledProvider {
-                        path: wasm_path,
+                        path: WasmArtifactPath::new(wasm_path, &config.name)?,
                         provider_name: config.name.clone(),
                         provenance: ProviderArtifactProvenance::LockFile {
                             project_dir: base_dir.to_path_buf(),
@@ -4802,21 +4664,13 @@ pub fn find_installed_provider(
         } = &lock_entry.kind
     {
         let wasm_path = cache_path_wasm(base_dir, &source, version);
-        let binary_path = cache_path(base_dir, &source, version);
-        let path = if wasm_path.exists() {
-            Some(wasm_path)
-        } else if binary_path.exists() {
-            Some(binary_path)
-        } else {
-            None
-        };
         let pin = LockedProviderPin::Version {
             version: version.clone(),
             constraint: constraint.clone(),
         };
-        if let Some(path) = path {
+        if wasm_path.exists() {
             return Ok(InstalledProvider {
-                path,
+                path: WasmArtifactPath::new(wasm_path, &config.name)?,
                 provider_name: config.name.clone(),
                 provenance: ProviderArtifactProvenance::LockFile {
                     project_dir: base_dir.to_path_buf(),
@@ -4831,11 +4685,6 @@ pub fn find_installed_provider(
         "not installed. Run `{}`",
         ProjectCommand::new("init", base_dir)
     ))
-}
-
-/// Returns true if the given path points to a WASM provider binary.
-pub fn is_wasm_provider(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "wasm")
 }
 
 /// Decide whether the locked version can be reused for this version-mode config.
@@ -5203,7 +5052,7 @@ pub fn resolve_all(
     base_dir: &Path,
     providers: &[ProviderConfig],
     mode: LockMode,
-) -> Result<HashMap<String, PathBuf>, String> {
+) -> Result<HashMap<String, WasmArtifactPath>, String> {
     resolve_all_with_http(base_dir, providers, mode, &UreqRegistryHttp)
 }
 
@@ -5212,7 +5061,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
     providers: &[ProviderConfig],
     mode: LockMode,
     http: &H,
-) -> Result<HashMap<String, PathBuf>, String> {
+) -> Result<HashMap<String, WasmArtifactPath>, String> {
     let lock_path = provider_lock_path(base_dir);
     let mut lock_file = load_lock_file(base_dir)
         .map_err(|error| error.to_string())?
@@ -5234,14 +5083,15 @@ fn resolve_all_with_http<H: RegistryHttp>(
 
         // Handle file:// sources: copy into .carina/providers/
         if let Some(file_path) = source.strip_prefix("file://") {
-            let src_path = PathBuf::from(file_path);
-            if !src_path.exists() {
+            let src_path = WasmArtifactPath::new(PathBuf::from(file_path), &config.name)?;
+            if !src_path.as_path().exists() {
                 return Err(format!(
                     "Provider '{}': file source not found: {}",
                     config.name, file_path
                 ));
             }
             let file_name = src_path
+                .as_path()
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("provider");
@@ -5252,19 +5102,21 @@ fn resolve_all_with_http<H: RegistryHttp>(
                 .join(file_name)
                 .join(
                     src_path
+                        .as_path()
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("provider.wasm"),
                 );
-            if let Some(parent) = dest.parent() {
+            let dest = WasmArtifactPath::new(dest, &config.name)?;
+            if let Some(parent) = dest.as_path().parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create provider directory: {e}"))?;
             }
             // Remove existing file before hard-linking (hard_link fails if dest exists)
-            let _ = fs::remove_file(&dest);
-            link_or_copy(&src_path, &dest)
+            let _ = fs::remove_file(dest.as_path());
+            link_or_copy(src_path.as_path(), dest.as_path())
                 .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
-            let sha = sha256_file(&dest)
+            let sha = sha256_file(dest.as_path())
                 .map_err(|e| format!("Failed to compute SHA256 for file:// provider: {e}"))?;
 
             // Update or add lock entry
@@ -5285,7 +5137,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
         }
         let source = canonical_provider_source(source)?;
 
-        let binary_path = if registry_revision(&source, config)?.is_some() {
+        let artifact_path = if registry_revision(&source, config)?.is_some() {
             let version =
                 resolve_version(base_dir, &source, config, &mut lock_file, upgrade, http)?;
             let path = resolve_provider_with_http(
@@ -5324,7 +5176,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
             path
         };
 
-        resolved.insert(config.name.clone(), binary_path);
+        resolved.insert(config.name.clone(), artifact_path);
     }
 
     if !resolved.is_empty() {
@@ -5979,29 +5831,6 @@ transparency_log_present = false
     }
 
     #[test]
-    fn detect_target_returns_known_triple() {
-        let target = detect_target().unwrap();
-        assert!(
-            target.contains("apple-darwin") || target.contains("unknown-linux"),
-            "Unexpected target: {target}"
-        );
-    }
-
-    #[test]
-    fn download_url_builds_tarball_url() {
-        let url = download_url(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.1.0",
-            "aarch64-apple-darwin",
-        )
-        .unwrap();
-        assert_eq!(
-            url,
-            "https://github.com/carina-rs/carina-provider-awscc/releases/download/v0.1.0/carina-provider-awscc-v0.1.0-aarch64-apple-darwin.tar.gz"
-        );
-    }
-
-    #[test]
     fn download_url_wasm_builds_wasm_url() {
         let url = download_url_wasm("github.com/carina-rs/carina-provider-awscc", "0.1.0").unwrap();
         assert_eq!(
@@ -6011,52 +5840,20 @@ transparency_log_present = false
     }
 
     #[test]
-    fn download_url_rejects_invalid_source() {
-        assert!(download_url("invalid-source", "0.1.0", "x86_64-unknown-linux-gnu").is_err());
+    fn download_url_wasm_rejects_invalid_source() {
         assert!(download_url_wasm("invalid-source", "0.1.0").is_err());
     }
 
     #[test]
-    fn cache_path_lays_out_project_local_directory() {
+    fn cache_path_wasm_lays_out_project_local_directory() {
         let base = Path::new("/tmp/project");
         let source = "github.com/carina-rs/carina-provider-awscc";
-        assert_eq!(
-            cache_path(base, source, "0.1.0"),
-            PathBuf::from(
-                "/tmp/project/.carina/providers/github.com/carina-rs/carina-provider-awscc/0.1.0/carina-provider-awscc"
-            )
-        );
         assert_eq!(
             cache_path_wasm(base, source, "0.1.0"),
             PathBuf::from(
                 "/tmp/project/.carina/providers/github.com/carina-rs/carina-provider-awscc/0.1.0/carina-provider-awscc.wasm"
             )
         );
-    }
-
-    #[test]
-    fn resolve_prefers_wasm_cache_over_native_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let source = "github.com/carina-rs/carina-provider-awscc";
-        let version = "0.1.0";
-
-        let wasm_path = cache_path_wasm(base, source, version);
-        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
-        fs::File::create(&wasm_path)
-            .unwrap()
-            .write_all(b"fake wasm content")
-            .unwrap();
-
-        let native_path = cache_path(base, source, version);
-        fs::File::create(&native_path)
-            .unwrap()
-            .write_all(b"fake native binary")
-            .unwrap();
-
-        let mut lock_file = LockFile::default();
-        let result = resolve_provider(base, source, version, "awscc", &mut lock_file).unwrap();
-        assert_eq!(result, wasm_path);
     }
 
     /// Issue #2032: when `resolve_provider` hits the project-local WASM cache,
@@ -6090,31 +5887,6 @@ transparency_log_present = false
             other => panic!("expected Version variant, got {other:?}"),
         }
         assert!(!entry.sha256.is_empty(), "entry must record a sha256");
-    }
-
-    /// Same guarantee for the native binary cache path.
-    #[test]
-    fn resolve_upserts_lock_entry_when_native_cache_is_hit() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let source = "github.com/carina-rs/carina-provider-awscc";
-        let version = "0.1.0";
-
-        // Only the native binary exists — no WASM in the cache.
-        let native_path = cache_path(base, source, version);
-        fs::create_dir_all(native_path.parent().unwrap()).unwrap();
-        fs::File::create(&native_path)
-            .unwrap()
-            .write_all(b"fake native binary")
-            .unwrap();
-
-        let mut lock_file = LockFile::default();
-        resolve_provider(base, source, version, "awscc", &mut lock_file).unwrap();
-
-        assert!(
-            lock_file.find_by_source(source).is_some(),
-            "native-cache-hit path must upsert a lock entry"
-        );
     }
 
     /// Round-trip a version-mode entry through TOML. The serialized form carries
@@ -9250,8 +9022,11 @@ transparency_log_present = true
 
         let result = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap();
         let dest = result.get("test").expect("provider should be resolved");
-        assert!(dest.exists());
-        assert!(dest.starts_with(tmp.path().join(".carina/providers/file")));
+        assert!(dest.as_path().exists());
+        assert!(
+            dest.as_path()
+                .starts_with(tmp.path().join(".carina/providers/file"))
+        );
 
         let lock = load_lock_file_for_test(&tmp.path().join("carina-providers.lock"))
             .unwrap()
@@ -9276,6 +9051,32 @@ transparency_log_present = true
         }];
         let err = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn non_wasm_file_provider_is_rejected_at_resolver_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native_path = tmp.path().join("native-provider");
+        fs::write(&native_path, b"native provider fixture").unwrap();
+        let config = provider_config(&format!("file://{}", native_path.display()), None);
+        let expected = "Provider 'awscc': native binaries are no longer supported. Use a .wasm component instead.";
+
+        let direct_error = find_file_provider_source(&config)
+            .expect_err("a direct file lookup must reject native binaries");
+        assert_eq!(direct_error, expected);
+
+        let installed_error = find_installed_provider(tmp.path(), &config)
+            .expect_err("an installed file lookup must reject native binaries");
+        assert_eq!(installed_error, expected);
+
+        let error = resolve_all(tmp.path(), std::slice::from_ref(&config), LockMode::Normal)
+            .expect_err("file:// native binaries must be rejected by the resolver");
+
+        assert_eq!(error, expected);
+        assert!(
+            !provider_lock_path(tmp.path()).exists(),
+            "a rejected artifact must not update the provider lock"
+        );
     }
 
     #[derive(Clone)]
@@ -9402,6 +9203,27 @@ transparency_log_present = true
                 .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
             Ok(())
         }
+    }
+
+    #[test]
+    fn wasm_download_failure_does_not_request_native_tarball() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "github.com/carina-test-only/provider";
+        let version = "1.2.3";
+        let wasm_url = download_url_wasm(source, version).unwrap();
+        let http = FakeRegistryHttp::default();
+        let mut lock_file = LockFile::default();
+
+        let error =
+            resolve_provider_with_http(dir.path(), source, version, "test", &mut lock_file, &http)
+                .expect_err("a failed WASM download must be returned directly");
+
+        assert_eq!(error, format!("unexpected test download URL: {wasm_url}"));
+        assert_eq!(http.request_count(&wasm_url), 1);
+        assert!(
+            !http.was_requested(".tar.gz"),
+            "the resolver must not request a native tarball after a WASM failure"
+        );
     }
 
     fn sha256_bytes(bytes: &[u8]) -> String {
@@ -9580,7 +9402,7 @@ transparency_log_present = true
             .expect("signed provider resolution should succeed inside a Tokio runtime");
 
         assert_eq!(
-            fs::read(resolved.get("awscc").unwrap()).unwrap(),
+            fs::read(resolved.get("awscc").unwrap().as_path()).unwrap(),
             SIGNED_FIXTURE_ARTIFACT
         );
         let lock_contents = saved_lock_contents(dir.path());
@@ -9626,7 +9448,7 @@ transparency_log_present = true
         let path = resolve_single_config_with_http(dir.path(), &config, &unsigned_http)
             .expect("manual entry deletion demonstrates why recovery must preserve ratchets");
 
-        assert_eq!(fs::read(path).unwrap(), SIGNED_FIXTURE_ARTIFACT);
+        assert_eq!(fs::read(path.as_path()).unwrap(), SIGNED_FIXTURE_ARTIFACT);
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
             RegistrySequenceAnchor::Established(10_000_000)
@@ -9654,7 +9476,7 @@ transparency_log_present = true
                 panic!("honest first contact at sequence {sequence} was refused: {error}")
             });
 
-            assert_eq!(fs::read(path).unwrap(), ARTIFACT);
+            assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
             assert_eq!(
                 saved_registry_sequence_anchor(dir.path()),
                 RegistrySequenceAnchor::Established(sequence)
@@ -9737,7 +9559,7 @@ transparency_log_present = true
         );
         let path = resolve_single_config_with_http(dir.path(), &config, &honest_http)
             .expect("an unpinned observation must not become a rollback floor");
-        assert_eq!(fs::read(path).unwrap(), ARTIFACT);
+        assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
             RegistrySequenceAnchor::Established(42)
@@ -9863,7 +9685,7 @@ transparency_log_present = true
         );
         let cached_path =
             resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
-        fs::remove_file(cached_path).unwrap();
+        fs::remove_file(cached_path.as_path()).unwrap();
 
         let failed_http = registry_http_with_listing(
             b"tampered sequence-ratchet artifact",
@@ -10150,7 +9972,7 @@ transparency_log_present = true
         );
         let path = resolve_single_config_with_http(dir.path(), &config, &honest_http)
             .expect("the malformed timestamp must not poison the next listing");
-        assert_eq!(fs::read(path).unwrap(), ARTIFACT);
+        assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
     }
 
     #[test]
@@ -10277,7 +10099,7 @@ transparency_log_present = true
         );
         let path = resolve_single_config_with_http(dir.path(), &config, &honest_http)
             .expect("the rejected download response must not poison the honest registry");
-        assert_eq!(fs::read(path).unwrap(), ARTIFACT);
+        assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
     }
 
     #[test]
@@ -10414,7 +10236,7 @@ transparency_log_present = true
             )
             .unwrap();
 
-            assert_eq!(fs::read(path).unwrap(), ARTIFACT);
+            assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
             assert_eq!(
                 http.request_count(versions_url),
                 1,
@@ -10662,7 +10484,7 @@ transparency_log_present = true
         )
         .unwrap();
 
-        assert_eq!(fs::read(path).unwrap(), SIGNED_FIXTURE_ARTIFACT);
+        assert_eq!(fs::read(path.as_path()).unwrap(), SIGNED_FIXTURE_ARTIFACT);
         let registry = lock_file
             .find_by_source("carina-rs/aws")
             .unwrap()
@@ -11050,7 +10872,7 @@ transparency_log_present = true
         )
         .expect("an HTTPS download URL may use a different origin from the registry API");
 
-        assert_eq!(fs::read(path).unwrap(), body);
+        assert_eq!(fs::read(path.as_path()).unwrap(), body);
         assert_eq!(http.request_count(download_url), 1);
     }
 
@@ -11369,7 +11191,7 @@ transparency_log_present = false
         )
         .unwrap();
 
-        assert_eq!(fs::read(&path).unwrap(), body);
+        assert_eq!(fs::read(path.as_path()).unwrap(), body);
         assert!(http.was_requested("/.well-known/carina.json"));
         assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
         assert!(http.was_requested("/v1/providers/carina-rs/aws/0.5.0/download"));
@@ -11687,7 +11509,7 @@ transparency_log_present = false
 
         let path = resolve_single_config_with_http(dir.path(), &config, &http).unwrap();
 
-        assert_eq!(fs::read(&path).unwrap(), body);
+        assert_eq!(fs::read(path.as_path()).unwrap(), body);
         assert!(http.was_requested("/.well-known/carina.json"));
         assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
         assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
@@ -11771,7 +11593,10 @@ transparency_log_present = false
         let resolved =
             resolve_all_with_http(dir.path(), &[config], LockMode::Upgrade, &http).unwrap();
 
-        assert_eq!(fs::read(resolved.get("aws").unwrap()).unwrap(), new_body);
+        assert_eq!(
+            fs::read(resolved.get("aws").unwrap().as_path()).unwrap(),
+            new_body
+        );
         assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
         assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
         let lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
@@ -11847,7 +11672,10 @@ transparency_log_present = false
         let resolved =
             resolve_all_with_http(dir.path(), &[config], LockMode::Normal, &http).unwrap();
 
-        assert_eq!(fs::read(resolved.get("aws").unwrap()).unwrap(), body);
+        assert_eq!(
+            fs::read(resolved.get("aws").unwrap().as_path()).unwrap(),
+            body
+        );
         assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download"));
         assert!(!http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
     }
@@ -12390,9 +12218,9 @@ transparency_log_present = false
                 find_installed_provider(dir.path(), &provider_config(requested_source, None))
                     .unwrap();
 
-            assert_eq!(found_path.path(), installed_path);
+            assert_eq!(found_path.path().as_path(), installed_path.as_path());
             assert_eq!(
-                installed_path,
+                installed_path.as_path(),
                 cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")
             );
             assert_eq!(lock_file.provider.len(), 1);
@@ -12741,8 +12569,11 @@ transparency_log_present = false
         )
         .expect("registry WASM download should stream to disk instead of using capped get");
 
-        assert_eq!(sha256_file(&path).unwrap(), shasum);
-        assert_eq!(fs::metadata(&path).unwrap().len(), body.len() as u64);
+        assert_eq!(sha256_file(path.as_path()).unwrap(), shasum);
+        assert_eq!(
+            fs::metadata(path.as_path()).unwrap().len(),
+            body.len() as u64
+        );
     }
 
     /// Serialize env-var tests in this module. `CARINA_PLUGIN_CACHE_DIR` is
@@ -12823,6 +12654,33 @@ transparency_log_present = false
 
         // SAFETY: still holding env_lock.
         unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") };
+    }
+
+    #[test]
+    fn find_installed_provider_ignores_stale_native_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(source, version));
+        lock.save(&provider_lock_path(base)).unwrap();
+
+        let native_path = base
+            .join(".carina")
+            .join("providers")
+            .join(source)
+            .join(version)
+            .join("carina-provider-awscc");
+        fs::create_dir_all(native_path.parent().unwrap()).unwrap();
+        fs::write(&native_path, b"stale native provider").unwrap();
+
+        let error = find_installed_provider(base, &provider_config(source, None))
+            .expect_err("a stale native cache entry must not count as an installed provider");
+
+        assert!(error.contains("artifact is missing"), "{error}");
+        assert!(error.contains("carina init"), "{error}");
     }
 
     #[test]
@@ -12991,7 +12849,10 @@ transparency_log_present = false
         let config = provider_config(source, Some("main"));
 
         assert_eq!(
-            find_installed_provider(base, &config).unwrap().path(),
+            find_installed_provider(base, &config)
+                .unwrap()
+                .path()
+                .as_path(),
             wasm_path
         );
     }
@@ -13013,7 +12874,7 @@ transparency_log_present = false
 
         let installed = find_installed_provider(base, &provider_config(source, Some(revision)))
             .expect("revision provider should resolve");
-        assert_eq!(installed.path(), wasm_path);
+        assert_eq!(installed.path().as_path(), wasm_path);
         let error = installed.with_load_error(io::Error::other(
             "Failed to instantiate WASM component (HTTP)",
         ));
@@ -13045,7 +12906,7 @@ transparency_log_present = false
 
         let installed = find_installed_provider(base, &provider_config(&source, None))
             .expect("file provider should resolve");
-        assert_eq!(installed.path(), installed_path);
+        assert_eq!(installed.path().as_path(), installed_path);
         let rendered = installed
             .with_load_error("Failed to instantiate WASM component (HTTP)")
             .to_string();

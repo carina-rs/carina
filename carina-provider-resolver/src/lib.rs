@@ -1,4 +1,4 @@
-//! Provider resolution: download, extract, cache, and verify provider binaries.
+//! Provider resolution: download, cache, and verify provider WASM components.
 
 pub mod provider_resolver;
 pub mod revision_resolver;

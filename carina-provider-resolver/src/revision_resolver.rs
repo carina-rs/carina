@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
 
+use crate::provider_resolver::WasmArtifactPath;
+
 /// GitHub Actions artifact metadata (subset used by the resolver).
 #[derive(Deserialize)]
 struct Artifact {
@@ -369,7 +371,7 @@ pub fn resolve_provider_by_revision(
     name: &str,
     lock_file: &mut super::provider_resolver::LockFile,
     upgrade: bool,
-) -> Result<(PathBuf, String), String> {
+) -> Result<(WasmArtifactPath, String), String> {
     let token = get_github_token()?;
 
     // 1. Resolve revision to SHA
@@ -392,9 +394,9 @@ pub fn resolve_provider_by_revision(
     };
 
     // 2. Check cache
-    let wasm_path = cache_path_revision(base_dir, source, &sha);
-    if wasm_path.exists() {
-        let actual_hash = super::provider_resolver::sha256_file(&wasm_path)
+    let wasm_path = WasmArtifactPath::new(cache_path_revision(base_dir, source, &sha), name)?;
+    if wasm_path.as_path().exists() {
+        let actual_hash = super::provider_resolver::sha256_file(wasm_path.as_path())
             .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
         if let Some(lock_entry) = lock_file.find_by_source_and_sha(source, &sha)
             && actual_hash != lock_entry.sha256
@@ -427,12 +429,12 @@ pub fn resolve_provider_by_revision(
     if let Some(global_wasm) = global_cache_path_revision(source, &sha)
         && global_wasm.exists()
     {
-        if let Some(parent) = wasm_path.parent() {
+        if let Some(parent) = wasm_path.as_path().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        super::provider_resolver::link_or_copy(&global_wasm, &wasm_path)
+        super::provider_resolver::link_or_copy(&global_wasm, wasm_path.as_path())
             .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
-        let hash = super::provider_resolver::sha256_file(&wasm_path)
+        let hash = super::provider_resolver::sha256_file(wasm_path.as_path())
             .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
         lock_file.upsert(super::provider_resolver::LockEntry {
             name: name.to_string(),
@@ -469,17 +471,17 @@ pub fn resolve_provider_by_revision(
         select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
             fetch_run_artifacts(source, run_id, &token)
         })?;
-    download_artifact(source, artifact_id, &wasm_path, &token)?;
+    download_artifact(source, artifact_id, wasm_path.as_path(), &token)?;
 
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_revision(source, &sha) {
         if let Some(parent) = global_wasm.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = super::provider_resolver::link_or_copy(&wasm_path, &global_wasm);
+        let _ = super::provider_resolver::link_or_copy(wasm_path.as_path(), &global_wasm);
     }
 
-    let hash = super::provider_resolver::sha256_file(&wasm_path)
+    let hash = super::provider_resolver::sha256_file(wasm_path.as_path())
         .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
 
     lock_file.upsert(super::provider_resolver::LockEntry {
