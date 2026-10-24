@@ -1927,14 +1927,11 @@ pub fn merge_secrets_into_provider_json(
 /// Mask an observed value using the desired value's secret shape without
 /// replacing any observed material with desired material.
 ///
-/// Complete mutation writeback intentionally keeps its historical
-/// desired-driven fallback in [`merge_secrets_into_provider_json`]. A
-/// created-then-failed row has a stricter provenance rule: observed wins,
-/// then a value actually sent, then absence. This walker therefore hashes a
-/// top-level observed secret even when the desired secret is a literal, and
-/// never inserts a desired map child that the selected observed/sent value
-/// did not contain.
-pub(crate) fn merge_secrets_into_observation_json(
+/// Writeback selects provider-observed, accepted-request, or previously
+/// persisted material before calling this walker. It hashes a top-level
+/// observed secret even when the desired secret is a literal, and never
+/// inserts a desired map child that the selected value did not contain.
+pub fn merge_secrets_into_observation_json(
     desired: &Value,
     observed: &PersistedValue,
     previous: Option<&PersistedValue>,
@@ -3540,6 +3537,15 @@ pub fn verify_historical_state_secrets(
     let mut drifted_attributes = BTreeSet::new();
     let mut drift_errors = Vec::new();
     for (key, saved_value) in &saved.attributes {
+        // The managed-read seam may fill a provider-omitted write-only value
+        // with the exact persisted placeholder from the current state row.
+        // That is historical evidence, not provider plaintext to rehydrate.
+        // Keep genuinely provider-returned redacted values strict: only an
+        // exact match with the saved placeholder represents no drift.
+        if contains_redacted_secret(saved_value) && actual.attributes.get(key) == Some(saved_value)
+        {
+            continue;
+        }
         let result = rehydrate_secret_entry(
             saved_value,
             actual.attributes.get(key),
@@ -4011,6 +4017,19 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states(
             ) => {
                 if saved_hash != guide_hash {
                     return Err(SecretRehydrationError::HashMismatch);
+                }
+                if let Value::Deferred(DeferredValue::RedactedSecret {
+                    hash: verified_hash,
+                }) = verified
+                {
+                    if verified_hash != guide_hash {
+                        return Err(SecretRehydrationError::HashMismatch);
+                    }
+                    // A provider-omitted write-only value is verified by its
+                    // exact persisted placeholder. Keep it in Update.from;
+                    // the desired patch is rehydrated independently and must
+                    // still carry provider plaintext.
+                    return Ok(verified.clone());
                 }
                 if contains_redacted_secret(verified) {
                     return Err(SecretRehydrationError::ShapeMismatch);

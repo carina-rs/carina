@@ -335,6 +335,8 @@ async fn run_destroy_locked_with_ctx_owned(
         // composition resources are not destroyed and never enter this list.
         let resources: Vec<&Resource> = all_resources.iter().collect();
         let provider_ref = &provider;
+        let persisted_state = state_file.as_ref();
+        let schemas = ctx.schemas();
         let mut refresh_cancelled = false;
         let mut resource_iter = resources.into_iter();
         let mut refresh_in_flight = FuturesUnordered::new();
@@ -357,14 +359,18 @@ async fn run_destroy_locked_with_ctx_owned(
                     break;
                 };
                 let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                let loaded = state_file
-                    .as_ref()
+                let loaded = persisted_state
                     .map(|sf| sf.build_state_for_resource(&resource.id))
                     .unwrap_or_else(|| Current::absent(resource.id.clone()));
                 refresh_in_flight.push(async move {
-                    let current = refresh_loaded_resource_with_retry(provider_ref, loaded)
-                        .await
-                        .map_err(AppError::Provider)?;
+                    let current = refresh_loaded_resource_with_retry(
+                        provider_ref,
+                        loaded,
+                        persisted_state,
+                        schemas,
+                    )
+                    .await
+                    .map_err(AppError::Provider)?;
                     progress.finish();
                     Ok((resource.id.clone(), current))
                 });
@@ -426,7 +432,7 @@ async fn run_destroy_locked_with_ctx_owned(
 
         // Include orphaned resources (in state but not in .crn).
         // Refresh each orphan concurrently via provider.read() to verify it still exists.
-        if let Some(sf) = state_file.as_ref() {
+        if let Some(sf) = persisted_state {
             let desired_ids: HashSet<ResourceId> =
                 all_resources.iter().map(|r| r.id.clone()).collect();
             let loaded_orphans = sf.build_orphans(&desired_ids);
@@ -454,9 +460,14 @@ async fn run_destroy_locked_with_ctx_owned(
                     };
                     let progress = RefreshProgress::begin_multi(&multi, &id);
                     orphan_in_flight.push(async move {
-                        let refreshed = refresh_loaded_orphan_with_retry(provider_ref, orphan)
-                            .await
-                            .map_err(AppError::Provider)?;
+                        let refreshed = refresh_loaded_orphan_with_retry(
+                            provider_ref,
+                            orphan,
+                            persisted_state,
+                            schemas,
+                        )
+                        .await
+                        .map_err(AppError::Provider)?;
                         progress.finish();
                         Ok((id, refreshed))
                     });

@@ -772,6 +772,11 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
             ),
         ))
         .attribute(AttributeSchema::new("write_only_token", AttributeType::string()).write_only())
+        .attribute(
+            AttributeSchema::new("create_only_write_only_token", AttributeType::string())
+                .write_only()
+                .create_only(),
+        )
         .attribute(AttributeSchema::new(
             "master_password",
             AttributeType::union(vec![
@@ -1614,11 +1619,11 @@ async fn create_success_publishes_complete() {
     );
     assert!(matches!(
         result.applied_states.get(&source_id),
-        Some(Applied::Complete(_))
+        Some(Applied::Complete { .. })
     ));
     assert!(matches!(
         result.applied_states.get(&dependent_id),
-        Some(Applied::Complete(_))
+        Some(Applied::Complete { .. })
     ));
 }
 
@@ -1658,7 +1663,7 @@ async fn resume_resumed_publishes_observed() {
     ));
     assert!(matches!(
         result.applied_states.get(&dependent_id),
-        Some(Applied::Complete(_))
+        Some(Applied::Complete { .. })
     ));
 }
 
@@ -2216,10 +2221,16 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
-        HashMap::from([(
-            "target".to_string(),
-            Value::Concrete(ConcreteValue::String("good-before".into())),
-        )]),
+        HashMap::from([
+            (
+                "target".to_string(),
+                Value::Concrete(ConcreteValue::String("good-before".into())),
+            ),
+            (
+                "obsolete".to_string(),
+                Value::Concrete(ConcreteValue::String("remove-me".into())),
+            ),
+        ]),
     )
     .with_identifier("id-123");
 
@@ -2231,7 +2242,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         ),
         from: Box::new(from),
         to: resolved(updated),
-        changed_attributes: vec!["target".to_string()],
+        changed_attributes: vec!["target".to_string(), "obsolete".to_string()],
     });
     provider.push_create(Ok(ok_state(&create_id)));
     provider.push_update(Ok(ok_state(&update_id)));
@@ -2275,6 +2286,14 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         .find(|op| op.key == "target")
         .expect("valid target must remain in the update patch");
     assert_eq!(target.value.as_ref(), Some(&update_value));
+    let Some(Applied::Complete { request, .. }) = result.applied_states.get(&update_id) else {
+        panic!("successful update must publish accepted-request provenance");
+    };
+    let AcceptedRequestKind::Update { sent, removed } = request.kind() else {
+        panic!("update must publish update request provenance");
+    };
+    assert_eq!(sent, &BTreeSet::from(["target".to_string()]));
+    assert_eq!(removed, &BTreeSet::from(["obsolete".to_string()]));
 }
 
 #[tokio::test]
@@ -4960,7 +4979,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 }
 
 #[tokio::test]
-async fn test_apply_effective_changed_includes_underscore_and_skips_write_only_attributes() {
+async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_write_only() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
     to_resource.binding = Some("a".to_string());
@@ -4977,6 +4996,10 @@ async fn test_apply_effective_changed_includes_underscore_and_skips_write_only_a
     to_resource.set_attr(
         "write_only_token",
         Value::Concrete(ConcreteValue::String("secret-token".into())),
+    );
+    to_resource.set_attr(
+        "create_only_write_only_token",
+        Value::Concrete(ConcreteValue::String("create-secret-token".into())),
     );
 
     let mut from_attrs = HashMap::new();
@@ -5023,7 +5046,10 @@ async fn test_apply_effective_changed_includes_underscore_and_skips_write_only_a
         .iter()
         .map(|op| op.key.as_str())
         .collect();
-    assert_eq!(patched_keys, vec!["description", "_provider_only"]);
+    assert_eq!(
+        patched_keys,
+        vec!["description", "_provider_only", "write_only_token"]
+    );
 }
 
 #[tokio::test]

@@ -27,6 +27,24 @@ use cancellation_fixture::ApplyCancellationFixture;
 use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::fixture_read_outcome;
 
+fn complete_create(state: carina_core::resource::State) -> carina_core::executor::Applied {
+    carina_core::executor::Applied::Complete {
+        state,
+        request: carina_core::executor::AcceptedRequest::create_for_test(),
+    }
+}
+
+fn complete_update(
+    state: carina_core::resource::State,
+    sent: &[&str],
+    removed: &[&str],
+) -> carina_core::executor::Applied {
+    carina_core::executor::Applied::Complete {
+        state,
+        request: carina_core::executor::AcceptedRequest::update_for_test(sent, removed),
+    }
+}
+
 macro_rules! unexpected_resume_create {
     () => {
         fn resume_create(
@@ -174,6 +192,8 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         )],
         &HistoricalResourceAddresses::from_plan(&Plan::new()),
         &ApplyTimeReadProvider { shared },
+        None,
+        &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(Path::new(".")),
     )
     .await
@@ -2645,10 +2665,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
         )]),
     )
     .with_identifier("legacy-id");
-    let applied_states = HashMap::from([(
-        id.clone(),
-        carina_core::executor::Applied::Complete(applied_state),
-    )]);
+    let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
     let plan = plan_with_name_override(&id, "legacy-temp", "legacy");
 
     let migrated = build_state_after_apply(
@@ -4425,7 +4442,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        carina_core::executor::Applied::Complete(applied_state),
+        complete_create(applied_state),
     );
 
     let current_states = HashMap::new();
@@ -4548,7 +4565,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        carina_core::executor::Applied::Complete(applied_state),
+        complete_create(applied_state),
     );
 
     let current_states = HashMap::new();
@@ -4796,7 +4813,7 @@ fn block_unique_name_attribute_state_roundtrip() {
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
-        carina_core::executor::Applied::Complete(applied_state),
+        complete_create(applied_state),
     );
 
     let state = build_state_after_apply(
@@ -4908,10 +4925,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     );
     let applied = State::existing(new_id.clone(), applied_attrs).with_identifier("tag-abc");
     let mut applied_states = HashMap::new();
-    applied_states.insert(
-        new_id.clone(),
-        carina_core::executor::Applied::Complete(applied),
-    );
+    applied_states.insert(new_id.clone(), complete_update(applied, &["value"], &[]));
 
     // Old state row carries the pre-Update value.
     let old_row = ResourceState::try_applied("ec2.Tag", "tag_old", "awscc", "tag-abc")
@@ -5186,9 +5200,7 @@ fn move_from_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        carina_core::executor::Applied::Complete(
-            State::existing(id.clone(), HashMap::new()).with_identifier("x"),
-        ),
+        complete_create(State::existing(id.clone(), HashMap::new()).with_identifier("x")),
     );
 
     let to_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "elsewhere", None);
@@ -5248,9 +5260,7 @@ fn remove_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        carina_core::executor::Applied::Complete(
-            State::existing(id.clone(), HashMap::new()).with_identifier("x"),
-        ),
+        complete_create(State::existing(id.clone(), HashMap::new()).with_identifier("x")),
     );
 
     let mut plan = Plan::new();
@@ -5306,9 +5316,7 @@ fn self_move_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        carina_core::executor::Applied::Complete(
-            State::existing(id.clone(), HashMap::new()).with_identifier("x"),
-        ),
+        complete_create(State::existing(id.clone(), HashMap::new()).with_identifier("x")),
     );
 
     let mut plan = Plan::new();

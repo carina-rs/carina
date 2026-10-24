@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use serde_json::json;
 
 use carina_core::effect::Effect;
-use carina_core::executor::Applied;
+use carina_core::executor::{AcceptedRequest, Applied};
 use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::provider::{
@@ -17,10 +17,11 @@ use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, ResolvedDataSource,
     ResolvedResource, Resource, ResourceId, State, Value,
 };
-use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+use carina_core::value::PersistedValue;
 use carina_state::{
     BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, StateBackend,
-    StateFile,
+    StateFile, WriteOnlyBasis,
 };
 
 use crate::commands::apply::{
@@ -46,6 +47,20 @@ use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn complete_create(state: State) -> Applied {
+    Applied::Complete {
+        state,
+        request: AcceptedRequest::create_for_test(),
+    }
+}
+
+fn complete_update(state: State, sent: &[&str], removed: &[&str]) -> Applied {
+    Applied::Complete {
+        state,
+        request: AcceptedRequest::update_for_test(sent, removed),
+    }
 }
 
 fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
@@ -1123,6 +1138,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         &applied_state,
         None,
         None,
+        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();
@@ -1252,6 +1268,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         &applied_state,
         None,
         None,
+        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();
@@ -1328,6 +1345,8 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
         &provider,
+        None,
+        &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),
     )
     .await;
@@ -1367,12 +1386,79 @@ async fn detect_drift_returns_none_when_no_drift() {
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
         &provider,
+        None,
+        &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),
     )
     .await
     .expect("drift check succeeds");
 
     assert!(result.drift_messages().is_none(), "Should detect no drift");
+}
+
+#[tokio::test]
+async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("secret-value".into()),
+    ))));
+    let persisted_secret = PersistedValue::encode_desired_value(&secret, None)
+        .expect("secret is persistable")
+        .as_json()
+        .clone();
+    let resource = Resource::with_provider("mock", "test.resource", "r1", None)
+        .with_attribute("name", Value::Concrete(ConcreteValue::String("r1".into())))
+        .with_attribute("password", secret);
+    let id = resource.id.clone();
+    let identifier = "provider-id";
+    let row = ResourceState::try_applied("test.resource", "r1", "mock", identifier)
+        .expect("fixture identifier is non-empty")
+        .with_attribute("name", json!("r1"))
+        .with_attribute("password", persisted_secret);
+    assert!(
+        row.write_only_attributes().is_empty(),
+        "fixture must model a legacy-shaped row without write-only metadata"
+    );
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("fixture row should be valid");
+    let planned = match state_file.build_state_for_resource(&id) {
+        Current::Present(present) => present.into_parts().0,
+        other => panic!("fixture must load as present, got {other:?}"),
+    };
+    let provider = TestProvider::with_read_state(
+        &id,
+        identifier,
+        State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("r1".into())),
+            )]),
+        )
+        .with_identifier(identifier),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+    );
+
+    let result = detect_drift(
+        &[resource],
+        &[ReloadedCurrentStateEntry::managed(id.clone(), planned)],
+        &MovedOrigins::from_plan(&Plan::new()),
+        &provider,
+        Some(&state_file),
+        &schemas,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await
+    .expect("drift check succeeds");
+
+    assert_eq!(result.drift_messages(), None);
 }
 
 #[tokio::test]
@@ -1394,6 +1480,8 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
         &provider,
+        None,
+        &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),
     )
     .await
@@ -1435,6 +1523,8 @@ async fn detect_drift_returns_messages_when_drift_detected() {
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
         &provider,
+        None,
+        &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),
     )
     .await
@@ -2613,7 +2703,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
     // Provider returns state WITHOUT the write-only attribute (API doesn't return it)
     let applied_states = HashMap::from([(
         id.clone(),
-        Applied::Complete(State {
+        complete_create(State {
             id: id.clone(),
             identifier: Some("vpc-123".to_string()),
             attributes: HashMap::from([(
@@ -2705,7 +2795,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let id = resource.id.clone();
     let applied_states = HashMap::from([(
         id.clone(),
-        Applied::Complete(State::existing(
+        complete_create(State::existing(
             id,
             HashMap::from([(
                 "allocation_id".to_string(),
@@ -2790,17 +2880,21 @@ fn build_state_after_apply_write_only_detects_value_change() {
     // Provider returns updated state (after apply) without write-only attribute
     let applied_states = HashMap::from([(
         id.clone(),
-        Applied::Complete(State {
-            id: id.clone(),
-            identifier: Some("vpc-123".to_string()),
-            attributes: HashMap::from([(
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
-            )]),
-            exists: true,
-            dependency_bindings: BTreeSet::new(),
-            partial_read: None,
-        }),
+        complete_update(
+            State {
+                id: id.clone(),
+                identifier: Some("vpc-123".to_string()),
+                attributes: HashMap::from([(
+                    "cidr_block".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
+                )]),
+                exists: true,
+                dependency_bindings: BTreeSet::new(),
+                partial_read: None,
+            },
+            &["cidr_block", "ipv4_netmask_length"],
+            &[],
+        ),
     )]);
 
     // Previous state had old write-only value
@@ -3383,7 +3477,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
-        applied_states: HashMap::from([(a_id.clone(), Applied::Complete(a_state.clone()))]),
+        applied_states: HashMap::from([(a_id.clone(), complete_create(a_state.clone()))]),
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
@@ -3499,7 +3593,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
-        applied_states: HashMap::from([(resource_id.clone(), Applied::Complete(state.clone()))]),
+        applied_states: HashMap::from([(resource_id.clone(), complete_create(state.clone()))]),
         runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
