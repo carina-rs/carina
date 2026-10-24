@@ -332,18 +332,6 @@ fn build_factories_from_providers_impl(
             continue;
         };
 
-        if !carina_provider_resolver::is_wasm_provider(installed.path()) {
-            let reason = format!(
-                "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
-                config.name
-            );
-            if report_errors {
-                eprintln!("{}", reason.red());
-            }
-            load_errors.insert(config.name.clone(), reason);
-            continue;
-        }
-
         let factory_result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(load_installed_wasm_provider(&installed))
         });
@@ -1844,7 +1832,7 @@ enum LoadSourceError {
             carina_plugin_host::WasmProviderLoadError,
         >,
     ),
-    /// Plumbing failure: binary not found, unsupported source scheme,
+    /// Plumbing failure: artifact not found, unsupported source scheme,
     /// invalid config, etc. Logged and skipped.
     Other(String),
 }
@@ -1870,13 +1858,6 @@ async fn load_source_provider(
             "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
         )));
     };
-
-    if !carina_provider_resolver::is_wasm_provider(installed.path()) {
-        return Err(LoadSourceError::Other(format!(
-            "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
-            config.name()
-        )));
-    }
 
     let factory: Box<dyn ProviderFactory> = Box::new(
         load_installed_wasm_provider(&installed)
