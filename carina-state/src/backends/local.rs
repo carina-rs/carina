@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
 
@@ -15,6 +15,9 @@ use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_config::LocalBackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
+
+#[cfg(test)]
+type WriteHook = Arc<dyn Fn(&StateFile) + Send + Sync>;
 
 /// Local file backend for development and simple use cases
 pub struct LocalBackend {
@@ -29,6 +32,24 @@ pub struct LocalBackend {
     /// unguarded `eprintln!` inside `check_and_migrate` would surface
     /// the warning twice for a single physical file.
     migration_logged: OnceLock<MigrationInfo>,
+    /// Serializes state replacements even when the async caller that started
+    /// one is cancelled while its blocking filesystem work keeps running.
+    /// This history is deliberately instance-local and is never seeded from
+    /// disk: a fresh writer such as `migrate_state --force` may legitimately
+    /// replace a same-lineage file that has a higher serial.
+    state_write: Arc<Mutex<LocalWriteState>>,
+    #[cfg(test)]
+    write_hook: Option<WriteHook>,
+}
+
+#[derive(Default)]
+struct LocalWriteState {
+    last_written: Option<StateRevision>,
+}
+
+struct StateRevision {
+    lineage: String,
+    serial: u64,
 }
 
 const RECOVERY_CLAIM_TIMEOUT_SECS: i64 = 30;
@@ -55,7 +76,16 @@ impl LocalBackend {
             state_path,
             lock_path,
             migration_logged: OnceLock::new(),
+            state_write: Arc::new(Mutex::new(LocalWriteState::default())),
+            #[cfg(test)]
+            write_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_write_hook(mut self, hook: impl Fn(&StateFile) + Send + Sync + 'static) -> Self {
+        self.write_hook = Some(Arc::new(hook));
+        self
     }
 
     /// Create a LocalBackend from configuration, anchoring relative paths at `base_dir`.
@@ -260,41 +290,89 @@ impl StateBackend for LocalBackend {
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
-        state
-            .validate_unique_identities()
-            .map_err(BackendError::InvalidState)?;
-        let content = carina_core::utils::pretty_with_newline(state).map_err(|e| {
-            BackendError::Serialization(format!("Failed to serialize state: {}", e))
-        })?;
+        let state = state.clone();
+        let state_path = self.state_path.clone();
+        let state_write = Arc::clone(&self.state_write);
+        #[cfg(test)]
+        let write_hook = self.write_hook.clone();
 
-        // Write to a temp file in the same directory, then rename atomically
-        let tmp_path = self.state_path.with_extension("json.tmp");
+        tokio::task::spawn_blocking(move || {
+            // Test instrumentation deliberately runs before the mutex so a
+            // test can model an already-dispatched old write being overtaken.
+            #[cfg(test)]
+            if let Some(hook) = write_hook {
+                hook(&state);
+            }
 
-        tokio::fs::write(&tmp_path, content.as_bytes())
-            .await
-            .map_err(|e| BackendError::Io(format!("Failed to write temp state file: {}", e)))?;
+            let mut write_state = state_write.lock().map_err(|_| {
+                BackendError::Io("Local state write mutex was poisoned".to_string())
+            })?;
 
-        // Sync the temp file to disk before renaming
-        let file = tokio::fs::File::open(&tmp_path).await.map_err(|e| {
-            BackendError::Io(format!("Failed to open temp state file for sync: {}", e))
-        })?;
-        file.sync_all().await.map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            BackendError::Io(format!("Failed to sync temp state file: {}", e))
-        })?;
+            state
+                .validate_unique_identities()
+                .map_err(BackendError::InvalidState)?;
+            let content = carina_core::utils::pretty_with_newline(&state).map_err(|error| {
+                BackendError::Serialization(format!("Failed to serialize state: {error}"))
+            })?;
 
-        tokio::fs::rename(&tmp_path, &self.state_path)
-            .await
-            .map_err(|e| BackendError::Io(format!("Failed to rename temp state file: {}", e)))?;
+            if write_state
+                .last_written
+                .as_ref()
+                .is_some_and(|last| last.lineage == state.lineage && state.serial <= last.serial)
+            {
+                // A cancelled spawn_blocking write may finish after its newer
+                // replacement. The newer same-lineage state is already the
+                // desired durable result, so treating this as success keeps
+                // write retries idempotent without weakening lineage checks.
+                return Ok(());
+            }
 
-        // Fsync the parent directory to ensure the rename is durable
-        if let Some(parent) = self.state_path.parent()
-            && let Ok(dir) = tokio::fs::File::open(parent).await
-        {
-            let _ = dir.sync_all().await;
-        }
+            // A unique path also prevents independent backend instances from
+            // truncating each other's temporary files. The final rename is
+            // still atomic because the file lives beside the destination.
+            let tmp_path = state_path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
+            let write_result = (|| -> BackendResult<()> {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_path)
+                    .map_err(|error| {
+                        BackendError::Io(format!("Failed to create temp state file: {error}"))
+                    })?;
+                file.write_all(content.as_bytes()).map_err(|error| {
+                    BackendError::Io(format!("Failed to write temp state file: {error}"))
+                })?;
+                file.sync_all().map_err(|error| {
+                    BackendError::Io(format!("Failed to sync temp state file: {error}"))
+                })?;
+                std::fs::rename(&tmp_path, &state_path).map_err(|error| {
+                    BackendError::Io(format!("Failed to rename temp state file: {error}"))
+                })?;
 
-        Ok(())
+                // Preserve the backend's existing best-effort directory sync
+                // behavior on platforms that cannot fsync a directory.
+                let parent = state_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if let Ok(directory) = std::fs::File::open(parent) {
+                    let _ = directory.sync_all();
+                }
+                Ok(())
+            })();
+            if write_result.is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            write_result?;
+
+            write_state.last_written = Some(StateRevision {
+                lineage: state.lineage.clone(),
+                serial: state.serial,
+            });
+            Ok(())
+        })
+        .await
+        .map_err(|error| BackendError::Io(format!("Local state write task failed: {error}")))?
     }
 
     async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
@@ -582,7 +660,8 @@ mod tests {
     use crate::state::ResourceState;
     use carina_core::resource::{ConcreteValue, Value};
     use std::collections::HashMap;
-    use std::sync::{Arc, Barrier};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
     use tempfile::tempdir;
 
     fn local_settings(path: Option<String>) -> LocalBackendSettings {
@@ -603,6 +682,24 @@ mod tests {
             crate::BackendConfig::Local(settings) => settings,
             crate::BackendConfig::S3(_) => unreachable!(),
         }
+    }
+
+    fn state_temp_files(state_path: &Path) -> Vec<PathBuf> {
+        let parent = state_path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_prefix = state_path.with_extension("json.tmp.");
+        let prefix = temp_prefix
+            .file_name()
+            .expect("state path has a file name")
+            .to_string_lossy();
+        std::fs::read_dir(parent)
+            .expect("state directory is readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(prefix.as_ref()))
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -846,9 +943,11 @@ mod tests {
         let parsed = StateFile::from_json_str(&content).unwrap();
         assert_eq!(parsed.serial, 1);
 
-        // Verify no temp file is left behind
-        let tmp_path = state_path.with_extension("json.tmp");
-        assert!(!tmp_path.exists(), "temp file should be cleaned up");
+        // Verify no uniquely named temp file is left behind.
+        assert!(
+            state_temp_files(&state_path).is_empty(),
+            "temp files should be cleaned up"
+        );
     }
 
     #[tokio::test]
@@ -871,9 +970,122 @@ mod tests {
         let parsed = StateFile::from_json_str(&content).unwrap();
         assert_eq!(parsed.serial, 2);
 
-        // Verify no temp file is left behind
-        let tmp_path = state_path.with_extension("json.tmp");
-        assert!(!tmp_path.exists(), "temp file should be cleaned up");
+        // Verify no uniquely named temp file is left behind.
+        assert!(
+            state_temp_files(&state_path).is_empty(),
+            "temp files should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn state_temp_file_search_matches_unique_temp_names() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let temp_path = state_path.with_extension("json.tmp.test-uuid");
+        std::fs::write(&temp_path, b"incomplete state").unwrap();
+
+        assert_eq!(state_temp_files(&state_path), [temp_path]);
+    }
+
+    #[tokio::test]
+    async fn failed_write_cleans_up_unique_temp_file() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        std::fs::create_dir(&state_path).unwrap();
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let error = backend.write_state(&StateFile::new()).await.unwrap_err();
+
+        assert!(matches!(error, BackendError::Io(_)));
+        assert!(
+            state_temp_files(&state_path).is_empty(),
+            "failed writes must clean up their uniquely named temp files"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn older_write_finishing_after_newer_write_cannot_regress_state() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let (older_started_tx, older_started_rx) = tokio::sync::oneshot::channel();
+        let older_started_tx = Arc::new(Mutex::new(Some(older_started_tx)));
+        let release_older = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let backend = Arc::new(
+            LocalBackend::with_path(state_path.clone()).with_write_hook({
+                let older_started_tx = Arc::clone(&older_started_tx);
+                let release_older = Arc::clone(&release_older);
+                move |state| {
+                    if state.serial != 1 {
+                        return;
+                    }
+                    older_started_tx
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    let (released, wake) = &*release_older;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+            }),
+        );
+
+        let mut older = StateFile::new();
+        older.increment_serial();
+        let mut newer = older.clone();
+        newer.increment_serial();
+
+        let older_write = {
+            let backend = Arc::clone(&backend);
+            tokio::spawn(async move { backend.write_state(&older).await })
+        };
+        older_started_rx.await.unwrap();
+
+        backend.write_state(&newer).await.unwrap();
+        {
+            let (released, wake) = &*release_older;
+            *released.lock().unwrap() = true;
+            wake.notify_one();
+        }
+        older_write.await.unwrap().unwrap();
+
+        let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+        assert_eq!(persisted.lineage, newer.lineage);
+        assert_eq!(persisted.serial, newer.serial);
+    }
+
+    #[tokio::test]
+    async fn fresh_backend_can_replace_higher_serial_on_disk_with_lower_serial() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+
+        let mut lower = StateFile::new();
+        lower.increment_serial();
+        let mut higher = lower.clone();
+        higher.increment_serial();
+
+        LocalBackend::with_path(state_path.clone())
+            .write_state(&higher)
+            .await
+            .unwrap();
+        LocalBackend::with_path(state_path.clone())
+            .write_state(&lower)
+            .await
+            .unwrap();
+
+        let persisted = LocalBackend::with_path(state_path)
+            .read_state()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_state();
+        assert_eq!(persisted.lineage, lower.lineage);
+        assert_eq!(persisted.serial, lower.serial);
     }
 
     #[tokio::test]

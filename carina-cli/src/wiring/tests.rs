@@ -3875,6 +3875,8 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         factories: ctx.factories(),
         schemas: ctx.schemas(),
         parallelism: carina_core::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
     let outcome = execute_plan(
         &provider,

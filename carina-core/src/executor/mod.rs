@@ -34,16 +34,17 @@ pub use replace::compute_full_diff_patch;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest, InFlightCreate, ObservedCreate,
-    PartialReadDiagnostic, PatchOpKind, Provider, ProviderError, ProviderNormalizer,
-    ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
-    UpdateRequest,
+    AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
+    InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOpKind, Provider, ProviderError,
+    ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
+    ResumeFailureKind, ResumeOutcome, UpdateRequest,
 };
 use crate::resource::{
     AccessPath, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
@@ -273,13 +274,13 @@ impl AcceptedRequest {
 
 /// Provenance-preserving result of one effect. State writeback must classify
 /// every arm explicitly instead of treating every state-shaped value alike.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Applied {
     Complete {
         state: State,
         request: AcceptedRequest,
     },
-    Observed(ObservedCreate),
+    Observed(Arc<ObservedCreate>),
     CreateInFlight(InFlightCreate),
     CreateEnded,
     Imported(State),
@@ -327,6 +328,13 @@ pub struct ExecutionInput<'a> {
     pub schemas: &'a crate::schema::SchemaRegistry,
     /// Maximum concurrent provider operations.
     pub parallelism: NonZeroUsize,
+    /// Successful state-only operations completed synchronously by the caller
+    /// before provider dispatch.
+    pub precompleted_success_count: usize,
+    /// Required handoff for accumulated execution snapshots. Production
+    /// callers must choose and construct the handoff explicitly; tests that do
+    /// not persist effect results may use the test-only no-op constructor.
+    pub checkpoint_sink: ExecutionCheckpointSink,
 }
 
 /// Value provenance for provider-bound effects in one execution.
@@ -544,7 +552,48 @@ pub async fn read_data_source_with_retry(
     unreachable!()
 }
 
+/// Non-blocking handoff for accumulated execution snapshots.
+///
+/// The executor only clones the accumulated result into an `Arc` and invokes
+/// this synchronous callback. Implementations must hand the snapshot to a
+/// background consumer and must not perform state I/O in the callback.
+#[derive(Clone)]
+pub struct ExecutionCheckpointSink {
+    publish: Arc<dyn Fn(Arc<ExecutionResult>) + Send + Sync>,
+}
+
+impl ExecutionCheckpointSink {
+    pub fn new(publish: impl Fn(Arc<ExecutionResult>) + Send + Sync + 'static) -> Self {
+        Self {
+            publish: Arc::new(publish),
+        }
+    }
+
+    /// Explicit sink for callers that do not persist executor results.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn noop() -> Self {
+        Self::new(drop)
+    }
+
+    pub fn publish(&self, result: &ExecutionResult) {
+        (self.publish)(Arc::new(result.clone()));
+    }
+
+    fn publish_owned(&self, result: ExecutionResult) {
+        (self.publish)(Arc::new(result));
+    }
+}
+
+impl std::fmt::Debug for ExecutionCheckpointSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionCheckpointSink")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Result of executing a plan's effects.
+#[derive(Clone)]
 pub struct ExecutionResult {
     pub success_count: usize,
     pub failure_count: usize,
@@ -559,6 +608,175 @@ pub struct ExecutionResult {
     pub data_source_states: HashMap<ResourceId, State>,
     pub bindings: ResolvedBindings,
     pub failed_refreshes: HashSet<ResourceId>,
+}
+
+/// Mutable execution-result fields other than applied states.
+///
+/// Keeping `applied_states` out of this mutation view makes it impossible for
+/// an executor branch to add a state without explicitly choosing whether its
+/// identifier is published to downstream Wait effects.
+#[derive(Clone)]
+pub(super) struct ExecutionResultFields {
+    pub(super) success_count: usize,
+    pub(super) failure_count: usize,
+    pub(super) partial_count: usize,
+    pub(super) partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
+    pub(super) skip_count: usize,
+    pub(super) runtime_synthesized_resources: Vec<ResolvedResource>,
+    pub(super) successfully_deleted: HashSet<DeletedInstanceKey>,
+    pub(super) permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
+    pub(super) managed_current: HashMap<ResourceId, Current>,
+    pub(super) data_source_states: HashMap<ResourceId, State>,
+    pub(super) bindings: ResolvedBindings,
+    pub(super) failed_refreshes: HashSet<ResourceId>,
+}
+
+impl ExecutionResultFields {
+    fn into_result(
+        self,
+        applied_states: std::collections::HashMap<ResourceId, Applied>,
+    ) -> ExecutionResult {
+        let Self {
+            success_count,
+            failure_count,
+            partial_count,
+            partial_diagnostics,
+            skip_count,
+            runtime_synthesized_resources,
+            successfully_deleted,
+            permanent_name_overrides,
+            managed_current,
+            data_source_states,
+            bindings,
+            failed_refreshes,
+        } = self;
+        ExecutionResult {
+            success_count,
+            failure_count,
+            partial_count,
+            partial_diagnostics,
+            skip_count,
+            applied_states,
+            runtime_synthesized_resources,
+            successfully_deleted,
+            permanent_name_overrides,
+            managed_current,
+            data_source_states,
+            bindings,
+            failed_refreshes,
+        }
+    }
+}
+
+/// The executor's single mutable result, with applied-state publication and
+/// checkpoint dirtiness attached.
+pub(super) struct ExecutionAccumulator {
+    fields: ExecutionResultFields,
+    applied_states: std::collections::HashMap<ResourceId, Applied>,
+    wait_identifiers: wait::SharedWaitIdentifiers,
+    dirty: bool,
+}
+
+impl ExecutionAccumulator {
+    pub(super) fn new(result: ExecutionResult) -> (Self, wait::SharedWaitIdentifiers) {
+        let ExecutionResult {
+            success_count,
+            failure_count,
+            partial_count,
+            partial_diagnostics,
+            skip_count,
+            applied_states,
+            runtime_synthesized_resources,
+            successfully_deleted,
+            permanent_name_overrides,
+            managed_current,
+            data_source_states,
+            bindings,
+            failed_refreshes,
+        } = result;
+        assert!(
+            applied_states.is_empty(),
+            "execution accumulator must start without applied states"
+        );
+        let wait_identifiers =
+            wait::initial_wait_identifiers(&managed_current, &data_source_states);
+        let accumulator = Self {
+            fields: ExecutionResultFields {
+                success_count,
+                failure_count,
+                partial_count,
+                partial_diagnostics,
+                skip_count,
+                runtime_synthesized_resources,
+                successfully_deleted,
+                permanent_name_overrides,
+                managed_current,
+                data_source_states,
+                bindings,
+                failed_refreshes,
+            },
+            applied_states,
+            wait_identifiers: wait_identifiers.clone(),
+            dirty: false,
+        };
+        (accumulator, wait_identifiers)
+    }
+
+    pub(super) fn result(&self) -> &ExecutionResultFields {
+        &self.fields
+    }
+
+    #[cfg(test)]
+    pub(super) fn applied_states(&self) -> &HashMap<ResourceId, Applied> {
+        &self.applied_states
+    }
+
+    pub(super) fn mutate<T>(
+        &mut self,
+        mutation: impl FnOnce(&mut ExecutionResultFields) -> T,
+    ) -> T {
+        self.dirty = true;
+        mutation(&mut self.fields)
+    }
+
+    pub(super) fn insert_published(&mut self, id: ResourceId, applied: Applied, state: &State) {
+        self.wait_identifiers
+            .lock()
+            .expect("wait identifier map poisoned")
+            .insert(
+                id.clone(),
+                state
+                    .identifier
+                    .as_deref()
+                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok()),
+            );
+        self.applied_states.insert(id, applied);
+        self.dirty = true;
+    }
+
+    pub(super) fn insert_unpublished(&mut self, id: ResourceId, applied: Applied) {
+        self.applied_states.insert(id, applied);
+        self.dirty = true;
+    }
+
+    pub(super) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub(super) fn publish_if_dirty(&mut self, sink: &ExecutionCheckpointSink) {
+        if !std::mem::take(&mut self.dirty) {
+            return;
+        }
+        // ponytail: this still clones the full cumulative result once per
+        // executor iteration; use delta checkpoints if very large plans make
+        // that remaining ceiling material.
+        sink.publish_owned(self.fields.clone().into_result(self.applied_states.clone()));
+    }
+
+    pub(super) fn finish(mut self, sink: &ExecutionCheckpointSink) -> ExecutionResult {
+        self.publish_if_dirty(sink);
+        self.fields.into_result(self.applied_states)
+    }
 }
 
 /// Outcome of executing a plan: either it ran to completion, or a

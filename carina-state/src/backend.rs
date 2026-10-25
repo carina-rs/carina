@@ -147,6 +147,10 @@ pub enum BackendError {
     #[error("State lineage mismatch: expected {expected}, got {actual}")]
     LineageMismatch { expected: String, actual: String },
 
+    /// A conditional state write repeatedly lost races with other writers.
+    #[error("State write failed after {attempts} conditional-write conflicts")]
+    StateWriteConflict { attempts: usize },
+
     /// Network or I/O error
     #[error("I/O error: {0}")]
     Io(String),

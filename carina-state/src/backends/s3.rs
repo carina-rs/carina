@@ -9,7 +9,7 @@ use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::backend::{AwsError, BackendError, BackendResult, StateBackend};
@@ -20,11 +20,20 @@ use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migrat
 const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
 
 // GitHub Actions cancellation is SIGINT -> 7.5s -> SIGTERM -> 2.5s ->
-// SIGKILL. Cleanup has a 2s hard deadline. The S3 cancellation path performs
-// at most three ordered state calls and two lock-release calls, so a 300ms
-// single-attempt cap leaves 500ms for scheduling and local serialization while
-// preserving the normal client's retry/timeout behavior outside cancellation.
+// SIGKILL. Cleanup has a 2s hard deadline and a 1s state-flush budget. A state
+// read resolves the ETag cache to either present or absent, so the steady-state
+// locked flush performs lock GET + lock PUT + state PUT: 3 * 300ms = 900ms.
+// This also holds for a known-absent first state, whose PUT uses If-None-Match
+// directly. Lock release performs GET + DELETE, so all five calls take at most
+// 1.5s and leave 500ms for scheduling and serialization. A conflict is an
+// expected cleanup case when an aborted checkpoint PUT commits after the final
+// flush starts: lock GET + lock PUT + state PUT (412) + HEAD + lock GET + state
+// PUT is 6 * 300ms = 1.8s, beyond the 1s state-flush budget. Cleanup may abandon
+// that retry, but the late checkpoint that caused the conflict is already
+// durable, and every later state PUT remains conditional. Normal operations
+// retain SDK retries.
 const CLEANUP_S3_OPERATION_TIMEOUT: Duration = Duration::from_millis(300);
+const STATE_WRITE_MAX_ATTEMPTS: usize = 5;
 
 fn cleanup_operation_config() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::Config::builder()
@@ -61,6 +70,35 @@ pub struct S3Backend {
     /// `read_state` on this backend instance (carina#3283). See the
     /// equivalent field on `LocalBackend` for the rationale.
     migration_logged: OnceLock<MigrationInfo>,
+    /// Best-known state of the state object's ETag. Successful reads (including
+    /// a 404) and writes resolve this cache so the steady-state conditional
+    /// write needs only one PUT. A stale value is safe: S3 rejects it and the
+    /// writer refreshes via HEAD.
+    state_etag: Mutex<CachedStateEtag>,
+}
+
+#[derive(Clone)]
+enum CachedStateEtag {
+    Unknown,
+    Absent,
+    Etag(String),
+}
+
+#[derive(Clone, Copy)]
+enum StateWriteOperation {
+    Normal,
+    Cleanup,
+}
+
+#[derive(Clone, Copy)]
+enum StateWriteLock<'a> {
+    Unlocked,
+    Locked(&'a LockInfo),
+}
+
+enum StatePutOutcome {
+    Written(String),
+    Conflict,
 }
 
 impl S3Backend {
@@ -137,6 +175,7 @@ impl S3Backend {
             encrypt,
             auto_create,
             migration_logged: OnceLock::new(),
+            state_etag: Mutex::new(CachedStateEtag::Unknown),
         }
     }
 
@@ -262,6 +301,213 @@ impl S3Backend {
             .map_err(|e| BackendError::Serialization(e.to_string()))
     }
 
+    fn cached_state_etag(&self) -> CachedStateEtag {
+        self.state_etag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_cached_state_etag(&self, etag: CachedStateEtag) {
+        *self
+            .state_etag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = etag;
+    }
+
+    async fn head_state_etag(
+        &self,
+        operation: StateWriteOperation,
+    ) -> BackendResult<CachedStateEtag> {
+        let read = async {
+            let request = self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&self.key);
+            let result = match operation {
+                StateWriteOperation::Normal => request.send().await,
+                StateWriteOperation::Cleanup => {
+                    request
+                        .customize()
+                        .config_override(cleanup_operation_config())
+                        .send()
+                        .await
+                }
+            };
+
+            match result {
+                Ok(output) => {
+                    let etag = output.e_tag().map(ToOwned::to_owned).ok_or_else(|| {
+                        BackendError::Configuration(format!(
+                            "State object {}/{} missing ETag",
+                            self.bucket, self.key
+                        ))
+                    })?;
+                    Ok(CachedStateEtag::Etag(etag))
+                }
+                Err(error) if is_not_found_error(&error) => Ok(CachedStateEtag::Absent),
+                Err(error) => Err(BackendError::Aws(Box::new(
+                    AwsError::from_sdk_error("s3.HeadObject", error)
+                        .bucket(&self.bucket)
+                        .key(&self.key),
+                ))),
+            }
+        };
+
+        match operation {
+            StateWriteOperation::Normal => read.await,
+            StateWriteOperation::Cleanup => {
+                self.with_cleanup_operation_timeout("s3.HeadObject", read)
+                    .await
+            }
+        }
+    }
+
+    async fn put_state_conditionally(
+        &self,
+        body: Vec<u8>,
+        current_etag: Option<&str>,
+        operation: StateWriteOperation,
+    ) -> BackendResult<StatePutOutcome> {
+        let write = async {
+            let mut request = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .body(ByteStream::from(body))
+                .content_type("application/json");
+
+            if self.encrypt {
+                request = request.server_side_encryption(ServerSideEncryption::Aes256);
+            }
+            request = match current_etag {
+                Some(etag) => request.if_match(etag),
+                None => request.if_none_match("*"),
+            };
+
+            let result = match operation {
+                StateWriteOperation::Normal => request.send().await,
+                StateWriteOperation::Cleanup => {
+                    request
+                        .customize()
+                        .config_override(cleanup_operation_config())
+                        .send()
+                        .await
+                }
+            };
+            match result {
+                Ok(output) => output
+                    .e_tag()
+                    .map(ToOwned::to_owned)
+                    .map(StatePutOutcome::Written)
+                    .ok_or_else(|| {
+                        BackendError::Configuration(format!(
+                            "State object {}/{} PUT response missing ETag",
+                            self.bucket, self.key
+                        ))
+                    }),
+                Err(error) if is_conditional_write_conflict(&error) => {
+                    Ok(StatePutOutcome::Conflict)
+                }
+                Err(error) => Err(BackendError::Aws(Box::new(
+                    AwsError::from_sdk_error("s3.PutObject", error)
+                        .bucket(&self.bucket)
+                        .key(&self.key),
+                ))),
+            }
+        };
+
+        match operation {
+            StateWriteOperation::Normal => write.await,
+            StateWriteOperation::Cleanup => {
+                self.with_cleanup_operation_timeout("s3.PutObject", write)
+                    .await
+            }
+        }
+    }
+
+    async fn write_state_conditionally(
+        &self,
+        state: &StateFile,
+        operation: StateWriteOperation,
+        write_lock: StateWriteLock<'_>,
+    ) -> BackendResult<()> {
+        let body = Self::state_body(state)?;
+        let mut cached_etag = self.cached_state_etag();
+        if matches!(cached_etag, CachedStateEtag::Unknown) {
+            cached_etag = self.head_state_etag(operation).await?;
+            self.set_cached_state_etag(cached_etag.clone());
+        }
+
+        // Dropping an AWS SDK future cannot prove that S3 did not already
+        // accept its PUT. Compare-and-swap the object ETag so an abandoned
+        // older request either commits first (and this live writer retries)
+        // or fails its precondition after this newer write commits.
+        for attempt in 1..=STATE_WRITE_MAX_ATTEMPTS {
+            if attempt > 1
+                && let StateWriteLock::Locked(lock) = write_lock
+            {
+                self.verify_state_write_lock(lock, operation).await?;
+            }
+            let current_etag = match &cached_etag {
+                CachedStateEtag::Absent => None,
+                CachedStateEtag::Etag(etag) => Some(etag.as_str()),
+                CachedStateEtag::Unknown => {
+                    unreachable!("unknown state ETag must be resolved before a conditional PUT")
+                }
+            };
+            match self
+                .put_state_conditionally(body.clone(), current_etag, operation)
+                .await?
+            {
+                StatePutOutcome::Written(etag) => {
+                    self.set_cached_state_etag(CachedStateEtag::Etag(etag));
+                    return Ok(());
+                }
+                StatePutOutcome::Conflict if attempt < STATE_WRITE_MAX_ATTEMPTS => {
+                    cached_etag = self.head_state_etag(operation).await?;
+                    self.set_cached_state_etag(cached_etag.clone());
+                }
+                StatePutOutcome::Conflict => break,
+            }
+        }
+
+        Err(BackendError::StateWriteConflict {
+            attempts: STATE_WRITE_MAX_ATTEMPTS,
+        })
+    }
+
+    async fn verify_state_write_lock(
+        &self,
+        lock: &LockInfo,
+        operation: StateWriteOperation,
+    ) -> BackendResult<()> {
+        let existing_lock = match operation {
+            StateWriteOperation::Normal => self.read_lock().await?,
+            StateWriteOperation::Cleanup => self
+                .read_lock_with_etag_for_cleanup()
+                .await?
+                .map(|(existing_lock, _)| existing_lock),
+        };
+        let Some(existing_lock) = existing_lock else {
+            return Err(BackendError::LockNotHeld(
+                "lock file no longer exists".to_string(),
+            ));
+        };
+
+        if existing_lock.id() != lock.id() {
+            return Err(BackendError::LockNotHeld(format!(
+                "lock {} was replaced by {}",
+                lock.id(),
+                existing_lock.id()
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn write_lock_if_absent(&self, lock: &LockInfo) -> BackendResult<bool> {
         self.write_lock(lock, Some("*"), None).await
     }
@@ -308,36 +554,13 @@ impl S3Backend {
         .await
     }
 
-    async fn write_state_for_cleanup_operation(&self, state: &StateFile) -> BackendResult<()> {
-        let body = Self::state_body(state)?;
-        self.with_cleanup_operation_timeout("s3.PutObject", async {
-            let mut request = self
-                .client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .body(ByteStream::from(body))
-                .content_type("application/json");
-
-            if self.encrypt {
-                request = request.server_side_encryption(ServerSideEncryption::Aes256);
-            }
-
-            request
-                .customize()
-                .config_override(cleanup_operation_config())
-                .send()
-                .await
-                .map_err(|err| {
-                    BackendError::Aws(Box::new(
-                        AwsError::from_sdk_error("s3.PutObject", err)
-                            .bucket(&self.bucket)
-                            .key(&self.key),
-                    ))
-                })?;
-            Ok(())
-        })
-        .await
+    async fn write_state_for_cleanup_operation(
+        &self,
+        state: &StateFile,
+        write_lock: StateWriteLock<'_>,
+    ) -> BackendResult<()> {
+        self.write_state_conditionally(state, StateWriteOperation::Cleanup, write_lock)
+            .await
     }
 
     /// Write a lock file to S3 using conditional headers for atomic acquisition.
@@ -447,6 +670,7 @@ impl StateBackend for S3Backend {
 
         match result {
             Ok(output) => {
+                let etag = output.e_tag().map(ToOwned::to_owned);
                 let body = output
                     .body
                     .collect()
@@ -464,10 +688,14 @@ impl StateBackend for S3Backend {
                 } else {
                     LoadedState::Pristine(state)
                 };
+                self.set_cached_state_etag(
+                    etag.map_or(CachedStateEtag::Unknown, CachedStateEtag::Etag),
+                );
                 Ok(Some(loaded))
             }
             Err(err) => {
                 if is_not_found_error(&err) {
+                    self.set_cached_state_etag(CachedStateEtag::Absent);
                     Ok(None)
                 } else {
                     Err(BackendError::Aws(Box::new(
@@ -481,29 +709,8 @@ impl StateBackend for S3Backend {
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
-        let body = Self::state_body(state)?;
-
-        let mut request = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .body(ByteStream::from(body))
-            .content_type("application/json");
-
-        if self.encrypt {
-            request = request.server_side_encryption(ServerSideEncryption::Aes256);
-        }
-
-        request.send().await.map_err(|e| {
-            BackendError::Aws(Box::new(
-                AwsError::from_sdk_error("s3.PutObject", e)
-                    .bucket(&self.bucket)
-                    .key(&self.key),
-            ))
-        })?;
-
-        Ok(())
+        self.write_state_conditionally(state, StateWriteOperation::Normal, StateWriteLock::Unlocked)
+            .await
     }
 
     async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
@@ -555,26 +762,19 @@ impl StateBackend for S3Backend {
     }
 
     async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
-        // Verify the lock is still held by us before writing state
-        let Some(existing_lock) = self.read_lock().await? else {
-            return Err(BackendError::LockNotHeld(
-                "lock file no longer exists".to_string(),
-            ));
-        };
-
-        if existing_lock.id() != lock.id() {
-            return Err(BackendError::LockNotHeld(format!(
-                "lock {} was replaced by {}",
-                lock.id(),
-                existing_lock.id()
-            )));
-        }
-
-        self.write_state(state).await
+        self.verify_state_write_lock(lock, StateWriteOperation::Normal)
+            .await?;
+        self.write_state_conditionally(
+            state,
+            StateWriteOperation::Normal,
+            StateWriteLock::Locked(lock),
+        )
+        .await
     }
 
     async fn write_state_for_cleanup(&self, state: &StateFile) -> BackendResult<()> {
-        self.write_state_for_cleanup_operation(state).await
+        self.write_state_for_cleanup_operation(state, StateWriteLock::Unlocked)
+            .await
     }
 
     async fn write_state_locked_for_cleanup(
@@ -584,7 +784,7 @@ impl StateBackend for S3Backend {
     ) -> BackendResult<()> {
         // Releasing first, or racing release against this write, is unsafe:
         // another process could acquire the now-free lock after our ownership
-        // check but before the unconditional state PUT. Keep state-before-release.
+        // check but before the state PUT. Keep state-before-release.
         // We also cannot skip renewal because a long apply may be near its TTL;
         // the conditional renewal both proves ownership and establishes a fresh
         // exclusive lease. Reusing that proof for the state PUT removes the
@@ -613,7 +813,8 @@ impl StateBackend for S3Backend {
             ));
         }
 
-        self.write_state_for_cleanup_operation(state).await
+        self.write_state_for_cleanup_operation(state, StateWriteLock::Locked(&renewed))
+            .await
     }
 
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {

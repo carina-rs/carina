@@ -349,6 +349,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_overwrites_higher_serial_same_lineage_target_from_fresh_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_path = tmp.path().join("a.json");
+        let dst_path = tmp.path().join("b.json");
+
+        let mut source_state = state_with("lin-shared", 1);
+        source_state.increment_serial();
+        LocalBackend::with_path(src_path.clone())
+            .write_state(&source_state)
+            .await
+            .unwrap();
+
+        let mut target_state = state_with("lin-shared", 2);
+        target_state.increment_serial();
+        target_state.increment_serial();
+        LocalBackend::with_path(dst_path.clone())
+            .write_state(&target_state)
+            .await
+            .unwrap();
+
+        let source = LocalBackend::with_path(src_path);
+        let target = LocalBackend::with_path(dst_path);
+        perform_state_migration(&source, &target, true, tmp.path())
+            .await
+            .unwrap();
+
+        let migrated = target.read_state().await.unwrap().unwrap().into_state();
+        assert_eq!(migrated.lineage, source_state.lineage);
+        assert_eq!(migrated.serial, source_state.serial);
+        assert_eq!(migrated.resources().len(), 1);
+    }
+
+    #[tokio::test]
     async fn errors_when_source_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let src = LocalBackend::with_path(tmp.path().join("a.json"));

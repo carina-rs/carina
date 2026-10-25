@@ -3,13 +3,22 @@ use std::sync::Arc;
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_state::{LockHeartbeat, LockInfo, LockLost, StateBackend};
 
+use super::incremental_state_saver::MidRunStateWriter;
+
 /// Proof that the CLI flag explicitly disabled state locking.
 ///
 /// Its field and constructor stay private so an unlocked state write cannot be
 /// authorized by an absent `LockInfo`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LockingDisabled {
     _private: (),
+}
+
+impl LockingDisabled {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self { _private: () }
+    }
 }
 
 /// The command's state-lock mode after processing `--lock`.
@@ -47,7 +56,7 @@ impl StateLock {
 
     #[cfg(test)]
     pub(crate) fn disabled_for_test() -> Self {
-        Self::Disabled(LockingDisabled { _private: () })
+        Self::Disabled(LockingDisabled::for_test())
     }
 
     pub(crate) fn as_ref(&self) -> StateLockRef<'_> {
@@ -68,7 +77,7 @@ pub(crate) async fn with_lock_heartbeat<T>(
     backend: Arc<dyn StateBackend>,
     lock: StateLock,
     shutdown: ShutdownToken,
-    operation: impl AsyncFnOnce(ShutdownToken) -> T,
+    operation: impl AsyncFnOnce(ShutdownToken, MidRunStateWriter) -> T,
 ) -> HeartbeatOutcome<T> {
     match lock {
         StateLock::Held(lock) => {
@@ -76,7 +85,8 @@ pub(crate) async fn with_lock_heartbeat<T>(
             let heartbeat = LockHeartbeat::start(backend, lock, move || {
                 trigger.request_graceful_shutdown();
             });
-            let result = operation(run_shutdown).await;
+            let writer = MidRunStateWriter::locked(heartbeat.writer());
+            let result = operation(run_shutdown, writer).await;
             let stopped = match shutdown.phase() {
                 ShutdownPhase::CleanupPriority => heartbeat.stop_for_cleanup().await,
                 ShutdownPhase::Running | ShutdownPhase::Graceful => heartbeat.stop().await,
@@ -90,7 +100,8 @@ pub(crate) async fn with_lock_heartbeat<T>(
             }
         }
         StateLock::Disabled(disabled) => {
-            let result = operation(shutdown).await;
+            let writer = MidRunStateWriter::unlocked(Arc::clone(&backend), disabled.clone());
+            let result = operation(shutdown, writer).await;
             HeartbeatOutcome::Kept {
                 result,
                 lock: StateLock::Disabled(disabled),
@@ -205,7 +216,7 @@ mod tests {
             backend.clone(),
             StateLock::held(lock),
             shutdown.clone(),
-            async move |run_shutdown| {
+            async move |run_shutdown, _writer| {
                 let _ = run_shutdown_tx.send(run_shutdown.clone());
                 let mut dispatch_count = 0;
                 while matches!(run_shutdown.phase(), ShutdownPhase::Running) {
@@ -254,10 +265,15 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            with_lock_heartbeat(backend, StateLock::held(lock), shutdown, async move |_| {
-                run_backend.renewal_started.notified().await;
-                trigger.prioritize_cleanup();
-            }),
+            with_lock_heartbeat(
+                backend,
+                StateLock::held(lock),
+                shutdown,
+                async move |_, _writer| {
+                    run_backend.renewal_started.notified().await;
+                    trigger.prioritize_cleanup();
+                },
+            ),
         )
         .await
         .expect("cleanup priority must abort a hung heartbeat renewal");

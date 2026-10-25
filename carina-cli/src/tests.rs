@@ -32,8 +32,8 @@ use crate::commands::plan::{CurrentStateEntry, MovedOrigins, PlanFile, ReloadedC
 use crate::commands::shared::finalize::StatePersistence;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::state_writeback::{
-    ApplyStateSave, FinalizeApplyInput, PostApplyStates, build_state_after_apply,
-    queue_state_refresh,
+    ApplyStateSave, ApplyStateSaveInputs, FinalizeApplyInput, PostApplyStates,
+    build_state_after_apply, queue_state_refresh,
 };
 use crate::commands::state::run_state_refresh_locked;
 use crate::fixture_read_outcome;
@@ -47,6 +47,15 @@ use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn final_state_save_inputs(sorted_resources: &[ResolvedResource]) -> Arc<ApplyStateSaveInputs> {
+    Arc::new(ApplyStateSaveInputs::new(
+        sorted_resources.to_vec(),
+        Plan::new(),
+        SchemaRegistry::new(),
+        None,
+    ))
 }
 
 fn complete_create(state: State) -> Applied {
@@ -246,7 +255,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(existing_state),
+            state_file: existing_state,
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
             managed_current: &current_states,
@@ -309,7 +318,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(existing_state),
+            state_file: existing_state,
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
             managed_current: &current_states,
@@ -365,7 +374,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(existing_state),
+            state_file: existing_state,
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
             managed_current: &current_states,
@@ -1738,22 +1747,19 @@ async fn lock_released_on_write_state_failure() {
     let op_result = finalize_apply(
         FinalizeApplyInput {
             result: &result,
-            state_file: Some(StateFile::new()),
-            sorted_resources: &[],
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(StateFile::new()),
+            ),
+            state_save_inputs: final_state_save_inputs(&[]),
             data_sources: &[],
-            managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
-            plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
-        None,
     )
     .await;
 
@@ -1885,22 +1891,19 @@ async fn finalize_apply_uses_write_state_locked() {
     let op_result = finalize_apply(
         FinalizeApplyInput {
             result: &result,
-            state_file: Some(StateFile::new()),
-            sorted_resources: &[],
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(StateFile::new()),
+            ),
+            state_save_inputs: final_state_save_inputs(&[]),
             data_sources: &[],
-            managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
-            plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
-        None,
     )
     .await;
 
@@ -2210,22 +2213,19 @@ async fn finalize_apply_without_lock_uses_write_state() {
     let op_result = finalize_apply(
         FinalizeApplyInput {
             result: &result,
-            state_file: Some(StateFile::new()),
-            sorted_resources: &[],
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(StateFile::new()),
+            ),
+            state_save_inputs: final_state_save_inputs(&[]),
             data_sources: &[],
-            managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
-            plan: &Plan::new(),
             backend: &backend,
             lock: state_lock.as_ref(),
-            schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
-        None,
     )
     .await;
 
@@ -2241,6 +2241,82 @@ async fn finalize_apply_without_lock_uses_write_state() {
     assert!(
         !backend.renew_lock_called.load(Ordering::SeqCst),
         "finalize_apply without lock must NOT call renew_lock"
+    );
+}
+
+#[tokio::test]
+async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
+    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::resource::AccessPath;
+
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::for_test("apply");
+
+    let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "lookup", None);
+    let mut data_source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
+    data_source.binding = Some("lookup".to_string());
+    let data_sources = vec![data_source];
+    let data_source_state = State::existing(
+        data_source_id.clone(),
+        HashMap::from([(
+            "answer".to_string(),
+            Value::Concrete(ConcreteValue::String("from-execution-result".into())),
+        )]),
+    );
+    let result = ApplyResult {
+        success_count: 1,
+        failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
+        permanent_name_overrides: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::from([(data_source_id, data_source_state)]),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
+        failed_refreshes: HashSet::new(),
+    };
+    let export_params = vec![InferredExportParam {
+        name: "answer".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("lookup", "answer"),
+        })),
+    }];
+
+    let _ = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(StateFile::new()),
+            ),
+            state_save_inputs: final_state_save_inputs(&[]),
+            data_sources: &data_sources,
+            backend: &backend,
+            lock: StateLockRef::Held(&lock),
+            export_params: Some(&checked_exports(&export_params)),
+            provider_context: &ProviderContext::default(),
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
+    .await
+    .expect("finalize apply must save data-source-derived exports");
+
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert_eq!(
+        state
+            .exports
+            .get("answer")
+            .map(carina_core::value::PersistedExportValue::as_json),
+        Some(&serde_json::json!("from-execution-result"))
     );
 }
 
@@ -2632,7 +2708,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -2730,7 +2806,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -2816,7 +2892,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &[resolved(resource.clone())],
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -2924,7 +3000,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(existing_state),
+            state_file: existing_state,
             sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -3345,22 +3421,19 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
     let op_result = finalize_apply(
         FinalizeApplyInput {
             result: &result,
-            state_file: Some(state_in),
-            sorted_resources: &[],
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(state_in),
+            ),
+            state_save_inputs: final_state_save_inputs(&[]),
             data_sources: &[],
-            managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
-            plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&[])),
             provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
-        None,
     )
     .await;
 
@@ -3412,22 +3485,19 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
     let op_result = finalize_apply(
         FinalizeApplyInput {
             result: &result,
-            state_file: Some(state_in),
-            sorted_resources: &[],
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(state_in),
+            ),
+            state_save_inputs: final_state_save_inputs(&[]),
             data_sources: &[],
-            managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
-            plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            schemas: &SchemaRegistry::new(),
             export_params: None,
             provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
-        None,
     )
     .await;
 
@@ -3507,22 +3577,19 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let op_result = finalize_apply(
         FinalizeApplyInput {
             result: &result,
-            state_file: Some(StateFile::new()),
-            sorted_resources: &sorted_resources,
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(StateFile::new()),
+            ),
+            state_save_inputs: final_state_save_inputs(&sorted_resources),
             data_sources: &[],
-            managed_current: &result.managed_current,
-            data_source_states: &result.data_source_states,
-            plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&export_params)),
             provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
-        None,
     )
     .await;
 
@@ -3611,22 +3678,19 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let error = finalize_apply(
         FinalizeApplyInput {
             result: &result,
-            state_file: Some(StateFile::new()),
-            sorted_resources: &sorted_resources,
+            state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
+                Some(StateFile::new()),
+            ),
+            state_save_inputs: final_state_save_inputs(&sorted_resources),
             data_sources: &[],
-            managed_current: &result.managed_current,
-            data_source_states: &result.data_source_states,
-            plan: &Plan::new(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            schemas: &SchemaRegistry::new(),
             export_params: Some(&checked_exports(&export_params)),
             provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
         StatePersistence::Normal,
-        None,
     )
     .await
     .expect_err("non-finite export must still be reported");

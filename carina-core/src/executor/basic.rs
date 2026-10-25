@@ -25,8 +25,10 @@ use crate::resource::{
 };
 use crate::value::{SerializationContext, SerializationError};
 
-use super::wait::AppliedStates;
-use super::{AcceptedRequest, Applied, ExecutionEvent, ExecutionObserver, ProgressInfo};
+use super::{
+    AcceptedRequest, Applied, ExecutionAccumulator, ExecutionCheckpointSink, ExecutionEvent,
+    ExecutionObserver, ProgressInfo,
+};
 
 pub(super) struct CompletedEffect {
     state: Box<State>,
@@ -75,15 +77,9 @@ pub(super) enum BasicEffectResult {
 /// through every call to `process_basic_result`, reducing parameter count.
 pub(super) struct ExecutionState<'a> {
     pub(super) idx: usize,
-    pub(super) success_count: &'a mut usize,
-    pub(super) failure_count: &'a mut usize,
-    pub(super) partial_count: &'a mut usize,
-    pub(super) partial_diagnostics: &'a mut Vec<(ResourceId, PartialReadDiagnostic)>,
-    pub(super) applied_states: &'a mut AppliedStates,
+    pub(super) accumulator: &'a mut ExecutionAccumulator,
     pub(super) failed_indices: &'a mut std::collections::HashSet<usize>,
-    pub(super) successfully_deleted: &'a mut std::collections::HashSet<DeletedInstanceKey>,
     pub(super) pending_refreshes: &'a mut HashMap<ResourceId, AppliedIdentifier>,
-    pub(super) bindings: &'a mut ResolvedBindings,
 }
 
 /// Queue a state refresh for a resource after a failed operation.
@@ -98,25 +94,28 @@ pub(super) fn queue_state_refresh(
 /// Refresh states for resources whose operations failed.
 pub(super) async fn refresh_pending_states(
     provider: &dyn Provider,
-    managed_current: &mut HashMap<ResourceId, Current>,
+    accumulator: &mut ExecutionAccumulator,
     pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
     observer: &dyn ExecutionObserver,
-) -> std::collections::HashSet<ResourceId> {
+    checkpoint_sink: &ExecutionCheckpointSink,
+) {
     if pending_refreshes.is_empty() {
-        return std::collections::HashSet::new();
+        return;
     }
 
     observer.on_event(&ExecutionEvent::RefreshStarted);
 
     let mut refreshes: Vec<_> = pending_refreshes.iter().collect();
     refreshes.sort_by_key(|(left_id, _)| left_id.to_string());
-    let mut failed_refreshes = std::collections::HashSet::new();
-
     for (id, identifier) in refreshes {
         match provider.read(id, identifier, ReadRequest).await {
             Ok(outcome) => {
                 observer.on_event(&ExecutionEvent::RefreshSucceeded { id });
-                managed_current.insert(id.clone(), Current::from_state(outcome.into_state()));
+                accumulator.mutate(|result| {
+                    result
+                        .managed_current
+                        .insert(id.clone(), Current::from_state(outcome.into_state()));
+                });
             }
             Err(error) => {
                 let error_str = error.to_string();
@@ -124,12 +123,13 @@ pub(super) async fn refresh_pending_states(
                     id,
                     error: &error_str,
                 });
-                failed_refreshes.insert(id.clone());
+                accumulator.mutate(|result| {
+                    result.failed_refreshes.insert(id.clone());
+                });
             }
         }
+        accumulator.publish_if_dirty(checkpoint_sink);
     }
-
-    failed_refreshes
 }
 
 /// Resolve a resource's attributes using the current bindings.
@@ -520,6 +520,9 @@ fn pick_unresolved_binding_for_diagnostic<'a>(
 /// This helper is used by both sequential and phased execution paths to avoid
 /// duplicating the result-processing logic for Create/Update/Delete effects.
 pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut ExecutionState<'_>) {
+    let idx = exec.idx;
+    let failed_indices = &mut *exec.failed_indices;
+    let pending_refreshes = &mut *exec.pending_refreshes;
     match result {
         BasicEffectResult::Success {
             completed,
@@ -527,14 +530,17 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             resolved_attrs,
             binding,
         } => {
-            *exec.success_count += 1;
             let CompletedEffect { state, request } = completed;
-            if let Some(attrs) = &resolved_attrs {
-                exec.bindings
-                    .record_applied(binding.as_deref(), attrs, &state);
-            }
+            exec.accumulator.mutate(|accumulated| {
+                accumulated.success_count += 1;
+                if let Some(attrs) = &resolved_attrs {
+                    accumulated
+                        .bindings
+                        .record_applied(binding.as_deref(), attrs, &state);
+                }
+            });
             let state = *state;
-            exec.applied_states.insert_published(
+            exec.accumulator.insert_published(
                 resource_id,
                 Applied::Complete {
                     state: state.clone(),
@@ -544,10 +550,11 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             );
         }
         BasicEffectResult::Failure { refresh } => {
-            *exec.failure_count += 1;
-            exec.failed_indices.insert(exec.idx);
+            exec.accumulator
+                .mutate(|accumulated| accumulated.failure_count += 1);
+            failed_indices.insert(idx);
             if let Some((id, identifier)) = &refresh {
-                queue_state_refresh(exec.pending_refreshes, id, identifier);
+                queue_state_refresh(pending_refreshes, id, identifier);
             }
         }
         BasicEffectResult::ResumeSuccess {
@@ -556,20 +563,27 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             resolved_attrs,
             binding,
         } => {
-            *exec.success_count += 1;
             let state = created.observed_state();
-            exec.bindings
-                .record_applied(binding.as_deref(), &resolved_attrs, &state);
-            exec.applied_states
-                .insert_published(resource_id, Applied::Observed(created), &state);
+            exec.accumulator.mutate(|accumulated| {
+                accumulated.success_count += 1;
+                accumulated
+                    .bindings
+                    .record_applied(binding.as_deref(), &resolved_attrs, &state);
+            });
+            exec.accumulator.insert_published(
+                resource_id,
+                Applied::Observed(std::sync::Arc::new(created)),
+                &state,
+            );
         }
         BasicEffectResult::ClassifiedFailure {
             resource_id,
             applied,
         } => {
-            *exec.failure_count += 1;
-            exec.failed_indices.insert(exec.idx);
-            exec.applied_states.insert_unpublished(resource_id, applied);
+            exec.accumulator
+                .mutate(|accumulated| accumulated.failure_count += 1);
+            failed_indices.insert(idx);
+            exec.accumulator.insert_unpublished(resource_id, applied);
         }
         BasicEffectResult::PartialSuccess {
             completed: CompletedEffect { state, request },
@@ -578,25 +592,32 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             resolved_attrs,
             binding,
         } => {
-            *exec.partial_count += 1;
-            if let Some(attrs) = &resolved_attrs {
-                exec.bindings
-                    .record_applied(binding.as_deref(), attrs, &state);
-            }
+            exec.accumulator.mutate(|accumulated| {
+                accumulated.partial_count += 1;
+                if let Some(attrs) = &resolved_attrs {
+                    accumulated
+                        .bindings
+                        .record_applied(binding.as_deref(), attrs, &state);
+                }
+                accumulated
+                    .partial_diagnostics
+                    .push((resource_id.clone(), diagnostic));
+            });
             let state = *state;
-            exec.applied_states.insert_published(
-                resource_id.clone(),
+            exec.accumulator.insert_published(
+                resource_id,
                 Applied::Complete {
                     state: state.clone(),
                     request,
                 },
                 &state,
             );
-            exec.partial_diagnostics.push((resource_id, diagnostic));
         }
         BasicEffectResult::Deleted { instance_key } => {
-            *exec.success_count += 1;
-            exec.successfully_deleted.insert(instance_key);
+            exec.accumulator.mutate(|accumulated| {
+                accumulated.success_count += 1;
+                accumulated.successfully_deleted.insert(instance_key);
+            });
         }
     }
 }
@@ -619,7 +640,7 @@ pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a>,
     pub(super) runtime_authored: bool,
     pub(super) preparation: &'a ProviderPreparationContext<'a>,
-    pub(super) managed_current: &'a HashMap<ResourceId, Current>,
+    pub(super) resume_create: Option<crate::provider::InFlightCreate>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
 }
@@ -738,7 +759,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         });
                         BasicEffectResult::ClassifiedFailure {
                             resource_id: resource.id.clone(),
-                            applied: Applied::Observed(created),
+                            applied: Applied::Observed(created.into()),
                         }
                     }
                     CreateFailureKind::InFlight { pending, error } => {
@@ -775,12 +796,9 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             };
             let resolved_attrs = resolved.as_resource().resolved_attributes();
-            let pending = match ctx.managed_current.get(&resource.id) {
-                Some(Current::CreateInFlight(pending)) => pending.clone(),
-                Some(Current::Absent(_))
-                | Some(Current::Present(_))
-                | Some(Current::MissingIdentifier(_))
-                | None => {
+            let pending = match &ctx.resume_create {
+                Some(pending) => pending.clone(),
+                None => {
                     let error = format!(
                         "saved create continuation for {} changed before dispatch",
                         resource.id
@@ -892,7 +910,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         });
                         BasicEffectResult::ClassifiedFailure {
                             resource_id: resource.id.clone(),
-                            applied: Applied::Observed(created),
+                            applied: Applied::Observed(created.into()),
                         }
                     }
                     ResumeFailureKind::InFlight { pending, error } => {
@@ -1100,9 +1118,45 @@ pub(super) async fn execute_basic_effect<'a>(
 #[cfg(test)]
 mod process_basic_result_tests {
     use super::*;
+    use crate::executor::ExecutionResult;
     use crate::provider::PartialReadDiagnostic;
     use crate::resource::{State, Value};
     use std::collections::HashSet;
+
+    fn empty_execution_result() -> ExecutionResult {
+        ExecutionResult {
+            success_count: 0,
+            failure_count: 0,
+            partial_count: 0,
+            partial_diagnostics: Vec::new(),
+            skip_count: 0,
+            applied_states: HashMap::new(),
+            runtime_synthesized_resources: Vec::new(),
+            successfully_deleted: HashSet::new(),
+            permanent_name_overrides: HashMap::new(),
+            managed_current: HashMap::new(),
+            data_source_states: HashMap::new(),
+            bindings: ResolvedBindings::default(),
+            failed_refreshes: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn applied_state_insertion_keeps_wait_identifier_registry_in_sync() {
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "waited", None);
+        let identifier = crate::provider::AppliedIdentifier::new("waited-id").unwrap();
+        let state = State::existing(id.clone(), HashMap::new()).with_identifier("waited-id");
+        let (mut accumulator, wait_identifiers) =
+            ExecutionAccumulator::new(empty_execution_result());
+
+        accumulator.insert_published(id.clone(), Applied::DataSource(state.clone()), &state);
+
+        assert_eq!(
+            crate::executor::wait::resolve_wait_identifier(&wait_identifiers, &id),
+            Some(identifier),
+            "every applied-state insertion must update the Wait identifier registry"
+        );
+    }
 
     #[test]
     fn partial_success_records_state_and_diagnostic() {
@@ -1114,26 +1168,14 @@ mod process_basic_result_tests {
         )
         .expect("missing attributes are non-empty");
         let writeback_state = diagnostic.clone().into_state_for_writeback(state.clone());
-        let (mut applied_states, _) = AppliedStates::with_initial(&HashMap::new(), &HashMap::new());
-        let mut success_count = 0;
-        let mut failure_count = 0;
-        let mut partial_count = 0;
-        let mut partial_diagnostics = Vec::new();
+        let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
         let mut failed_indices = HashSet::new();
-        let mut successfully_deleted = HashSet::new();
         let mut pending_refreshes = HashMap::new();
-        let mut bindings = ResolvedBindings::default();
         let mut exec = ExecutionState {
             idx: 7,
-            success_count: &mut success_count,
-            failure_count: &mut failure_count,
-            partial_count: &mut partial_count,
-            partial_diagnostics: &mut partial_diagnostics,
-            applied_states: &mut applied_states,
+            accumulator: &mut accumulator,
             failed_indices: &mut failed_indices,
-            successfully_deleted: &mut successfully_deleted,
             pending_refreshes: &mut pending_refreshes,
-            bindings: &mut bindings,
         };
 
         process_basic_result(
@@ -1150,12 +1192,15 @@ mod process_basic_result_tests {
             &mut exec,
         );
 
-        assert_eq!(success_count, 0);
-        assert_eq!(failure_count, 0);
-        assert_eq!(partial_count, 1);
-        assert_eq!(partial_diagnostics, vec![(id.clone(), diagnostic)]);
-        let states = applied_states.into_inner();
-        let applied = states.get(&id).expect("partial state must be recorded");
+        let result = accumulator.result();
+        assert_eq!(result.success_count, 0);
+        assert_eq!(result.failure_count, 0);
+        assert_eq!(result.partial_count, 1);
+        assert_eq!(result.partial_diagnostics, vec![(id.clone(), diagnostic)]);
+        let applied = accumulator
+            .applied_states()
+            .get(&id)
+            .expect("partial state must be recorded");
         let applied = match applied {
             Applied::Complete {
                 state,

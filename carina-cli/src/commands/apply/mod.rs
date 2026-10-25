@@ -19,8 +19,8 @@ use carina_core::differ::{
     into_all_prior_states, provider_states_for,
 };
 use carina_core::executor::{
-    DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    ProviderCheckInputs, UnresolvedResource,
+    DeferredDataSourceReads, ExecutionCheckpointSink, ExecutionInput, ExecutionObserver,
+    ExecutionOutcome, ExecutionResult, ProviderCheckInputs, UnresolvedResource,
 };
 use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
@@ -50,6 +50,9 @@ use crate::commands::shared::effect_execution::{
 use crate::commands::shared::finalize::{
     LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
 };
+use crate::commands::shared::incremental_state_saver::{
+    FinalStateBase, IncrementalStateSaver, MidRunStateWriter,
+};
 use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, LockingDisabled, StateLock, StateLockRef, with_lock_heartbeat,
 };
@@ -59,8 +62,8 @@ use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
 };
 use crate::commands::shared::state_writeback::{
-    ApplyStateSave, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
-    SkippedExports, build_state_after_apply, materialize_exports, resolve_export_values_post_apply,
+    ApplyStateSaveInputs, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
+    SkippedExports, materialize_exports, resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -80,8 +83,8 @@ use crate::wiring::{
 };
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
-    DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, PlannedSecretHashes,
-    RehydratedPlanFile, ReloadedInspectedPlanFile,
+    DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, RehydratedPlanFile,
+    ReloadedInspectedPlanFile,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -292,6 +295,18 @@ fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool)
     }
 }
 
+fn start_apply_state_saver(
+    state_file: Option<StateFile>,
+    writer: MidRunStateWriter,
+    state_save_inputs: Arc<ApplyStateSaveInputs>,
+) -> IncrementalStateSaver<ExecutionResult> {
+    IncrementalStateSaver::start(
+        state_file.unwrap_or_default(),
+        writer,
+        move |state, result: &ExecutionResult| state_save_inputs.build_state(state, result),
+    )
+}
+
 fn finalize_module_constraints(
     compositions: &[carina_core::resource::Composition],
     bindings: &ResolvedBindings,
@@ -462,49 +477,6 @@ fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
     .to_string()
 }
 
-/// Execute all effects in a plan, resolving references dynamically.
-///
-/// This delegates to `carina_core::executor::execute_plan()` with a `CliObserver`
-/// for colored progress output.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_effects(
-    plan: &Plan,
-    provider: &dyn Provider,
-    normalizer: &dyn ProviderNormalizer,
-    provider_configs: &[ProviderConfig],
-    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
-    schemas: &carina_core::schema::SchemaRegistry,
-    bindings: &mut ResolvedBindings,
-    managed_current: &mut HashMap<ResourceId, Current>,
-    data_source_states: &mut HashMap<ResourceId, State>,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    data_source_origins: &[DataSource],
-    compositions: &[carina_core::resource::Composition],
-    cancel: ShutdownToken,
-    parallelism: NonZeroUsize,
-) -> ExecutionOutcome {
-    let observer = cli_observer_factory(plan);
-    execute_effects_with_observer(
-        plan,
-        provider,
-        normalizer,
-        provider_configs,
-        factories,
-        schemas,
-        bindings,
-        managed_current,
-        data_source_states,
-        unresolved_resources,
-        data_source_origins,
-        compositions,
-        DeferredDataSourceReads::none(),
-        cancel.clone(),
-        parallelism,
-        observer,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn execute_effects_with_observer(
     plan: &Plan,
@@ -520,6 +492,8 @@ async fn execute_effects_with_observer(
     data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
     deferred_data_source_reads: DeferredDataSourceReads,
+    precompleted_success_count: usize,
+    checkpoint_sink: ExecutionCheckpointSink,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
     observer: Box<dyn ExecutionObserver>,
@@ -540,6 +514,8 @@ async fn execute_effects_with_observer(
         factories,
         schemas,
         parallelism,
+        precompleted_success_count,
+        checkpoint_sink,
     };
 
     let outcome = carina_core::executor::execute_plan(provider, input, &*observer, cancel).await;
@@ -573,6 +549,8 @@ async fn execute_rehydrated_saved_plan(
     data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
     deferred_data_source_reads: DeferredDataSourceReads,
+    precompleted_success_count: usize,
+    checkpoint_sink: ExecutionCheckpointSink,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
     observer: Box<dyn ExecutionObserver>,
@@ -591,6 +569,8 @@ async fn execute_rehydrated_saved_plan(
         data_source_origins,
         compositions,
         deferred_data_source_reads,
+        precompleted_success_count,
+        checkpoint_sink,
         cancel,
         parallelism,
         observer,
@@ -809,23 +789,13 @@ pub async fn refresh_pending_states(
 pub(crate) async fn finalize_apply(
     input: FinalizeApplyInput<'_>,
     persistence: StatePersistence,
-    planned_secret_hashes: Option<&PlannedSecretHashes>,
 ) -> Result<SkippedExports, AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
 
-    let save = ApplyStateSave {
-        state_file: input.state_file,
-        sorted_resources: input.sorted_resources,
-        runtime_synthesized_resources: &input.result.runtime_synthesized_resources,
-        managed_current: input.managed_current,
-        applied_states: &input.result.applied_states,
-        plan: input.plan,
-        successfully_deleted: &input.result.successfully_deleted,
-        failed_refreshes: &input.result.failed_refreshes,
-        schemas: input.schemas,
-    };
-    let mut state = build_state_after_apply(save, planned_secret_hashes)?;
+    let mut state = input
+        .state_save_inputs
+        .build_state(input.state_base.into_state(), input.result)?;
 
     // `Some([])` is meaningful: the user removed the `exports {}` block,
     // so stale entries the previous apply persisted must be cleared
@@ -834,12 +804,13 @@ pub(crate) async fn finalize_apply(
     // `FinalizeApplyInput::export_params` doc-comment.
     let export_resolution = if let Some(params) = input.export_params {
         let post_apply_states = PostApplyStates::from_current_and_state(
-            input.managed_current,
-            input.data_source_states,
+            &input.result.managed_current,
+            &input.result.data_source_states,
             &state,
         );
         let export_resources: Vec<Resource> = input
-            .sorted_resources
+            .state_save_inputs
+            .sorted_resources()
             .iter()
             .map(|resource| resource.as_resource().clone())
             .collect();
@@ -849,7 +820,7 @@ pub(crate) async fn finalize_apply(
             data_sources: input.data_sources,
             pre_resolve_compositions: input.pre_resolve_compositions,
             post_apply_states: &post_apply_states,
-            schemas: input.schemas,
+            schemas: input.state_save_inputs.schemas(),
             wait_aliases: input.wait_aliases,
             provider_context: input.provider_context,
         })
@@ -1656,12 +1627,9 @@ struct SourceApplyExecuted {
     cancelled: bool,
     resources_finished: Instant,
     apply_phase_started: Instant,
-    state_file: Option<StateFile>,
-    resolved_resources: Vec<ResolvedResource>,
+    state_base: FinalStateBase,
+    state_save_inputs: Arc<ApplyStateSaveInputs>,
     data_sources: Vec<DataSource>,
-    managed_current: HashMap<ResourceId, Current>,
-    data_source_states: HashMap<ResourceId, State>,
-    plan: Plan,
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
     pre_resolve_compositions: Vec<carina_core::resource::Composition>,
@@ -1678,13 +1646,10 @@ struct SavedPlanApplyExecuted {
     cancelled: bool,
     resources_finished: Instant,
     apply_phase_started: Instant,
-    state_file: Option<StateFile>,
-    resolved_resources: Vec<ResolvedResource>,
-    managed_current: HashMap<ResourceId, Current>,
-    data_source_states: HashMap<ResourceId, State>,
+    state_base: FinalStateBase,
+    state_save_inputs: Arc<ApplyStateSaveInputs>,
     rehydrated_plan: RehydratedPlanFile,
     wait_aliases: Vec<WaitAliasSpec>,
-    ctx: WiringContext,
     cancel: ShutdownToken,
 }
 
@@ -1732,8 +1697,11 @@ async fn run_apply_locked_owned(
             lock,
         };
     }
-    let heartbeat_outcome =
-        with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
+    let heartbeat_outcome = with_lock_heartbeat(
+        Arc::clone(&backend),
+        lock,
+        cancel,
+        async |cancel, mid_run_writer| {
             if let Some(state) = state_file.as_ref() {
                 check_legacy_name_overrides(
                     state,
@@ -2472,6 +2440,21 @@ async fn run_apply_locked_owned(
             // so apply re-normalizes with exactly the plan-time normalizer
             // (carina#3060). They must stay the same object.
             let observer = observer_factory(&plan);
+            let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
+                resolved_resources.clone(),
+                plan.clone(),
+                ctx.schemas().clone(),
+                None,
+            ));
+            let saver =
+                start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
+            let publisher = saver.publisher();
+            let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
+                publisher.send_replace(Some(snapshot));
+            });
+            // Remove and Move need no provider call. Report them now; every
+            // checkpoint's state writeback materializes them from the plan.
+            let state_only_success_count = execute_state_only_effects(&plan);
             let outcome = execute_effects_with_observer(
                 &plan,
                 &provider,
@@ -2486,6 +2469,8 @@ async fn run_apply_locked_owned(
                 &data_sources,
                 &pre_resolve_compositions,
                 deferred_data_source_reads,
+                state_only_success_count,
+                checkpoint_sink.clone(),
                 cancel.clone(),
                 parallelism,
                 observer,
@@ -2494,10 +2479,8 @@ async fn run_apply_locked_owned(
             let (mut result, cancelled) = split_execution_outcome(outcome);
 
             // Execute import effects: read imported resources from the provider
-            execute_import_effects(&plan, &provider, &mut result, &cancel).await;
-
-            // Execute remove and move effects (state-only, logged for user feedback)
-            execute_state_only_effects(&plan, &mut result);
+            execute_import_effects(&plan, &provider, &mut result, &cancel, &checkpoint_sink).await;
+            let state_base = saver.stop(&cancel).await;
             let resources_finished = Instant::now();
 
             Ok(SourceApplyAfterHeartbeat::Executed(Box::new(
@@ -2506,20 +2489,18 @@ async fn run_apply_locked_owned(
                     cancelled,
                     resources_finished,
                     apply_phase_started,
-                    state_file,
-                    resolved_resources,
+                    state_base,
+                    state_save_inputs,
                     data_sources: data_sources_for_plan,
-                    managed_current,
-                    data_source_states,
-                    plan,
                     checked_exports: checked_exports_pre_apply,
                     wait_aliases,
                     pre_resolve_compositions,
                     cancel,
                 },
             )))
-        })
-        .await;
+        },
+    )
+    .await;
     let (heartbeat_result, lock) = match heartbeat_outcome {
         HeartbeatOutcome::Kept { result, lock } => (result, lock),
         HeartbeatOutcome::Lost {
@@ -2569,12 +2550,9 @@ async fn run_apply_locked_owned(
                     cancelled,
                     resources_finished,
                     apply_phase_started,
-                    state_file,
-                    resolved_resources,
+                    state_base,
+                    state_save_inputs,
                     data_sources,
-                    managed_current,
-                    data_source_states,
-                    plan,
                     checked_exports,
                     wait_aliases,
                     pre_resolve_compositions,
@@ -2590,22 +2568,17 @@ async fn run_apply_locked_owned(
                         finalize_apply(
                             FinalizeApplyInput {
                                 result: &result,
-                                state_file,
-                                sorted_resources: &resolved_resources,
+                                state_base,
+                                state_save_inputs,
                                 data_sources: &data_sources,
-                                managed_current: &managed_current,
-                                data_source_states: &data_source_states,
-                                plan: &plan,
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                schemas: ctx.schemas(),
                                 export_params: Some(&checked_exports),
                                 provider_context,
                                 wait_aliases: &wait_aliases,
                                 pre_resolve_compositions: &pre_resolve_compositions,
                             },
                             persistence,
-                            None,
                         )
                     },
                     cancelled,
@@ -3343,8 +3316,11 @@ async fn run_apply_from_plan_locked_owned(
         }
     }
 
-    let heartbeat_outcome =
-        with_lock_heartbeat(Arc::clone(&backend), lock, cancel, async |cancel| {
+    let heartbeat_outcome = with_lock_heartbeat(
+        Arc::clone(&backend),
+        lock,
+        cancel,
+        async |cancel, mid_run_writer| {
             let (desired_plan, prepared_wiring) = match inspected_plan {
                 ReloadedInspectedPlanFile::Verified(plan) => {
                     (DesiredPlanFile::Verified(plan), None)
@@ -3599,6 +3575,21 @@ async fn run_apply_from_plan_locked_owned(
             // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
             // with the plan-time normalizer (carina#3060).
             let observer = observer_factory(plan);
+            let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
+                resolved_sorted_resources.clone(),
+                (*plan).clone(),
+                ctx.schemas().clone(),
+                Some(rehydrated_plan_file.planned_secret_hashes().clone()),
+            ));
+            let saver =
+                start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
+            let publisher = saver.publisher();
+            let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
+                publisher.send_replace(Some(snapshot));
+            });
+            // Remove and Move need no provider call. Report them now; every
+            // checkpoint's state writeback materializes them from the plan.
+            let state_only_success_count = execute_state_only_effects(plan);
             let outcome = execute_rehydrated_saved_plan(
                 &rehydrated_plan_file,
                 &provider,
@@ -3613,6 +3604,8 @@ async fn run_apply_from_plan_locked_owned(
                 plan_data_source_origins,
                 plan_compositions,
                 deferred_data_source_reads,
+                state_only_success_count,
+                checkpoint_sink.clone(),
                 cancel.clone(),
                 parallelism,
                 observer,
@@ -3621,10 +3614,8 @@ async fn run_apply_from_plan_locked_owned(
             let (mut result, cancelled) = split_execution_outcome(outcome);
 
             // Execute import effects: read imported resources from the provider
-            execute_import_effects(plan, &provider, &mut result, &cancel).await;
-
-            // Execute remove and move effects (state-only, logged for user feedback)
-            execute_state_only_effects(plan, &mut result);
+            execute_import_effects(plan, &provider, &mut result, &cancel, &checkpoint_sink).await;
+            let state_base = saver.stop(&cancel).await;
 
             Ok(SavedPlanApplyAfterHeartbeat::Executed(Box::new(
                 SavedPlanApplyExecuted {
@@ -3632,18 +3623,16 @@ async fn run_apply_from_plan_locked_owned(
                     cancelled,
                     resources_finished: Instant::now(),
                     apply_phase_started,
-                    state_file,
-                    resolved_resources: resolved_sorted_resources,
-                    managed_current,
-                    data_source_states,
+                    state_base,
+                    state_save_inputs,
                     rehydrated_plan: rehydrated_plan_file,
                     wait_aliases,
-                    ctx,
                     cancel,
                 },
             )))
-        })
-        .await;
+        },
+    )
+    .await;
     let (heartbeat_result, lock) = match heartbeat_outcome {
         HeartbeatOutcome::Kept { result, lock } => (result, lock),
         HeartbeatOutcome::Lost {
@@ -3665,13 +3654,10 @@ async fn run_apply_from_plan_locked_owned(
                     cancelled,
                     resources_finished,
                     apply_phase_started,
-                    state_file,
-                    resolved_resources,
-                    managed_current,
-                    data_source_states,
+                    state_base,
+                    state_save_inputs,
                     rehydrated_plan,
                     wait_aliases,
-                    ctx,
                     cancel,
                 } = *context;
                 // Reuse the exact factory/schema context that prepared and executed the
@@ -3683,15 +3669,11 @@ async fn run_apply_from_plan_locked_owned(
                         finalize_apply(
                             FinalizeApplyInput {
                                 result: &result,
-                                state_file,
-                                sorted_resources: &resolved_resources,
+                                state_base,
+                                state_save_inputs,
                                 data_sources: rehydrated_plan.data_sources(),
-                                managed_current: &managed_current,
-                                data_source_states: &data_source_states,
-                                plan: rehydrated_plan.plan(),
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                schemas: ctx.schemas(),
                                 // Saved plan files do not persist `export_params` today, so
                                 // pass `None` to preserve `state.exports` rather than wipe it.
                                 // Source-driven `carina apply` reconciles exports from the
@@ -3708,7 +3690,6 @@ async fn run_apply_from_plan_locked_owned(
                                 pre_resolve_compositions: &[],
                             },
                             persistence,
-                            Some(rehydrated_plan.planned_secret_hashes()),
                         )
                     },
                     cancelled,

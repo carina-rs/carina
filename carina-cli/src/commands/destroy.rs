@@ -45,6 +45,7 @@ use crate::commands::plan::{
 use crate::commands::shared::finalize::{
     LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
 };
+use crate::commands::shared::incremental_state_saver::{FinalStateBase, IncrementalStateSaver};
 use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
 };
@@ -54,7 +55,8 @@ use crate::commands::shared::progress::{
 };
 use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
-    DestroyedInstance, apply_destroy_to_state, apply_name_overrides, build_orphan_resource,
+    DestroyStateWrite, DestroyedInstance, apply_destroy_to_state, apply_name_overrides,
+    build_orphan_resource,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -201,13 +203,40 @@ enum DestroyAfterHeartbeat {
 }
 
 struct DestroyExecuted {
-    state_file: Option<StateFile>,
+    state_base: FinalStateBase,
     destroyed_instances: Vec<DestroyedInstance>,
     success_count: usize,
     failure_count: usize,
     skip_count: usize,
     cancelled: bool,
     cancel: ShutdownToken,
+}
+
+struct DestroyedInstances {
+    instances: Vec<DestroyedInstance>,
+    publisher: tokio::sync::watch::Sender<Option<Arc<Vec<DestroyedInstance>>>>,
+}
+
+impl DestroyedInstances {
+    fn new(publisher: tokio::sync::watch::Sender<Option<Arc<Vec<DestroyedInstance>>>>) -> Self {
+        Self {
+            instances: Vec::new(),
+            publisher,
+        }
+    }
+
+    fn record(&mut self, destroyed: DestroyedInstance) {
+        self.instances.push(destroyed);
+        // ponytail: this clones the cumulative destroyed-instance list once
+        // per completion; use delta checkpoints if very large plans make that
+        // remaining ceiling material.
+        self.publisher
+            .send_replace(Some(Arc::new(self.instances.clone())));
+    }
+
+    fn into_instances(self) -> Vec<DestroyedInstance> {
+        self.instances
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -260,7 +289,7 @@ async fn run_destroy_locked_with_ctx_owned(
         Arc::clone(&backend),
         lock,
         cancel,
-        async |cancel| {
+        async |cancel, mid_run_writer| {
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     let state_block_claims = crate::wiring::resolve_state_block_claims(
@@ -802,7 +831,19 @@ async fn run_destroy_locked_with_ctx_owned(
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
-    let mut destroyed_instances: Vec<DestroyedInstance> = Vec::new();
+    let saver = IncrementalStateSaver::start(
+        state_file.unwrap_or_default(),
+        mid_run_writer,
+        |mut state, checkpoint: &Vec<DestroyedInstance>| {
+            apply_destroy_to_state(
+                &mut state,
+                checkpoint,
+                DestroyStateWrite::Checkpoint,
+            );
+            Ok(state)
+        },
+    );
+    let mut destroyed_instances = DestroyedInstances::new(saver.publisher());
     let mut failed_indices: HashSet<usize> = HashSet::new();
     let mut cancelled = false;
 
@@ -1084,10 +1125,11 @@ async fn run_destroy_locked_with_ctx_owned(
                 finish_spinner(&mut spinners, finished_idx, msg);
                 success_count += 1;
                 observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
-                destroyed_instances.push(DestroyedInstance {
+                let destroyed = DestroyedInstance {
                     id: resource_id,
                     generation,
-                });
+                };
+                destroyed_instances.record(destroyed);
             }
             Err(e) => {
                 let retries = retry_counts.get(&finished_idx).copied().unwrap_or(0);
@@ -1132,9 +1174,11 @@ async fn run_destroy_locked_with_ctx_owned(
         }
     }
     drop(in_flight);
+    let state_base = saver.stop(&cancel).await;
+    let destroyed_instances = destroyed_instances.into_instances();
 
     Ok(DestroyAfterHeartbeat::Executed(Box::new(DestroyExecuted {
-        state_file,
+        state_base,
         destroyed_instances,
         success_count,
         failure_count,
@@ -1162,7 +1206,7 @@ async fn run_destroy_locked_with_ctx_owned(
             DestroyAfterHeartbeat::Done => Ok(()),
             DestroyAfterHeartbeat::Executed(context) => {
                 let DestroyExecuted {
-                    state_file,
+                    state_base,
                     destroyed_instances,
                     success_count,
                     failure_count,
@@ -1183,7 +1227,7 @@ async fn run_destroy_locked_with_ctx_owned(
                             FinalizeDestroyInput {
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                state_file,
+                                state_base,
                                 destroyed_instances: &destroyed_instances,
                             },
                             persistence,
@@ -1776,7 +1820,7 @@ fn graph_reaches_delete_idx(start: usize, target: usize, analysis: &DependencyAn
 pub(crate) struct FinalizeDestroyInput<'a> {
     pub backend: &'a dyn StateBackend,
     pub lock: StateLockRef<'a>,
-    pub state_file: Option<StateFile>,
+    pub state_base: FinalStateBase,
     pub destroyed_instances: &'a [DestroyedInstance],
 }
 
@@ -1784,13 +1828,13 @@ pub(crate) async fn finalize_destroy(
     input: FinalizeDestroyInput<'_>,
     persistence: StatePersistence,
 ) -> Result<(), AppError> {
-    let mut state = input.state_file.unwrap_or_default();
+    let mut state = input.state_base.into_state();
 
-    // NOTE: apply_destroy_to_state currently clears state.exports unconditionally.
-    // On a cancelled partial destroy, exports for resources that survived are
-    // also wiped. This is pre-existing behavior; downstream consumers should
-    // re-derive exports from a fresh plan. See carina-cli/src/commands/shared/state_writeback.rs.
-    apply_destroy_to_state(&mut state, input.destroyed_instances);
+    apply_destroy_to_state(
+        &mut state,
+        input.destroyed_instances,
+        DestroyStateWrite::Final,
+    );
 
     match input.lock {
         StateLockRef::Held(lock) => {
@@ -1830,6 +1874,35 @@ mod tests {
     mod cancellation_fixture;
 
     use cancellation_fixture::DestroyCancellationFixture;
+
+    #[test]
+    fn destroyed_instances_owner_publishes_snapshots_and_derives_final_view() {
+        let first = DestroyedInstance {
+            id: ResolvedResourceId::with_provider_identity("mock", "test.resource", "first", None),
+            generation: EffectGeneration::Current,
+        };
+        let second = DestroyedInstance {
+            id: ResolvedResourceId::with_provider_identity("mock", "test.resource", "second", None),
+            generation: EffectGeneration::Current,
+        };
+        let (publisher, receiver) = tokio::sync::watch::channel(None);
+        let mut completed = DestroyedInstances::new(publisher);
+
+        completed.record(first.clone());
+        let checkpoint = receiver
+            .borrow()
+            .clone()
+            .expect("recording a destroy must publish its checkpoint");
+        completed.record(second.clone());
+
+        assert_eq!(checkpoint.len(), 1);
+        assert_eq!(checkpoint[0].id, first.id);
+
+        let final_instances = completed.into_instances();
+        assert_eq!(final_instances.len(), 2);
+        assert_eq!(final_instances[0].id, first.id);
+        assert_eq!(final_instances[1].id, second.id);
+    }
 
     fn expect_valid_destroy_effects(result: (Vec<Effect>, Vec<PlanError>)) -> Vec<Effect> {
         let (effects, errors) = result;
@@ -2810,10 +2883,46 @@ mod tests {
             id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
             generation: EffectGeneration::Current,
         }];
-        apply_destroy_to_state(&mut state, &destroyed);
+        apply_destroy_to_state(&mut state, &destroyed, DestroyStateWrite::Final);
 
         assert!(state.resources().is_empty(), "resource should be removed");
         assert!(state.exports.is_empty(), "exports should be cleared");
+    }
+
+    #[test]
+    fn destroy_checkpoint_keeps_exports_until_the_final_save() {
+        use carina_state::ResourceState;
+
+        let mut state = carina_state::StateFile::new();
+        for name in ["first", "second"] {
+            state
+                .upsert_resource(ResourceState::new("ec2.Vpc", name, "awscc"))
+                .expect("test state setup must be valid");
+        }
+        state.insert_export_json_for_test("vpc_id", serde_json::json!("vpc-12345"));
+        let destroyed = [DestroyedInstance {
+            id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "first", None),
+            generation: EffectGeneration::Current,
+        }];
+
+        apply_destroy_to_state(&mut state, &destroyed, DestroyStateWrite::Checkpoint);
+
+        assert!(
+            state.find_resource("awscc", "ec2.Vpc", "first").is_none(),
+            "the completed delete must be durable"
+        );
+        assert!(
+            state.find_resource("awscc", "ec2.Vpc", "second").is_some(),
+            "unfinished deletes must retain their rows"
+        );
+        assert_eq!(
+            state
+                .exports
+                .get("vpc_id")
+                .and_then(|value| serde_json::to_value(value).ok()),
+            Some(serde_json::json!("vpc-12345")),
+            "mid-run checkpoints must not wipe exports"
+        );
     }
 
     #[test]
@@ -2841,7 +2950,7 @@ mod tests {
             id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
             generation: EffectGeneration::Current,
         }];
-        apply_destroy_to_state(&mut state, &destroyed);
+        apply_destroy_to_state(&mut state, &destroyed, DestroyStateWrite::Final);
 
         let retained = state
             .find_resource("awscc", "ec2.Vpc", "main")
@@ -2886,7 +2995,7 @@ mod tests {
             id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
             generation: EffectGeneration::Deposed(removed_key),
         }];
-        apply_destroy_to_state(&mut state, &destroyed);
+        apply_destroy_to_state(&mut state, &destroyed, DestroyStateWrite::Final);
 
         let retained = state
             .find_resource("awscc", "ec2.Vpc", "main")
@@ -2932,7 +3041,7 @@ mod tests {
                 generation: EffectGeneration::Deposed(deposed_key),
             },
         ];
-        apply_destroy_to_state(&mut state, &destroyed);
+        apply_destroy_to_state(&mut state, &destroyed, DestroyStateWrite::Final);
 
         assert!(
             state.find_resource("awscc", "ec2.Vpc", "main").is_none(),
