@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::plan::Plan;
+use carina_core::provider::PartialReadDiagnostic;
 use carina_core::value::format_value_user_facing;
 use carina_core::wait::WaitObservation;
 use colored::Colorize;
@@ -33,6 +34,21 @@ enum Backend {
         bars: Mutex<HashMap<String, ProgressBar>>,
     },
     Plain,
+}
+
+/// Render the shared diagnostic details for a mutation whose follow-up read
+/// only partially succeeded.
+pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [String; 3] {
+    let missing = if diagnostic.missing_attributes().is_empty() {
+        "(none)".to_string()
+    } else {
+        diagnostic.missing_attributes().join(", ")
+    };
+    [
+        format!("reason: {}", diagnostic.reason()),
+        format!("missing attributes: {missing}"),
+        "state recorded; re-run apply to complete the read".to_string(),
+    ]
 }
 
 /// CLI observer that prints colored progress output.
@@ -123,22 +139,19 @@ fn handle_tty(
             let key = format_effect(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
-            let missing = if diagnostic.missing_attributes().is_empty() {
-                "(none)".to_string()
-            } else {
-                diagnostic.missing_attributes().join(", ")
-            };
+            let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
             let msg = format!(
-                "{} {} (partial) {} {}\n      {} reason: {}\n      {} missing attributes: {}\n      {} state recorded; re-run apply to complete the read",
+                "{} {} (partial) {} {}\n      {} {}\n      {} {}\n      {} {}",
                 "⚠".yellow(),
                 format_effect(effect),
                 timing,
                 counter,
                 "→".yellow(),
-                diagnostic.reason(),
+                reason,
                 "→".yellow(),
                 missing,
-                "→".yellow()
+                "→".yellow(),
+                state_recorded,
             );
             let mut bars = bars.lock().unwrap();
             if let Some(pb) = bars.remove(&key) {
@@ -306,11 +319,7 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
         } => {
             let timing = format!("took {}", format_duration(*duration));
             let counter = format_progress(progress);
-            let missing = if diagnostic.missing_attributes().is_empty() {
-                "(none)".to_string()
-            } else {
-                diagnostic.missing_attributes().join(", ")
-            };
+            let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
             vec![
                 format!(
                     "  ⚠ {} (partial) {} {}",
@@ -318,9 +327,9 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
                     timing,
                     counter
                 ),
-                format!("      → reason: {}", diagnostic.reason()),
-                format!("      → missing attributes: {}", missing),
-                "      → state recorded; re-run apply to complete the read".to_string(),
+                format!("      → {reason}"),
+                format!("      → {missing}"),
+                format!("      → {state_recorded}"),
             ]
         }
         ExecutionEvent::EffectFailed {
@@ -586,6 +595,59 @@ mod tests {
         assert!(line.contains("demo"), "missing resource name: {line}");
         assert!(line.contains("took"), "missing `took` label: {line}");
         assert!(line.contains("1/3"), "missing counter: {line}");
+    }
+
+    #[test]
+    fn plain_partial_success_detail_lines_are_stable() {
+        let effect = dummy_create_effect();
+        let state = carina_core::resource::State::not_found(ResourceId::with_identity(
+            "aws.s3.Bucket",
+            "demo",
+        ));
+        let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
+            "provider read was incomplete".to_string(),
+            vec!["arn".to_string(), "versioning".to_string()],
+        )
+        .expect("fixture has missing attributes");
+
+        let lines = format_plain(&ExecutionEvent::EffectPartiallySucceeded {
+            effect: &effect,
+            state: &state,
+            diagnostic: &diagnostic,
+            duration: Duration::from_millis(123),
+            progress: ProgressInfo {
+                completed: 1,
+                total: 3,
+            },
+        });
+
+        assert_eq!(
+            lines,
+            [
+                "  ⚠ Create aws.s3.Bucket demo (partial) took 0.1s 1/3",
+                "      → reason: provider read was incomplete",
+                "      → missing attributes: arn, versioning",
+                "      → state recorded; re-run apply to complete the read",
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_read_detail_lines_render_none_for_empty_missing_attributes() {
+        let diagnostic: PartialReadDiagnostic = serde_json::from_value(serde_json::json!({
+            "reason": "provider returned no attributes",
+            "missing_attributes": [],
+        }))
+        .expect("serialized diagnostic shape is valid");
+
+        assert_eq!(
+            partial_read_detail_lines(&diagnostic),
+            [
+                "reason: provider returned no attributes",
+                "missing attributes: (none)",
+                "state recorded; re-run apply to complete the read",
+            ]
+        );
     }
 
     #[test]

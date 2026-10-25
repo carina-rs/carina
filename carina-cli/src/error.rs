@@ -180,6 +180,49 @@ impl std::error::Error for StateBucketCreateError {
     }
 }
 
+/// A state bucket was created successfully, but its protected recovery row
+/// could not be persisted.
+#[derive(Debug)]
+pub struct StateBucketSeedError {
+    identifier: String,
+    resource_address: String,
+    source: BackendError,
+}
+
+impl StateBucketSeedError {
+    pub fn new(identifier: String, resource_address: String, source: BackendError) -> Self {
+        Self {
+            identifier,
+            resource_address,
+            source,
+        }
+    }
+
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    pub fn resource_address(&self) -> &str {
+        &self.resource_address
+    }
+}
+
+impl std::fmt::Display for StateBucketSeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "State bucket '{}' was created but could not be recorded in state, so it exists outside state. Add the following import block to the configuration and re-run apply to record it:",
+            self.identifier
+        )
+    }
+}
+
+impl std::error::Error for StateBucketSeedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn apply_input_expectation() -> String {
     format!(
         "`{}` expects a project directory or a plan file written by `{}`.",
@@ -494,6 +537,10 @@ pub enum AppError {
     /// The provider rejected state-backend bootstrap creation.
     #[error(transparent)]
     StateBucketCreate(StateBucketCreateError),
+
+    /// The state bucket was created, but its recovery row could not be written.
+    #[error(transparent)]
+    StateBucketSeed(Box<StateBucketSeedError>),
 
     /// Provider lock-file loading or constraint errors.
     #[error(transparent)]

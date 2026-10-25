@@ -607,6 +607,18 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
             stderr: format_error_lines(message),
             exit_code: 2,
         },
+        error::AppError::StateBucketSeed(seed_error) => {
+            let stderr = format!(
+                "{}\nimport {{\n  to = {}\n  id = {}\n}}\n",
+                format_error_with_source_chain(seed_error.as_ref()),
+                seed_error.resource_address(),
+                carina_core::parser::display_string_literal(seed_error.identifier()),
+            );
+            AppErrorRendering {
+                stderr,
+                exit_code: 1,
+            }
+        }
         _ => AppErrorRendering {
             stderr: format_error_lines(&e.to_string()),
             exit_code: 1,
@@ -637,6 +649,16 @@ fn format_error_lines(msg: &str) -> String {
         .collect()
 }
 
+fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = format_error_lines(&error.to_string());
+    let mut source = error.source();
+    while let Some(current) = source {
+        rendered.push_str(&format_error_lines(&current.to_string()));
+        source = current.source();
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod cli_version_tests;
 
@@ -656,6 +678,80 @@ mod error_format_tests {
         colored::control::set_override(false);
         let result = format_error_lines("first error\nsecond error");
         assert_eq!(result, "Error: first error\nError: second error\n");
+    }
+
+    #[test]
+    fn state_bucket_seed_error_renders_source_and_pasteable_import_block() {
+        colored::control::set_override(false);
+        let error = error::AppError::StateBucketSeed(Box::new(error::StateBucketSeedError::new(
+            "state'bucket".to_string(),
+            "aws.s3.Bucket 'state_bucket'".to_string(),
+            carina_state::BackendError::Configuration("seed write failed".to_string()),
+        )));
+
+        let rendered = render_app_error(&error);
+
+        assert_eq!(rendered.exit_code, 1);
+        let lead_in =
+            "Add the following import block to the configuration and re-run apply to record it:";
+        assert!(
+            rendered.stderr.contains(lead_in),
+            "import lead-in missing: {}",
+            rendered.stderr
+        );
+        assert!(
+            rendered
+                .stderr
+                .contains("Error: Backend configuration error: seed write failed"),
+            "backend source missing: {}",
+            rendered.stderr
+        );
+        assert!(
+            rendered.stderr.contains(
+                "\nimport {\n  to = aws.s3.Bucket 'state_bucket'\n  id = \"state'bucket\"\n}\n"
+            ),
+            "pasteable import block missing: {}",
+            rendered.stderr
+        );
+        assert!(
+            rendered.stderr.find(lead_in) < rendered.stderr.find("\nimport {"),
+            "import lead-in must precede the block: {}",
+            rendered.stderr
+        );
+        assert!(
+            !rendered.stderr.contains("Error: import {")
+                && !rendered.stderr.contains("Error:   to =")
+                && !rendered.stderr.contains("Error:   id =")
+                && !rendered.stderr.contains("Error: }"),
+            "import block must not be prefixed: {}",
+            rendered.stderr
+        );
+
+        let import_start = rendered
+            .stderr
+            .find("import {")
+            .expect("rendered error should contain an import block");
+        let import_block = &rendered.stderr[import_start..];
+        let parsed = carina_core::parser::parse(
+            import_block,
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("rendered import block should parse");
+        assert_eq!(parsed.state_blocks.len(), 1);
+        match &parsed.state_blocks[0] {
+            carina_core::parser::StateBlock::Import { to, id } => {
+                assert_eq!(to.provider, "aws");
+                assert_eq!(to.resource_type, "s3.Bucket");
+                assert_eq!(to.name_str(), "state_bucket");
+                assert_eq!(
+                    id,
+                    &carina_core::resource::Value::Concrete(
+                        carina_core::resource::ConcreteValue::String("state'bucket".into())
+                    )
+                );
+            }
+            other => panic!("expected one import state block, got {other:?}"),
+        }
     }
 
     // -- #2407 acceptance: AppError -> stderr rendering --

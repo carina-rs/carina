@@ -637,11 +637,6 @@ impl StateBackend for LocalBackend {
         Ok(())
     }
 
-    async fn init(&self) -> BackendResult<()> {
-        // Local backend doesn't need initialization
-        Ok(())
-    }
-
     async fn bucket_exists(&self) -> BackendResult<bool> {
         // For local backend, we consider the "bucket" to always exist
         // (it's just the local filesystem)

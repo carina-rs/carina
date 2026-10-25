@@ -3788,6 +3788,7 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Backend
 #[derive(Clone, Copy)]
 enum BootstrapCreateBehavior {
     Success,
+    PartialSuccess,
     Untracked,
     Created,
     InFlight,
@@ -3834,15 +3835,41 @@ impl Provider for BootstrapRecordingProvider {
         let id = id.clone();
         match self.behavior {
             BootstrapCreateBehavior::Success => {
-                let identifier =
-                    AppliedIdentifier::new("bucket-id").expect("fixture identifier is non-empty");
+                let identifier = AppliedIdentifier::new("state-bucket")
+                    .expect("fixture identifier is non-empty");
                 Box::pin(async move {
                     Ok(attempt
                         .issued(
                             identifier,
                             carina_core::provider::Sent::AllRequestAttributes,
                         )
-                        .succeeded(HashMap::new()))
+                        .succeeded(HashMap::from([(
+                            "bucket".to_string(),
+                            Value::Concrete(ConcreteValue::String("state-bucket".into())),
+                        )])))
+                })
+            }
+            BootstrapCreateBehavior::PartialSuccess => {
+                let identifier = AppliedIdentifier::new("state-bucket")
+                    .expect("fixture identifier is non-empty");
+                let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
+                    "bootstrap read incomplete".to_string(),
+                    vec!["versioning".to_string()],
+                )
+                .expect("fixture diagnostic has a missing attribute");
+                Box::pin(async move {
+                    Ok(attempt
+                        .issued(
+                            identifier,
+                            carina_core::provider::Sent::AllRequestAttributes,
+                        )
+                        .partial(
+                            HashMap::from([(
+                                "bucket".to_string(),
+                                Value::Concrete(ConcreteValue::String("state-bucket".into())),
+                            )]),
+                            diagnostic,
+                        ))
                 })
             }
             BootstrapCreateBehavior::Untracked => Box::pin(async move {
@@ -3967,10 +3994,6 @@ impl StateBackend for BootstrapWriteFailureBackend {
         ))
     }
 
-    async fn init(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-
     async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
         Ok(true)
     }
@@ -3978,6 +4001,263 @@ impl StateBackend for BootstrapWriteFailureBackend {
     async fn create_bucket(&self) -> carina_state::BackendResult<()> {
         Ok(())
     }
+}
+
+async fn bootstrap_declared_state_bucket(
+    provider: &BootstrapRecordingProvider,
+    backend: &dyn StateBackend,
+) -> Result<(Resource, SchemaRegistry), AppError> {
+    let resource = Resource::with_provider("aws", "s3.Bucket", "state_bucket", None)
+        .with_attribute(
+            "bucket",
+            Value::Concrete(ConcreteValue::String("state-bucket".into())),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string()))
+            .attribute(AttributeSchema::new("versioning", AttributeType::string())),
+    );
+    let parsed = carina_core::parser::InferredFile::default();
+    let provider_configs = empty_resolved_provider_configs();
+
+    create_checked_bootstrap_resource(
+        provider,
+        resource.clone(),
+        BootstrapCreateContext {
+            backend,
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await?;
+
+    Ok((resource, schemas))
+}
+
+#[tokio::test]
+async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let (_temp, backend) = bootstrap_test_backend();
+    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, &backend)
+        .await
+        .expect("declared state bucket create must seed state");
+    let id = resource.id.clone();
+    let expected_identity = id
+        .identity_str()
+        .expect("declared resource identity must be resolved")
+        .to_string();
+
+    let state = backend
+        .read_state()
+        .await
+        .expect("seed state read")
+        .expect("successful bootstrap must write state")
+        .into_state();
+    assert_eq!(state.resources().len(), 1);
+    let row = state
+        .find_resource_for_id(&id)
+        .expect("seed must use the declared resource's resolved identity");
+    assert_eq!(row.identity.as_str(), expected_identity);
+    assert!(row.protected);
+    assert_eq!(
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("state-bucket")
+    );
+}
+
+#[tokio::test]
+async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_state() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::PartialSuccess,
+    };
+    let (_temp, backend) = bootstrap_test_backend();
+    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, &backend)
+        .await
+        .expect("partial-success bootstrap must seed state");
+    let id = resource.id.clone();
+
+    let state = backend
+        .read_state()
+        .await
+        .expect("seed state read")
+        .expect("partial-success bootstrap must write state")
+        .into_state();
+    let row = state
+        .find_resource_for_id(&id)
+        .expect("partial-success row must be seeded");
+    assert!(row.protected);
+    assert_eq!(
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("state-bucket")
+    );
+    let partial = row
+        .partial_read()
+        .expect("normal create writeback must preserve the partial-read marker");
+    assert_eq!(partial.detail, "bootstrap read incomplete");
+    assert_eq!(
+        partial.missing_attributes,
+        BTreeSet::from(["versioning".to_string()])
+    );
+}
+
+#[test]
+fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
+    struct ColorOverrideGuard;
+
+    impl Drop for ColorOverrideGuard {
+        fn drop(&mut self) {
+            colored::control::unset_override();
+        }
+    }
+
+    let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
+        "bootstrap read incomplete".to_string(),
+        vec!["versioning".to_string()],
+    )
+    .expect("fixture diagnostic has a missing attribute");
+    let rendered = {
+        colored::control::set_override(true);
+        let _guard = ColorOverrideGuard;
+        format_partial_state_bucket_create_warning("state-bucket", &diagnostic)
+    };
+
+    assert!(
+        rendered.contains("\u{1b}["),
+        "fixture must exercise ANSI styling: {rendered:?}"
+    );
+    let chars: Vec<char> = rendered.chars().collect();
+    let mut depth = 0_u32;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'[') {
+            let mut end = i + 2;
+            while end < chars.len() && chars[end] != 'm' {
+                end += 1;
+            }
+            let params: String = chars[i + 2..end].iter().collect();
+            if params == "0" {
+                depth = depth.saturating_sub(1);
+            } else {
+                depth += 1;
+            }
+            i = end + 1;
+            continue;
+        }
+        if chars[i] == '\n' {
+            assert_eq!(
+                depth, 0,
+                "an ANSI color span crossed a newline: {rendered:?}"
+            );
+        }
+        i += 1;
+    }
+}
+
+#[tokio::test]
+async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
+    use carina_core::effect::Effect;
+
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let (_temp, backend) = bootstrap_test_backend();
+    let (resource, schemas) = bootstrap_declared_state_bucket(&provider, &backend)
+        .await
+        .expect("declared state bucket create must seed state");
+    let id = resource.id.clone();
+
+    let state_file = backend
+        .read_state()
+        .await
+        .expect("seed state read")
+        .expect("successful bootstrap must write state")
+        .into_state();
+    let current_state = match state_file.build_state_for_resource(&id) {
+        Current::Present(present) => present.into_parts().0,
+        current => panic!("seeded bucket must be present, got {current:?}"),
+    };
+    let plan_input_states = crate::plan_input_current_from_states(
+        HashMap::from([(id.clone(), current_state)]),
+        &schemas,
+        std::slice::from_ref(&resource),
+    );
+    let resolved_resource = ResolvedResource::new(resource);
+    let saved_attrs = state_file.build_saved_attrs().lift(&schemas);
+    let plan = carina_core::differ::create_plan(
+        std::slice::from_ref(&resolved_resource),
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        carina_core::differ::PlanPriorStates::new(
+            &plan_input_states,
+            &HashMap::new(),
+            &carina_core::differ::Orphans::new(),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &saved_attrs,
+        &state_file.build_explicit(),
+        &[],
+    )
+    .expect("subsequent plan must build from bootstrap seed");
+
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Create(created) if created.id == id)),
+        "seeded state bucket must not be planned for creation: {:?}",
+        plan.effects()
+    );
+}
+
+#[tokio::test]
+async fn declared_state_bucket_successful_create_seed_write_failure_is_actionable() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let error = bootstrap_declared_state_bucket(&provider, &BootstrapWriteFailureBackend)
+        .await
+        .expect_err("a successful create followed by a seed write failure must be actionable");
+
+    let AppError::StateBucketSeed(seed) = &error else {
+        panic!("seed write failure lost its bootstrap context: {error:?}");
+    };
+    assert_eq!(seed.identifier(), "state-bucket");
+    assert_eq!(seed.resource_address(), "aws.s3.Bucket 'state_bucket'");
+
+    let message = error.to_string();
+    assert!(
+        message
+            .contains("State bucket 'state-bucket' was created but could not be recorded in state"),
+        "{message}"
+    );
+    assert!(message.contains("it exists outside state"), "{message}");
+    assert!(!message.contains("import {"), "{message}");
+
+    let mut source = std::error::Error::source(&error);
+    let mut backend_source = None;
+    while let Some(current) = source {
+        if let Some(backend_error) = current.downcast_ref::<carina_state::BackendError>() {
+            backend_source = Some(backend_error);
+            break;
+        }
+        source = current.source();
+    }
+    assert!(matches!(
+        backend_source,
+        Some(carina_state::BackendError::Configuration(message)) if message == "seed write failed"
+    ));
 }
 
 #[tokio::test]

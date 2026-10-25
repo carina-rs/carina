@@ -3248,8 +3248,19 @@ impl CreateOutcome {
         }
     }
 
+    /// Provider-assigned identifier carried by every successful create.
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        match &self.0 {
+            CreateOutcomeKind::Success { state }
+            | CreateOutcomeKind::PartialSuccess {
+                state,
+                diagnostic: _,
+            } => state.identifier(),
+        }
+    }
+
     /// Consume the outcome and produce a State ready for writeback.
-    pub fn into_state_for_writeback(self) -> State {
+    pub(crate) fn into_state_for_writeback(self) -> State {
         match self.0 {
             CreateOutcomeKind::Success { state } => state.into_state_for_writeback(),
             CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
@@ -5681,6 +5692,7 @@ mod tests {
 
         let success = CreateOutcome::fixture_success(state.clone());
         assert_eq!(success.diagnostic(), None);
+        assert_eq!(success.identifier().as_str(), "mock-id");
         assert_eq!(success.into_state_for_writeback(), expected);
 
         let partial = CreateOutcome::partial_success(
@@ -5690,6 +5702,7 @@ mod tests {
         );
 
         assert_eq!(partial.diagnostic(), Some(&diagnostic));
+        assert_eq!(partial.identifier().as_str(), "mock-id");
         let state = partial.into_state_for_writeback();
         assert_eq!(state.partial_read.unwrap().missing_attributes.len(), 1);
     }

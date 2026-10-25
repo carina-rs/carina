@@ -272,6 +272,17 @@ impl AcceptedRequest {
     }
 }
 
+/// Convert a successful provider create into the state and provenance used by
+/// normal apply writeback. Partial-success diagnostics are folded into the
+/// state before it is persisted.
+pub fn complete_create_for_writeback(
+    outcome: CreateOutcome,
+) -> (State, AcceptedRequest, Option<PartialReadDiagnostic>) {
+    let diagnostic = outcome.diagnostic().cloned();
+    let state = outcome.into_state_for_writeback();
+    (state, AcceptedRequest::create(), diagnostic)
+}
+
 /// Provenance-preserving result of one effect. State writeback must classify
 /// every arm explicitly instead of treating every state-shaped value alike.
 #[derive(Debug, Clone)]

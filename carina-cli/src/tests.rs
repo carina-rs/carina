@@ -1696,9 +1696,6 @@ impl StateBackend for MockBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn init(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
     async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
         Ok(true)
     }
@@ -1822,9 +1819,6 @@ impl StateBackend for LockTrackingBackend {
         Ok(())
     }
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    async fn init(&self) -> carina_state::BackendResult<()> {
         Ok(())
     }
     async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
@@ -1963,9 +1957,6 @@ impl StateBackend for RefreshTestBackend {
         self.write_state(state).await
     }
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    async fn init(&self) -> carina_state::BackendResult<()> {
         Ok(())
     }
     async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
@@ -3212,9 +3203,6 @@ impl StateBackend for CapturingBackend {
         self.write_state(state).await
     }
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    async fn init(&self) -> carina_state::BackendResult<()> {
         Ok(())
     }
     async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
