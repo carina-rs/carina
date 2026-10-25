@@ -5322,15 +5322,27 @@ fn fetch_registry_revision_download<H: RegistryHttp>(
     fetch_json(http, &url)
 }
 
-fn branch_revision_version_matches(version: &Version, revision: &str) -> bool {
-    if version.major != 0 || version.minor != 0 || version.patch != 0 {
+fn branch_build_matches(version: &Version, branch: &str) -> bool {
+    if !is_zero_prerelease(version) {
         return false;
     }
-    let mut identifiers = version.pre.as_str().split('.');
-    matches!(identifiers.next(), Some(first) if first == revision)
-        && identifiers
-            .next()
-            .is_some_and(|identifier| !identifier.is_empty())
+
+    let mut version_identifiers = version.pre.as_str().split('.');
+    for branch_identifier in branch.split('.') {
+        if branch_identifier.is_empty() || version_identifiers.next() != Some(branch_identifier) {
+            return false;
+        }
+    }
+
+    version_identifiers.next().is_some_and(is_numeric)
+}
+
+fn is_zero_prerelease(version: &Version) -> bool {
+    version.major == 0 && version.minor == 0 && version.patch == 0 && !version.pre.is_empty()
+}
+
+fn is_numeric(identifier: &str) -> bool {
+    !identifier.is_empty() && identifier.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn eligible_commit_sha(revision: &str) -> bool {
@@ -5367,7 +5379,7 @@ fn bind_registry_revision_with_selection(
     selection: RegistryRevisionSelection,
 ) -> Result<(), String> {
     if let Some(identity) = identity {
-        let branch_matches = branch_revision_version_matches(&version.parsed, revision)
+        let branch_matches = branch_build_matches(&version.parsed, revision)
             && identity.source_ref() == format!("refs/heads/{revision}");
         let release_version = listed_stable_release_for_tag(revision, listing);
         let tag_matches = identity.source_ref() == format!("refs/tags/{revision}")
@@ -5392,7 +5404,7 @@ fn bind_registry_revision_with_selection(
             "unsigned registry revision {revision:?} looks like a commit SHA and cannot be bound without a certificate"
         ));
     }
-    let branch_shaped_version = branch_revision_version_matches(&version.parsed, revision);
+    let branch_shaped_version = branch_build_matches(&version.parsed, revision);
     if branch_shaped_version {
         if selection == RegistryRevisionSelection::Locked {
             return Ok(());
@@ -5403,8 +5415,7 @@ fn bind_registry_revision_with_selection(
             .filter(|entry| !entry.yanked)
             .filter_map(|entry| {
                 let parsed = Version::parse(&entry.version).ok()?;
-                branch_revision_version_matches(&parsed, revision)
-                    .then_some((parsed, &entry.version))
+                branch_build_matches(&parsed, revision).then_some((parsed, &entry.version))
             })
             .max_by(|(left, _), (right, _)| left.cmp(right))
             .map(|(_, raw)| raw.as_str());
@@ -8098,6 +8109,215 @@ mod tests {
                 &ListedVersion::parse("0.0.0-other.1").unwrap(),
                 &listing,
                 Some(&branch)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_dotted_branch_binding_requires_matching_ref() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![listed_version("0.0.0-release.1.7.gabc", false)],
+        };
+        let identity = verified_signer(
+            "https://example.test/ci.yml@refs/heads/release.1",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/heads/release.1",
+            "https://example.test/ci.yml",
+        );
+        let version = ListedVersion::parse("0.0.0-release.1.7.gabc").unwrap();
+
+        bind_registry_revision("release.1", &version, &listing, Some(&identity)).unwrap();
+        assert!(bind_registry_revision("release", &version, &listing, Some(&identity)).is_err());
+    }
+
+    #[test]
+    fn signed_branch_binding_requires_a_numeric_build_identifier() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![listed_version("0.0.0-main.gabc1234", false)],
+        };
+        let identity = verified_signer(
+            "https://example.test/ci.yml@refs/heads/main",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/heads/main",
+            "https://example.test/ci.yml",
+        );
+
+        assert!(
+            bind_registry_revision(
+                "main",
+                &ListedVersion::parse("0.0.0-main.gabc1234").unwrap(),
+                &listing,
+                Some(&identity),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsigned_branch_binding_requires_numeric_after_the_exact_branch() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.0.0-feature.2.gaaa", false),
+                listed_version("0.0.0-feature.x.3.gbbb", false),
+            ],
+        };
+        let feature_x = Version::parse("0.0.0-feature.x.3.gbbb").unwrap();
+
+        assert!(!branch_build_matches(&feature_x, "feature"));
+        assert!(branch_build_matches(&feature_x, "feature.x"));
+
+        bind_registry_revision(
+            "feature",
+            &ListedVersion::parse("0.0.0-feature.2.gaaa").unwrap(),
+            &listing,
+            None,
+        )
+        .unwrap();
+        bind_registry_revision(
+            "feature.x",
+            &ListedVersion::parse("0.0.0-feature.x.3.gbbb").unwrap(),
+            &listing,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unsigned_dotted_numeric_branch_requires_the_highest_listed_build() {
+        // §4 gives unsigned builds the signed prefix-plus-numeric rule; registry grouping differs for numeric branch segments.
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.0.0-release-1.2.5.gaaa", false),
+                listed_version("0.0.0-release-1.2.9.gbbb", false),
+            ],
+        };
+
+        assert!(
+            bind_registry_revision(
+                "release-1.2",
+                &ListedVersion::parse("0.0.0-release-1.2.5.gaaa").unwrap(),
+                &listing,
+                None,
+            )
+            .is_err()
+        );
+        bind_registry_revision(
+            "release-1.2",
+            &ListedVersion::parse("0.0.0-release-1.2.9.gbbb").unwrap(),
+            &listing,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unsigned_branch_binding_ignores_versions_without_a_numeric_identifier() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.0.0-main.2.gaaa", false),
+                listed_version("0.0.0-main.gabc", false),
+            ],
+        };
+
+        bind_registry_revision(
+            "main",
+            &ListedVersion::parse("0.0.0-main.2.gaaa").unwrap(),
+            &listing,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn branch_build_matching_requires_exact_branch_then_numeric_and_selects_highest() {
+        let main_2 = Version::parse("0.0.0-main.2.gaaaaaaa").unwrap();
+        let main_10 = Version::parse("0.0.0-main.10.gbbbbbbb").unwrap();
+
+        assert!(branch_build_matches(&main_2, "main"));
+        assert!(branch_build_matches(&main_10, "main"));
+        assert!(!branch_build_matches(
+            &Version::parse("0.0.0-2.gccccccc").unwrap(),
+            "2"
+        ));
+        assert!(!branch_build_matches(
+            &Version::parse("1.0.0-alpha.1").unwrap(),
+            "alpha"
+        ));
+        assert!(!branch_build_matches(
+            &Version::parse("0.0.0-main.gabc").unwrap(),
+            "main"
+        ));
+
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.0.0-main.2.gaaaaaaa", false),
+                listed_version("0.0.0-main.10.gbbbbbbb", false),
+                listed_version("0.0.0-2.gccccccc", false),
+                listed_version("1.0.0-alpha.1", false),
+            ],
+        };
+        bind_registry_revision(
+            "main",
+            &ListedVersion::parse("0.0.0-main.10.gbbbbbbb").unwrap(),
+            &listing,
+            None,
+        )
+        .unwrap();
+        assert!(
+            bind_registry_revision(
+                "main",
+                &ListedVersion::parse("0.0.0-main.2.gaaaaaaa").unwrap(),
+                &listing,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn locked_unsigned_revision_uses_dotted_branch_without_reselecting() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.0.0-feature.x.3.gaaa", false),
+                listed_version("0.0.0-feature.x.10.gbbb", false),
+            ],
+        };
+        let locked = ListedVersion::parse("0.0.0-feature.x.3.gaaa").unwrap();
+
+        bind_registry_revision_with_selection(
+            "feature.x",
+            &locked,
+            &listing,
+            None,
+            RegistryRevisionSelection::Locked,
+        )
+        .unwrap();
+        assert!(
+            bind_registry_revision_with_selection(
+                "feature.x",
+                &locked,
+                &listing,
+                None,
+                RegistryRevisionSelection::Resolved,
             )
             .is_err()
         );
