@@ -373,6 +373,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         factories: &[],
         schemas: &schemas,
         parallelism: carina_core::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::new(drop),
     };
 
     let result = completed_result(
@@ -549,6 +551,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         factories: &[],
         schemas: &schemas,
         parallelism: carina_core::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::new(drop),
     };
 
     let result = completed_result(

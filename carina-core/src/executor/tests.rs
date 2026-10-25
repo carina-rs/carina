@@ -1380,6 +1380,80 @@ struct ControlledReadyCreateProvider {
     waker: Arc<Mutex<Option<std::task::Waker>>>,
 }
 
+struct CheckpointBlockingProvider {
+    release_second: Notify,
+    release_third: Notify,
+}
+
+impl Provider for CheckpointBlockingProvider {
+    fn name(&self) -> &str {
+        "checkpoint-blocking"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("read not used")) })
+    }
+
+    fn read_data_source(
+        &self,
+        _resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: CreateRequest,
+        _attempt: crate::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
+        let id = id.clone();
+        Box::pin(async move {
+            if id.identity_str() == Some("second") {
+                self.release_second.notified().await;
+            } else if id.identity_str() == Some("third") {
+                self.release_third.notified().await;
+            }
+            Ok(crate::provider::CreateOutcome::fixture_success(
+                applied_state_for_test(ok_state(&id)),
+            ))
+        })
+    }
+
+    unexpected_resume_create!();
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("update not used")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Err(ProviderError::internal("delete not used")) })
+    }
+
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
 impl ControlledReadyCreateProvider {
     fn new() -> Self {
         Self {
@@ -1520,6 +1594,8 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -1534,6 +1610,117 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
         }
         ExecutionOutcome::Cancelled(_) => panic!("uncancelled execution returned Cancelled"),
     }
+}
+
+#[tokio::test]
+async fn checkpoint_sink_receives_each_completed_effect_before_execution_ends() {
+    let provider = CheckpointBlockingProvider {
+        release_second: Notify::new(),
+        release_third: Notify::new(),
+    };
+    let first = make_resource("first", &[]);
+    let first_id = first.id.clone();
+    let second = make_resource("second", &[]);
+    let second_id = second.id.clone();
+    let third = make_resource("third", &[]);
+    let third_id = third.id.clone();
+    let plan = create_independent_create_plan(["first", "second", "third"]);
+    let (checkpoint_tx, mut checkpoint_rx) = tokio::sync::mpsc::unbounded_channel();
+    let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
+        checkpoint_tx
+            .send(snapshot)
+            .expect("checkpoint receiver must remain alive");
+    });
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink,
+    };
+    let observer = MockObserver::new();
+    let execution = execute_plan(&provider, input, &observer, uncancelled_shutdown());
+    tokio::pin!(execution);
+
+    let first_snapshot = tokio::select! {
+        snapshot = checkpoint_rx.recv() => snapshot.expect("first checkpoint"),
+        _ = &mut execution => panic!("execution ended before publishing the first checkpoint"),
+    };
+    assert_eq!(first_snapshot.success_count, 1);
+    assert!(first_snapshot.applied_states.contains_key(&first_id));
+    assert!(!first_snapshot.applied_states.contains_key(&second_id));
+
+    provider.release_second.notify_one();
+    let second_snapshot = tokio::select! {
+        biased;
+        snapshot = checkpoint_rx.recv() => snapshot.expect("second checkpoint"),
+        _ = &mut execution => panic!("execution ended before publishing the second checkpoint"),
+    };
+    assert_eq!(second_snapshot.success_count, 2);
+    assert!(second_snapshot.applied_states.contains_key(&first_id));
+    assert!(second_snapshot.applied_states.contains_key(&second_id));
+    assert!(!second_snapshot.applied_states.contains_key(&third_id));
+
+    provider.release_third.notify_one();
+    assert!(matches!(execution.await, ExecutionOutcome::Completed(_)));
+    let third_snapshot = checkpoint_rx.recv().await.expect("third checkpoint");
+    assert_eq!(third_snapshot.success_count, 3);
+    assert!(third_snapshot.applied_states.contains_key(&third_id));
+}
+
+#[tokio::test]
+async fn precompleted_state_only_result_is_checkpointed_before_provider_completion() {
+    let provider = ControlledReadyCreateProvider::new();
+    let resource = make_resource("provider-blocked", &[]);
+    let resource_id = resource.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    let (checkpoint_tx, mut checkpoint_rx) = tokio::sync::mpsc::unbounded_channel();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 1,
+        checkpoint_sink: ExecutionCheckpointSink::new(move |snapshot| {
+            checkpoint_tx
+                .send(snapshot)
+                .expect("checkpoint receiver must remain alive");
+        }),
+    };
+    let observer = MockObserver::new();
+    let execution = execute_plan(&provider, input, &observer, uncancelled_shutdown());
+    tokio::pin!(execution);
+
+    let state_only_snapshot = tokio::select! {
+        snapshot = checkpoint_rx.recv() => snapshot.expect("state-only checkpoint"),
+        _ = &mut execution => panic!("provider-blocked execution ended unexpectedly"),
+    };
+    assert_eq!(state_only_snapshot.success_count, 1);
+    assert!(state_only_snapshot.applied_states.is_empty());
+
+    provider.complete();
+    assert!(matches!(execution.await, ExecutionOutcome::Completed(_)));
+    let provider_snapshot = checkpoint_rx.recv().await.expect("provider checkpoint");
+    assert_eq!(provider_snapshot.success_count, 2);
+    assert!(provider_snapshot.applied_states.contains_key(&resource_id));
 }
 
 fn persisted_create_for_executor(id: &ResourceId) -> crate::provider::InFlightCreate {
@@ -1582,6 +1769,8 @@ async fn execute_lifecycle_fixture(
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     completed_result(
         execute_plan(
@@ -2001,6 +2190,8 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2066,6 +2257,8 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -2132,6 +2325,8 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2190,6 +2385,8 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2260,6 +2457,8 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2355,6 +2554,8 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2460,6 +2661,8 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2533,6 +2736,8 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2611,6 +2816,8 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -2696,6 +2903,8 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2866,6 +3075,8 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -2963,6 +3174,8 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3029,6 +3242,8 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3092,6 +3307,8 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -3164,6 +3381,8 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -3217,6 +3436,8 @@ async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3291,6 +3512,8 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -3345,6 +3568,8 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3407,6 +3632,8 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3462,6 +3689,8 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3503,6 +3732,8 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3550,6 +3781,8 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3598,6 +3831,8 @@ async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3671,6 +3906,8 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result =
@@ -3732,6 +3969,8 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -3751,6 +3990,46 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
 }
 
 #[tokio::test]
+async fn cancelled_skip_batch_publishes_one_cumulative_checkpoint() {
+    let provider = MockProvider::new();
+    let plan = create_independent_create_plan(["one", "two", "three"]);
+    let published_skip_counts = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&published_skip_counts);
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::new(move |snapshot| {
+            recorded.lock().unwrap().push(snapshot.skip_count);
+        }),
+    };
+    let (trigger, shutdown) = shutdown_channel();
+    trigger.request_graceful_shutdown();
+
+    let outcome = execute_plan(&provider, input, &MockObserver::new(), shutdown).await;
+
+    let ExecutionOutcome::Cancelled(result) = outcome else {
+        panic!("pre-cancelled execution must return Cancelled")
+    };
+    assert_eq!(result.skip_count, 3);
+    assert_eq!(
+        *published_skip_counts.lock().unwrap(),
+        [3],
+        "one loop batch must publish one cumulative snapshot"
+    );
+}
+
+#[tokio::test]
 async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed() {
     let provider = MockProvider::new();
     let plan = Plan::new();
@@ -3767,6 +4046,8 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
     let (shutdown, cancel) = shutdown_channel();
@@ -3802,6 +4083,8 @@ async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
@@ -3860,6 +4143,8 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
@@ -3926,6 +4211,8 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
@@ -3986,6 +4273,8 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
@@ -4022,6 +4311,8 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let outcome = execute_plan(&provider, input, &observer, shutdown).await;
@@ -4067,6 +4358,8 @@ async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let execution = execute_plan(&provider, input, &observer, shutdown);
@@ -4124,6 +4417,8 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let outcome = tokio::time::timeout(
@@ -4160,6 +4455,8 @@ async fn test_simple_create() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4209,6 +4506,8 @@ async fn partial_create_records_state_and_diagnostic() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4262,6 +4561,8 @@ async fn test_apply_renormalizes_after_resolution() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4348,6 +4649,8 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4418,6 +4721,8 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4527,6 +4832,8 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4576,6 +4883,8 @@ async fn test_apply_reapplies_host_enum_canonicalization() {
         factories: &factories,
         schemas: &ALIAS_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4642,6 +4951,8 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
         factories: &factories,
         schemas: &ALIAS_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4702,6 +5013,8 @@ async fn test_apply_reapplies_canonicalize_stage() {
         factories: &[],
         schemas: &CANON_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4765,6 +5078,8 @@ async fn test_apply_renormalizes_update_path() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4852,6 +5167,8 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         factories: &[],
         schemas: &DEFAULT_TAG_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -4960,6 +5277,8 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5031,6 +5350,8 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5096,6 +5417,8 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5158,6 +5481,8 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5217,6 +5542,8 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5311,6 +5638,8 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let result = completed_result(
@@ -5435,6 +5764,8 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5506,6 +5837,8 @@ async fn test_simple_delete() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5547,6 +5880,8 @@ async fn test_failed_effect_propagates_to_dependent() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5588,6 +5923,8 @@ async fn test_observer_events_emitted_correctly() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5623,6 +5960,8 @@ async fn test_read_effect_is_no_op() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5669,6 +6008,8 @@ async fn test_independent_effects_run_in_parallel() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5725,6 +6066,8 @@ async fn test_parallel_failure_skips_dependents() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -5778,6 +6121,8 @@ async fn test_dependency_levels_sequential_chain() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -6028,6 +6373,8 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -6262,6 +6609,8 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -6341,6 +6690,8 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(2).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -6412,6 +6763,8 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -6681,6 +7034,8 @@ async fn test_update_effect_binding_map_propagation() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -6815,6 +7170,8 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -7234,6 +7591,8 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         factories: &[],
         schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
 
@@ -7340,6 +7699,8 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -7495,6 +7856,8 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -7579,6 +7942,8 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -7701,6 +8066,8 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -7801,6 +8168,8 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -7966,6 +8335,8 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -8193,6 +8564,8 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -8244,6 +8617,8 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
     let result =
@@ -8290,6 +8665,8 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
     let result =
@@ -8343,6 +8720,8 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
     let result =
@@ -8443,6 +8822,8 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
 
@@ -8539,6 +8920,8 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
     let result =
@@ -8805,6 +9188,8 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: NonZeroUsize::new(2).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
     let observer = MockObserver::new();
 
@@ -8992,6 +9377,8 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -9132,6 +9519,8 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -9266,6 +9655,8 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -9351,6 +9742,8 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();
@@ -9445,6 +9838,8 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
         factories: &[],
         schemas: &TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
 
     let observer = MockObserver::new();

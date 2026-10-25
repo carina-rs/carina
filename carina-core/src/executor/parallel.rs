@@ -4,13 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
-use crate::effect::{DeletedInstanceKey, Effect};
 use crate::provider::{AppliedIdentifier, Provider};
 #[cfg(test)]
 use crate::resource::Resource;
-use crate::resource::{ResolvedResource, ResourceId, ResourceIdentity, Value};
+use crate::resource::{ResourceId, ResourceIdentity, Value};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 #[cfg(test)]
@@ -24,17 +24,16 @@ use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
     FailureView, PureMetaOutcome, SchedulerDeps, build_scheduler_deps, dependency_failed_reason,
-    emit_cancelled_skips_with_progress, failure_binding_name, try_dispatch_pure_meta,
-    wait_dependency_failed_reason,
+    failure_binding_name, try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
-    AppliedStates, SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome, WaitSignal,
+    SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome, WaitSignal,
     count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
     wait_failure_message,
 };
 use super::{
-    DeferredDataSourceReads, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult,
-    ProgressInfo, unresolved_data_source_inputs,
+    DeferredDataSourceReads, ExecutionAccumulator, ExecutionEvent, ExecutionInput,
+    ExecutionObserver, ExecutionResult, ProgressInfo, unresolved_data_source_inputs,
 };
 
 pub(super) struct ExpandedEffects {
@@ -224,17 +223,26 @@ pub(super) async fn execute_effects_sequential(
     observer: &dyn ExecutionObserver,
     shutdown: &ShutdownToken,
 ) -> (ExecutionResult, bool) {
-    let mut success_count = 0;
-    let mut failure_count = 0;
-    let mut partial_count = 0;
-    let mut partial_diagnostics = Vec::new();
-    let mut skip_count = 0;
-    let (mut applied_states, wait_identifiers) =
-        AppliedStates::with_initial(&input.managed_current, &input.data_source_states);
-    let mut successfully_deleted: HashSet<DeletedInstanceKey> = HashSet::new();
-    let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
+    let result = ExecutionResult {
+        success_count: input.precompleted_success_count,
+        failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
+        successfully_deleted: HashSet::new(),
+        permanent_name_overrides: HashMap::new(),
+        managed_current: std::mem::take(&mut input.managed_current),
+        data_source_states: std::mem::take(&mut input.data_source_states),
+        bindings: std::mem::take(&mut input.bindings),
+        failed_refreshes: HashSet::new(),
+    };
+    let (mut accumulated, wait_identifiers) = ExecutionAccumulator::new(result);
+    if input.precompleted_success_count > 0 {
+        accumulated.mark_dirty();
+    }
     let mut pending_refreshes: HashMap<ResourceId, AppliedIdentifier> = HashMap::new();
-    let mut runtime_synthesized_resources: Vec<ResolvedResource> = Vec::new();
     let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = super::ModuleConstraintGate::new(input.compositions);
 
@@ -288,11 +296,12 @@ pub(super) async fn execute_effects_sequential(
             duration: std::time::Duration::ZERO,
             progress,
         });
-        failure_count += 1;
+        accumulated.mutate(|result| result.failure_count += 1);
         completed_indices.insert(idx);
         failed_indices.insert(idx);
         dispatched.insert(idx);
     }
+    accumulated.publish_if_dirty(&input.checkpoint_sink);
     // All actionable effect indices (excluding Read and state operations)
     let mut actionable_indices: Vec<usize> = (0..effects.len())
         .filter(|&idx| is_runtime_dispatchable(&effects[idx], &input.deferred_data_source_reads))
@@ -402,9 +411,10 @@ pub(super) async fn execute_effects_sequential(
                         total,
                     },
                 });
-                skip_count += 1;
+                accumulated.mutate(|result| result.skip_count += 1);
                 failed_indices.insert(idx);
                 completed_indices.insert(idx);
+                completed_synchronous_dispatch = true;
                 continue;
             }
 
@@ -413,10 +423,10 @@ pub(super) async fn execute_effects_sequential(
                 total,
                 observer,
             };
-            match try_dispatch_pure_meta(&effect, &input.bindings, &dispatch_ctx) {
+            match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
                 PureMetaOutcome::NotPureMeta => {}
                 PureMetaOutcome::Failed => {
-                    failure_count += 1;
+                    accumulated.mutate(|result| result.failure_count += 1);
                     failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     completed_synchronous_dispatch = true;
@@ -429,7 +439,9 @@ pub(super) async fn execute_effects_sequential(
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
                                 runtime_authored_resource_ids.insert(resource.id.clone());
-                                runtime_synthesized_resources.push(resource.clone());
+                                accumulated.mutate(|result| {
+                                    result.runtime_synthesized_resources.push(resource.clone());
+                                });
                             }
                             if let Some(binding) = failure_binding_name(&child) {
                                 idx_to_binding.insert(child_idx, binding);
@@ -460,7 +472,7 @@ pub(super) async fn execute_effects_sequential(
                                 duration: std::time::Duration::ZERO,
                                 progress,
                             });
-                            failure_count += 1;
+                            accumulated.mutate(|result| result.failure_count += 1);
                             completed_indices.insert(failed_idx);
                             failed_indices.insert(failed_idx);
                         }
@@ -472,7 +484,7 @@ pub(super) async fn execute_effects_sequential(
             }
 
             // Snapshot bindings for this effect's resolution.
-            let binding_snapshot = input.bindings.clone();
+            let binding_snapshot = accumulated.result().bindings.clone();
             let wait_identifiers = wait_identifiers.clone();
             let provider_check_inputs = &input.provider_check_inputs;
             let runtime_authored = runtime_authored_resource_ids.contains(effect.resource_id());
@@ -481,7 +493,19 @@ pub(super) async fn execute_effects_sequential(
             let provider_configs = input.provider_configs;
             let factories = input.factories;
             let schemas = input.schemas;
-            let managed_current = &input.managed_current;
+            let resume_create = match &effect {
+                Effect::ResumeCreate { resource, .. } => accumulated
+                    .result()
+                    .managed_current
+                    .get(&resource.id)
+                    .and_then(|current| match current {
+                        crate::resource::Current::CreateInFlight(pending) => Some(pending.clone()),
+                        crate::resource::Current::Absent(_)
+                        | crate::resource::Current::Present(_)
+                        | crate::resource::Current::MissingIdentifier(_) => None,
+                    }),
+                _ => None,
+            };
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
@@ -511,7 +535,7 @@ pub(super) async fn execute_effects_sequential(
                                 provider_check_inputs,
                                 runtime_authored,
                                 preparation: &preparation,
-                                managed_current,
+                                resume_create,
                                 completed: completed_ref,
                                 total,
                             },
@@ -659,6 +683,7 @@ pub(super) async fn execute_effects_sequential(
         }
 
         if completed_synchronous_dispatch {
+            accumulated.publish_if_dirty(&input.checkpoint_sink);
             continue;
         }
 
@@ -679,26 +704,30 @@ pub(super) async fn execute_effects_sequential(
                 .filter(|idx| !dispatched.contains(idx))
                 .count();
             if cancelled {
-                let mut progress_for = |_| ProgressInfo {
+                let progress_for = |_| ProgressInfo {
                     completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
                     total,
                 };
-                emit_cancelled_skips_with_progress(
-                    &effects,
-                    &actionable_indices,
-                    &mut dispatched,
-                    &mut completed_indices,
-                    &mut skip_count,
-                    observer,
-                    &mut progress_for,
-                );
+                for &idx in &actionable_indices {
+                    if dispatched.contains(&idx) {
+                        continue;
+                    }
+                    dispatched.insert(idx);
+                    completed_indices.insert(idx);
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
+                        effect: &effects[idx],
+                        reason: SKIP_REASON_CANCELLED,
+                        progress: progress_for(idx),
+                    });
+                    accumulated.mutate(|result| result.skip_count += 1);
+                }
             } else if remaining > 0 {
                 // Cycle detected: skip remaining effects as failures
                 for &idx in &actionable_indices {
                     if !dispatched.contains(&idx) {
                         dispatched.insert(idx);
                         completed_indices.insert(idx);
-                        failure_count += 1;
+                        accumulated.mutate(|result| result.failure_count += 1);
                     }
                 }
             }
@@ -729,7 +758,7 @@ pub(super) async fn execute_effects_sequential(
             in_flight.signal_in_flight_waits();
             continue;
         };
-        let (finished_idx, result) = match completion {
+        let (finished_idx, effect_result) = match completion {
             CleanupInterrupted::Completed(Some(finished)) => finished,
             CleanupInterrupted::Completed(None) => break 'execution,
             CleanupInterrupted::Abandoned => {
@@ -740,21 +769,15 @@ pub(super) async fn execute_effects_sequential(
         completed_indices.insert(finished_idx);
 
         // Process the result and update shared state immediately
-        match result {
+        match effect_result {
             SingleEffectResult::Basic(basic) => {
                 process_basic_result(
                     *basic,
                     &mut ExecutionState {
                         idx: finished_idx,
-                        success_count: &mut success_count,
-                        failure_count: &mut failure_count,
-                        partial_count: &mut partial_count,
-                        partial_diagnostics: &mut partial_diagnostics,
-                        applied_states: &mut applied_states,
+                        accumulator: &mut accumulated,
                         failed_indices: &mut failed_indices,
-                        successfully_deleted: &mut successfully_deleted,
                         pending_refreshes: &mut pending_refreshes,
-                        bindings: &mut input.bindings,
                     },
                 );
             }
@@ -773,16 +796,18 @@ pub(super) async fn execute_effects_sequential(
                         duration,
                         progress,
                     });
-                    success_count += 1;
-                    input.bindings.record_applied(
-                        resource.binding.as_deref(),
-                        &resolved_attrs,
-                        &state,
-                    );
-                    input
-                        .data_source_states
-                        .insert(resource.id.clone(), state.clone());
-                    applied_states.insert_published(
+                    accumulated.mutate(|result| {
+                        result.success_count += 1;
+                        result.bindings.record_applied(
+                            resource.binding.as_deref(),
+                            &resolved_attrs,
+                            &state,
+                        );
+                        result
+                            .data_source_states
+                            .insert(resource.id.clone(), state.clone());
+                    });
+                    accumulated.insert_published(
                         resource.id.clone(),
                         crate::executor::Applied::DataSource(state.clone()),
                         &state,
@@ -795,7 +820,7 @@ pub(super) async fn execute_effects_sequential(
                         duration,
                         progress,
                     });
-                    failure_count += 1;
+                    accumulated.mutate(|result| result.failure_count += 1);
                     failed_indices.insert(finished_idx);
                 }
             },
@@ -812,7 +837,6 @@ pub(super) async fn execute_effects_sequential(
                         duration,
                         progress,
                     });
-                    success_count += 1;
                     // Register the captured target snapshot under the
                     // wait's *synthetic* ResourceId so the downstream
                     // resolution layer can deref `<binding>.<attr>` —
@@ -827,10 +851,13 @@ pub(super) async fn execute_effects_sequential(
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    input
-                        .bindings
-                        .record_applied(Some(&binding), &attrs, &state);
-                    applied_states.insert_published(
+                    accumulated.mutate(|result| {
+                        result.success_count += 1;
+                        result
+                            .bindings
+                            .record_applied(Some(&binding), &attrs, &state);
+                    });
+                    accumulated.insert_published(
                         synthetic,
                         crate::executor::Applied::WaitSnapshot(state.clone()),
                         &state,
@@ -844,7 +871,7 @@ pub(super) async fn execute_effects_sequential(
                         reason: &reason,
                         progress,
                     });
-                    skip_count += 1;
+                    accumulated.mutate(|result| result.skip_count += 1);
                     failed_indices.insert(finished_idx);
                 }
                 WaitOutcome::Cancelled | WaitOutcome::Abandoned => {
@@ -853,7 +880,7 @@ pub(super) async fn execute_effects_sequential(
                         reason: SKIP_REASON_CANCELLED,
                         progress,
                     });
-                    skip_count += 1;
+                    accumulated.mutate(|result| result.skip_count += 1);
                 }
                 outcome @ (WaitOutcome::Timeout { .. }
                 | WaitOutcome::NotFound(_)
@@ -865,11 +892,12 @@ pub(super) async fn execute_effects_sequential(
                         duration,
                         progress,
                     });
-                    failure_count += 1;
+                    accumulated.mutate(|result| result.failure_count += 1);
                     failed_indices.insert(finished_idx);
                 }
             },
         }
+        accumulated.publish_if_dirty(&input.checkpoint_sink);
         in_flight
             .check_terminal(count_undispatched(&dispatched, &failed_indices))
             .cancel_if_terminal()
@@ -879,49 +907,40 @@ pub(super) async fn execute_effects_sequential(
     // Cleanup-priority mode deliberately drops unresolved provider futures so
     // the caller can persist the results already folded into `applied_states`.
     drop(in_flight);
-    let (failed_refreshes, refresh_cancelled) = match cleanup_loop.step() {
-        LoopStep::Abandon => (HashSet::new(), true),
+    accumulated.publish_if_dirty(&input.checkpoint_sink);
+    let refresh_cancelled = match cleanup_loop.step() {
+        LoopStep::Abandon => true,
         LoopStep::Continue(cleanup_wait) => {
             let refresh = refresh_pending_states(
                 provider,
-                &mut input.managed_current,
+                &mut accumulated,
                 &pending_refreshes,
                 observer,
+                &input.checkpoint_sink,
             );
             match cleanup_wait.until_cleanup_priority(refresh).await {
-                CleanupInterrupted::Completed(failed) => (failed, false),
-                CleanupInterrupted::Abandoned => (HashSet::new(), true),
+                CleanupInterrupted::Completed(()) => false,
+                CleanupInterrupted::Abandoned => true,
             }
         }
     };
     cancelled |= refresh_cancelled;
 
-    let report_unresolved_constraints = failure_count == 0 && skip_count == 0;
+    let report_unresolved_constraints =
+        accumulated.result().failure_count == 0 && accumulated.result().skip_count == 0;
     if !cancelled
-        && let Err(error) = module_gate.finish(&input.bindings, report_unresolved_constraints)
+        && let Err(error) = module_gate.finish(
+            &accumulated.result().bindings,
+            report_unresolved_constraints,
+        )
     {
         for failure in error.failures() {
             let message = failure.to_string();
             observer.on_event(&ExecutionEvent::ModuleConstraintFailed { error: &message });
-            failure_count += 1;
+            accumulated.mutate(|result| result.failure_count += 1);
         }
     }
-
-    let result = ExecutionResult {
-        success_count,
-        failure_count,
-        partial_count,
-        partial_diagnostics,
-        skip_count,
-        applied_states: applied_states.into_inner(),
-        runtime_synthesized_resources,
-        successfully_deleted,
-        permanent_name_overrides,
-        managed_current: input.managed_current.clone(),
-        data_source_states: input.data_source_states.clone(),
-        bindings: input.bindings.clone(),
-        failed_refreshes,
-    };
+    let result = accumulated.finish(&input.checkpoint_sink);
     (result, cancelled)
 }
 
@@ -1205,6 +1224,8 @@ mod tests {
             factories: &[],
             schemas: &schemas,
             parallelism: std::num::NonZeroUsize::new(2).unwrap(),
+            precompleted_success_count: 0,
+            checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
         };
         let observer = RecordingSkipObserver::new();
 
@@ -1321,6 +1342,8 @@ mod tests {
             factories: &[],
             schemas: &schemas,
             parallelism: std::num::NonZeroUsize::new(2).unwrap(),
+            precompleted_success_count: 0,
+            checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
         };
         let observer = RecordingSkipObserver::new();
 

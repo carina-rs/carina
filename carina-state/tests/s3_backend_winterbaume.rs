@@ -19,7 +19,12 @@ use carina_state::backends::S3Backend;
 use carina_state::{BackendError, StateBackend, StateFile};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use winterbaume_core::MockAws;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{Notify, Semaphore, oneshot};
+use winterbaume_core::{MockAws, MockRequest, MockResponse, MockService};
 use winterbaume_s3::S3Service;
 
 const TEST_REGION: &str = "us-east-1";
@@ -58,6 +63,199 @@ async fn mock_backend_with_client() -> (S3Backend, Client) {
     );
     let raw_client = Client::new(&sdk_config);
     (backend, raw_client)
+}
+
+async fn mock_backend_with_service(service: impl MockService) -> S3Backend {
+    let mock = MockAws::builder().with_service(service).build();
+    let sdk_config = mock.sdk_config(TEST_REGION).await;
+    S3Backend::from_client(
+        Client::new(&sdk_config),
+        TEST_BUCKET.to_string(),
+        TEST_KEY.to_string(),
+        TEST_REGION.to_string(),
+        false,
+        true,
+    )
+}
+
+fn state_serial(request: &MockRequest) -> Option<u64> {
+    (request.method == "PUT")
+        .then(|| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .flatten()?
+        .get("serial")?
+        .as_u64()
+}
+
+struct DelayedStatePut {
+    inner: Arc<S3Service>,
+    delayed_serial: u64,
+    landed: Arc<Notify>,
+    release: Arc<Semaphore>,
+    completed: Arc<Notify>,
+    state_puts: Arc<AtomicUsize>,
+    state_heads: Arc<AtomicUsize>,
+}
+
+impl MockService for DelayedStatePut {
+    fn service_name(&self) -> &str {
+        self.inner.service_name()
+    }
+
+    fn url_patterns(&self) -> Vec<&str> {
+        self.inner.url_patterns()
+    }
+
+    fn handle(
+        &self,
+        request: MockRequest,
+    ) -> Pin<Box<dyn Future<Output = MockResponse> + Send + '_>> {
+        if request.method == "HEAD" && request.uri.contains(TEST_KEY) {
+            self.state_heads.fetch_add(1, Ordering::SeqCst);
+        }
+        if state_serial(&request).is_some() {
+            self.state_puts.fetch_add(1, Ordering::SeqCst);
+        }
+        if state_serial(&request) != Some(self.delayed_serial) {
+            return self.inner.handle(request);
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let landed = Arc::clone(&self.landed);
+        let release = Arc::clone(&self.release);
+        let completed = Arc::clone(&self.completed);
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            // Model a request that S3 has committed even though the caller is
+            // still waiting for the response and can abandon that future.
+            let response = inner.handle(request).await;
+            landed.notify_one();
+            release
+                .acquire()
+                .await
+                .expect("delayed PUT release semaphore must remain open")
+                .forget();
+            completed.notify_one();
+            let _ = response_tx.send(response);
+        });
+        Box::pin(async move {
+            response_rx.await.unwrap_or_else(|_| {
+                MockResponse::error(500, "AbandonedTestResponse", "response receiver dropped")
+            })
+        })
+    }
+}
+
+struct RecordingS3Calls {
+    inner: Arc<S3Service>,
+    enabled: Arc<AtomicBool>,
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl MockService for RecordingS3Calls {
+    fn service_name(&self) -> &str {
+        self.inner.service_name()
+    }
+
+    fn url_patterns(&self) -> Vec<&str> {
+        self.inner.url_patterns()
+    }
+
+    fn handle(
+        &self,
+        request: MockRequest,
+    ) -> Pin<Box<dyn Future<Output = MockResponse> + Send + '_>> {
+        if self.enabled.load(Ordering::SeqCst) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request.method.clone(), request.uri.clone()));
+        }
+        self.inner.handle(request)
+    }
+}
+
+struct ConflictingStatePuts {
+    inner: Arc<S3Service>,
+    enabled: Arc<AtomicBool>,
+    conflicts: Arc<AtomicUsize>,
+    heads: Arc<AtomicUsize>,
+    gets: Arc<AtomicUsize>,
+}
+
+struct PauseFirstStatePut {
+    inner: Arc<S3Service>,
+    paused_serial: u64,
+    paused: AtomicBool,
+    started: Arc<Notify>,
+    release: Arc<Semaphore>,
+}
+
+impl MockService for PauseFirstStatePut {
+    fn service_name(&self) -> &str {
+        self.inner.service_name()
+    }
+
+    fn url_patterns(&self) -> Vec<&str> {
+        self.inner.url_patterns()
+    }
+
+    fn handle(
+        &self,
+        request: MockRequest,
+    ) -> Pin<Box<dyn Future<Output = MockResponse> + Send + '_>> {
+        if state_serial(&request) != Some(self.paused_serial)
+            || self.paused.swap(true, Ordering::SeqCst)
+        {
+            return self.inner.handle(request);
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            started.notify_one();
+            release
+                .acquire()
+                .await
+                .expect("paused PUT release semaphore must remain open")
+                .forget();
+            inner.handle(request).await
+        })
+    }
+}
+
+impl MockService for ConflictingStatePuts {
+    fn service_name(&self) -> &str {
+        self.inner.service_name()
+    }
+
+    fn url_patterns(&self) -> Vec<&str> {
+        self.inner.url_patterns()
+    }
+
+    fn handle(
+        &self,
+        request: MockRequest,
+    ) -> Pin<Box<dyn Future<Output = MockResponse> + Send + '_>> {
+        if self.enabled.load(Ordering::SeqCst) {
+            match request.method.as_str() {
+                "HEAD" => {
+                    self.heads.fetch_add(1, Ordering::SeqCst);
+                }
+                "GET" => {
+                    self.gets.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            if state_serial(&request).is_some() {
+                self.conflicts.fetch_add(1, Ordering::SeqCst);
+                return Box::pin(async {
+                    MockResponse::error(412, "PreconditionFailed", "forced state write conflict")
+                });
+            }
+        }
+        self.inner.handle(request)
+    }
 }
 
 /// S3 key the backend uses for its lock file. Mirrors `S3Backend::lock_key`
@@ -252,6 +450,241 @@ async fn write_then_read_state_round_trips() {
 }
 
 #[tokio::test]
+async fn lower_serial_same_lineage_write_replaces_remote_state() {
+    let backend = mock_backend().await;
+    backend.init().await.unwrap();
+
+    let mut older = StateFile::new();
+    older.increment_serial();
+    let mut newer = older.clone();
+    newer.increment_serial();
+
+    backend.write_state(&newer).await.unwrap();
+    backend.write_state(&older).await.unwrap();
+
+    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    assert_eq!(persisted.lineage, older.lineage);
+    assert_eq!(persisted.serial, older.serial);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_older_put_cannot_overwrite_a_completed_newer_put() {
+    let landed = Arc::new(Notify::new());
+    let release = Arc::new(Semaphore::new(0));
+    let completed = Arc::new(Notify::new());
+    let state_puts = Arc::new(AtomicUsize::new(0));
+    let state_heads = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(
+        mock_backend_with_service(DelayedStatePut {
+            inner: Arc::new(S3Service::new()),
+            delayed_serial: 1,
+            landed: Arc::clone(&landed),
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+            state_puts: Arc::clone(&state_puts),
+            state_heads: Arc::clone(&state_heads),
+        })
+        .await,
+    );
+    backend.init().await.unwrap();
+
+    let initial = backend.read_state().await.unwrap().unwrap().into_state();
+    state_puts.store(0, Ordering::SeqCst);
+    state_heads.store(0, Ordering::SeqCst);
+    let mut older = initial.clone();
+    older.increment_serial();
+    let mut newer = older.clone();
+    newer.increment_serial();
+
+    let older_write = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move { backend.write_state(&older).await })
+    };
+    landed.notified().await;
+    older_write.abort();
+    assert!(older_write.await.unwrap_err().is_cancelled());
+    release.add_permits(1);
+    completed.notified().await;
+
+    backend.write_state(&newer).await.unwrap();
+
+    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    assert_eq!(persisted.lineage, newer.lineage);
+    assert_eq!(persisted.serial, newer.serial);
+    assert_eq!(
+        state_puts.load(Ordering::SeqCst),
+        3,
+        "old landed PUT + stale cached-Etag PUT + retry PUT"
+    );
+    assert_eq!(
+        state_heads.load(Ordering::SeqCst),
+        1,
+        "only the precondition conflict should require HEAD"
+    );
+}
+
+#[tokio::test]
+async fn repeated_state_write_conflicts_are_bounded() {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let conflicts = Arc::new(AtomicUsize::new(0));
+    let heads = Arc::new(AtomicUsize::new(0));
+    let gets = Arc::new(AtomicUsize::new(0));
+    let backend = mock_backend_with_service(ConflictingStatePuts {
+        inner: Arc::new(S3Service::new()),
+        enabled: Arc::clone(&enabled),
+        conflicts: Arc::clone(&conflicts),
+        heads: Arc::clone(&heads),
+        gets: Arc::clone(&gets),
+    })
+    .await;
+    backend.init().await.unwrap();
+    let mut state = backend.read_state().await.unwrap().unwrap().into_state();
+    state.increment_serial();
+    enabled.store(true, Ordering::SeqCst);
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        backend.write_state(&state),
+    )
+    .await
+    .expect("state write conflicts must have a bounded retry limit")
+    .expect_err("every conditional state PUT should conflict");
+
+    assert_eq!(conflicts.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        heads.load(Ordering::SeqCst),
+        4,
+        "the cached ETag avoids the first HEAD; each retry refreshes it"
+    );
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        error,
+        BackendError::StateWriteConflict { attempts: 5 }
+    ));
+}
+
+#[tokio::test]
+async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mock = MockAws::builder()
+        .with_service(RecordingS3Calls {
+            inner: Arc::new(S3Service::new()),
+            enabled: Arc::clone(&enabled),
+            calls: Arc::clone(&calls),
+        })
+        .build();
+    let sdk_config = mock.sdk_config(TEST_REGION).await;
+
+    let seed_backend = S3Backend::from_client(
+        Client::new(&sdk_config),
+        TEST_BUCKET.to_string(),
+        TEST_KEY.to_string(),
+        TEST_REGION.to_string(),
+        false,
+        true,
+    );
+    seed_backend.init().await.unwrap();
+
+    // Use a fresh backend so only this read can seed its state ETag cache.
+    let backend = S3Backend::from_client(
+        Client::new(&sdk_config),
+        TEST_BUCKET.to_string(),
+        TEST_KEY.to_string(),
+        TEST_REGION.to_string(),
+        false,
+        true,
+    );
+    let mut state = backend.read_state().await.unwrap().unwrap().into_state();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    state.increment_serial();
+
+    enabled.store(true, Ordering::SeqCst);
+    backend
+        .write_state_locked_for_cleanup(&state, &lock)
+        .await
+        .unwrap();
+    enabled.store(false, Ordering::SeqCst);
+
+    let recorded: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, uri)| {
+            let object = if uri.contains(&lock_key()) {
+                "lock"
+            } else if uri.contains(TEST_KEY) {
+                "state"
+            } else {
+                "other"
+            };
+            format!("{method} {object}")
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec!["GET lock", "PUT lock", "PUT state"],
+        "cached cleanup must fit the 900ms lock GET + lock PUT + state PUT budget"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_locked_write_with_known_absent_state_uses_three_s3_calls() {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mock = MockAws::builder()
+        .with_service(RecordingS3Calls {
+            inner: Arc::new(S3Service::new()),
+            enabled: Arc::clone(&enabled),
+            calls: Arc::clone(&calls),
+        })
+        .build();
+    let sdk_config = mock.sdk_config(TEST_REGION).await;
+    let backend = S3Backend::from_client(
+        Client::new(&sdk_config),
+        TEST_BUCKET.to_string(),
+        TEST_KEY.to_string(),
+        TEST_REGION.to_string(),
+        false,
+        true,
+    );
+
+    backend.create_bucket().await.unwrap();
+    assert!(backend.read_state().await.unwrap().is_none());
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    let mut state = StateFile::new();
+    state.increment_serial();
+
+    enabled.store(true, Ordering::SeqCst);
+    backend
+        .write_state_locked_for_cleanup(&state, &lock)
+        .await
+        .unwrap();
+    enabled.store(false, Ordering::SeqCst);
+
+    let recorded: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, uri)| {
+            let object = if uri.contains(&lock_key()) {
+                "lock"
+            } else if uri.contains(TEST_KEY) {
+                "state"
+            } else {
+                "other"
+            };
+            format!("{method} {object}")
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec!["GET lock", "PUT lock", "PUT state"],
+        "known-absent cleanup must use If-None-Match directly and fit the 900ms budget"
+    );
+}
+
+#[tokio::test]
 async fn read_state_returns_none_when_object_absent() {
     let backend = mock_backend().await;
     // Create the bucket but never write a state object.
@@ -312,6 +745,95 @@ async fn write_state_locked_succeeds_for_held_lock() {
     assert_eq!(read_back.serial, state.serial);
 
     backend.release_lock(&lock).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locked_state_conflict_rechecks_ownership_before_retrying() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Semaphore::new(0));
+    let mock = MockAws::builder()
+        .with_service(PauseFirstStatePut {
+            inner: Arc::new(S3Service::new()),
+            paused_serial: 2,
+            paused: AtomicBool::new(false),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })
+        .build();
+    let sdk_config = mock.sdk_config(TEST_REGION).await;
+    let backend = Arc::new(S3Backend::from_client(
+        Client::new(&sdk_config),
+        TEST_BUCKET.to_string(),
+        TEST_KEY.to_string(),
+        TEST_REGION.to_string(),
+        false,
+        true,
+    ));
+    let raw_client = Client::new(&sdk_config);
+    backend.init().await.unwrap();
+
+    let initial = backend.read_state().await.unwrap().unwrap().into_state();
+    let held_lock = backend.acquire_lock("apply").await.unwrap();
+
+    // Advance the object behind the backend's cached ETag so its next state
+    // PUT reaches the precondition-conflict retry path.
+    let mut competing_state = initial;
+    competing_state.increment_serial();
+    raw_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(TEST_KEY)
+        .body(ByteStream::from(
+            carina_core::utils::pretty_with_newline_bytes(&competing_state).unwrap(),
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let mut attempted_state = competing_state.clone();
+    attempted_state.increment_serial();
+    let attempted_write = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            backend
+                .write_state_locked(&attempted_state, &held_lock)
+                .await
+        })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("locked state PUT must reach the controlled conflict");
+
+    // Replace the lock only after the writer's initial ownership check. A
+    // retry based solely on a refreshed state ETag would now overwrite the
+    // new owner's state.
+    let replacement_lock = test_lock("apply", 3600);
+    raw_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(lock_key())
+        .body(ByteStream::from(
+            carina_core::utils::pretty_with_newline_bytes(&replacement_lock).unwrap(),
+        ))
+        .send()
+        .await
+        .unwrap();
+    release.add_permits(1);
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), attempted_write)
+        .await
+        .expect("locked state write must finish after the conflict is released")
+        .unwrap()
+        .expect_err("a writer that lost its lock must not retry the state PUT");
+    assert!(
+        matches!(error, BackendError::LockNotHeld(_)),
+        "expected LockNotHeld after replacement, got {error:?}"
+    );
+
+    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    assert_eq!(persisted.serial, competing_state.serial);
+    assert_eq!(persisted.lineage, competing_state.lineage);
 }
 
 #[tokio::test]

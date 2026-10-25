@@ -25,6 +25,7 @@ mod cancellation_fixture;
 use cancellation_fixture::ApplyCancellationFixture;
 
 use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
+use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 
 fn complete_create(state: carina_core::resource::State) -> carina_core::executor::Applied {
@@ -2670,7 +2671,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
 
     let migrated = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(state_file),
+            state_file,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -4452,7 +4453,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
 
     let result = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &current_states,
@@ -4575,7 +4576,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
 
     let state = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &current_states,
@@ -4818,7 +4819,7 @@ fn block_unique_name_attribute_state_roundtrip() {
 
     let state = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -4952,7 +4953,7 @@ fn move_plus_update_keeps_post_update_attributes() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(state_file),
+            state_file,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -5037,7 +5038,7 @@ fn move_alone_carries_attributes_via_managed_current() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(state_file),
+            state_file,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &managed_current,
@@ -5095,7 +5096,7 @@ fn move_with_absent_from_is_no_op() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(StateFile::default()),
+            state_file: StateFile::default(),
             sorted_resources: &[],
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -5149,7 +5150,7 @@ fn failed_refresh_preserves_existing_row() {
 
     let saved = build_state_after_apply(
         ApplyStateSave {
-            state_file: Some(state_file),
+            state_file,
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -5212,7 +5213,7 @@ fn move_from_overlapping_desired_resource_errors() {
 
     let result = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -5270,7 +5271,7 @@ fn remove_overlapping_desired_resource_errors() {
 
     let result = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
@@ -5327,7 +5328,7 @@ fn self_move_overlapping_desired_resource_errors() {
 
     let result = build_state_after_apply(
         ApplyStateSave {
-            state_file: None,
+            state_file: StateFile::new(),
             sorted_resources: &sorted_resources,
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),

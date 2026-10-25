@@ -8,8 +8,6 @@ use crate::resource::ResourceId;
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
 use super::parallel::apply_deferred_replace_delete_deps;
-use super::wait::SKIP_REASON_CANCELLED;
-use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 use crate::effect::deps::{
     ScheduleInputs, UnresolvedRequiredDependency, build_effect_dependency_analysis,
     relax_update_update_edges,
@@ -213,29 +211,5 @@ impl<'a> FailureView<'a> {
 
     pub(super) fn is_effectively_pre_skipped(&self, idx: usize) -> bool {
         self.find_failed_dependency(idx).is_some()
-    }
-}
-
-pub(super) fn emit_cancelled_skips_with_progress(
-    effects: &[Effect],
-    indices: &[usize],
-    dispatched: &mut HashSet<usize>,
-    completed_indices: &mut HashSet<usize>,
-    skip_count: &mut usize,
-    observer: &dyn ExecutionObserver,
-    progress_for: &mut dyn FnMut(usize) -> ProgressInfo,
-) {
-    for &idx in indices {
-        if dispatched.contains(&idx) {
-            continue;
-        }
-        dispatched.insert(idx);
-        completed_indices.insert(idx);
-        observer.on_event(&ExecutionEvent::EffectSkipped {
-            effect: &effects[idx],
-            reason: SKIP_REASON_CANCELLED,
-            progress: progress_for(idx),
-        });
-        *skip_count += 1;
     }
 }

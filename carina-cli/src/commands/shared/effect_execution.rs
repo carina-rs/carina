@@ -1,11 +1,44 @@
 //! Helpers for executing import and state-only effects with user feedback.
 
 use carina_core::effect::{Effect, resolve_import_identifier};
-use carina_core::executor::ExecutionResult;
+use carina_core::executor::{ExecutionCheckpointSink, ExecutionResult};
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, Provider, ReadRequest};
 use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 use colored::Colorize;
+
+/// Owns all result mutation for one import iteration and publishes at most one
+/// checkpoint when the iteration leaves scope, including through `continue`.
+struct ImportResultIteration<'a> {
+    result: &'a mut ExecutionResult,
+    checkpoint_sink: &'a ExecutionCheckpointSink,
+    dirty: bool,
+}
+
+impl<'a> ImportResultIteration<'a> {
+    fn new(result: &'a mut ExecutionResult, checkpoint_sink: &'a ExecutionCheckpointSink) -> Self {
+        Self {
+            result,
+            checkpoint_sink,
+            dirty: false,
+        }
+    }
+
+    fn mutate<T>(&mut self, mutation: impl FnOnce(&mut ExecutionResult) -> T) -> T {
+        self.dirty = true;
+        mutation(self.result)
+    }
+}
+
+impl Drop for ImportResultIteration<'_> {
+    fn drop(&mut self) {
+        if self.dirty {
+            // ponytail: this clones the full cumulative result once per import
+            // iteration; use deltas if very large import plans make it material.
+            self.checkpoint_sink.publish(self.result);
+        }
+    }
+}
 
 /// Execute import effects by reading the resource from the provider.
 ///
@@ -17,6 +50,7 @@ pub(crate) async fn execute_import_effects(
     provider: &dyn Provider,
     result: &mut ExecutionResult,
     shutdown: &ShutdownToken,
+    checkpoint_sink: &ExecutionCheckpointSink,
 ) {
     let cleanup_loop = shutdown.cleanup_aware_loop();
     for effect in plan.effects() {
@@ -29,6 +63,7 @@ pub(crate) async fn execute_import_effects(
                 LoopShutdownPhase::Running => {}
                 LoopShutdownPhase::Graceful => return,
             }
+            let mut iteration = ImportResultIteration::new(result, checkpoint_sink);
 
             // carina#3329: the identifier is a `Value` so an
             // interpolation referencing a deferred upstream-state ref
@@ -42,7 +77,7 @@ pub(crate) async fn execute_import_effects(
                 Ok(s) => s.to_string(),
                 Err(e) => {
                     println!("  {} Import failed for {}: {}", "✗".red(), id, e);
-                    result.failure_count += 1;
+                    iteration.mutate(|result| result.failure_count += 1);
                     continue;
                 }
             };
@@ -55,7 +90,7 @@ pub(crate) async fn execute_import_effects(
                         id,
                         error
                     );
-                    result.failure_count += 1;
+                    iteration.mutate(|result| result.failure_count += 1);
                     continue;
                 }
             };
@@ -80,11 +115,13 @@ pub(crate) async fn execute_import_effects(
                     let state = outcome.into_state();
                     if state.exists {
                         println!("  {} Imported {}", "✓".green(), id);
-                        result.applied_states.insert(
-                            id.clone().into_inner(),
-                            carina_core::executor::Applied::Imported(state),
-                        );
-                        result.success_count += 1;
+                        iteration.mutate(|result| {
+                            result.applied_states.insert(
+                                id.clone().into_inner(),
+                                carina_core::executor::Applied::Imported(state),
+                            );
+                            result.success_count += 1;
+                        });
                     } else {
                         println!(
                             "  {} Import failed: resource {} with id {} not found",
@@ -92,12 +129,12 @@ pub(crate) async fn execute_import_effects(
                             id,
                             identifier_display
                         );
-                        result.failure_count += 1;
+                        iteration.mutate(|result| result.failure_count += 1);
                     }
                 }
                 Err(e) => {
                     println!("  {} Import failed for {}: {}", "✗".red(), id, e);
-                    result.failure_count += 1;
+                    iteration.mutate(|result| result.failure_count += 1);
                 }
             }
         }
@@ -122,16 +159,19 @@ fn format_state_only_effect_line(effect: &Effect) -> Option<String> {
     }
 }
 
-/// Execute state-only effects (remove, move) with user feedback.
+/// Report state-only effects (remove, move) and return their success count.
 ///
-/// These effects only modify state and don't call the provider.
-pub(crate) fn execute_state_only_effects(plan: &Plan, result: &mut ExecutionResult) {
+/// State writeback applies these effects to every checkpoint and to the final
+/// state; this function only emits their user-facing output.
+pub(crate) fn execute_state_only_effects(plan: &Plan) -> usize {
+    let mut completed = 0;
     for effect in plan.effects() {
         if let Some(line) = format_state_only_effect_line(effect) {
             println!("{}", line);
-            result.success_count += 1;
+            completed += 1;
         }
     }
+    completed
 }
 
 #[cfg(test)]
@@ -166,6 +206,27 @@ mod tests {
             bindings: carina_core::binding_index::ResolvedBindings::default(),
             failed_refreshes: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn import_iteration_publishes_once_after_multiple_result_mutations() {
+        let snapshots = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = ExecutionCheckpointSink::new({
+            let snapshots = std::sync::Arc::clone(&snapshots);
+            move |snapshot| snapshots.lock().unwrap().push(snapshot)
+        });
+        let mut result = empty_result();
+
+        {
+            let mut iteration = ImportResultIteration::new(&mut result, &sink);
+            iteration.mutate(|result| result.success_count += 1);
+            iteration.mutate(|result| result.failure_count += 1);
+        }
+
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].success_count, 1);
+        assert_eq!(snapshots[0].failure_count, 1);
     }
 
     /// Mock provider that records every `read` call so the test can
@@ -289,7 +350,14 @@ mod tests {
 
         let recorder = ReadRecorder::new();
         let mut result = empty_result();
-        execute_import_effects(&plan, &recorder, &mut result, &ShutdownToken::running()).await;
+        execute_import_effects(
+            &plan,
+            &recorder,
+            &mut result,
+            &ShutdownToken::running(),
+            &ExecutionCheckpointSink::noop(),
+        )
+        .await;
 
         assert_eq!(
             recorder.read_count(),
@@ -319,7 +387,14 @@ mod tests {
 
         let recorder = ReadRecorder::new();
         let mut result = empty_result();
-        execute_import_effects(&plan, &recorder, &mut result, &ShutdownToken::running()).await;
+        execute_import_effects(
+            &plan,
+            &recorder,
+            &mut result,
+            &ShutdownToken::running(),
+            &ExecutionCheckpointSink::noop(),
+        )
+        .await;
 
         let reads = recorder.reads.lock().unwrap();
         assert_eq!(reads.len(), 1);

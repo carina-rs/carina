@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, oneshot};
+use std::sync::Mutex as StdMutex;
+
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{BackendError, LockInfo, StateBackend};
@@ -11,13 +13,81 @@ pub struct LockHeartbeat;
 
 /// Owns both the lock capability and its renewal task.
 ///
-/// Call [`HeartbeatGuard::stop`] before saving state or releasing the lock.
-/// Dropping the guard aborts the task, which is appropriate for unwind paths
-/// where the lock capability cannot be recovered.
+/// Use [`HeartbeatGuard::writer`] for state checkpoints while renewals are
+/// active. Call [`HeartbeatGuard::stop`] before the final raw state save or
+/// lock release. Dropping the guard aborts the task, which is appropriate for
+/// unwind paths where the lock capability cannot be recovered.
 pub struct HeartbeatGuard {
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), BackendError>>>,
-    lock: Arc<Mutex<Option<LockInfo>>>,
+    backend: Arc<dyn StateBackend>,
+    ownership: Arc<LockOwnership>,
+}
+
+/// Serialized state writer that shares the heartbeat's current lock capability.
+///
+/// Clones all point at the same lock slot. A write holds that slot's mutex and
+/// uses the heartbeat's current capability, so it cannot race a renewal.
+#[derive(Clone)]
+pub struct LockedStateWriter {
+    backend: Arc<dyn StateBackend>,
+    ownership: Arc<LockOwnership>,
+}
+
+struct LockOwnership {
+    lock: Mutex<Option<LockInfo>>,
+    lost_message: StdMutex<Option<String>>,
+    on_lost: StdMutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    lost: Notify,
+}
+
+impl LockOwnership {
+    fn new(lock: LockInfo, on_lost: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            lock: Mutex::new(Some(lock)),
+            lost_message: StdMutex::new(None),
+            on_lost: StdMutex::new(Some(Box::new(on_lost))),
+            lost: Notify::new(),
+        }
+    }
+
+    fn record_lock_loss(&self, error: &BackendError) {
+        let BackendError::LockNotHeld(message) = error else {
+            return;
+        };
+        let first_loss = {
+            let mut recorded = self
+                .lost_message
+                .lock()
+                .expect("lock-loss diagnostic mutex poisoned");
+            if recorded.is_some() {
+                false
+            } else {
+                *recorded = Some(message.clone());
+                true
+            }
+        };
+        if !first_loss {
+            return;
+        }
+        if let Some(on_lost) = self
+            .on_lost
+            .lock()
+            .expect("lock-loss callback mutex poisoned")
+            .take()
+        {
+            on_lost();
+        }
+        self.lost.notify_one();
+    }
+
+    fn lock_loss_error(&self) -> Option<BackendError> {
+        self.lost_message
+            .lock()
+            .expect("lock-loss diagnostic mutex poisoned")
+            .as_ref()
+            .map(|message| BackendError::LockNotHeld(message.clone()))
+    }
 }
 
 /// A heartbeat renewal proved that this process no longer owns the state lock.
@@ -50,32 +120,37 @@ impl LockHeartbeat {
     ) -> HeartbeatGuard {
         let interval = (lock.renewal_ttl() / 3).max(Duration::from_millis(1));
         let (stop_tx, mut stop_rx) = oneshot::channel();
-        let lock = Arc::new(Mutex::new(Some(lock)));
-        let task_lock = Arc::clone(&lock);
+        let ownership = Arc::new(LockOwnership::new(lock, on_lost));
+        let task_ownership = Arc::clone(&ownership);
+        let task_backend = Arc::clone(&backend);
         let task = tokio::spawn(async move {
-            let mut on_lost = Some(on_lost);
             let mut warned_for_failure_streak = false;
             loop {
                 tokio::select! {
                     biased;
                     _ = &mut stop_rx => return Ok(()),
+                    _ = task_ownership.lost.notified() => {
+                        return Err(task_ownership.lock_loss_error().expect(
+                            "lock-loss notification must carry a diagnostic",
+                        ));
+                    }
                     _ = tokio::time::sleep(interval) => {}
                 }
 
-                let mut lock = task_lock.lock().await;
+                let mut lock = task_ownership.lock.lock().await;
+                if let Some(error) = task_ownership.lock_loss_error() {
+                    return Err(error);
+                }
                 let current = lock
                     .as_ref()
                     .expect("heartbeat lock must exist until the guard stops");
-                match backend.renew_lock(current).await {
+                match task_backend.renew_lock(current).await {
                     Ok(renewed) => {
                         *lock = Some(renewed);
                         warned_for_failure_streak = false;
                     }
                     Err(error @ BackendError::LockNotHeld(_)) => {
-                        let on_lost = on_lost
-                            .take()
-                            .expect("lock-loss callback must only run once");
-                        on_lost();
+                        task_ownership.record_lock_loss(&error);
                         return Err(error);
                     }
                     Err(error) => {
@@ -95,12 +170,41 @@ impl LockHeartbeat {
         HeartbeatGuard {
             stop: Some(stop_tx),
             task: Some(task),
-            lock,
+            backend,
+            ownership,
         }
     }
 }
 
+impl LockedStateWriter {
+    /// Write state with the heartbeat's current lock capability while
+    /// excluding renewal from the same capability slot.
+    pub async fn write_state(&self, state: &mut crate::StateFile) -> crate::BackendResult<()> {
+        let slot = self.ownership.lock.lock().await;
+        if let Some(error) = self.ownership.lock_loss_error() {
+            return Err(error);
+        }
+        let current = slot
+            .as_ref()
+            .expect("heartbeat lock must exist while its writer is alive");
+        state.increment_serial();
+        let result = self.backend.write_state_locked(state, current).await;
+        if let Err(error @ BackendError::LockNotHeld(_)) = &result {
+            self.ownership.record_lock_loss(error);
+        }
+        result
+    }
+}
+
 impl HeartbeatGuard {
+    /// Obtain a state writer backed by the heartbeat's serialized lock slot.
+    pub fn writer(&self) -> LockedStateWriter {
+        LockedStateWriter {
+            backend: Arc::clone(&self.backend),
+            ownership: Arc::clone(&self.ownership),
+        }
+    }
+
     /// Stop renewals, join any renewal already in progress, and recover the
     /// most recently renewed lock capability.
     pub async fn stop(mut self) -> Result<LockInfo, LockLost> {
@@ -140,7 +244,8 @@ impl HeartbeatGuard {
     }
 
     async fn take_lock(&self) -> LockInfo {
-        self.lock
+        self.ownership
+            .lock
             .lock()
             .await
             .take()
@@ -149,6 +254,10 @@ impl HeartbeatGuard {
 
     async fn finish(&self, outcome: Result<(), BackendError>) -> Result<LockInfo, LockLost> {
         let lock = self.take_lock().await;
+        let outcome = match outcome {
+            Ok(()) => self.ownership.lock_loss_error().map_or(Ok(()), Err),
+            Err(error) => Err(error),
+        };
         match outcome {
             Ok(()) => Ok(lock),
             Err(error) => {
@@ -231,6 +340,9 @@ mod tests {
         renewals: AtomicUsize,
         renewing: AtomicBool,
         save_overlapped_renewal: AtomicBool,
+        write_used_latest_lock: AtomicBool,
+        renewals_at_write: AtomicUsize,
+        latest_renewed_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
         renewal_started: Notify,
         renewal_completed: Semaphore,
         renewal_delay: Duration,
@@ -245,6 +357,9 @@ mod tests {
                 renewals: AtomicUsize::new(0),
                 renewing: AtomicBool::new(false),
                 save_overlapped_renewal: AtomicBool::new(false),
+                write_used_latest_lock: AtomicBool::new(false),
+                renewals_at_write: AtomicUsize::new(usize::MAX),
+                latest_renewed_at: Mutex::new(None),
                 renewal_started: Notify::new(),
                 renewal_completed: Semaphore::new(0),
                 renewal_delay,
@@ -302,26 +417,41 @@ mod tests {
             {
                 return Err(BackendError::Io("temporary test failure".to_string()));
             }
-            self.renewing.store(true, Ordering::SeqCst);
-            self.renewal_started.notify_waiters();
+            if self.renewing.swap(true, Ordering::SeqCst) {
+                return Err(BackendError::LockNotHeld(
+                    "concurrent renewal replaced the lock capability".to_string(),
+                ));
+            }
+            self.renewal_started.notify_one();
             if self.renewal_never_completes {
                 std::future::pending::<()>().await;
             }
             tokio::time::sleep(self.renewal_delay).await;
+            let renewed = lock.renewed_for_test();
+            *self.latest_renewed_at.lock().expect("latest renewed lock") = Some(renewed.created());
             self.renewals.fetch_add(1, Ordering::SeqCst);
             self.renewal_completed.add_permits(1);
             self.renewing.store(false, Ordering::SeqCst);
-            Ok(lock.renewed_for_test())
+            Ok(renewed)
         }
 
         async fn write_state_locked(
             &self,
             _state: &StateFile,
-            _lock: &LockInfo,
+            lock: &LockInfo,
         ) -> BackendResult<()> {
+            self.renewals_at_write
+                .store(self.renewals.load(Ordering::SeqCst), Ordering::SeqCst);
             if self.renewing.load(Ordering::SeqCst) {
                 self.save_overlapped_renewal.store(true, Ordering::SeqCst);
             }
+            let used_latest = self
+                .latest_renewed_at
+                .lock()
+                .expect("latest renewed lock")
+                .is_some_and(|created| created == lock.created());
+            self.write_used_latest_lock
+                .store(used_latest, Ordering::SeqCst);
             Ok(())
         }
 
@@ -380,6 +510,52 @@ mod tests {
 
         assert_eq!(backend.renewals.load(Ordering::SeqCst), 1);
         assert!(!backend.save_overlapped_renewal.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn writer_serializes_with_renewal_uses_latest_lock_and_heartbeat_continues() {
+        let backend = Arc::new(RecordingBackend::new(Duration::from_millis(50)));
+        let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(30));
+        let guard =
+            LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
+        let writer = guard.writer();
+
+        backend.renewal_started.notified().await;
+        let mut state = StateFile::new();
+        writer
+            .write_state(&mut state)
+            .await
+            .expect("writer must wait for the renewal and keep ownership");
+        let renewals_after_write = backend.renewals.load(Ordering::SeqCst);
+        backend
+            .renewal_completed
+            .acquire()
+            .await
+            .expect("first heartbeat renewal completion must be recorded")
+            .forget();
+
+        tokio::time::timeout(Duration::from_secs(5), backend.renewal_completed.acquire())
+            .await
+            .expect("heartbeat must continue renewing after the write")
+            .expect("renewal semaphore must remain open")
+            .forget();
+        let _lock = guard.stop().await.expect("lock should remain held");
+
+        assert_eq!(state.serial, 1);
+        assert_eq!(
+            backend.renewals_at_write.load(Ordering::SeqCst),
+            1,
+            "checkpoint writes must reuse the heartbeat's current capability without renewing"
+        );
+        assert!(backend.renewals.load(Ordering::SeqCst) > renewals_after_write);
+        assert!(
+            !backend.save_overlapped_renewal.load(Ordering::SeqCst),
+            "renewal and write must use the same serialized lock slot"
+        );
+        assert!(
+            backend.write_used_latest_lock.load(Ordering::SeqCst),
+            "state write must receive the capability returned by the heartbeat renewal"
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@
 //! resolving exports, and (for destroy) removing destroyed resources.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
@@ -29,6 +30,7 @@ use carina_state::{
 use colored::Colorize;
 
 use crate::commands::plan::MovedOrigins;
+use crate::commands::shared::incremental_state_saver::FinalStateBase;
 use crate::commands::shared::lock_heartbeat::StateLockRef;
 use crate::error::AppError;
 
@@ -142,28 +144,77 @@ impl PostApplyStates {
     }
 }
 
+/// Immutable inputs shared by every checkpoint and the final apply write.
+///
+/// Owning these together prevents the background saver and final write from
+/// silently diverging on the desired resources, plan, schemas, or saved-plan
+/// secret hashes.
+pub(crate) struct ApplyStateSaveInputs {
+    sorted_resources: Vec<ResolvedResource>,
+    plan: Plan,
+    schemas: SchemaRegistry,
+    planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
+}
+
+impl ApplyStateSaveInputs {
+    pub(crate) fn new(
+        sorted_resources: Vec<ResolvedResource>,
+        plan: Plan,
+        schemas: SchemaRegistry,
+        planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
+    ) -> Self {
+        Self {
+            sorted_resources,
+            plan,
+            schemas,
+            planned_secret_hashes,
+        }
+    }
+
+    pub(crate) fn sorted_resources(&self) -> &[ResolvedResource] {
+        &self.sorted_resources
+    }
+
+    pub(crate) fn schemas(&self) -> &SchemaRegistry {
+        &self.schemas
+    }
+
+    pub(crate) fn build_state(
+        &self,
+        state: StateFile,
+        result: &ExecutionResult,
+    ) -> Result<StateFile, AppError> {
+        build_state_after_apply(
+            ApplyStateSave {
+                state_file: state,
+                sorted_resources: &self.sorted_resources,
+                runtime_synthesized_resources: &result.runtime_synthesized_resources,
+                managed_current: &result.managed_current,
+                applied_states: &result.applied_states,
+                plan: &self.plan,
+                successfully_deleted: &result.successfully_deleted,
+                failed_refreshes: &result.failed_refreshes,
+                schemas: &self.schemas,
+            },
+            self.planned_secret_hashes.as_ref(),
+        )
+    }
+}
+
 /// Input parameters for `finalize_apply`.
 ///
 /// Groups the execution result, resource data, and backend configuration
 /// needed to save state after an apply operation.
 pub(crate) struct FinalizeApplyInput<'a> {
     pub result: &'a ExecutionResult,
-    pub state_file: Option<StateFile>,
-    pub sorted_resources: &'a [ResolvedResource],
+    pub state_base: FinalStateBase,
+    pub state_save_inputs: Arc<ApplyStateSaveInputs>,
     /// Data sources (`read`-keyword resources). Layered into the
     /// export-resolution binding view so `exports { x = some_read.attr }`
     /// resolves (carina#3181).
     pub data_sources: &'a [carina_core::resource::DataSource],
-    /// Live execution view of managed resources read this run.
-    pub managed_current: &'a HashMap<ResourceId, Current>,
-    /// Transient provider-read data-source results. `state.resources` never
-    /// persists these, so post-apply export resolution receives them
-    /// separately (carina#3266).
-    pub data_source_states: &'a HashMap<ResourceId, State>,
-    pub plan: &'a Plan,
     pub backend: &'a dyn StateBackend,
     pub lock: StateLockRef<'a>,
-    pub schemas: &'a SchemaRegistry,
     /// `Some(params)` rebuilds `state.exports` from the source
     /// configuration's `exports {}` block — empty `params` clears the
     /// map (#2932). `None` preserves the existing `state.exports` and
@@ -537,7 +588,7 @@ pub(crate) fn materialize_exports(
 }
 
 pub(crate) struct ApplyStateSave<'a> {
-    pub state_file: Option<StateFile>,
+    pub state_file: StateFile,
     pub sorted_resources: &'a [ResolvedResource],
     pub runtime_synthesized_resources: &'a [ResolvedResource],
     pub managed_current: &'a HashMap<ResourceId, Current>,
@@ -1314,7 +1365,7 @@ pub(crate) fn build_state_after_apply(
         failed_refreshes,
         schemas,
     } = save;
-    let mut state = state_file.unwrap_or_default();
+    let mut state = state_file;
     let moved_origins = MovedOrigins::from_plan(plan);
 
     let writeback = decompose_with_moved_origins(
@@ -1442,11 +1493,17 @@ fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) -> Result
     Ok(())
 }
 
-/// Apply destroy results to the state file: remove destroyed resources and
-/// clear any exports (since exports reference attributes of destroyed resources).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DestroyStateWrite {
+    Checkpoint,
+    Final,
+}
+
+/// Apply destroy results to the state file.
 pub(crate) fn apply_destroy_to_state(
     state: &mut carina_state::StateFile,
     destroyed: &[DestroyedInstance],
+    write: DestroyStateWrite,
 ) {
     for destroyed in destroyed {
         match &destroyed.generation {
@@ -1467,7 +1524,9 @@ pub(crate) fn apply_destroy_to_state(
             }
         }
     }
-    state.exports.clear();
+    if write == DestroyStateWrite::Final {
+        state.exports.clear();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1817,7 +1876,7 @@ mod apply_state_save_tests {
             }
             ReplacementAppliedKind::CreateEnded => build_state_after_apply(
                 ApplyStateSave {
-                    state_file: None,
+                    state_file: StateFile::new(),
                     sorted_resources: std::slice::from_ref(&resolved_resource),
                     runtime_synthesized_resources: &[],
                     managed_current: &HashMap::new(),
@@ -1885,14 +1944,17 @@ mod apply_state_save_tests {
                 )
                 .with_identifier("complete-id"),
             ),
-            ReplacementAppliedKind::Observed => Applied::Observed(observed_create(
-                &id,
-                HashMap::from([(
-                    "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("observed.example.com".into())),
-                )]),
-                carina_core::provider::Sent::AllRequestAttributes,
-            )),
+            ReplacementAppliedKind::Observed => Applied::Observed(
+                observed_create(
+                    &id,
+                    HashMap::from([(
+                        "name".to_string(),
+                        Value::Concrete(ConcreteValue::String("observed.example.com".into())),
+                    )]),
+                    carina_core::provider::Sent::AllRequestAttributes,
+                )
+                .into(),
+            ),
             ReplacementAppliedKind::CreateInFlight => Applied::CreateInFlight(fresh_in_flight(
                 &id,
                 "new-token",
@@ -1911,7 +1973,7 @@ mod apply_state_save_tests {
 
         build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state),
+                state_file: state,
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved_resource),
                 managed_current: &managed_current,
@@ -2093,7 +2155,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(initial),
+                state_file: initial,
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved_desired),
                 managed_current: &managed_current,
@@ -2188,7 +2250,7 @@ mod apply_state_save_tests {
         let id = resource.id.clone();
         build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved(resource.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -2251,7 +2313,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
@@ -2321,7 +2383,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &managed_current,
@@ -2364,7 +2426,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
@@ -2427,7 +2489,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -2461,7 +2523,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -2495,7 +2557,7 @@ mod apply_state_save_tests {
         let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
@@ -2534,7 +2596,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -2608,7 +2670,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(existing),
+                state_file: existing,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &managed_current,
@@ -2651,7 +2713,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -2698,7 +2760,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -2729,11 +2791,11 @@ mod apply_state_save_tests {
         let created = observed_create(&id, observed_attributes, sent);
         build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved(resource.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Observed(created))]),
+                applied_states: &HashMap::from([(id, Applied::Observed(created.into()))]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -2971,7 +3033,7 @@ mod apply_state_save_tests {
         );
         let initial = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -2994,7 +3056,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(initial),
+                state_file: initial,
                 sorted_resources: std::slice::from_ref(&resolved_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &managed_current,
@@ -3039,7 +3101,7 @@ mod apply_state_save_tests {
         );
         let initial = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&source_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3089,7 +3151,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(initial),
+                state_file: initial,
                 sorted_resources: std::slice::from_ref(&destination_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(
@@ -3122,6 +3184,84 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn checkpoint_after_moved_update_contains_only_the_destination() {
+        let source = ResourceId::with_provider_identity("mock", "test.resource", "a", None);
+        let destination = ResourceId::with_provider_identity("mock", "test.resource", "b", None);
+        let destination_resource = resolved(Resource::from_id(destination.clone()).with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("after".into())),
+        ));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("name", AttributeType::string())),
+        );
+        let mut initial = StateFile::new();
+        initial
+            .upsert_resource(
+                ResourceState::try_applied("test.resource", "a", "mock", "stable-id")
+                    .expect("fixture identifier is non-empty")
+                    .with_attribute("name", serde_json::json!("before")),
+            )
+            .expect("fixture row is valid");
+        let applied = State::existing(
+            destination.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )]),
+        )
+        .with_identifier("stable-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            identifier: crate::fixture_applied_identifier("stable-id"),
+            from: Box::new(
+                State::existing(source.clone(), HashMap::new()).with_identifier("stable-id"),
+            ),
+            to: destination_resource.clone(),
+            changed_attributes: vec!["name".to_string()],
+        });
+        plan.add(Effect::Move {
+            from: ResolvedResourceId::new(source.clone()),
+            to: ResolvedResourceId::new(destination.clone()),
+        });
+
+        // Crash-shaped checkpoint: the provider Update on `b` has completed,
+        // but the old post-executor state-only phase has not run yet.
+        let checkpoint = build_state_after_apply(
+            ApplyStateSave {
+                state_file: initial,
+                sorted_resources: std::slice::from_ref(&destination_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    destination.clone(),
+                    complete_update(applied, &["name"], &[]),
+                )]),
+                plan: &plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("checkpoint writeback should succeed");
+
+        assert!(
+            checkpoint.find_resource_for_id(&source).is_none(),
+            "a durable provider result must not leave the moved-from row behind"
+        );
+        assert_eq!(
+            checkpoint
+                .find_resource_for_id(&destination)
+                .and_then(|row| row.identifier())
+                .map(|identifier| identifier.as_str()),
+            Some("stable-id")
+        );
+    }
+
+    #[test]
     fn repend_keeps_envelope_values_started_at_and_name_overrides() {
         let resource = Resource::with_provider("mock", "test.resource", "pending", None)
             .with_attribute(
@@ -3151,7 +3291,7 @@ mod apply_state_save_tests {
         );
         let initial = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3194,7 +3334,7 @@ mod apply_state_save_tests {
             .with_attribute("api_key", secret_string("changed-api-key"));
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(initial),
+                state_file: initial,
                 sorted_resources: std::slice::from_ref(&resolved(changed_resource)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3290,7 +3430,7 @@ mod apply_state_save_tests {
         });
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(initial),
+                state_file: initial,
                 sorted_resources: std::slice::from_ref(&destination_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3331,7 +3471,7 @@ mod apply_state_save_tests {
         );
         let mut initial = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3366,7 +3506,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(initial),
+                state_file: initial,
                 sorted_resources: std::slice::from_ref(&resolved_resource),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3434,7 +3574,7 @@ mod apply_state_save_tests {
         .with_identifier("listener-id");
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: &[resolved(resource)],
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3521,7 +3661,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
                     .unwrap(),
                 runtime_synthesized_resources: &[],
@@ -3577,7 +3717,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
                     .unwrap(),
                 runtime_synthesized_resources: &[],
@@ -3623,7 +3763,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(StateFile::new()),
+                state_file: StateFile::new(),
                 sorted_resources: &[],
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(child_id.clone(), complete_create(child_state))]),
@@ -3682,7 +3822,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &[],
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3778,7 +3918,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &[],
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -3945,7 +4085,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
@@ -4001,7 +4141,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(StateFile::new()),
+                state_file: StateFile::new(),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
@@ -4070,7 +4210,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4132,7 +4272,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4197,7 +4337,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id.clone(), Current::from_state(current_state))]),
@@ -4257,7 +4397,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4357,7 +4497,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4421,7 +4561,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4529,7 +4669,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4652,7 +4792,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4721,7 +4861,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::from([(id, Current::from_state(refreshed_state))]),
@@ -4788,7 +4928,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4873,7 +5013,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: None,
+                state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved(desired)),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -4930,7 +5070,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
@@ -5048,7 +5188,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 managed_current: &crate::managed_current_from_states(HashMap::from([(
@@ -5146,7 +5286,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(StateFile::new()),
+                state_file: StateFile::new(),
                 sorted_resources: &sorted_resources,
                 runtime_synthesized_resources: &[],
                 managed_current: &crate::managed_current_from_states(current_states),
@@ -5213,7 +5353,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(StateFile::new()),
+                state_file: StateFile::new(),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
@@ -5299,7 +5439,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
@@ -5373,7 +5513,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(StateFile::new()),
+                state_file: StateFile::new(),
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
@@ -5576,7 +5716,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &[],
                 runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
                 managed_current: &crate::managed_current_from_states(current_states.clone()),
@@ -5829,7 +5969,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(
             ApplyStateSave {
-                state_file: Some(state_file),
+                state_file,
                 sorted_resources: &sorted_resources,
                 runtime_synthesized_resources: &[],
                 managed_current: &crate::managed_current_from_states(current_states.clone()),

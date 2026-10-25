@@ -627,6 +627,9 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         factories: ctx.factories(),
         schemas: ctx.schemas(),
         parallelism: carina_core::executor::TEST_UNCAPPED,
+        // This executor-only integration test does not persist state.
+        precompleted_success_count: 0,
+        checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
     let result = completed_result(
         execute_plan(

@@ -17,7 +17,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::Instant;
 
 use crate::executor::scheduler::FailureView;
-use crate::executor::{Applied, ExecutionEvent, ExecutionObserver};
+use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{AppliedIdentifier, Provider, ProviderError, ReadRequest};
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
@@ -31,7 +31,7 @@ pub(crate) type WaitIdentifierResolver<'a> =
     dyn Fn(&ResourceId) -> Option<AppliedIdentifier> + Send + Sync + 'a;
 pub(crate) type SharedWaitIdentifiers = Arc<Mutex<HashMap<ResourceId, Option<AppliedIdentifier>>>>;
 
-fn initial_wait_identifiers(
+pub(super) fn initial_wait_identifiers(
     managed_current: &HashMap<ResourceId, Current>,
     data_source_states: &HashMap<ResourceId, State>,
 ) -> SharedWaitIdentifiers {
@@ -67,47 +67,6 @@ pub(crate) fn resolve_wait_identifier(
         .get(target_id)
         .cloned()
         .flatten()
-}
-
-pub(crate) struct AppliedStates {
-    states: HashMap<ResourceId, Applied>,
-    wait_identifiers: SharedWaitIdentifiers,
-}
-
-impl AppliedStates {
-    pub(crate) fn with_initial(
-        managed_current: &HashMap<ResourceId, Current>,
-        data_source_states: &HashMap<ResourceId, State>,
-    ) -> (Self, SharedWaitIdentifiers) {
-        let shared = initial_wait_identifiers(managed_current, data_source_states);
-        let applied_states = Self {
-            states: HashMap::new(),
-            wait_identifiers: shared.clone(),
-        };
-        (applied_states, shared)
-    }
-
-    pub(crate) fn insert_published(&mut self, id: ResourceId, applied: Applied, state: &State) {
-        self.wait_identifiers
-            .lock()
-            .expect("wait identifier map poisoned")
-            .insert(
-                id.clone(),
-                state
-                    .identifier
-                    .as_deref()
-                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok()),
-            );
-        self.states.insert(id, applied);
-    }
-
-    pub(crate) fn insert_unpublished(&mut self, id: ResourceId, applied: Applied) {
-        self.states.insert(id, applied);
-    }
-
-    pub(crate) fn into_inner(self) -> HashMap<ResourceId, Applied> {
-        self.states
-    }
 }
 
 /// Outcome of polling a Wait effect. The variants distinguish:
