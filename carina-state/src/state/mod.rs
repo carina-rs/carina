@@ -366,8 +366,10 @@ pub enum ResourceStateEncodingError {
 /// Coupling write-only and authoring provenance makes invalid combinations
 /// unrepresentable: an accepted request always establishes the desired
 /// authoring record, while a carried refresh rebuilds current desired keys
-/// against fresh stored values and retains only live, pending top-level
-/// removals from the prior record.
+/// against fresh stored values and retains live pending removals at any
+/// authored depth from the prior record. Ambiguous list-element removals are
+/// retained as whole-value comparisons rather than assigned to guessed
+/// elements.
 #[derive(Debug, Clone, Copy)]
 pub enum RowBasis<'a> {
     /// A provider accepted this create or update request.
@@ -375,7 +377,8 @@ pub enum RowBasis<'a> {
     /// Import established the desired authoring record without sending values.
     Imported,
     /// No desired write completed; rebuild desired metadata while retaining
-    /// live, pending top-level removals from known prior metadata.
+    /// live pending removals at any authored depth from known prior metadata.
+    /// Ambiguous list-element removals remain whole-value comparisons.
     Carried,
 }
 
@@ -618,7 +621,10 @@ impl StateFile {
     ///      marker strings are migrated only in resource attribute trees.
     /// v15: Current instance is a tagged union. An applied identifier and a
     ///      pending create continuation cannot coexist in one row.
-    pub const CURRENT_VERSION: u32 = 15;
+    /// v16: Added `ExplicitFields::WholeValue` with validated authored-path
+    ///      evidence for carried ambiguous-list removals. Older rows need no
+    ///      structural rewrite because they cannot contain the new marker.
+    pub const CURRENT_VERSION: u32 = 16;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -1646,8 +1652,13 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
                 None
             };
             let pre_current_migration = migrated_v13.as_deref().unwrap_or(pre_secret_migration);
-            let migrated_v14 = migrate_v14_current_instance(pre_current_migration)?;
-            let mut state = StateFile::from_json_str(&migrated_v14)
+            let migrated_v14 = if v <= 14 {
+                Some(migrate_v14_current_instance(pre_current_migration)?)
+            } else {
+                None
+            };
+            let migrated_content = migrated_v14.as_deref().unwrap_or(pre_current_migration);
+            let mut state = StateFile::from_json_str(migrated_content)
                 .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
             // v5 → v6: lift the flat `desired_keys: Vec<String>` field
             // (already discarded by serde because the v6 struct no longer
@@ -2708,42 +2719,24 @@ impl ResourceState {
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
     ) -> ExplicitFields {
-        let mut carried =
-            explicit::build_from_resource_for_stored_values(resource, stored_attributes, schema);
-        let (
-            ExplicitFields::Struct {
-                children: carried_children,
-            },
-            Some(ExplicitFields::Struct {
-                children: prior_children,
-            }),
-        ) = (&mut carried, existing.map(|row| &row.explicit))
-        else {
-            return carried;
+        let Some(existing) = existing else {
+            return explicit::build_from_resource_for_stored_values(
+                resource,
+                stored_attributes,
+                schema,
+            );
         };
-
-        // A carried write records current desired keys rebuilt against fresh
-        // stored values, plus a prior top-level key only while the fresh
-        // provider state proves that its removal is still pending. Rebuilding
-        // desired children preserves their list-element alignment and never
-        // promotes provider-only keys. A retained prior-only child must be
-        // demoted because any ListElements inside it were aligned to the old
-        // row rather than these fresh stored values.
-        //
-        // This deliberately retains pending removals only at the top level. A
-        // nested field removed by a failed update can still lose its pending
-        // removal when its desired parent is rebuilt; preserving that requires
-        // nested reconciliation with stable element identity.
-        for (key, prior_child) in prior_children {
-            if !resource.attributes.contains_key(key) && stored_attributes.contains_key(key) {
-                carried_children.insert(
-                    key.clone(),
-                    explicit::demote_list_elements_to_union(prior_child),
-                );
-            }
-        }
-
-        carried
+        let prior_stored_attributes = existing
+            .persisted_attributes()
+            .map(PersistedAttributes::to_values)
+            .unwrap_or_default();
+        explicit::build_carried_from_resource_for_stored_values(
+            resource,
+            &prior_stored_attributes,
+            &existing.explicit,
+            stored_attributes,
+            schema,
+        )
     }
 
     /// Build an applied row for a create that exists but whose finishing step

@@ -24,15 +24,17 @@ fn fixture_applied_identifier(
         .expect("fixture provider identifier must be non-empty")
 }
 
-use std::io;
+use std::{collections::HashMap, io};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{ExecutableCommand, execute};
 use ratatui::prelude::*;
 
+use carina_core::explicit::ExplicitFields;
 use carina_core::module::FileSignature;
 use carina_core::plan::Plan;
+use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 
 pub use app::{App, FocusedPanel};
@@ -194,12 +196,15 @@ pub fn run_module_info(signature: &FileSignature) -> io::Result<()> {
 /// When schemas are provided, the detail panel shows read-only attributes
 /// with `(known after apply)` and default values with `# default`,
 /// matching CLI `--detail full` behavior.
+/// When prior authoring records are provided, ambiguous pending list removals
+/// use the same whole-value display as the CLI.
 pub fn run(
     plan: &Plan,
     schemas: &SchemaRegistry,
     historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
+    prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
 ) -> io::Result<()> {
-    let mut app = App::new(plan, schemas, historical_display);
+    let mut app = App::new(plan, schemas, historical_display, prev_explicit);
     run_tui(ui::draw, handle_key, &mut app)
 }
 

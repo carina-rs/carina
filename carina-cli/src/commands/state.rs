@@ -922,10 +922,12 @@ async fn run_state_show(
         let plan = build_plan_from_state(&state);
         let historical_display =
             carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+        let prev_explicit = state.build_explicit();
         carina_tui::run(
             &plan,
             &carina_core::schema::SchemaRegistry::new(),
             &historical_display,
+            Some(&prev_explicit),
         )
         .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
@@ -2212,8 +2214,9 @@ fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
 ///
 /// When `resource` is `Some`, current desired metadata such as directives and
 /// dependencies is rebuilt. Authoring for desired keys is realigned to the
-/// fresh values, while live pending top-level removals are carried from the
-/// prior record.
+/// fresh values, while live pending removals at any authored depth are carried
+/// from the prior record. Ambiguous list-element removals remain whole-value
+/// comparisons rather than being assigned to guessed elements.
 /// When `None`, the existing orphan row keeps every host-owned field and only
 /// its provider-observed state is replaced.
 ///
@@ -4905,6 +4908,186 @@ mod tests {
             panic!("refresh must preserve the pending tags removal");
         };
         assert_eq!(changed_attributes, vec!["tags".to_string()]);
+    }
+
+    fn diff_after_failed_update_and_state_refresh(
+        applied: Resource,
+        desired: Resource,
+        provider_attributes: HashMap<String, Value>,
+        changed_attribute: &str,
+    ) -> (
+        carina_core::differ::Diff,
+        carina_core::explicit::ExplicitFields,
+    ) {
+        use carina_core::differ::{Diff, diff};
+        use carina_core::executor::AcceptedRequest;
+
+        let id = desired.id.clone();
+        let applied = resolved(applied);
+        let desired = resolved(desired);
+        let provider_state =
+            State::existing(id.clone(), provider_attributes).with_identifier("provider-id");
+        let accepted_create = AcceptedRequest::create_for_test();
+        let prior = ResourceState::from_provider_state_for_resource_and_schema(
+            &applied,
+            &provider_state,
+            None,
+            None,
+            RowBasis::Applied(&accepted_create),
+            None,
+        )
+        .expect("accepted create should establish the original authoring tree");
+        let mut prior_state = StateFile::new();
+        prior_state
+            .upsert_resource(prior.clone())
+            .expect("prior row should be valid");
+        let prior_saved = prior_state.build_saved_attrs();
+        let Diff::Update {
+            changed_attributes, ..
+        } = diff(
+            &desired,
+            &provider_state,
+            prior_saved.get(&id),
+            Some(&prior.explicit),
+            None,
+        )
+        else {
+            panic!("the Applied row must initially plan the nested removal");
+        };
+        assert_eq!(changed_attributes, vec![changed_attribute.to_string()]);
+
+        // A failed update has no Applied result, so apply writeback carries the
+        // fresh pre-update provider state against the new desired resource.
+        let failed_writeback = ResourceState::from_provider_state_for_resource_and_schema(
+            &desired,
+            &provider_state,
+            Some(&prior),
+            None,
+            RowBasis::Carried,
+            None,
+        )
+        .expect("failed update should carry provider state");
+        let mut refreshed_state = StateFile::new();
+        refreshed_state
+            .upsert_resource(failed_writeback)
+            .expect("failed-update row should be valid");
+
+        // Exercise the state-refresh write path between the failed update and
+        // the next plan. The provider still reports the pre-update value.
+        let mut counts = StateRefreshCounts::default();
+        diff_display_update_resource(
+            &ResolvedResourceId::new(id.clone()),
+            &Current::from_state(provider_state.clone()),
+            &mut refreshed_state,
+            Some(&desired),
+            &SchemaRegistry::new(),
+            "",
+            &mut counts,
+        )
+        .expect("state refresh should write the fresh provider state");
+
+        let refreshed = refreshed_state
+            .find_resource_for_id(&id)
+            .expect("refreshed row should remain");
+        let explicit = refreshed.explicit.clone();
+        let saved = refreshed_state.build_saved_attrs();
+        (
+            diff(
+                &desired,
+                &provider_state,
+                saved.get(&id),
+                Some(&explicit),
+                None,
+            ),
+            explicit,
+        )
+    }
+
+    #[test]
+    fn state_refresh_nested_struct_pending_removal_after_failed_update_is_replanned() {
+        use carina_core::differ::Diff;
+
+        let settings = |description: Option<&str>| {
+            let mut fields = IndexMap::from([(
+                "enabled".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            )]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let applied_settings = settings(Some("web"));
+        let applied = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("settings", applied_settings.clone());
+        let desired = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("settings", settings(None));
+
+        let (result, explicit) = diff_after_failed_update_and_state_refresh(
+            applied,
+            desired,
+            HashMap::from([("settings".to_string(), applied_settings)]),
+            "settings",
+        );
+        assert!(
+            matches!(
+                result,
+                Diff::Update {
+                    ref changed_attributes,
+                    ..
+                } if changed_attributes == &["settings".to_string()]
+            ),
+            "state refresh must preserve the pending nested struct removal; explicit={explicit:#?}, diff={result:#?}"
+        );
+    }
+
+    #[test]
+    fn state_refresh_list_element_nested_pending_removal_after_failed_update_is_replanned() {
+        use carina_core::differ::Diff;
+
+        let rule = |port, description: Option<&str>| {
+            let mut fields = IndexMap::from([(
+                "port".to_string(),
+                Value::Concrete(ConcreteValue::Int(port)),
+            )]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let applied_rules = Value::Concrete(ConcreteValue::List(vec![
+            rule(80, Some("web")),
+            rule(443, None),
+        ]));
+        let desired_rules =
+            Value::Concrete(ConcreteValue::List(vec![rule(80, None), rule(443, None)]));
+        let applied = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("rules", applied_rules.clone());
+        let desired = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("rules", desired_rules);
+
+        let (result, explicit) = diff_after_failed_update_and_state_refresh(
+            applied,
+            desired,
+            HashMap::from([("rules".to_string(), applied_rules)]),
+            "rules",
+        );
+        assert!(
+            matches!(
+                result,
+                Diff::Update {
+                    ref changed_attributes,
+                    ..
+                } if changed_attributes == &["rules".to_string()]
+            ),
+            "state refresh must preserve the pending list-element removal; explicit={explicit:#?}, diff={result:#?}"
+        );
     }
 
     #[test]

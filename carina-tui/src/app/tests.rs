@@ -204,6 +204,65 @@ fn update_effect_has_detail_rows() {
 }
 
 #[test]
+fn whole_value_list_uses_whole_value_detail_row() {
+    let rule = |description: Option<&str>| {
+        let mut fields = indexmap::IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(80)),
+        )]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.to_string().into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let id = ResourceId::with_identity("test.Listener", "listener");
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![rule(Some("web")), rule(None)])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let to = resolved(Resource::new("test.Listener", "listener").with_attribute(
+        "rules",
+        Value::Concrete(ConcreteValue::List(vec![rule(None), rule(None)])),
+    ));
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::fixture_applied_identifier("listener-id"),
+        from: Box::new(from),
+        to,
+        changed_attributes: vec!["rules".to_string()],
+    });
+    let prev_explicit = HashMap::from([(
+        id,
+        carina_core::explicit::ExplicitFields::Struct {
+            children: HashMap::from([(
+                "rules".to_string(),
+                carina_core::explicit::ExplicitFields::WholeValue {
+                    pending: carina_core::explicit::PendingPaths::try_new([vec![
+                        "description".to_string(),
+                    ]])
+                    .unwrap(),
+                },
+            )]),
+        },
+    )]);
+
+    let schemas = SchemaRegistry::new();
+    let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
+    let app = App::new(&plan, &schemas, &historical_display, Some(&prev_explicit));
+    assert!(matches!(
+        app.nodes[0].detail_rows.as_slice(),
+        [DetailRow::Changed { key, .. }] if key == "rules"
+    ));
+}
+
+#[test]
 fn host_metadata_fields_are_not_rendered_as_attributes() {
     let mut plan = Plan::new();
     plan.add(create(

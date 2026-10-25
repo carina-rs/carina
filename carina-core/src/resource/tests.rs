@@ -1495,6 +1495,60 @@ fn pair_list_elements_preserves_stable_indices_for_indistinguishable_peers_in_bo
 }
 
 #[test]
+fn list_element_pairing_marks_ties_and_zero_similarity_as_non_unique() {
+    let defs = crate::schema::empty_defs_for_schema_walks();
+    for len in [2, HASH_THRESHOLD] {
+        let peer = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(80)),
+        )])));
+        let tied = pair_list_elements_with_uniqueness(
+            std::slice::from_ref(&peer),
+            &vec![peer.clone(); len],
+            None,
+            defs,
+        );
+        assert!(matches!(tied.as_slice(), [ListElementPairing::Ambiguous]));
+
+        let unrelated = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(443)),
+        )])));
+        assert_eq!(
+            pair_list_elements_with_uniqueness(
+                std::slice::from_ref(&peer),
+                &[unrelated],
+                None,
+                defs,
+            ),
+            vec![ListElementPairing::Unmatched]
+        );
+    }
+}
+
+#[test]
+fn list_element_pairing_marks_a_sole_positive_best_match_as_unique() {
+    let map = |port| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(port)),
+        )])))
+    };
+    let desired = [map(80)];
+    let saved = [map(443), map(80)];
+
+    assert_eq!(
+        pair_list_elements_with_uniqueness(
+            &desired,
+            &saved,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+        ),
+        vec![ListElementPairing::Unique(1)]
+    );
+}
+
+#[test]
 fn pair_list_elements_handles_secrets_in_both_paths() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
@@ -1632,6 +1686,41 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
             "Secret state-hash pairing changed at list length {len}: {pairs:?}"
         );
     }
+}
+
+#[test]
+fn list_element_with_persisted_secret_hash_pairs_uniquely() {
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
+    let desired_secret = Value::Deferred(DeferredValue::Secret(Box::new(string("p"))));
+    let serialized = serde_json::to_string("p").expect("string serialization must succeed");
+    let state_hash = RedactedSecretHash::generate(serialized.as_bytes());
+    let persisted_secret = serde_json::from_value::<Value>(serde_json::json!({
+        "RedactedSecret": { "hash": state_hash }
+    }))
+    .expect("deserialize production persisted-secret shape");
+    let record = |credential| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "credential".to_string(),
+            credential,
+        )])))
+    };
+    let item_type = AttributeType::struct_(
+        "Credential",
+        vec![crate::schema::StructField::new(
+            "credential",
+            AttributeType::string(),
+        )],
+    );
+
+    assert_eq!(
+        pair_list_elements_with_uniqueness(
+            &[record(desired_secret)],
+            &[record(persisted_secret)],
+            Some(&item_type),
+            crate::schema::empty_defs_for_schema_walks(),
+        ),
+        vec![ListElementPairing::Unique(0)]
+    );
 }
 
 #[test]

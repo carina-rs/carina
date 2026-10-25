@@ -8,11 +8,56 @@
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
 use crate::diff_helpers::{list_element_type, map_entry_subtype};
-use crate::resource::{ConcreteValue, Resource, Value, pair_list_elements};
+use crate::resource::{
+    ConcreteValue, ListElementPairing, Resource, Value, pair_list_elements,
+    pair_list_elements_with_uniqueness,
+};
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// Authored field paths whose removals could not be assigned to a specific
+/// list element. Paths are relative to a list element and never contain a list
+/// index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct PendingPaths(BTreeSet<Vec<String>>);
+
+impl PendingPaths {
+    /// Construct a validated, non-empty set of non-empty field paths.
+    pub fn try_new(paths: impl IntoIterator<Item = Vec<String>>) -> Option<Self> {
+        let paths: BTreeSet<_> = paths.into_iter().collect();
+        (!paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| !path.is_empty() && path.iter().all(|segment| !segment.is_empty())))
+        .then_some(Self(paths))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[String]> {
+        self.0.iter().map(Vec::as_slice)
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        self.0.extend(other.0);
+        self
+    }
+}
+
+impl<'de> Deserialize<'de> for PendingPaths {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let paths = BTreeSet::<Vec<String>>::deserialize(deserializer)?;
+        Self::try_new(paths).ok_or_else(|| {
+            D::Error::custom(
+                "pending paths must contain at least one non-empty field path with non-empty segments",
+            )
+        })
+    }
+}
 
 /// Tree describing which fields the user explicitly wrote in their
 /// `.crn` for this resource. Each variant corresponds to a `Value`
@@ -28,6 +73,10 @@ use std::collections::{BTreeMap, HashMap};
 ///   union of authoring across all elements.
 /// - `ListElements`: one authoring tree per element, indexed by the
 ///   stored list in the same state row.
+/// - `WholeValue`: a carried list had a pending nested removal but its
+///   element identity could not be established. The differ must compare
+///   the entire list value instead of assigning authoring to a guessed
+///   element. Normal desired-backed builders never produce this variant.
 /// - `Unrecorded`: no authoring record for this position. See the
 ///   per-variant doc on `Unrecorded` and carina#3280 for the
 ///   motivation — splitting it off from `Struct { children: {} }`
@@ -49,6 +98,13 @@ pub enum ExplicitFields {
     /// provider reads; plan-time list pairing selects the stored index.
     ListElements {
         elements: Vec<ExplicitFields>,
+    },
+    /// A carried list must be compared as one authored value because pending
+    /// nested removals could not be transferred to uniquely paired elements.
+    /// The paths retain only authored removal evidence, never a guessed
+    /// element identity.
+    WholeValue {
+        pending: PendingPaths,
     },
     /// No authoring record for this position. Top-level callers
     /// (`project_attributes`) treat this as "pass attrs through, the
@@ -113,6 +169,647 @@ pub fn build_from_resource_for_stored_values(
                 )
             })
             .collect(),
+    }
+}
+
+/// Rebuild a carried row's authoring tree against fresh provider values while
+/// preserving nested removals that have not taken effect yet.
+///
+/// Struct children have stable key identity and are transferred recursively.
+/// Per-element list authoring is transferred only across mutually unique
+/// prior-to-fresh and desired-to-fresh pairings. If a possible pending nested
+/// removal crosses an ambiguous list identity, the list becomes
+/// [`ExplicitFields::WholeValue`]. That keeps the removal visible without assigning
+/// it to a guessed element.
+pub fn build_carried_from_resource_for_stored_values(
+    resource: &Resource,
+    prior_stored_attributes: &HashMap<String, Value>,
+    prior_explicit: &ExplicitFields,
+    fresh_stored_attributes: &HashMap<String, Value>,
+    schema: Option<&ResourceSchema>,
+) -> ExplicitFields {
+    let defs = schema
+        .map(|schema| &schema.defs)
+        .unwrap_or(empty_defs_for_schema_walks());
+    let rebuilt = build_from_resource_for_stored_values(resource, fresh_stored_attributes, schema);
+    let prior_children = match prior_explicit {
+        ExplicitFields::Struct { children } => children,
+        ExplicitFields::Leaf
+        | ExplicitFields::List { .. }
+        | ExplicitFields::ListElements { .. }
+        | ExplicitFields::WholeValue { .. }
+        | ExplicitFields::Unrecorded => return rebuilt,
+    };
+    carry_struct_fields(
+        prior_children,
+        rebuilt,
+        Some(CarryMap::Hash(prior_stored_attributes)),
+        CarryMap::Index(&resource.attributes),
+        CarryMap::Hash(fresh_stored_attributes),
+        CarryContext::resource(schema, defs),
+    )
+    .explicit
+}
+
+struct CarriedNode {
+    explicit: ExplicitFields,
+    pending_removal: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CarryMap<'a> {
+    Hash(&'a HashMap<String, Value>),
+    Index(&'a IndexMap<String, Value>),
+}
+
+impl<'a> CarryMap<'a> {
+    fn get(self, key: &str) -> Option<&'a Value> {
+        match self {
+            Self::Hash(fields) => fields.get(key),
+            Self::Index(fields) => fields.get(key),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CarryLocation<'a> {
+    Resource(Option<&'a ResourceSchema>),
+    Value(Option<&'a AttributeType>),
+}
+
+#[derive(Clone, Copy)]
+struct CarryContext<'a> {
+    location: CarryLocation<'a>,
+    defs: &'a BTreeMap<String, AttributeType>,
+}
+
+impl<'a> CarryContext<'a> {
+    fn resource(
+        schema: Option<&'a ResourceSchema>,
+        defs: &'a BTreeMap<String, AttributeType>,
+    ) -> Self {
+        Self {
+            location: CarryLocation::Resource(schema),
+            defs,
+        }
+    }
+
+    fn value(
+        attr_type: Option<&'a AttributeType>,
+        defs: &'a BTreeMap<String, AttributeType>,
+    ) -> Self {
+        Self {
+            location: CarryLocation::Value(attr_type),
+            defs,
+        }
+    }
+
+    fn child(self, key: &str) -> Self {
+        let attr_type = match self.location {
+            CarryLocation::Resource(schema) => schema
+                .and_then(|schema| schema.attributes.get(key))
+                .map(|attribute| &attribute.attr_type),
+            CarryLocation::Value(attr_type) => map_entry_subtype(attr_type, key, self.defs),
+        };
+        Self::value(attr_type, self.defs)
+    }
+
+    fn list_element(self) -> Self {
+        let attr_type = match self.location {
+            CarryLocation::Resource(_) => None,
+            CarryLocation::Value(attr_type) => list_element_type(attr_type, self.defs),
+        };
+        Self::value(attr_type, self.defs)
+    }
+
+    fn attr_type(self) -> Option<&'a AttributeType> {
+        match self.location {
+            CarryLocation::Resource(_) => None,
+            CarryLocation::Value(attr_type) => attr_type,
+        }
+    }
+}
+
+fn carry_node(
+    prior_explicit: &ExplicitFields,
+    rebuilt: ExplicitFields,
+    prior_stored: Option<&Value>,
+    desired: &Value,
+    fresh: &Value,
+    context: CarryContext<'_>,
+) -> CarriedNode {
+    match prior_explicit {
+        ExplicitFields::Leaf | ExplicitFields::Unrecorded => CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        },
+        ExplicitFields::List { element } => {
+            carry_legacy_list(element, rebuilt, desired, fresh, context)
+        }
+        ExplicitFields::WholeValue { pending } => {
+            carry_whole_value(rebuilt, pending, desired, fresh, context)
+        }
+        ExplicitFields::Struct { children } => {
+            carry_struct(children, rebuilt, prior_stored, desired, fresh, context)
+        }
+        ExplicitFields::ListElements { elements } => {
+            carry_list(elements, rebuilt, prior_stored, desired, fresh, context)
+        }
+    }
+}
+
+fn carry_legacy_list(
+    element: &ExplicitFields,
+    rebuilt: ExplicitFields,
+    desired: &Value,
+    fresh: &Value,
+    context: CarryContext<'_>,
+) -> CarriedNode {
+    let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
+    else {
+        return CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        };
+    };
+    let (mut pending_by_element, _) = pending_paths_by_element(
+        std::slice::from_ref(element),
+        desired_items,
+        fresh_items,
+        context.list_element(),
+    );
+    let pending = pending_by_element.pop().and_then(PendingPaths::try_new);
+    if let Some(pending) = pending {
+        CarriedNode {
+            explicit: ExplicitFields::WholeValue { pending },
+            pending_removal: true,
+        }
+    } else {
+        CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        }
+    }
+}
+
+fn carry_whole_value(
+    rebuilt: ExplicitFields,
+    pending: &PendingPaths,
+    desired: &Value,
+    fresh: &Value,
+    context: CarryContext<'_>,
+) -> CarriedNode {
+    let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
+    else {
+        return CarriedNode {
+            explicit: ExplicitFields::WholeValue {
+                pending: pending.clone(),
+            },
+            pending_removal: true,
+        };
+    };
+    // WholeValue no longer has per-element authoring records. Its payload can
+    // remain pending only while the live list contains more occurrences of a
+    // path than the desired list authors.
+    let live_path_counts = pending
+        .iter()
+        .map(|path| {
+            (
+                path.to_vec(),
+                fresh_items
+                    .iter()
+                    .filter(|item| field_path_is_present(item, path))
+                    .count(),
+            )
+        })
+        .collect();
+    let (still_pending, _) = pending_candidate_paths(
+        live_path_counts,
+        desired_items,
+        fresh_items,
+        context.list_element(),
+    );
+    let still_present = PendingPaths::try_new(still_pending);
+    if let Some(pending) = still_present {
+        CarriedNode {
+            explicit: ExplicitFields::WholeValue { pending },
+            pending_removal: true,
+        }
+    } else {
+        CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        }
+    }
+}
+
+fn carry_struct(
+    prior_children: &HashMap<String, ExplicitFields>,
+    rebuilt: ExplicitFields,
+    prior_stored: Option<&Value>,
+    desired: &Value,
+    fresh: &Value,
+    context: CarryContext<'_>,
+) -> CarriedNode {
+    let (Some(desired_fields), Some(fresh_fields)) = (concrete_map(desired), concrete_map(fresh))
+    else {
+        return CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        };
+    };
+    carry_struct_fields(
+        prior_children,
+        rebuilt,
+        prior_stored.and_then(concrete_map).map(CarryMap::Index),
+        CarryMap::Index(desired_fields),
+        CarryMap::Index(fresh_fields),
+        context,
+    )
+}
+
+fn carry_struct_fields(
+    prior_children: &HashMap<String, ExplicitFields>,
+    rebuilt: ExplicitFields,
+    prior_fields: Option<CarryMap<'_>>,
+    desired_fields: CarryMap<'_>,
+    fresh_fields: CarryMap<'_>,
+    context: CarryContext<'_>,
+) -> CarriedNode {
+    let mut rebuilt_children = match rebuilt {
+        ExplicitFields::Struct { children } => children,
+        other @ (ExplicitFields::Leaf
+        | ExplicitFields::List { .. }
+        | ExplicitFields::ListElements { .. }
+        | ExplicitFields::WholeValue { .. }
+        | ExplicitFields::Unrecorded) => {
+            return CarriedNode {
+                explicit: other,
+                pending_removal: false,
+            };
+        }
+    };
+    let mut pending_removal = false;
+
+    for (key, prior_child) in prior_children {
+        match (desired_fields.get(key), fresh_fields.get(key)) {
+            (Some(desired_child), Some(fresh_child)) => {
+                let Some(rebuilt_child) = rebuilt_children.remove(key) else {
+                    continue;
+                };
+                let carried = carry_node(
+                    prior_child,
+                    rebuilt_child,
+                    prior_fields.and_then(|fields| fields.get(key)),
+                    desired_child,
+                    fresh_child,
+                    context.child(key),
+                );
+                pending_removal |= carried.pending_removal;
+                rebuilt_children.insert(key.clone(), carried.explicit);
+            }
+            (None, Some(_)) => {
+                pending_removal = true;
+                rebuilt_children.insert(key.clone(), demote_list_elements_to_union(prior_child));
+            }
+            (Some(_), None) | (None, None) => {}
+        }
+    }
+
+    CarriedNode {
+        explicit: ExplicitFields::Struct {
+            children: rebuilt_children,
+        },
+        pending_removal,
+    }
+}
+
+fn carry_list(
+    prior_elements: &[ExplicitFields],
+    rebuilt: ExplicitFields,
+    prior_stored: Option<&Value>,
+    desired: &Value,
+    fresh: &Value,
+    context: CarryContext<'_>,
+) -> CarriedNode {
+    let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
+    else {
+        return CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        };
+    };
+    // Compute candidate paths and desired/fresh identity evidence once. If
+    // no path remains pending, the rebuilt record is authoritative and no
+    // prior-list pairing is necessary.
+    let item_context = context.list_element();
+    let (candidate_paths, desired_by_fresh) =
+        pending_paths_by_element(prior_elements, desired_items, fresh_items, item_context);
+    if candidate_paths.iter().all(BTreeSet::is_empty) {
+        return CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        };
+    }
+
+    let item_type = item_context.attr_type();
+    let Some(prior_items) = prior_stored.and_then(concrete_list) else {
+        return carried_list_without_alignment(&candidate_paths, rebuilt);
+    };
+    if prior_elements.len() != prior_items.len() {
+        return carried_list_without_alignment(&candidate_paths, rebuilt);
+    }
+
+    let prior_to_desired =
+        pair_list_elements_with_uniqueness(prior_items, desired_items, item_type, context.defs);
+    let prior_to_fresh = mutually_unique_pairs(prior_items, fresh_items, item_type, context.defs);
+    // The normal builder deliberately retains only the stable stored-index
+    // authoring vector (including deterministic choices for duplicates). It
+    // does not retain the desired index or uniqueness evidence, so transfer
+    // must ask the shared pairing engine for that evidence here rather than
+    // reverse-engineering identity from equal-looking authoring subtrees.
+    let mut rebuilt_elements = match rebuilt {
+        ExplicitFields::ListElements { elements } => elements,
+        other @ (ExplicitFields::Leaf
+        | ExplicitFields::Struct { .. }
+        | ExplicitFields::List { .. }
+        | ExplicitFields::WholeValue { .. }
+        | ExplicitFields::Unrecorded) => {
+            return CarriedNode {
+                explicit: other,
+                pending_removal: false,
+            };
+        }
+    };
+    let mut pending_removal = false;
+    let mut unresolved_pending = BTreeSet::new();
+
+    for (prior_index, prior_element) in prior_elements.iter().enumerate() {
+        let uniquely_aligned = prior_to_fresh[prior_index].and_then(|fresh_index| {
+            desired_by_fresh[fresh_index].map(|desired_index| (desired_index, fresh_index))
+        });
+        if let Some((desired_index, fresh_index)) = uniquely_aligned {
+            let carried = carry_node(
+                prior_element,
+                rebuilt_elements[fresh_index].clone(),
+                Some(&prior_items[prior_index]),
+                &desired_items[desired_index],
+                &fresh_items[fresh_index],
+                item_context,
+            );
+            if carried.pending_removal {
+                pending_removal = true;
+                rebuilt_elements[fresh_index] = carried.explicit;
+            }
+        } else if matches!(
+            prior_to_desired.get(prior_index),
+            Some(ListElementPairing::Unique(_) | ListElementPairing::Ambiguous)
+        ) {
+            unresolved_pending.extend(candidate_paths[prior_index].iter().cloned());
+        }
+    }
+
+    if let Some(pending) = PendingPaths::try_new(unresolved_pending) {
+        return CarriedNode {
+            explicit: ExplicitFields::WholeValue { pending },
+            pending_removal: true,
+        };
+    }
+
+    CarriedNode {
+        explicit: ExplicitFields::ListElements {
+            elements: rebuilt_elements,
+        },
+        pending_removal,
+    }
+}
+
+fn carried_list_without_alignment(
+    candidate_paths: &[BTreeSet<Vec<String>>],
+    rebuilt: ExplicitFields,
+) -> CarriedNode {
+    let pending = candidate_paths
+        .iter()
+        .flat_map(|paths| paths.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if let Some(pending) = PendingPaths::try_new(pending) {
+        CarriedNode {
+            explicit: ExplicitFields::WholeValue { pending },
+            pending_removal: true,
+        }
+    } else {
+        CarriedNode {
+            explicit: rebuilt,
+            pending_removal: false,
+        }
+    }
+}
+
+fn mutually_unique_pairs(
+    left: &[Value],
+    right: &[Value],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Vec<Option<usize>> {
+    let forward = pair_list_elements_with_uniqueness(left, right, attr_type, defs);
+    let reverse = pair_list_elements_with_uniqueness(right, left, attr_type, defs);
+    forward
+        .into_iter()
+        .enumerate()
+        .map(|(left_index, pairing)| match pairing {
+            ListElementPairing::Unique(right_index) => match reverse.get(right_index) {
+                Some(ListElementPairing::Unique(reverse_index)) if *reverse_index == left_index => {
+                    Some(right_index)
+                }
+                Some(ListElementPairing::Unique(_))
+                | Some(ListElementPairing::Ambiguous)
+                | Some(ListElementPairing::Unmatched)
+                | None => None,
+            },
+            ListElementPairing::Ambiguous | ListElementPairing::Unmatched => None,
+        })
+        .collect()
+}
+
+fn pending_paths_by_element(
+    elements: &[ExplicitFields],
+    desired_items: &[Value],
+    fresh_items: &[Value],
+    item_context: CarryContext<'_>,
+) -> (Vec<BTreeSet<Vec<String>>>, Vec<Option<usize>>) {
+    let authored_by_element: Vec<_> = elements
+        .iter()
+        .map(|element| {
+            let mut paths = BTreeSet::new();
+            collect_authored_paths(element, &mut Vec::new(), &mut paths);
+            paths
+        })
+        .collect();
+    let mut authored_counts = BTreeMap::new();
+    for path in authored_by_element.iter().flatten() {
+        *authored_counts.entry(path.clone()).or_insert(0) += 1;
+    }
+    let (candidates, desired_by_fresh) =
+        pending_candidate_paths(authored_counts, desired_items, fresh_items, item_context);
+
+    (
+        authored_by_element
+            .into_iter()
+            .map(|paths| paths.intersection(&candidates).cloned().collect())
+            .collect(),
+        desired_by_fresh,
+    )
+}
+
+fn pending_candidate_paths(
+    prior_authored_counts: BTreeMap<Vec<String>, usize>,
+    desired_items: &[Value],
+    fresh_items: &[Value],
+    item_context: CarryContext<'_>,
+) -> (BTreeSet<Vec<String>>, Vec<Option<usize>>) {
+    let broad_candidates: BTreeSet<_> = prior_authored_counts
+        .into_iter()
+        .filter_map(|(path, prior_authored_count)| {
+            let desired_authored_count = desired_items
+                .iter()
+                .filter(|item| field_path_is_present(item, &path))
+                .count();
+            let some_fresh_item_has_path = fresh_items
+                .iter()
+                .any(|item| field_path_is_present(item, &path));
+            (prior_authored_count > desired_authored_count && some_fresh_item_has_path)
+                .then_some(path)
+        })
+        .collect();
+
+    if broad_candidates.is_empty() {
+        return (BTreeSet::new(), Vec::new());
+    }
+
+    let desired_by_fresh = mutually_unique_pairs(
+        fresh_items,
+        desired_items,
+        item_context.attr_type(),
+        item_context.defs,
+    );
+    let pending = broad_candidates
+        .into_iter()
+        .filter(|path| {
+            fresh_items
+                .iter()
+                .enumerate()
+                .filter(|(_, fresh_item)| field_path_is_present(fresh_item, path))
+                .any(|(fresh_index, _)| {
+                    desired_by_fresh[fresh_index].is_none_or(|desired_index| {
+                        !field_path_is_present(&desired_items[desired_index], path)
+                    })
+                })
+        })
+        .collect::<BTreeSet<_>>();
+
+    // With count evidence for an authored removal, identity uncertainty
+    // resolves toward a visible retry. Indistinguishable duplicate identities
+    // and reorder plus mutation can still require WholeValue because guessing
+    // an element could silently drop a removal. A zero-similarity replacement
+    // is Unmatched instead: its whole-element change is already visible to the
+    // normal list diff as a removal/addition.
+    //
+    // Known boundary: removing P from one ambiguous element while adding P to
+    // another in the same failed update leaves the authored counts equal, so
+    // this deliberately does not infer a pending removal.
+    (pending, desired_by_fresh)
+}
+
+fn collect_authored_paths(
+    explicit: &ExplicitFields,
+    prefix: &mut Vec<String>,
+    paths: &mut BTreeSet<Vec<String>>,
+) {
+    match explicit {
+        ExplicitFields::Leaf => {
+            if !prefix.is_empty() {
+                paths.insert(prefix.clone());
+            }
+        }
+        ExplicitFields::Struct { children } => {
+            let before = paths.len();
+            for (key, child) in children {
+                if matches!(child, ExplicitFields::Unrecorded) {
+                    continue;
+                }
+                prefix.push(key.clone());
+                collect_authored_paths(child, prefix, paths);
+                prefix.pop();
+            }
+            if paths.len() == before && children.is_empty() && !prefix.is_empty() {
+                paths.insert(prefix.clone());
+            }
+        }
+        ExplicitFields::List { element } => {
+            let before = paths.len();
+            collect_authored_paths(element, prefix, paths);
+            if paths.len() == before && !prefix.is_empty() {
+                paths.insert(prefix.clone());
+            }
+        }
+        ExplicitFields::ListElements { elements } => {
+            let before = paths.len();
+            for element in elements {
+                collect_authored_paths(element, prefix, paths);
+            }
+            if paths.len() == before && !prefix.is_empty() {
+                paths.insert(prefix.clone());
+            }
+        }
+        ExplicitFields::WholeValue { pending } => {
+            for path in pending.iter() {
+                let mut full_path = prefix.clone();
+                full_path.extend_from_slice(path);
+                paths.insert(full_path);
+            }
+        }
+        ExplicitFields::Unrecorded => {}
+    }
+}
+
+fn field_path_is_present(value: &Value, path: &[String]) -> bool {
+    let Some((head, tail)) = path.split_first() else {
+        return true;
+    };
+    match value {
+        Value::Concrete(ConcreteValue::Map(fields)) => fields
+            .get(head)
+            .is_some_and(|child| field_path_is_present(child, tail)),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            items.iter().any(|item| field_path_is_present(item, path))
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(_) => false,
+    }
+}
+
+fn concrete_map(value: &Value) -> Option<&IndexMap<String, Value>> {
+    if let Value::Concrete(ConcreteValue::Map(fields)) = value {
+        Some(fields)
+    } else {
+        None
+    }
+}
+
+fn concrete_list(value: &Value) -> Option<&[Value]> {
+    if let Value::Concrete(ConcreteValue::List(items)) = value {
+        Some(items)
+    } else {
+        None
     }
 }
 
@@ -226,6 +923,9 @@ fn union_elements(elements: impl IntoIterator<Item = ExplicitFields>) -> Explici
 pub fn demote_list_elements_to_union(explicit: &ExplicitFields) -> ExplicitFields {
     match explicit {
         ExplicitFields::Leaf => ExplicitFields::Leaf,
+        ExplicitFields::WholeValue { pending } => ExplicitFields::WholeValue {
+            pending: pending.clone(),
+        },
         ExplicitFields::Unrecorded => ExplicitFields::Unrecorded,
         ExplicitFields::Struct { children } => ExplicitFields::Struct {
             children: children
@@ -253,6 +953,17 @@ pub fn demote_list_elements_to_union(explicit: &ExplicitFields) -> ExplicitField
 pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
     use ExplicitFields::*;
     match (a, b) {
+        (WholeValue { pending: a }, WholeValue { pending: b }) => WholeValue {
+            pending: a.union(b),
+        },
+        (
+            whole @ WholeValue { .. },
+            Leaf | Unrecorded | Struct { .. } | List { .. } | ListElements { .. },
+        )
+        | (
+            Leaf | Unrecorded | Struct { .. } | List { .. } | ListElements { .. },
+            whole @ WholeValue { .. },
+        ) => whole,
         (ListElements { elements: a }, ListElements { elements: b }) => List {
             element: Box::new(merge(union_elements(a), union_elements(b))),
         },
@@ -264,15 +975,12 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
         | (Leaf | Unrecorded | Struct { .. }, ListElements { elements }) => List {
             element: Box::new(union_elements(elements)),
         },
-        (Leaf, b) => b,
-        (a, Leaf) => a,
-        // `Unrecorded` carries no shape information, so merging it with
-        // anything yields the other side. Builders from concrete values never
-        // produce `Unrecorded`; it originates from legacy/default state rows
-        // and remains explicit here so a future caller cannot hit the silent
-        // catch-all `(a, _) => a` fallback below.
-        (Unrecorded, b) => b,
-        (a, Unrecorded) => a,
+        (Leaf, Leaf) => Leaf,
+        (Leaf, Unrecorded) | (Unrecorded, Leaf) | (Unrecorded, Unrecorded) => Unrecorded,
+        (Leaf | Unrecorded, Struct { children }) => Struct { children },
+        (Struct { children }, Leaf | Unrecorded) => Struct { children },
+        (Leaf | Unrecorded, List { element }) => List { element },
+        (List { element }, Leaf | Unrecorded) => List { element },
         (
             Struct {
                 children: mut a_children,
@@ -297,7 +1005,8 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
         },
         // Mismatched shapes shouldn't occur for well-typed inputs;
         // prefer the structural variant on the left.
-        (a, _) => a,
+        (Struct { children }, List { .. }) => Struct { children },
+        (List { element }, Struct { .. }) => List { element },
     }
 }
 
@@ -315,6 +1024,9 @@ pub fn project(value: Value, explicit: &ExplicitFields) -> Value {
     match explicit {
         // user wrote whole leaf: keep entire current value
         ExplicitFields::Leaf => value,
+        // An ambiguous carried list is deliberately projected intact; its
+        // whole-value merge rule, not projection, keeps the removal visible.
+        ExplicitFields::WholeValue { .. } => value,
         // no authoring record at this position: same effect as `Leaf`
         // — keep the entire current value (carina#3280).
         ExplicitFields::Unrecorded => value,
@@ -384,7 +1096,8 @@ pub fn project_attributes(
         // resource's full attribute set; pass through conservatively.
         ExplicitFields::Leaf
         | ExplicitFields::List { .. }
-        | ExplicitFields::ListElements { .. } => attrs,
+        | ExplicitFields::ListElements { .. }
+        | ExplicitFields::WholeValue { .. } => attrs,
     }
 }
 
@@ -430,6 +1143,65 @@ mod tests {
         for key in expected {
             assert!(children.contains_key(*key), "missing authored key {key}");
         }
+    }
+
+    fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
+        ExplicitFields::WholeValue {
+            pending: PendingPaths::try_new(
+                paths
+                    .iter()
+                    .map(|path| path.iter().map(|segment| (*segment).to_string()).collect()),
+            )
+            .expect("test pending paths are non-empty and valid"),
+        }
+    }
+
+    fn carried_items_explicit(
+        desired_items: Vec<Value>,
+        prior_items: Vec<Value>,
+        prior_explicit: &ExplicitFields,
+        fresh_items: Vec<Value>,
+    ) -> ExplicitFields {
+        carried_items_explicit_with_schema(
+            desired_items,
+            prior_items,
+            prior_explicit,
+            fresh_items,
+            None,
+        )
+    }
+
+    fn carried_items_explicit_with_schema(
+        desired_items: Vec<Value>,
+        prior_items: Vec<Value>,
+        prior_explicit: &ExplicitFields,
+        fresh_items: Vec<Value>,
+        schema: Option<&ResourceSchema>,
+    ) -> ExplicitFields {
+        let resource = Resource::new("example.Listener", "listener")
+            .with_attribute("items", Value::Concrete(ConcreteValue::List(desired_items)));
+        let prior_stored = HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(prior_items)),
+        )]);
+        let fresh_stored = HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(fresh_items)),
+        )]);
+        build_carried_from_resource_for_stored_values(
+            &resource,
+            &prior_stored,
+            prior_explicit,
+            &fresh_stored,
+            schema,
+        )
+    }
+
+    fn root_items_child(explicit: &ExplicitFields) -> &ExplicitFields {
+        let ExplicitFields::Struct { children } = explicit else {
+            panic!("expected resource-root Struct, got {explicit:?}");
+        };
+        &children["items"]
     }
 
     #[test]
@@ -480,6 +1252,329 @@ mod tests {
         );
         let back: ExplicitFields = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    #[test]
+    fn carried_legacy_list_union_falls_back_for_a_pending_removal() {
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".to_string(),
+                ExplicitFields::List {
+                    element: Box::new(ExplicitFields::Struct {
+                        children: HashMap::from([
+                            ("port".to_string(), ExplicitFields::Leaf),
+                            ("description".to_string(), ExplicitFields::Leaf),
+                        ]),
+                    }),
+                },
+            )]),
+        };
+        let carried = carried_items_explicit(
+            vec![rule(80, None), rule(443, None)],
+            vec![rule(80, Some("web")), rule(443, None)],
+            &prior_explicit,
+            vec![rule(80, Some("web")), rule(443, None)],
+        );
+
+        assert_eq!(
+            root_items_child(&carried),
+            &whole_value(&[&["description"]])
+        );
+    }
+
+    #[test]
+    fn carried_legacy_list_union_mixed_list_without_removal_uses_the_rebuilt_record() {
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".to_string(),
+                ExplicitFields::List {
+                    element: Box::new(ExplicitFields::Struct {
+                        children: HashMap::from([
+                            ("port".to_string(), ExplicitFields::Leaf),
+                            ("description".to_string(), ExplicitFields::Leaf),
+                        ]),
+                    }),
+                },
+            )]),
+        };
+        let carried = carried_items_explicit(
+            vec![rule(80, Some("web")), rule(443, None)],
+            vec![rule(80, Some("web")), rule(443, None)],
+            &prior_explicit,
+            vec![rule(80, Some("web")), rule(443, None)],
+        );
+
+        assert!(matches!(
+            root_items_child(&carried),
+            ExplicitFields::ListElements { .. }
+        ));
+    }
+
+    #[test]
+    fn carried_list_without_prior_stored_mixed_list_without_removal_uses_rebuilt_record() {
+        let desired_items = vec![rule(80, Some("web")), rule(443, None)];
+        let resource = Resource::new("example.Listener", "listener").with_attribute(
+            "items",
+            Value::Concrete(ConcreteValue::List(desired_items.clone())),
+        );
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".to_string(),
+                ExplicitFields::ListElements {
+                    elements: vec![
+                        ExplicitFields::Struct {
+                            children: HashMap::from([
+                                ("port".to_string(), ExplicitFields::Leaf),
+                                ("description".to_string(), ExplicitFields::Leaf),
+                            ]),
+                        },
+                        ExplicitFields::Struct {
+                            children: HashMap::from([("port".to_string(), ExplicitFields::Leaf)]),
+                        },
+                    ],
+                },
+            )]),
+        };
+        let fresh_stored = HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(desired_items)),
+        )]);
+
+        let carried = build_carried_from_resource_for_stored_values(
+            &resource,
+            &HashMap::new(),
+            &prior_explicit,
+            &fresh_stored,
+            None,
+        );
+
+        assert!(matches!(
+            root_items_child(&carried),
+            ExplicitFields::ListElements { .. }
+        ));
+    }
+
+    #[test]
+    fn carried_list_length_mismatch_mixed_list_without_removal_uses_rebuilt_record() {
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".to_string(),
+                ExplicitFields::ListElements {
+                    elements: vec![
+                        ExplicitFields::Struct {
+                            children: HashMap::from([
+                                ("port".to_string(), ExplicitFields::Leaf),
+                                ("description".to_string(), ExplicitFields::Leaf),
+                            ]),
+                        },
+                        ExplicitFields::Struct {
+                            children: HashMap::from([("port".to_string(), ExplicitFields::Leaf)]),
+                        },
+                    ],
+                },
+            )]),
+        };
+        let carried = carried_items_explicit(
+            vec![rule(80, Some("web")), rule(443, None)],
+            vec![rule(999, None)],
+            &prior_explicit,
+            vec![rule(80, Some("web")), rule(443, None)],
+        );
+
+        assert!(matches!(
+            root_items_child(&carried),
+            ExplicitFields::ListElements { .. }
+        ));
+    }
+
+    #[test]
+    fn carried_list_length_mismatch_keeps_every_pending_candidate() {
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".to_string(),
+                ExplicitFields::ListElements {
+                    elements: vec![ExplicitFields::Struct {
+                        children: HashMap::from([
+                            ("port".to_string(), ExplicitFields::Leaf),
+                            ("description".to_string(), ExplicitFields::Leaf),
+                        ]),
+                    }],
+                },
+            )]),
+        };
+        let carried = carried_items_explicit(
+            vec![rule(80, None)],
+            vec![rule(999, None), rule(80, Some("web"))],
+            &prior_explicit,
+            vec![rule(80, Some("web"))],
+        );
+
+        assert_eq!(
+            root_items_child(&carried),
+            &whole_value(&[&["description"]])
+        );
+    }
+
+    #[test]
+    fn carried_ambiguous_elements_track_path_missing_from_any_desired_peer() {
+        let with_provider_default = |mut value: Value| {
+            let Value::Concrete(ConcreteValue::Map(fields)) = &mut value else {
+                unreachable!("test rule is a map");
+            };
+            fields.insert(
+                "provider_default".to_string(),
+                Value::Concrete(ConcreteValue::String("filled".into())),
+            );
+            value
+        };
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".to_string(),
+                ExplicitFields::ListElements {
+                    elements: vec![
+                        ExplicitFields::Struct {
+                            children: HashMap::from([
+                                ("port".to_string(), ExplicitFields::Leaf),
+                                ("description".to_string(), ExplicitFields::Leaf),
+                            ]),
+                        },
+                        ExplicitFields::Struct {
+                            children: HashMap::from([
+                                ("port".to_string(), ExplicitFields::Leaf),
+                                ("description".to_string(), ExplicitFields::Leaf),
+                            ]),
+                        },
+                    ],
+                },
+            )]),
+        };
+        let carried = carried_items_explicit(
+            vec![rule(80, None), rule(80, Some("b"))],
+            vec![
+                with_provider_default(rule(80, Some("a"))),
+                with_provider_default(rule(80, Some("b"))),
+            ],
+            &prior_explicit,
+            vec![
+                with_provider_default(rule(80, Some("a"))),
+                with_provider_default(rule(80, Some("b"))),
+            ],
+        );
+
+        assert_eq!(
+            serde_json::to_value(root_items_child(&carried)).unwrap(),
+            serde_json::json!({
+                "kind": "whole-value",
+                "pending": [["description"]]
+            })
+        );
+    }
+
+    #[test]
+    fn whole_value_has_a_dedicated_serde_kind() {
+        let json = r#"{"kind":"whole-value","pending":[["description"],["nested","tag"]]}"#;
+        let parsed: Result<ExplicitFields, _> = serde_json::from_str(json);
+        let parsed = parsed.expect("whole-value kind must deserialize");
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn whole_value_rejects_empty_pending_paths() {
+        let parsed: Result<ExplicitFields, _> =
+            serde_json::from_str(r#"{"kind":"whole-value","pending":[]}"#);
+        assert!(parsed.is_err(), "an empty pending-path set is invalid");
+    }
+
+    #[test]
+    fn merging_whole_values_unions_pending_paths() {
+        let merged = merge(
+            whole_value(&[&["description"]]),
+            whole_value(&[&["nested", "tag"]]),
+        );
+        assert_eq!(
+            serde_json::to_value(merged).unwrap(),
+            serde_json::json!({
+                "kind": "whole-value",
+                "pending": [["description"], ["nested", "tag"]]
+            })
+        );
+    }
+
+    #[test]
+    fn carried_whole_value_fallback_survives_refresh_until_values_converge() {
+        use crate::schema::{AttributeSchema, StructField};
+
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([("items".to_string(), whole_value(&[&["description"]]))]),
+        };
+        let schema = ResourceSchema::new("example.Listener").attribute(AttributeSchema::new(
+            "items",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![
+                    StructField::new("port", AttributeType::int()),
+                    StructField::new("description", AttributeType::string()),
+                    StructField::new("provider_status", AttributeType::string()).read_only(),
+                ],
+            )),
+        ));
+        let desired = vec![rule(80, None), rule(80, None)];
+        let with_provider_status = |mut value: Value| {
+            let Value::Concrete(ConcreteValue::Map(fields)) = &mut value else {
+                unreachable!("test rule is a map");
+            };
+            fields.insert(
+                "provider_status".to_string(),
+                Value::Concrete(ConcreteValue::String("ready".into())),
+            );
+            value
+        };
+        let still_live = vec![
+            with_provider_status(rule(80, Some("web"))),
+            with_provider_status(rule(80, None)),
+        ];
+        let carried = carried_items_explicit_with_schema(
+            desired.clone(),
+            still_live.clone(),
+            &prior_explicit,
+            still_live.clone(),
+            Some(&schema),
+        );
+        assert_eq!(
+            root_items_child(&carried),
+            &whole_value(&[&["description"]])
+        );
+
+        let out_of_band = vec![
+            with_provider_status(rule(80, None)),
+            with_provider_status(rule(80, None)),
+        ];
+        let converged = carried_items_explicit_with_schema(
+            desired,
+            still_live,
+            &carried,
+            out_of_band,
+            Some(&schema),
+        );
+        assert!(matches!(
+            root_items_child(&converged),
+            ExplicitFields::ListElements { .. }
+        ));
+    }
+
+    #[test]
+    fn carried_whole_value_clears_when_readded_path_has_unique_pairing() {
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([("items".to_string(), whole_value(&[&["description"]]))]),
+        };
+        let desired = vec![rule(80, Some("web")), rule(443, None)];
+        let carried =
+            carried_items_explicit(desired.clone(), desired.clone(), &prior_explicit, desired);
+
+        assert!(matches!(
+            root_items_child(&carried),
+            ExplicitFields::ListElements { .. }
+        ));
     }
 
     #[test]
@@ -1015,7 +2110,9 @@ mod tests {
                     children.values().any(contains_list_elements)
                 }
                 ExplicitFields::List { element } => contains_list_elements(element),
-                ExplicitFields::Leaf | ExplicitFields::Unrecorded => false,
+                ExplicitFields::Leaf
+                | ExplicitFields::WholeValue { .. }
+                | ExplicitFields::Unrecorded => false,
             }
         }
         assert!(!contains_list_elements(element.as_ref()));

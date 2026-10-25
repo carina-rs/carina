@@ -3,7 +3,7 @@ use super::{create_plan_for_tests as create_plan, *};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashSet};
 
-use crate::explicit::ExplicitFields;
+use crate::explicit::{ExplicitFields, PendingPaths};
 use crate::plan::{
     PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
@@ -1360,6 +1360,97 @@ fn list_elements_authored_field_removal_produces_update_for_paired_element() {
         panic!("Expected the paired authored-field removal to produce an Update");
     };
     assert_eq!(changed_attributes, vec!["rules".to_string()]);
+}
+
+#[test]
+fn legacy_migrated_leaf_list_authoring_preserves_provider_nested_fields() {
+    let resource_id = ResourceId::with_identity("example.Listener", "listener");
+    let rule = |description: Option<&str>| {
+        let mut fields =
+            IndexMap::from([("port".to_string(), Value::Concrete(ConcreteValue::Int(80)))]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.to_string().into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let desired_rules = Value::Concrete(ConcreteValue::List(vec![rule(None), rule(None)]));
+    let current_rules = Value::Concrete(ConcreteValue::List(vec![rule(Some("web")), rule(None)]));
+    let desired = Resource::new("example.Listener", "listener")
+        .with_attribute("rules", desired_rules.clone());
+    let current_attrs = HashMap::from([("rules".to_string(), current_rules)]);
+    let current = existing_state(resource_id, current_attrs.clone());
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([("rules".to_string(), ExplicitFields::Leaf)]),
+    };
+
+    let result = diff_test(
+        &desired,
+        &current,
+        Some(&current_attrs),
+        Some(&prev_explicit),
+        None,
+    );
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "legacy Leaf list authoring must retain provider-populated element fields, got {result:?}"
+    );
+}
+
+#[test]
+fn whole_value_list_authoring_compares_and_sends_the_full_desired_list() {
+    let resource_id = ResourceId::with_identity("example.Listener", "listener");
+    let rule = |description: Option<&str>| {
+        let mut fields =
+            IndexMap::from([("port".to_string(), Value::Concrete(ConcreteValue::Int(80)))]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.to_string().into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let desired_rules = Value::Concrete(ConcreteValue::List(vec![rule(None), rule(None)]));
+    let current_rules = Value::Concrete(ConcreteValue::List(vec![rule(Some("web")), rule(None)]));
+    let desired = Resource::new("example.Listener", "listener")
+        .with_attribute("rules", desired_rules.clone());
+    let current_attrs = HashMap::from([("rules".to_string(), current_rules)]);
+    let current = existing_state(resource_id, current_attrs.clone());
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".to_string(),
+            ExplicitFields::WholeValue {
+                pending: PendingPaths::try_new([vec!["description".to_string()]]).unwrap(),
+            },
+        )]),
+    };
+
+    let result = diff_test(
+        &desired,
+        &current,
+        Some(&current_attrs),
+        Some(&prev_explicit),
+        None,
+    );
+    let Diff::Update {
+        from,
+        to,
+        changed_attributes,
+        ..
+    } = result
+    else {
+        panic!("WholeValue list authoring must compare the full list value");
+    };
+    assert_eq!(changed_attributes, vec!["rules".to_string()]);
+
+    let patch =
+        crate::provider::build_update_patch(&changed_attributes, &provider_ready(to), &from);
+    assert_eq!(patch.ops.len(), 1);
+    assert_eq!(patch.ops[0].kind, crate::provider::PatchOpKind::Replace);
+    assert_eq!(patch.ops[0].value.as_ref(), Some(&desired_rules));
 }
 
 #[test]

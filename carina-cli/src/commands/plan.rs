@@ -754,6 +754,7 @@ mod historical_display_tests {
             &plan,
             &carina_core::schema::SchemaRegistry::new(),
             &historical,
+            None,
         );
         let rendered = format!("{:?}", app.nodes[0].detail_rows);
 
@@ -2015,8 +2016,13 @@ pub async fn run_plan(
             crate::commands::iam_preflight::emit_warnings(result);
         }
     } else if tui {
-        carina_tui::run(&ctx.plan, wiring.schemas(), &historical_display)
-            .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        carina_tui::run(
+            &ctx.plan,
+            wiring.schemas(),
+            &historical_display,
+            Some(&ctx.prev_explicit),
+        )
+        .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
         }
