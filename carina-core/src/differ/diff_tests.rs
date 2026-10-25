@@ -117,6 +117,182 @@ fn diff_reports_string_list_vs_generic_string_list_shape_mismatch() {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PolicyValueListOrdering {
+    Ordered,
+    Unordered,
+}
+
+enum SavedPolicyAttrs {
+    Include,
+    Omit,
+}
+
+fn plan_for_reordered_iam_policy_value_lists(
+    ordering: PolicyValueListOrdering,
+    saved_policy_attrs: SavedPolicyAttrs,
+) -> Plan {
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::value::canonicalize_resources_with_schemas;
+
+    let string_or_list = || {
+        let list = match ordering {
+            PolicyValueListOrdering::Ordered => AttributeType::list(AttributeType::string()),
+            PolicyValueListOrdering::Unordered => {
+                AttributeType::unordered_list(AttributeType::string())
+            }
+        };
+        AttributeType::union(vec![AttributeType::string(), list])
+    };
+    let principal =
+        AttributeType::struct_("Principal", vec![StructField::new("aws", string_or_list())]);
+    let statement = AttributeType::struct_(
+        "Statement",
+        vec![
+            StructField::new("action", string_or_list()),
+            StructField::new("principal", principal),
+        ],
+    );
+    let policy_document = AttributeType::struct_(
+        "PolicyDocument",
+        vec![StructField::new(
+            "statement",
+            AttributeType::list(statement),
+        )],
+    );
+    let schema = ResourceSchema::new("iam.Policy")
+        .attribute(AttributeSchema::new("policy_document", policy_document));
+    let mut registry = SchemaRegistry::new();
+    registry.insert("aws", schema);
+
+    let string_list = |items: &[&str]| {
+        Value::Concrete(ConcreteValue::List(
+            items
+                .iter()
+                .map(|item| Value::Concrete(ConcreteValue::String((*item).into())))
+                .collect(),
+        ))
+    };
+    let policy = |actions: &[&str], principals: &[&str]| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "statement".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([
+                    ("action".to_string(), string_list(actions)),
+                    (
+                        "principal".to_string(),
+                        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                            "aws".to_string(),
+                            string_list(principals),
+                        )]))),
+                    ),
+                ])),
+            )])),
+        )])))
+    };
+
+    let desired_policy = policy(
+        &["s3:GetObject", "s3:ListBucket"],
+        &[
+            "arn:aws:iam::111122223333:root",
+            "arn:aws:iam::444455556666:root",
+        ],
+    );
+    let mut resources = vec![
+        Resource::with_provider("aws", "iam.Policy", "policy", None)
+            .with_attribute("policy_document", desired_policy.clone()),
+    ];
+    canonicalize_resources_with_schemas(&mut resources, &registry).unwrap();
+
+    let current_policy = policy(
+        &["s3:ListBucket", "s3:GetObject"],
+        &[
+            "arn:aws:iam::444455556666:root",
+            "arn:aws:iam::111122223333:root",
+        ],
+    );
+    let id = resources[0].id.clone();
+    let saved_attrs = match saved_policy_attrs {
+        SavedPolicyAttrs::Include => {
+            crate::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+                id.clone(),
+                HashMap::from([("policy_document".to_string(), desired_policy)]),
+            )]))
+            .lift(&registry)
+        }
+        SavedPolicyAttrs::Omit => empty_lifted_saved_attrs(),
+    };
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id,
+            HashMap::from([("policy_document".to_string(), current_policy)]),
+        ),
+    )]);
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &registry,
+        &resources,
+    );
+
+    create_plan(
+        &resources,
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &registry,
+        &saved_attrs,
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn plan_ignores_reordered_unordered_iam_policy_value_lists() {
+    let plan = plan_for_reordered_iam_policy_value_lists(
+        PolicyValueListOrdering::Unordered,
+        SavedPolicyAttrs::Omit,
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "reordering unordered IAM action and principal lists must not produce an Update; got {:?}",
+        plan.effects()
+    );
+}
+
+#[test]
+fn plan_ignores_reordered_unordered_iam_policy_value_lists_with_saved_attrs() {
+    let plan = plan_for_reordered_iam_policy_value_lists(
+        PolicyValueListOrdering::Unordered,
+        SavedPolicyAttrs::Include,
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "reordering unordered IAM action and principal lists must not produce an Update when the \
+         saved policy preserves the declared order; got {:?}",
+        plan.effects()
+    );
+}
+
+#[test]
+fn plan_updates_reordered_ordered_iam_policy_value_lists() {
+    let plan = plan_for_reordered_iam_policy_value_lists(
+        PolicyValueListOrdering::Ordered,
+        SavedPolicyAttrs::Omit,
+    );
+
+    assert_eq!(plan.effects().len(), 1);
+    assert!(
+        matches!(plan.effects()[0], Effect::Update { .. }),
+        "reordering ordered IAM action and principal lists must produce an Update; got {:?}",
+        plan.effects()
+    );
+}
+
 #[test]
 fn create_plan_from_resources() {
     let resources = vec![

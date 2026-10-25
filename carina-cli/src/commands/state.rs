@@ -2258,30 +2258,31 @@ fn diff_display_update_resource(
         }
     };
 
+    let schema = match resource {
+        Some(resource) => schemas.get_for(resource),
+        None => schemas.get(
+            &id.provider,
+            &id.resource_type,
+            carina_core::schema::SchemaKind::Resource,
+        ),
+    };
+
     let refreshed_resource_state = if exists {
         match resource {
-            Some(resource) => {
-                let schema = schemas.get_for(resource);
-                Some(
-                    ResourceState::from_provider_state_for_resource_and_schema(
-                        resource,
-                        fresh_state,
-                        Some(existing_rs),
-                        schema,
-                        WriteOnlyBasis::CarryPrevious,
-                        None,
-                    )
-                    .map_err(|source| {
-                        AppError::from_resource_state_encoding(resource.id.clone(), source)
-                    })?,
+            Some(resource) => Some(
+                ResourceState::from_provider_state_for_resource_and_schema(
+                    resource,
+                    fresh_state,
+                    Some(existing_rs),
+                    schema,
+                    WriteOnlyBasis::CarryPrevious,
+                    None,
                 )
-            }
+                .map_err(|source| {
+                    AppError::from_resource_state_encoding(resource.id.clone(), source)
+                })?,
+            ),
             None => {
-                let schema = schemas.get(
-                    &id.provider,
-                    &id.resource_type,
-                    carina_core::schema::SchemaKind::Resource,
-                );
                 let refreshable = existing_rs.refreshable().ok_or_else(|| {
                     AppError::Config(format!(
                         "Cannot refresh in-flight resource state for {}",
@@ -2332,7 +2333,11 @@ fn diff_display_update_resource(
             let new_val = refreshed_attrs.get(*key);
 
             match (old_val, new_val) {
-                (Some(old), Some(new)) if old != new => {
+                (Some(old), Some(new))
+                    if !carina_core::diff_helpers::resource_attribute_values_equal(
+                        old, new, schema, key,
+                    ) =>
+                {
                     has_changes = true;
                     changes.push(format!(
                         "    {} {}: {} {} {}",
@@ -4691,6 +4696,88 @@ mod tests {
                 action: carina_core::plan::PreventDestroyAction::DeleteRemovedFromConfiguration
             }
         ));
+    }
+
+    fn refresh_reordered_list(list_type: AttributeType) -> StateRefreshCounts {
+        let id = ResourceId::with_provider_identity("test", "example.Lists", "main", None);
+        let desired = Resource::with_provider("test", "example.Lists", "main", None);
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("example.Lists", "main", "test", "lists-current")
+                    .expect("fixture identifier is non-empty")
+                    .with_attribute("items", json!(["a", "b"])),
+            )
+            .expect("test state setup must be valid");
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "items".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    string_value("b"),
+                    string_value("a"),
+                ])),
+            )]),
+        )
+        .with_identifier("lists-current");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("example.Lists")
+                .attribute(AttributeSchema::new("items", list_type)),
+        );
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &ResolvedResourceId::new(id),
+            &Current::from_state(fresh),
+            &mut state,
+            Some(&resolved(desired)),
+            &schemas,
+            "",
+            &mut counts,
+        )
+        .expect("state refresh should compare the reordered list");
+
+        counts
+    }
+
+    #[test]
+    fn current_refresh_ignores_reordered_unordered_list() {
+        let counts = refresh_reordered_list(AttributeType::unordered_list(AttributeType::string()));
+
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.unchanged, 1);
+    }
+
+    #[test]
+    fn current_refresh_reports_reordered_ordered_list() {
+        let counts = refresh_reordered_list(AttributeType::list(AttributeType::string()));
+
+        assert_eq!(counts.updated, 1);
+        assert_eq!(counts.unchanged, 0);
+    }
+
+    #[test]
+    fn current_refresh_ignores_reordered_unordered_string_or_list_union() {
+        let counts = refresh_reordered_list(AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::unordered_list(AttributeType::string()),
+        ]));
+
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.unchanged, 1);
+    }
+
+    #[test]
+    fn current_refresh_reports_reordered_ordered_string_or_list_union() {
+        let counts = refresh_reordered_list(AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::list(AttributeType::string()),
+        ]));
+
+        assert_eq!(counts.updated, 1);
+        assert_eq!(counts.unchanged, 0);
     }
 
     #[test]

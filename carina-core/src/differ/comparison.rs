@@ -39,6 +39,11 @@ use crate::value::{canonical_secret_hash_material, contains_secret};
 /// `merge_with_saved` adds to the effective desired side are canonicalized by
 /// `provider::RawSavedAttrs::lift` at the raw-to-lifted seam (carina#3740).
 ///
+/// A `StringList` pair compared under any List shape uses that List's `ordered`
+/// flag to select positional or multiset comparison and compares each element
+/// through the inner type. The `Union[String, list(String)]` List member is the
+/// main case (carina-rs/carina-provider-aws#535).
+///
 /// **Do not add a special-case equality here that treats `"x"` and
 /// `["x"]` as equal for this Union type.** Doing so would mask the
 /// canonicalization invariant: if a non-canonical value reaches the
@@ -152,6 +157,31 @@ fn type_aware_equal_on_path<'a>(
                     ..
                 },
             ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered),
+
+            (
+                Value::Concrete(ConcreteValue::StringList(la)),
+                Value::Concrete(ConcreteValue::StringList(lb)),
+                crate::schema::Shape::List {
+                    element_type: inner,
+                    ordered,
+                    ..
+                },
+            ) => {
+                // A StringList pair can reach any List shape; the
+                // `Union[String, list(String)]` List member is the main case.
+                // Honor this List's ordering and inner element type.
+                let as_values = |items: &[_]| {
+                    items
+                        .iter()
+                        .cloned()
+                        .map(ConcreteValue::String)
+                        .map(Value::Concrete)
+                        .collect::<Vec<_>>()
+                };
+                let la = as_values(la);
+                let lb = as_values(lb);
+                type_aware_lists_equal(&la, &lb, Some(inner), defs, ordered)
+            }
 
             // Maps: recursive comparison with inner value type
             (

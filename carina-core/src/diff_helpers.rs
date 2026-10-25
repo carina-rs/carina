@@ -1,7 +1,7 @@
-//! Shared diff computation helpers for plan display.
+//! Shared diff computation helpers for plan display and state refresh.
 //!
 //! These helpers extract the pure computation logic (no formatting/coloring)
-//! that is shared between CLI and TUI frontends.
+//! shared by CLI/TUI plan rendering and state refresh reporting.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -33,6 +33,35 @@ pub(crate) fn schema_aware_equal(
         Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs),
         None => old.semantically_equal(new),
     }
+}
+
+/// Compare two values for a named resource attribute using its schema type.
+///
+/// This is the public resource-level entry point for callers holding raw
+/// (non-canonical) persisted or provider values, such as state refresh. It
+/// resolves both the attribute type and definition map from `schema`, keeping
+/// callers from accidentally pairing an attribute with definitions from another
+/// resource. Both operands are canonicalized through the state pipeline before
+/// comparison. When the schema or named attribute is unavailable, comparison
+/// falls back to schema-blind semantic equality without cloning either value.
+pub fn resource_attribute_values_equal(
+    old: &Value,
+    new: &Value,
+    schema: Option<&ResourceSchema>,
+    attribute_name: &str,
+) -> bool {
+    let Some((attr_type, defs)) = schema.and_then(|schema| {
+        schema
+            .attributes
+            .get(attribute_name)
+            .map(|attribute| (&attribute.attr_type, &schema.defs))
+    }) else {
+        return old.semantically_equal(new);
+    };
+
+    let old = crate::value::canonicalize_state_with_type(old.clone(), attr_type, defs);
+    let new = crate::value::canonicalize_state_with_type(new.clone(), attr_type, defs);
+    schema_aware_equal(&old, &new, Some(attr_type), defs)
 }
 
 /// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
@@ -374,7 +403,7 @@ pub(crate) fn compute_string_list_diff_by<T, U>(
 mod tests {
     use super::*;
     use crate::resource::ConcreteValue;
-    use crate::schema::StructField;
+    use crate::schema::{StructField, empty_defs_for_schema_walks};
 
     fn struct_or_list_union(struct_first: bool) -> AttributeType {
         let struct_member = AttributeType::struct_(
