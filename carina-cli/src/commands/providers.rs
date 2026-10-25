@@ -134,13 +134,13 @@ fn confirm_recovery(target: &str, target_label: &str, force: bool) -> Result<boo
 }
 
 fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
-    // `PreparedRegistryDiscoveryRepin::Display` folds the migration header into
-    // its discard preview, so printing this event separately would duplicate it.
-    let (lock_path, mut lock, _migration) = load_lock(base_dir)?;
+    // The recovery preview folds this explicit load event into its discard
+    // report, so printing the event separately would duplicate its header.
+    let (lock_path, mut lock, migration) = load_lock(base_dir)?;
     let recovery = lock
         .prepare_registry_discovery_repin(host)
         .map_err(|error| AppError::Config(error.to_string()))?;
-    eprintln!("{recovery}");
+    eprintln!("{}", recovery.display_with_migration(migration.as_ref()));
     flush_preview()?;
 
     if !confirm_recovery(host, "registry host", force)? {
