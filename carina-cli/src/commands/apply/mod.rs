@@ -33,7 +33,7 @@ use carina_core::resource::{
 };
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
-use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
+use carina_state::{BackendLock, LockInfo, StateBackend, StateFile, WriteOnlyBasis};
 
 use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfigs};
 
@@ -56,7 +56,7 @@ use crate::commands::shared::incremental_state_saver::{
 use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, LockingDisabled, StateLock, StateLockRef, with_lock_heartbeat,
 };
-use crate::commands::shared::observer::CliObserver;
+use crate::commands::shared::observer::{CliObserver, partial_read_detail_lines};
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
@@ -216,7 +216,41 @@ async fn create_checked_bootstrap_resource(
         .map_err(AppError::from_state_bucket_preparation)?;
     let resolved = ResolvedResource::new(request.resource().as_resource().clone());
     match carina_core::executor::dispatch_create(provider, &id, request).await {
-        Ok(_outcome) => Ok(()),
+        Ok(outcome) => {
+            let identifier = outcome.identifier().as_str().to_string();
+            let (state, accepted_request, diagnostic) =
+                carina_core::executor::complete_create_for_writeback(outcome);
+            let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
+                &resolved,
+                &state,
+                None,
+                schemas.get_for(resolved.as_resource()),
+                WriteOnlyBasis::AcceptedRequest(&accepted_request),
+                None,
+            )
+            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
+            seed_protected_bootstrap_resource(backend, row)
+                .await
+                .map_err(|source| {
+                    let resource_address = format!(
+                        "{} {}",
+                        resolved.id.display_type(),
+                        carina_core::parser::display_string_literal(resolved.identity_str())
+                    );
+                    AppError::StateBucketSeed(Box::new(crate::error::StateBucketSeedError::new(
+                        identifier.clone(),
+                        resource_address,
+                        source,
+                    )))
+                })?;
+            if let Some(diagnostic) = diagnostic {
+                eprintln!(
+                    "{}",
+                    format_partial_state_bucket_create_warning(&identifier, &diagnostic)
+                );
+            }
+            Ok(())
+        }
         Err(error) => {
             let row = match error.kind() {
                 carina_core::provider::CreateFailureKind::Untracked(_error) => Ok(None),
@@ -246,18 +280,10 @@ async fn create_checked_bootstrap_resource(
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
             };
             let seed_error = match row {
-                Ok(Some(mut row)) => {
-                    row.protected = true;
-                    let mut seed = StateFile::new();
-                    match seed.upsert_resource(row) {
-                        Ok(()) => backend
-                            .write_state(&seed)
-                            .await
-                            .map_err(AppError::Backend)
-                            .err(),
-                        Err(seed_error) => Some(AppError::Backend(seed_error)),
-                    }
-                }
+                Ok(Some(row)) => seed_protected_bootstrap_resource(backend, row)
+                    .await
+                    .err()
+                    .map(AppError::Backend),
                 Ok(None) => None,
                 Err(seed_error) => Some(seed_error),
             };
@@ -266,6 +292,30 @@ async fn create_checked_bootstrap_resource(
             ))
         }
     }
+}
+
+async fn seed_protected_bootstrap_resource(
+    backend: &dyn StateBackend,
+    mut row: carina_state::ResourceState,
+) -> carina_state::BackendResult<()> {
+    row.protected = true;
+    let mut seed = StateFile::new();
+    seed.upsert_resource(row)?;
+    backend.write_state(&seed).await
+}
+
+fn format_partial_state_bucket_create_warning(
+    identifier: &str,
+    diagnostic: &carina_core::provider::PartialReadDiagnostic,
+) -> String {
+    let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
+    format!(
+        "{} State bucket '{identifier}' was created with a partial read:\n      {} {reason}\n      {} {missing}\n      {} {state_recorded}",
+        "⚠".yellow(),
+        "→".yellow(),
+        "→".yellow(),
+        "→".yellow(),
+    )
 }
 
 fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
@@ -1486,16 +1536,6 @@ async fn run_apply_with_observer_factory(
                         bucket_name
                     )));
                 }
-            }
-
-            // Initialize state if not already done (when bucket existed or was created from resource)
-            if backend
-                .read_state()
-                .await
-                .map_err(AppError::Backend)?
-                .is_none()
-            {
-                backend.init().await.map_err(AppError::Backend)?;
             }
         }
     }

@@ -85,10 +85,6 @@ impl StateBackend for LockLossBackend {
         self.inner.force_unlock(lock_id).await
     }
 
-    async fn init(&self) -> BackendResult<()> {
-        self.inner.init().await
-    }
-
     async fn bucket_exists(&self) -> BackendResult<bool> {
         self.inner.bucket_exists().await
     }

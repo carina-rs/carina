@@ -459,10 +459,6 @@ mod tests {
             Ok(())
         }
 
-        async fn init(&self) -> BackendResult<()> {
-            Ok(())
-        }
-
         async fn bucket_exists(&self) -> BackendResult<bool> {
             Ok(true)
         }

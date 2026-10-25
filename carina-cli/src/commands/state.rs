@@ -2499,10 +2499,6 @@ mod tests {
             Ok(())
         }
 
-        async fn init(&self) -> carina_state::BackendResult<()> {
-            Ok(())
-        }
-
         async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
             Ok(true)
         }

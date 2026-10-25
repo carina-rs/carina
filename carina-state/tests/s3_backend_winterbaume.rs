@@ -31,14 +31,6 @@ const TEST_REGION: &str = "us-east-1";
 const TEST_BUCKET: &str = "carina-state-test-bucket";
 const TEST_KEY: &str = "carina.state.json";
 
-/// Build an `aws_sdk_s3::Client` wired to a fresh in-process winterbaume
-/// S3 service. Each call gets an isolated mock with empty state.
-async fn mock_s3_client() -> Client {
-    let mock = MockAws::builder().with_service(S3Service::new()).build();
-    let sdk_config = mock.sdk_config(TEST_REGION).await;
-    Client::new(&sdk_config)
-}
-
 /// Build an `S3Backend` over a winterbaume-backed client. `encrypt` is
 /// disabled because the mock does not need server-side encryption and
 /// leaving it on only adds a header the mock ignores.
@@ -76,6 +68,41 @@ async fn mock_backend_with_service(service: impl MockService) -> S3Backend {
         false,
         true,
     )
+}
+
+async fn create_bucket_and_seed_empty_state(backend: &S3Backend) {
+    backend.create_bucket().await.unwrap();
+    backend.write_state(&StateFile::new()).await.unwrap();
+}
+
+struct FailingCreateBucketService {
+    inner: S3Service,
+}
+
+impl MockService for FailingCreateBucketService {
+    fn service_name(&self) -> &str {
+        self.inner.service_name()
+    }
+
+    fn url_patterns(&self) -> Vec<&str> {
+        self.inner.url_patterns()
+    }
+
+    fn handle(
+        &self,
+        _request: MockRequest,
+    ) -> Pin<Box<dyn Future<Output = MockResponse> + Send + '_>> {
+        Box::pin(async {
+            MockResponse::xml(
+                409,
+                r#"<Error>
+  <Code>BucketAlreadyOwnedByYou</Code>
+  <Message>The bucket already exists and is owned by you</Message>
+  <RequestId>00000000-0000-0000-0000-000000000000</RequestId>
+</Error>"#,
+            )
+        })
+    }
 }
 
 fn state_serial(request: &MockRequest) -> Option<u64> {
@@ -296,39 +323,39 @@ fn test_lock(operation: &str, timeout_secs: i64) -> TestLockFile {
 }
 
 #[tokio::test]
-async fn init_auto_creates_bucket_and_seeds_empty_state() {
+async fn create_bucket_makes_bucket_exist() {
     let backend = mock_backend().await;
 
-    // The bucket does not exist yet.
     assert!(
         !backend.bucket_exists().await.unwrap(),
-        "bucket should not exist before init",
+        "bucket should not exist before create_bucket",
     );
 
-    // init() auto-creates the bucket and seeds an empty state file.
-    backend.init().await.unwrap();
+    backend.create_bucket().await.unwrap();
 
     assert!(
         backend.bucket_exists().await.unwrap(),
-        "bucket should exist after init",
+        "bucket should exist after create_bucket",
     );
+}
 
-    let state = backend
-        .read_state()
+#[tokio::test]
+async fn create_bucket_error_preserves_aws_operation_bucket_and_service_details() {
+    let backend = mock_backend_with_service(FailingCreateBucketService {
+        inner: S3Service::new(),
+    })
+    .await;
+
+    let error = backend
+        .create_bucket()
         .await
-        .unwrap()
-        .expect("init should seed a state file")
-        .into_state();
-    assert_eq!(
-        state.version,
-        StateFile::CURRENT_VERSION,
-        "seeded state should be the current format version",
-    );
-    assert_eq!(state.serial, 0, "seeded state should start at serial 0");
-    assert!(
-        state.resources().is_empty(),
-        "seeded state should have no resources",
-    );
+        .expect_err("CreateBucket must return the structured AWS error");
+
+    assert!(matches!(error, BackendError::Aws(_)), "{error:?}");
+    let rendered = error.to_string();
+    assert!(rendered.contains("s3.CreateBucket"), "{rendered}");
+    assert!(rendered.contains(TEST_BUCKET), "{rendered}");
+    assert!(rendered.contains("BucketAlreadyOwnedByYou"), "{rendered}");
 }
 
 // carina#3336: end-to-end exercise of `--state-url s3://...`'s
@@ -343,7 +370,7 @@ async fn init_auto_creates_bucket_and_seeds_empty_state() {
 #[tokio::test]
 async fn url_loader_s3_path_reads_seeded_state() {
     let (backend, raw_client) = mock_backend_with_client().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     let mut seeded = StateFile::new();
     seeded.increment_serial();
@@ -374,7 +401,7 @@ async fn url_loader_s3_path_reads_seeded_state() {
 #[tokio::test]
 async fn write_then_read_state_round_trips() {
     let backend = mock_backend().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     // Use a state that carries a resource entry, not just scalar header
     // fields — a serde regression that dropped `resources` would survive
@@ -452,7 +479,7 @@ async fn write_then_read_state_round_trips() {
 #[tokio::test]
 async fn lower_serial_same_lineage_write_replaces_remote_state() {
     let backend = mock_backend().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     let mut older = StateFile::new();
     older.increment_serial();
@@ -486,7 +513,7 @@ async fn abandoned_older_put_cannot_overwrite_a_completed_newer_put() {
         })
         .await,
     );
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     let initial = backend.read_state().await.unwrap().unwrap().into_state();
     state_puts.store(0, Ordering::SeqCst);
@@ -537,7 +564,7 @@ async fn repeated_state_write_conflicts_are_bounded() {
         gets: Arc::clone(&gets),
     })
     .await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
     let mut state = backend.read_state().await.unwrap().unwrap().into_state();
     state.increment_serial();
     enabled.store(true, Ordering::SeqCst);
@@ -584,7 +611,7 @@ async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
         false,
         true,
     );
-    seed_backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&seed_backend).await;
 
     // Use a fresh backend so only this read can seed its state ETag cache.
     let backend = S3Backend::from_client(
@@ -704,7 +731,7 @@ async fn acquire_then_release_lock_round_trips() {
     // conditional-write contention path is exercised separately in
     // `acquire_lock_conflicts_with_held_lock` (#3205).
     let backend = mock_backend().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     // No lock held: acquire writes the lock object and succeeds.
     let lock = backend.acquire_lock("apply").await.unwrap();
@@ -729,7 +756,7 @@ async fn acquire_then_release_lock_round_trips() {
 #[tokio::test]
 async fn write_state_locked_succeeds_for_held_lock() {
     let backend = mock_backend().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     let lock = backend.acquire_lock("apply").await.unwrap();
 
@@ -770,7 +797,7 @@ async fn locked_state_conflict_rechecks_ownership_before_retrying() {
         true,
     ));
     let raw_client = Client::new(&sdk_config);
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(backend.as_ref()).await;
 
     let initial = backend.read_state().await.unwrap().unwrap().into_state();
     let held_lock = backend.acquire_lock("apply").await.unwrap();
@@ -839,7 +866,7 @@ async fn locked_state_conflict_rechecks_ownership_before_retrying() {
 #[tokio::test]
 async fn cancellation_cleanup_write_and_release_preserve_the_lock_protocol() {
     let backend = mock_backend().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
     let lock = backend.acquire_lock("apply").await.unwrap();
     let mut state = StateFile::new();
     state.increment_serial();
@@ -869,7 +896,7 @@ async fn write_state_locked_rejects_write_when_lock_not_held() {
     // `write_state_locked_succeeds_for_held_lock` would still pass even
     // if the ownership check were bypassed entirely.
     let backend = mock_backend().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     let lock = backend.acquire_lock("apply").await.unwrap();
     backend.release_lock(&lock).await.unwrap();
@@ -896,7 +923,7 @@ async fn acquire_lock_conflicts_with_held_lock() {
     // conditional header the second PUT would silently overwrite and
     // this test would fail.
     let backend = mock_backend().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     let first = backend.acquire_lock("apply").await.unwrap();
 
@@ -932,7 +959,7 @@ async fn acquire_lock_takes_over_expired_lock() {
     // exercises the second branch of the acquire loop, which only
     // works when the mock enforces `If-Match`.
     let (backend, client) = mock_backend_with_client().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     // Plant an expired lock under the same key the backend uses.
     let expired = test_lock("apply", -60);
@@ -975,7 +1002,7 @@ async fn renew_lock_rejects_when_lock_was_replaced() {
     // `If-Match`-conditional `replace_lock_if_match` further guards
     // against TOCTOU between the read and the write.
     let (backend, client) = mock_backend_with_client().await;
-    backend.init().await.unwrap();
+    create_bucket_and_seed_empty_state(&backend).await;
 
     let original = backend.acquire_lock("apply").await.unwrap();
 
@@ -1032,26 +1059,5 @@ async fn head_bucket_resolves_to_typed_not_found_on_missing_bucket() {
         "HeadBucket must resolve to the typed NotFound variant; got {service_err:?}. \
          An Unhandled variant here means winterbaume regressed and is returning a \
          response body on a 4xx HEAD response (see moriyoshi/winterbaume#3).",
-    );
-}
-
-#[tokio::test]
-async fn init_without_auto_create_errors_on_missing_bucket() {
-    let backend = S3Backend::from_client(
-        mock_s3_client().await,
-        TEST_BUCKET.to_string(),
-        TEST_KEY.to_string(),
-        TEST_REGION.to_string(),
-        false, // encrypt
-        false, // auto_create disabled
-    );
-
-    let err = backend
-        .init()
-        .await
-        .expect_err("init must fail when the bucket is absent and auto_create is off");
-    assert!(
-        matches!(&err, carina_state::BackendError::BucketNotFound(b) if b == TEST_BUCKET),
-        "expected BucketNotFound({TEST_BUCKET}), got: {err:?}",
     );
 }

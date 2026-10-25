@@ -118,10 +118,6 @@ pub enum BackendError {
     #[error("Bucket not found: {0}")]
     BucketNotFound(String),
 
-    /// Failed to create bucket
-    #[error("Failed to create bucket: {0}")]
-    BucketCreationFailed(String),
-
     /// State file is corrupted or invalid
     #[error("Invalid state file: {0}")]
     InvalidState(String),
@@ -562,11 +558,6 @@ pub trait StateBackend: Send + Sync {
     ///
     /// This is an administrative operation that should be used with caution
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()>;
-
-    /// Initialize the backend (create bucket if needed, etc.)
-    ///
-    /// This is called when setting up state management for the first time
-    async fn init(&self) -> BackendResult<()>;
 
     /// Check if the backend storage (bucket) exists
     async fn bucket_exists(&self) -> BackendResult<bool>;

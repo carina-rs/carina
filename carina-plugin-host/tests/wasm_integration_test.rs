@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
+use carina_core::executor::complete_create_for_writeback;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateOutcome,
     CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Observation, Provider,
@@ -22,6 +23,10 @@ use carina_plugin_host::WasmProviderFactory;
 
 fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
+}
+
+fn create_state_for_writeback(outcome: CreateOutcome) -> State {
+    complete_create_for_writeback(outcome).0
 }
 
 fn lifted_saved_attrs(
@@ -330,11 +335,12 @@ async fn test_wasm_pending_create_polls_until_success() {
         i64::from(PENDING_POLLS),
     );
 
-    let state = provider
-        .create_for_test(&id, create_request_for_test(resource).await)
-        .await
-        .expect("pending create should settle")
-        .into_state_for_writeback();
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("pending create should settle"),
+    );
 
     assert_eq!(state.identifier.as_deref(), Some("mock-id"));
     assert!(state.exists);
@@ -358,11 +364,12 @@ async fn test_wasm_pending_update_polls_until_success() {
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-update", None);
     let mut resource = resource_with_int_attribute("test.resource", "pending-update", "value", 1);
-    let created = provider
-        .create_for_test(&id, create_request_for_test(resource.clone()).await)
-        .await
-        .expect("setup create should succeed")
-        .into_state_for_writeback();
+    let created = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("setup create should succeed"),
+    );
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_pending_polls",
@@ -456,11 +463,12 @@ async fn test_wasm_pending_create_can_settle_on_final_poll_at_deadline() {
         i64::from(PENDING_POLLS),
     );
 
-    let state = provider
-        .create_for_test(&id, create_request_for_test(resource).await)
-        .await
-        .expect("the final poll at the schema deadline should be allowed")
-        .into_state_for_writeback();
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the final poll at the schema deadline should be allowed"),
+    );
 
     assert_eq!(
         state.attributes.get("__mock_create_polls_served__"),
@@ -1272,11 +1280,12 @@ async fn test_wasm_mock_provider_create_and_read() {
         ("count".into(), Value::Concrete(ConcreteValue::Int(42))),
     ]);
 
-    let created = provider
-        .create_for_test(&id, create_request_for_test(resource.clone()).await)
-        .await
-        .expect("create should succeed")
-        .into_state_for_writeback();
+    let created = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("create should succeed"),
+    );
     assert_eq!(created.identifier, Some("mock-id".into()));
     assert_eq!(
         created.attributes.get("name"),
@@ -1362,11 +1371,12 @@ async fn test_wasm_mock_provider_update_and_delete() {
         ("size".into(), Value::Concrete(ConcreteValue::Int(10))),
     ]);
 
-    let created = provider
-        .create_for_test(&id, create_request_for_test(resource.clone()).await)
-        .await
-        .expect("create should succeed")
-        .into_state_for_writeback();
+    let created = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("create should succeed"),
+    );
     assert_eq!(
         created.attributes.get("color"),
         Some(&Value::Concrete(ConcreteValue::String("red".into())))

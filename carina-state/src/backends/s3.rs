@@ -864,27 +864,6 @@ impl StateBackend for S3Backend {
         self.delete_lock().await
     }
 
-    async fn init(&self) -> BackendResult<()> {
-        // Seeding the state bucket as a managed resource needs the resolved
-        // anonymous identifier of the desired aws.s3.Bucket block in the
-        // user's .crn — not reachable from this layer. The carina-cli apply
-        // bootstrap path owns that responsibility (it parses the .crn,
-        // resolves the identifier, then writes the seeded StateFile).
-        if !self.bucket_exists().await? {
-            if self.auto_create {
-                self.create_bucket().await?;
-            } else {
-                return Err(BackendError::BucketNotFound(self.bucket.clone()));
-            }
-        }
-
-        if self.read_state().await?.is_none() {
-            self.write_state(&StateFile::new()).await?;
-        }
-
-        Ok(())
-    }
-
     async fn bucket_exists(&self) -> BackendResult<bool> {
         let result = self.client.head_bucket().bucket(&self.bucket).send().await;
 
@@ -928,10 +907,11 @@ impl StateBackend for S3Backend {
             create_request = create_request.create_bucket_configuration(config);
         }
 
-        create_request
-            .send()
-            .await
-            .map_err(|e| BackendError::BucketCreationFailed(e.to_string()))?;
+        create_request.send().await.map_err(|e| {
+            BackendError::Aws(Box::new(
+                AwsError::from_sdk_error("s3.CreateBucket", e).bucket(&self.bucket),
+            ))
+        })?;
 
         // Block public access
         let public_access_block = PublicAccessBlockConfiguration::builder()

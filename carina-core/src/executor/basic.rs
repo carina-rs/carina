@@ -698,8 +698,8 @@ pub(super) async fn execute_basic_effect<'a>(
                 .await
             {
                 Ok(outcome) => {
-                    let diagnostic = outcome.diagnostic().cloned();
-                    let state = outcome.into_state_for_writeback();
+                    let (state, request, diagnostic) =
+                        super::complete_create_for_writeback(outcome);
                     if let Some(diagnostic) = diagnostic {
                         observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
                             effect,
@@ -711,7 +711,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
                                 state: Box::new(state),
-                                request: AcceptedRequest::create(),
+                                request,
                             },
                             resource_id: resource.id.clone(),
                             diagnostic,
@@ -728,7 +728,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         BasicEffectResult::Success {
                             completed: CompletedEffect {
                                 state: Box::new(state),
-                                request: AcceptedRequest::create(),
+                                request,
                             },
                             resource_id: resource.id.clone(),
                             resolved_attrs: Some(resolved_attrs),
@@ -846,8 +846,8 @@ pub(super) async fn execute_basic_effect<'a>(
                     }
                 }
                 Ok(ResumeOutcomeKind::Resent(outcome)) => {
-                    let diagnostic = outcome.diagnostic().cloned();
-                    let state = (*outcome).into_state_for_writeback();
+                    let (state, request, diagnostic) =
+                        super::complete_create_for_writeback(*outcome);
                     if let Some(diagnostic) = diagnostic {
                         observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
                             effect,
@@ -859,7 +859,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
                                 state: Box::new(state),
-                                request: AcceptedRequest::create(),
+                                request,
                             },
                             resource_id: resource.id.clone(),
                             diagnostic,
@@ -876,7 +876,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         BasicEffectResult::Success {
                             completed: CompletedEffect {
                                 state: Box::new(state),
-                                request: AcceptedRequest::create(),
+                                request,
                             },
                             resource_id: resource.id.clone(),
                             resolved_attrs: Some(resolved_attrs),
