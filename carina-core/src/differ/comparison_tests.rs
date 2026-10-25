@@ -1287,6 +1287,13 @@ fn string_or_list_of_strings_type() -> AttributeType {
     ])
 }
 
+fn string_or_unordered_list_of_strings_type() -> AttributeType {
+    AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::unordered_list(AttributeType::string()),
+    ])
+}
+
 #[test]
 fn type_aware_equal_self_cyclic_union_ref_uses_concrete_member() {
     let root = AttributeType::ref_("A");
@@ -1334,6 +1341,70 @@ fn union_string_or_list_canonical_string_list_diff_on_different_content() {
     let union = string_or_list_of_strings_type();
     let a = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".into()]));
     let b = Value::Concrete(ConcreteValue::StringList(vec!["repo:bar:*".into()]));
+    assert!(!type_aware_equal(
+        &a,
+        &b,
+        Some(&union),
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+}
+
+#[test]
+fn union_string_or_unordered_list_compares_canonical_string_list_as_multiset() {
+    let union = string_or_unordered_list_of_strings_type();
+    let a = Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]));
+    let b = Value::Concrete(ConcreteValue::StringList(vec!["b".into(), "a".into()]));
+
+    assert!(type_aware_equal(
+        &a,
+        &b,
+        Some(&union),
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+}
+
+#[test]
+fn unordered_list_of_strings_compares_string_list_as_multiset() {
+    let list = AttributeType::unordered_list(AttributeType::string());
+    let a = Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]));
+    let b = Value::Concrete(ConcreteValue::StringList(vec!["b".into(), "a".into()]));
+
+    assert!(type_aware_equal(
+        &a,
+        &b,
+        Some(&list),
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+}
+
+#[test]
+fn union_string_or_ordered_list_keeps_canonical_string_list_order_significant() {
+    let union = string_or_list_of_strings_type();
+    let a = Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]));
+    let b = Value::Concrete(ConcreteValue::StringList(vec!["b".into(), "a".into()]));
+
+    assert!(!type_aware_equal(
+        &a,
+        &b,
+        Some(&union),
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+}
+
+#[test]
+fn union_string_or_unordered_list_counts_canonical_string_list_multiplicity() {
+    let union = string_or_unordered_list_of_strings_type();
+    let a = Value::Concrete(ConcreteValue::StringList(vec![
+        "a".into(),
+        "a".into(),
+        "b".into(),
+    ]));
+    let b = Value::Concrete(ConcreteValue::StringList(vec![
+        "a".into(),
+        "b".into(),
+        "b".into(),
+    ]));
+
     assert!(!type_aware_equal(
         &a,
         &b,
