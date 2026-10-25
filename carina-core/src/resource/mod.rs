@@ -4505,6 +4505,8 @@ fn lists_equal_hashed(a: &[Value], b: &[Value]) -> bool {
 /// `prior_explicit` is the authoring tree for this value. At each map node:
 /// - [`ExplicitFields::Unrecorded`], [`ExplicitFields::Leaf`], or a shape mismatch keeps the
 ///   legacy full merge;
+/// - [`ExplicitFields::WholeValue`] only has special meaning for lists; at a
+///   malformed map position it keeps the conservative legacy full merge;
 /// - a saved key absent from prior authored children is unmanaged and is retained;
 /// - a saved key present in prior authored children but absent from desired was removed by the
 ///   user and is omitted;
@@ -4588,7 +4590,8 @@ fn merge_maps(
         ExplicitFields::Unrecorded
         | ExplicitFields::Leaf
         | ExplicitFields::List { .. }
-        | ExplicitFields::ListElements { .. } => None,
+        | ExplicitFields::ListElements { .. }
+        | ExplicitFields::WholeValue { .. } => None,
     };
 
     let mut merged = projected_saved.clone();
@@ -4650,21 +4653,76 @@ where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = if desired.len().max(saved.len()) < HASH_THRESHOLD {
+    let candidates = list_pair_candidates(desired, saved, attr_type, defs);
+    commit_list_element_pairs(desired.len(), saved.len(), &candidates)
+}
+
+/// A stable list-element pairing together with the evidence for that pairing.
+///
+/// The ordinary differ separately uses a stable match for ambiguous peers as a
+/// display/merge heuristic. State authoring transfer is not allowed to do so:
+/// only [`Self::Unique`] establishes element identity. A zero-similarity
+/// element is [`Self::Unmatched`] even when list position could supply a
+/// tempting guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListElementPairing {
+    Unique(usize),
+    Ambiguous,
+    Unmatched,
+}
+
+/// Pair list elements while distinguishing evidence-backed identity from the
+/// stable tie-breaking used by the normal differ.
+///
+/// A match is unique only when the selected saved element is the sole
+/// positive, highest-scoring candidate for that desired element. Global
+/// contention that forces a lower-scoring choice is therefore ambiguous too.
+pub(crate) fn pair_list_elements_with_uniqueness<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Vec<ListElementPairing>
+where
+    D: Borrow<Value>,
+    S: Borrow<Value>,
+{
+    let candidates = list_pair_candidates(desired, saved, attr_type, defs);
+    let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
+    classify_list_element_pairs(&pairs, saved.len(), &candidates)
+}
+
+fn list_pair_candidates<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> PairCandidates
+where
+    D: Borrow<Value>,
+    S: Borrow<Value>,
+{
+    if desired.len().max(saved.len()) < HASH_THRESHOLD {
         pair_candidates_quadratic(desired, saved, attr_type, defs)
     } else {
         pair_candidates_hashed(desired, saved, attr_type, defs)
-    };
+    }
+}
 
+fn commit_list_element_pairs(
+    desired_len: usize,
+    saved_len: usize,
+    candidates: &PairCandidates,
+) -> Vec<Option<usize>> {
     // Assign each desired element one stable, schema-aware preference before
     // committing anything. Preferences are not pair commits: every explicit
     // candidate and every implicit complete-row score has already been
     // computed, and score remains the first ordering key. Choosing an
     // unreserved equal-best saved index when possible is the O(n + m)
     // equivalent of the former desired×saved reservation matrix.
-    let mut preferred_saved = vec![None; desired.len()];
-    let mut preferred_score = vec![0; desired.len()];
-    let mut preference_reserved = vec![false; saved.len()];
+    let mut preferred_saved = vec![None; desired_len];
+    let mut preferred_score = vec![0; desired_len];
+    let mut preference_reserved = vec![false; saved_len];
     for (desired_index, preferred_slot) in preferred_saved.iter_mut().enumerate() {
         let entries = &candidates.entries[candidates.desired_offsets[desired_index]
             ..candidates.desired_offsets[desired_index + 1]];
@@ -4682,9 +4740,9 @@ where
             // Every saved index has this score. Prefer the first index not
             // already reserved by an earlier desired element, matching the
             // explicit-candidate tie rule without materializing n×m edges.
-            (0..saved.len())
+            (0..saved_len)
                 .find(|saved_index| !preference_reserved[*saved_index])
-                .or((!saved.is_empty()).then_some(0))
+                .or((saved_len != 0).then_some(0))
         } else {
             let fallback = entries
                 .iter()
@@ -4719,12 +4777,12 @@ where
             .copied()
             .filter(|score| *score > 0),
     );
-    let mut pairs = vec![None; desired.len()];
-    let mut available_saved: BTreeSet<usize> = (0..saved.len()).collect();
+    let mut pairs = vec![None; desired_len];
+    let mut available_saved: BTreeSet<usize> = (0..saved_len).collect();
     for score in score_levels.into_iter().rev() {
         // Preferred candidates sort before every non-preferred candidate at
         // the same score.
-        for desired_index in 0..desired.len() {
+        for desired_index in 0..desired_len {
             if pairs[desired_index].is_some() || preferred_score[desired_index] != score {
                 continue;
             }
@@ -4765,6 +4823,54 @@ where
         }
     }
     pairs
+}
+
+fn classify_list_element_pairs(
+    pairs: &[Option<usize>],
+    saved_len: usize,
+    candidates: &PairCandidates,
+) -> Vec<ListElementPairing> {
+    pairs
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(desired_index, selected)| {
+            let entries = &candidates.entries[candidates.desired_offsets[desired_index]
+                ..candidates.desired_offsets[desired_index + 1]];
+            let explicit_best = entries
+                .iter()
+                .map(|(score, _, _)| *score)
+                .max()
+                .unwrap_or(0);
+            let implicit_best = candidates.implicit_scores[desired_index];
+            let best_score = explicit_best.max(implicit_best);
+
+            if best_score == 0 {
+                return ListElementPairing::Unmatched;
+            }
+
+            let sole_best = if implicit_best == best_score {
+                (saved_len == 1).then_some(0)
+            } else {
+                let mut best_indices = entries
+                    .iter()
+                    .filter(|(score, _, _)| *score == best_score)
+                    .map(|(_, _, saved_index)| *saved_index);
+                let first = best_indices.next();
+                match (first, best_indices.next()) {
+                    (Some(index), None) => Some(index),
+                    (None, None) | (Some(_), Some(_)) | (None, Some(_)) => None,
+                }
+            };
+
+            match (selected, sole_best) {
+                (Some(selected), Some(sole)) if selected == sole => {
+                    ListElementPairing::Unique(selected)
+                }
+                (Some(_), Some(_) | None) | (None, Some(_) | None) => ListElementPairing::Ambiguous,
+            }
+        })
+        .collect()
 }
 
 type PairCandidate = (usize, usize, usize);
@@ -5155,14 +5261,23 @@ fn merge_lists(
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
 ) -> Vec<Value> {
+    // `WholeValue` is the explicit whole-value fallback used when a carried row
+    // cannot transfer a pending nested removal to a uniquely identified list
+    // element. Merging individual saved elements here would fill the removed
+    // child back in and hide the very diff the fallback represents.
     let aligned_elements = match prior_explicit {
+        ExplicitFields::WholeValue { .. } => return desired.to_vec(),
         ExplicitFields::ListElements { elements }
             if elements.len() == projected_saved.len()
                 && raw_saved.len() == projected_saved.len() =>
         {
             Some(elements)
         }
-        _ => None,
+        ExplicitFields::Leaf
+        | ExplicitFields::Struct { .. }
+        | ExplicitFields::List { .. }
+        | ExplicitFields::ListElements { .. }
+        | ExplicitFields::Unrecorded => None,
     };
 
     let item_type = list_element_type(attr_type, defs);

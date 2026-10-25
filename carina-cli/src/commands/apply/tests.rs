@@ -11,11 +11,13 @@ use carina_core::resource::{
     PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
     ResourceIdentity, Signature,
 };
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+};
 use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -955,6 +957,7 @@ struct ApplyTimeReadShared {
     operations: Arc<Mutex<Vec<String>>>,
     consumer_description: Arc<Mutex<Option<Value>>>,
     read_calls: Arc<AtomicUsize>,
+    allow_internet_gateway_updates: Arc<AtomicBool>,
 }
 
 struct ApplyTimeReadFactory {
@@ -1024,6 +1027,26 @@ impl ProviderFactory for ApplyTimeReadFactory {
                 .attribute(AttributeSchema::new(
                     "tags",
                     AttributeType::map(AttributeType::string()),
+                ))
+                .attribute(AttributeSchema::new(
+                    "settings",
+                    AttributeType::struct_(
+                        "InternetGatewaySettings",
+                        vec![
+                            StructField::new("enabled", AttributeType::bool()),
+                            StructField::new("description", AttributeType::string()),
+                        ],
+                    ),
+                ))
+                .attribute(AttributeSchema::new(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "InternetGatewayRule",
+                        vec![
+                            StructField::new("port", AttributeType::int()),
+                            StructField::new("description", AttributeType::string()),
+                        ],
+                    )),
                 )),
             ResourceSchema::new("ec2.NatGateway").attribute(AttributeSchema::new(
                 "tags",
@@ -1637,7 +1660,10 @@ impl Provider for ApplyTimeReadProvider {
         let identifier = identifier.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
-            if id.resource_type != "ec2.NatGateway" {
+            let supports_update = id.resource_type == "ec2.NatGateway"
+                || (id.resource_type == "ec2.InternetGateway"
+                    && shared.allow_internet_gateway_updates.load(Ordering::SeqCst));
+            if !supports_update {
                 return Err(ProviderError::internal("unexpected update").for_resource(id));
             }
 
@@ -4011,6 +4037,312 @@ let igw = mock.ec2.InternetGateway {{{tags}
         "the next plan must retry the failed tags removal: {:#?}",
         retry.plan,
     );
+}
+
+#[derive(Clone, Copy)]
+enum NestedPendingRemovalCase {
+    StructAttribute,
+    ListElement,
+    DuplicateListElement,
+}
+
+impl NestedPendingRemovalCase {
+    fn top_level_attribute(self) -> &'static str {
+        match self {
+            Self::StructAttribute => "settings",
+            Self::ListElement | Self::DuplicateListElement => "rules",
+        }
+    }
+
+    fn config(self, state_path: &Path, with_description: bool) -> String {
+        let nested = match (self, with_description) {
+            (Self::StructAttribute, true) => {
+                r#"settings = { enabled = true, description = "web" }"#
+            }
+            (Self::StructAttribute, false) => r#"settings = { enabled = true }"#,
+            (Self::ListElement, true) => {
+                r#"rules = [{ port = 80, description = "web" }, { port = 443 }]"#
+            }
+            (Self::ListElement, false) => r#"rules = [{ port = 80 }, { port = 443 }]"#,
+            (Self::DuplicateListElement, true) => {
+                r#"rules = [{ port = 80, description = "web" }, { port = 80 }]"#
+            }
+            (Self::DuplicateListElement, false) => r#"rules = [{ port = 80 }, { port = 80 }]"#,
+        };
+        format!(
+            r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let igw = mock.ec2.InternetGateway {{
+  name = "x"
+  {nested}
+}}
+"#,
+            state_path.display()
+        )
+    }
+}
+
+async fn assert_failed_nested_pending_removal_is_replanned(
+    case: NestedPendingRemovalCase,
+    complete_retry: bool,
+) {
+    let fixture = ApplyCancellationFixture::new();
+    let state_path = fixture.state_path().to_path_buf();
+    let fixture = fixture.with_raw_config(case.config(&state_path, true));
+    let base_dir = get_base_dir(fixture.config_path());
+    let shared = ApplyTimeReadShared::default();
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
+    let load = || {
+        let loaded = load_configuration_with_config(
+            fixture.config_path(),
+            fixture.provider_context(),
+            &SchemaRegistry::new(),
+        )
+        .expect("fixture must load");
+        let mut parsed = loaded.parsed;
+        let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+            &mut parsed,
+            base_dir,
+            false,
+            vec![Box::new(ApplyTimeReadFactory {
+                shared: shared.clone(),
+            })],
+            HashMap::new(),
+            &loaded.inference_errors,
+            &loaded.duplicate_declarations,
+        );
+        assert!(
+            validation_errors.is_empty(),
+            "fixture must validate, got: {validation_errors:?}"
+        );
+        (parsed, loaded.unresolved_parsed)
+    };
+
+    let (mut parsed, unresolved_parsed) = load();
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect("initial apply should create the IGW with the nested field");
+
+    std::fs::write(
+        fixture.config_path().join("main.crn"),
+        case.config(&state_path, false),
+    )
+    .expect("remove the nested field from desired configuration");
+    let (mut parsed, unresolved_parsed) = load();
+    let provider_configs = resolved_provider_configs(&parsed);
+    let before_failure = Some(fixture.read_state().await);
+    let removal_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &provider_configs,
+        &unresolved_parsed.resources,
+        &before_failure,
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        base_dir,
+    )
+    .await
+    .expect("the removal plan should succeed");
+    let attribute = case.top_level_attribute();
+    assert!(
+        removal_plan.plan.effects().iter().any(|effect| matches!(
+            effect,
+            carina_core::effect::Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == attribute)
+        )),
+        "an Applied row must initially plan the nested removal: {:#?}",
+        removal_plan.plan,
+    );
+
+    let error = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("the fixture rejects IGW updates");
+    assert!(error.to_string().contains("failed"), "{error:?}");
+
+    let saved = fixture.read_state().await;
+    let row = serde_json::to_value(
+        saved
+            .find_resource("mock", "ec2.InternetGateway", "igw")
+            .expect("failed update must retain the IGW row"),
+    )
+    .expect("IGW row must serialize");
+    match case {
+        NestedPendingRemovalCase::StructAttribute => assert_eq!(
+            row["current"]["attributes"]["settings"]["description"],
+            serde_json::json!("web"),
+            "the failed provider update must leave the nested struct field live"
+        ),
+        NestedPendingRemovalCase::ListElement | NestedPendingRemovalCase::DuplicateListElement => {
+            assert_eq!(
+                row["current"]["attributes"]["rules"][0]["description"],
+                serde_json::json!("web"),
+                "the failed provider update must leave the list-element field live"
+            )
+        }
+    }
+
+    if complete_retry {
+        assert_eq!(
+            row["explicit"]["children"]["rules"]["kind"],
+            serde_json::json!("whole-value"),
+            "ambiguous carried list identity must fall back to whole-value authoring"
+        );
+    }
+
+    let (parsed, unresolved_parsed) = load();
+    let provider_configs = resolved_provider_configs(&parsed);
+    let saved = Some(saved);
+    let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &provider_configs,
+        &unresolved_parsed.resources,
+        &saved,
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        base_dir,
+    )
+    .await
+    .expect("retry plan should succeed");
+    assert!(
+        retry.plan.effects().iter().any(|effect| matches!(
+            effect,
+            carina_core::effect::Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == attribute)
+        )),
+        "the next plan must retry the failed nested removal; explicit={:#?}, plan={:#?}",
+        row["explicit"],
+        retry.plan,
+    );
+
+    if !complete_retry {
+        return;
+    }
+
+    shared
+        .allow_internet_gateway_updates
+        .store(true, Ordering::SeqCst);
+    let (mut parsed, unresolved_parsed) = load();
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect("the retry update should apply the desired whole list");
+
+    let applied = fixture.read_state().await;
+    let applied_row = serde_json::to_value(
+        applied
+            .find_resource("mock", "ec2.InternetGateway", "igw")
+            .expect("successful retry must retain the IGW row"),
+    )
+    .expect("applied IGW row must serialize");
+    assert_eq!(
+        applied_row["current"]["attributes"]["rules"],
+        serde_json::json!([{ "port": 80 }, { "port": 80 }]),
+        "the successful retry must send the current desired list"
+    );
+    assert_eq!(
+        applied_row["explicit"]["children"]["rules"]["kind"],
+        serde_json::json!("list-elements"),
+        "an Applied write must clear the whole-value fallback"
+    );
+
+    let (parsed, unresolved_parsed) = load();
+    let provider_configs = resolved_provider_configs(&parsed);
+    let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &provider_configs,
+        &unresolved_parsed.resources,
+        &Some(applied),
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        base_dir,
+    )
+    .await
+    .expect("plan after the successful retry should succeed");
+    assert!(
+        !final_plan.plan.has_mutations(),
+        "the Applied write must converge: {:#?}",
+        final_plan.plan
+    );
+}
+
+#[tokio::test]
+async fn failed_update_nested_struct_pending_removal_is_replanned() {
+    assert_failed_nested_pending_removal_is_replanned(
+        NestedPendingRemovalCase::StructAttribute,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_update_list_element_nested_pending_removal_is_replanned() {
+    assert_failed_nested_pending_removal_is_replanned(NestedPendingRemovalCase::ListElement, false)
+        .await;
+}
+
+#[tokio::test]
+async fn ambiguous_list_pending_removal_retries_whole_value_and_converges() {
+    assert_failed_nested_pending_removal_is_replanned(
+        NestedPendingRemovalCase::DuplicateListElement,
+        true,
+    )
+    .await;
 }
 
 #[tokio::test]

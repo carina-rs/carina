@@ -777,7 +777,8 @@ pub(super) fn find_changed_attributes(
                             Some(
                                 ExplicitFields::Leaf
                                 | ExplicitFields::List { .. }
-                                | ExplicitFields::ListElements { .. },
+                                | ExplicitFields::ListElements { .. }
+                                | ExplicitFields::WholeValue { .. },
                             )
                             | None => &ExplicitFields::Unrecorded,
                         },
@@ -799,15 +800,25 @@ pub(super) fn find_changed_attributes(
     // attribute removal is not detected for those rows. A later desired-backed
     // state write can seed the record from desired keys (never provider keys),
     // after which removals of those recorded keys are detectable.
-    if let Some(ExplicitFields::Struct { children }) = prev_explicit {
-        for key in children.keys() {
-            if desired.contains_key(key) {
-                continue;
-            }
-            if projected_current.contains_key(key) {
-                changed.push(key.clone());
+    match prev_explicit {
+        Some(ExplicitFields::Struct { children }) => {
+            for key in children.keys() {
+                if desired.contains_key(key) {
+                    continue;
+                }
+                if projected_current.contains_key(key) {
+                    changed.push(key.clone());
+                }
             }
         }
+        Some(
+            ExplicitFields::Leaf
+            | ExplicitFields::List { .. }
+            | ExplicitFields::ListElements { .. }
+            | ExplicitFields::WholeValue { .. }
+            | ExplicitFields::Unrecorded,
+        )
+        | None => {}
     }
 
     changed

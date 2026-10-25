@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
 use carina_core::effect::Effect;
+use carina_state::StateFile;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -135,7 +136,7 @@ fn combined_output(output: &Output) -> String {
 }
 
 fn only_current(state: &Value) -> &Value {
-    assert_eq!(state["version"], Value::from(15));
+    assert_eq!(state["version"], Value::from(StateFile::CURRENT_VERSION));
     &only_resource(state)["current"]
 }
 

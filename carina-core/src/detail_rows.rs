@@ -729,7 +729,8 @@ fn build_update_rows(
             schema,
             defs,
             detail,
-        ),
+        )
+        .with_explicit(explicit),
     );
     rows.extend(attr_rows.rows);
 
@@ -844,6 +845,7 @@ struct AttributeDiffContext<'a> {
     detail: DetailLevel,
     forces_replacement_keys: Option<&'a HashSet<&'a str>>,
     cascade_ref_hints: &'a [(String, String)],
+    explicit: Option<&'a crate::explicit::ExplicitFields>,
 }
 
 impl<'a> AttributeDiffContext<'a> {
@@ -862,6 +864,7 @@ impl<'a> AttributeDiffContext<'a> {
             detail,
             forces_replacement_keys: None,
             cascade_ref_hints: &[],
+            explicit: None,
         }
     }
 
@@ -882,8 +885,65 @@ impl<'a> AttributeDiffContext<'a> {
             detail,
             forces_replacement_keys: Some(forces_replacement_keys),
             cascade_ref_hints,
+            explicit: None,
         }
     }
+
+    fn with_explicit(mut self, explicit: Option<&'a crate::explicit::ExplicitFields>) -> Self {
+        self.explicit = explicit;
+        self
+    }
+
+    fn is_whole_value_authored(&self, key: &str) -> bool {
+        is_whole_value(self.explicit_for_key(key))
+    }
+
+    fn explicit_for_key(&self, key: &str) -> Option<&'a crate::explicit::ExplicitFields> {
+        explicit_child(self.explicit, key)
+    }
+}
+
+fn explicit_child<'a>(
+    explicit: Option<&'a crate::explicit::ExplicitFields>,
+    key: &str,
+) -> Option<&'a crate::explicit::ExplicitFields> {
+    match explicit {
+        Some(crate::explicit::ExplicitFields::Struct { children }) => children.get(key),
+        Some(
+            crate::explicit::ExplicitFields::Leaf
+            | crate::explicit::ExplicitFields::List { .. }
+            | crate::explicit::ExplicitFields::ListElements { .. }
+            | crate::explicit::ExplicitFields::WholeValue { .. }
+            | crate::explicit::ExplicitFields::Unrecorded,
+        )
+        | None => None,
+    }
+}
+
+fn explicit_list_element(
+    explicit: Option<&crate::explicit::ExplicitFields>,
+    stored_index: usize,
+) -> Option<&crate::explicit::ExplicitFields> {
+    match explicit {
+        Some(crate::explicit::ExplicitFields::ListElements { elements }) => {
+            elements.get(stored_index)
+        }
+        Some(crate::explicit::ExplicitFields::List { element }) => Some(element),
+        Some(
+            crate::explicit::ExplicitFields::Leaf
+            | crate::explicit::ExplicitFields::Struct { .. }
+            | crate::explicit::ExplicitFields::WholeValue { .. }
+            | crate::explicit::ExplicitFields::Unrecorded,
+        )
+        | None => None,
+    }
+}
+
+fn is_whole_value(explicit: Option<&crate::explicit::ExplicitFields>) -> bool {
+    matches!(
+        explicit,
+        Some(crate::explicit::ExplicitFields::WholeValue { .. })
+    )
 }
 
 fn project_from_attrs(
@@ -978,14 +1038,31 @@ fn build_attribute_diff_rows(
             continue;
         }
 
+        // An attribute-level WholeValue means the entire value is authoritative.
+        // This is the carried-list ambiguity fallback: using
+        // element-level display pairing here could hide the pending removal
+        // behind the same guessed identity the state record intentionally
+        // refused to claim.
+        if ctx.is_whole_value_authored(key) && is_list_of_maps(new_value) {
+            let old = old_value
+                .map(render_value)
+                .unwrap_or_else(|| render_other("(none)"));
+            rows.push(changed_row(
+                key.to_string(),
+                old,
+                render_value(new_value),
+                forces_replacement,
+            ));
+            continue;
+        }
+
         if is_list_of_maps(new_value) {
             match build_list_of_maps_diff_row(
                 key,
                 old_value,
                 new_value,
                 attr_type,
-                ctx.defs,
-                ctx.detail,
+                &ctx,
                 forces_replacement,
             ) {
                 Some(row) => rows.push(row),
@@ -1004,6 +1081,7 @@ fn build_attribute_diff_rows(
                 ctx.detail,
                 forces_replacement,
                 (key == "tags").then_some(&to.default_tag_keys),
+                ctx.explicit_for_key(key),
             ) {
                 Some(row) => rows.push(row),
                 None if forces_replacement => rows.push(DetailRow::ForceReplaceMapHeader {
@@ -1136,7 +1214,8 @@ fn build_replace_rows_from_attributes(
             detail,
             &force_keys,
             cascade_ref_hints,
-        ),
+        )
+        .with_explicit(explicit),
     );
     rows.extend(attr_rows.rows);
 
@@ -1370,8 +1449,11 @@ fn build_map_diff_row(
     detail: DetailLevel,
     forces_replacement: bool,
     default_tag_keys: Option<&DefaultTagKeys>,
+    explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Option<DetailRow> {
-    let mut entries = compute_map_diff_entries(old_value, new_value, attr_type, defs, detail);
+    let mut entries = compute_map_diff_entries_with_explicit(
+        old_value, new_value, attr_type, defs, detail, explicit,
+    );
     if let Some(default_tag_keys) = default_tag_keys {
         for entry in &mut entries {
             match entry {
@@ -1394,12 +1476,24 @@ fn build_map_diff_row(
     Some(map_diff_row(key.to_string(), entries, forces_replacement))
 }
 
+#[cfg(test)]
 fn compute_map_diff_entries(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
+) -> Vec<MapDiffEntryIR> {
+    compute_map_diff_entries_with_explicit(old_value, new_value, attr_type, defs, detail, None)
+}
+
+fn compute_map_diff_entries_with_explicit(
+    old_value: Option<&Value>,
+    new_value: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    detail: DetailLevel,
+    explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<MapDiffEntryIR> {
     let new_map = match new_value {
         Value::Concrete(ConcreteValue::Map(m)) => m,
@@ -1429,6 +1523,7 @@ fn compute_map_diff_entries(
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
                 let entry_type = map_entry_subtype(attr_type, &e.key, defs);
+                let entry_explicit = explicit_child(explicit, &e.key);
                 // Site 5 (carina#3073): `compute_map_diff` flagged this
                 // entry as changed via schema-blind `semantically_equal`.
                 // For a scalar/leaf entry, re-test schema-aware: an
@@ -1448,16 +1543,26 @@ fn compute_map_diff_entries(
                 {
                     continue;
                 }
+                if is_whole_value(entry_explicit) && is_list_of_maps(&e.new_value) {
+                    entries.push(MapDiffEntryIR::Changed {
+                        key: RenderedKey::from_raw(&e.key),
+                        old: render_value(&e.old_value),
+                        new: render_value(&e.new_value),
+                        annotation: None,
+                    });
+                    continue;
+                }
                 // If both old and new are maps, recursively diff
                 if matches!(&e.old_value, Value::Concrete(ConcreteValue::Map(_)))
                     && matches!(&e.new_value, Value::Concrete(ConcreteValue::Map(_)))
                 {
-                    let nested = compute_map_diff_entries(
+                    let nested = compute_map_diff_entries_with_explicit(
                         Some(&e.old_value),
                         &e.new_value,
                         entry_type,
                         defs,
                         detail,
+                        entry_explicit,
                     );
                     // #2910: `from_vec` returns None for the all-empty
                     // recursive case (every grandchild was itself
@@ -1471,13 +1576,15 @@ fn compute_map_diff_entries(
                     }
                 } else if is_list_of_maps(&e.new_value) {
                     // List-of-maps: compute per-item field-level diffs
-                    let (_, modified, added, removed) = compute_list_of_maps_diff_parts(
-                        Some(&e.old_value),
-                        &e.new_value,
-                        entry_type,
-                        defs,
-                        detail,
-                    );
+                    let (_, modified, added, removed) =
+                        compute_list_of_maps_diff_parts_with_explicit(
+                            Some(&e.old_value),
+                            &e.new_value,
+                            entry_type,
+                            defs,
+                            detail,
+                            entry_explicit,
+                        );
                     // #2910: `from_parts` returns None when every
                     // paired element was dropped per #2886 and there
                     // are no wholly-added / wholly-removed elements
@@ -1553,12 +1660,17 @@ fn build_list_of_maps_diff_row(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-    detail: DetailLevel,
+    ctx: &AttributeDiffContext<'_>,
     forces_replacement: bool,
 ) -> Option<DetailRow> {
-    let (unchanged, modified, added, removed) =
-        compute_list_of_maps_diff_parts(old_value, new_value, attr_type, defs, detail);
+    let (unchanged, modified, added, removed) = compute_list_of_maps_diff_parts_with_explicit(
+        old_value,
+        new_value,
+        attr_type,
+        ctx.defs,
+        ctx.detail,
+        ctx.explicit_for_key(key),
+    );
     let block = NonEmptyListOfMapsBlock::from_parts(unchanged, modified, added, removed)?;
     Some(list_of_maps_diff_row(
         key.to_string(),
@@ -1573,6 +1685,24 @@ fn compute_list_of_maps_diff_parts(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
+) -> (
+    Vec<RenderedValue>,
+    Vec<ListOfMapsDiffModified>,
+    Vec<ListOfMapsDiffItem>,
+    Vec<ListOfMapsDiffItem>,
+) {
+    compute_list_of_maps_diff_parts_with_explicit(
+        old_value, new_value, attr_type, defs, detail, None,
+    )
+}
+
+fn compute_list_of_maps_diff_parts_with_explicit(
+    old_value: Option<&Value>,
+    new_value: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    detail: DetailLevel,
+    explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> (
     Vec<RenderedValue>,
     Vec<ListOfMapsDiffModified>,
@@ -1677,11 +1807,13 @@ fn compute_list_of_maps_diff_parts(
             Value::Concrete(ConcreteValue::Map(new_map)),
         ) = (&old_items[oi], &new_items[ni])
         {
+            let element_explicit = explicit_list_element(explicit, oi);
             let mut keys: Vec<_> = new_map.keys().collect();
             keys.sort();
             let mut fields: Vec<ListOfMapsDiffField> = Vec::new();
             let mut unchanged_count: usize = 0;
             for k in keys {
+                let field_explicit = explicit_child(element_explicit, k);
                 // Site 4 (carina#3073): resolve the struct field's
                 // type so an enum-equal field (`effect: allow` vs
                 // `Allow`) is treated as unchanged instead of emitting
@@ -1703,8 +1835,14 @@ fn compute_list_of_maps_diff_parts(
                 if matches!(old_val, Some(Value::Concrete(ConcreteValue::Map(_))))
                     && matches!(&new_map[k], Value::Concrete(ConcreteValue::Map(_)))
                 {
-                    let nested =
-                        compute_map_diff_entries(old_val, &new_map[k], field_type, defs, detail);
+                    let nested = compute_map_diff_entries_with_explicit(
+                        old_val,
+                        &new_map[k],
+                        field_type,
+                        defs,
+                        detail,
+                        field_explicit,
+                    );
                     // carina#3258: when every nested entry was
                     // suppressed (display-equal phantom or
                     // schema-aware leaf-skip), the parent header alone
@@ -1721,6 +1859,14 @@ fn compute_list_of_maps_diff_parts(
                     fields.push(ListOfMapsDiffField::NestedMapChanged {
                         key: RenderedKey::from_raw(k),
                         entries: nested,
+                    });
+                } else if is_whole_value(field_explicit) && is_list_of_maps(&new_map[k]) {
+                    fields.push(ListOfMapsDiffField::Changed {
+                        key: RenderedKey::from_raw(k),
+                        old: old_val
+                            .map(render_value)
+                            .unwrap_or_else(|| render_other("(none)")),
+                        new: render_value(&new_map[k]),
                     });
                 } else if let Some(diff) =
                     compute_string_list_change(old_val, &new_map[k], field_type, defs)
@@ -2018,6 +2164,7 @@ fn string_list_inner_type<'a>(
 mod tests {
     use super::*;
     use crate::effect::{ChangedCreateOnly, EffectGeneration};
+    use crate::explicit::{ExplicitFields, PendingPaths};
     use crate::parser::ProviderConfig;
     use crate::plan::ReplaceDisplayMetadata;
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
@@ -2944,6 +3091,353 @@ mod tests {
                 )
                 .unwrap(),
             }]
+        );
+    }
+
+    #[test]
+    fn update_legacy_leaf_list_authoring_keeps_element_level_display() {
+        let rule = |description: Option<&str>| {
+            let mut fields =
+                IndexMap::from([("port".to_string(), Value::Concrete(ConcreteValue::Int(80)))]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let id = ResourceId::with_identity("test.Listener", "listener");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![rule(Some("web")), rule(None)])),
+            )]),
+        );
+        let to = Resource::new("test.Listener", "listener").with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![rule(None), rule(None)])),
+        );
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("listener-id"),
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["rules".to_string()],
+        };
+        let explicit = HashMap::from([(
+            id,
+            crate::explicit::ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "rules".to_string(),
+                    crate::explicit::ExplicitFields::Leaf,
+                )]),
+            },
+        )]);
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, Some(&explicit));
+
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, DetailRow::ListOfMapsDiff { key, .. } if key == "rules")),
+            "legacy Leaf must retain the ordinary element-level display: {rows:#?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, DetailRow::Changed { key, .. } if key == "rules")),
+            "legacy Leaf must not opt into whole-value display: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn update_whole_value_list_avoids_element_identity_display() {
+        let rule = |description: Option<&str>| {
+            let mut fields =
+                IndexMap::from([("port".to_string(), Value::Concrete(ConcreteValue::Int(80)))]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let id = ResourceId::with_identity("test.Listener", "listener");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![rule(Some("web")), rule(None)])),
+            )]),
+        );
+        let to = Resource::new("test.Listener", "listener").with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![rule(None), rule(None)])),
+        );
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("listener-id"),
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["rules".to_string()],
+        };
+        let explicit = HashMap::from([(
+            id,
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "rules".to_string(),
+                    ExplicitFields::WholeValue {
+                        pending: PendingPaths::try_new([vec!["description".to_string()]]).unwrap(),
+                    },
+                )]),
+            },
+        )]);
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, Some(&explicit));
+
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, DetailRow::Changed { key, .. } if key == "rules")),
+            "WholeValue must render the list without element pairing: {rows:#?}"
+        );
+        assert!(format!("{rows:#?}").contains("description"));
+    }
+
+    #[test]
+    fn update_nested_whole_value_list_avoids_element_identity_display() {
+        let rule = |description: Option<&str>| {
+            let mut fields =
+                IndexMap::from([("port".to_string(), Value::Concrete(ConcreteValue::Int(80)))]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let settings = |rules| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(rules)),
+            )])))
+        };
+        let id = ResourceId::with_identity("test.Listener", "listener");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "settings".to_string(),
+                settings(vec![rule(Some("web")), rule(None)]),
+            )]),
+        );
+        let to = Resource::new("test.Listener", "listener")
+            .with_attribute("settings", settings(vec![rule(None), rule(None)]));
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("listener-id"),
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["settings".to_string()],
+        };
+        let explicit = HashMap::from([(
+            id,
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "settings".to_string(),
+                    ExplicitFields::Struct {
+                        children: HashMap::from([(
+                            "rules".to_string(),
+                            ExplicitFields::WholeValue {
+                                pending: PendingPaths::try_new([vec!["description".to_string()]])
+                                    .unwrap(),
+                            },
+                        )]),
+                    },
+                )]),
+            },
+        )]);
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, Some(&explicit));
+
+        let [DetailRow::MapDiff { key, entries }] = rows.as_slice() else {
+            panic!("nested WholeValue must stay inside the parent map row: {rows:#?}");
+        };
+        assert_eq!(key, "settings");
+        assert!(matches!(
+            entries.as_slice(),
+            [MapDiffEntryIR::Changed { key, .. }] if key.raw() == "rules"
+        ));
+    }
+
+    #[test]
+    fn update_whole_value_nested_inside_list_element_avoids_inner_element_pairing() {
+        let rule = |port: i64, description: Option<&str>, enabled: bool| {
+            let mut fields = IndexMap::from([
+                (
+                    "port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(port)),
+                ),
+                (
+                    "enabled".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(enabled)),
+                ),
+            ]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let listener = |rules| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("primary".into())),
+                ),
+                (
+                    "settings".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "rules".to_string(),
+                        Value::Concrete(ConcreteValue::List(rules)),
+                    )]))),
+                ),
+            ])))
+        };
+        let id = ResourceId::with_identity("test.ListenerSet", "listeners");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "listeners".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![listener(vec![
+                    rule(80, Some("web"), true),
+                    rule(443, None, true),
+                ])])),
+            )]),
+        );
+        let to = Resource::new("test.ListenerSet", "listeners").with_attribute(
+            "listeners",
+            Value::Concrete(ConcreteValue::List(vec![listener(vec![
+                rule(80, None, false),
+                rule(443, None, true),
+            ])])),
+        );
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("listener-set-id"),
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["listeners".to_string()],
+        };
+        let explicit = HashMap::from([(
+            id,
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "listeners".to_string(),
+                    ExplicitFields::ListElements {
+                        elements: vec![ExplicitFields::Struct {
+                            children: HashMap::from([
+                                ("name".to_string(), ExplicitFields::Leaf),
+                                (
+                                    "settings".to_string(),
+                                    ExplicitFields::Struct {
+                                        children: HashMap::from([(
+                                            "rules".to_string(),
+                                            ExplicitFields::WholeValue {
+                                                pending: PendingPaths::try_new([vec![
+                                                    "description".to_string(),
+                                                ]])
+                                                .unwrap(),
+                                            },
+                                        )]),
+                                    },
+                                ),
+                            ]),
+                        }],
+                    },
+                )]),
+            },
+        )]);
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, Some(&explicit));
+
+        let [DetailRow::ListOfMapsDiff { key, block }] = rows.as_slice() else {
+            panic!("outer list must retain its element-level row: {rows:#?}");
+        };
+        assert_eq!(key, "listeners");
+        let [modified] = block.modified() else {
+            panic!("outer list must have one modified element: {block:#?}");
+        };
+        let Some(ListOfMapsDiffField::NestedMapChanged { key, entries }) = modified
+            .fields
+            .as_slice()
+            .iter()
+            .find(|field| matches!(field, ListOfMapsDiffField::NestedMapChanged { key, .. } if key.raw() == "settings"))
+        else {
+            panic!("settings must render as a nested map: {modified:#?}");
+        };
+        assert_eq!(key.raw(), "settings");
+        assert!(matches!(
+            entries.as_slice(),
+            [MapDiffEntryIR::Changed { key, .. }] if key.raw() == "rules"
+        ));
+    }
+
+    #[test]
+    fn deleting_a_whole_list_element_keeps_aligned_element_display() {
+        let rule = |port, description: Option<&str>| {
+            let mut fields = IndexMap::from([(
+                "port".to_string(),
+                Value::Concrete(ConcreteValue::Int(port)),
+            )]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let applied_rules = Value::Concrete(ConcreteValue::List(vec![
+            rule(80, Some("web")),
+            rule(443, None),
+        ]));
+        let desired_rules = Value::Concrete(ConcreteValue::List(vec![rule(443, None)]));
+        let applied = Resource::new("test.Listener", "listener")
+            .with_attribute("rules", applied_rules.clone());
+        let desired =
+            Resource::new("test.Listener", "listener").with_attribute("rules", desired_rules);
+        let stored = HashMap::from([("rules".to_string(), applied_rules.clone())]);
+        let prior = crate::explicit::build_from_resource_for_stored_values(&applied, &stored, None);
+        let carried = crate::explicit::build_carried_from_resource_for_stored_values(
+            &desired, &stored, &prior, &stored, None,
+        );
+        let ExplicitFields::Struct { children } = &carried else {
+            panic!("expected carried root Struct");
+        };
+        assert!(matches!(
+            children["rules"],
+            ExplicitFields::ListElements { .. }
+        ));
+
+        let id = desired.id.clone();
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("listener-id"),
+            from: Box::new(State::existing(id.clone(), stored)),
+            to: resolved(desired),
+            changed_attributes: vec!["rules".to_string()],
+        };
+        let explicit = HashMap::from([(id, carried)]);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, Some(&explicit));
+
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, DetailRow::ListOfMapsDiff { key, .. } if key == "rules")),
+            "whole-element deletion must retain element-level display: {rows:#?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, DetailRow::Changed { key, .. } if key == "rules"))
         );
     }
 

@@ -7,6 +7,7 @@ use carina_core::detail_rows::{
     build_replace_detail_rows_from_display, delete_identifier_fallback_row,
 };
 use carina_core::effect::Effect;
+use carina_core::explicit::ExplicitFields;
 use carina_core::plan::{Plan, PlanSummary, ReplaceDisplayInfo};
 use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, deferred_for_detail_rows,
@@ -101,13 +102,14 @@ impl App {
     #[cfg(test)]
     pub(crate) fn for_plan(plan: &Plan, schemas: &SchemaRegistry) -> Self {
         let historical_display = HistoricalDisplayAttributes::for_plan(plan);
-        Self::new(plan, schemas, &historical_display)
+        Self::new(plan, schemas, &historical_display, None)
     }
 
     pub fn new(
         plan: &Plan,
         schemas: &SchemaRegistry,
         historical_display: &HistoricalDisplayAttributes,
+        prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     ) -> Self {
         let schemas_opt = if schemas.is_empty() {
             None
@@ -134,6 +136,7 @@ impl App {
                     schemas_opt,
                     historical_display,
                     replacement_create_info.get(&idx).copied(),
+                    prev_explicit,
                 )
             })
             .collect();
@@ -733,22 +736,28 @@ fn effect_to_node(
     schemas: Option<&SchemaRegistry>,
     historical_display: &HistoricalDisplayAttributes,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
+    prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
 ) -> TreeNode {
-    let mut detail_rows = if let (Effect::Create(resource), Some(replacement)) =
-        (effect, replacement_info)
-    {
-        build_replace_detail_rows_from_display(
-            plan,
-            resource,
-            replacement,
-            historical_display,
-            schemas,
-            DetailLevel::Full,
-            None,
-        )
-    } else {
-        build_detail_rows_by_instance(effect, schemas, DetailLevel::Full, historical_display, None)
-    };
+    let mut detail_rows =
+        if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
+            build_replace_detail_rows_from_display(
+                plan,
+                resource,
+                replacement,
+                historical_display,
+                schemas,
+                DetailLevel::Full,
+                prev_explicit.and_then(|map| map.get(&resource.id)),
+            )
+        } else {
+            build_detail_rows_by_instance(
+                effect,
+                schemas,
+                DetailLevel::Full,
+                historical_display,
+                prev_explicit,
+            )
+        };
     if let Effect::Remove { id } = effect {
         detail_rows.extend(
             plan.abandoned_deposed_generations()

@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[test]
-fn v15_round_trips_none_applied_in_flight_and_missing_identifier() {
+fn v15_migrates_to_v16_and_round_trips_all_current_instance_variants() {
     let json = serde_json::json!({
         "version": 15,
         "serial": 4,
@@ -63,9 +63,12 @@ fn v15_round_trips_none_applied_in_flight_and_missing_identifier() {
         "exports": {}
     });
 
-    let state = check_and_migrate(&json.to_string())
-        .expect("v15 state must load")
-        .into_state();
+    let migrated = check_and_migrate(&json.to_string()).expect("v15 state must load");
+    assert_eq!(
+        migrated.migration(),
+        Some(MigrationInfo { from: 15, to: 16 })
+    );
+    let state = migrated.into_state();
     assert!(matches!(
         state.resources()[0].current(),
         CurrentInstance::None
@@ -128,7 +131,7 @@ fn v15_in_flight_row_has_stable_golden_serialization() {
 }
 
 #[test]
-fn v14_to_v15_preserves_write_only_partial_and_deposed_fields() {
+fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
     let json = serde_json::json!({
         "version": 14,
         "serial": 2,
@@ -158,7 +161,10 @@ fn v14_to_v15_preserves_write_only_partial_and_deposed_fields() {
     let migrated = check_and_migrate(&json.to_string()).expect("v14 state must migrate");
     assert_eq!(
         migrated.migration(),
-        Some(MigrationInfo { from: 14, to: 15 })
+        Some(MigrationInfo {
+            from: 14,
+            to: StateFile::CURRENT_VERSION,
+        })
     );
     let state = migrated.into_state();
     let CurrentInstance::Applied {
@@ -257,6 +263,81 @@ fn list_rule(port: i64, description: Option<&str>) -> Value {
     Value::Concrete(ConcreteValue::Map(fields))
 }
 
+fn list_rule_with_tag(port: i64, description: Option<&str>, tag: Option<&str>) -> Value {
+    let Value::Concrete(ConcreteValue::Map(mut fields)) = list_rule(port, description) else {
+        unreachable!("list_rule always returns a map");
+    };
+    if let Some(tag) = tag {
+        fields.insert(
+            "tag".to_string(),
+            Value::Concrete(ConcreteValue::String(tag.to_string().into())),
+        );
+    }
+    Value::Concrete(ConcreteValue::Map(fields))
+}
+
+fn with_provider_status(mut rule: Value) -> Value {
+    let Value::Concrete(ConcreteValue::Map(fields)) = &mut rule else {
+        unreachable!("test rule is a map");
+    };
+    fields.insert(
+        "provider_status".to_string(),
+        Value::Concrete(ConcreteValue::String("ready".into())),
+    );
+    rule
+}
+
+fn carried_rules_fixture(
+    applied_rules: Vec<Value>,
+    desired_rules: Vec<Value>,
+    fresh_rules: Vec<Value>,
+) -> (Resource, State, ResourceState) {
+    let applied = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(applied_rules.clone())),
+        );
+    let prior_provider = State::existing(
+        applied.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(applied_rules)),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let prior = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&applied),
+        &prior_provider,
+        None,
+        None,
+        RowBasis::Imported,
+        None,
+    )
+    .expect("initial applied row");
+
+    let desired = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute("rules", Value::Concrete(ConcreteValue::List(desired_rules)));
+    let fresh = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(fresh_rules)),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let carried = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &fresh,
+        Some(&prior),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .expect("carried row");
+
+    (desired, fresh, carried)
+}
+
 fn assert_explicit_struct_keys(explicit: &ExplicitFields, expected: &[&str]) {
     let ExplicitFields::Struct { children } = explicit else {
         panic!("expected Struct, got {explicit:?}");
@@ -267,10 +348,22 @@ fn assert_explicit_struct_keys(explicit: &ExplicitFields, expected: &[&str]) {
     }
 }
 
+fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
+    ExplicitFields::WholeValue {
+        pending: carina_core::explicit::PendingPaths::try_new(
+            paths
+                .iter()
+                .map(|path| path.iter().map(|segment| (*segment).to_string()).collect()),
+        )
+        .expect("test pending paths are non-empty and valid"),
+    }
+}
+
 #[test]
 fn test_state_file_new() {
     let state = StateFile::new();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
+    assert_eq!(StateFile::CURRENT_VERSION, 16);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
@@ -280,7 +373,7 @@ fn test_state_file_new() {
 fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 15);
+    assert_eq!(StateFile::CURRENT_VERSION, 16);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -1673,6 +1766,673 @@ fn test_from_provider_state_carry_prior_drops_removed_key_absent_from_fresh_stat
 }
 
 #[test]
+fn carried_top_level_unrecorded_child_still_plans_its_removal() {
+    use carina_core::differ::{Diff, diff};
+
+    let authored = Resource::with_provider("mock", "test.Resource", "main", None).with_attribute(
+        "legacy",
+        Value::Concrete(ConcreteValue::String("provider-value".into())),
+    );
+    let provider_state = State::existing(
+        authored.id.clone(),
+        HashMap::from([(
+            "legacy".to_string(),
+            Value::Concrete(ConcreteValue::String("provider-value".into())),
+        )]),
+    )
+    .with_identifier("resource-id");
+    let mut prior = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&authored),
+        &provider_state,
+        None,
+        None,
+        RowBasis::Imported,
+        None,
+    )
+    .expect("prior row");
+    prior.explicit = ExplicitFields::Struct {
+        children: HashMap::from([("legacy".to_string(), ExplicitFields::Unrecorded)]),
+    };
+
+    let desired = Resource::with_provider("mock", "test.Resource", "main", None);
+    let carried = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &provider_state,
+        Some(&prior),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .expect("carried row");
+    let ExplicitFields::Struct { children } = &carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(children.get("legacy"), Some(&ExplicitFields::Unrecorded));
+
+    let mut state = StateFile::new();
+    state.upsert_resource(carried.clone()).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&desired),
+            &provider_state,
+            saved.get(&desired.id),
+            Some(&carried.explicit),
+            None,
+        ),
+        Diff::Update {
+            ref changed_attributes,
+            ..
+        } if changed_attributes == &["legacy".to_string()]
+    ));
+}
+
+#[test]
+fn carried_list_pending_removal_transfers_across_unique_reorder() {
+    use carina_core::differ::{Diff, diff};
+
+    let (desired, fresh, carried) = carried_rules_fixture(
+        vec![list_rule(80, Some("web")), list_rule(443, None)],
+        vec![list_rule(443, None), list_rule(80, None)],
+        vec![list_rule(443, None), list_rule(80, Some("web"))],
+    );
+    let explicit = carried.explicit.clone();
+    let ExplicitFields::Struct { children } = &explicit else {
+        panic!("expected carried root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("a uniquely paired removal must retain aligned ListElements");
+    };
+    assert_explicit_struct_keys(&elements[0], &["port"]);
+    assert_explicit_struct_keys(&elements[1], &["port", "description"]);
+
+    let mut state = StateFile::new();
+    state.upsert_resource(carried).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&desired),
+            &fresh,
+            saved.get(&desired.id),
+            Some(&explicit),
+            None,
+        ),
+        Diff::Update {
+            ref changed_attributes,
+            ..
+        } if changed_attributes == &["rules".to_string()]
+    ));
+}
+
+#[test]
+fn carried_list_with_secret_field_still_pairs_by_ordinary_identity_fields() {
+    let authored_rule = |port: i64, description: Option<&str>, token: &str| {
+        let Value::Concrete(ConcreteValue::Map(mut fields)) = list_rule(port, description) else {
+            unreachable!("list_rule always returns a map");
+        };
+        fields.insert(
+            "token".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(token.to_string().into()),
+            )))),
+        );
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let provider_rule = |port: i64, description: Option<&str>, token: &str| {
+        let Value::Concrete(ConcreteValue::Map(mut fields)) = list_rule(port, description) else {
+            unreachable!("list_rule always returns a map");
+        };
+        fields.insert(
+            "token".to_string(),
+            Value::Concrete(ConcreteValue::String(token.to_string().into())),
+        );
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+
+    let applied = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![
+                authored_rule(80, Some("web"), "alpha"),
+                authored_rule(443, None, "beta"),
+            ])),
+        );
+    let prior_provider = State::existing(
+        applied.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                provider_rule(80, Some("web"), "alpha"),
+                provider_rule(443, None, "beta"),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let prior = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&applied),
+        &prior_provider,
+        None,
+        None,
+        RowBasis::Imported,
+        None,
+    )
+    .expect("initial row with secret-bearing list elements");
+
+    let desired = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![
+                authored_rule(443, None, "beta"),
+                authored_rule(80, None, "alpha"),
+            ])),
+        );
+    let fresh = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                provider_rule(443, None, "beta"),
+                provider_rule(80, Some("web"), "alpha"),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let carried = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &fresh,
+        Some(&prior),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .expect("secret hashes must not prevent ordinary unique pairing");
+    let ExplicitFields::Struct { children } = &carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("unique port identity should retain aligned ListElements");
+    };
+    assert_explicit_struct_keys(&elements[0], &["port", "token"]);
+    assert_explicit_struct_keys(&elements[1], &["port", "description", "token"]);
+}
+
+#[test]
+fn carried_ambiguous_heterogeneous_removal_retries_the_whole_list() {
+    use carina_core::differ::{Diff, diff};
+
+    let applied_rules = vec![list_rule(80, Some("a")), list_rule(80, Some("b"))];
+    let desired_rules = vec![list_rule(80, None), list_rule(80, Some("b"))];
+    let (desired, fresh, carried) =
+        carried_rules_fixture(applied_rules.clone(), desired_rules, applied_rules);
+    let ExplicitFields::Struct { children } = &carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(children["rules"], whole_value(&[&["description"]]));
+
+    let explicit = carried.explicit.clone();
+    let mut state = StateFile::new();
+    state.upsert_resource(carried).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&desired),
+            &fresh,
+            saved.get(&desired.id),
+            Some(&explicit),
+            None,
+        ),
+        Diff::Update {
+            ref changed_attributes,
+            ..
+        } if changed_attributes == &["rules".to_string()]
+    ));
+}
+
+#[test]
+fn carried_list_pending_removal_with_duplicates_falls_back_to_whole_value() {
+    let (_desired, _fresh, carried) = carried_rules_fixture(
+        vec![list_rule(80, Some("web")), list_rule(80, None)],
+        vec![list_rule(80, None), list_rule(80, None)],
+        vec![list_rule(80, Some("web")), list_rule(80, None)],
+    );
+    let ExplicitFields::Struct { children } = &carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(children["rules"], whole_value(&[&["description"]]));
+
+    let mut state = StateFile::new();
+    state.upsert_resource(carried).unwrap();
+    let encoded = serde_json::to_string(&state).expect("WholeValue state serializes");
+    assert!(encoded.contains(r#""kind":"whole-value""#));
+    let reloaded = check_and_migrate(&encoded)
+        .expect("current WholeValue state reloads")
+        .into_state();
+    assert_eq!(
+        reloaded.resources()[0].explicit,
+        state.resources()[0].explicit
+    );
+}
+
+#[test]
+fn carried_converged_duplicate_elements_stay_aligned_across_refresh() {
+    use carina_core::differ::{Diff, diff};
+
+    let rules = vec![
+        list_rule(80, Some("web")),
+        list_rule(80, Some("web")),
+        list_rule(80, None),
+    ];
+    let (desired, fresh, first_refresh) =
+        carried_rules_fixture(rules.clone(), rules.clone(), rules);
+
+    let assert_aligned = |row: &ResourceState| {
+        let ExplicitFields::Struct { children } = &row.explicit else {
+            panic!("expected carried root Struct");
+        };
+        assert!(
+            matches!(children["rules"], ExplicitFields::ListElements { .. }),
+            "a converged duplicate list must not acquire WholeValue: {:?}",
+            children["rules"]
+        );
+    };
+    assert_aligned(&first_refresh);
+
+    // A stale WholeValue from an earlier ambiguous removal must clear under
+    // the same converged counts, even though the duplicate elements still
+    // cannot be assigned identities.
+    let mut stale_marker = first_refresh.clone();
+    let ExplicitFields::Struct { children } = &mut stale_marker.explicit else {
+        panic!("expected carried root Struct");
+    };
+    children.insert("rules".to_string(), whole_value(&[&["description"]]));
+    let marker_refresh = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &fresh,
+        Some(&stale_marker),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .expect("converged authored counts should clear a stale WholeValue");
+    assert_aligned(&marker_refresh);
+
+    let second_refresh = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &fresh,
+        Some(&marker_refresh),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .expect("a second refresh should remain converged");
+    assert_aligned(&second_refresh);
+
+    let mut state = StateFile::new();
+    state.upsert_resource(second_refresh.clone()).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&desired),
+            &fresh,
+            saved.get(&desired.id),
+            Some(&second_refresh.explicit),
+            None,
+        ),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
+fn carried_list_pending_removal_with_reorder_and_mutation_falls_back_to_whole_value() {
+    let with_protocol = |mut rule: Value| {
+        let Value::Concrete(ConcreteValue::Map(fields)) = &mut rule else {
+            unreachable!("test rule is a map");
+        };
+        fields.insert(
+            "protocol".to_string(),
+            Value::Concrete(ConcreteValue::String("tcp".into())),
+        );
+        rule
+    };
+    let (_desired, _fresh, carried) = carried_rules_fixture(
+        vec![
+            with_protocol(list_rule(80, Some("web"))),
+            with_protocol(list_rule(443, None)),
+        ],
+        vec![
+            with_protocol(list_rule(8443, None)),
+            with_protocol(list_rule(8080, None)),
+        ],
+        vec![
+            with_protocol(list_rule(443, None)),
+            with_protocol(list_rule(80, Some("web"))),
+        ],
+    );
+    let ExplicitFields::Struct { children } = carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(children["rules"], whole_value(&[&["description"]]));
+}
+
+#[test]
+fn carried_whole_value_keeps_remaining_pending_removal_after_partial_success() {
+    use carina_core::differ::{Diff, diff};
+
+    let applied_rules = vec![
+        list_rule_with_tag(80, Some("web"), None),
+        list_rule_with_tag(80, None, Some("legacy")),
+    ];
+    let desired_rules = vec![
+        list_rule_with_tag(80, None, None),
+        list_rule_with_tag(80, None, None),
+    ];
+    let (desired, _fresh, first_carried) =
+        carried_rules_fixture(applied_rules.clone(), desired_rules, applied_rules);
+    let ExplicitFields::Struct { children } = &first_carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(
+        children["rules"],
+        whole_value(&[&["description"], &["tag"]])
+    );
+
+    // The description removal completed out of band, but the tag removal did
+    // not. Clearing WholeValue here would hide the remaining removal again.
+    let partially_updated = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule_with_tag(80, None, None),
+                list_rule_with_tag(80, None, Some("legacy")),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let carried = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &partially_updated,
+        Some(&first_carried),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .expect("partial provider progress should remain carryable");
+    let ExplicitFields::Struct { children } = &carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(children["rules"], whole_value(&[&["tag"]]));
+
+    let explicit = carried.explicit.clone();
+    let mut state = StateFile::new();
+    state.upsert_resource(carried).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&desired),
+            &partially_updated,
+            saved.get(&desired.id),
+            Some(&explicit),
+            None,
+        ),
+        Diff::Update {
+            ref changed_attributes,
+            ..
+        } if changed_attributes == &["rules".to_string()]
+    ));
+}
+
+#[test]
+fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
+    use carina_core::differ::{Diff, diff};
+    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+    let authored_rules = vec![list_rule(80, Some("web")), list_rule(80, None)];
+    let provider_rules: Vec<_> = authored_rules
+        .iter()
+        .cloned()
+        .map(with_provider_status)
+        .collect();
+    let schema = ResourceSchema::new("listener.Listener").attribute(AttributeSchema::new(
+        "rules",
+        AttributeType::list(AttributeType::struct_(
+            "Rule",
+            vec![
+                StructField::new("port", AttributeType::int()),
+                StructField::new("description", AttributeType::string()),
+                StructField::new("provider_status", AttributeType::string()).read_only(),
+            ],
+        )),
+    ));
+    let applied = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(authored_rules.clone())),
+        );
+    let provider = State::existing(
+        applied.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(provider_rules)),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let prior = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&applied),
+        &provider,
+        None,
+        Some(&schema),
+        RowBasis::Imported,
+        None,
+    )
+    .expect("initial applied row");
+    let removed = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, None),
+                list_rule(80, None),
+            ])),
+        );
+    let marker = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&removed),
+        &provider,
+        Some(&prior),
+        Some(&schema),
+        RowBasis::Carried,
+        None,
+    )
+    .expect("ambiguous removal should be carried");
+    let ExplicitFields::Struct { children } = &marker.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(
+        serde_json::to_value(&children["rules"]).unwrap(),
+        serde_json::json!({
+            "kind": "whole-value",
+            "pending": [["description"]]
+        })
+    );
+
+    // The fresh element that still has description now pairs uniquely to the
+    // desired element that re-authored it. A carried refresh can therefore
+    // clear the marker without guessing about the other duplicate.
+    let refreshed = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&applied),
+        &provider,
+        Some(&marker),
+        Some(&schema),
+        RowBasis::Carried,
+        None,
+    )
+    .expect("re-added field should converge on refresh");
+    let ExplicitFields::Struct { children } = &refreshed.explicit else {
+        panic!("expected refreshed root Struct");
+    };
+    assert!(matches!(
+        children["rules"],
+        ExplicitFields::ListElements { .. }
+    ));
+
+    let explicit = refreshed.explicit.clone();
+    let mut state = StateFile::new();
+    state.upsert_resource(refreshed.clone()).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&applied),
+            &provider,
+            saved.get(&applied.id),
+            Some(&explicit),
+            Some(&schema),
+        ),
+        Diff::NoChange(_)
+    ));
+
+    let accepted = AcceptedRequest::create_for_test();
+    let applied_row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&applied),
+        &provider,
+        Some(&refreshed),
+        Some(&schema),
+        RowBasis::Applied(&accepted),
+        None,
+    )
+    .expect("successful apply rebuilds the authoring record");
+    let ExplicitFields::Struct { children } = &applied_row.explicit else {
+        panic!("expected applied root Struct");
+    };
+    assert!(matches!(
+        children["rules"],
+        ExplicitFields::ListElements { .. }
+    ));
+
+    let mut state = StateFile::new();
+    state.upsert_resource(applied_row.clone()).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&applied),
+            &provider,
+            saved.get(&applied.id),
+            Some(&applied_row.explicit),
+            Some(&schema),
+        ),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
+fn carried_legacy_list_mixed_refresh_rebuilds_alignment_and_plans_clean() {
+    use carina_core::differ::{Diff, diff};
+    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+    let authored_rules = vec![list_rule(80, Some("web")), list_rule(443, None)];
+    let provider_rules: Vec<_> = authored_rules
+        .iter()
+        .cloned()
+        .map(with_provider_status)
+        .collect();
+    let schema = ResourceSchema::new("listener.Listener").attribute(AttributeSchema::new(
+        "rules",
+        AttributeType::list(AttributeType::struct_(
+            "Rule",
+            vec![
+                StructField::new("port", AttributeType::int()),
+                StructField::new("description", AttributeType::string()),
+                // Deliberately not read-only: WholeValue would expose this
+                // provider-populated field as a phantom removal.
+                StructField::new("provider_status", AttributeType::string()),
+            ],
+        )),
+    ));
+    let desired = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(authored_rules)),
+        );
+    let provider = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(provider_rules)),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let mut prior = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &provider,
+        None,
+        Some(&schema),
+        RowBasis::Imported,
+        None,
+    )
+    .expect("initial row");
+    prior.explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".to_string(),
+            ExplicitFields::List {
+                element: Box::new(ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("port".to_string(), ExplicitFields::Leaf),
+                        ("description".to_string(), ExplicitFields::Leaf),
+                    ]),
+                }),
+            },
+        )]),
+    };
+
+    let refreshed = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&desired),
+        &provider,
+        Some(&prior),
+        Some(&schema),
+        RowBasis::Carried,
+        None,
+    )
+    .expect("legacy row refresh");
+    let ExplicitFields::Struct { children } = &refreshed.explicit else {
+        panic!("expected refreshed root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("a mixed list without a removal must upgrade to ListElements");
+    };
+    assert_explicit_struct_keys(&elements[0], &["port", "description"]);
+    assert_explicit_struct_keys(&elements[1], &["port"]);
+
+    let mut state = StateFile::new();
+    state.upsert_resource(refreshed.clone()).unwrap();
+    let saved = state.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&desired),
+            &provider,
+            saved.get(&desired.id),
+            Some(&refreshed.explicit),
+            Some(&schema),
+        ),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
+fn carried_list_without_pending_removal_keeps_rebuilt_alignment() {
+    let (_desired, _fresh, carried) = carried_rules_fixture(
+        vec![list_rule(80, Some("web")), list_rule(443, None)],
+        vec![list_rule(80, Some("web")), list_rule(443, None)],
+        vec![list_rule(443, None), list_rule(80, Some("web"))],
+    );
+    let ExplicitFields::Struct { children } = carried.explicit else {
+        panic!("expected carried root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("a list without a pending removal must stay aligned");
+    };
+    assert_explicit_struct_keys(&elements[0], &["port"]);
+    assert_explicit_struct_keys(&elements[1], &["port", "description"]);
+}
+
+#[test]
 fn test_from_provider_state_records_empty_struct_for_fresh_empty_body_resource() {
     // An empty desired resource is an authoritative record that the user
     // authored no attributes, including for green-field writes and imports.
@@ -1916,6 +2676,34 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
         ),
         Diff::NoChange(_)
     ));
+}
+
+#[test]
+fn bodyless_refresh_preserves_whole_value_without_guessing_alignment() {
+    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
+    let provider = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, Some("web")),
+                list_rule(80, None),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let mut existing = ResourceState::new("listener.Listener", "listener", "mock");
+    existing.explicit = ExplicitFields::Struct {
+        children: HashMap::from([("rules".to_string(), whole_value(&[&["description"]]))]),
+    };
+
+    let refreshed = existing
+        .refreshable()
+        .expect("orphan row is refreshable")
+        .refreshed_from_provider_state(&provider, None)
+        .expect("orphan refresh succeeds");
+
+    assert_eq!(refreshed.explicit, existing.explicit);
 }
 
 #[test]
@@ -3547,7 +4335,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 15);
+    assert_eq!(StateFile::CURRENT_VERSION, 16);
     let json = format!(
         r#"{{
         "version": 11,

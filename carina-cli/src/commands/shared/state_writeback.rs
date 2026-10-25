@@ -2422,6 +2422,157 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn failed_update_nested_struct_pending_removal_survives_writeback() {
+        let settings = |description: Option<&str>| {
+            let mut fields = indexmap::IndexMap::from([(
+                "enabled".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            )]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let applied_settings = settings(Some("web"));
+        let applied = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("settings", applied_settings.clone());
+        let desired = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("settings", settings(None));
+        let id = desired.id.clone();
+        let schemas = SchemaRegistry::new();
+        let existing = state_after_accepted_create(
+            &applied,
+            HashMap::from([("settings".to_string(), applied_settings)]),
+            &schemas,
+        );
+        let failed_plan = plan_after_writeback(&desired, &existing, &schemas);
+        assert!(
+            failed_plan.effects().iter().any(|effect| matches!(
+                effect,
+                Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "settings")
+            )),
+            "an Applied row must initially plan the nested struct removal: {failed_plan:#?}"
+        );
+        let managed_current = HashMap::from([(id.clone(), existing.build_state_for_resource(&id))]);
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: existing,
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &managed_current,
+                applied_states: &HashMap::new(),
+                plan: &failed_plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("failed update should carry the refreshed current state");
+
+        let row = saved
+            .find_resource_for_id(&id)
+            .expect("carried row must exist");
+        let retry_plan = plan_after_writeback(&desired, &saved, &schemas);
+        assert!(
+            retry_plan.effects().iter().any(|effect| matches!(
+                effect,
+                Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "settings")
+            )),
+            "the carried row must retain the pending nested struct removal; explicit={:#?}, plan={retry_plan:#?}",
+            row.explicit,
+        );
+    }
+
+    #[test]
+    fn failed_update_list_element_nested_pending_removal_survives_writeback() {
+        let rule = |port, description: Option<&str>| {
+            let mut fields = indexmap::IndexMap::from([(
+                "port".to_string(),
+                Value::Concrete(ConcreteValue::Int(port)),
+            )]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let applied_rules = Value::Concrete(ConcreteValue::List(vec![
+            rule(80, Some("web")),
+            rule(443, None),
+        ]));
+        let desired_rules =
+            Value::Concrete(ConcreteValue::List(vec![rule(80, None), rule(443, None)]));
+        let applied = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("rules", applied_rules.clone());
+        let desired = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_attribute("rules", desired_rules);
+        let id = desired.id.clone();
+        let schemas = SchemaRegistry::new();
+        let existing = state_after_accepted_create(
+            &applied,
+            HashMap::from([("rules".to_string(), applied_rules)]),
+            &schemas,
+        );
+        let failed_plan = plan_after_writeback(&desired, &existing, &schemas);
+        assert!(
+            failed_plan.effects().iter().any(|effect| matches!(
+                effect,
+                Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "rules")
+            )),
+            "an Applied row must initially plan the list-element removal: {failed_plan:#?}"
+        );
+        let managed_current = HashMap::from([(id.clone(), existing.build_state_for_resource(&id))]);
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: existing,
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &managed_current,
+                applied_states: &HashMap::new(),
+                plan: &failed_plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("failed update should carry the refreshed current state");
+
+        let row = saved
+            .find_resource_for_id(&id)
+            .expect("carried row must exist");
+        let retry_plan = plan_after_writeback(&desired, &saved, &schemas);
+        assert!(
+            retry_plan.effects().iter().any(|effect| matches!(
+                effect,
+                Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "rules")
+            )),
+            "the carried row must retain the pending list-element removal; explicit={:#?}, plan={retry_plan:#?}",
+            row.explicit,
+        );
+    }
+
+    #[test]
     fn replacement_create_does_not_carry_removed_write_only_value() {
         let schemas = write_only_password_schema();
         let old = Resource::with_provider("mock", "test.resource", "replace", None)

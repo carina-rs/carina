@@ -90,7 +90,12 @@ fn main() -> ExitCode {
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
 
     if tui {
-        if let Err(e) = carina_tui::run(&fp.plan, &fp.schemas, &historical_display) {
+        if let Err(e) = carina_tui::run(
+            &fp.plan,
+            &fp.schemas,
+            &historical_display,
+            Some(&fp.prev_explicit),
+        ) {
             eprintln!("TUI error: {}", e);
             return ExitCode::from(1);
         }
