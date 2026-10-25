@@ -33,7 +33,7 @@ use carina_core::resource::{
 };
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
-use carina_state::{BackendLock, LockInfo, StateBackend, StateFile, WriteOnlyBasis};
+use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
 use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfigs};
 
@@ -225,7 +225,7 @@ async fn create_checked_bootstrap_resource(
                 &state,
                 None,
                 schemas.get_for(resolved.as_resource()),
-                WriteOnlyBasis::AcceptedRequest(&accepted_request),
+                RowBasis::Applied(&accepted_request),
                 None,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
