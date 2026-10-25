@@ -796,9 +796,9 @@ pub(super) fn find_changed_attributes(
     // This prevents false removals for computed/provider-returned
     // attributes the user never specified. With `Unrecorded` (no
     // authoring record) there is nothing to compare against, so
-    // attribute removal is not detected for those rows — the
-    // `from_provider_state` repair populates `Struct` on the next
-    // apply, after which removal detection works normally.
+    // attribute removal is not detected for those rows. A later desired-backed
+    // state write can seed the record from desired keys (never provider keys),
+    // after which removals of those recorded keys are detectable.
     if let Some(ExplicitFields::Struct { children }) = prev_explicit {
         for key in children.keys() {
             if desired.contains_key(key) {

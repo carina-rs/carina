@@ -20,8 +20,8 @@ use carina_core::resource::{
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedValue;
 use carina_state::{
-    BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, StateBackend,
-    StateFile, WriteOnlyBasis,
+    BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, RowBasis,
+    StateBackend, StateFile,
 };
 
 use crate::commands::apply::{
@@ -1147,7 +1147,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         &applied_state,
         None,
         None,
-        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();
@@ -1277,7 +1277,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         &applied_state,
         None,
         None,
-        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();

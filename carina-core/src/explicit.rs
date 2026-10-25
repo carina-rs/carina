@@ -54,12 +54,11 @@ pub enum ExplicitFields {
     /// (`project_attributes`) treat this as "pass attrs through, the
     /// authoring shape is whatever the user wrote in `.crn` right
     /// now"; recursive `project` treats it the same as `Leaf` (keep
-    /// the entire value). Emitted by the `from_provider_state`
-    /// legacy-corruption repair (`carina-state/src/state/mod.rs`)
-    /// when the prior on-disk row carried an empty `Struct` whose
-    /// children were destroyed by an older write-path bug; deserialised
-    /// from `{ "kind": "unrecorded" }` in state files written after
-    /// carina#3280.
+    /// the entire value). Used as the typed legacy-corruption marker
+    /// when an older state migration encounters an empty `Struct`
+    /// whose children may have been destroyed by an old write-path
+    /// bug. A later desired-backed state write can seed it from current
+    /// desired keys without treating provider-returned keys as authored.
     Unrecorded,
 }
 
@@ -267,13 +266,11 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
         },
         (Leaf, b) => b,
         (a, Leaf) => a,
-        // `Unrecorded` carries no shape information, so merging it
-        // with anything yields the other side. `build_from_value`
-        // never produces `Unrecorded` (only `from_provider_state`
-        // does), so reaching this arm in production is unlikely —
-        // the explicit handling exists to keep the `match` exhaustive
-        // and prevent a future caller from getting a silent fallback
-        // via the catch-all `(a, _) => a` arm below.
+        // `Unrecorded` carries no shape information, so merging it with
+        // anything yields the other side. Builders from concrete values never
+        // produce `Unrecorded`; it originates from legacy/default state rows
+        // and remains explicit here so a future caller cannot hit the silent
+        // catch-all `(a, _) => a` fallback below.
         (Unrecorded, b) => b,
         (a, Unrecorded) => a,
         (
@@ -364,7 +361,7 @@ pub fn project(value: Value, explicit: &ExplicitFields) -> Value {
 /// Apply `project` to every entry of a top-level attribute map. The
 /// outer `explicit` is expected to be `ExplicitFields::Struct` (the
 /// shape the resource builders produce); `Unrecorded` (no authoring
-/// record — emitted by the carina#3280 legacy-corruption repair)
+/// record — emitted by the carina#3280 legacy-state migration)
 /// passes attrs through unchanged. `Leaf` / `List` / `ListElements` at
 /// the top level shouldn't occur for a resource's full attribute set
 /// and pass through conservatively.
@@ -380,8 +377,8 @@ pub fn project_attributes(
         // No authoring record at the top level (carina#3280): the
         // legacy-corruption case where the differ must compare the
         // real `current` against `desired` directly, without
-        // filtering. The `from_provider_state` repair rebuilds a
-        // populated `Struct` on the next write.
+        // filtering. A later desired-backed state write can seed its
+        // `Struct` from desired keys without promoting provider-only keys.
         ExplicitFields::Unrecorded => attrs,
         // Top-level Leaf / List / ListElements shouldn't occur for a
         // resource's full attribute set; pass through conservatively.
