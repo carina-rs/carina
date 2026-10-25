@@ -15,8 +15,9 @@ use time::format_description::well_known::Rfc3339;
 
 use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
+use carina_core::version_constraint::VersionConstraint;
 
-use crate::signing::{self, ExpectedIdentity};
+use crate::signing;
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
 
@@ -739,21 +740,327 @@ enum RegistrySequenceAnchor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrySignatureProtection {
     NotRequired,
-    RequiredUnpinned,
-    RequiredPinned(IdentityPin),
+    Required(SignerPinState),
 }
 
-/// A signing-identity pin whose identity and issuer are always present together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseChannel {
+    Stable,
+    Prerelease,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityPin {
-    pub certificate_identity: String,
-    pub certificate_oidc_issuer: String,
+pub struct LegacySignerPin {
+    pub certificate_san: String,
+    pub oidc_issuer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePin {
+    pub oidc_issuer: String,
+    pub repository_owner_id: String,
+    pub repository_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowPin(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowPins {
+    Stable(WorkflowPin),
+    Prerelease(WorkflowPin),
+    Both {
+        stable: WorkflowPin,
+        prerelease: WorkflowPin,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentSignerPins {
+    pub source: SourcePin,
+    pub workflows: WorkflowPins,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignerPinState {
+    Unpinned,
+    Legacy(LegacySignerPin),
+    Current(CurrentSignerPins),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscardedSignerPins {
+    Legacy(LegacySignerPin),
+    Current(CurrentSignerPins),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedVersion {
+    raw: String,
+    parsed: Version,
+}
+
+impl ListedVersion {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let parsed = Version::parse(raw)
+            .map_err(|error| format!("Registry returned invalid version {raw:?}: {error}"))?;
+        Ok(Self {
+            raw: raw.to_string(),
+            parsed,
+        })
+    }
+
+    fn channel(&self) -> ReleaseChannel {
+        if self.parsed.pre.is_empty() {
+            ReleaseChannel::Stable
+        } else {
+            ReleaseChannel::Prerelease
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignerTransition {
+    Unchanged,
+    FirstContact,
+    ChannelPinned(ReleaseChannel),
+    LegacyConverted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignerAcceptance {
+    next: SignerPinState,
+    transition: SignerTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignerRejection {
+    StableSourceRef {
+        expected: String,
+        actual: String,
+    },
+    LegacyIdentity,
+    SourceMismatch {
+        expected: Box<SourcePin>,
+        actual: Box<SourcePin>,
+    },
+    Workflow {
+        channel: ReleaseChannel,
+        expected: WorkflowPin,
+        actual: WorkflowPin,
+    },
+}
+
+impl fmt::Display for SignerRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StableSourceRef { expected, actual } => write!(
+                f,
+                "stable provider certificate source ref mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::LegacyIdentity => {
+                write!(
+                    f,
+                    "certificate SAN or OIDC issuer differs from the legacy lock pin"
+                )
+            }
+            Self::SourceMismatch { expected, actual } => write!(
+                f,
+                "certificate source differs from the lock pin: expected {expected:?}, got {actual:?}"
+            ),
+            Self::Workflow {
+                channel,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "certificate workflow for {channel:?} differs from the lock pin: expected {:?}, got {:?}",
+                expected.0, actual.0
+            ),
+        }
+    }
+}
+
+fn decide_signer(
+    expected: &SignerPinState,
+    identity: &signing::VerifiedSignerIdentity,
+    version: &ListedVersion,
+) -> Result<SignerAcceptance, SignerRejection> {
+    let channel = version.channel();
+    if channel == ReleaseChannel::Stable {
+        let expected_ref = format!("refs/tags/v{}", version.raw);
+        if identity.source_ref() != expected_ref {
+            return Err(SignerRejection::StableSourceRef {
+                expected: expected_ref,
+                actual: identity.source_ref().to_string(),
+            });
+        }
+    }
+
+    let source = SourcePin {
+        oidc_issuer: identity.source().oidc_issuer.clone(),
+        repository_owner_id: identity.source().repository_owner_id.clone(),
+        repository_id: identity.source().repository_id.clone(),
+    };
+    let workflow = WorkflowPin(identity.workflow().to_string());
+
+    match expected {
+        SignerPinState::Unpinned => Ok(SignerAcceptance {
+            next: SignerPinState::Current(CurrentSignerPins {
+                source,
+                workflows: WorkflowPins::for_channel(channel, workflow),
+            }),
+            transition: SignerTransition::FirstContact,
+        }),
+        SignerPinState::Legacy(pin) => {
+            // Legacy locks got oidc_issuer from Fulcio extension 1.1; the source
+            // issuer is extension 1.8. GitHub Actions writes the same
+            // token.actions.githubusercontent.com value to both extensions.
+            if pin.certificate_san != identity.certificate_san()
+                || pin.oidc_issuer != identity.source().oidc_issuer
+            {
+                return Err(SignerRejection::LegacyIdentity);
+            }
+            Ok(SignerAcceptance {
+                next: SignerPinState::Current(CurrentSignerPins {
+                    source,
+                    workflows: WorkflowPins::for_channel(channel, workflow),
+                }),
+                transition: SignerTransition::LegacyConverted,
+            })
+        }
+        SignerPinState::Current(pins) => {
+            if pins.source != source {
+                return Err(SignerRejection::SourceMismatch {
+                    expected: Box::new(pins.source.clone()),
+                    actual: Box::new(source),
+                });
+            }
+            match pins.workflows.workflow_for(channel) {
+                Some(expected_workflow) if expected_workflow != &workflow => {
+                    Err(SignerRejection::Workflow {
+                        channel,
+                        expected: expected_workflow.clone(),
+                        actual: workflow,
+                    })
+                }
+                Some(_) => Ok(SignerAcceptance {
+                    next: expected.clone(),
+                    transition: SignerTransition::Unchanged,
+                }),
+                None => Ok(SignerAcceptance {
+                    next: SignerPinState::Current(CurrentSignerPins {
+                        source: pins.source.clone(),
+                        workflows: pins.workflows.clone().with_channel(channel, workflow),
+                    }),
+                    transition: SignerTransition::ChannelPinned(channel),
+                }),
+            }
+        }
+    }
+}
+
+impl WorkflowPins {
+    fn for_channel(channel: ReleaseChannel, workflow: WorkflowPin) -> Self {
+        match channel {
+            ReleaseChannel::Stable => Self::Stable(workflow),
+            ReleaseChannel::Prerelease => Self::Prerelease(workflow),
+        }
+    }
+
+    fn workflow_for(&self, channel: ReleaseChannel) -> Option<&WorkflowPin> {
+        match (self, channel) {
+            (Self::Stable(workflow), ReleaseChannel::Stable)
+            | (Self::Prerelease(workflow), ReleaseChannel::Prerelease) => Some(workflow),
+            (Self::Both { stable, .. }, ReleaseChannel::Stable) => Some(stable),
+            (Self::Both { prerelease, .. }, ReleaseChannel::Prerelease) => Some(prerelease),
+            (Self::Stable(_), ReleaseChannel::Prerelease)
+            | (Self::Prerelease(_), ReleaseChannel::Stable) => None,
+        }
+    }
+
+    fn with_channel(self, channel: ReleaseChannel, workflow: WorkflowPin) -> Self {
+        match (self, channel) {
+            (Self::Stable(stable), ReleaseChannel::Prerelease) => Self::Both {
+                stable,
+                prerelease: workflow,
+            },
+            (Self::Prerelease(prerelease), ReleaseChannel::Stable) => Self::Both {
+                stable: workflow,
+                prerelease,
+            },
+            (existing, _) => existing,
+        }
+    }
+
+    fn into_options(self) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Stable(stable) => (Some(stable.0), None),
+            Self::Prerelease(prerelease) => (None, Some(prerelease.0)),
+            Self::Both { stable, prerelease } => (Some(stable.0), Some(prerelease.0)),
+        }
+    }
+
+    fn merge(&self, other: &Self) -> Option<Self> {
+        let stable = merge_optional_workflow(
+            self.workflow_for(ReleaseChannel::Stable),
+            other.workflow_for(ReleaseChannel::Stable),
+        )?;
+        let prerelease = merge_optional_workflow(
+            self.workflow_for(ReleaseChannel::Prerelease),
+            other.workflow_for(ReleaseChannel::Prerelease),
+        )?;
+        match (stable, prerelease) {
+            (Some(stable), Some(prerelease)) => Some(Self::Both { stable, prerelease }),
+            (Some(stable), None) => Some(Self::Stable(stable)),
+            (None, Some(prerelease)) => Some(Self::Prerelease(prerelease)),
+            (None, None) => None,
+        }
+    }
+}
+
+fn merge_optional_workflow(
+    left: Option<&WorkflowPin>,
+    right: Option<&WorkflowPin>,
+) -> Option<Option<WorkflowPin>> {
+    match (left, right) {
+        (Some(left), Some(right)) if left != right => None,
+        (Some(workflow), Some(_) | None) | (None, Some(workflow)) => Some(Some(workflow.clone())),
+        (None, None) => Some(None),
+    }
+}
+
+impl DiscardedSignerPins {
+    fn merge(self, other: Self) -> Result<Self, RegistryIdentityPinConflict> {
+        let conflict_left = self.clone();
+        let conflict_right = other.clone();
+        match (self, other) {
+            (Self::Legacy(left), Self::Legacy(right)) if left == right => Ok(Self::Legacy(left)),
+            (Self::Current(left), Self::Current(right)) if left.source == right.source => left
+                .workflows
+                .merge(&right.workflows)
+                .map(|workflows| {
+                    Self::Current(CurrentSignerPins {
+                        source: left.source,
+                        workflows,
+                    })
+                })
+                .ok_or(RegistryIdentityPinConflict {
+                    left: Box::new(conflict_left),
+                    right: Box::new(conflict_right),
+                }),
+            _ => Err(RegistryIdentityPinConflict {
+                left: Box::new(conflict_left),
+                right: Box::new(conflict_right),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryIdentityPinConflict {
-    pub left: IdentityPin,
-    pub right: IdentityPin,
+    pub left: Box<DiscardedSignerPins>,
+    pub right: Box<DiscardedSignerPins>,
 }
 
 #[derive(Debug)]
@@ -766,11 +1073,8 @@ impl fmt::Display for RegistryIdentityPinConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "conflicting registry identity pins: {} (issuer {}) and {} (issuer {})",
-            self.left.certificate_identity,
-            self.left.certificate_oidc_issuer,
-            self.right.certificate_identity,
-            self.right.certificate_oidc_issuer
+            "conflicting registry signer pins: {:?} and {:?}",
+            self.left, self.right
         )
     }
 }
@@ -914,7 +1218,7 @@ struct ResolvedRegistryRecovery {
 }
 
 struct RegistryIdentityRepinState {
-    pin: IdentityPin,
+    pin: DiscardedSignerPins,
     residual: RegistryIdentityRepinResidual,
 }
 
@@ -951,26 +1255,7 @@ impl Default for RegistryRatchets {
 
 impl RegistryRatchets {
     fn merge(mut self, other: &Self) -> Result<Self, RegistryIdentityPinConflict> {
-        let signature_required = self.signature.is_required() || other.signature.is_required();
-        let identity_pin = match (
-            self.signature.identity_pin(),
-            other.signature.identity_pin(),
-        ) {
-            (Some(left), Some(right)) if left == right => Some(left.clone()),
-            (Some(left), Some(right)) => {
-                return Err(RegistryIdentityPinConflict {
-                    left: left.clone(),
-                    right: right.clone(),
-                });
-            }
-            (Some(pin), None) | (None, Some(pin)) => Some(pin.clone()),
-            (None, None) => None,
-        };
-        let signature = match (signature_required, identity_pin) {
-            (_, Some(pin)) => RegistrySignatureProtection::RequiredPinned(pin),
-            (true, None) => RegistrySignatureProtection::RequiredUnpinned,
-            (false, None) => RegistrySignatureProtection::NotRequired,
-        };
+        let signature = self.signature.merge(&other.signature)?;
         self.sequence = match (self.sequence.value(), other.sequence.value()) {
             (Some(left), Some(right)) => RegistrySequence::Present(left.max(right)),
             (None, Some(sequence)) => RegistrySequence::Present(sequence),
@@ -1016,8 +1301,13 @@ impl RegistryRatchets {
             transparency_log_present,
         } = self;
         let pin = match signature {
-            RegistrySignatureProtection::RequiredPinned(pin) => pin,
-            RegistrySignatureProtection::RequiredUnpinned => {
+            RegistrySignatureProtection::Required(SignerPinState::Legacy(pin)) => {
+                DiscardedSignerPins::Legacy(pin)
+            }
+            RegistrySignatureProtection::Required(SignerPinState::Current(pins)) => {
+                DiscardedSignerPins::Current(pins)
+            }
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned) => {
                 return Err(RegistryLockRecoveryError::IdentityAlreadyUnpinned { provider });
             }
             RegistrySignatureProtection::NotRequired => {
@@ -1061,7 +1351,7 @@ impl RegistryIdentityRepinResidual {
             sequence: self.sequence,
             valid_until_present: self.valid_until_present,
             yanked_versions: self.yanked_versions,
-            signature: RegistrySignatureProtection::RequiredUnpinned,
+            signature: RegistrySignatureProtection::Required(SignerPinState::Unpinned),
             transparency_log_present: self.transparency_log_present,
         }
     }
@@ -1144,6 +1434,200 @@ impl From<&RegistryLock> for RegistryRatchets {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RegistrySignatureStateSerde {
+    NotRequired,
+    RequiredUnpinned,
+    RequiredLegacy,
+    RequiredCurrent,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySignatureProtectionSerde {
+    signature_state: RegistrySignatureStateSerde,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_certificate_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_certificate_oidc_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_oidc_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_repository_owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stable_workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prerelease_workflow: Option<String>,
+}
+
+impl TryFrom<RegistrySignatureProtectionSerde> for RegistrySignatureProtection {
+    type Error = RegistryLockError;
+
+    fn try_from(value: RegistrySignatureProtectionSerde) -> Result<Self, Self::Error> {
+        let RegistrySignatureProtectionSerde {
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
+        } = value;
+        let has_legacy =
+            legacy_certificate_identity.is_some() || legacy_certificate_oidc_issuer.is_some();
+        let has_current = source_oidc_issuer.is_some()
+            || source_repository_owner_id.is_some()
+            || source_repository_id.is_some()
+            || stable_workflow.is_some()
+            || prerelease_workflow.is_some();
+        let state = match signature_state {
+            RegistrySignatureStateSerde::NotRequired if !has_legacy && !has_current => {
+                return Ok(Self::NotRequired);
+            }
+            RegistrySignatureStateSerde::RequiredUnpinned if !has_legacy && !has_current => {
+                SignerPinState::Unpinned
+            }
+            RegistrySignatureStateSerde::RequiredLegacy if !has_current => {
+                let (Some(certificate_san), Some(oidc_issuer)) =
+                    (legacy_certificate_identity, legacy_certificate_oidc_issuer)
+                else {
+                    return Err(RegistryLockError::InconsistentSignature);
+                };
+                SignerPinState::Legacy(LegacySignerPin {
+                    certificate_san,
+                    oidc_issuer,
+                })
+            }
+            RegistrySignatureStateSerde::RequiredCurrent if !has_legacy => {
+                let (Some(oidc_issuer), Some(repository_owner_id), Some(repository_id)) = (
+                    source_oidc_issuer,
+                    source_repository_owner_id,
+                    source_repository_id,
+                ) else {
+                    return Err(RegistryLockError::InconsistentSignature);
+                };
+                let workflows = match (stable_workflow, prerelease_workflow) {
+                    (Some(stable), Some(prerelease)) => WorkflowPins::Both {
+                        stable: WorkflowPin(stable),
+                        prerelease: WorkflowPin(prerelease),
+                    },
+                    (Some(stable), None) => WorkflowPins::Stable(WorkflowPin(stable)),
+                    (None, Some(prerelease)) => WorkflowPins::Prerelease(WorkflowPin(prerelease)),
+                    (None, None) => return Err(RegistryLockError::InconsistentSignature),
+                };
+                SignerPinState::Current(CurrentSignerPins {
+                    source: SourcePin {
+                        oidc_issuer,
+                        repository_owner_id,
+                        repository_id,
+                    },
+                    workflows,
+                })
+            }
+            RegistrySignatureStateSerde::NotRequired
+            | RegistrySignatureStateSerde::RequiredUnpinned
+            | RegistrySignatureStateSerde::RequiredLegacy
+            | RegistrySignatureStateSerde::RequiredCurrent => {
+                return Err(RegistryLockError::InconsistentSignature);
+            }
+        };
+        Ok(Self::Required(state))
+    }
+}
+
+impl From<RegistrySignatureProtection> for RegistrySignatureProtectionSerde {
+    fn from(value: RegistrySignatureProtection) -> Self {
+        match value {
+            RegistrySignatureProtection::NotRequired => Self {
+                signature_state: RegistrySignatureStateSerde::NotRequired,
+                legacy_certificate_identity: None,
+                legacy_certificate_oidc_issuer: None,
+                source_oidc_issuer: None,
+                source_repository_owner_id: None,
+                source_repository_id: None,
+                stable_workflow: None,
+                prerelease_workflow: None,
+            },
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned) => Self {
+                signature_state: RegistrySignatureStateSerde::RequiredUnpinned,
+                legacy_certificate_identity: None,
+                legacy_certificate_oidc_issuer: None,
+                source_oidc_issuer: None,
+                source_repository_owner_id: None,
+                source_repository_id: None,
+                stable_workflow: None,
+                prerelease_workflow: None,
+            },
+            RegistrySignatureProtection::Required(SignerPinState::Legacy(pin)) => Self {
+                signature_state: RegistrySignatureStateSerde::RequiredLegacy,
+                legacy_certificate_identity: Some(pin.certificate_san),
+                legacy_certificate_oidc_issuer: Some(pin.oidc_issuer),
+                source_oidc_issuer: None,
+                source_repository_owner_id: None,
+                source_repository_id: None,
+                stable_workflow: None,
+                prerelease_workflow: None,
+            },
+            RegistrySignatureProtection::Required(SignerPinState::Current(pins)) => {
+                let (stable_workflow, prerelease_workflow) = pins.workflows.into_options();
+                Self {
+                    signature_state: RegistrySignatureStateSerde::RequiredCurrent,
+                    legacy_certificate_identity: None,
+                    legacy_certificate_oidc_issuer: None,
+                    source_oidc_issuer: Some(pins.source.oidc_issuer),
+                    source_repository_owner_id: Some(pins.source.repository_owner_id),
+                    source_repository_id: Some(pins.source.repository_id),
+                    stable_workflow,
+                    prerelease_workflow,
+                }
+            }
+        }
+    }
+}
+
+fn sequence_from_wire(
+    present: bool,
+    sequence: Option<u64>,
+) -> Result<RegistrySequence, RegistryLockError> {
+    match (present, sequence) {
+        (false, None) => Ok(RegistrySequence::Absent),
+        (true, Some(sequence)) => Ok(RegistrySequence::Present(sequence)),
+        _ => Err(RegistryLockError::InconsistentSequence),
+    }
+}
+
+fn sequence_anchor_from_wire(
+    established: bool,
+    sequence: Option<u64>,
+) -> Result<RegistrySequenceAnchor, RegistryLockError> {
+    match (established, sequence) {
+        (false, None) => Ok(RegistrySequenceAnchor::Unestablished),
+        (true, Some(sequence)) => Ok(RegistrySequenceAnchor::Established(sequence)),
+        _ => Err(RegistryLockError::InconsistentSequence),
+    }
+}
+
+fn validate_sequence_anchor(
+    sequence: &RegistrySequence,
+    anchor: RegistrySequenceAnchor,
+) -> Result<(), RegistryLockError> {
+    match (sequence, anchor) {
+        (RegistrySequence::Absent, RegistrySequenceAnchor::Established(_)) => {
+            Err(RegistryLockError::InconsistentSequence)
+        }
+        (RegistrySequence::Present(observed), RegistrySequenceAnchor::Established(anchor))
+            if anchor > *observed =>
+        {
+            Err(RegistryLockError::InconsistentSequence)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryRatchetsSerde {
     sequence_present: bool,
@@ -1152,11 +1636,21 @@ struct RegistryRatchetsSerde {
     valid_until_present: bool,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     yanked_versions: BTreeSet<String>,
-    signature_present: bool,
+    signature_state: RegistrySignatureStateSerde,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    certificate_identity: Option<String>,
+    legacy_certificate_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    certificate_oidc_issuer: Option<String>,
+    legacy_certificate_oidc_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_oidc_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_repository_owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stable_workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prerelease_workflow: Option<String>,
     transparency_log_present: bool,
 }
 
@@ -1164,22 +1658,43 @@ impl TryFrom<RegistryRatchetsSerde> for RegistryRatchets {
     type Error = RegistryLockError;
 
     fn try_from(value: RegistryRatchetsSerde) -> Result<Self, Self::Error> {
-        let sequence = match (value.sequence_present, value.sequence) {
+        let RegistryRatchetsSerde {
+            sequence_present,
+            sequence,
+            valid_until_present,
+            yanked_versions,
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
+            transparency_log_present,
+        } = value;
+        let sequence = match (sequence_present, sequence) {
             (false, None) => RegistrySequence::Absent,
             (true, Some(sequence)) => RegistrySequence::Present(sequence),
             _ => return Err(RegistryLockError::InconsistentSequence),
         };
-        let signature = RegistrySignatureProtection::from_serialized(
-            value.signature_present,
-            value.certificate_identity,
-            value.certificate_oidc_issuer,
-        )?;
+        let signature = RegistrySignatureProtectionSerde {
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
+        }
+        .try_into()?;
         Ok(Self {
             sequence,
-            valid_until_present: value.valid_until_present,
-            yanked_versions: YankedRegistryVersions::from_serialized(value.yanked_versions),
+            valid_until_present,
+            yanked_versions: YankedRegistryVersions::from_serialized(yanked_versions),
             signature,
-            transparency_log_present: value.transparency_log_present,
+            transparency_log_present,
         })
     }
 }
@@ -1190,16 +1705,29 @@ impl From<RegistryRatchets> for RegistryRatchetsSerde {
             RegistrySequence::Absent => (false, None),
             RegistrySequence::Present(sequence) => (true, Some(sequence)),
         };
-        let (signature_present, certificate_identity, certificate_oidc_issuer) =
-            value.signature.into_serialized();
+        let RegistrySignatureProtectionSerde {
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
+        } = value.signature.into();
         Self {
             sequence_present,
             sequence,
             valid_until_present: value.valid_until_present,
             yanked_versions: value.yanked_versions.into_serialized(),
-            signature_present,
-            certificate_identity,
-            certificate_oidc_issuer,
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
             transparency_log_present: value.transparency_log_present,
         }
     }
@@ -1229,11 +1757,21 @@ struct RegistryLockSerde {
     valid_until_present: bool,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     yanked_versions: BTreeSet<String>,
-    signature_present: bool,
+    signature_state: RegistrySignatureStateSerde,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    certificate_identity: Option<String>,
+    legacy_certificate_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    certificate_oidc_issuer: Option<String>,
+    legacy_certificate_oidc_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_oidc_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_repository_owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stable_workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prerelease_workflow: Option<String>,
     transparency_log_present: bool,
 }
 
@@ -1241,12 +1779,30 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
     type Error = RegistryLockError;
 
     fn try_from(value: RegistryLockSerde) -> Result<Self, Self::Error> {
-        let sequence = match (value.sequence_present, value.sequence) {
+        let RegistryLockSerde {
+            resolved_hostname,
+            sequence_present,
+            sequence,
+            sequence_anchor_established,
+            sequence_anchor,
+            valid_until_present,
+            yanked_versions,
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
+            transparency_log_present,
+        } = value;
+        let sequence = match (sequence_present, sequence) {
             (false, None) => RegistrySequence::Absent,
             (true, Some(sequence)) => RegistrySequence::Present(sequence),
             _ => return Err(RegistryLockError::InconsistentSequence),
         };
-        let sequence_anchor = match (value.sequence_anchor_established, value.sequence_anchor) {
+        let sequence_anchor = match (sequence_anchor_established, sequence_anchor) {
             (false, None) => RegistrySequenceAnchor::Unestablished,
             (true, Some(sequence)) => RegistrySequenceAnchor::Established(sequence),
             _ => return Err(RegistryLockError::InconsistentSequence),
@@ -1262,19 +1818,25 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
             }
             (RegistrySequence::Absent | RegistrySequence::Present(_), _) => {}
         }
-        let signature = RegistrySignatureProtection::from_serialized(
-            value.signature_present,
-            value.certificate_identity,
-            value.certificate_oidc_issuer,
-        )?;
+        let signature = RegistrySignatureProtectionSerde {
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
+        }
+        .try_into()?;
         Ok(Self {
-            resolved_hostname: value.resolved_hostname,
+            resolved_hostname,
             sequence,
             sequence_anchor,
-            valid_until_present: value.valid_until_present,
-            yanked_versions: YankedRegistryVersions::from_serialized(value.yanked_versions),
+            valid_until_present,
+            yanked_versions: YankedRegistryVersions::from_serialized(yanked_versions),
             signature,
-            transparency_log_present: value.transparency_log_present,
+            transparency_log_present,
         })
     }
 }
@@ -1289,8 +1851,16 @@ impl From<RegistryLock> for RegistryLockSerde {
             RegistrySequenceAnchor::Unestablished => (false, None),
             RegistrySequenceAnchor::Established(sequence) => (true, Some(sequence)),
         };
-        let (signature_present, certificate_identity, certificate_oidc_issuer) =
-            value.signature.into_serialized();
+        let RegistrySignatureProtectionSerde {
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
+        } = value.signature.into();
         Self {
             resolved_hostname: value.resolved_hostname,
             sequence_present,
@@ -1299,9 +1869,14 @@ impl From<RegistryLock> for RegistryLockSerde {
             sequence_anchor,
             valid_until_present: value.valid_until_present,
             yanked_versions: value.yanked_versions.into_serialized(),
-            signature_present,
-            certificate_identity,
-            certificate_oidc_issuer,
+            signature_state,
+            legacy_certificate_identity,
+            legacy_certificate_oidc_issuer,
+            source_oidc_issuer,
+            source_repository_owner_id,
+            source_repository_id,
+            stable_workflow,
+            prerelease_workflow,
             transparency_log_present: value.transparency_log_present,
         }
     }
@@ -1322,7 +1897,7 @@ impl fmt::Display for RegistryLockError {
             ),
             Self::InconsistentSignature => write!(
                 f,
-                "registry lock is inconsistent: certificate_identity and certificate_oidc_issuer must be present together and only when signature_present is true"
+                "registry lock is inconsistent: legacy certificate_identity and certificate_oidc_issuer must appear together, while current signer pins require exactly one source and at least one workflow"
             ),
         }
     }
@@ -1342,59 +1917,44 @@ impl<'de> Deserialize<'de> for RegistryLock {
 }
 
 impl RegistrySignatureProtection {
-    fn from_serialized(
-        signature_required: bool,
-        certificate_identity: Option<String>,
-        certificate_oidc_issuer: Option<String>,
-    ) -> Result<Self, RegistryLockError> {
-        match (
-            signature_required,
-            certificate_identity,
-            certificate_oidc_issuer,
-        ) {
-            (false, None, None) => Ok(Self::NotRequired),
-            (true, None, None) => Ok(Self::RequiredUnpinned),
-            (true, Some(certificate_identity), Some(certificate_oidc_issuer)) => {
-                Ok(Self::RequiredPinned(IdentityPin {
-                    certificate_identity,
-                    certificate_oidc_issuer,
-                }))
-            }
-            _ => Err(RegistryLockError::InconsistentSignature),
-        }
-    }
-
-    fn into_serialized(self) -> (bool, Option<String>, Option<String>) {
-        match self {
-            Self::NotRequired => (false, None, None),
-            Self::RequiredUnpinned => (true, None, None),
-            Self::RequiredPinned(pin) => (
-                true,
-                Some(pin.certificate_identity),
-                Some(pin.certificate_oidc_issuer),
-            ),
-        }
-    }
-
     fn is_required(&self) -> bool {
-        matches!(self, Self::RequiredUnpinned | Self::RequiredPinned(_))
+        matches!(self, Self::Required(_))
     }
 
-    fn identity_pin(&self) -> Option<&IdentityPin> {
+    fn pin_state(&self) -> Option<&SignerPinState> {
         match self {
-            Self::RequiredPinned(pin) => Some(pin),
-            Self::NotRequired | Self::RequiredUnpinned => None,
+            Self::Required(state) => Some(state),
+            Self::NotRequired => None,
         }
     }
 
-    fn expected_identity(&self) -> Option<ExpectedIdentity> {
+    fn established_pins(&self) -> Option<DiscardedSignerPins> {
         match self {
-            Self::RequiredPinned(pin) => Some(ExpectedIdentity::pinned(
-                pin.certificate_identity.clone(),
-                pin.certificate_oidc_issuer.clone(),
-            )),
-            Self::NotRequired | Self::RequiredUnpinned => None,
+            Self::Required(SignerPinState::Legacy(pin)) => {
+                Some(DiscardedSignerPins::Legacy(pin.clone()))
+            }
+            Self::Required(SignerPinState::Current(pins)) => {
+                Some(DiscardedSignerPins::Current(pins.clone()))
+            }
+            Self::NotRequired | Self::Required(SignerPinState::Unpinned) => None,
         }
+    }
+
+    fn merge(&self, other: &Self) -> Result<Self, RegistryIdentityPinConflict> {
+        let required = self.is_required() || other.is_required();
+        let pins = match (self.established_pins(), other.established_pins()) {
+            (Some(left), Some(right)) => Some(left.merge(right)?),
+            (Some(pin), None) | (None, Some(pin)) => Some(pin),
+            (None, None) => None,
+        };
+        Ok(match pins {
+            Some(DiscardedSignerPins::Legacy(pin)) => Self::Required(SignerPinState::Legacy(pin)),
+            Some(DiscardedSignerPins::Current(pins)) => {
+                Self::Required(SignerPinState::Current(pins))
+            }
+            None if required => Self::Required(SignerPinState::Unpinned),
+            None => Self::NotRequired,
+        })
     }
 }
 
@@ -1571,15 +2131,164 @@ struct UncheckedLockFile {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UncheckedLockFileV3 {
+    #[serde(rename = "version")]
+    _version: u32,
+    #[serde(default)]
+    registry_host: BTreeMap<String, RegistryHostLock>,
+    #[serde(default)]
+    provider: Vec<LockEntry<RegistryLockV3>>,
+    #[serde(default)]
+    unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UncheckedLockFileV2 {
     #[serde(rename = "version")]
     _version: u32,
     #[serde(default)]
     registry_host: BTreeMap<String, LegacyRegistryHostLock>,
     #[serde(default)]
-    provider: Vec<LockEntry<RegistryLock>>,
+    provider: Vec<LockEntry<RegistryLockV3>>,
     #[serde(default)]
-    unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+    unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryLockV3 {
+    resolved_hostname: CanonicalRegistryHostname,
+    sequence_present: bool,
+    #[serde(default)]
+    sequence: Option<u64>,
+    sequence_anchor_established: bool,
+    #[serde(default)]
+    sequence_anchor: Option<u64>,
+    valid_until_present: bool,
+    #[serde(default)]
+    yanked_versions: BTreeSet<String>,
+    signature_present: bool,
+    #[serde(default)]
+    certificate_identity: Option<String>,
+    #[serde(default)]
+    certificate_oidc_issuer: Option<String>,
+    transparency_log_present: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryRatchetsV3 {
+    sequence_present: bool,
+    #[serde(default)]
+    sequence: Option<u64>,
+    valid_until_present: bool,
+    #[serde(default)]
+    yanked_versions: BTreeSet<String>,
+    signature_present: bool,
+    #[serde(default)]
+    certificate_identity: Option<String>,
+    #[serde(default)]
+    certificate_oidc_issuer: Option<String>,
+    transparency_log_present: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(transparent)]
+struct UnpinnedRegistryRatchetsV3(BTreeMap<String, RegistryRatchetsV3>);
+
+fn signature_from_v3(
+    signature_present: bool,
+    certificate_identity: Option<String>,
+    certificate_oidc_issuer: Option<String>,
+) -> Result<RegistrySignatureProtection, RegistryLockError> {
+    match (
+        signature_present,
+        certificate_identity,
+        certificate_oidc_issuer,
+    ) {
+        (false, None, None) => Ok(RegistrySignatureProtection::NotRequired),
+        (true, None, None) => Ok(RegistrySignatureProtection::Required(
+            SignerPinState::Unpinned,
+        )),
+        (true, Some(certificate_san), Some(oidc_issuer)) => Ok(
+            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
+                certificate_san,
+                oidc_issuer,
+            })),
+        ),
+        _ => Err(RegistryLockError::InconsistentSignature),
+    }
+}
+
+impl TryFrom<RegistryLockV3> for RegistryLock {
+    type Error = RegistryLockError;
+
+    fn try_from(value: RegistryLockV3) -> Result<Self, Self::Error> {
+        let sequence = sequence_from_wire(value.sequence_present, value.sequence)?;
+        let sequence_anchor =
+            sequence_anchor_from_wire(value.sequence_anchor_established, value.sequence_anchor)?;
+        validate_sequence_anchor(&sequence, sequence_anchor)?;
+        Ok(Self {
+            resolved_hostname: value.resolved_hostname,
+            sequence,
+            sequence_anchor,
+            valid_until_present: value.valid_until_present,
+            yanked_versions: YankedRegistryVersions::from_serialized(value.yanked_versions),
+            signature: signature_from_v3(
+                value.signature_present,
+                value.certificate_identity,
+                value.certificate_oidc_issuer,
+            )?,
+            transparency_log_present: value.transparency_log_present,
+        })
+    }
+}
+
+impl TryFrom<RegistryRatchetsV3> for RegistryRatchets {
+    type Error = RegistryLockError;
+
+    fn try_from(value: RegistryRatchetsV3) -> Result<Self, Self::Error> {
+        Ok(Self {
+            sequence: sequence_from_wire(value.sequence_present, value.sequence)?,
+            valid_until_present: value.valid_until_present,
+            yanked_versions: YankedRegistryVersions::from_serialized(value.yanked_versions),
+            signature: signature_from_v3(
+                value.signature_present,
+                value.certificate_identity,
+                value.certificate_oidc_issuer,
+            )?,
+            transparency_log_present: value.transparency_log_present,
+        })
+    }
+}
+
+fn migrate_v3_provider_entries(
+    entries: Vec<LockEntry<RegistryLockV3>>,
+) -> Result<Vec<LockEntry<RegistryLock>>, RegistryLockError> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            Ok(LockEntry {
+                name: entry.name,
+                source: entry.source,
+                kind: entry.kind,
+                sha256: entry.sha256,
+                registry: entry.registry.map(TryInto::try_into).transpose()?,
+            })
+        })
+        .collect()
+}
+
+fn migrate_v3_ratchets(
+    ratchets: UnpinnedRegistryRatchetsV3,
+) -> Result<UnpinnedRegistryRatchets, RegistryLockError> {
+    ratchets
+        .0
+        .into_iter()
+        .map(|(source, ratchets)| Ok((source, ratchets.try_into()?)))
+        .collect::<Result<BTreeMap<_, _>, RegistryLockError>>()
+        .map(UnpinnedRegistryRatchets)
 }
 
 fn canonicalize_registry_host_keys<T>(
@@ -1599,7 +2308,7 @@ fn canonicalize_registry_host_keys<T>(
     Ok(canonical)
 }
 
-/// Details of a v2-to-v3 provider-lock migration applied in memory.
+/// Details of an older provider-lock migration applied in memory.
 ///
 /// The event carries every legacy discovery pin that now requires operator
 /// authorization before it can be discarded. The load operation itself never
@@ -1632,10 +2341,17 @@ impl fmt::Display for LockFileMigration {
             provider_lock_path(&self.project_dir).display()
         )?;
         if self.discarded_discovery_pins.is_empty() {
-            writeln!(
-                f,
-                "Migration found no v2 discovery pins requiring operator authorization."
-            )?;
+            if self.from == 2 {
+                writeln!(
+                    f,
+                    "Migration found no v2 discovery pins requiring operator authorization."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "Existing signer state is preserved; any legacy signer pin remains gated until verified conversion."
+                )?;
+            }
             writeln!(
                 f,
                 "All provider entries and provider security state will be retained."
@@ -1681,8 +2397,8 @@ impl fmt::Display for LockFileMigration {
 
 /// A provider lock tagged with whether load migrated its wire format.
 ///
-/// Production callers destructure this result so a pending v2 discovery-pin
-/// migration can be surfaced alongside the in-memory v3 lock.
+/// Production callers destructure this result so retained legacy security
+/// state can be surfaced alongside the in-memory current-format lock.
 #[derive(Debug)]
 pub enum LoadedLockFile {
     Pristine(LockFile),
@@ -1797,6 +2513,13 @@ define_lock_file_error! {
             source,
         }
     },
+    InvalidRegistryState {
+        path: PathBuf,
+        detail: String,
+    } => Self::InvalidRegistryState {
+        path: PathBuf::from("carina-providers.lock"),
+        detail: "inconsistent migrated registry state".into(),
+    },
     RegistryIdentityPinConflict {
         path: PathBuf,
         provider: String,
@@ -1805,14 +2528,14 @@ define_lock_file_error! {
         path: PathBuf::from("carina-providers.lock"),
         provider: "carina-rs/aws".into(),
         source: Box::new(RegistryIdentityPinConflict {
-            left: IdentityPin {
-                certificate_identity: "identity-a".into(),
-                certificate_oidc_issuer: "issuer-a".into(),
-            },
-            right: IdentityPin {
-                certificate_identity: "identity-b".into(),
-                certificate_oidc_issuer: "issuer-b".into(),
-            },
+            left: Box::new(DiscardedSignerPins::Legacy(LegacySignerPin {
+                certificate_san: "identity-a".into(),
+                oidc_issuer: "issuer-a".into(),
+            })),
+            right: Box::new(DiscardedSignerPins::Legacy(LegacySignerPin {
+                certificate_san: "identity-b".into(),
+                oidc_issuer: "issuer-b".into(),
+            })),
         }),
     },
 }
@@ -1826,6 +2549,11 @@ impl fmt::Display for LockFileError {
             Self::MissingVersion { path } => write!(
                 f,
                 "Lock file {} has no format version and predates lock format versioning. It cannot be distinguished from a lock whose protection fields were stripped by an older Carina binary. Because automatic migration is unsafe, restore this file from version control or backup so its recorded protection state remains intact; if no trustworthy copy exists, preserve it for manual inspection and make any decision to move it aside explicitly.",
+                path.display()
+            ),
+            Self::InvalidRegistryState { path, detail } => write!(
+                f,
+                "Failed to migrate registry security state from {}: {detail}",
                 path.display()
             ),
             Self::VersionTooNew { found, supported } => write!(
@@ -1924,7 +2652,7 @@ impl Default for LockFile {
 
 impl<'a> PreparedRegistryIdentityRepin<'a> {
     /// Return the identity pin that committing this recovery will discard.
-    pub fn identity_pin(&self) -> &IdentityPin {
+    pub fn identity_pin(&self) -> &DiscardedSignerPins {
         &self.target.state().pin
     }
 
@@ -1965,7 +2693,11 @@ impl fmt::Display for PreparedRegistryDiscoveryRepin<'_> {
             &self.discarded,
             PreparedRegistryDiscoveryRepinState::MigrationPending(_)
         ) {
-            writeln!(f, "Provider lock format migration: version 2 -> version 3")?;
+            writeln!(
+                f,
+                "Provider lock format migration: version 2 -> version {}",
+                LockFile::CURRENT_VERSION
+            )?;
         }
         writeln!(f, "Registry host: {}", self.hostname)?;
         match &self.discarded {
@@ -2095,6 +2827,10 @@ fn rename_lock_file_for_test(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 impl LockFile {
+    /// v4 stores signer source and per-channel workflow pins extracted from
+    /// verified certificates. v3 full-SAN pins migrate losslessly into the
+    /// explicit legacy state and are converted only by a matching signature.
+    ///
     /// v3: Registry discovery pins contain the resolved values the client
     /// consumes, keyed by discovery field. The open map preserves values an
     /// older client does not consume.
@@ -2104,7 +2840,7 @@ impl LockFile {
     /// retains each legacy host pin in a resolution-blocking state because
     /// neither value can truthfully be reinterpreted as a v3 pin. Only an
     /// operator-authorized discovery re-pin can leave that state.
-    pub const CURRENT_VERSION: u32 = 3;
+    pub const CURRENT_VERSION: u32 = 4;
 
     fn registry_host_lock(&self, hostname: &str) -> Option<&RegistryHostLock> {
         self.registry_host.get(hostname)
@@ -2118,7 +2854,8 @@ impl LockFile {
     ///
     /// Returns `Ok(None)` when the file is absent (normal first-run case).
     /// A present file is tagged as pristine or migrated so callers can surface
-    /// any legacy discovery material awaiting operator authorization.
+    /// retained legacy security state and any discovery material awaiting
+    /// operator authorization.
     /// Parse errors — including an entry that can't be discriminated into a
     /// [`LockEntryKind`] variant — surface as `Err` rather than being silently
     /// collapsed into a default-empty lock.
@@ -2190,6 +2927,43 @@ impl LockFile {
                 let lock_file = Self::from_unchecked(unchecked, path, project_dir)?;
                 Ok(LoadedLockFile::Pristine(lock_file))
             }
+            3 => {
+                let legacy: UncheckedLockFileV3 =
+                    toml::from_str(content).map_err(|source| LockFileError::Parse {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                let provider = migrate_v3_provider_entries(legacy.provider).map_err(|error| {
+                    LockFileError::InvalidRegistryState {
+                        path: path.to_path_buf(),
+                        detail: error.to_string(),
+                    }
+                })?;
+                let unpinned_registry_ratchets =
+                    migrate_v3_ratchets(legacy.unpinned_registry_ratchets).map_err(|error| {
+                        LockFileError::InvalidRegistryState {
+                            path: path.to_path_buf(),
+                            detail: error.to_string(),
+                        }
+                    })?;
+                let registry_host = canonicalize_registry_host_keys(legacy.registry_host, path)?;
+                let lock_file = Self::from_parts(
+                    registry_host,
+                    provider,
+                    unpinned_registry_ratchets,
+                    path,
+                    project_dir,
+                )?;
+                Ok(LoadedLockFile::Migrated {
+                    lock_file,
+                    migration: LockFileMigration {
+                        project_dir: project_dir.to_path_buf(),
+                        from: version,
+                        to: Self::CURRENT_VERSION,
+                        discarded_discovery_pins: BTreeMap::new(),
+                    },
+                })
+            }
             2 => {
                 let legacy: UncheckedLockFileV2 =
                     toml::from_str(content).map_err(|source| LockFileError::Parse {
@@ -2213,10 +2987,23 @@ impl LockFile {
                     };
                     registry_host.insert(host, RegistryHostLock { discovery });
                 }
+                let provider = migrate_v3_provider_entries(legacy.provider).map_err(|error| {
+                    LockFileError::InvalidRegistryState {
+                        path: path.to_path_buf(),
+                        detail: error.to_string(),
+                    }
+                })?;
+                let unpinned_registry_ratchets =
+                    migrate_v3_ratchets(legacy.unpinned_registry_ratchets).map_err(|error| {
+                        LockFileError::InvalidRegistryState {
+                            path: path.to_path_buf(),
+                            detail: error.to_string(),
+                        }
+                    })?;
                 let lock_file = Self::from_parts(
                     registry_host,
-                    legacy.provider,
-                    legacy.unpinned_registry_ratchets,
+                    provider,
+                    unpinned_registry_ratchets,
                     path,
                     project_dir,
                 )?;
@@ -2667,6 +3454,38 @@ impl LockFile {
         Ok(())
     }
 
+    fn replace_legacy_signer_pin(
+        &mut self,
+        source: &str,
+        next: SignerPinState,
+    ) -> Result<(), String> {
+        let SignerPinState::Current(_) = next else {
+            return Err("legacy signer conversion did not produce current signer pins".into());
+        };
+        let source_key = canonical_lock_source(source);
+        let signature = self
+            .provider
+            .iter_mut()
+            .find(|entry| Self::sources_match(&entry.source, &source_key))
+            .and_then(|entry| entry.registry.as_mut())
+            .map(|registry| &mut registry.signature)
+            .or_else(|| {
+                self.unpinned_registry_ratchets
+                    .0
+                    .get_mut(&source_key)
+                    .map(|ratchets| &mut ratchets.signature)
+            })
+            .ok_or_else(|| "legacy signer conversion lost its persisted pin state".to_string())?;
+        if !matches!(
+            signature,
+            RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
+        ) {
+            return Err("legacy signer conversion lost its legacy pin before commit".into());
+        }
+        *signature = RegistrySignatureProtection::Required(next);
+        Ok(())
+    }
+
     pub fn upsert(&mut self, entry: LockEntry<NoRegistryLock>) {
         self.upsert_entry(entry.into_stored());
     }
@@ -2819,13 +3638,45 @@ impl<'a> PersistentLockFile<'a> {
         })
     }
 
-    fn record_verified_registry_signature(
+    fn record_registry_signature_presence(
         &mut self,
         source: &str,
-        pin: IdentityPin,
+        present: bool,
     ) -> Result<(), String> {
+        if !present {
+            return Ok(());
+        }
+        self.persist_registry_ratchets(source, "signature presence", |ratchets| {
+            ratchets.signature = ratchets
+                .signature
+                .merge(&RegistrySignatureProtection::Required(
+                    SignerPinState::Unpinned,
+                ))
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_signer_acceptance(
+        &mut self,
+        source: &str,
+        acceptance: SignerAcceptance,
+    ) -> Result<(), String> {
+        let SignerAcceptance { next, transition } = acceptance;
+        if transition == SignerTransition::LegacyConverted {
+            let mut persisted = self.lock_file.clone();
+            persisted.replace_legacy_signer_pin(source, next)?;
+            persisted.save(&self.path).map_err(|error| {
+                format!(
+                    "Failed to persist registry verified signature observation to {}: {error}",
+                    self.path.display()
+                )
+            })?;
+            *self.lock_file = persisted;
+            return Ok(());
+        }
         let verified = RegistryRatchets {
-            signature: RegistrySignatureProtection::RequiredPinned(pin),
+            signature: RegistrySignatureProtection::Required(next.clone()),
             ..RegistryRatchets::default()
         };
         self.persist_registry_ratchets(source, "verified signature", |ratchets| {
@@ -3210,24 +4061,194 @@ enum HttpResponse {
     Failure { status: u16 },
 }
 
+#[derive(Debug)]
+enum RegistryDownloadError {
+    Transport(String),
+    HttpStatus { status: u16, url: String },
+    LocalIo(String),
+}
+
+impl RegistryDownloadError {
+    fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_) | Self::HttpStatus { status: 404, .. }
+        )
+    }
+}
+
+impl fmt::Display for RegistryDownloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(message) | Self::LocalIo(message) => formatter.write_str(message),
+            Self::HttpStatus { status, url } => {
+                write!(formatter, "Download failed with status {status}: {url}")
+            }
+        }
+    }
+}
+
 trait RegistryHttp {
     fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String>;
 
-    fn download_to_file(&self, url: &RegistryResourceUrl, dest: &Path) -> Result<(), String> {
+    fn download_to_file(
+        &self,
+        url: &RegistryResourceUrl,
+        dest: &Path,
+    ) -> Result<(), RegistryDownloadError> {
         let raw_url = url.as_str();
-        let body = match self.get(RegistryHttpRequest::Resource(url))? {
+        let body = match self
+            .get(RegistryHttpRequest::Resource(url))
+            .map_err(RegistryDownloadError::Transport)?
+        {
             HttpResponse::Success { body } => body,
             HttpResponse::Failure { status } => {
-                return Err(format!("Download failed with status {status}: {raw_url}"));
+                return Err(RegistryDownloadError::HttpStatus {
+                    status,
+                    url: raw_url.to_string(),
+                });
             }
         };
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                RegistryDownloadError::LocalIo(format!(
+                    "Failed to create directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
         }
-        fs::write(dest, body)
-            .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
+        fs::write(dest, body).map_err(|error| {
+            RegistryDownloadError::LocalIo(format!(
+                "Failed to write file {}: {error}",
+                dest.display()
+            ))
+        })?;
         Ok(())
+    }
+}
+
+/// In-memory registry transport used by cross-crate integration tests. It is
+/// feature-gated so production callers cannot accidentally bypass the HTTPS
+/// transport, while still exercising the complete resolver and verifier.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Default)]
+pub struct FixtureRegistryHttp {
+    responses: HashMap<String, FixtureRegistryResponse>,
+    downloads: HashMap<String, Vec<u8>>,
+    requested: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone)]
+enum FixtureRegistryResponse {
+    Body { status: u16, body: Vec<u8> },
+    TransportError(String),
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl FixtureRegistryHttp {
+    pub fn json(mut self, url: &str, body: impl AsRef<[u8]>) -> Self {
+        self.responses.insert(
+            url.to_string(),
+            FixtureRegistryResponse::Body {
+                status: 200,
+                body: body.as_ref().to_vec(),
+            },
+        );
+        self
+    }
+
+    pub fn response(mut self, url: &str, status: u16, body: impl AsRef<[u8]>) -> Self {
+        self.downloads.remove(url);
+        self.responses.insert(
+            url.to_string(),
+            FixtureRegistryResponse::Body {
+                status,
+                body: body.as_ref().to_vec(),
+            },
+        );
+        self
+    }
+
+    pub fn transport_error(mut self, url: &str, error: impl Into<String>) -> Self {
+        self.downloads.remove(url);
+        self.responses.insert(
+            url.to_string(),
+            FixtureRegistryResponse::TransportError(error.into()),
+        );
+        self
+    }
+
+    pub fn downloadable_bytes(mut self, url: &str, body: impl Into<Vec<u8>>) -> Self {
+        self.downloads.insert(url.to_string(), body.into());
+        self
+    }
+
+    pub fn requested_urls(&self) -> Vec<String> {
+        self.requested.lock().unwrap().clone()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl RegistryHttp for FixtureRegistryHttp {
+    fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String> {
+        let url = request.url();
+        self.requested.lock().unwrap().push(url.to_string());
+        match self.responses.get(url) {
+            Some(FixtureRegistryResponse::Body { status, body }) => {
+                if (200..300).contains(status) {
+                    Ok(HttpResponse::Success { body: body.clone() })
+                } else {
+                    Ok(HttpResponse::Failure { status: *status })
+                }
+            }
+            Some(FixtureRegistryResponse::TransportError(error)) => Err(error.clone()),
+            None => Err(format!("unexpected fixture registry URL: {url}")),
+        }
+    }
+
+    fn download_to_file(
+        &self,
+        url: &RegistryResourceUrl,
+        dest: &Path,
+    ) -> Result<(), RegistryDownloadError> {
+        let url = url.as_str();
+        self.requested.lock().unwrap().push(url.to_string());
+        let body = match self.downloads.get(url) {
+            Some(body) => body,
+            None => match self.responses.get(url) {
+                Some(FixtureRegistryResponse::Body { status, body })
+                    if (200..300).contains(status) =>
+                {
+                    body
+                }
+                Some(FixtureRegistryResponse::Body { status, .. }) => {
+                    return Err(RegistryDownloadError::HttpStatus {
+                        status: *status,
+                        url: url.to_string(),
+                    });
+                }
+                Some(FixtureRegistryResponse::TransportError(error)) => {
+                    return Err(RegistryDownloadError::Transport(error.clone()));
+                }
+                None => {
+                    return Err(RegistryDownloadError::Transport(format!(
+                        "unexpected fixture registry download URL: {url}"
+                    )));
+                }
+            },
+        };
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                RegistryDownloadError::LocalIo(format!(
+                    "Failed to create {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::write(dest, body).map_err(|error| {
+            RegistryDownloadError::LocalIo(format!("Failed to write {}: {error}", dest.display()))
+        })
     }
 }
 
@@ -3270,31 +4291,69 @@ impl RegistryHttp for UreqRegistryHttp {
         Ok(HttpResponse::Success { body })
     }
 
-    fn download_to_file(&self, url: &RegistryResourceUrl, dest: &Path) -> Result<(), String> {
+    fn download_to_file(
+        &self,
+        url: &RegistryResourceUrl,
+        dest: &Path,
+    ) -> Result<(), RegistryDownloadError> {
         let request = RegistryHttpRequest::Resource(url);
         let url = url.as_str();
-        let response = Self::agent(request)
-            .get(url)
-            .call()
-            .map_err(|e| format!("Failed to download {url}: {e}"))?;
+        let response = match Self::agent(request).get(url).call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(status)) => {
+                return Err(RegistryDownloadError::HttpStatus {
+                    status,
+                    url: url.to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(RegistryDownloadError::Transport(format!(
+                    "Failed to download {url}: {error}"
+                )));
+            }
+        };
 
-        if response.status() != 200 {
-            return Err(format!(
-                "Download failed with status {}: {url}",
-                response.status()
-            ));
+        let status = response.status().into();
+        if status != 200 {
+            return Err(RegistryDownloadError::HttpStatus {
+                status,
+                url: url.to_string(),
+            });
         }
 
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                RegistryDownloadError::LocalIo(format!(
+                    "Failed to create directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
         }
 
         let mut reader = response.into_body().into_reader();
-        let mut file = fs::File::create(dest)
-            .map_err(|e| format!("Failed to create file {}: {e}", dest.display()))?;
-        io::copy(&mut reader, &mut file)
-            .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
+        let mut file = fs::File::create(dest).map_err(|error| {
+            RegistryDownloadError::LocalIo(format!(
+                "Failed to create file {}: {error}",
+                dest.display()
+            ))
+        })?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer).map_err(|error| {
+                RegistryDownloadError::Transport(format!(
+                    "Failed to read download response from {url}: {error}"
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            io::Write::write_all(&mut file, &buffer[..read]).map_err(|error| {
+                RegistryDownloadError::LocalIo(format!(
+                    "Failed to write file {}: {error}",
+                    dest.display()
+                ))
+            })?;
+        }
 
         Ok(())
     }
@@ -3525,11 +4584,38 @@ struct RegistryDownload {
 }
 
 #[derive(Debug, Deserialize)]
+struct RegistryRevisionDownload {
+    version: String,
+    #[serde(flatten)]
+    download: RegistryDownload,
+}
+
+#[derive(Debug)]
 struct RegistrySignature {
     r#type: String,
-    certificate_identity: String,
-    certificate_oidc_issuer: String,
     bundle_url: String,
+}
+
+#[derive(Deserialize)]
+struct RegistrySignatureWire {
+    r#type: String,
+    #[serde(rename = "certificate_identity")]
+    _certificate_identity: String,
+    #[serde(rename = "certificate_oidc_issuer")]
+    _certificate_oidc_issuer: String,
+    bundle_url: String,
+}
+
+impl From<RegistrySignatureWire> for RegistrySignature {
+    fn from(value: RegistrySignatureWire) -> Self {
+        let RegistrySignatureWire {
+            r#type,
+            _certificate_identity: _,
+            _certificate_oidc_issuer: _,
+            bundle_url,
+        } = value;
+        Self { r#type, bundle_url }
+    }
 }
 
 fn deserialize_registry_signature<'de, D>(
@@ -3538,7 +4624,8 @@ fn deserialize_registry_signature<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    RegistrySignature::deserialize(deserializer)
+    RegistrySignatureWire::deserialize(deserializer)
+        .map(Into::into)
         .map(Some)
         .map_err(|error| {
             serde::de::Error::custom(signing::verification_failure(format!(
@@ -3835,27 +4922,10 @@ impl ProviderSource {
 
 fn select_registry_version(
     versions: &SelectableRegistryVersions,
-    config: &ProviderConfig,
+    provider_name: &str,
+    constraint: Option<&VersionConstraint>,
 ) -> Result<String, String> {
-    if let Some(revision) = &config.revision {
-        return versions
-            .iter()
-            .filter(|version| registry_revision_matches(version, revision))
-            .max()
-            .map(|version| version.to_string())
-            .ok_or_else(|| {
-                registry_selection_error(
-                    format!(
-                        "No registry version of '{}' matches revision '{}'",
-                        config.name, revision
-                    ),
-                    versions
-                        .yanked_matching(|version| registry_revision_matches(version, revision)),
-                )
-            });
-    }
-
-    match &config.version {
+    match constraint {
         Some(constraint) => {
             let mut candidates: Vec<&Version> = versions
                 .iter()
@@ -3870,7 +4940,7 @@ fn select_registry_version(
                     registry_selection_error(
                         format!(
                             "No release of '{}' matches constraint '{}'",
-                            config.name, constraint.raw
+                            provider_name, constraint.raw
                         ),
                         versions.yanked_matching(|version| constraint.req.matches(version)),
                     )
@@ -3882,7 +4952,7 @@ fn select_registry_version(
             .map(|version| version.to_string())
             .ok_or_else(|| {
                 registry_selection_error(
-                    format!("No versions found for provider '{}'", config.name),
+                    format!("No versions found for provider '{provider_name}'"),
                     versions.yanked_matching(|_| true),
                 )
             }),
@@ -3900,16 +4970,6 @@ fn registry_selection_error(message: String, yanked_versions: Vec<String>) -> St
     }
 }
 
-fn registry_revision_matches(version: &Version, revision: &str) -> bool {
-    if version.major != 0 || version.minor != 0 || version.patch != 0 {
-        return false;
-    }
-
-    let mut identifiers = version.pre.as_str().split('.');
-    matches!(identifiers.next(), Some(first) if first == revision)
-        && matches!(identifiers.next(), Some(run) if !run.is_empty() && run.bytes().all(|b| b.is_ascii_digit()))
-}
-
 fn fetch_registry_download<H: RegistryHttp>(
     registry: &ResolvedRegistry,
     source: &RegistrySource,
@@ -3923,6 +4983,327 @@ fn fetch_registry_download<H: RegistryHttp>(
     let url = parse_registry_resource_url(&url, "registry download metadata URL")?;
     let download: RegistryDownload = fetch_json(http, &url)?;
     Ok(download)
+}
+
+fn fetch_registry_revision_download<H: RegistryHttp>(
+    registry: &ResolvedRegistry,
+    source: &RegistrySource,
+    revision: &str,
+    http: &H,
+) -> Result<RegistryRevisionDownload, String> {
+    let mut url = url::Url::parse(registry.api_base_url())
+        .map_err(|error| format!("Invalid registry API base URL: {error}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "registry API base URL cannot accept path segments".to_string())?;
+        segments.pop_if_empty();
+        segments.extend([
+            source.namespace.as_str(),
+            source.name.as_str(),
+            "revisions",
+            revision,
+            "download",
+        ]);
+    }
+    let url = parse_registry_resource_url(url.as_str(), "registry revision download metadata URL")?;
+    fetch_json(http, &url)
+}
+
+fn branch_revision_version_matches(version: &Version, revision: &str) -> bool {
+    if version.major != 0 || version.minor != 0 || version.patch != 0 {
+        return false;
+    }
+    let mut identifiers = version.pre.as_str().split('.');
+    matches!(identifiers.next(), Some(first) if first == revision)
+        && identifiers
+            .next()
+            .is_some_and(|identifier| !identifier.is_empty())
+}
+
+fn eligible_commit_sha(revision: &str) -> bool {
+    revision.len() >= 7 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn listed_stable_release_for_tag<'a>(
+    revision: &str,
+    listing: &'a RegistryVersions,
+) -> Option<&'a str> {
+    let version = revision.strip_prefix('v')?;
+    let parsed = Version::parse(version).ok()?;
+    if !parsed.pre.is_empty() {
+        return None;
+    }
+    listing
+        .versions
+        .iter()
+        .find(|entry| entry.version == version)
+        .map(|entry| entry.version.as_str())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryRevisionSelection {
+    Locked,
+    Resolved,
+}
+
+fn bind_registry_revision_with_selection(
+    revision: &str,
+    version: &ListedVersion,
+    listing: &RegistryVersions,
+    identity: Option<&signing::VerifiedSignerIdentity>,
+    selection: RegistryRevisionSelection,
+) -> Result<(), String> {
+    if let Some(identity) = identity {
+        let branch_matches = branch_revision_version_matches(&version.parsed, revision)
+            && identity.source_ref() == format!("refs/heads/{revision}");
+        let release_version = listed_stable_release_for_tag(revision, listing);
+        let tag_matches = identity.source_ref() == format!("refs/tags/{revision}")
+            && release_version.is_none_or(|release| release == version.raw);
+        let sha_matches = eligible_commit_sha(revision)
+            && identity.repository_digest().is_some_and(|digest| {
+                digest
+                    .get(..revision.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(revision))
+            });
+        if branch_matches || tag_matches || sha_matches {
+            return Ok(());
+        }
+        return Err(format!(
+            "verified certificate does not bind registry revision {revision:?} to version {}",
+            version.raw
+        ));
+    }
+
+    if eligible_commit_sha(revision) {
+        return Err(format!(
+            "unsigned registry revision {revision:?} looks like a commit SHA and cannot be bound without a certificate"
+        ));
+    }
+    let branch_shaped_version = branch_revision_version_matches(&version.parsed, revision);
+    if branch_shaped_version {
+        if selection == RegistryRevisionSelection::Locked {
+            return Ok(());
+        }
+        let highest = listing
+            .versions
+            .iter()
+            .filter(|entry| !entry.yanked)
+            .filter_map(|entry| {
+                let parsed = Version::parse(&entry.version).ok()?;
+                branch_revision_version_matches(&parsed, revision)
+                    .then_some((parsed, &entry.version))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, raw)| raw.as_str());
+        if highest == Some(version.raw.as_str()) {
+            return Ok(());
+        }
+        return Err(format!(
+            "unsigned registry branch revision {revision:?} did not return its highest listed build"
+        ));
+    }
+    if let Some(release) = listed_stable_release_for_tag(revision, listing) {
+        if release == version.raw {
+            return Ok(());
+        }
+    } else {
+        // With no certificate, a non-release tag has no certificate-derived
+        // constraint beyond the already-enforced non-yanked listing membership.
+        return Ok(());
+    }
+    Err(format!(
+        "unsigned registry revision {revision:?} does not bind to returned version {}",
+        version.raw
+    ))
+}
+
+#[cfg(test)]
+fn bind_registry_revision(
+    revision: &str,
+    version: &ListedVersion,
+    listing: &RegistryVersions,
+    identity: Option<&signing::VerifiedSignerIdentity>,
+) -> Result<(), String> {
+    bind_registry_revision_with_selection(
+        revision,
+        version,
+        listing,
+        identity,
+        RegistryRevisionSelection::Resolved,
+    )
+}
+
+enum LegacyFetch<T> {
+    Available(T),
+    Unavailable,
+}
+
+fn fetch_registry_download_for_legacy_conversion<H: RegistryHttp>(
+    registry: &ResolvedRegistry,
+    source: &RegistrySource,
+    version: &str,
+    http: &H,
+) -> Result<LegacyFetch<RegistryDownload>, String> {
+    let url = join_registry_url(
+        registry.api_base_url(),
+        &format!("/{}/{}/{version}/download", source.namespace, source.name),
+    );
+    let url = parse_registry_resource_url(&url, "registry download metadata URL")?;
+    let body = match http.get(RegistryHttpRequest::Resource(&url)) {
+        Ok(HttpResponse::Success { body }) => body,
+        Ok(HttpResponse::Failure { status: 404 }) | Err(_) => {
+            return Ok(LegacyFetch::Unavailable);
+        }
+        Ok(HttpResponse::Failure { status }) => {
+            return Err(format!(
+                "cannot fetch legacy-pinned version metadata from {} (HTTP {status})",
+                url.as_str()
+            ));
+        }
+    };
+    serde_json::from_slice(&body)
+        .map(LegacyFetch::Available)
+        .map_err(|error| {
+            format!(
+                "Failed to parse registry JSON from {}: {error}",
+                url.as_str()
+            )
+        })
+}
+
+fn fetch_signature_bundle_for_legacy_conversion<H: RegistryHttp>(
+    signature: &RegistrySignature,
+    http: &H,
+) -> Result<LegacyFetch<Vec<u8>>, String> {
+    let bundle_url = parse_registry_resource_url(&signature.bundle_url, "signature bundle URL")
+        .map_err(signing::verification_failure)?;
+    let body = match http.get(RegistryHttpRequest::Resource(&bundle_url)) {
+        Ok(HttpResponse::Success { body }) => body,
+        Ok(HttpResponse::Failure { status: 404 }) | Err(_) => {
+            return Ok(LegacyFetch::Unavailable);
+        }
+        Ok(HttpResponse::Failure { status }) => {
+            return Err(signing::verification_failure(format!(
+                "cannot fetch legacy-pinned signature bundle from {} (HTTP {status})",
+                signature.bundle_url
+            )));
+        }
+    };
+    if body.len() > MAX_SIGNATURE_BUNDLE_BYTES {
+        return Err(signing::verification_failure(format!(
+            "signature bundle from {} is {} bytes, exceeding the {MAX_SIGNATURE_BUNDLE_BYTES}-byte limit",
+            signature.bundle_url,
+            body.len()
+        )));
+    }
+    Ok(LegacyFetch::Available(body))
+}
+
+fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
+    registry: &ResolvedRegistry,
+    source: &RegistrySource,
+    candidate_version: Option<&str>,
+    lock_file: &mut PersistentLockFile<'_>,
+    http: &H,
+) -> Result<(), String> {
+    let source_key = source.source_key();
+    let Some((locked_name, locked_version, locked_sha256, legacy_pin)) = lock_file
+        .lock_file()
+        .find_by_source(&source_key)
+        .and_then(|entry| {
+            let locked_version = entry.kind.resolved_version()?;
+            let registry = entry.registry.as_ref()?;
+            let RegistrySignatureProtection::Required(SignerPinState::Legacy(pin)) =
+                &registry.signature
+            else {
+                return None;
+            };
+            Some((
+                entry.name.clone(),
+                locked_version.to_string(),
+                entry.sha256.clone(),
+                pin.clone(),
+            ))
+        })
+    else {
+        return Ok(());
+    };
+    if candidate_version == Some(locked_version.as_str()) {
+        return Ok(());
+    }
+
+    let download = match fetch_registry_download_for_legacy_conversion(
+        registry,
+        source,
+        &locked_version,
+        http,
+    )? {
+        LegacyFetch::Available(download) => download,
+        LegacyFetch::Unavailable => return Ok(()),
+    };
+    if download.shasum != locked_sha256 {
+        return Err(format!(
+            "registry shasum for the legacy-pinned version {source_key}@{locked_version} differs from carina-providers.lock: lock has {locked_sha256}, registry returned {}",
+            download.shasum
+        ));
+    }
+    let signature = download.signature.as_ref().ok_or_else(|| {
+        format!(
+            "legacy-pinned version {source_key}@{locked_version} was obtained without its required registry signature"
+        )
+    })?;
+    signing::ensure_supported_signature_type(&signature.r#type)?;
+    let download_url = parse_registry_resource_url(
+        &download.download_url,
+        "legacy-pinned registry download URL",
+    )?;
+    let artifact_context =
+        format!("legacy-pinned registry provider '{locked_name}' ({source_key}@{locked_version})");
+    let artifact = match obtain_registry_artifact(
+        RegistryArtifactRequest {
+            base_dir: &lock_file.project_dir,
+            source: &source_key,
+            version: &locked_version,
+            provider_name: &locked_name,
+            download_url: &download_url,
+            expected_shasum: &locked_sha256,
+            context: &artifact_context,
+        },
+        http,
+    ) {
+        Ok(artifact) => artifact,
+        Err(RegistryArtifactError::Unavailable(_)) => return Ok(()),
+        Err(RegistryArtifactError::Invalid(error)) => {
+            return Err(format!(
+                "legacy-pinned version {source_key}@{locked_version}: {error}"
+            ));
+        }
+    };
+    let bundle = match fetch_signature_bundle_for_legacy_conversion(signature, http)? {
+        LegacyFetch::Available(bundle) => bundle,
+        LegacyFetch::Unavailable => return Ok(()),
+    };
+    let version = ListedVersion::parse(&locked_version)?;
+    let expected_signer = SignerPinState::Legacy(legacy_pin);
+    let (_, acceptance) = match verify_and_decide_signer(
+        artifact.digest,
+        &bundle,
+        &expected_signer,
+        &version,
+        &source_key,
+        &lock_file.project_dir,
+    ) {
+        Ok(verified) => verified,
+        Err(error) => {
+            let _ = fs::remove_file(artifact.path.as_path());
+            return Err(format!(
+                "legacy-pinned version {source_key}@{locked_version}: {error}"
+            ));
+        }
+    };
+    debug_assert_eq!(acceptance.transition, SignerTransition::LegacyConverted);
+    lock_file.record_signer_acceptance(&source_key, acceptance)
 }
 
 /// Get the global plugin cache directory.
@@ -3996,6 +5377,94 @@ fn hash_and_check(
     Ok(artifact_digest)
 }
 
+struct VerifiedRegistryArtifact {
+    path: WasmArtifactPath,
+    digest: Sha256,
+}
+
+enum RegistryArtifactError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+impl fmt::Display for RegistryArtifactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+struct RegistryArtifactRequest<'a> {
+    base_dir: &'a Path,
+    source: &'a str,
+    version: &'a str,
+    provider_name: &'a str,
+    download_url: &'a RegistryResourceUrl,
+    expected_shasum: &'a str,
+    context: &'a str,
+}
+
+fn obtain_registry_artifact<H: RegistryHttp>(
+    request: RegistryArtifactRequest<'_>,
+    http: &H,
+) -> Result<VerifiedRegistryArtifact, RegistryArtifactError> {
+    let RegistryArtifactRequest {
+        base_dir,
+        source,
+        version,
+        provider_name,
+        download_url,
+        expected_shasum,
+        context,
+    } = request;
+    let path = WasmArtifactPath::new(cache_path_wasm(base_dir, source, version), provider_name)
+        .map_err(RegistryArtifactError::Invalid)?;
+    let digest = if path.as_path().exists() {
+        hash_and_check(
+            path.as_path(),
+            expected_shasum,
+            &format!("cached {context}"),
+            base_dir,
+        )
+        .map_err(RegistryArtifactError::Invalid)?
+    } else {
+        if let Err(error) = http.download_to_file(download_url, path.as_path()) {
+            let _ = fs::remove_file(path.as_path());
+            let message = error.to_string();
+            return Err(if error.is_unavailable() {
+                RegistryArtifactError::Unavailable(message)
+            } else {
+                RegistryArtifactError::Invalid(message)
+            });
+        }
+        match hash_and_check(path.as_path(), expected_shasum, context, base_dir) {
+            Ok(digest) => digest,
+            Err(error) => {
+                let _ = fs::remove_file(path.as_path());
+                return Err(RegistryArtifactError::Invalid(error));
+            }
+        }
+    };
+    Ok(VerifiedRegistryArtifact { path, digest })
+}
+
+fn verify_and_decide_signer(
+    artifact_digest: Sha256,
+    bundle: &[u8],
+    expected_signer: &SignerPinState,
+    version: &ListedVersion,
+    source: &str,
+    project_dir: &Path,
+) -> Result<(signing::VerifiedSignerIdentity, SignerAcceptance), String> {
+    let identity = signing::verify_artifact(artifact_digest, bundle)?;
+    let acceptance = decide_signer(expected_signer, &identity, version).map_err(|error| {
+        let remediation = identity_repin_remediation(source, project_dir);
+        format!("{error}; signature verification has no override. {remediation}")
+    })?;
+    Ok((identity, acceptance))
+}
+
 /// Validate a cached version-mode WASM component and ensure the lock file records it.
 ///
 /// When a previous `carina init` left a component in `.carina/providers/`, the
@@ -4049,7 +5518,7 @@ fn verify_or_record_version_cache(
 
 struct VerifiedRegistryLockPin {
     existing_constraint: Option<String>,
-    expected_identity: Option<ExpectedIdentity>,
+    expected_signer: Option<SignerPinState>,
 }
 
 fn verify_registry_lock_pin(
@@ -4069,7 +5538,7 @@ fn verify_registry_lock_pin(
         _ => None,
     });
     if let Some(entry) = entry
-        && matches!(&entry.kind, LockEntryKind::Version { version: locked, .. } if locked == version)
+        && entry.kind.resolved_version() == Some(version)
         && entry.sha256 != expected_shasum
     {
         return Err(format!(
@@ -4091,35 +5560,33 @@ fn verify_registry_lock_pin(
     let ratchets = current_lock
         .known_registry_ratchets(&source_key)
         .map_err(|error| error.to_string())?;
-    let expected_identity = ratchets.signature.expected_identity();
     if ratchets.signature.is_required() && signature.is_none() {
         let remediation = identity_repin_remediation(&source_key, &lock_file.project_dir);
         return Err(format!(
             "the resolved version of {source_key} has no registry signature, but carina-providers.lock records signatures as required for this provider; downgrades from signed to unsigned versions are refused and have no override. {remediation}"
         ));
     }
-    if let (Some(expected_identity), Some(signature)) = (&expected_identity, signature) {
-        let (certificate_identity, certificate_oidc_issuer) = expected_identity.values();
-        if signature.certificate_identity != certificate_identity
-            || signature.certificate_oidc_issuer != certificate_oidc_issuer
-        {
-            let remediation = identity_repin_remediation(&source_key, &lock_file.project_dir);
-            return Err(format!(
-                "registry signature identity for {source_key} differs from the carina-providers.lock pin; signature verification has no override. {remediation}"
-            ));
-        }
-    }
+    let expected_signer = signature.map(|_| {
+        ratchets
+            .signature
+            .pin_state()
+            .cloned()
+            .unwrap_or(SignerPinState::Unpinned)
+    });
     if ratchets.transparency_log_present && !transparency_log_present {
         return Err(format!(
             "registry transparency_log field disappeared for {source_key}"
         ));
     }
     // Lock-pin validation is the presence observation's acceptance gate.
-    // Persist it before later signature-type and artifact checks.
+    // Persist both independent presence ratchets before later signature-type
+    // and artifact checks; a failed signature must never make a later
+    // unsigned response acceptable.
+    lock_file.record_registry_signature_presence(&source_key, signature.is_some())?;
     lock_file.record_registry_transparency_log_presence(&source_key, transparency_log_present)?;
     Ok(VerifiedRegistryLockPin {
         existing_constraint,
-        expected_identity,
+        expected_signer,
     })
 }
 
@@ -4171,47 +5638,190 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
         versions,
         validated_sequence,
     } = fetch_registry_versions(&registry, source, &mut persistent_lock, http)?;
+    convert_obtainable_legacy_signer_pin(
+        &registry,
+        source,
+        Some(version),
+        &mut persistent_lock,
+        http,
+    )?;
     let source_key = source.source_key();
-    if !versions
-        .versions
-        .iter()
-        .any(|entry| entry.version == version)
-    {
-        return Err(format!(
-            "Registry provider {} does not contain version {}",
-            source_key, version
-        ));
-    }
-    let listed_version_is_yanked = versions
-        .versions
-        .iter()
-        .any(|entry| entry.version == version && entry.yanked);
-    if listed_version_is_yanked {
-        if persistent_lock
+    let listed_version = require_listed_registry_version(
+        &versions,
+        version,
+        &source_key,
+        persistent_lock
             .lock_file()
             .find(&source_key, version)
-            .is_some()
-        {
-            eprintln!(
-                "carina: warning: registry provider {source_key}@{version} is yanked; continuing because carina-providers.lock pins this version"
-            );
-        } else {
-            return Err(format!(
-                "Registry provider {source_key} version {version} is yanked and cannot be newly pinned"
-            ));
-        }
-    }
+            .is_some(),
+    )?;
     let download = fetch_registry_download(&registry, source, version, http)?;
+    accept_registry_download_with_http(
+        PendingRegistryDownload {
+            base_dir,
+            source,
+            version: listed_version,
+            name,
+            registry,
+            validated_sequence,
+            download,
+            intent: RegistryDownloadIntent::Version,
+        },
+        &mut persistent_lock,
+        http,
+    )
+}
+
+fn resolve_registry_revision_with_http<H: RegistryHttp>(
+    base_dir: &Path,
+    source: &RegistrySource,
+    revision: &str,
+    name: &str,
+    lock_file: &mut LockFile,
+    mode: LockMode,
+    http: &H,
+) -> Result<WasmArtifactPath, String> {
+    let existing_host = lock_file.registry_host_lock(&source.hostname).cloned();
+    let registry = resolve_registry(source, existing_host.as_ref(), base_dir, http)?;
+    let mut persistent_lock = PersistentLockFile::new(lock_file, base_dir);
+    let RecordedRegistryListing {
+        versions,
+        validated_sequence,
+    } = fetch_registry_versions(&registry, source, &mut persistent_lock, http)?;
+    let source_key = source.source_key();
+    let locked_version = if mode == LockMode::Upgrade {
+        None
+    } else {
+        persistent_lock
+            .lock_file()
+            .find_by_source(&source_key)
+            .and_then(|entry| match &entry.kind {
+                LockEntryKind::RegistryRevision {
+                    revision: locked_revision,
+                    version,
+                } if locked_revision == revision => Some(version.clone()),
+                LockEntryKind::Version { .. }
+                | LockEntryKind::Revision { .. }
+                | LockEntryKind::RegistryRevision { .. }
+                | LockEntryKind::File => None,
+            })
+    };
+    let (listed_version, download, selection) = if let Some(locked_version) = locked_version {
+        convert_obtainable_legacy_signer_pin(
+            &registry,
+            source,
+            Some(&locked_version),
+            &mut persistent_lock,
+            http,
+        )?;
+        let listed_version =
+            require_listed_registry_version(&versions, &locked_version, &source_key, true)?;
+        let download = fetch_registry_download(&registry, source, &locked_version, http)?;
+        (listed_version, download, RegistryRevisionSelection::Locked)
+    } else {
+        convert_obtainable_legacy_signer_pin(&registry, source, None, &mut persistent_lock, http)?;
+        let response = fetch_registry_revision_download(&registry, source, revision, http)?;
+        let listed_version =
+            require_listed_registry_version(&versions, &response.version, &source_key, false)?;
+        (
+            listed_version,
+            response.download,
+            RegistryRevisionSelection::Resolved,
+        )
+    };
+    accept_registry_download_with_http(
+        PendingRegistryDownload {
+            base_dir,
+            source,
+            version: listed_version,
+            name,
+            registry,
+            validated_sequence,
+            download,
+            intent: RegistryDownloadIntent::Revision {
+                requested: revision,
+                listing: &versions,
+                selection,
+            },
+        },
+        &mut persistent_lock,
+        http,
+    )
+}
+
+fn require_listed_registry_version(
+    versions: &RegistryVersions,
+    version: &str,
+    source_key: &str,
+    permit_locked_yanked: bool,
+) -> Result<ListedVersion, String> {
+    let entry = versions
+        .versions
+        .iter()
+        .find(|entry| entry.version == version)
+        .ok_or_else(|| {
+            format!("Registry provider {source_key} does not contain version {version}")
+        })?;
+    if entry.yanked && !permit_locked_yanked {
+        return Err(format!(
+            "Registry provider {source_key} version {version} is yanked and cannot be newly pinned"
+        ));
+    }
+    if entry.yanked {
+        eprintln!(
+            "carina: warning: registry provider {source_key}@{version} is yanked; continuing because carina-providers.lock pins this version"
+        );
+    }
+    ListedVersion::parse(&entry.version)
+}
+
+enum RegistryDownloadIntent<'a> {
+    Version,
+    Revision {
+        requested: &'a str,
+        listing: &'a RegistryVersions,
+        selection: RegistryRevisionSelection,
+    },
+}
+
+struct PendingRegistryDownload<'a> {
+    base_dir: &'a Path,
+    source: &'a RegistrySource,
+    version: ListedVersion,
+    name: &'a str,
+    registry: ResolvedRegistry,
+    validated_sequence: ValidatedRegistrySequence,
+    download: RegistryDownload,
+    intent: RegistryDownloadIntent<'a>,
+}
+
+fn accept_registry_download_with_http<H: RegistryHttp>(
+    pending: PendingRegistryDownload<'_>,
+    persistent_lock: &mut PersistentLockFile<'_>,
+    http: &H,
+) -> Result<WasmArtifactPath, String> {
+    let PendingRegistryDownload {
+        base_dir,
+        source,
+        version,
+        name,
+        registry,
+        validated_sequence,
+        download,
+        intent,
+    } = pending;
+    let version_string = version.raw.as_str();
+    let source_key = source.source_key();
     let download_url =
         parse_registry_resource_url(&download.download_url, "registry download URL")?;
     let transparency_log_present = download.transparency_log.is_some();
     let VerifiedRegistryLockPin {
         existing_constraint,
-        expected_identity: pinned_identity,
+        expected_signer,
     } = verify_registry_lock_pin(
-        &mut persistent_lock,
+        persistent_lock,
         source,
-        version,
+        version_string,
         &download.shasum,
         &registry,
         download.signature.as_ref(),
@@ -4222,94 +5832,103 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
     if let Some(signature) = &download.signature {
         signing::ensure_supported_signature_type(&signature.r#type)?;
     }
-    let provider_context = format!("registry provider '{name}' ({source_key}@{version})");
-    let signed = download.signature.as_ref().map(|signature| {
-        (
-            signature,
-            pinned_identity.unwrap_or_else(|| {
-                ExpectedIdentity::first_use(
-                    signature.certificate_identity.clone(),
-                    signature.certificate_oidc_issuer.clone(),
-                )
-            }),
-        )
-    });
+    let provider_context = format!("registry provider '{name}' ({source_key}@{version_string})");
+    let signed = download.signature.as_ref().zip(expected_signer);
 
-    let wasm_path = WasmArtifactPath::new(cache_path_wasm(base_dir, &source_key, version), name)?;
-    let artifact_digest = if wasm_path.as_path().exists() {
-        hash_and_check(
-            wasm_path.as_path(),
-            &download.shasum,
-            &format!("cached {provider_context}"),
+    let artifact = obtain_registry_artifact(
+        RegistryArtifactRequest {
             base_dir,
-        )?
-    } else {
-        http.download_to_file(&download_url, wasm_path.as_path())?;
-        hash_and_check(
-            wasm_path.as_path(),
-            &download.shasum,
-            &provider_context,
-            base_dir,
-        )?
-    };
+            source: &source_key,
+            version: version_string,
+            provider_name: name,
+            download_url: &download_url,
+            expected_shasum: &download.shasum,
+            context: &provider_context,
+        },
+        http,
+    )
+    .map_err(|error| error.to_string())?;
 
-    let verified_identity = match signed {
-        Some((signature, expected_identity)) => {
+    let verified_signature = match signed {
+        Some((signature, expected_signer)) => {
             let bundle = fetch_signature_bundle(signature, http)
                 .map_err(|error| format!("{provider_context}: {error}"))?;
-            match signing::verify(artifact_digest, &bundle, &expected_identity) {
-                Ok(identity) => Some((identity, expected_identity)),
+            match verify_and_decide_signer(
+                artifact.digest,
+                &bundle,
+                &expected_signer,
+                &version,
+                &source_key,
+                base_dir,
+            ) {
+                Ok(verified) => Some(verified),
                 Err(error) => {
-                    let _ = fs::remove_file(wasm_path.as_path());
+                    let _ = fs::remove_file(artifact.path.as_path());
                     return Err(format!("{provider_context}: {error}"));
                 }
             }
         }
         None => None,
     };
-    if let Some((identity, expected_identity)) = verified_identity {
-        let (certificate_identity, certificate_oidc_issuer) = identity.into_parts();
-        let first_use = expected_identity.is_first_use();
-        let pin = IdentityPin {
-            certificate_identity,
-            certificate_oidc_issuer,
-        };
-        persistent_lock.record_verified_registry_signature(&source_key, pin.clone())?;
-        if first_use {
-            eprintln!(
-                "carina: pinned signing identity for {source_key}: {} (issuer {})",
-                pin.certificate_identity, pin.certificate_oidc_issuer
-            );
+
+    let kind = match intent {
+        RegistryDownloadIntent::Version => LockEntryKind::Version {
+            version: version.raw.clone(),
+            constraint: existing_constraint,
+        },
+        RegistryDownloadIntent::Revision {
+            requested,
+            listing,
+            selection,
+        } => {
+            if let Err(error) = bind_registry_revision_with_selection(
+                requested,
+                &version,
+                listing,
+                verified_signature.as_ref().map(|(identity, _)| identity),
+                selection,
+            ) {
+                let _ = fs::remove_file(artifact.path.as_path());
+                return Err(error);
+            }
+            LockEntryKind::RegistryRevision {
+                revision: requested.to_string(),
+                version: version.raw.clone(),
+            }
+        }
+    };
+
+    if let Some((_, acceptance)) = verified_signature {
+        let transition = acceptance.transition.clone();
+        persistent_lock.record_signer_acceptance(&source_key, acceptance)?;
+        if transition != SignerTransition::Unchanged {
+            eprintln!("carina: updated verified signer pins for {source_key}: {transition:?}");
         }
     }
 
     persistent_lock.upsert_registry_provider(RegistryProviderLockEntry {
         name: name.to_string(),
         source: source_key,
-        kind: LockEntryKind::Version {
-            version: version.to_string(),
-            constraint: existing_constraint,
-        },
+        kind,
         sha256: download.shasum,
         registry,
         validated_sequence,
     })?;
-    Ok(wasm_path)
+    Ok(artifact.path)
 }
 
-fn annotate_version_lock_entry(source: &str, config: &ProviderConfig, lock_file: &mut LockFile) {
+fn annotate_version_lock_entry(
+    source: &str,
+    constraint: Option<&VersionConstraint>,
+    lock_file: &mut LockFile,
+) {
     if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source)
-        && let LockEntryKind::Version { version, .. } = &entry.kind
+        && let LockEntryKind::Version {
+            constraint: locked_constraint,
+            ..
+        } = &mut entry.kind
     {
-        let version = version.clone();
-        if let Some(revision) = &config.revision {
-            entry.kind = LockEntryKind::RegistryRevision {
-                revision: revision.clone(),
-                version,
-            };
-        } else if let LockEntryKind::Version { constraint, .. } = &mut entry.kind {
-            *constraint = config.version.as_ref().map(|c| c.raw.clone());
-        }
+        *locked_constraint = constraint.map(|constraint| constraint.raw.clone());
     }
 }
 
@@ -4432,7 +6051,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
         Err(e) => {
             // Clean up any partial download.
             let _ = fs::remove_file(wasm_path.as_path());
-            Err(e)
+            Err(e.to_string())
         }
     }
 }
@@ -4463,18 +6082,19 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
-    let artifact_path = if registry_revision(&source, config)?.is_some() {
-        let version = resolve_version(base_dir, &source, config, &mut lock_file, false, http)?;
-        let path = resolve_provider_with_http(
+    let artifact_path = if let Some(revision) = registry_revision(&source, config)? {
+        let ProviderSource::Registry(registry_source) = parse_provider_source(&source)? else {
+            unreachable!("registry_revision only returns Some for registry sources")
+        };
+        resolve_registry_revision_with_http(
             base_dir,
-            &source,
-            &version,
+            &registry_source,
+            revision,
             &config.name,
             &mut lock_file,
+            LockMode::Normal,
             http,
-        )?;
-        annotate_version_lock_entry(&source, config, &mut lock_file);
-        path
+        )?
     } else if let Some(revision) = &config.revision {
         let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
             base_dir,
@@ -4486,7 +6106,15 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         )?;
         path
     } else {
-        let version = resolve_version(base_dir, &source, config, &mut lock_file, false, http)?;
+        let version = resolve_version(
+            base_dir,
+            &source,
+            &config.name,
+            config.version.as_ref(),
+            &mut lock_file,
+            false,
+            http,
+        )?;
         let path = resolve_provider_with_http(
             base_dir,
             &source,
@@ -4496,7 +6124,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
             http,
         )?;
 
-        annotate_version_lock_entry(&source, config, &mut lock_file);
+        annotate_version_lock_entry(&source, config.version.as_ref(), &mut lock_file);
         path
     };
 
@@ -4696,29 +6324,15 @@ pub fn find_installed_provider(
 /// site, no runtime check needed.
 fn try_reuse_locked_version(
     source: &str,
-    config: &ProviderConfig,
+    constraint: Option<&VersionConstraint>,
     lock_file: &LockFile,
 ) -> Option<String> {
     let entry = lock_file.find_by_source(source)?;
-    if let Some(config_revision) = &config.revision {
-        return match &entry.kind {
-            LockEntryKind::RegistryRevision { revision, version }
-                if revision == config_revision =>
-            {
-                Some(version.clone())
-            }
-            LockEntryKind::Version { .. }
-            | LockEntryKind::Revision { .. }
-            | LockEntryKind::RegistryRevision { .. }
-            | LockEntryKind::File => None,
-        };
-    }
-
     match &entry.kind {
         LockEntryKind::Version {
             version,
             constraint: _,
-        } => match &config.version {
+        } => match constraint {
             Some(constraint) if constraint.matches(version).unwrap_or(false) => {
                 Some(version.clone())
             }
@@ -4735,12 +6349,13 @@ fn try_reuse_locked_version(
 fn resolve_version<H: RegistryHttp>(
     project_dir: &Path,
     source: &str,
-    config: &ProviderConfig,
+    provider_name: &str,
+    constraint: Option<&VersionConstraint>,
     lock_file: &mut LockFile,
     upgrade: bool,
     http: &H,
 ) -> Result<String, String> {
-    if !upgrade && let Some(version) = try_reuse_locked_version(source, config, lock_file) {
+    if !upgrade && let Some(version) = try_reuse_locked_version(source, constraint, lock_file) {
         return Ok(version);
     }
 
@@ -4748,20 +6363,21 @@ fn resolve_version<H: RegistryHttp>(
         return resolve_registry_version_with_http(
             project_dir,
             &registry_source,
-            config,
+            provider_name,
+            constraint,
             lock_file,
             http,
         );
     }
 
-    match &config.version {
+    match constraint {
         Some(constraint) => {
             let tags = crate::version_resolver::fetch_release_tags(source)?;
             let resolved = crate::version_resolver::resolve_from_tags(&tags, &constraint.req)
                 .ok_or_else(|| {
                     format!(
                         "No release of '{}' matches constraint '{}'. Available: {}",
-                        config.name,
+                        provider_name,
                         constraint.raw,
                         tags.join(", ")
                     )
@@ -4779,7 +6395,8 @@ fn resolve_version<H: RegistryHttp>(
 fn resolve_registry_version_with_http<H: RegistryHttp>(
     project_dir: &Path,
     source: &RegistrySource,
-    config: &ProviderConfig,
+    provider_name: &str,
+    constraint: Option<&VersionConstraint>,
     lock_file: &mut LockFile,
     http: &H,
 ) -> Result<String, String> {
@@ -4787,10 +6404,12 @@ fn resolve_registry_version_with_http<H: RegistryHttp>(
     let registry = resolve_registry(source, existing_host.as_ref(), project_dir, http)?;
     let RecordedRegistryListing { versions, .. } = {
         let mut persistent_lock = PersistentLockFile::new(lock_file, project_dir);
-        fetch_registry_versions(&registry, source, &mut persistent_lock, http)?
+        let listing = fetch_registry_versions(&registry, source, &mut persistent_lock, http)?;
+        convert_obtainable_legacy_signer_pin(&registry, source, None, &mut persistent_lock, http)?;
+        listing
     };
     let candidates = SelectableRegistryVersions::from_listing(&versions.versions);
-    select_registry_version(&candidates, config)
+    select_registry_version(&candidates, provider_name, constraint)
 }
 
 /// How strictly `resolve_all` treats a pre-existing lock file.
@@ -5056,6 +6675,16 @@ pub fn resolve_all(
     resolve_all_with_http(base_dir, providers, mode, &UreqRegistryHttp)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub fn resolve_all_with_fixture_registry(
+    base_dir: &Path,
+    providers: &[ProviderConfig],
+    mode: LockMode,
+    http: &FixtureRegistryHttp,
+) -> Result<HashMap<String, WasmArtifactPath>, String> {
+    resolve_all_with_http(base_dir, providers, mode, http)
+}
+
 fn resolve_all_with_http<H: RegistryHttp>(
     base_dir: &Path,
     providers: &[ProviderConfig],
@@ -5137,19 +6766,19 @@ fn resolve_all_with_http<H: RegistryHttp>(
         }
         let source = canonical_provider_source(source)?;
 
-        let artifact_path = if registry_revision(&source, config)?.is_some() {
-            let version =
-                resolve_version(base_dir, &source, config, &mut lock_file, upgrade, http)?;
-            let path = resolve_provider_with_http(
+        let artifact_path = if let Some(revision) = registry_revision(&source, config)? {
+            let ProviderSource::Registry(registry_source) = parse_provider_source(&source)? else {
+                unreachable!("registry_revision only returns Some for registry sources")
+            };
+            resolve_registry_revision_with_http(
                 base_dir,
-                &source,
-                &version,
+                &registry_source,
+                revision,
                 &config.name,
                 &mut lock_file,
+                mode,
                 http,
-            )?;
-            annotate_version_lock_entry(&source, config, &mut lock_file);
-            path
+            )?
         } else if let Some(revision) = &config.revision {
             let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
                 base_dir,
@@ -5161,8 +6790,15 @@ fn resolve_all_with_http<H: RegistryHttp>(
             )?;
             path
         } else {
-            let version =
-                resolve_version(base_dir, &source, config, &mut lock_file, upgrade, http)?;
+            let version = resolve_version(
+                base_dir,
+                &source,
+                &config.name,
+                config.version.as_ref(),
+                &mut lock_file,
+                upgrade,
+                http,
+            )?;
             let path = resolve_provider_with_http(
                 base_dir,
                 &source,
@@ -5172,7 +6808,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
                 http,
             )?;
 
-            annotate_version_lock_entry(&source, config, &mut lock_file);
+            annotate_version_lock_entry(&source, config.version.as_ref(), &mut lock_file);
             path
         };
 
@@ -5246,10 +6882,124 @@ mod tests {
     const SIGNED_FIXTURE_IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
     const SIGNED_FIXTURE_ISSUER: &str = "https://token.actions.githubusercontent.com";
     const SIGNED_FIXTURE_BUNDLE_URL: &str = "https://downloads.example.test/aws.sigstore.json";
+    const SIGNED_FIXTURE_VERSION: &str = "0.0.0-main.1";
+    const SIGNED_FIXTURE_CANDIDATE_VERSION: &str = "0.0.0-main.2";
+    const SIGNED_FIXTURE_DOWNLOAD_URL: &str =
+        "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.1/download";
+    const SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL: &str =
+        "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.2/download";
+    const SIGNED_FIXTURE_LOCKED_ARTIFACT_URL: &str =
+        "https://downloads.example.test/aws-main-1.wasm";
+    const SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL: &str =
+        "https://downloads.example.test/aws-main-2.wasm";
     const REGISTRY_VERSIONS_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions";
     const REGISTRY_DOWNLOAD_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download";
+    const CAPTURED_AWS_STABLE_VERSION: &str = "0.7.0";
+    const CAPTURED_AWS_PRERELEASE_VERSION: &str = "0.0.0-main.630.1.g12ec945";
+    const CAPTURED_AWS_LISTING: &[u8] =
+        include_bytes!("signing/testdata/issue-3928/aws-versions.json");
+    const CAPTURED_AWS_STABLE_BUNDLE: &[u8] =
+        include_bytes!("signing/testdata/issue-3928/aws-0.7.0/bundle.sigstore.json");
+    const CAPTURED_AWS_PRERELEASE_DOWNLOAD: &[u8] =
+        include_bytes!("signing/testdata/issue-3928/aws-0.0.0-main.630.1.g12ec945/download.json");
+    const CAPTURED_AWS_PRERELEASE_BUNDLE: &[u8] = include_bytes!(
+        "signing/testdata/issue-3928/aws-0.0.0-main.630.1.g12ec945/bundle.sigstore.json"
+    );
+    const CAPTURED_AWSCC_STABLE_BUNDLE: &[u8] =
+        include_bytes!("signing/testdata/issue-3928/awscc-0.7.0/bundle.sigstore.json");
+
+    fn captured_listing(raw: &[u8]) -> Vec<u8> {
+        let mut listing: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        listing["valid_until"] = serde_json::json!("2999-01-01T00:00:00Z");
+        serde_json::to_vec(&listing).unwrap()
+    }
+
+    fn captured_registry_base(listing: impl AsRef<[u8]>) -> FixtureRegistryHttp {
+        FixtureRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(REGISTRY_VERSIONS_URL, listing)
+    }
+
+    fn captured_identity(bundle: &[u8]) -> signing::VerifiedSignerIdentity {
+        signing::extract_signer_identity_from_bundle_for_test(bundle).unwrap()
+    }
+
+    fn signed_fixture_download(version: &str, artifact_url: &str) -> Vec<u8> {
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        serde_json::to_vec(&serde_json::json!({
+            "protocols": ["1"],
+            "filename": format!("carina-provider-aws-v{version}.wasm"),
+            "download_url": artifact_url,
+            "shasum": shasum,
+            "shasum_authored_by": "registry",
+            "signature": {
+                "type": "sigstore-bundle",
+                "certificate_identity": "deliberately-wrong-response-value",
+                "certificate_oidc_issuer": "https://wrong.example.test",
+                "bundle_url": SIGNED_FIXTURE_BUNDLE_URL,
+            },
+        }))
+        .unwrap()
+    }
+
+    fn signed_fixture_registry() -> FixtureRegistryHttp {
+        FixtureRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                REGISTRY_VERSIONS_URL,
+                format!(
+                    r#"{{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{{"version":"{SIGNED_FIXTURE_VERSION}","protocols":["1"]}},{{"version":"{SIGNED_FIXTURE_CANDIDATE_VERSION}","protocols":["1"]}}]}}"#
+                ),
+            )
+            .json(
+                SIGNED_FIXTURE_DOWNLOAD_URL,
+                signed_fixture_download(
+                    SIGNED_FIXTURE_VERSION,
+                    SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
+                ),
+            )
+            .json(
+                SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL,
+                signed_fixture_download(
+                    SIGNED_FIXTURE_CANDIDATE_VERSION,
+                    SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL,
+                ),
+            )
+            .response(SIGNED_FIXTURE_BUNDLE_URL, 200, SIGNED_FIXTURE_BUNDLE)
+            .downloadable_bytes(
+                SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
+                SIGNED_FIXTURE_ARTIFACT.to_vec(),
+            )
+            .downloadable_bytes(
+                SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL,
+                SIGNED_FIXTURE_ARTIFACT.to_vec(),
+            )
+    }
+
+    fn signed_fixture_legacy_lock(base_dir: &Path) -> LockFile {
+        let mut lock = LockFile::default();
+        resolve_provider_with_http(
+            base_dir,
+            "carina-rs/aws",
+            SIGNED_FIXTURE_VERSION,
+            "aws",
+            &mut lock,
+            &signed_fixture_registry(),
+        )
+        .unwrap();
+        lock.provider[0].registry.as_mut().unwrap().signature =
+            signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER);
+        lock.save(&provider_lock_path(base_dir)).unwrap();
+        lock
+    }
 
     #[test]
     fn link_or_copy_falls_back_to_copy_when_link_fails() {
@@ -5320,14 +7070,810 @@ mod tests {
     }
 
     fn signature_pin(identity: &str, issuer: &str) -> RegistrySignatureProtection {
-        RegistrySignatureProtection::RequiredPinned(IdentityPin {
-            certificate_identity: identity.into(),
-            certificate_oidc_issuer: issuer.into(),
-        })
+        RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
+            certificate_san: identity.into(),
+            oidc_issuer: issuer.into(),
+        }))
     }
 
     fn signed_fixture_pin() -> RegistrySignatureProtection {
         signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER)
+    }
+
+    fn verified_signer(
+        san: &str,
+        issuer: &str,
+        owner_id: &str,
+        repository_id: &str,
+        source_ref: &str,
+        workflow: &str,
+    ) -> signing::VerifiedSignerIdentity {
+        signing::VerifiedSignerIdentity::for_test(
+            san,
+            issuer,
+            owner_id,
+            repository_id,
+            source_ref,
+            workflow,
+            Some("12ec945ec6ea2fb89bff8857e2a06dc54c933700"),
+        )
+    }
+
+    #[test]
+    fn signer_decision_enforces_the_exact_stable_ref_including_build_metadata() {
+        let identity = verified_signer(
+            "https://example.test/release.yml@refs/tags/v1.2.3+build.7",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/tags/v1.2.3+build.7",
+            "https://example.test/release.yml",
+        );
+        let version = ListedVersion::parse("1.2.3+build.7").unwrap();
+
+        let accepted = decide_signer(&SignerPinState::Unpinned, &identity, &version).unwrap();
+
+        assert_eq!(accepted.transition, SignerTransition::FirstContact);
+        assert!(matches!(
+            accepted.next,
+            SignerPinState::Current(CurrentSignerPins {
+                workflows: WorkflowPins::Stable(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn signer_decision_rejects_stable_refs_without_v_or_with_rc_tag() {
+        let version = ListedVersion::parse("1.2.3").unwrap();
+        for source_ref in ["refs/tags/1.2.3", "refs/tags/v1.2.3-rc.1"] {
+            let identity = verified_signer(
+                "https://example.test/release.yml",
+                "https://issuer.example",
+                "owner-1",
+                "repo-1",
+                source_ref,
+                "https://example.test/release.yml",
+            );
+
+            assert!(matches!(
+                decide_signer(&SignerPinState::Unpinned, &identity, &version),
+                Err(SignerRejection::StableSourceRef { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn signer_decision_pins_two_workflows_for_two_channels_of_one_source() {
+        let prerelease = verified_signer(
+            "https://example.test/ci.yml@refs/heads/main",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/heads/main",
+            "https://example.test/ci.yml",
+        );
+        let prerelease_version = ListedVersion::parse("0.0.0-main.1").unwrap();
+        let first =
+            decide_signer(&SignerPinState::Unpinned, &prerelease, &prerelease_version).unwrap();
+        let stable = verified_signer(
+            "https://example.test/release.yml@refs/tags/v1.0.0",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/tags/v1.0.0",
+            "https://example.test/release.yml",
+        );
+
+        let second = decide_signer(
+            &first.next,
+            &stable,
+            &ListedVersion::parse("1.0.0").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            second.transition,
+            SignerTransition::ChannelPinned(ReleaseChannel::Stable)
+        );
+        assert!(matches!(
+            second.next,
+            SignerPinState::Current(CurrentSignerPins {
+                workflows: WorkflowPins::Both { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn signer_decision_checks_source_before_pinning_an_unseen_channel() {
+        let current = SignerPinState::Current(CurrentSignerPins {
+            source: SourcePin {
+                oidc_issuer: "https://issuer.example".into(),
+                repository_owner_id: "owner-1".into(),
+                repository_id: "repo-1".into(),
+            },
+            workflows: WorkflowPins::Prerelease(WorkflowPin("https://example.test/ci.yml".into())),
+        });
+        let other_repo = verified_signer(
+            "https://example.test/release.yml@refs/tags/v1.0.0",
+            "https://issuer.example",
+            "owner-1",
+            "repo-2",
+            "refs/tags/v1.0.0",
+            "https://example.test/release.yml",
+        );
+
+        assert!(matches!(
+            decide_signer(
+                &current,
+                &other_repo,
+                &ListedVersion::parse("1.0.0").unwrap()
+            ),
+            Err(SignerRejection::SourceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn signer_decision_converts_legacy_pin_without_parsing_it() {
+        let legacy = SignerPinState::Legacy(LegacySignerPin {
+            certificate_san: "https://example.test/ci.yml@refs/heads/main".into(),
+            oidc_issuer: "https://issuer.example".into(),
+        });
+        let identity = verified_signer(
+            "https://example.test/ci.yml@refs/heads/main",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/heads/main",
+            "https://example.test/ci.yml",
+        );
+
+        let accepted = decide_signer(
+            &legacy,
+            &identity,
+            &ListedVersion::parse("0.0.0-main.1").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(accepted.transition, SignerTransition::LegacyConverted);
+        assert!(matches!(accepted.next, SignerPinState::Current(_)));
+    }
+
+    #[test]
+    fn captured_stable_certificate_is_accepted_from_exact_v_tag() {
+        let identity = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
+        let accepted = decide_signer(
+            &SignerPinState::Unpinned,
+            &identity,
+            &ListedVersion::parse(CAPTURED_AWS_STABLE_VERSION).unwrap(),
+        )
+        .unwrap();
+        let SignerPinState::Current(pins) = accepted.next else {
+            panic!("first stable contact must establish current signer pins");
+        };
+
+        assert_eq!(accepted.transition, SignerTransition::FirstContact);
+        assert!(matches!(
+            pins.workflows,
+            WorkflowPins::Stable(WorkflowPin(ref workflow))
+                if workflow.ends_with("/.github/workflows/release.yml")
+        ));
+        assert_eq!(
+            pins.source.oidc_issuer,
+            "https://token.actions.githubusercontent.com"
+        );
+    }
+
+    #[test]
+    fn captured_stable_certificate_cannot_be_relabelled_as_another_stable_version() {
+        let identity = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
+        let error = decide_signer(
+            &SignerPinState::Unpinned,
+            &identity,
+            &ListedVersion::parse("0.7.1").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SignerRejection::StableSourceRef { expected, actual }
+                if expected == "refs/tags/v0.7.1" && actual == "refs/tags/v0.7.0"
+        ));
+    }
+
+    #[test]
+    fn captured_prerelease_certificate_cannot_be_served_as_a_stable_version() {
+        let identity = captured_identity(CAPTURED_AWS_PRERELEASE_BUNDLE);
+        let error = decide_signer(
+            &SignerPinState::Unpinned,
+            &identity,
+            &ListedVersion::parse(CAPTURED_AWS_STABLE_VERSION).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SignerRejection::StableSourceRef { expected, actual }
+                if expected == "refs/tags/v0.7.0" && actual == "refs/heads/main"
+        ));
+    }
+
+    #[test]
+    fn captured_prerelease_and_stable_certificates_pin_distinct_workflows_for_one_source() {
+        let prerelease = captured_identity(CAPTURED_AWS_PRERELEASE_BUNDLE);
+        let stable = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
+        let first = decide_signer(
+            &SignerPinState::Unpinned,
+            &prerelease,
+            &ListedVersion::parse(CAPTURED_AWS_PRERELEASE_VERSION).unwrap(),
+        )
+        .unwrap();
+        let second = decide_signer(
+            &first.next,
+            &stable,
+            &ListedVersion::parse(CAPTURED_AWS_STABLE_VERSION).unwrap(),
+        )
+        .unwrap();
+        let SignerPinState::Current(pins) = second.next else {
+            panic!("both signed channels must retain current signer pins");
+        };
+
+        let WorkflowPins::Both { stable, prerelease } = pins.workflows else {
+            panic!("stable and prerelease must have independent workflow pins");
+        };
+        assert!(stable.0.ends_with("/.github/workflows/release.yml"));
+        assert!(prerelease.0.ends_with("/.github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn captured_stable_from_another_repo_fails_the_shared_source_gate() {
+        let prerelease = captured_identity(CAPTURED_AWS_PRERELEASE_BUNDLE);
+        let other_repo = captured_identity(CAPTURED_AWSCC_STABLE_BUNDLE);
+        let first = decide_signer(
+            &SignerPinState::Unpinned,
+            &prerelease,
+            &ListedVersion::parse(CAPTURED_AWS_PRERELEASE_VERSION).unwrap(),
+        )
+        .unwrap();
+
+        let error = decide_signer(
+            &first.next,
+            &other_repo,
+            &ListedVersion::parse(CAPTURED_AWS_STABLE_VERSION).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SignerRejection::SourceMismatch { .. }));
+        assert!(matches!(
+            first.next,
+            SignerPinState::Current(CurrentSignerPins {
+                workflows: WorkflowPins::Prerelease(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_pin_converts_from_locked_version_artifact_before_candidate_is_evaluated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = signed_fixture_legacy_lock(dir.path());
+        fs::remove_file(cache_path_wasm(
+            dir.path(),
+            "carina-rs/aws",
+            SIGNED_FIXTURE_VERSION,
+        ))
+        .unwrap();
+
+        let http = signed_fixture_registry();
+        resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            SIGNED_FIXTURE_CANDIDATE_VERSION,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+
+        let requests = http.requested_urls();
+        let legacy_metadata = requests
+            .iter()
+            .position(|url| url == SIGNED_FIXTURE_DOWNLOAD_URL)
+            .unwrap();
+        let legacy_artifact = requests
+            .iter()
+            .position(|url| url == SIGNED_FIXTURE_LOCKED_ARTIFACT_URL)
+            .unwrap();
+        let legacy_bundle = requests
+            .iter()
+            .position(|url| url == SIGNED_FIXTURE_BUNDLE_URL)
+            .unwrap();
+        let candidate_metadata = requests
+            .iter()
+            .position(|url| url == SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL)
+            .unwrap();
+        assert!(legacy_metadata < legacy_artifact, "{requests:#?}");
+        assert!(legacy_artifact < legacy_bundle, "{requests:#?}");
+        assert!(legacy_bundle < candidate_metadata, "{requests:#?}");
+
+        let RegistrySignatureProtection::Required(SignerPinState::Current(pins)) = lock
+            .known_registry_ratchets("carina-rs/aws")
+            .unwrap()
+            .signature
+        else {
+            panic!("legacy state must be replaced by current pins");
+        };
+        let identity = captured_identity(SIGNED_FIXTURE_BUNDLE);
+        assert_eq!(pins.source.oidc_issuer, identity.source().oidc_issuer);
+        assert_eq!(
+            pins.source.repository_owner_id,
+            identity.source().repository_owner_id
+        );
+        assert_eq!(pins.source.repository_id, identity.source().repository_id);
+        assert!(matches!(
+            pins.workflows,
+            WorkflowPins::Prerelease(WorkflowPin(ref workflow)) if workflow == identity.workflow()
+        ));
+        assert_eq!(
+            lock.find_by_source("carina-rs/aws")
+                .unwrap()
+                .kind
+                .resolved_version(),
+            Some(SIGNED_FIXTURE_CANDIDATE_VERSION)
+        );
+    }
+
+    #[test]
+    fn unavailable_legacy_metadata_bundle_or_artifact_keeps_the_legacy_gate() {
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let unsigned_candidate = serde_json::to_vec(&serde_json::json!({
+            "protocols": ["1"],
+            "filename": "carina-provider-aws-v0.0.0-main.2.wasm",
+            "download_url": SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL,
+            "shasum": shasum,
+            "shasum_authored_by": "registry",
+        }))
+        .unwrap();
+        let scenarios = [
+            signed_fixture_registry().transport_error(SIGNED_FIXTURE_DOWNLOAD_URL, "offline"),
+            signed_fixture_registry().response(SIGNED_FIXTURE_DOWNLOAD_URL, 404, b"not found"),
+            signed_fixture_registry().transport_error(SIGNED_FIXTURE_BUNDLE_URL, "offline"),
+            signed_fixture_registry().response(SIGNED_FIXTURE_BUNDLE_URL, 404, b"not found"),
+            signed_fixture_registry()
+                .transport_error(SIGNED_FIXTURE_LOCKED_ARTIFACT_URL, "offline"),
+            signed_fixture_registry().response(
+                SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
+                404,
+                b"not found",
+            ),
+        ];
+
+        for http in scenarios
+            .into_iter()
+            .map(|http| http.json(SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL, &unsigned_candidate))
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut lock = signed_fixture_legacy_lock(dir.path());
+            fs::remove_file(cache_path_wasm(
+                dir.path(),
+                "carina-rs/aws",
+                SIGNED_FIXTURE_VERSION,
+            ))
+            .unwrap();
+
+            let error = resolve_provider_with_http(
+                dir.path(),
+                "carina-rs/aws",
+                SIGNED_FIXTURE_CANDIDATE_VERSION,
+                "aws",
+                &mut lock,
+                &http,
+            )
+            .unwrap_err();
+
+            assert!(error.contains("signature"), "{error}");
+            assert!(matches!(
+                lock.known_registry_ratchets("carina-rs/aws")
+                    .unwrap()
+                    .signature,
+                RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn downloaded_legacy_artifact_hash_mismatch_fails_closed_and_removes_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = signed_fixture_legacy_lock(dir.path());
+        let locked_path = cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION);
+        fs::remove_file(&locked_path).unwrap();
+        let http = signed_fixture_registry()
+            .downloadable_bytes(SIGNED_FIXTURE_LOCKED_ARTIFACT_URL, b"tampered".to_vec());
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            SIGNED_FIXTURE_CANDIDATE_VERSION,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("SHA256 mismatch"), "{error}");
+        assert!(!locked_path.exists());
+        assert!(
+            !http
+                .requested_urls()
+                .iter()
+                .any(|url| url == SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL),
+            "candidate metadata was requested after the locked digest failed verification"
+        );
+        assert!(matches!(
+            lock.known_registry_ratchets("carina-rs/aws")
+                .unwrap()
+                .signature,
+            RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
+        ));
+    }
+
+    #[test]
+    fn cached_legacy_artifact_is_hash_checked_before_signature_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = signed_fixture_legacy_lock(dir.path());
+        let locked_path = cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION);
+        fs::write(&locked_path, b"tampered cached artifact").unwrap();
+        let http = signed_fixture_registry();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            SIGNED_FIXTURE_CANDIDATE_VERSION,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("SHA256 mismatch"), "{error}");
+        assert!(!locked_path.exists());
+        assert!(
+            !http
+                .requested_urls()
+                .iter()
+                .any(|url| url == SIGNED_FIXTURE_LOCKED_ARTIFACT_URL)
+        );
+        assert!(matches!(
+            lock.known_registry_ratchets("carina-rs/aws")
+                .unwrap()
+                .signature,
+            RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
+        ));
+    }
+
+    #[test]
+    fn obtained_invalid_legacy_evidence_fails_before_candidate_evaluation() {
+        let mut invalid_metadata: serde_json::Value = serde_json::from_slice(
+            &signed_fixture_download(SIGNED_FIXTURE_VERSION, SIGNED_FIXTURE_LOCKED_ARTIFACT_URL),
+        )
+        .unwrap();
+        let mut missing_signature: serde_json::Value = invalid_metadata.clone();
+        missing_signature
+            .as_object_mut()
+            .unwrap()
+            .remove("signature");
+        let mut unsupported_signature: serde_json::Value = invalid_metadata.clone();
+        unsupported_signature["signature"]["type"] = serde_json::json!("unsupported");
+        invalid_metadata["shasum"] = serde_json::json!("00".repeat(32));
+        let scenarios = [
+            (
+                signed_fixture_registry().json(
+                    SIGNED_FIXTURE_DOWNLOAD_URL,
+                    serde_json::to_vec(&invalid_metadata).unwrap(),
+                ),
+                "differs from carina-providers.lock",
+            ),
+            (
+                signed_fixture_registry().json(
+                    SIGNED_FIXTURE_DOWNLOAD_URL,
+                    serde_json::to_vec(&missing_signature).unwrap(),
+                ),
+                "without its required registry signature",
+            ),
+            (
+                signed_fixture_registry().json(
+                    SIGNED_FIXTURE_DOWNLOAD_URL,
+                    serde_json::to_vec(&unsupported_signature).unwrap(),
+                ),
+                "unsupported registry signature type",
+            ),
+            (
+                signed_fixture_registry().response(SIGNED_FIXTURE_BUNDLE_URL, 200, b"not a bundle"),
+                "cannot parse Sigstore bundle JSON",
+            ),
+            (
+                signed_fixture_registry().response(
+                    SIGNED_FIXTURE_DOWNLOAD_URL,
+                    500,
+                    b"server error",
+                ),
+                "HTTP 500",
+            ),
+            (
+                signed_fixture_registry().response(SIGNED_FIXTURE_BUNDLE_URL, 500, b"server error"),
+                "HTTP 500",
+            ),
+            (
+                signed_fixture_registry().response(
+                    SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
+                    500,
+                    b"server error",
+                ),
+                "status 500",
+            ),
+        ];
+
+        for (http, expected_error) in scenarios {
+            let dir = tempfile::tempdir().unwrap();
+            let mut lock = signed_fixture_legacy_lock(dir.path());
+            fs::remove_file(cache_path_wasm(
+                dir.path(),
+                "carina-rs/aws",
+                SIGNED_FIXTURE_VERSION,
+            ))
+            .unwrap();
+
+            let error = resolve_provider_with_http(
+                dir.path(),
+                "carina-rs/aws",
+                SIGNED_FIXTURE_CANDIDATE_VERSION,
+                "aws",
+                &mut lock,
+                &http,
+            )
+            .unwrap_err();
+
+            assert!(error.contains(expected_error), "{error}");
+            assert!(
+                !http
+                    .requested_urls()
+                    .iter()
+                    .any(|url| url == SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL),
+                "candidate metadata was requested after invalid locked-version evidence"
+            );
+            assert!(matches!(
+                lock.known_registry_ratchets("carina-rs/aws")
+                    .unwrap()
+                    .signature,
+                RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn captured_certificates_bind_branch_tag_and_sha_revisions() {
+        let listing: RegistryVersions =
+            serde_json::from_slice(&captured_listing(CAPTURED_AWS_LISTING)).unwrap();
+        let prerelease = captured_identity(CAPTURED_AWS_PRERELEASE_BUNDLE);
+        let stable = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
+
+        bind_registry_revision(
+            "main",
+            &ListedVersion::parse(CAPTURED_AWS_PRERELEASE_VERSION).unwrap(),
+            &listing,
+            Some(&prerelease),
+        )
+        .unwrap();
+        bind_registry_revision(
+            "12EC945",
+            &ListedVersion::parse(CAPTURED_AWS_PRERELEASE_VERSION).unwrap(),
+            &listing,
+            Some(&prerelease),
+        )
+        .unwrap();
+        bind_registry_revision(
+            "v0.7.0",
+            &ListedVersion::parse(CAPTURED_AWS_STABLE_VERSION).unwrap(),
+            &listing,
+            Some(&stable),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn captured_certificate_rejects_wrong_revision_ref() {
+        let listing: RegistryVersions =
+            serde_json::from_slice(&captured_listing(CAPTURED_AWS_LISTING)).unwrap();
+        let prerelease = captured_identity(CAPTURED_AWS_PRERELEASE_BUNDLE);
+
+        let error = bind_registry_revision(
+            "other",
+            &ListedVersion::parse(CAPTURED_AWS_PRERELEASE_VERSION).unwrap(),
+            &listing,
+            Some(&prerelease),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("does not bind registry revision"), "{error}");
+    }
+
+    #[test]
+    fn registry_revision_response_without_version_is_rejected_before_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint =
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/revisions/main/download";
+        let download: serde_json::Value =
+            serde_json::from_slice(CAPTURED_AWS_PRERELEASE_DOWNLOAD).unwrap();
+        let artifact_url = download["download_url"].as_str().unwrap();
+        let http = captured_registry_base(captured_listing(CAPTURED_AWS_LISTING))
+            .json(endpoint, CAPTURED_AWS_PRERELEASE_DOWNLOAD);
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let mut lock = LockFile::default();
+
+        let error = resolve_registry_revision_with_http(
+            dir.path(),
+            &source,
+            "main",
+            "aws",
+            &mut lock,
+            LockMode::Normal,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("missing field `version`"), "{error}");
+        assert!(!http.requested_urls().iter().any(|url| url == artifact_url));
+    }
+
+    #[test]
+    fn revision_binding_checks_signed_branch_tag_and_sha_against_certificate() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.0.0-main.630.1.g12ec945", false),
+                listed_version("0.7.0", false),
+            ],
+        };
+        let branch = verified_signer(
+            "https://example.test/ci.yml@refs/heads/main",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/heads/main",
+            "https://example.test/ci.yml",
+        );
+        let branch_version = ListedVersion::parse("0.0.0-main.630.1.g12ec945").unwrap();
+        bind_registry_revision("main", &branch_version, &listing, Some(&branch)).unwrap();
+        bind_registry_revision("12EC945", &branch_version, &listing, Some(&branch)).unwrap();
+
+        let tag = verified_signer(
+            "https://example.test/release.yml@refs/tags/v0.7.0",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/tags/v0.7.0",
+            "https://example.test/release.yml",
+        );
+        bind_registry_revision(
+            "v0.7.0",
+            &ListedVersion::parse("0.7.0").unwrap(),
+            &listing,
+            Some(&tag),
+        )
+        .unwrap();
+
+        assert!(bind_registry_revision("other", &branch_version, &listing, Some(&branch)).is_err());
+        assert!(
+            bind_registry_revision("abcdef0", &branch_version, &listing, Some(&branch)).is_err()
+        );
+        assert!(
+            bind_registry_revision(
+                "v0.7.1",
+                &ListedVersion::parse("0.7.0").unwrap(),
+                &listing,
+                Some(&tag)
+            )
+            .is_err()
+        );
+        assert!(
+            bind_registry_revision(
+                "main",
+                &ListedVersion::parse("0.0.0-other.1").unwrap(),
+                &listing,
+                Some(&branch)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn revision_binding_does_not_fall_back_from_a_listed_yanked_stable_tag() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.7.0", true),
+                listed_version("0.0.0-main.1", false),
+            ],
+        };
+        let identity = verified_signer(
+            "https://example.test/ci.yml@refs/tags/v0.7.0",
+            "https://issuer.example",
+            "owner-1",
+            "repo-1",
+            "refs/tags/v0.7.0",
+            "https://example.test/ci.yml",
+        );
+
+        assert!(
+            bind_registry_revision(
+                "v0.7.0",
+                &ListedVersion::parse("0.0.0-main.1").unwrap(),
+                &listing,
+                Some(&identity),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsigned_revision_binding_requires_highest_branch_and_refuses_sha() {
+        let listing = RegistryVersions {
+            sequence: None,
+            valid_until: None,
+            versions: vec![
+                listed_version("0.0.0-main.1", false),
+                listed_version("0.0.0-main.2", false),
+                listed_version("0.7.0", false),
+            ],
+        };
+
+        bind_registry_revision(
+            "main",
+            &ListedVersion::parse("0.0.0-main.2").unwrap(),
+            &listing,
+            None,
+        )
+        .unwrap();
+        assert!(
+            bind_registry_revision(
+                "main",
+                &ListedVersion::parse("0.0.0-main.1").unwrap(),
+                &listing,
+                None
+            )
+            .is_err()
+        );
+        bind_registry_revision(
+            "v0.7.0",
+            &ListedVersion::parse("0.7.0").unwrap(),
+            &listing,
+            None,
+        )
+        .unwrap();
+        assert!(
+            bind_registry_revision(
+                "v0.7.0",
+                &ListedVersion::parse("0.0.0-main.2").unwrap(),
+                &listing,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            bind_registry_revision(
+                "12ec945",
+                &ListedVersion::parse("0.0.0-main.2").unwrap(),
+                &listing,
+                None
+            )
+            .is_err()
+        );
     }
 
     fn discovery_pin(api_base_url: &str) -> RegistryDiscoveryPin {
@@ -5674,21 +8220,7 @@ transparency_log_present = false
         config: &ProviderConfig,
     ) -> Result<String, String> {
         let candidates = SelectableRegistryVersions::from_listing(versions);
-        select_registry_version(&candidates, config)
-    }
-
-    #[test]
-    fn registry_revision_selection_skips_yanked_versions() {
-        let config = provider_config("carina-rs/aws", Some("main"));
-        let versions = [
-            listed_version("0.0.0-main.1.aaa", false),
-            listed_version("0.0.0-main.10.bbb", true),
-        ];
-
-        assert_eq!(
-            select_from_listing(&versions, &config).unwrap(),
-            "0.0.0-main.1.aaa"
-        );
+        select_registry_version(&candidates, &config.name, config.version.as_ref())
     }
 
     #[test]
@@ -5711,22 +8243,6 @@ transparency_log_present = false
         ];
 
         assert_eq!(select_from_listing(&versions, &config).unwrap(), "1.0.0");
-    }
-
-    #[test]
-    fn registry_revision_error_names_skipped_yanked_versions() {
-        let config = provider_config("carina-rs/aws", Some("main"));
-        let versions = [
-            listed_version("0.0.0-main.1.aaa", true),
-            listed_version("0.0.0-main.10.bbb", true),
-            listed_version("0.0.0-dev.20.ccc", false),
-        ];
-
-        let error = select_from_listing(&versions, &config).unwrap_err();
-
-        assert!(error.contains("yanked"), "{error}");
-        assert!(error.contains("0.0.0-main.1.aaa"), "{error}");
-        assert!(error.contains("0.0.0-main.10.bbb"), "{error}");
     }
 
     #[test]
@@ -5758,76 +8274,6 @@ transparency_log_present = false
         assert!(error.contains("yanked"), "{error}");
         assert!(error.contains("1.0.0"), "{error}");
         assert!(error.contains("2.0.0"), "{error}");
-    }
-
-    #[test]
-    fn registry_revision_selects_highest_matching_branch_prerelease() {
-        let config = provider_config("carina-rs/aws", Some("main"));
-        let versions = [
-            RegistryVersion {
-                version: "0.0.0-main.1.aaa".into(),
-                yanked: false,
-            },
-            RegistryVersion {
-                version: "0.0.0-main.10.bbb".into(),
-                yanked: false,
-            },
-            RegistryVersion {
-                version: "0.5.0".into(),
-                yanked: false,
-            },
-            RegistryVersion {
-                version: "0.0.0-dev.2.ccc".into(),
-                yanked: false,
-            },
-        ];
-
-        assert_eq!(
-            select_from_listing(&versions, &config).unwrap(),
-            "0.0.0-main.10.bbb"
-        );
-
-        let versions_with_malformed_high_precedence = [
-            RegistryVersion {
-                version: "0.0.0-main.5.aaa".into(),
-                yanked: false,
-            },
-            RegistryVersion {
-                version: "0.0.0-main.x".into(),
-                yanked: false,
-            },
-        ];
-        assert_eq!(
-            select_from_listing(&versions_with_malformed_high_precedence, &config).unwrap(),
-            "0.0.0-main.5.aaa"
-        );
-
-        let malformed_only = [RegistryVersion {
-            version: "0.0.0-main.zzz".into(),
-            yanked: false,
-        }];
-        let err = select_from_listing(&malformed_only, &config).unwrap_err();
-        assert_eq!(
-            err,
-            "No registry version of 'awscc' matches revision 'main'"
-        );
-
-        let single_identifier = [RegistryVersion {
-            version: "0.0.0-main".into(),
-            yanked: false,
-        }];
-        let err = select_from_listing(&single_identifier, &config).unwrap_err();
-        assert_eq!(
-            err,
-            "No registry version of 'awscc' matches revision 'main'"
-        );
-
-        let config = provider_config("carina-rs/aws", Some("feature"));
-        let err = select_from_listing(&versions, &config).unwrap_err();
-        assert_eq!(
-            err,
-            "No registry version of 'awscc' matches revision 'feature'"
-        );
     }
 
     #[test]
@@ -6559,8 +9005,75 @@ sha256 = "abc"
     }
 
     #[test]
-    fn discovery_values_lock_format_is_v3() {
-        assert_eq!(LockFile::CURRENT_VERSION, 3);
+    fn signer_pins_lock_format_is_v4() {
+        assert_eq!(LockFile::CURRENT_VERSION, 4);
+    }
+
+    #[test]
+    fn v3_signature_pin_migrates_losslessly_to_opaque_legacy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let opaque_san = "https://example.test/a@b@refs/tags/v0.5.0";
+        let v3 = format!(
+            r#"version = 3
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+
+[registry_host."registry.carina-rs.dev".discovery_values]
+"providers.v1" = "https://registry.carina-rs.dev/v1/providers/"
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = true
+certificate_identity = {opaque_san:?}
+certificate_oidc_issuer = "issuer-a"
+transparency_log_present = false
+"#
+        );
+        fs::write(&lock_path, v3).unwrap();
+
+        let LoadedLockFile::Migrated {
+            lock_file,
+            migration,
+        } = LockFile::load(dir.path()).unwrap().unwrap()
+        else {
+            panic!("v3 must produce an explicit v3-to-v4 migration event");
+        };
+        assert_eq!(migration.from, 3);
+        assert_eq!(migration.to, 4);
+        let report = migration.to_string();
+        assert!(
+            report.contains("any legacy signer pin remains gated until verified conversion"),
+            "{report}"
+        );
+        assert!(!report.contains("v2 discovery pins"), "{report}");
+        assert_eq!(
+            lock_file
+                .known_registry_ratchets("carina-rs/aws")
+                .unwrap()
+                .signature,
+            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
+                certificate_san: opaque_san.into(),
+                oidc_issuer: "issuer-a".into(),
+            }))
+        );
+        let migrated = lock_file.to_toml_string().unwrap();
+        assert!(migrated.starts_with("version = 4\n"), "{migrated}");
+        assert!(
+            migrated.contains(&format!("legacy_certificate_identity = {opaque_san:?}")),
+            "{migrated}"
+        );
     }
 
     #[test]
@@ -6593,12 +9106,12 @@ transparency_log_present = false
             &error,
             LockFileError::VersionTooOld {
                 found: 1,
-                supported: 3
+                supported: 4
             }
         ));
         let rendered = error.to_string();
         assert!(rendered.contains("version 1"), "{rendered}");
-        assert!(rendered.contains("version 3"), "{rendered}");
+        assert!(rendered.contains("version 4"), "{rendered}");
         assert!(rendered.contains("cannot read"), "{rendered}");
         assert!(rendered.contains("can migrate version 2"), "{rendered}");
         assert!(rendered.contains("version control or backup"), "{rendered}");
@@ -6951,7 +9464,7 @@ discovery_pin_present = false
     }
 
     #[test]
-    fn migrated_v2_lock_saves_as_v3_without_rewriting_during_load() {
+    fn migrated_v2_lock_saves_as_v4_without_rewriting_during_load() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
         let original = fully_protected_v2_lock_toml();
@@ -6963,7 +9476,7 @@ discovery_pin_present = false
         let (lock, migration) = loaded.into_parts();
         let migration = migration.expect("v2 load must expose its in-memory migration");
         assert_eq!(migration.from, 2);
-        assert_eq!(migration.to, 3);
+        assert_eq!(migration.to, 4);
         let discarded = migration
             .discarded_discovery_pin("registry.carina-rs.dev")
             .expect("the legacy pinned host must be reported");
@@ -6980,7 +9493,7 @@ discovery_pin_present = false
 
         lock.save(&lock_path).unwrap();
         let saved = fs::read_to_string(&lock_path).unwrap();
-        assert!(saved.starts_with("version = 3\n"), "{saved}");
+        assert!(saved.starts_with("version = 4\n"), "{saved}");
         assert!(saved.contains("discovery_pin_present = false"), "{saved}");
         assert!(saved.contains("migration_pending_discovery_pin"), "{saved}");
         assert!(saved.contains("api_base_url"), "{saved}");
@@ -6990,11 +9503,11 @@ discovery_pin_present = false
         assert!(saved.contains("\"0.3.0\""), "{saved}");
         assert!(saved.contains("\"0.4.0\""), "{saved}");
         assert!(saved.contains("sequence_anchor = 5"), "{saved}");
-        assert!(saved.contains("certificate_identity = \"identity-a\""));
+        assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
 
         let reloaded = load_lock_file_for_test(&lock_path)
-            .expect("saved v3 lock must parse")
-            .expect("saved v3 lock must remain present");
+            .expect("saved v4 lock must parse")
+            .expect("saved v4 lock must remain present");
         assert!(matches!(
             reloaded
                 .registry_host
@@ -7523,8 +10036,15 @@ transparency_log_present = false
         let stripped = fully_protected_lock_toml()
             .lines()
             .filter(|line| {
-                !line.starts_with("certificate_identity")
-                    && !line.starts_with("certificate_oidc_issuer")
+                !line.starts_with("legacy_certificate_identity")
+                    && !line.starts_with("legacy_certificate_oidc_issuer")
+            })
+            .map(|line| {
+                if line == "signature_state = \"required_legacy\"" {
+                    "signature_state = \"required_unpinned\""
+                } else {
+                    line
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -7534,14 +10054,16 @@ transparency_log_present = false
             lock.known_registry_ratchets("carina-rs/aws")
                 .unwrap()
                 .signature,
-            RegistrySignatureProtection::RequiredUnpinned
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned)
         );
     }
 
     #[test]
     fn lock_load_rejects_identity_when_signature_is_not_required() {
-        let contradictory = fully_protected_lock_toml()
-            .replace("signature_present = true\n", "signature_present = false\n");
+        let contradictory = fully_protected_lock_toml().replace(
+            "signature_state = \"required_legacy\"\n",
+            "signature_state = \"not_required\"\n",
+        );
         assert_lock_toml_is_rejected(&contradictory);
     }
 
@@ -7549,15 +10071,51 @@ transparency_log_present = false
     fn lock_load_rejects_partial_signature_identity_pin() {
         let contradictory = fully_protected_lock_toml()
             .lines()
-            .filter(|line| !line.starts_with("certificate_oidc_issuer"))
+            .filter(|line| !line.starts_with("legacy_certificate_oidc_issuer"))
             .collect::<Vec<_>>()
             .join("\n");
         assert_lock_toml_is_rejected(&contradictory);
     }
 
     #[test]
+    fn v4_lock_load_rejects_misspelled_signer_field() {
+        let misspelled = fully_protected_lock_toml().replace(
+            "transparency_log_present = true\n",
+            "stable_workflw = \"release.yml\"\ntransparency_log_present = true\n",
+        );
+
+        let error = LockFile::from_toml_str(&misspelled, Path::new("carina-providers.lock"))
+            .expect_err("unknown v4 signer fields must not silently become absent pins");
+
+        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+        assert!(error.to_string().contains("stable_workflw"), "{error}");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn v4_unpinned_registry_ratchet_rejects_misspelled_signer_field() {
+        let misspelled = r#"version = 4
+
+[unpinned_registry_ratchets."carina-rs/aws"]
+sequence_present = false
+valid_until_present = false
+signature_state = "required_unpinned"
+stable_workflw = "release.yml"
+transparency_log_present = false
+"#;
+
+        let error = LockFile::from_toml_str(misspelled, Path::new("carina-providers.lock"))
+            .expect_err("unknown unpinned-ratchet signer fields must be rejected");
+
+        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+        assert!(error.to_string().contains("stable_workflw"), "{error}");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
     fn lock_load_rejects_stripped_signature_presence() {
-        let stripped = fully_protected_lock_toml().replace("signature_present = true\n", "");
+        let stripped =
+            fully_protected_lock_toml().replace("signature_state = \"required_legacy\"\n", "");
         assert_lock_toml_is_rejected(&stripped);
     }
 
@@ -7618,7 +10176,7 @@ transparency_log_present = false
     #[test]
     fn existing_registry_locks_default_sticky_yanked_set_to_empty() {
         let serialized = fully_protected_lock_toml();
-        assert!(serialized.starts_with("version = 3\n"), "{serialized}");
+        assert!(serialized.starts_with("version = 4\n"), "{serialized}");
         assert!(!serialized.contains("yanked_versions"), "{serialized}");
 
         let lock =
@@ -7626,8 +10184,8 @@ transparency_log_present = false
         let registry = lock.provider[0].registry.as_ref().unwrap();
         assert!(registry.yanked_versions().is_empty());
         assert!(
-            lock.to_toml_string().unwrap().starts_with("version = 3\n"),
-            "the defaulted yank set must remain stable within lock format v3"
+            lock.to_toml_string().unwrap().starts_with("version = 4\n"),
+            "the defaulted yank set must remain stable within lock format v4"
         );
     }
 
@@ -7653,17 +10211,14 @@ transparency_log_present = false
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: true,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::RequiredPinned(IdentityPin {
-                        certificate_identity: SIGNED_FIXTURE_IDENTITY.into(),
-                        certificate_oidc_issuer: SIGNED_FIXTURE_ISSUER.into(),
-                    }),
+                    signature: signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER),
                     transparency_log_present: false,
                 }),
             }],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let expected = format!(
-            r#"version = 3
+            r#"version = 4
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -7685,9 +10240,9 @@ sequence = 7
 sequence_anchor_established = true
 sequence_anchor = 7
 valid_until_present = true
-signature_present = true
-certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}
-certificate_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}
+signature_state = "required_legacy"
+legacy_certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}
+legacy_certificate_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}
 transparency_log_present = false
 "#
         );
@@ -7707,10 +10262,30 @@ transparency_log_present = false
 
     #[test]
     fn registry_signature_states_roundtrip_through_lock_and_ratchet_serializers() {
-        let states = [
+        let source = SourcePin {
+            oidc_issuer: "issuer-a".into(),
+            repository_owner_id: "owner-a".into(),
+            repository_id: "repo-a".into(),
+        };
+        let states = vec![
             RegistrySignatureProtection::NotRequired,
-            RegistrySignatureProtection::RequiredUnpinned,
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned),
             signature_pin("identity-a", "issuer-a"),
+            RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+                source: source.clone(),
+                workflows: WorkflowPins::Stable(WorkflowPin("stable.yml".into())),
+            })),
+            RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+                source: source.clone(),
+                workflows: WorkflowPins::Prerelease(WorkflowPin("ci.yml".into())),
+            })),
+            RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+                source,
+                workflows: WorkflowPins::Both {
+                    stable: WorkflowPin("stable.yml".into()),
+                    prerelease: WorkflowPin("ci.yml".into()),
+                },
+            })),
         ];
 
         for signature in states {
@@ -7739,39 +10314,51 @@ transparency_log_present = false
 
     #[test]
     fn registry_ratchet_serializer_rejects_contradictory_signature_encodings() {
-        for encoded in [
-            RegistryRatchetsSerde {
-                sequence_present: false,
-                sequence: None,
-                valid_until_present: false,
-                yanked_versions: BTreeSet::new(),
-                signature_present: false,
-                certificate_identity: Some("identity-a".into()),
-                certificate_oidc_issuer: Some("issuer-a".into()),
-                transparency_log_present: false,
-            },
-            RegistryRatchetsSerde {
-                sequence_present: false,
-                sequence: None,
-                valid_until_present: false,
-                yanked_versions: BTreeSet::new(),
-                signature_present: true,
-                certificate_identity: Some("identity-a".into()),
-                certificate_oidc_issuer: None,
-                transparency_log_present: false,
-            },
-        ] {
-            assert!(matches!(
-                RegistryRatchets::try_from(encoded),
-                Err(RegistryLockError::InconsistentSignature)
-            ));
-        }
+        let source_without_workflow = RegistryRatchetsSerde {
+            sequence_present: false,
+            sequence: None,
+            valid_until_present: false,
+            yanked_versions: BTreeSet::new(),
+            signature_state: RegistrySignatureStateSerde::RequiredCurrent,
+            legacy_certificate_identity: None,
+            legacy_certificate_oidc_issuer: None,
+            source_oidc_issuer: Some("issuer-a".into()),
+            source_repository_owner_id: Some("owner-a".into()),
+            source_repository_id: Some("repo-a".into()),
+            stable_workflow: None,
+            prerelease_workflow: None,
+            transparency_log_present: false,
+        };
+        assert!(matches!(
+            RegistryRatchets::try_from(source_without_workflow),
+            Err(RegistryLockError::InconsistentSignature)
+        ));
+
+        let legacy_and_current = RegistryRatchetsSerde {
+            sequence_present: false,
+            sequence: None,
+            valid_until_present: false,
+            yanked_versions: BTreeSet::new(),
+            signature_state: RegistrySignatureStateSerde::RequiredCurrent,
+            legacy_certificate_identity: Some("legacy-san".into()),
+            legacy_certificate_oidc_issuer: Some("legacy-issuer".into()),
+            source_oidc_issuer: Some("issuer-a".into()),
+            source_repository_owner_id: Some("owner-a".into()),
+            source_repository_id: Some("repo-a".into()),
+            stable_workflow: Some("release.yml".into()),
+            prerelease_workflow: None,
+            transparency_log_present: false,
+        };
+        assert!(matches!(
+            RegistryRatchets::try_from(legacy_and_current),
+            Err(RegistryLockError::InconsistentSignature)
+        ));
     }
 
     #[test]
     fn registry_signature_merge_retains_requirement_and_any_existing_pin() {
         let awaiting = RegistryRatchets {
-            signature: RegistrySignatureProtection::RequiredUnpinned,
+            signature: RegistrySignatureProtection::Required(SignerPinState::Unpinned),
             ..RegistryRatchets::default()
         };
         let pinned = RegistryRatchets {
@@ -7784,7 +10371,7 @@ transparency_log_present = false
                 .merge(&awaiting)
                 .unwrap()
                 .signature,
-            RegistrySignatureProtection::RequiredUnpinned
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned)
         );
         assert_eq!(
             awaiting.clone().merge(&pinned).unwrap().signature,
@@ -7801,8 +10388,9 @@ transparency_log_present = false
         let source = "carina-rs/aws";
         let downgrade = RegistryRatchets::default();
 
-        let mut pinned =
-            lock_with_registry_security_state(RegistrySignatureProtection::RequiredUnpinned);
+        let mut pinned = lock_with_registry_security_state(RegistrySignatureProtection::Required(
+            SignerPinState::Unpinned,
+        ));
         pinned
             .store_registry_ratchets(source, downgrade.clone())
             .unwrap();
@@ -7820,7 +10408,7 @@ transparency_log_present = false
             .store_registry_ratchets(
                 source,
                 RegistryRatchets {
-                    signature: RegistrySignatureProtection::RequiredUnpinned,
+                    signature: RegistrySignatureProtection::Required(SignerPinState::Unpinned),
                     ..RegistryRatchets::default()
                 },
             )
@@ -7867,9 +10455,14 @@ transparency_log_present = false
         let recovery = lock
             .prepare_registry_identity_repin("carina-rs/aws")
             .unwrap();
+        let RegistrySignatureProtection::Required(SignerPinState::Legacy(before_pin)) =
+            &before.signature
+        else {
+            panic!("fixture must carry a legacy signer pin");
+        };
         assert_eq!(
             recovery.identity_pin(),
-            before.signature.identity_pin().unwrap()
+            &DiscardedSignerPins::Legacy(before_pin.clone())
         );
         recovery.commit().unwrap();
 
@@ -7877,7 +10470,46 @@ transparency_log_present = false
         let after = lock.provider[1].registry.as_ref().unwrap();
         assert_eq!(
             after.signature,
-            RegistrySignatureProtection::RequiredUnpinned
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned)
+        );
+        assert_eq!(after.sequence, before.sequence);
+        assert_eq!(after.sequence_anchor, before.sequence_anchor);
+        assert_eq!(after.yanked_versions, before.yanked_versions);
+        assert_eq!(after.valid_until_present, before.valid_until_present);
+        assert_eq!(
+            after.transparency_log_present,
+            before.transparency_log_present
+        );
+    }
+
+    #[test]
+    fn repin_identity_clears_the_source_and_both_channel_workflows_together() {
+        let pins = CurrentSignerPins {
+            source: SourcePin {
+                oidc_issuer: "issuer-a".into(),
+                repository_owner_id: "owner-a".into(),
+                repository_id: "repo-a".into(),
+            },
+            workflows: WorkflowPins::Both {
+                stable: WorkflowPin("release.yml".into()),
+                prerelease: WorkflowPin("ci.yml".into()),
+            },
+        };
+        let mut lock = lock_with_registry_security_state(RegistrySignatureProtection::Required(
+            SignerPinState::Current(pins.clone()),
+        ));
+        let before = lock.provider[0].registry.as_ref().unwrap().clone();
+
+        let recovery = lock
+            .prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap();
+        assert_eq!(recovery.identity_pin(), &DiscardedSignerPins::Current(pins));
+        recovery.commit().unwrap();
+
+        let after = lock.provider[0].registry.as_ref().unwrap();
+        assert_eq!(
+            after.signature,
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned)
         );
         assert_eq!(after.sequence, before.sequence);
         assert_eq!(after.sequence_anchor, before.sequence_anchor);
@@ -7898,7 +10530,13 @@ transparency_log_present = false
             .prepare_registry_identity_repin("registry.carina-rs.dev/carina-rs/aws")
             .unwrap();
         let preview = recovery.identity_pin().clone();
-        assert_eq!(preview.certificate_identity, "identity-a");
+        assert_eq!(
+            preview,
+            DiscardedSignerPins::Legacy(LegacySignerPin {
+                certificate_san: "identity-a".into(),
+                oidc_issuer: "issuer-a".into(),
+            })
+        );
         recovery.commit().unwrap();
 
         let ratchets = lock.known_registry_ratchets("carina-rs/aws").unwrap();
@@ -7908,7 +10546,7 @@ transparency_log_present = false
         assert!(ratchets.transparency_log_present);
         assert_eq!(
             ratchets.signature,
-            RegistrySignatureProtection::RequiredUnpinned
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned)
         );
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
@@ -7959,7 +10597,7 @@ transparency_log_present = false
         ));
         let preview = prepared.to_string();
         assert!(
-            preview.contains("Provider lock format migration: version 2 -> version 3"),
+            preview.contains("Provider lock format migration: version 2 -> version 4"),
             "{preview}"
         );
         assert!(
@@ -8351,10 +10989,6 @@ transparency_log_present = false
         let rebootstrap_registry = rebootstrap_only.provider[0].registry.as_ref().unwrap();
         assert_eq!(rebootstrap_registry.signature, original_registry.signature);
         assert!(rebootstrap_registry.signature.is_required());
-        assert_eq!(
-            rebootstrap_registry.signature.identity_pin(),
-            original_registry.signature.identity_pin()
-        );
 
         let mut repin_then_rebootstrap = original.clone();
         repin_then_rebootstrap
@@ -8390,7 +11024,8 @@ transparency_log_present = false
         let expected_registry = expected.provider[0].registry.as_mut().unwrap();
         expected_registry.sequence = RegistrySequence::Absent;
         expected_registry.sequence_anchor = RegistrySequenceAnchor::Unestablished;
-        expected_registry.signature = RegistrySignatureProtection::RequiredUnpinned;
+        expected_registry.signature =
+            RegistrySignatureProtection::Required(SignerPinState::Unpinned);
         assert_eq!(
             repin_then_rebootstrap.to_toml_string().unwrap(),
             expected.to_toml_string().unwrap(),
@@ -8767,18 +11402,18 @@ transparency_log_present = true
             )
             .expect_err("a conflicting identity pin must be rejected");
         assert_eq!(
-            hostile.left,
-            IdentityPin {
-                certificate_identity: "EVIL".into(),
-                certificate_oidc_issuer: "EVIL-issuer".into(),
-            }
+            *hostile.left,
+            DiscardedSignerPins::Legacy(LegacySignerPin {
+                certificate_san: "EVIL".into(),
+                oidc_issuer: "EVIL-issuer".into(),
+            })
         );
         assert_eq!(
-            hostile.right,
-            IdentityPin {
-                certificate_identity: "id-a".into(),
-                certificate_oidc_issuer: "issuer-a".into(),
-            }
+            *hostile.right,
+            DiscardedSignerPins::Legacy(LegacySignerPin {
+                certificate_san: "id-a".into(),
+                oidc_issuer: "issuer-a".into(),
+            })
         );
 
         let entry = lock.find_by_source("carina-rs/aws").unwrap();
@@ -8917,10 +11552,9 @@ transparency_log_present = true
         let source = "github.com/carina-rs/carina-provider-awscc";
         let mut lock = LockFile::default();
         lock.upsert(revision_entry(source, "main", "deadbeefcafe"));
-        let config = provider_config(source, None);
 
         assert!(
-            try_reuse_locked_version(source, &config, &lock).is_none(),
+            try_reuse_locked_version(source, None, &lock).is_none(),
             "revision-mode lock entries must not be reused for version-mode configs"
         );
     }
@@ -8930,47 +11564,16 @@ transparency_log_present = true
         let source = "github.com/carina-rs/carina-provider-awscc";
         let mut lock = LockFile::default();
         lock.upsert(version_entry(source, "0.5.2"));
-        let config = provider_config(source, None);
 
         assert_eq!(
-            try_reuse_locked_version(source, &config, &lock),
+            try_reuse_locked_version(source, None, &lock),
             Some("0.5.2".to_string())
         );
     }
 
     #[test]
-    fn try_reuse_registry_revision_requires_matching_revision_metadata() {
+    fn try_reuse_rejects_registry_revision_lock_in_version_mode() {
         let source = "carina-rs/aws";
-        let config = provider_config(source, Some("main"));
-
-        let mut matching_lock = LockFile::default();
-        matching_lock.upsert(LockEntry {
-            name: "aws".into(),
-            source: source.into(),
-            kind: LockEntryKind::RegistryRevision {
-                revision: "main".into(),
-                version: "0.0.0-main.1.aaa".into(),
-            },
-            sha256: "abc".into(),
-            registry: None,
-        });
-        assert_eq!(
-            try_reuse_locked_version(source, &config, &matching_lock),
-            Some("0.0.0-main.1.aaa".into())
-        );
-
-        let mut plain_version_lock = LockFile::default();
-        plain_version_lock.upsert(version_entry(source, "0.5.0"));
-        assert!(
-            try_reuse_locked_version(source, &config, &plain_version_lock).is_none(),
-            "registry revision must not reuse a plain version lock"
-        );
-    }
-
-    #[test]
-    fn try_reuse_rejects_registry_revision_lock_when_config_has_no_revision_or_version() {
-        let source = "carina-rs/aws";
-        let config = provider_config(source, None);
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
@@ -8984,20 +11587,19 @@ transparency_log_present = true
         });
 
         assert!(
-            try_reuse_locked_version(source, &config, &lock).is_none(),
+            try_reuse_locked_version(source, None, &lock).is_none(),
             "unconstrained version-mode configs must not reuse registry-revision locks"
         );
     }
 
     #[test]
-    fn try_reuse_accepts_plain_version_lock_when_config_has_no_revision_or_version() {
+    fn try_reuse_accepts_plain_version_lock_without_constraint() {
         let source = "carina-rs/aws";
-        let config = provider_config(source, None);
         let mut lock = LockFile::default();
         lock.upsert(version_entry(source, "0.5.0"));
 
         assert_eq!(
-            try_reuse_locked_version(source, &config, &lock),
+            try_reuse_locked_version(source, None, &lock),
             Some("0.5.0".into())
         );
     }
@@ -9188,19 +11790,49 @@ transparency_log_present = true
             Err(format!("too many test redirects from {url}"))
         }
 
-        fn download_to_file(&self, url: &RegistryResourceUrl, dest: &Path) -> Result<(), String> {
+        fn download_to_file(
+            &self,
+            url: &RegistryResourceUrl,
+            dest: &Path,
+        ) -> Result<(), RegistryDownloadError> {
             let url = url.as_str();
             self.requested.lock().unwrap().push(url.to_string());
-            let body = self
-                .downloads
-                .get(url)
-                .ok_or_else(|| format!("unexpected test download URL: {url}"))?;
+            let body = match self.downloads.get(url) {
+                Some(body) => body,
+                None => match self.responses.get(url) {
+                    Some(FakeHttpAnswer::Response { status, body })
+                        if (200..300).contains(status) =>
+                    {
+                        body
+                    }
+                    Some(FakeHttpAnswer::Response { status, .. })
+                    | Some(FakeHttpAnswer::Redirect { status, .. }) => {
+                        return Err(RegistryDownloadError::HttpStatus {
+                            status: *status,
+                            url: url.to_string(),
+                        });
+                    }
+                    None => {
+                        return Err(RegistryDownloadError::Transport(format!(
+                            "unexpected test download URL: {url}"
+                        )));
+                    }
+                },
+            };
             if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+                fs::create_dir_all(parent).map_err(|error| {
+                    RegistryDownloadError::LocalIo(format!(
+                        "Failed to create directory {}: {error}",
+                        parent.display()
+                    ))
+                })?;
             }
-            fs::write(dest, body)
-                .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
+            fs::write(dest, body).map_err(|error| {
+                RegistryDownloadError::LocalIo(format!(
+                    "Failed to write file {}: {error}",
+                    dest.display()
+                ))
+            })?;
             Ok(())
         }
     }
@@ -9298,14 +11930,14 @@ transparency_log_present = true
             )
             .json(
                 "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
-                r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+                r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
             )
             .json(
-                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+                SIGNED_FIXTURE_DOWNLOAD_URL,
                 &format!(
                     r#"{{
                         "protocols":["1"],
-                        "filename":"carina-provider-aws-v0.5.0.wasm",
+                        "filename":"carina-provider-aws-v0.0.0-main.1.wasm",
                         "download_url":"https://downloads.example.test/aws.wasm",
                         "shasum":"{shasum}",
                         "shasum_authored_by":"registry",
@@ -9408,9 +12040,7 @@ transparency_log_present = true
         let lock_contents = saved_lock_contents(dir.path());
         assert!(lock_contents.contains("[[provider]]"), "{lock_contents}");
         assert!(
-            lock_contents.contains(&format!(
-                "certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}"
-            )),
+            lock_contents.contains(&format!("source_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}")),
             "{lock_contents}"
         );
     }
@@ -9725,13 +12355,13 @@ transparency_log_present = true
         let config = provider_config("carina-rs/aws", None);
         let baseline_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
             REGISTRY_VERSIONS_URL,
-            r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+            r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
         );
         resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
 
         let failed_http = signed_registry_http(b"bundle unavailable", 503).json(
             REGISTRY_VERSIONS_URL,
-            r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+            r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
         );
 
         let error = resolve_single_config_with_http(dir.path(), &config, &failed_http).unwrap_err();
@@ -10109,7 +12739,7 @@ transparency_log_present = true
         resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200),
@@ -10117,17 +12747,25 @@ transparency_log_present = true
         .unwrap();
 
         let lock_contents = saved_lock_contents(dir.path());
-        assert!(lock_contents.contains(SIGNED_FIXTURE_IDENTITY));
+        assert!(
+            lock_contents.contains("signature_state = \"required_current\""),
+            "{lock_contents}"
+        );
         drop(lock_file);
 
         let lock_path = dir.path().join("carina-providers.lock");
         let mut reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
-        let unsigned_http = registry_http(SIGNED_FIXTURE_ARTIFACT, &shasum);
+        let unsigned_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            SIGNED_FIXTURE_DOWNLOAD_URL,
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}"}}"#
+            ),
+        );
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut reloaded,
             &unsigned_http,
@@ -10159,7 +12797,8 @@ transparency_log_present = true
         let selected = resolve_registry_version_with_http(
             dir.path(),
             &source,
-            &config,
+            &config.name,
+            config.version.as_ref(),
             &mut lock_file,
             &initial_http,
         )
@@ -10182,7 +12821,8 @@ transparency_log_present = true
         let selected = resolve_registry_version_with_http(
             dir.path(),
             &source,
-            &config,
+            &config.name,
+            config.version.as_ref(),
             &mut reloaded,
             &rollback_http,
         )
@@ -10442,7 +13082,8 @@ transparency_log_present = true
         let selected = resolve_registry_version_with_http(
             dir.path(),
             &source,
-            &config,
+            &config.name,
+            config.version.as_ref(),
             &mut lock_file,
             &selection_http,
         )
@@ -10477,7 +13118,7 @@ transparency_log_present = true
         let path = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10491,25 +13132,18 @@ transparency_log_present = true
             .registry
             .as_ref()
             .unwrap();
-        let RegistrySignatureProtection::RequiredPinned(pin) = &registry.signature else {
-            panic!("verified signature must carry its identity pin");
+        let RegistrySignatureProtection::Required(SignerPinState::Current(pin)) =
+            &registry.signature
+        else {
+            panic!("verified signature must carry current signer pins");
         };
-        assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
-        assert_eq!(pin.certificate_oidc_issuer, SIGNED_FIXTURE_ISSUER);
+        assert_eq!(pin.source.oidc_issuer, SIGNED_FIXTURE_ISSUER);
 
         let lock_path = dir.path().join("carina-providers.lock");
         lock_file.save(&lock_path).unwrap();
         let lock_contents = fs::read_to_string(lock_path).unwrap();
         assert!(
-            lock_contents.contains(&format!(
-                "certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}"
-            )),
-            "{lock_contents}"
-        );
-        assert!(
-            lock_contents.contains(&format!(
-                "certificate_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}"
-            )),
+            lock_contents.contains(&format!("source_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}")),
             "{lock_contents}"
         );
     }
@@ -10527,7 +13161,7 @@ transparency_log_present = true
             resolve_provider_with_http(
                 dir.path(),
                 "carina-rs/aws",
-                "0.5.0",
+                SIGNED_FIXTURE_VERSION,
                 "aws",
                 &mut lock_file,
                 &http,
@@ -10536,7 +13170,7 @@ transparency_log_present = true
             resolve_provider_with_http(
                 dir.path(),
                 "carina-rs/aws",
-                "0.5.0",
+                SIGNED_FIXTURE_VERSION,
                 "aws",
                 &mut lock_file,
                 &http,
@@ -10552,9 +13186,7 @@ transparency_log_present = true
             .unwrap();
         assert!(output.status.success(), "child test failed: {output:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        let notice = format!(
-            "carina: pinned signing identity for carina-rs/aws: {SIGNED_FIXTURE_IDENTITY} (issuer {SIGNED_FIXTURE_ISSUER})"
-        );
+        let notice = "carina: updated verified signer pins for carina-rs/aws: FirstContact";
         assert_eq!(stderr.matches(&notice).count(), 1, "{stderr}");
     }
 
@@ -10567,7 +13199,7 @@ transparency_log_present = true
         resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10576,7 +13208,7 @@ transparency_log_present = true
         resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10591,54 +13223,115 @@ transparency_log_present = true
     }
 
     #[test]
-    fn registry_source_rejects_declared_identity_mismatch_before_artifact_download() {
-        let initial_dir = tempfile::tempdir().unwrap();
-        let initial_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+    fn registry_source_ignores_declared_identity_and_uses_verified_certificate() {
+        let dir = tempfile::tempdir().unwrap();
         let mut lock_file = LockFile::default();
-        resolve_provider_with_http(
-            initial_dir.path(),
-            "carina-rs/aws",
-            "0.5.0",
-            "aws",
-            &mut lock_file,
-            &initial_http,
-        )
-        .unwrap();
-        let pinned_dir = tempfile::tempdir().unwrap();
-        let lock_path = pinned_dir.path().join("carina-providers.lock");
-        lock_file.save(&lock_path).unwrap();
-        let mut lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
-
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let mismatched_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
-                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"https://github.com/example/other/.github/workflows/release.yml@refs/heads/main","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"deliberately-wrong","certificate_oidc_issuer":"https://wrong.example.test","bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#
             ),
         );
 
-        let error = resolve_provider_with_http(
-            pinned_dir.path(),
+        resolve_provider_with_http(
+            dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &mismatched_http,
         )
-        .unwrap_err();
+        .expect("untrusted identity declarations must not override the verified certificate");
+        let pins = lock_file
+            .known_registry_ratchets("carina-rs/aws")
+            .unwrap()
+            .signature;
+        let RegistrySignatureProtection::Required(SignerPinState::Current(pins)) = pins else {
+            panic!("verified certificate must establish current pins");
+        };
+        assert_eq!(pins.source.oidc_issuer, SIGNED_FIXTURE_ISSUER);
+    }
 
-        assert!(error.contains("identity"), "{error}");
-        assert!(error.contains("no override"), "{error}");
-        assert!(error.contains("verifying out-of-band"), "{error}");
+    #[test]
+    fn real_verifier_rejects_conformance_bundle_against_aws_source_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let aws = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
+        let aws_source = SourcePin {
+            oidc_issuer: aws.source().oidc_issuer.clone(),
+            repository_owner_id: aws.source().repository_owner_id.clone(),
+            repository_id: aws.source().repository_id.clone(),
+        };
+        let mut lock_file = LockFile {
+            version: LockFile::CURRENT_VERSION,
+            registry_host: registry_host_table(
+                "registry.carina-rs.dev",
+                "https://registry.carina-rs.dev/v1/providers/",
+            ),
+            provider: vec![LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::Version {
+                    version: CAPTURED_AWS_STABLE_VERSION.into(),
+                    constraint: None,
+                },
+                sha256: "captured-aws-artifact-shasum".into(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    sequence: RegistrySequence::Present(7),
+                    sequence_anchor: RegistrySequenceAnchor::Established(7),
+                    valid_until_present: true,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: RegistrySignatureProtection::Required(SignerPinState::Current(
+                        CurrentSignerPins {
+                            source: aws_source,
+                            workflows: WorkflowPins::Stable(WorkflowPin(
+                                aws.workflow().to_string(),
+                            )),
+                        },
+                    )),
+                    transparency_log_present: false,
+                }),
+            }],
+            unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
+        };
+        let before = lock_file.to_toml_string().unwrap();
+        lock_file.save(&provider_lock_path(dir.path())).unwrap();
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            SIGNED_FIXTURE_DOWNLOAD_URL,
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":{:?},"certificate_oidc_issuer":{:?},"bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#,
+                aws.certificate_san(),
+                aws.source().oidc_issuer,
+            ),
+        );
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            SIGNED_FIXTURE_VERSION,
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .expect_err("the verified conformance certificate must not satisfy the AWS source pin");
+
         assert!(
-            error.contains(&format!(
-                "`carina providers repin-identity carina-rs/aws {}`",
-                pinned_dir.path().display()
-            )),
+            error.contains("certificate source differs from the lock pin"),
             "{error}"
         );
-        assert!(!mismatched_http.was_requested("https://downloads.example.test/aws.wasm"));
-        assert!(!mismatched_http.was_requested(SIGNED_FIXTURE_BUNDLE_URL));
+        assert!(http.was_requested(SIGNED_FIXTURE_BUNDLE_URL));
+        assert!(http.was_requested("https://downloads.example.test/aws.wasm"));
+        assert_eq!(lock_file.to_toml_string().unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(provider_lock_path(dir.path())).unwrap(),
+            before
+        );
+        assert!(
+            !cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION).exists(),
+            "an artifact rejected with SourceMismatch must not remain cached"
+        );
     }
 
     #[test]
@@ -10649,7 +13342,7 @@ transparency_log_present = true
         resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &initial_http,
@@ -10657,7 +13350,7 @@ transparency_log_present = true
         .unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let unsigned_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
                 r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}"}}"#
             ),
@@ -10666,7 +13359,7 @@ transparency_log_present = true
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &unsigned_http,
@@ -10698,7 +13391,7 @@ transparency_log_present = true
                     name: "aws".into(),
                     source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
-                        version: "0.5.0".into(),
+                        version: SIGNED_FIXTURE_VERSION.into(),
                         constraint: None,
                     },
                     sha256: shasum,
@@ -10720,7 +13413,7 @@ transparency_log_present = true
         resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10733,11 +13426,12 @@ transparency_log_present = true
             .registry
             .as_ref()
             .unwrap();
-        let RegistrySignatureProtection::RequiredPinned(pin) = &registry.signature else {
-            panic!("signed registry lock must retain its identity pin");
+        let RegistrySignatureProtection::Required(SignerPinState::Current(pin)) =
+            &registry.signature
+        else {
+            panic!("signed registry lock must retain current signer pins");
         };
-        assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
-        assert_eq!(pin.certificate_oidc_issuer, SIGNED_FIXTURE_ISSUER);
+        assert_eq!(pin.source.oidc_issuer, SIGNED_FIXTURE_ISSUER);
     }
 
     #[test]
@@ -10750,7 +13444,7 @@ transparency_log_present = true
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10760,7 +13454,12 @@ transparency_log_present = true
         assert!(error.contains("exceeding"), "{error}");
         assert!(error.contains("no override"), "{error}");
         assert_eq!(
-            fs::read(cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")).unwrap(),
+            fs::read(cache_path_wasm(
+                dir.path(),
+                "carina-rs/aws",
+                SIGNED_FIXTURE_VERSION
+            ))
+            .unwrap(),
             SIGNED_FIXTURE_ARTIFACT
         );
     }
@@ -10771,7 +13470,7 @@ transparency_log_present = true
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let bundle_url = "http://downloads.example.test/aws.sigstore.json";
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
                 r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{bundle_url}"}}}}"#
             ),
@@ -10781,7 +13480,7 @@ transparency_log_present = true
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10792,7 +13491,12 @@ transparency_log_present = true
         assert!(error.contains("no override"), "{error}");
         assert_eq!(http.request_count(bundle_url), 0);
         assert_eq!(
-            fs::read(cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")).unwrap(),
+            fs::read(cache_path_wasm(
+                dir.path(),
+                "carina-rs/aws",
+                SIGNED_FIXTURE_VERSION
+            ))
+            .unwrap(),
             SIGNED_FIXTURE_ARTIFACT
         );
     }
@@ -10942,7 +13646,7 @@ transparency_log_present = false
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10952,10 +13656,12 @@ transparency_log_present = false
         assert!(error.contains("signature verification"), "{error}");
         assert!(error.contains("no override"), "{error}");
         assert!(
-            error.contains("registry provider 'aws' (carina-rs/aws@0.5.0)"),
+            error.contains(&format!(
+                "registry provider 'aws' (carina-rs/aws@{SIGNED_FIXTURE_VERSION})"
+            )),
             "{error}"
         );
-        assert!(!cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0").exists());
+        assert!(!cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION).exists());
     }
 
     #[test]
@@ -10963,7 +13669,7 @@ transparency_log_present = false
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
                 r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"something-else","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#
             ),
@@ -10973,7 +13679,7 @@ transparency_log_present = false
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -10989,7 +13695,7 @@ transparency_log_present = false
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            REGISTRY_DOWNLOAD_URL,
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
                 r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"something-else","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}},"transparency_log":{{"observed":true}}}}"#
             ),
@@ -10999,7 +13705,7 @@ transparency_log_present = false
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -11024,7 +13730,7 @@ transparency_log_present = false
         resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &initial_http,
@@ -11035,7 +13741,7 @@ transparency_log_present = false
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -11053,14 +13759,16 @@ transparency_log_present = false
         );
         assert!(error.contains("no override"), "{error}");
         assert!(
-            error.contains("registry provider 'aws' (carina-rs/aws@0.5.0)"),
+            error.contains(&format!(
+                "registry provider 'aws' (carina-rs/aws@{SIGNED_FIXTURE_VERSION})"
+            )),
             "{error}"
         );
         assert!(
             !error.contains("Sigstore signature verification failed"),
             "{error}"
         );
-        let wasm_path = cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0");
+        let wasm_path = cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION);
         assert_eq!(fs::read(wasm_path).unwrap(), SIGNED_FIXTURE_ARTIFACT);
         assert_eq!(
             http.request_count("https://downloads.example.test/aws.wasm"),
@@ -11074,7 +13782,7 @@ transparency_log_present = false
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let unavailable_bundle_url = "https://downloads.example.test/unavailable.sigstore.json";
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
                 r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{unavailable_bundle_url}"}}}}"#
             ),
@@ -11084,7 +13792,7 @@ transparency_log_present = false
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -11102,7 +13810,9 @@ transparency_log_present = false
         );
         assert!(error.contains("no override"), "{error}");
         assert!(
-            error.contains("registry provider 'aws' (carina-rs/aws@0.5.0)"),
+            error.contains(&format!(
+                "registry provider 'aws' (carina-rs/aws@{SIGNED_FIXTURE_VERSION})"
+            )),
             "{error}"
         );
         assert!(
@@ -11110,7 +13820,12 @@ transparency_log_present = false
             "{error}"
         );
         assert_eq!(
-            fs::read(cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")).unwrap(),
+            fs::read(cache_path_wasm(
+                dir.path(),
+                "carina-rs/aws",
+                SIGNED_FIXTURE_VERSION
+            ))
+            .unwrap(),
             SIGNED_FIXTURE_ARTIFACT
         );
     }
@@ -11120,7 +13835,7 @@ transparency_log_present = false
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
                 r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle"}}}}"#
             ),
@@ -11130,7 +13845,7 @@ transparency_log_present = false
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -11147,7 +13862,7 @@ transparency_log_present = false
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            SIGNED_FIXTURE_DOWNLOAD_URL,
             &format!(
                 r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":null}}"#
             ),
@@ -11157,7 +13872,7 @@ transparency_log_present = false
         let error = resolve_provider_with_http(
             dir.path(),
             "carina-rs/aws",
-            "0.5.0",
+            SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
             &http,
@@ -11483,9 +14198,10 @@ transparency_log_present = false
                 r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]},{"version":"0.0.0-main.10.bbb","protocols":["1"]},{"version":"0.5.0","protocols":["1"]},{"version":"0.0.0-dev.2.ccc","protocols":["1"]}]}"#,
             )
             .json(
-                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download",
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/revisions/main/download",
                 &format!(
                     r#"{{
+                        "version":"0.0.0-main.10.bbb",
                         "protocols":["1"],
                         "filename":"carina-provider-aws-v0.0.0-main.10.bbb.wasm",
                         "download_url":"https://downloads.example.test/aws-main.wasm",
@@ -11512,8 +14228,8 @@ transparency_log_present = false
         assert_eq!(fs::read(path.as_path()).unwrap(), body);
         assert!(http.was_requested("/.well-known/carina.json"));
         assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
-        assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
-        assert!(!http.was_requested("/revisions/main/download"));
+        assert!(http.was_requested("/revisions/main/download"));
+        assert!(!http.was_requested("/0.0.0-main.10.bbb/download"));
 
         let lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
             .unwrap()
@@ -11572,9 +14288,9 @@ transparency_log_present = false
                 r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]},{"version":"0.0.0-main.10.bbb","protocols":["1"]}]}"#,
             )
             .json(
-                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download",
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/revisions/main/download",
                 &format!(
-                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-main-10.wasm","shasum":"{new_shasum}","shasum_authored_by":"registry"}}"#
+                    r#"{{"version":"0.0.0-main.10.bbb","protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-main-10.wasm","shasum":"{new_shasum}","shasum_authored_by":"registry"}}"#
                 ),
             )
             .bytes("https://downloads.example.test/aws-main-10.wasm", new_body)
@@ -11598,7 +14314,7 @@ transparency_log_present = false
             new_body
         );
         assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
-        assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
+        assert!(http.was_requested("/revisions/main/download"));
         let lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
             .unwrap()
             .unwrap();
@@ -11613,6 +14329,150 @@ transparency_log_present = false
 
     #[test]
     fn registry_revision_reinit_reuses_locked_version_without_reselecting() {
+        for mode in [LockMode::Normal, LockMode::Locked] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = b"locked registry revision wasm bytes";
+            let shasum = sha256_bytes(body);
+            let mut lock = LockFile::default();
+            lock.upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::RegistryRevision {
+                        revision: "main".into(),
+                        version: "0.0.0-main.1.aaa".into(),
+                    },
+                    sha256: shasum.clone(),
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: RegistrySignatureProtection::NotRequired,
+                        transparency_log_present: false,
+                    }),
+                },
+                registry_host_lock("https://registry.carina-rs.dev/v1/providers/"),
+            )
+            .unwrap();
+            lock.save(&dir.path().join("carina-providers.lock"))
+                .unwrap();
+            let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]},{"version":"0.0.0-main.10.bbb","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download",
+                &format!(
+                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-main-1.wasm","shasum":"{shasum}","shasum_authored_by":"registry"}}"#
+                ),
+            )
+            .bytes("https://downloads.example.test/aws-main-1.wasm", body)
+            .downloadable_bytes("https://downloads.example.test/aws-main-1.wasm", body);
+            let config = ProviderConfig {
+                name: "aws".into(),
+                source: Some("carina-rs/aws".into()),
+                version: None,
+                revision: Some("main".into()),
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+            };
+
+            let resolved = resolve_all_with_http(dir.path(), &[config], mode, &http).unwrap();
+
+            assert_eq!(
+                fs::read(resolved.get("aws").unwrap().as_path()).unwrap(),
+                body
+            );
+            assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download"));
+            assert!(!http.was_requested("/revisions/main/download"));
+            assert!(!http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
+        }
+    }
+
+    #[test]
+    fn registry_revision_reinit_refuses_changed_shasum_for_locked_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked_shasum = sha256_bytes(b"locked registry revision wasm bytes");
+        let replacement_body = b"replacement registry revision wasm bytes";
+        let replacement_shasum = sha256_bytes(replacement_body);
+        let mut lock = LockFile::default();
+        lock.upsert_registry(
+            LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::RegistryRevision {
+                    revision: "main".into(),
+                    version: "0.0.0-main.1.aaa".into(),
+                },
+                sha256: locked_shasum.clone(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    sequence: RegistrySequence::Present(7),
+                    sequence_anchor: RegistrySequenceAnchor::Established(7),
+                    valid_until_present: true,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: RegistrySignatureProtection::NotRequired,
+                    transparency_log_present: false,
+                }),
+            },
+            registry_host_lock("https://registry.carina-rs.dev/v1/providers/"),
+        )
+        .unwrap();
+        lock.save(&provider_lock_path(dir.path())).unwrap();
+        let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                REGISTRY_VERSIONS_URL,
+                r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download",
+                &format!(
+                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/replacement.wasm","shasum":"{replacement_shasum}","shasum_authored_by":"registry"}}"#
+                ),
+            )
+            .bytes(
+                "https://downloads.example.test/replacement.wasm",
+                replacement_body,
+            )
+            .downloadable_bytes(
+                "https://downloads.example.test/replacement.wasm",
+                replacement_body,
+            );
+        let config = ProviderConfig {
+            name: "aws".into(),
+            source: Some("carina-rs/aws".into()),
+            version: None,
+            revision: Some("main".into()),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+
+        let error = resolve_all_with_http(dir.path(), &[config], LockMode::Normal, &http)
+            .expect_err("the locked version's registry shasum must remain pinned");
+
+        assert!(error.contains("registry shasum pin mismatch"), "{error}");
+        assert!(error.contains(&locked_shasum), "{error}");
+        assert!(error.contains(&replacement_shasum), "{error}");
+        assert!(!http.was_requested("https://downloads.example.test/replacement.wasm"));
+    }
+
+    #[test]
+    fn registry_revision_upgrade_refuses_a_stale_unsigned_branch_response() {
         let dir = tempfile::tempdir().unwrap();
         let body = b"locked registry revision wasm bytes";
         let shasum = sha256_bytes(body);
@@ -11651,9 +14511,9 @@ transparency_log_present = false
                 r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]},{"version":"0.0.0-main.10.bbb","protocols":["1"]}]}"#,
             )
             .json(
-                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download",
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/revisions/main/download",
                 &format!(
-                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-main-1.wasm","shasum":"{shasum}","shasum_authored_by":"registry"}}"#
+                    r#"{{"version":"0.0.0-main.1.aaa","protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-main-1.wasm","shasum":"{shasum}","shasum_authored_by":"registry"}}"#
                 ),
             )
             .bytes("https://downloads.example.test/aws-main-1.wasm", body)
@@ -11669,15 +14529,11 @@ transparency_log_present = false
             binding: None,
         };
 
-        let resolved =
-            resolve_all_with_http(dir.path(), &[config], LockMode::Normal, &http).unwrap();
+        let error = resolve_all_with_http(dir.path(), &[config], LockMode::Upgrade, &http)
+            .expect_err("an unsigned branch response must return the highest listed build");
 
-        assert_eq!(
-            fs::read(resolved.get("aws").unwrap().as_path()).unwrap(),
-            body
-        );
-        assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download"));
-        assert!(!http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
+        assert!(error.contains("highest listed build"), "{error}");
+        assert!(http.was_requested("/revisions/main/download"));
     }
 
     #[test]

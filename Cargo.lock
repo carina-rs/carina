@@ -1177,6 +1177,7 @@ dependencies = [
  "futures",
  "indexmap 2.13.0",
  "libc",
+ "rcgen",
  "semver",
  "serde",
  "serde_json",
@@ -1189,6 +1190,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq",
  "url",
+ "x509-cert",
  "zip",
 ]
 
