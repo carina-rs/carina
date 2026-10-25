@@ -25,7 +25,7 @@ use carina_core::value::PersistedExportValue;
 use carina_core::value::PersistedValue;
 use carina_state::{
     DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority, ResourceState,
-    StateBackend, StateFile, WriteOnlyBasis,
+    RowBasis, StateBackend, StateFile,
 };
 use colored::Colorize;
 
@@ -1395,7 +1395,7 @@ pub(crate) fn build_state_after_apply(
                     state,
                     existing,
                     schema,
-                    WriteOnlyBasis::AcceptedRequest(request),
+                    RowBasis::Applied(request),
                     preferred_hashes,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
@@ -1409,7 +1409,7 @@ pub(crate) fn build_state_after_apply(
                     state,
                     existing,
                     schema,
-                    WriteOnlyBasis::CarryPrevious,
+                    RowBasis::Imported,
                     preferred_hashes,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
@@ -1420,7 +1420,7 @@ pub(crate) fn build_state_after_apply(
                     state,
                     existing,
                     schema,
-                    WriteOnlyBasis::CarryPrevious,
+                    RowBasis::Carried,
                     preferred_hashes,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
@@ -2339,6 +2339,89 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn failed_update_carries_live_pending_removal_and_next_plan_retries_attribute() {
+        let name = Value::Concrete(ConcreteValue::String("x".into()));
+        let tags = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "environment".to_string(),
+            Value::Concrete(ConcreteValue::String("production".into())),
+        )])));
+        let applied = Resource::with_provider("mock", "ec2.InternetGateway", "igw", None)
+            .with_attribute("name", name.clone())
+            .with_attribute("tags", tags.clone());
+        let desired = Resource::with_provider("mock", "ec2.InternetGateway", "igw", None)
+            .with_attribute("name", name.clone());
+        let id = desired.id.clone();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("ec2.InternetGateway")
+                .attribute(AttributeSchema::new("name", AttributeType::string()))
+                .attribute(AttributeSchema::new(
+                    "tags",
+                    AttributeType::map(AttributeType::string()),
+                )),
+        );
+        let existing = state_after_accepted_create(
+            &applied,
+            HashMap::from([("name".to_string(), name), ("tags".to_string(), tags)]),
+            &schemas,
+        );
+        let prior_explicit = existing
+            .find_resource_for_id(&id)
+            .expect("created IGW row")
+            .explicit
+            .clone();
+        let failed_plan = plan_after_writeback(&desired, &existing, &schemas);
+        assert!(
+            failed_plan.effects().iter().any(|effect| matches!(
+                effect,
+                Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "tags")
+            )),
+            "removing authored tags must initially plan an update: {failed_plan:#?}"
+        );
+        let managed_current = HashMap::from([(id.clone(), existing.build_state_for_resource(&id))]);
+
+        let saved = build_state_after_apply(
+            ApplyStateSave {
+                state_file: existing,
+                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                runtime_synthesized_resources: &[],
+                managed_current: &managed_current,
+                applied_states: &HashMap::new(),
+                plan: &failed_plan,
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &schemas,
+            },
+            None,
+        )
+        .expect("failed update should write refreshed current state");
+
+        assert_eq!(
+            saved
+                .find_resource_for_id(&id)
+                .expect("saved IGW row")
+                .explicit,
+            prior_explicit,
+            "an unapplied update must rebuild desired authoring and retain the live pending tags removal"
+        );
+        let retry_plan = plan_after_writeback(&desired, &saved, &schemas);
+        assert!(
+            retry_plan.effects().iter().any(|effect| matches!(
+                effect,
+                Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "tags")
+            )),
+            "the next plan must retry the unapplied tags removal: {retry_plan:#?}"
+        );
+    }
+
+    #[test]
     fn replacement_create_does_not_carry_removed_write_only_value() {
         let schemas = write_only_password_schema();
         let old = Resource::with_provider("mock", "test.resource", "replace", None)
@@ -2728,6 +2811,17 @@ mod apply_state_save_tests {
         .expect("import should write state");
 
         assert_stored_password(&saved, &id, None);
+        let ExplicitFields::Struct { children } = &saved
+            .find_resource_for_id(&id)
+            .expect("imported row exists")
+            .explicit
+        else {
+            panic!("import must establish a desired authoring record");
+        };
+        assert!(
+            children.contains_key("password"),
+            "authoring provenance must be independent of CarryPrevious write-only provenance"
+        );
         let next_plan = plan_after_writeback(&desired, &saved, &schemas);
         assert!(next_plan.effects().iter().any(|effect| matches!(
             effect,
@@ -3363,6 +3457,57 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn persisted_repend_seeds_unrecorded_explicit_from_desired() {
+        let resource = Resource::with_provider("mock", "test.resource", "pending", None)
+            .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
+        let resolved_resource = resolved(resource.clone());
+        let fresh = fresh_in_flight(
+            &resource.id,
+            "first-token",
+            None,
+            carina_core::provider::Sent::AllRequestAttributes,
+        );
+        let mut existing =
+            ResourceState::from_in_flight(&resolved_resource, &fresh, None, None, None)
+                .expect("fresh continuation must encode");
+        existing.explicit = ExplicitFields::Unrecorded;
+
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(existing.clone())
+            .expect("in-flight fixture must be valid");
+        let Current::CreateInFlight(loaded) = state.build_state_for_resource(&resource.id) else {
+            panic!("persisted fixture must load as in flight");
+        };
+        let repended = crate::fixture_repend_in_flight_create(loaded, "second-token");
+
+        let seeded_without_prior =
+            ResourceState::from_in_flight(&resolved_resource, &repended, None, None, None)
+                .expect("persisted re-pend without a prior row must encode");
+        assert_eq!(
+            seeded_without_prior.explicit,
+            ExplicitFields::Struct {
+                children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)])
+            }
+        );
+
+        let repaired = ResourceState::from_in_flight(
+            &resolved_resource,
+            &repended,
+            Some(&existing),
+            None,
+            None,
+        )
+        .expect("persisted re-pend must encode");
+        assert_eq!(
+            repaired.explicit,
+            ExplicitFields::Struct {
+                children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)])
+            }
+        );
+    }
+
+    #[test]
     fn moved_repend_persists_the_continuation_route_as_the_row_route() {
         let source = ResourceId::with_provider_identity(
             "mock",
@@ -3561,6 +3706,12 @@ mod apply_state_save_tests {
                 ])),
             );
         let id = resource.id.clone();
+        let sibling = Resource::with_provider("mock", "test.Resource", "sibling", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("before".into())),
+            );
+        let sibling_id = sibling.id.clone();
         let applied_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -3572,13 +3723,26 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("listener-id");
+        let sibling_state = State::existing(
+            sibling_id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("before".into())),
+            )]),
+        )
+        .with_identifier("sibling-id");
+        let resources = vec![resolved(resource.clone()), resolved(sibling.clone())];
+        let applied_states = HashMap::from([
+            (id.clone(), complete_create(applied_state)),
+            (sibling_id.clone(), complete_create(sibling_state)),
+        ]);
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file: StateFile::new(),
-                sorted_resources: &[resolved(resource)],
+                sorted_resources: &resources,
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, complete_create(applied_state))]),
+                applied_states: &applied_states,
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3630,6 +3794,59 @@ mod apply_state_save_tests {
             .expect("deserialize state")
             .into_state();
         assert_aligned(&round_tripped);
+
+        let listener_current = round_tripped.build_state_for_resource(&id);
+        let sibling = Resource::with_provider("mock", "test.Resource", "sibling", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("after".into())),
+            );
+        let sibling_state = State::existing(
+            sibling_id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )]),
+        )
+        .with_identifier("sibling-id");
+        let resources = vec![resolved(resource.clone()), resolved(sibling)];
+        let managed_current = HashMap::from([(id.clone(), listener_current)]);
+        let applied_states =
+            HashMap::from([(sibling_id, complete_update(sibling_state, &["name"], &[]))]);
+        let carried = build_state_after_apply(
+            ApplyStateSave {
+                state_file: round_tripped,
+                sorted_resources: &resources,
+                runtime_synthesized_resources: &[],
+                managed_current: &managed_current,
+                applied_states: &applied_states,
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("unrelated apply writeback");
+
+        assert_aligned(&carried);
+        let removed_description =
+            Resource::with_provider("mock", "listener.Listener", "listener", None).with_attribute(
+                "rules",
+                Value::Concrete(ConcreteValue::List(vec![rule(80, None), rule(443, None)])),
+            );
+        let retry_plan =
+            plan_after_writeback(&removed_description, &carried, &SchemaRegistry::new());
+        assert!(
+            retry_plan.effects().iter().any(|effect| matches!(
+                effect,
+                Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "rules")
+            )),
+            "removing the authored nested field must still plan an update after unrelated writeback: {retry_plan:#?}"
+        );
     }
 
     #[test]

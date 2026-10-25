@@ -361,14 +361,28 @@ pub enum ResourceStateEncodingError {
     InvalidSentAttributes { attributes: Vec<String> },
 }
 
-/// Provenance for write-only values while rebuilding a provider-backed row.
+/// Provenance for all desired-backed metadata while rebuilding a provider row.
 ///
-/// Every caller must state whether a provider accepted a request or no request
-/// was sent.
+/// Coupling write-only and authoring provenance makes invalid combinations
+/// unrepresentable: an accepted request always establishes the desired
+/// authoring record, while a carried refresh rebuilds current desired keys
+/// against fresh stored values and retains only live, pending top-level
+/// removals from the prior record.
 #[derive(Debug, Clone, Copy)]
-pub enum WriteOnlyBasis<'a> {
-    AcceptedRequest(&'a AcceptedRequest),
-    CarryPrevious,
+pub enum RowBasis<'a> {
+    /// A provider accepted this create or update request.
+    Applied(&'a AcceptedRequest),
+    /// Import established the desired authoring record without sending values.
+    Imported,
+    /// No desired write completed; rebuild desired metadata while retaining
+    /// live, pending top-level removals from known prior metadata.
+    Carried,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DesiredAuthoringBasis {
+    AppliedDesired,
+    CarryPrior,
 }
 
 /// The main state file structure that persists to the backend
@@ -583,8 +597,8 @@ impl StateFile {
     /// v6: Replaced flat `desired_keys: Vec<String>` with recursive
     ///     `explicit: ExplicitFields` (refs awscc#206). Reads of v5
     ///     state lift each top-level key to a `Leaf` child of the
-    ///     root `Struct`; the next plan/apply rebuilds a full tree
-    ///     from the resource's authored `Value`.
+    ///     root `Struct`; a later applied/imported desired write rebuilds
+    ///     a full tree from the resource's authored `Value`.
     /// v7: Replaced top-level empty `ExplicitFields::Struct` with
     ///     `ExplicitFields::Unrecorded`.
     /// v8: Renamed `ResourceState.name` to `ResourceState.identity`.
@@ -1648,15 +1662,11 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             // v6 → v7 (carina#3280): a top-level
             // `ExplicitFields::Struct { children: {} }` row is the
             // legacy-corruption shape produced by an older for-loop
-            // expansion path; it is structurally ambiguous with "user
-            // authored an empty struct at the top level" (which the
-            // current code never legitimately emits — the resource
-            // authoring builders produce this shape only when
-            // `resource.attributes` is empty, and the writeback path emits `Unrecorded`
-            // instead). Rewriting every top-level empty Struct to
-            // `Unrecorded` on read makes the variant the single
-            // source of truth and lets every `match` arm be exhaustive
-            // again.
+            // expansion path. Rewriting every top-level empty Struct
+            // from v6 to `Unrecorded` preserves that legacy meaning.
+            // Current-version desired-backed writes legitimately emit an
+            // empty Struct when the user authored no attributes;
+            // this migration is version-gated and never rewrites them.
             if v <= 6 {
                 migrate_v6_empty_struct_to_unrecorded(&mut state);
             }
@@ -1944,8 +1954,8 @@ pub struct ResourceState {
     ///
     /// Replaces the flat `desired_keys: Vec<String>` (state ≤ v5);
     /// the v5 reader lifts each top-level key to a `Leaf` child of
-    /// the root `Struct`. The next plan/apply rebuilds a full tree
-    /// from the resource's authored `Value` via the aligned
+    /// the root `Struct`. A later applied/imported desired write rebuilds a
+    /// full tree from the resource's authored `Value` via the aligned
     /// `carina_core::explicit::build_from_resource_for_stored_values`.
     #[serde(default, skip_serializing_if = "is_empty_explicit")]
     pub explicit: ExplicitFields,
@@ -2089,29 +2099,6 @@ impl<'de> Deserialize<'de> for ResourceState {
     }
 }
 
-fn refreshed_explicit_without_desired_values(
-    prior: Option<&ExplicitFields>,
-    attributes: &HashMap<String, Value>,
-) -> ExplicitFields {
-    match prior {
-        Some(ExplicitFields::Unrecorded) if !attributes.is_empty() => {
-            let children = attributes
-                .iter()
-                .map(|(key, value)| (key.clone(), explicit::build_from_value(value)))
-                .collect();
-            ExplicitFields::Struct { children }
-        }
-        Some(prior @ ExplicitFields::Struct { children }) if !children.is_empty() => {
-            explicit::demote_list_elements_to_union(prior)
-        }
-        Some(prior @ ExplicitFields::List { .. })
-        | Some(prior @ ExplicitFields::ListElements { .. }) => {
-            explicit::demote_list_elements_to_union(prior)
-        }
-        _ => ExplicitFields::Unrecorded,
-    }
-}
-
 #[cfg(any(test, feature = "test-utils"))]
 impl WritableResourceState {
     #[doc(hidden)]
@@ -2190,8 +2177,10 @@ impl RefreshableResourceState<'_> {
                 partial_read: state.partial_read.clone(),
             },
         };
-        refreshed.explicit =
-            refreshed_explicit_without_desired_values(Some(&source.explicit), &state.attributes);
+        // An orphan has no desired resource from which to rebuild authoring
+        // metadata. Preserve the prior record, conservatively discarding only
+        // stored-index alignment that a provider refresh may have invalidated.
+        refreshed.explicit = explicit::demote_list_elements_to_union(&source.explicit);
         Ok(refreshed)
     }
 }
@@ -2682,6 +2671,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
+        authoring_basis: DesiredAuthoringBasis,
     ) {
         if let Some(existing) = existing {
             self.protected = existing.protected;
@@ -2692,19 +2682,18 @@ impl ResourceState {
             self.directives.provider_instance = resource.id.provider_instance.clone();
         }
         self.prefixes = resource.prefixes.clone();
-        // carina#3280: an empty top-level Struct used to double as the
-        // legacy-corruption marker. Preserve or rebuild an existing authoring
-        // record when possible; otherwise use the typed Unrecorded signal.
-        let built =
-            explicit::build_from_resource_for_stored_values(resource, stored_attributes, schema);
-        self.explicit = match built {
-            ExplicitFields::Struct { ref children } if children.is_empty() => {
-                refreshed_explicit_without_desired_values(
-                    existing.map(|entry| &entry.explicit),
-                    stored_attributes,
-                )
+        self.explicit = match authoring_basis {
+            // An empty Struct is a complete record that the applied desired
+            // resource authored no attributes.
+            DesiredAuthoringBasis::AppliedDesired => {
+                explicit::build_from_resource_for_stored_values(resource, stored_attributes, schema)
             }
-            other => other,
+            DesiredAuthoringBasis::CarryPrior => Self::carried_explicit_for_stored_values(
+                resource,
+                existing,
+                stored_attributes,
+                schema,
+            ),
         };
         self.binding = resource.binding.clone();
         let dependencies = get_resource_dependencies(resource);
@@ -2713,10 +2702,55 @@ impl ResourceState {
         }
     }
 
+    fn carried_explicit_for_stored_values(
+        resource: &ResolvedResource,
+        existing: Option<&ResourceState>,
+        stored_attributes: &HashMap<String, Value>,
+        schema: Option<&ResourceSchema>,
+    ) -> ExplicitFields {
+        let mut carried =
+            explicit::build_from_resource_for_stored_values(resource, stored_attributes, schema);
+        let (
+            ExplicitFields::Struct {
+                children: carried_children,
+            },
+            Some(ExplicitFields::Struct {
+                children: prior_children,
+            }),
+        ) = (&mut carried, existing.map(|row| &row.explicit))
+        else {
+            return carried;
+        };
+
+        // A carried write records current desired keys rebuilt against fresh
+        // stored values, plus a prior top-level key only while the fresh
+        // provider state proves that its removal is still pending. Rebuilding
+        // desired children preserves their list-element alignment and never
+        // promotes provider-only keys. A retained prior-only child must be
+        // demoted because any ListElements inside it were aligned to the old
+        // row rather than these fresh stored values.
+        //
+        // This deliberately retains pending removals only at the top level. A
+        // nested field removed by a failed update can still lose its pending
+        // removal when its desired parent is rebuilt; preserving that requires
+        // nested reconciliation with stable element identity.
+        for (key, prior_child) in prior_children {
+            if !resource.attributes.contains_key(key) && stored_attributes.contains_key(key) {
+                carried_children.insert(
+                    key.clone(),
+                    explicit::demote_list_elements_to_union(prior_child),
+                );
+            }
+        }
+
+        carried
+    }
+
     /// Build an applied row for a create that exists but whose finishing step
     /// failed. Values are selected strictly as observed, then sent, then
     /// absent. Desired state controls masking but cannot introduce an unsent
-    /// value.
+    /// value. The observed create establishes the current desired resource as
+    /// the authoring baseline.
     pub fn from_observation(
         resource: &ResolvedResource,
         created: &ObservedCreate,
@@ -2795,13 +2829,21 @@ impl ResourceState {
             write_only_attributes,
             partial_read,
         };
-        row.populate_desired_metadata(resource, existing, &stored_attributes, schema);
+        row.populate_desired_metadata(
+            resource,
+            existing,
+            &stored_attributes,
+            schema,
+            DesiredAuthoringBasis::AppliedDesired,
+        );
         Ok(row)
     }
 
-    /// Build the mutually-exclusive v15 continuation row. A re-pend loaded
-    /// from state keeps the prior envelope, timestamp, and host metadata; a
-    /// newly sent create encodes only sent write-only and secret values.
+    /// Build the mutually-exclusive v15 continuation row. A persisted re-pend
+    /// keeps the prior envelope, timestamp, and host metadata, including a
+    /// known authoring record. A legacy `Unrecorded` authoring record is seeded
+    /// from desired keys. A freshly sent create encodes sent write-only and
+    /// secret values and establishes the current desired authoring baseline.
     pub fn from_in_flight(
         resource: &ResolvedResource,
         pending: &InFlightCreate,
@@ -2809,7 +2851,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let persisted = match pending.persistence() {
+        let (persisted, authoring_basis) = match pending.persistence() {
             InFlightPersistence::Persisted => {
                 if let Some(existing) = existing {
                     let mut row = existing.clone();
@@ -2830,9 +2872,21 @@ impl ResourceState {
                     row.current = CurrentInstance::CreateInFlight {
                         pending: pending.clone(),
                     };
+                    // A persisted continuation has no fresh provider
+                    // attributes with which to reconcile completed versus
+                    // pending removals, so preserve every known prior field.
+                    // Only a legacy unknown record can be safely seeded from
+                    // the desired resource.
+                    if matches!(row.explicit, ExplicitFields::Unrecorded) {
+                        row.explicit = explicit::build_from_resource_for_stored_values(
+                            resource,
+                            &HashMap::new(),
+                            schema,
+                        );
+                    }
                     return Ok(row);
                 }
-                pending.clone()
+                (pending.clone(), DesiredAuthoringBasis::CarryPrior)
             }
             InFlightPersistence::Fresh(fresh) => {
                 let selected = Self::selected_sent_attributes(
@@ -2851,7 +2905,10 @@ impl ResourceState {
                         .get(key)
                         .is_some_and(carina_core::value::contains_secret)
                 });
-                fresh.persist(write_only, secrets)
+                (
+                    fresh.persist(write_only, secrets),
+                    DesiredAuthoringBasis::AppliedDesired,
+                )
             }
         };
 
@@ -2861,7 +2918,7 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         row.current = CurrentInstance::CreateInFlight { pending: persisted };
-        row.populate_desired_metadata(resource, existing, &HashMap::new(), schema);
+        row.populate_desired_metadata(resource, existing, &HashMap::new(), schema, authoring_basis);
         Ok(row)
     }
 
@@ -2870,12 +2927,11 @@ impl ResourceState {
     ///
     /// Provider attributes are serialized into state JSON, desired secret
     /// values are masked before storage, and previously-stored secret hashes
-    /// can protect keys removed from desired state. `write_only_basis` is
-    /// mandatory: it determines whether write-only values come from an
-    /// accepted request or the previous row. When `existing` is provided,
-    /// protected/name override
-    /// metadata and existing deposed generations are preserved by the
-    /// row-write path.
+    /// can protect keys removed from desired state. `row_basis` couples
+    /// write-only and authoring provenance so a successful request cannot
+    /// retain a stale authoring record. When `existing` is provided,
+    /// protected/name override metadata and existing deposed generations are
+    /// preserved by the row-write path.
     ///
     /// Returns an error if any provider attribute value cannot be converted to
     /// JSON, such as non-finite float values.
@@ -2884,7 +2940,7 @@ impl ResourceState {
         state: &State,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
-        write_only_basis: WriteOnlyBasis<'_>,
+        row_basis: RowBasis<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let mut rs = Self::new(
@@ -2899,8 +2955,8 @@ impl ResourceState {
             .map(|attributes| recorded_write_only_keys(schema, attributes, &[]))
             .unwrap_or_default();
         let mut accepted = BTreeSet::new();
-        match write_only_basis {
-            WriteOnlyBasis::AcceptedRequest(request) => match request.kind() {
+        match row_basis {
+            RowBasis::Applied(request) => match request.kind() {
                 AcceptedRequestKind::Create => {
                     accepted.extend(
                         desired_keys
@@ -2919,7 +2975,7 @@ impl ResourceState {
                     );
                 }
             },
-            WriteOnlyBasis::CarryPrevious => {}
+            RowBasis::Imported | RowBasis::Carried => {}
         }
         let desired_fallback = Sent::only(
             accepted
@@ -2951,9 +3007,9 @@ impl ResourceState {
                     None => desired_fallback.encoded_value(key).cloned(),
                 }
             } else {
-                let carries_previous = match write_only_basis {
-                    WriteOnlyBasis::CarryPrevious => true,
-                    WriteOnlyBasis::AcceptedRequest(request) => match request.kind() {
+                let carries_previous = match row_basis {
+                    RowBasis::Imported | RowBasis::Carried => true,
+                    RowBasis::Applied(request) => match request.kind() {
                         AcceptedRequestKind::Create => false,
                         AcceptedRequestKind::Update { removed, .. } => !removed.contains(key),
                     },
@@ -2996,16 +3052,26 @@ impl ResourceState {
                 partial_read: state.partial_read.clone(),
             },
         };
-        rs.populate_desired_metadata(resource, existing, &state.attributes, schema);
+        let authoring_basis = match row_basis {
+            RowBasis::Applied(_) | RowBasis::Imported => DesiredAuthoringBasis::AppliedDesired,
+            RowBasis::Carried => DesiredAuthoringBasis::CarryPrior,
+        };
+        rs.populate_desired_metadata(
+            resource,
+            existing,
+            &state.attributes,
+            schema,
+            authoring_basis,
+        );
         Ok(rs)
     }
 }
 
 /// Returns true if the `ExplicitFields` is the default (`Leaf`) — used
 /// as a `skip_serializing_if` predicate so resources that have not yet
-/// been touched by `from_provider_state_for_resource_and_schema` (or that legitimately have no
-/// authored attributes) don't emit a verbose `"explicit": {"kind": "leaf"}`
-/// line.
+/// been touched by a state constructor don't emit a verbose
+/// `"explicit": {"kind": "leaf"}` line. A recorded empty `Struct` is not
+/// skipped: it records that a desired-backed write saw no authored attributes.
 fn is_empty_explicit(e: &ExplicitFields) -> bool {
     matches!(e, ExplicitFields::Leaf)
 }
@@ -3247,14 +3313,12 @@ fn migrate_v5_desired_keys_to_explicit(
 
 /// v6 → v7 (carina#3280): rewrite every top-level
 /// `ExplicitFields::Struct { children: {} }` row to
-/// `ExplicitFields::Unrecorded`. The empty-Struct shape on disk is
-/// always the legacy-corruption pattern (the older for-loop expansion
-/// path that lost child attributes before reaching writeback), never a
-/// legitimate "user authored an empty struct at top level" — the
-/// the resource authoring builders produce this shape only when
-/// `resource.attributes` is empty, and the writeback path emits `Unrecorded`
-/// for that case instead. Migrating eliminates the
-/// runtime ambiguity that callers used to disambiguate by convention.
+/// `ExplicitFields::Unrecorded`. In v6 the empty-Struct shape on disk
+/// represented the legacy-corruption pattern (the older for-loop expansion
+/// path that lost child attributes before reaching writeback). Current-version
+/// rows may legitimately use an empty Struct to record that the desired
+/// resource authored no attributes; the migration remains version-gated so
+/// those rows are not rewritten.
 fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {
     for rs in state.resources.iter_mut() {
         if let ExplicitFields::Struct { children } = &rs.explicit

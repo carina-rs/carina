@@ -32,7 +32,7 @@ use carina_core::value::format_value;
 use carina_state::LockInfo;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LoadedOrphans,
-    ResourceState, StateBackend, StateFile, StateUrl, WriteOnlyBasis, create_backend,
+    ResourceState, RowBasis, StateBackend, StateFile, StateUrl, create_backend,
     create_remote_backend, load_state_from_url, resolve_backend_for_read,
 };
 
@@ -2210,9 +2210,12 @@ fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
 /// Compare old state with fresh provider state for a single resource,
 /// display any changes, and update the state file accordingly.
 ///
-/// When `resource` is `Some`, desired metadata is rebuilt from it. When
-/// `None`, the existing orphan row keeps every host-owned field and only its
-/// provider-observed state is replaced.
+/// When `resource` is `Some`, current desired metadata such as directives and
+/// dependencies is rebuilt. Authoring for desired keys is realigned to the
+/// fresh values, while live pending top-level removals are carried from the
+/// prior record.
+/// When `None`, the existing orphan row keeps every host-owned field and only
+/// its provider-observed state is replaced.
 ///
 /// `label_suffix` is appended to the resource header (e.g., `" (orphan)"`).
 #[derive(Default)]
@@ -2275,7 +2278,7 @@ fn diff_display_update_resource(
                     fresh_state,
                     Some(existing_rs),
                     schema,
-                    WriteOnlyBasis::CarryPrevious,
+                    RowBasis::Carried,
                     None,
                 )
                 .map_err(|source| {
@@ -4740,6 +4743,172 @@ mod tests {
         .expect("state refresh should compare the reordered list");
 
         counts
+    }
+
+    #[test]
+    fn current_refresh_seeds_unrecorded_from_empty_desired_without_promoting_tags() {
+        use carina_core::differ::{Diff, diff};
+        use carina_core::explicit::ExplicitFields;
+
+        let id = ResourceId::with_provider_identity("mock", "ec2.InternetGateway", "igw", None);
+        let desired = resolved(Resource::with_provider(
+            "mock",
+            "ec2.InternetGateway",
+            "igw",
+            None,
+        ));
+        let mut prior = ResourceState::try_applied("ec2.InternetGateway", "igw", "mock", "igw-id")
+            .expect("fixture identifier is non-empty");
+        prior.explicit = ExplicitFields::Unrecorded;
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(prior)
+            .expect("test state setup must be valid");
+
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            )]),
+        )
+        .with_identifier("igw-id");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("ec2.InternetGateway").attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::map(AttributeType::string()),
+            )),
+        );
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &ResolvedResourceId::new(id.clone()),
+            &Current::from_state(fresh.clone()),
+            &mut state,
+            Some(&desired),
+            &schemas,
+            "",
+            &mut counts,
+        )
+        .expect("state refresh should write the canonical provider state");
+
+        let row = state
+            .find_resource_for_id(&id)
+            .expect("refreshed IGW row must remain");
+        assert_eq!(
+            row.explicit,
+            ExplicitFields::Struct {
+                children: HashMap::new()
+            },
+            "refresh must repair from empty desired without promoting provider attributes"
+        );
+        let saved = state.build_saved_attrs();
+        assert!(matches!(
+            diff(
+                &desired,
+                &fresh,
+                saved.get(&id),
+                Some(&row.explicit),
+                schemas.get_for(&desired),
+            ),
+            Diff::NoChange(_)
+        ));
+    }
+
+    #[test]
+    fn current_refresh_keeps_prior_authored_tags_when_desired_has_removed_them() {
+        use carina_core::differ::{Diff, diff};
+        use carina_core::explicit::ExplicitFields;
+
+        let id = ResourceId::with_provider_identity("mock", "ec2.InternetGateway", "igw", None);
+        let desired = resolved(
+            Resource::with_provider("mock", "ec2.InternetGateway", "igw", None)
+                .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into()))),
+        );
+        let mut prior = ResourceState::try_applied("ec2.InternetGateway", "igw", "mock", "igw-id")
+            .expect("fixture identifier is non-empty")
+            .with_attribute("name", json!("x"))
+            .with_attribute("tags", json!({ "environment": "production" }));
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([
+                ("name".to_string(), ExplicitFields::Leaf),
+                (
+                    "tags".to_string(),
+                    ExplicitFields::Struct {
+                        children: HashMap::from([(
+                            "environment".to_string(),
+                            ExplicitFields::Leaf,
+                        )]),
+                    },
+                ),
+            ]),
+        };
+        prior.explicit = prior_explicit.clone();
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(prior)
+            .expect("test state setup must be valid");
+
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("x".into())),
+                ),
+                (
+                    "tags".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                ),
+            ]),
+        )
+        .with_identifier("igw-id");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("ec2.InternetGateway")
+                .attribute(AttributeSchema::new("name", AttributeType::string()))
+                .attribute(AttributeSchema::new(
+                    "tags",
+                    AttributeType::map(AttributeType::string()),
+                )),
+        );
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &ResolvedResourceId::new(id.clone()),
+            &Current::from_state(fresh.clone()),
+            &mut state,
+            Some(&desired),
+            &schemas,
+            "",
+            &mut counts,
+        )
+        .expect("state refresh should rebuild desired authoring and retain live pending removals");
+
+        let row = state
+            .find_resource_for_id(&id)
+            .expect("refreshed IGW row must remain");
+        assert_eq!(
+            row.explicit, prior_explicit,
+            "refresh must not record an unapplied removal as authored state"
+        );
+        let saved = state.build_saved_attrs();
+        let Diff::Update {
+            changed_attributes, ..
+        } = diff(
+            &desired,
+            &fresh,
+            saved.get(&id),
+            Some(&row.explicit),
+            schemas.get_for(&desired),
+        )
+        else {
+            panic!("refresh must preserve the pending tags removal");
+        };
+        assert_eq!(changed_attributes, vec!["tags".to_string()]);
     }
 
     #[test]

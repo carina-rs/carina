@@ -2234,8 +2234,8 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
 fn find_changed_attributes_unrecorded_prev_explicit_is_no_change_when_values_match() {
     // carina#3280: a legacy state row whose authoring record was
     // destroyed by an older for-loop expansion path is signalled by
-    // `ExplicitFields::Unrecorded` (emitted by the
-    // `from_provider_state` legacy-corruption repair). The projection
+    // `ExplicitFields::Unrecorded` (emitted by the legacy-state
+    // migration). The projection
     // must pass `current` through unchanged so the equality loop can
     // compare against `desired` directly — otherwise every attribute
     // gets flagged as changed and the plan surfaces a spurious

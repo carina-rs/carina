@@ -298,7 +298,7 @@ fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .expect("marker-shaped plaintext is valid provider state");
@@ -1192,7 +1192,7 @@ fn test_from_provider_state() {
         &provider_state,
         Some(&existing),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -1239,7 +1239,7 @@ fn test_from_provider_state_without_existing() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -1303,7 +1303,7 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -1350,19 +1350,15 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
 }
 
 #[test]
-fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
-    // carina#3280: when the prior on-disk row carries `Unrecorded` (the
-    // legacy-corruption marker, emitted by the v6→v7 migration for rows
-    // previously persisted as `Struct { children: {} }`) AND
-    // `resource.attributes` is empty AND the freshly-read
-    // `state.attributes` is populated, rebuild `explicit` from the
-    // fresh state so the next write replaces the corrupt row.
+fn test_from_provider_state_repairs_unrecorded_from_desired_resource() {
+    // carina#3280: a legacy `Unrecorded` row is repaired from the
+    // authoritative desired resource. Provider-returned attributes are not
+    // evidence that the user authored those keys.
     use carina_core::explicit::ExplicitFields;
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("awscc", "sso.Assignment", "x", None);
-    // resource.attributes intentionally left empty — this is the buggy
-    // input the old expansion path delivered to state writeback.
+    // The desired resource intentionally has no authored attributes.
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("identifier".to_string()),
@@ -1392,33 +1388,294 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
         &provider_state,
         Some(&existing),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
 
-    let ExplicitFields::Struct { children } = &rs.explicit else {
-        panic!(
-            "expected Struct explicit after repair, got {:?}",
-            rs.explicit
-        );
-    };
-    assert!(
-        children.contains_key("principal_type"),
-        "explicit should be rebuilt from state.attributes when prior on-disk explicit was `Unrecorded`"
+    assert_eq!(
+        rs.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::new()
+        },
+        "the empty desired resource must replace Unrecorded without promoting provider keys"
     );
-    assert!(children.contains_key("target_id"));
 }
 
 #[test]
-fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
-    // carina#3280: a green-field write of a resource with no DSL
-    // attributes (e.g. `aws.sts.CallerIdentity {}`, or `carina state
-    // import`) must emit `Unrecorded` — NOT `Struct { children: {} }`.
-    // Pre-fix resource authoring produced the ambiguous empty
-    // Struct shape, which the differ used to interpret as "user
-    // authored an empty struct, drop every server-side attribute".
-    // The typed signal removes the ambiguity at the source.
+fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_provider_promotion() {
+    use carina_core::differ::{Diff, diff};
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
+        .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("x".into())),
+            ),
+            (
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+        ]),
+    )
+    .with_identifier("identifier");
+    let mut existing = ResourceState::new("test.Resource", "main", "mock");
+    existing.explicit = ExplicitFields::Unrecorded;
+    let schema = ResourceSchema::new("test.Resource")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "tags",
+            AttributeType::map(AttributeType::string()),
+        ));
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        Some(&existing),
+        Some(&schema),
+        RowBasis::Carried,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        row.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)])
+        },
+        "an unknown prior record must be seeded only from desired keys"
+    );
+
+    let mut state = StateFile::new();
+    state.upsert_resource(row).unwrap();
+    let saved = state.build_saved_attrs();
+    let stored = state.find_resource_for_id(&resource.id).unwrap();
+    assert!(matches!(
+        diff(
+            &resolved(&resource),
+            &provider_state,
+            saved.get(&resource.id),
+            Some(&stored.explicit),
+            Some(&schema),
+        ),
+        Diff::NoChange(_)
+    ));
+
+    let removed_name = resolved(&Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "main",
+        None,
+    ));
+    let Diff::Update {
+        changed_attributes, ..
+    } = diff(
+        &removed_name,
+        &provider_state,
+        saved.get(&resource.id),
+        Some(&stored.explicit),
+        Some(&schema),
+    )
+    else {
+        panic!("removing a desired key after repair must plan an update");
+    };
+    assert_eq!(changed_attributes, vec!["name".to_string()]);
+}
+
+#[test]
+fn test_from_provider_state_carry_prior_without_prior_seeds_from_desired() {
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
+        .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("x".into())),
+            ),
+            (
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+        ]),
+    )
+    .with_identifier("identifier");
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        None,
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        row.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)])
+        }
+    );
+}
+
+#[test]
+fn test_from_provider_state_carry_prior_preserves_partially_removed_authored_key() {
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("kept".into())),
+    );
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("kept".into())),
+            ),
+            (
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+        ]),
+    )
+    .with_identifier("resource-id");
+    let prior_explicit = ExplicitFields::Struct {
+        children: HashMap::from([
+            ("name".to_string(), ExplicitFields::Leaf),
+            (
+                "tags".to_string(),
+                ExplicitFields::Struct {
+                    children: HashMap::new(),
+                },
+            ),
+        ]),
+    };
+    let mut existing = ResourceState::new("test.Resource", "main", "mock");
+    existing.explicit = prior_explicit.clone();
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        Some(&existing),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        row.explicit, prior_explicit,
+        "a failed partial removal must retain the removed key until a desired write applies"
+    );
+}
+
+#[test]
+fn test_from_provider_state_carry_prior_demotes_retained_list_alignment() {
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("kept".into())),
+    );
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("kept".into())),
+            ),
+            (
+                "k".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::Int(2)),
+                    Value::Concrete(ConcreteValue::Int(1)),
+                ])),
+            ),
+        ]),
+    )
+    .with_identifier("resource-id");
+    let mut existing = ResourceState::new("test.Resource", "main", "mock");
+    existing.explicit = ExplicitFields::Struct {
+        children: HashMap::from([
+            ("name".to_string(), ExplicitFields::Leaf),
+            (
+                "k".to_string(),
+                ExplicitFields::ListElements {
+                    elements: vec![ExplicitFields::Leaf, ExplicitFields::Leaf],
+                },
+            ),
+        ]),
+    };
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        Some(&existing),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .unwrap();
+
+    let ExplicitFields::Struct { children } = row.explicit else {
+        panic!("expected carried root Struct");
+    };
+    assert_eq!(
+        children["k"],
+        ExplicitFields::List {
+            element: Box::new(ExplicitFields::Leaf)
+        },
+        "a retained pending-removal child must not keep alignment to the prior row's list"
+    );
+}
+
+#[test]
+fn test_from_provider_state_carry_prior_drops_removed_key_absent_from_fresh_state() {
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("kept".into())),
+    );
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("kept".into())),
+        )]),
+    )
+    .with_identifier("resource-id");
+    let mut existing = ResourceState::new("test.Resource", "main", "mock");
+    existing.explicit = ExplicitFields::Struct {
+        children: HashMap::from([
+            ("name".to_string(), ExplicitFields::Leaf),
+            ("foo".to_string(), ExplicitFields::Leaf),
+        ]),
+    };
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        Some(&existing),
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        row.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)])
+        },
+        "a carried removal stops being pending once the provider no longer returns the key"
+    );
+}
+
+#[test]
+fn test_from_provider_state_records_empty_struct_for_fresh_empty_body_resource() {
+    // An empty desired resource is an authoritative record that the user
+    // authored no attributes, including for green-field writes and imports.
     use carina_core::explicit::ExplicitFields;
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
@@ -1443,38 +1700,34 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
 
-    assert!(
-        matches!(rs.explicit, ExplicitFields::Unrecorded),
-        "first-apply empty-body resource must emit `Unrecorded`, got {:?}",
-        rs.explicit
+    assert_eq!(
+        rs.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::new()
+        },
+        "first-apply empty-body resource must record an empty authored set"
     );
 }
 
 #[test]
-fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty() {
-    // carina#3280 idempotency: after the self-heal path runs once, the
-    // on-disk row carries a populated `Struct`. On the next apply (no
-    // DSL change), `resource.attributes` is still empty (the user's
-    // bodyless DSL hasn't changed), so the aligned builder produces
-    // `Struct { children: {} }` again. Without the preservation arm,
-    // the empty-Struct collapse would overwrite the populated record
-    // with `Unrecorded`, flip-flopping the row on every apply and
-    // churning state `serial`. Preserve the existing populated Struct.
+fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_are_deleted() {
+    use carina_core::differ::{Diff, diff};
     use carina_core::explicit::ExplicitFields;
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let resource = Resource::with_provider("aws", "sts.CallerIdentity", "caller", None);
+    let resource = Resource::with_provider("awscc", "ec2.InternetGateway", "igw", None);
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("id".to_string()),
         attributes: [(
-            "account_id".to_string(),
-            Value::Concrete(ConcreteValue::String("123".into())),
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
         )]
         .into_iter()
         .collect(),
@@ -1484,33 +1737,80 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
         partial_read: None,
     };
 
-    // Prior on-disk: populated Struct (e.g. from a previous self-heal).
-    let mut existing = ResourceState::new("sts.CallerIdentity", "caller", "aws");
-    let populated = ExplicitFields::Struct {
-        children: HashMap::from([("account_id".into(), ExplicitFields::Leaf)]),
+    let mut existing = ResourceState::new("ec2.InternetGateway", "igw", "awscc");
+    existing.explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "tags".into(),
+            ExplicitFields::Struct {
+                children: HashMap::new(),
+            },
+        )]),
     };
-    existing.explicit = populated.clone();
+    let schema = ResourceSchema::new("ec2.InternetGateway").attribute(AttributeSchema::new(
+        "tags",
+        AttributeType::map(AttributeType::string()),
+    ));
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
         Some(&existing),
-        None,
-        WriteOnlyBasis::CarryPrevious,
+        Some(&schema),
+        RowBasis::Imported,
         None,
     )
     .unwrap();
 
     assert_eq!(
-        rs.explicit, populated,
-        "populated Struct must be preserved on re-apply with no DSL change; \
-         got {:?}",
-        rs.explicit
+        rs.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::new()
+        },
+        "deleting all desired attributes must clear the prior authored keys"
     );
+
+    let mut state = StateFile::new();
+    state.upsert_resource(rs).unwrap();
+    let encoded = serde_json::to_string(&state).expect("current state serializes");
+    let checked = check_and_migrate(&encoded).expect("current state reloads without migration");
+    assert!(checked.migration().is_none());
+    let reloaded = checked.into_state();
+    let reloaded_row = reloaded
+        .find_resource_for_id(&resource.id)
+        .expect("reloaded IGW row");
+    assert_eq!(
+        reloaded_row.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::new()
+        },
+        "a current-version empty authored set must round-trip without becoming Unrecorded"
+    );
+
+    let saved = reloaded.build_saved_attrs();
+    assert!(matches!(
+        diff(
+            &resolved(&resource),
+            &provider_state,
+            saved.get(&resource.id),
+            Some(&reloaded_row.explicit),
+            Some(&schema),
+        ),
+        Diff::NoChange(_)
+    ));
+    assert!(matches!(
+        diff(
+            &resolved(&resource),
+            &provider_state,
+            saved.get(&resource.id),
+            Some(&ExplicitFields::Unrecorded),
+            Some(&schema),
+        ),
+        Diff::NoChange(_)
+    ));
 }
 
 #[test]
-fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_empty() {
+fn test_from_provider_state_replaces_prior_top_level_list_when_resource_attrs_empty() {
     let resource = Resource::with_provider("mock", "test.Resource", "empty", None);
     let provider_state = State::existing(
         resource.id.clone(),
@@ -1533,17 +1833,15 @@ fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_
         &provider_state,
         Some(&existing),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
 
     assert_eq!(
         row.explicit,
-        ExplicitFields::List {
-            element: Box::new(ExplicitFields::Struct {
-                children: HashMap::from([("id".to_string(), ExplicitFields::Leaf)]),
-            }),
+        ExplicitFields::Struct {
+            children: HashMap::new(),
         }
     );
 }
@@ -1584,15 +1882,11 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
         )]),
     };
 
-    let row = ResourceState::from_provider_state_for_resource_and_schema(
-        &resolved(&resource),
-        &reordered_provider,
-        Some(&existing),
-        None,
-        WriteOnlyBasis::CarryPrevious,
-        None,
-    )
-    .unwrap();
+    let row = existing
+        .refreshable()
+        .expect("an orphan row without an in-flight create can refresh")
+        .refreshed_from_provider_state(&reordered_provider, None)
+        .unwrap();
     let ExplicitFields::Struct { children } = &row.explicit else {
         panic!("expected preserved root Struct");
     };
@@ -1625,11 +1919,9 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
 }
 
 #[test]
-fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
-    // carina#3280 case (b): existing is `Unrecorded` AND fresh
-    // `state.attributes` is empty (no provider data to promote). The
-    // repair cannot rebuild authoring from nothing — emit `Unrecorded`
-    // (stable fixed point), do not crash, do not invent attributes.
+fn test_from_provider_state_replaces_unrecorded_when_desired_and_state_attrs_are_empty() {
+    // Even with no stored provider attributes, the empty desired resource is
+    // authoritative and records an empty authored set.
     use carina_core::explicit::ExplicitFields;
     use carina_core::resource::{Resource, State as ProviderState};
 
@@ -1652,15 +1944,16 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
         &provider_state,
         Some(&existing),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
 
-    assert!(
-        matches!(rs.explicit, ExplicitFields::Unrecorded),
-        "Unrecorded + empty state.attributes must stay Unrecorded, got {:?}",
-        rs.explicit
+    assert_eq!(
+        rs.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::new()
+        }
     );
 }
 
@@ -2509,7 +2802,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -2699,6 +2992,48 @@ fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
             element: Box::new(ExplicitFields::Struct {
                 children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)]),
             }),
+        }
+    );
+}
+
+#[test]
+fn orphan_provider_refresh_never_promotes_provider_keys_into_authoring_metadata() {
+    let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
+    let fresh = State::existing(
+        id,
+        HashMap::from([(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        )]),
+    )
+    .with_identifier("resource-123");
+
+    let mut unrecorded =
+        ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-123")
+            .expect("fixture identifier is non-empty");
+    unrecorded.explicit = ExplicitFields::Unrecorded;
+    let refreshed_unrecorded = unrecorded
+        .refreshable()
+        .unwrap()
+        .refreshed_from_provider_state(&fresh, None)
+        .unwrap();
+    assert_eq!(refreshed_unrecorded.explicit, ExplicitFields::Unrecorded);
+
+    let mut recorded_empty =
+        ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-123")
+            .expect("fixture identifier is non-empty");
+    recorded_empty.explicit = ExplicitFields::Struct {
+        children: HashMap::new(),
+    };
+    let refreshed_recorded_empty = recorded_empty
+        .refreshable()
+        .unwrap()
+        .refreshed_from_provider_state(&fresh, None)
+        .unwrap();
+    assert_eq!(
+        refreshed_recorded_empty.explicit,
+        ExplicitFields::Struct {
+            children: HashMap::new()
         }
     );
 }
@@ -3975,7 +4310,7 @@ fn accepted_create_records_write_only_attributes() {
         &provider_state,
         None,
         Some(&schema),
-        WriteOnlyBasis::AcceptedRequest(&request),
+        RowBasis::Applied(&request),
         None,
     )
     .unwrap();
@@ -4039,7 +4374,7 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
             &provider_state,
             None,
             None,
-            WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+            RowBasis::Applied(&AcceptedRequest::create_for_test()),
             None,
         )
         .expect_err("desired redacted secrets must never be written as new state");
@@ -4085,7 +4420,7 @@ fn accepted_write_only_rejects_desired_redacted_secret() {
         &State::existing(resource.id.clone(), HashMap::new()).with_identifier("main-id"),
         None,
         Some(&schema),
-        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
     )
     .expect_err("accepted redacted values cannot be encoded as new state");
@@ -4132,7 +4467,7 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         &provider_state,
         None,
         Some(&schema),
-        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();
@@ -4183,7 +4518,7 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
         &provider_state,
         None,
         Some(&schema),
-        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
     )
     .unwrap();
@@ -4276,7 +4611,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -4323,7 +4658,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         &provider_state,
         Some(&existing),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .expect("provider state should serialize");
@@ -4449,7 +4784,7 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
         &State::existing(resource.id.clone(), HashMap::new()).with_identifier("plain-id"),
         None,
         Some(&schema),
-        WriteOnlyBasis::AcceptedRequest(&AcceptedRequest::create_for_test()),
+        RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
     )
     .expect("marker-shaped desired plaintext is ordinary text");
@@ -4526,7 +4861,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         &provider_state,
         Some(&existing),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .expect("provider state should serialize");
@@ -4572,7 +4907,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         &provider_state,
         Some(&existing),
         Some(&schema),
-        WriteOnlyBasis::AcceptedRequest(&request),
+        RowBasis::Applied(&request),
         None,
     )
     .expect("provider state should serialize");
@@ -4611,7 +4946,7 @@ fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resourc
             .with_identifier("resource-id"),
         Some(&existing),
         Some(&schema),
-        WriteOnlyBasis::AcceptedRequest(&request),
+        RowBasis::Applied(&request),
         None,
     )
     .expect("non-write-only normalized patch keys must not fail state writeback");
@@ -4952,7 +5287,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -5032,7 +5367,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -5100,7 +5435,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -5253,7 +5588,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         &provider_state,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap_err();
@@ -5465,7 +5800,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
         &current,
         Some(row),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -5508,7 +5843,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         &first_provider,
         None,
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();
@@ -5612,7 +5947,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         &reordered_provider,
         Some(&first_row),
         None,
-        WriteOnlyBasis::CarryPrevious,
+        RowBasis::Imported,
         None,
     )
     .unwrap();

@@ -3,8 +3,8 @@ use carina_core::binding_index::PreApplyInputs;
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
-    Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult, ReadOutcome,
-    ReadRequest, UpdateRequest,
+    PatchOpKind, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
+    ReadOutcome, ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{
     Composition, CompositionArgument, DataSource, DeferredValue, ModuleConstraintId, ModuleSource,
@@ -1019,6 +1019,16 @@ impl ProviderFactory for ApplyTimeReadFactory {
                     AttributeType::list(AttributeType::string()),
                 ))
                 .as_data_source(),
+            ResourceSchema::new("ec2.InternetGateway")
+                .attribute(AttributeSchema::new("name", AttributeType::string()))
+                .attribute(AttributeSchema::new(
+                    "tags",
+                    AttributeType::map(AttributeType::string()),
+                )),
+            ResourceSchema::new("ec2.NatGateway").attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::map(AttributeType::string()),
+            )),
         ]
     }
 }
@@ -1517,8 +1527,14 @@ impl Provider for ApplyTimeReadProvider {
         Box::pin(async move {
             let roles = shared.created_roles.lock().unwrap();
             if let Some(attrs) = roles.get(id.identity_str().expect("resolved identity")) {
+                let mut attrs = attrs.clone();
+                if id.resource_type == "ec2.InternetGateway" {
+                    attrs
+                        .entry("tags".to_string())
+                        .or_insert_with(|| Value::Concrete(ConcreteValue::Map(IndexMap::new())));
+                }
                 Ok(fixture_read_outcome(
-                    State::existing(id, attrs.clone()).with_identifier("mock-id"),
+                    State::existing(id, attrs).with_identifier("mock-id"),
                 ))
             } else {
                 Ok(ReadOutcome::not_found(id))
@@ -1614,11 +1630,39 @@ impl Provider for ApplyTimeReadProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: UpdateRequest,
+        identifier: &carina_core::provider::AppliedIdentifier,
+        request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
-        Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
+        let identifier = identifier.clone();
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            if id.resource_type != "ec2.NatGateway" {
+                return Err(ProviderError::internal("unexpected update").for_resource(id));
+            }
+
+            let mut attrs = request.from().attributes.clone();
+            for op in &request.patch().ops {
+                match op.kind {
+                    PatchOpKind::Add | PatchOpKind::Replace => {
+                        attrs.insert(
+                            op.key.clone(),
+                            op.value.clone().expect("add/replace patch carries a value"),
+                        );
+                    }
+                    PatchOpKind::Remove => {
+                        attrs.remove(&op.key);
+                    }
+                }
+            }
+            shared.created_roles.lock().unwrap().insert(
+                id.identity_str().expect("resolved identity").to_string(),
+                attrs.clone(),
+            );
+            Ok(carina_core::provider::UpdateOutcome::Success {
+                state: AppliedState::from_identifier(id, identifier, attrs),
+            })
+        })
     }
 
     fn delete(
@@ -3655,6 +3699,317 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         shared.read_calls.load(Ordering::SeqCst),
         2,
         "post-apply plan must refresh the data source instead of deferring it"
+    );
+}
+
+#[tokio::test]
+async fn noop_writeback_does_not_turn_canonical_empty_tags_into_an_explicit_removal() {
+    let fixture = ApplyCancellationFixture::new();
+    let state_path = fixture.state_path().to_path_buf();
+    let config = |nat_tag: &str| {
+        format!(
+            r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let igw = mock.ec2.InternetGateway {{}}
+
+let nat = mock.ec2.NatGateway {{
+  tags = {{ version = "{nat_tag}" }}
+}}
+"#,
+            state_path.display()
+        )
+    };
+    let fixture = fixture.with_raw_config(config("one"));
+    let base_dir = get_base_dir(fixture.config_path());
+    let shared = ApplyTimeReadShared::default();
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
+    let load = || {
+        let loaded = load_configuration_with_config(
+            fixture.config_path(),
+            fixture.provider_context(),
+            &SchemaRegistry::new(),
+        )
+        .expect("fixture must load");
+        let mut parsed = loaded.parsed;
+        let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+            &mut parsed,
+            base_dir,
+            false,
+            vec![Box::new(ApplyTimeReadFactory {
+                shared: shared.clone(),
+            })],
+            HashMap::new(),
+            &loaded.inference_errors,
+            &loaded.duplicate_declarations,
+        );
+        assert!(
+            validation_errors.is_empty(),
+            "fixture must validate, got: {validation_errors:?}"
+        );
+        (parsed, loaded.unresolved_parsed)
+    };
+
+    let (mut parsed, unresolved_parsed) = load();
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(2).unwrap(),
+        false,
+    )
+    .await
+    .expect("initial apply should create both resources");
+
+    let step1_state = fixture.read_state().await;
+    let step1_row = serde_json::to_value(
+        step1_state
+            .find_resource("mock", "ec2.InternetGateway", "igw")
+            .expect("IGW row must exist after create"),
+    )
+    .expect("IGW row must serialize");
+    assert_eq!(
+        step1_row["current"]["attributes"],
+        serde_json::json!({}),
+        "the create response intentionally omits canonical read defaults"
+    );
+    assert_eq!(
+        step1_row["explicit"],
+        serde_json::json!({ "kind": "struct", "children": {} }),
+        "an empty resource records that the user authored no fields"
+    );
+
+    let (parsed, unresolved_parsed) = load();
+    let provider_configs = resolved_provider_configs(&parsed);
+    let step1_state = Some(step1_state);
+    let clean_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &provider_configs,
+        &unresolved_parsed.resources,
+        &step1_state,
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        base_dir,
+    )
+    .await
+    .expect("plan after create should succeed");
+    assert!(
+        !clean_plan.plan.has_mutations(),
+        "the first refresh plan must ignore the read-only canonical tags default: {:#?}",
+        clean_plan.plan
+    );
+
+    std::fs::write(fixture.config_path().join("main.crn"), config("two"))
+        .expect("update sibling configuration");
+    let (mut parsed, unresolved_parsed) = load();
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(2).unwrap(),
+        false,
+    )
+    .await
+    .expect("sibling-only update should apply");
+
+    let step2_state = fixture.read_state().await;
+    let step2_row = serde_json::to_value(
+        step2_state
+            .find_resource("mock", "ec2.InternetGateway", "igw")
+            .expect("IGW row must survive the sibling update"),
+    )
+    .expect("IGW row must serialize");
+    assert_eq!(
+        step2_row["current"]["attributes"]["tags"],
+        serde_json::json!({}),
+        "the provider read must canonicalize absent tags to an empty map"
+    );
+    assert_eq!(
+        step2_row["explicit"],
+        serde_json::json!({ "kind": "struct", "children": {} }),
+        "provider-read defaults must not become authored fields during sibling writeback"
+    );
+
+    let (parsed, unresolved_parsed) = load();
+    let provider_configs = resolved_provider_configs(&parsed);
+    let step2_state = Some(step2_state);
+    let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &provider_configs,
+        &unresolved_parsed.resources,
+        &step2_state,
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        base_dir,
+    )
+    .await
+    .expect("plan after sibling update should succeed");
+    assert!(
+        !final_plan.plan.has_mutations(),
+        "changing only the sibling must leave the IGW clean: {:#?}",
+        final_plan.plan,
+    );
+}
+
+#[tokio::test]
+async fn failed_update_carries_live_pending_tags_removal_and_replans_it() {
+    let fixture = ApplyCancellationFixture::new();
+    let state_path = fixture.state_path().to_path_buf();
+    let config = |with_tags: bool| {
+        let tags = if with_tags {
+            "\n  tags = { environment = \"production\" }"
+        } else {
+            ""
+        };
+        format!(
+            r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let igw = mock.ec2.InternetGateway {{{tags}
+  name = "x"
+}}
+"#,
+            state_path.display()
+        )
+    };
+    let fixture = fixture.with_raw_config(config(true));
+    let base_dir = get_base_dir(fixture.config_path());
+    let shared = ApplyTimeReadShared::default();
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
+    let load = || {
+        let loaded = load_configuration_with_config(
+            fixture.config_path(),
+            fixture.provider_context(),
+            &SchemaRegistry::new(),
+        )
+        .expect("fixture must load");
+        let mut parsed = loaded.parsed;
+        let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+            &mut parsed,
+            base_dir,
+            false,
+            vec![Box::new(ApplyTimeReadFactory {
+                shared: shared.clone(),
+            })],
+            HashMap::new(),
+            &loaded.inference_errors,
+            &loaded.duplicate_declarations,
+        );
+        assert!(
+            validation_errors.is_empty(),
+            "fixture must validate, got: {validation_errors:?}"
+        );
+        (parsed, loaded.unresolved_parsed)
+    };
+
+    let (mut parsed, unresolved_parsed) = load();
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect("initial apply should create the IGW with tags");
+
+    std::fs::write(fixture.config_path().join("main.crn"), config(false))
+        .expect("remove tags from desired configuration");
+    let (mut parsed, unresolved_parsed) = load();
+    let error = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("the fixture rejects IGW updates");
+    assert!(error.to_string().contains("failed"), "{error:?}");
+
+    let saved = fixture.read_state().await;
+    let row = serde_json::to_value(
+        saved
+            .find_resource("mock", "ec2.InternetGateway", "igw")
+            .expect("failed update must retain the IGW row"),
+    )
+    .expect("IGW row must serialize");
+    assert!(
+        row["explicit"]["children"].get("tags").is_some(),
+        "failed update must retain the still-live pending tags removal: {row:#?}"
+    );
+
+    let (parsed, unresolved_parsed) = load();
+    let provider_configs = resolved_provider_configs(&parsed);
+    let saved = Some(saved);
+    let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &provider_configs,
+        &unresolved_parsed.resources,
+        &saved,
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        base_dir,
+    )
+    .await
+    .expect("retry plan should succeed");
+    assert!(
+        retry.plan.effects().iter().any(|effect| matches!(
+            effect,
+            carina_core::effect::Effect::Update {
+                changed_attributes,
+                ..
+            } if changed_attributes.iter().any(|key| key == "tags")
+        )),
+        "the next plan must retry the failed tags removal: {:#?}",
+        retry.plan,
     );
 }
 
