@@ -3642,6 +3642,202 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
 }
 
 #[test]
+fn parse_interpolation_expression_uses_ordinary_whitespace_rules() {
+    let spaced = parse(
+        r#"let value = "x-${join('-', ['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("whitespace between interpolation function arguments must parse");
+    let compact = parse(
+        r#"let value = "x-${join('-',['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+    let commented = parse(
+        r#"let value = "x-${join('-', /* elements */ ['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("comments between interpolation expression tokens must parse");
+
+    assert_eq!(
+        spaced.variables.get("value"),
+        compact.variables.get("value"),
+        "whitespace inside an interpolation expression must not change its value"
+    );
+    assert_eq!(
+        commented.variables.get("value"),
+        compact.variables.get("value"),
+        "comments inside an interpolation expression must not change its value"
+    );
+}
+
+#[test]
+fn parse_interpolation_expression_allows_spaced_operators_and_arguments() {
+    let spaced = parse(
+        r#"let value = "x-${ ['a', 'b'] |> join('-') }""#,
+        &ProviderContext::default(),
+    )
+    .expect("ordinary expression spacing inside interpolation must parse");
+    let compact = parse(
+        r#"let value = "x-${['a','b']|>join('-')}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact operator expression inside interpolation must parse");
+
+    assert_eq!(
+        spaced.variables.get("value"),
+        compact.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_interpolation_allows_normal_trivia_at_non_empty_edges() {
+    let compact = parse(
+        "let x = 'a'\nlet value = \"x-${x}\"",
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+
+    for (input, description) in [
+        (
+            "let x = 'a'\nlet value = \"x-${ x }\"",
+            "spaces around an interpolation expression",
+        ),
+        (
+            "let x = 'a'\nlet value = \"x-${\nx\n}\"",
+            "newlines around an interpolation expression",
+        ),
+        (
+            "let x = 'a'\nlet value = \"x-${x // trailing comment\n}\"",
+            "a line comment after an interpolation expression",
+        ),
+    ] {
+        let parsed = parse(input, &ProviderContext::default())
+            .unwrap_or_else(|error| panic!("{description} must parse: {error}"));
+        assert_eq!(
+            parsed.variables.get("value"),
+            compact.variables.get("value"),
+            "{description} must not change the interpolation value"
+        );
+    }
+}
+
+#[test]
+fn parse_interpolation_allows_newlines_inside_expression() {
+    let multiline = parse(
+        "let value = \"x-${join('-',\n    ['a'])}\"",
+        &ProviderContext::default(),
+    )
+    .expect("a newline between interpolation function arguments must parse");
+    let compact = parse(
+        r#"let value = "x-${join('-',['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+
+    assert_eq!(
+        multiline.variables.get("value"),
+        compact.variables.get("value")
+    );
+
+    let multiline_nested_brace = parse(
+        "let value = \"x-${{value = 'a'\n}.value}\"",
+        &ProviderContext::default(),
+    )
+    .expect("a newline before a nested expression brace must not look like edge trivia");
+    let compact_nested_brace = parse(
+        r#"let value = "x-${{value = 'a'}.value}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact nested-brace interpolation must parse");
+    assert_eq!(
+        multiline_nested_brace.variables.get("value"),
+        compact_nested_brace.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_interpolation_rejects_multiline_empty_body() {
+    for input in ["let value = \"x-${\n}\"", "let value = \"x-${ \n }\""] {
+        assert!(
+            parse(input, &ProviderContext::default()).is_err(),
+            "an empty interpolation that spans a newline must be rejected: {input:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_interpolation_rejects_comment_only_body() {
+    assert!(
+        parse("let value = \"${ /* c */ }\"", &ProviderContext::default()).is_err(),
+        "a comment without an expression must not satisfy interpolation_expr"
+    );
+}
+
+#[test]
+fn parse_interpolation_line_comment_consumes_closing_syntax_to_newline() {
+    let commented = parse(
+        "let x = 'a'\nlet value = \"${x # c }\"\n}\"",
+        &ProviderContext::default(),
+    )
+    .expect("the interpolation must close on the line after a line comment");
+    let compact = parse(
+        "let x = 'a'\nlet value = \"${x}\"",
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+
+    assert_eq!(
+        commented.variables.get("value"),
+        compact.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_heredoc_inside_multiline_interpolation() {
+    let heredoc = parse(
+        "let value = \"x-${join('-',\n  [<<EOT\nhello\nEOT\n  ])}\"",
+        &ProviderContext::default(),
+    )
+    .expect("a heredoc expression inside a multiline interpolation must parse");
+    let compact = parse(
+        "let value = \"x-${join('-', ['hello'])}\"",
+        &ProviderContext::default(),
+    )
+    .expect("compact equivalent must parse");
+
+    assert_eq!(
+        heredoc.variables.get("value"),
+        compact.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_heredoc_interpolation_is_confined_to_one_physical_body_line() {
+    for body in ["${\n  name\n}", "${join(\"-\", [name])}", "${ name # c }"] {
+        let input = format!("let name = 'value'\nlet value = <<EOT\n{body}\nEOT\n");
+        assert!(
+            parse(&input, &ProviderContext::default()).is_err(),
+            "heredoc interpolation body must follow preprocessed string rules: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_heredoc_backslash_does_not_escape_interpolation() {
+    let parsed = parse(
+        "let name = 'value'\nlet value = <<EOT\n\\${name}\nEOT\n",
+        &ProviderContext::default(),
+    )
+    .expect("a backslash before `${name}` must not suppress heredoc interpolation");
+
+    assert_eq!(
+        parsed.variables.get("value"),
+        Some(&Value::Concrete(ConcreteValue::String("\\value".into())))
+    );
+}
+
+#[test]
 fn parse_empty_interpolation_does_not_break_sibling_bindings() {
     // The whole file's other let bindings stay accessible — concretely,
     // a binding declared after the empty `${}` line still appears in

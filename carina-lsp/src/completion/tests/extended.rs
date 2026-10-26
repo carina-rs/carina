@@ -3582,6 +3582,54 @@ fn interpolation_completion_partial_offers_matching_binding() {
 }
 
 #[test]
+fn interpolation_completion_after_whitespace_offers_matching_binding() {
+    let provider = test_provider();
+    let main = "aws.s3.BucketPolicy {\n  policy = \"arn:aws:iam::${  o\"\n}\n";
+    let (_tmp, base) = set_up_interpolation_project(main);
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "  policy = \"arn:aws:iam::${  o".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(
+        labels.contains(&"orgs"),
+        "expected `orgs` after interpolation whitespace, got: {labels:?}"
+    );
+}
+
+#[test]
+fn interpolation_completion_after_heredoc_body_punctuation_offers_binding() {
+    for body in ["it's", "rm -rf /tmp/*"] {
+        let provider = test_provider();
+        let main = format!(
+            "let note = <<EOT\n{body}\nEOT\naws.s3.BucketPolicy {{\n  policy = \"${{ab\"\n}}\n"
+        );
+        let (_tmp, base) = set_up_interpolation_project(&main);
+        std::fs::write(
+            base.join("backend.crn"),
+            "let orgs = upstream_state { source = '../organizations' }\nlet abc = 'value'\n",
+        )
+        .unwrap();
+        let doc = create_document(&main);
+        let position = Position {
+            line: 4,
+            character: "  policy = \"${ab".chars().count() as u32,
+        };
+
+        let completions = provider.complete(&doc, position, Some(&base));
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            labels.contains(&"abc"),
+            "expected `abc` after heredoc body {body:?}, got: {labels:?}"
+        );
+    }
+}
+
+#[test]
 fn interpolation_completion_dot_after_binding_offers_exports() {
     // `"...${orgs.<cursor>"` — dot after the upstream_state binding
     // should surface its exports (`accounts`).

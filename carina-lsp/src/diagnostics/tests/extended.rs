@@ -8037,6 +8037,148 @@ fn check_attributes_blocks_still_warns_when_truly_undefined() {
 // =====================================================================
 
 #[test]
+fn spaced_interpolation_expression_has_no_error_diagnostic() {
+    let engine = test_engine();
+    let buffer = "let value = \"x-${join('-', ['a'])}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR)),
+        "valid whitespace inside interpolation must not produce an error: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn multiline_interpolation_expression_has_no_spurious_diagnostic() {
+    let engine = test_engine();
+    let buffer = "let value = \"x-${\n  join('-', ['a']) // trailing comment\n}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.severity != Some(DiagnosticSeverity::ERROR)
+                && !diagnostic
+                    .message
+                    .to_lowercase()
+                    .contains("empty interpolation")
+        }),
+        "normal trivia at non-empty interpolation edges must not produce an error or empty hint: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn empty_interpolation_after_multiline_interpolation_still_warns() {
+    let engine = test_engine();
+    let buffer = "let x = 'a'\nlet value = \"a-${\n  x\n} ${}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    let empty_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .collect();
+    assert_eq!(
+        empty_diagnostics.len(),
+        1,
+        "the same string's trailing `${{}}` must still produce a warning: {diagnostics:#?}"
+    );
+    assert_eq!(empty_diagnostics[0].range.start.line, 3);
+}
+
+#[test]
+fn interpolation_like_text_inside_line_comment_does_not_warn() {
+    let engine = test_engine();
+    let buffer = "let x = 'a'\nlet value = \"${ x // ${}\n}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .to_lowercase()
+            .contains("empty interpolation")),
+        "`${{}}` inside an interpolation line comment is not an empty interpolation: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn inline_whitespace_only_interpolations_emit_warnings() {
+    let engine = test_engine();
+    let buffer = "let value = \"${} / ${ }\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    let empty_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .collect();
+    assert_eq!(
+        empty_diagnostics.len(),
+        2,
+        "both `${{}}` and `${{ }}` must produce an empty-interpolation warning: {diagnostics:#?}"
+    );
+    assert!(
+        empty_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING)),
+        "both empty-interpolation diagnostics must be warnings: {empty_diagnostics:#?}"
+    );
+}
+
+#[test]
+fn empty_interpolation_after_heredoc_body_punctuation_still_warns() {
+    let engine = test_engine();
+
+    for body in ["it's", "rm -rf /tmp/*"] {
+        let buffer = format!("let note = <<EOT\n{body}\nEOT\nlet value = \"${{}}\"\n");
+        let diagnostics = engine.analyze(&create_document(&buffer), None);
+        let empty_count = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .to_lowercase()
+                    .contains("empty interpolation")
+            })
+            .count();
+
+        assert_eq!(
+            empty_count, 1,
+            "heredoc body {body:?} must not hide the following empty interpolation: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn backslash_prefixed_empty_interpolation_in_heredoc_warns() {
+    let engine = test_engine();
+    let buffer = "let value = <<EOT\n\\${}\nEOT\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+    let empty = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .unwrap_or_else(|| panic!("`\\${{}}` in an unquoted heredoc must warn: {diagnostics:#?}"));
+
+    assert_eq!(empty.range.start.line, 1);
+    assert_eq!(empty.range.start.character, 1);
+    assert_eq!(empty.range.end.character, 4);
+}
+
+#[test]
 fn empty_interpolation_emits_diagnostic_at_span() {
     let engine = test_engine();
     let buffer = "let bucket = aws.s3.Bucket {\n    name = \"arn:${}:root\"\n}\n";

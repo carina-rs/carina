@@ -276,8 +276,12 @@ impl<'a> CstBuilder<'a> {
             }
             Rule::duration_unit => None,
             Rule::boolean => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
-            Rule::inner_string
-            | Rule::char
+            Rule::string_part
+            | Rule::interpolation
+            | Rule::interpolation_expr
+            | Rule::inline_ws
+            | Rule::string_literal
+            | Rule::string_char
             | Rule::double_quoted_string
             | Rule::single_quoted_string
             | Rule::single_quoted_inner

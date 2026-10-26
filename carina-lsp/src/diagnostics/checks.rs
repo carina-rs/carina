@@ -3081,98 +3081,34 @@ impl DiagnosticEngine {
     /// accepts the empty form (so the rest of the AST stays intact and other
     /// diagnostics keep running), but a buffer that ships with literal `${}`
     /// will produce a meaningless value at apply time — so the user wants a
-    /// hint that the placeholder is unfilled. See #2480.
+    /// hint that the placeholder is unfilled. An empty body only admits spaces
+    /// and tabs, so it cannot cross a line; non-empty expressions use normal
+    /// trivia, including newlines at either edge. See #2480 and #3959.
     ///
-    /// Text scan rather than AST walk: the parser stamps the empty case as
+    /// The shared source lexer is used rather than an AST walk: the parser
+    /// stamps the empty case as
     /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))` but discards the
     /// source span, so the diagnostic range has to come from a source-level
-    /// pass anyway.
+    /// pass anyway. Sharing this lexer also keeps heredoc boundaries aligned
+    /// with semantic tokens and completion.
     pub(super) fn check_empty_interpolations(&self, doc: &Document) -> Vec<Diagnostic> {
-        let text = doc.text();
-        let mut out = Vec::new();
-        for (line_idx, line) in text.lines().enumerate() {
-            // 99% of lines have no `$` — bail before allocating chars.
-            if !line.as_bytes().contains(&b'$') {
-                continue;
-            }
-            let chars: Vec<char> = line.chars().collect();
-            let mut i = 0;
-            let mut in_double_quoted = false;
-            while i < chars.len() {
-                let c = chars[i];
-                if !in_double_quoted {
-                    if c == '"' {
-                        in_double_quoted = true;
-                    } else if c == '\'' {
-                        // Skip past the single-quoted string entirely so a
-                        // `${}` inside it (which is a literal in this DSL)
-                        // doesn't trigger the diagnostic.
-                        i += 1;
-                        while i < chars.len() && chars[i] != '\'' {
-                            i += 1;
-                        }
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if c == '\\' {
-                    i += 2;
-                    continue;
-                }
-                if c == '"' {
-                    in_double_quoted = false;
-                    i += 1;
-                    continue;
-                }
-                if c == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
-                    let start = i;
-                    // Brace-balance the interpolation body so `${ {}.a }`
-                    // closes at the matching `}`, not the first one.
-                    let mut depth = 1usize;
-                    let mut j = i + 2;
-                    let mut only_whitespace = true;
-                    while j < chars.len() && depth > 0 {
-                        match chars[j] {
-                            '\\' if j + 1 < chars.len() => {
-                                only_whitespace = false;
-                                j += 2;
-                                continue;
-                            }
-                            '{' => {
-                                depth += 1;
-                                only_whitespace = false;
-                            }
-                            '}' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    j += 1;
-                                    break;
-                                }
-                                only_whitespace = false;
-                            }
-                            ch if !ch.is_whitespace() => only_whitespace = false,
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    if depth == 0 && only_whitespace {
-                        out.push(carina_diagnostic(
-                            line_idx as u32,
-                            start as u32,
-                            j as u32,
-                            DiagnosticSeverity::WARNING,
-                            "empty interpolation `${}` — fill in the expression or remove it"
-                                .to_string(),
-                        ));
-                    }
-                    i = j;
-                    continue;
-                }
-                i += 1;
-            }
-        }
-        out
+        crate::lex::lex(&doc.text())
+            .interpolations()
+            .iter()
+            .copied()
+            .filter(|span| span.is_inline_empty())
+            .filter_map(|span| {
+                let end = span.end?;
+                debug_assert_eq!(span.start.line, end.line);
+                Some(carina_diagnostic(
+                    span.start.line,
+                    span.start.character,
+                    end.character,
+                    DiagnosticSeverity::WARNING,
+                    "empty interpolation `${}` — fill in the expression or remove it".to_string(),
+                ))
+            })
+            .collect()
     }
 
     /// Mirror `validate_depends_on` errors/warnings in the editor.
