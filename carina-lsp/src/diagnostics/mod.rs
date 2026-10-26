@@ -799,10 +799,21 @@ impl DiagnosticEngine {
                         } else {
                             authored_attr_value
                         };
-                        let typecheck_value = semantic_resource_attributes
-                            .as_ref()
-                            .and_then(|attributes| attributes.get(attr_name))
-                            .unwrap_or(attr_value);
+                        // Coalesce validation must inspect both authored
+                        // operands. A directory semantic view may already
+                        // have selected one branch, which would erase a
+                        // wrong-typed lazy default from diagnostics.
+                        let typecheck_value = if matches!(
+                            attr_value,
+                            Value::Deferred(DeferredValue::Coalesce { .. })
+                        ) {
+                            attr_value
+                        } else {
+                            semantic_resource_attributes
+                                .as_ref()
+                                .and_then(|attributes| attributes.get(attr_name))
+                                .unwrap_or(attr_value)
+                        };
                         // Resolve block_name to canonical attribute name
                         let canonical_name = bn_map
                             .get(attr_name)
@@ -957,6 +968,25 @@ impl DiagnosticEngine {
                                 // for canonical reference paths and inference
                                 // for computed Access values. Callers do not
                                 // classify binding kinds independently.
+                                (_, value @ Value::Deferred(DeferredValue::Coalesce { .. })) => {
+                                    let schema_view =
+                                        schema.schema_view_for(attr_schema.attr_type.clone());
+                                    schema_view
+                                        .validate(value)
+                                        .err()
+                                        .map(|error| error.with_attribute(attr_name).to_string())
+                                        .or_else(|| {
+                                            carina_core::validation::check_deferred_access_type(
+                                                value,
+                                                schema.type_in_schema(&attr_schema.attr_type),
+                                                &inference_bindings,
+                                                &self.schemas,
+                                                &binding_index,
+                                            )
+                                            .err()
+                                            .map(|error| error.to_string())
+                                        })
+                                }
                                 (
                                     _,
                                     value @ Value::Deferred(
@@ -1120,18 +1150,24 @@ impl DiagnosticEngine {
                                 }
                                 _ => None,
                             };
-
-                            if let Some(message) = type_error
-                                && let Some((line, col)) =
-                                    self.find_attribute_position(doc, attr_name, scope)
-                            {
-                                diagnostics.push(carina_diagnostic(
-                                    line,
-                                    col,
-                                    col + attr_name.len() as u32,
-                                    DiagnosticSeverity::WARNING,
-                                    message,
-                                ));
+                            if let Some(message) = type_error {
+                                // Multiple resources of the same type can
+                                // share an imprecise parser scope. Prefer it,
+                                // but fall back to the unique assignment in
+                                // the document instead of dropping a real
+                                // schema diagnostic.
+                                let position = self
+                                    .find_attribute_position(doc, attr_name, scope)
+                                    .or_else(|| self.find_attribute_position(doc, attr_name, None));
+                                if let Some((line, col)) = position {
+                                    diagnostics.push(carina_diagnostic(
+                                        line,
+                                        col,
+                                        col + attr_name.len() as u32,
+                                        DiagnosticSeverity::WARNING,
+                                        message,
+                                    ));
+                                }
                             }
 
                             // Struct field validation. The wrapper borrows
@@ -1201,7 +1237,6 @@ impl DiagnosticEngine {
                                     resource_attributes.get(attribute),
                                     Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
                                         | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
-                                        | Some(Value::Deferred(DeferredValue::Coalesce { .. }))
                                 )
                             {
                                 continue;

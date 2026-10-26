@@ -2992,13 +2992,8 @@ impl DiagnosticEngine {
             let attribute_name = path.attribute();
             let message = match binding_index.ref_type(path) {
                 RefType::UnknownAttribute(error)
-                    if matches!(
-                        usage,
-                        carina_core::resource::ResourceRefUsage::CoalesceValue
-                    ) && matches!(
-                        error,
-                        RefTypeError::UnknownAttribute { .. }
-                            | RefTypeError::UnknownUpstreamExport { .. }
+                    if carina_core::validation::suppress_coalesce_existence_error(
+                        &error, usage,
                     ) =>
                 {
                     return;

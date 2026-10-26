@@ -4914,6 +4914,21 @@ fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
                 .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
                 .map_err(|error| error_policy.mask_secret(error))
         }
+        (
+            Value::Deferred(DeferredValue::Coalesce { value, default }),
+            crate::schema::FitKind::Coalesce {
+                value: value_fit,
+                default: default_fit,
+            },
+        ) => {
+            let value = canonicalize_with_fit(*value, *value_fit, defs, purpose, error_policy)?;
+            let default =
+                canonicalize_with_fit(*default, *default_fit, defs, purpose, error_policy)?;
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(value),
+                default: Box::new(default),
+            }))
+        }
         (value, crate::schema::FitKind::Union { member, fit }) => {
             // The witness retains the declaration member as well as its
             // resolved child fit. Canonicalization needs only the child, but

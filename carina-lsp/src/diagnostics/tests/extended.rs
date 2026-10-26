@@ -6000,6 +6000,70 @@ for name in (orgs.accounts ?? orgs.account) {
     );
 }
 
+fn coalesce_resource_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn resource_attribute_coalesce_rejects_wrong_typed_default() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = producer.comment ?? 42
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            let message = diagnostic.message.to_ascii_lowercase();
+            message.contains("string") && message.contains("int")
+        }),
+        "the LSP must report a coalesce default that conflicts with the resource attribute schema: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn resource_attribute_typo_on_coalesce_lhs_is_still_flagged() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = producer.cmment ?? "d"
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("cmment")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        }),
+        "the LSP must not suppress schema-typed unknown attributes on a coalesce lhs: {diagnostics:#?}",
+    );
+}
+
 #[test]
 fn upstream_state_known_field_passes() {
     let (_tmp, base, name) = set_up_project_with_upstream(

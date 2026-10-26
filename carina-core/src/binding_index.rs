@@ -1344,14 +1344,23 @@ pub enum BindingCompleteness {
 /// Plan-derived knowledge about a managed resource's refreshed attributes.
 ///
 /// A successful refresh is a complete snapshot when the differ schedules no
-/// mutation. During an update, only the attributes named here are provisional:
-/// every other refreshed value (and absence) remains authoritative. Creates,
-/// replacements, and unavailable current rows use [`Self::Unavailable`].
+/// mutation. During an update, directly changed attributes are provisional;
+/// provider-populated attributes retain a present refreshed value but do not
+/// make a missing value definitive. Every other refreshed value and absence
+/// remains authoritative. Creates, replacements, and unavailable current rows
+/// use [`Self::Unavailable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedBindingStability {
     NoPlannedEffect,
     Updating {
-        non_definitive_attributes: HashSet<String>,
+        /// Attributes directly changed by the planned update. Their old
+        /// values and absence are both unknown until the update completes.
+        changed_attributes: HashSet<String>,
+        /// Provider-populated attributes which may be refreshed as a side
+        /// effect of the update. A value present in refreshed prior state is
+        /// still usable (matching ordinary reference resolution), while a
+        /// missing value is not definitive absence.
+        refreshable_attributes: HashSet<String>,
     },
     Unavailable,
 }
@@ -1366,9 +1375,13 @@ pub struct ResolvedBinding {
     /// desired/configured attributes; provider outputs merged from an old or
     /// in-flight snapshot are deliberately excluded.
     definitive_attributes: HashSet<String>,
-    /// Attributes whose old refreshed value, or absence from that refresh,
-    /// cannot be used while a planned update may change them.
-    non_definitive_attributes: HashSet<String>,
+    /// Attributes directly changed by a planned update. Neither their old
+    /// value nor their absence is usable before the update completes.
+    changed_attributes: HashSet<String>,
+    /// Provider-populated attributes which may be refreshed by a planned
+    /// update. Present prior-state values remain usable; only their absence
+    /// is unknown until refresh/apply completes.
+    refreshable_attributes: HashSet<String>,
 }
 
 /// Value-aware sibling of [`BindingIndex`]. See the module-level doc for
@@ -1501,7 +1514,8 @@ impl ResolvedBindings {
             };
             let mut merged: HashMap<String, Value> = resource.resolved_attributes();
             let definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
-            let mut non_definitive_attributes = HashSet::new();
+            let mut changed_attributes = HashSet::new();
+            let mut refreshable_attributes = HashSet::new();
             let mut completeness = BindingCompleteness::Incomplete;
             if let Some(current) = managed_current.get(&resource.id) {
                 match current.current() {
@@ -1514,8 +1528,12 @@ impl ResolvedBindings {
                         match managed_stability.get(&resource.id) {
                             None | Some(ManagedBindingStability::NoPlannedEffect) => {}
                             Some(ManagedBindingStability::Updating {
-                                non_definitive_attributes: attributes,
-                            }) => non_definitive_attributes.extend(attributes.iter().cloned()),
+                                changed_attributes: changed,
+                                refreshable_attributes: refreshable,
+                            }) => {
+                                changed_attributes.extend(changed.iter().cloned());
+                                refreshable_attributes.extend(refreshable.iter().cloned());
+                            }
                             Some(ManagedBindingStability::Unavailable) => {
                                 completeness = BindingCompleteness::Incomplete;
                             }
@@ -1536,7 +1554,8 @@ impl ResolvedBindings {
                     source: BindingValueSource::Local,
                     completeness,
                     definitive_attributes,
-                    non_definitive_attributes,
+                    changed_attributes,
+                    refreshable_attributes,
                 },
             );
         }
@@ -1549,7 +1568,8 @@ impl ResolvedBindings {
                     source: BindingValueSource::Upstream,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes: HashSet::new(),
-                    non_definitive_attributes: HashSet::new(),
+                    changed_attributes: HashSet::new(),
+                    refreshable_attributes: HashSet::new(),
                 },
             );
         }
@@ -1569,7 +1589,8 @@ impl ResolvedBindings {
             let snapshot = target_entry.attributes.clone();
             let completeness = target_entry.completeness;
             let definitive_attributes = target_entry.definitive_attributes.clone();
-            let non_definitive_attributes = target_entry.non_definitive_attributes.clone();
+            let changed_attributes = target_entry.changed_attributes.clone();
+            let refreshable_attributes = target_entry.refreshable_attributes.clone();
             self.by_name.insert(
                 spec.binding.as_str().to_string(),
                 ResolvedBinding {
@@ -1579,7 +1600,8 @@ impl ResolvedBindings {
                     },
                     completeness,
                     definitive_attributes,
-                    non_definitive_attributes,
+                    changed_attributes,
+                    refreshable_attributes,
                 },
             );
         }
@@ -1648,7 +1670,8 @@ impl ResolvedBindings {
                     source: BindingValueSource::Local,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes,
-                    non_definitive_attributes: HashSet::new(),
+                    changed_attributes: HashSet::new(),
+                    refreshable_attributes: HashSet::new(),
                 },
             );
         }
@@ -1735,7 +1758,8 @@ impl ResolvedBindings {
                     source: BindingValueSource::Local,
                     completeness,
                     definitive_attributes,
-                    non_definitive_attributes: HashSet::new(),
+                    changed_attributes: HashSet::new(),
+                    refreshable_attributes: HashSet::new(),
                 },
             );
         }
@@ -1753,18 +1777,31 @@ impl ResolvedBindings {
         self.by_name.get(name).map(|b| b.completeness)
     }
 
-    pub fn attribute_is_definitive(&self, name: &str, attribute: &str) -> bool {
+    /// Whether a present attribute value can be consumed before apply.
+    pub fn attribute_value_is_definitive(&self, name: &str, attribute: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
-            !binding.non_definitive_attributes.contains(attribute)
+            !binding.changed_attributes.contains(attribute)
                 && (binding.completeness == BindingCompleteness::Complete
                     || binding.definitive_attributes.contains(attribute))
         })
     }
 
+    /// Whether a missing attribute is definitive absence. Provider-populated
+    /// attributes may appear during an update, so their prior absence remains
+    /// unknown even though an already-present prior value is usable.
+    pub fn attribute_absence_is_definitive(&self, name: &str, attribute: &str) -> bool {
+        self.attribute_value_is_definitive(name, attribute)
+            && self
+                .by_name
+                .get(name)
+                .is_some_and(|binding| !binding.refreshable_attributes.contains(attribute))
+    }
+
     pub fn binding_is_fully_definitive(&self, name: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
             binding.completeness == BindingCompleteness::Complete
-                && binding.non_definitive_attributes.is_empty()
+                && binding.changed_attributes.is_empty()
+                && binding.refreshable_attributes.is_empty()
         })
     }
 
@@ -1789,7 +1826,8 @@ impl ResolvedBindings {
             };
             match stability.get(&resource.id) {
                 None | Some(ManagedBindingStability::NoPlannedEffect) => {
-                    binding.non_definitive_attributes.clear();
+                    binding.changed_attributes.clear();
+                    binding.refreshable_attributes.clear();
                     if managed_current.get(&resource.id).is_some_and(|current| {
                         matches!(current.current(), crate::resource::Current::Present(_))
                     }) {
@@ -1797,14 +1835,17 @@ impl ResolvedBindings {
                     }
                 }
                 Some(ManagedBindingStability::Updating {
-                    non_definitive_attributes,
+                    changed_attributes,
+                    refreshable_attributes,
                 }) => {
                     binding.completeness = BindingCompleteness::Complete;
-                    binding.non_definitive_attributes = non_definitive_attributes.clone();
+                    binding.changed_attributes = changed_attributes.clone();
+                    binding.refreshable_attributes = refreshable_attributes.clone();
                 }
                 Some(ManagedBindingStability::Unavailable) => {
                     binding.completeness = BindingCompleteness::Incomplete;
-                    binding.non_definitive_attributes.clear();
+                    binding.changed_attributes.clear();
+                    binding.refreshable_attributes.clear();
                 }
             }
         }
@@ -1814,7 +1855,8 @@ impl ResolvedBindings {
         let complete = value.root_bindings().iter().all(|name| {
             self.by_name.get(name).is_some_and(|binding| {
                 binding.completeness == BindingCompleteness::Complete
-                    && binding.non_definitive_attributes.is_empty()
+                    && binding.changed_attributes.is_empty()
+                    && binding.refreshable_attributes.is_empty()
             })
         });
         if complete {
@@ -1856,7 +1898,8 @@ impl ResolvedBindings {
                 source: BindingValueSource::Local,
                 completeness: BindingCompleteness::Complete,
                 definitive_attributes: HashSet::new(),
-                non_definitive_attributes: HashSet::new(),
+                changed_attributes: HashSet::new(),
+                refreshable_attributes: HashSet::new(),
             },
         );
     }
@@ -1897,7 +1940,8 @@ impl ResolvedBindings {
                 source,
                 completeness,
                 definitive_attributes,
-                non_definitive_attributes: HashSet::new(),
+                changed_attributes: HashSet::new(),
+                refreshable_attributes: HashSet::new(),
             },
         );
     }
@@ -1946,22 +1990,19 @@ pub fn managed_binding_stability_from_plan(
                 changed_attributes,
                 ..
             } if managed_ids.contains(&to.id) => {
-                let mut non_definitive_attributes: HashSet<String> =
-                    changed_attributes.iter().cloned().collect();
-                if let Some(schema) =
-                    schemas.get(&to.id.provider, &to.id.resource_type, SchemaKind::Resource)
-                {
-                    non_definitive_attributes.extend(
-                        schema
-                            .read_only_attributes()
-                            .into_iter()
-                            .map(str::to_string),
-                    );
-                }
+                let changed_attributes = changed_attributes.iter().cloned().collect();
+                let refreshable_attributes = schemas
+                    .get(&to.id.provider, &to.id.resource_type, SchemaKind::Resource)
+                    .map(|schema| schema.read_only_attributes())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
                 result.insert(
                     to.id.clone(),
                     ManagedBindingStability::Updating {
-                        non_definitive_attributes,
+                        changed_attributes,
+                        refreshable_attributes,
                     },
                 );
             }
@@ -2037,7 +2078,8 @@ impl<'a> IterableBindings<'a> {
                                 source: BindingValueSource::Upstream,
                                 completeness: BindingCompleteness::Complete,
                                 definitive_attributes: HashSet::new(),
-                                non_definitive_attributes: HashSet::new(),
+                                changed_attributes: HashSet::new(),
+                                refreshable_attributes: HashSet::new(),
                             },
                         )
                     })

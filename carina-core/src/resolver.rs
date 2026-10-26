@@ -469,14 +469,20 @@ fn resolve_ref_value_status_inner(
             let Some(attributes) = bindings.get(binding) else {
                 return Ok(ValueResolution::Unknown(value.clone()));
             };
-            let attribute_is_definitive =
-                bindings.attribute_is_definitive(binding, path.attribute());
-            if !attribute_is_definitive {
+            let value_is_definitive =
+                bindings.attribute_value_is_definitive(binding, path.attribute());
+            let absence_is_definitive =
+                bindings.attribute_absence_is_definitive(binding, path.attribute());
+            let Some(attribute) = attributes.get(path.attribute()) else {
+                return if absence_is_definitive {
+                    Ok(ValueResolution::Absent)
+                } else {
+                    Ok(ValueResolution::Unknown(value.clone()))
+                };
+            };
+            if !value_is_definitive {
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
-            let Some(attribute) = attributes.get(path.attribute()) else {
-                return Ok(ValueResolution::Absent);
-            };
 
             let mut resolved = resolve_ref_value_inner(attribute, bindings, config)?;
             if !resolved.is_fully_resolved() {
@@ -499,7 +505,7 @@ fn resolve_ref_value_status_inner(
                         ValuePathSegmentResult::Deferred(_)
                         | ValuePathSegmentResult::DeferredMiss(_),
                     ) => return Ok(ValueResolution::Unknown(value.clone())),
-                    Err(error) if missing_access(&error) && attribute_is_definitive => {
+                    Err(error) if missing_access(&error) && absence_is_definitive => {
                         return Ok(ValueResolution::Absent);
                     }
                     Err(error) if missing_access(&error) => {
@@ -962,9 +968,10 @@ mod tests {
         let stability = HashMap::from([(
             resource.id.clone(),
             crate::binding_index::ManagedBindingStability::Updating {
-                non_definitive_attributes: HashSet::from([
-                    "name".to_string(),
+                changed_attributes: HashSet::from(["name".to_string()]),
+                refreshable_attributes: HashSet::from([
                     "accounts".to_string(),
+                    "missing_output".to_string(),
                 ]),
             },
         )]);
@@ -997,7 +1004,22 @@ mod tests {
         );
         assert_eq!(
             resolve_ref_value_status(&provisional, &bindings),
-            Ok(ValueResolution::Unknown(provisional)),
+            Ok(ValueResolution::Present(Value::Concrete(
+                ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
+                    "old-account".into(),
+                ))]),
+            ))),
+            "a present provider-populated value remains usable during an unrelated update",
+        );
+
+        let missing_refreshable = coalesce(
+            Value::resource_ref("up", "missing_output", vec![]),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+        assert_eq!(
+            resolve_ref_value_status(&missing_refreshable, &bindings),
+            Ok(ValueResolution::Unknown(missing_refreshable)),
+            "a missing provider-populated value may still appear during refresh",
         );
 
         assert_eq!(

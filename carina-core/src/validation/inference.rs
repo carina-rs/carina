@@ -47,6 +47,10 @@ pub enum InferenceError {
     UnknownType { reason: String },
     /// Heterogeneous collection — inferred element types disagreed.
     HeterogeneousCollection { reason: String },
+    /// Both coalesce operands have statically known, incompatible types.
+    /// Unlike a genuinely unknown type this must not be swallowed by schema
+    /// validation, or the mismatch can survive until provider dispatch.
+    IncompatibleCoalesceTypes { left: String, default: String },
     /// `ResourceRef`'s binding doesn't appear in the binding map.
     UnknownBinding { binding: String },
     /// Binding is known but inference can't proceed through it —
@@ -100,6 +104,10 @@ impl std::fmt::Display for InferenceError {
         match self {
             InferenceError::UnknownType { reason } => write!(f, "{}", reason),
             InferenceError::HeterogeneousCollection { reason } => write!(f, "{}", reason),
+            InferenceError::IncompatibleCoalesceTypes { left, default } => write!(
+                f,
+                "coalesce default type `{default}` does not match left type `{left}`"
+            ),
             InferenceError::UnknownBinding { binding } => {
                 write!(f, "unknown binding `{}`", binding)
             }
@@ -421,10 +429,9 @@ pub(crate) fn infer_type_from_value_without_bindings(
             let left = infer_type_from_value_without_bindings(value)?;
             match infer_type_from_value_without_bindings(default) {
                 Ok(right) if right == left => Ok(left),
-                Ok(right) => Err(InferenceError::UnknownType {
-                    reason: format!(
-                        "coalesce default type `{right}` does not match left type `{left}`"
-                    ),
+                Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
+                    left: left.to_string(),
+                    default: right.to_string(),
                 }),
                 Err(InferenceError::UnknownType { .. })
                     if matches!(
@@ -558,10 +565,9 @@ fn infer_type_from_value_with_visiting(
             let left = infer_type_from_value_with_visiting(value, bindings, schemas, visiting)?;
             match infer_type_from_value_with_visiting(default, bindings, schemas, visiting) {
                 Ok(right) if right == left => Ok(left),
-                Ok(right) => Err(InferenceError::UnknownType {
-                    reason: format!(
-                        "coalesce default type `{right}` does not match left type `{left}`"
-                    ),
+                Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
+                    left: left.to_string(),
+                    default: right.to_string(),
                 }),
                 Err(InferenceError::UnknownType { .. })
                     if matches!(
@@ -1435,6 +1441,10 @@ mod tests {
 
         let error = infer_type_from_value(&value, &bindings, &SchemaRegistry::new())
             .expect_err("coalesce default must match the left type");
+        assert!(matches!(
+            &error,
+            InferenceError::IncompatibleCoalesceTypes { .. }
+        ));
         assert!(error.to_string().contains("does not match left type"));
     }
 

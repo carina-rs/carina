@@ -31,6 +31,16 @@ fn assert_success(output: &Output, operation: &str) {
     );
 }
 
+fn assert_failure(output: &Output, operation: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "carina {operation} unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    format!("{stdout}\n{stderr}")
+}
+
 fn write_common_files(dir: &Path) {
     fs::create_dir_all(dir).expect("create project directory");
     fs::write(
@@ -108,6 +118,32 @@ let producer = mock.test.resource {{
         ),
     )
     .expect("write managed coalesce configuration");
+}
+
+fn write_read_only_update_main(dir: &Path, update_producer: bool) {
+    let comment = if update_producer {
+        "\n  comment = \"refresh me\""
+    } else {
+        ""
+    };
+    fs::write(
+        dir.join("main.crn"),
+        format!(
+            r#"let producer = mock.test.resource {{
+  name = "seed"{comment}
+}}
+
+let consumer = mock.test.resource {{
+  name = producer.identifier ?? "d"
+}}
+
+exports {{
+  identifier: String = producer.identifier ?? "ed"
+}}
+"#,
+        ),
+    )
+    .expect("write read-only update configuration");
 }
 
 fn plan_json(dir: &Path) -> PlanFile {
@@ -249,5 +285,108 @@ fn unchanged_ref_authored_managed_producer_defaults_at_plan_and_apply() {
         settled.plan.effects().is_empty(),
         "the fallback consumer must have been applied without updating its unchanged producer: {:#?}",
         settled.plan.effects(),
+    );
+}
+
+#[test]
+fn present_read_only_attribute_stays_present_while_producer_updates() {
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    write_read_only_update_main(&project, false);
+
+    assert_success(&run_cli(&project, &["init", "."]), "init project");
+    assert_success(
+        &run_cli(&project, &["apply", "--auto-approve", "."]),
+        "apply read-only coalesce fixture",
+    );
+
+    write_read_only_update_main(&project, true);
+    let plan = plan_json(&project);
+    match plan.plan.effects() {
+        [Effect::Update { to, .. }] => assert_eq!(to.binding.as_deref(), Some("producer")),
+        effects => panic!(
+            "only the authored producer update is expected; the present read-only value must not change the consumer: {effects:#?}"
+        ),
+    }
+    let human_plan = run_cli(&project, &["plan", "."]);
+    assert_success(&human_plan, "plan read-only coalesce update");
+    let human_plan = String::from_utf8_lossy(&human_plan.stdout);
+    assert!(
+        !human_plan.contains("Exports:") && !human_plan.contains("export change(s)"),
+        "the present provider output must also keep the coalesced export stable:\n{human_plan}",
+    );
+
+    assert_success(
+        &run_cli(&project, &["apply", "--auto-approve", "."]),
+        "apply producer update",
+    );
+    let settled = plan_json(&project);
+    assert!(
+        settled.plan.effects().is_empty(),
+        "coalesced read-only references must settle to the same value as bare references: {:#?}",
+        settled.plan.effects(),
+    );
+}
+
+#[test]
+fn wrong_typed_coalesce_default_is_rejected_before_apply() {
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = producer.comment ?? 42
+}
+"#,
+    )
+    .expect("write wrong-typed coalesce fixture");
+
+    assert_success(&run_cli(&project, &["init", "."]), "init project");
+    for (operation, args) in [
+        ("validate wrong-typed coalesce", &["validate", "."][..]),
+        ("plan wrong-typed coalesce", &["plan", "."][..]),
+    ] {
+        let output = assert_failure(&run_cli(&project, args), operation);
+        let output = output.to_ascii_lowercase();
+        assert!(
+            output.contains("string") && output.contains("int"),
+            "{operation} must explain the coalesce type mismatch:\n{output}",
+        );
+    }
+}
+
+#[test]
+fn schema_attribute_typo_on_coalesce_lhs_is_rejected() {
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = producer.cmment ?? "d"
+}
+"#,
+    )
+    .expect("write schema typo coalesce fixture");
+
+    assert_success(&run_cli(&project, &["init", "."]), "init project");
+    let output = assert_failure(
+        &run_cli(&project, &["validate", "."]),
+        "validate schema typo coalesce",
+    );
+    assert!(
+        output.contains("cmment") && output.to_ascii_lowercase().contains("unknown attribute"),
+        "validation must retain schema-typed unknown-attribute errors:\n{output}",
     );
 }

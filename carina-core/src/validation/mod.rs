@@ -497,6 +497,13 @@ pub fn check_deferred_access_type(
         | Err(error @ inference::InferenceError::UnknownAttribute { .. }) => {
             return Err(DeferredAccessTypeError::InvalidAccess { error });
         }
+        Err(inference::InferenceError::IncompatibleCoalesceTypes { left, default }) => {
+            return Err(DeferredAccessTypeError::TypeMismatch {
+                expected: left,
+                actual: default,
+                origin: "from coalesce default".to_string(),
+            });
+        }
         // Dynamic result types and unavailable authorities cannot be checked
         // soundly at this phase. Spell every inference variant out so adding a
         // new failure reason forces an explicit checked/unchecked decision.
@@ -566,14 +573,21 @@ enum UnknownReferencePolicy {
     Defer,
 }
 
-fn suppress_coalesce_existence_error(
+/// Whether a missing reference is the optional, absence-selecting operand of
+/// `??`. Schema-backed resources are closed shapes: an unknown attribute is a
+/// typo, not absence. Upstream exports and composition attribute containers
+/// are open shapes whose missing keys may legitimately select the default.
+pub fn suppress_coalesce_existence_error(
     error: &RefTypeError,
     usage: crate::resource::ResourceRefUsage,
 ) -> bool {
     matches!(usage, crate::resource::ResourceRefUsage::CoalesceValue)
         && matches!(
             error,
-            RefTypeError::UnknownAttribute { .. } | RefTypeError::UnknownUpstreamExport { .. }
+            RefTypeError::UnknownAttribute {
+                target: crate::binding_index::RefTargetKind::Composition,
+                ..
+            } | RefTypeError::UnknownUpstreamExport { .. }
         )
 }
 

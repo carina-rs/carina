@@ -6,7 +6,7 @@
 mod comparison;
 mod plan;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Index;
 
 use crate::binding_index::ManagedBindingStability;
@@ -91,20 +91,18 @@ pub fn managed_binding_stability(
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
         }
-        let mut non_definitive_attributes: HashSet<String> =
-            changed_attributes.into_iter().collect();
-        if let Some(schema) = schema {
-            non_definitive_attributes.extend(
-                schema
-                    .read_only_attributes()
-                    .into_iter()
-                    .map(str::to_string),
-            );
-        }
+        let changed_attributes = changed_attributes.into_iter().collect();
+        let refreshable_attributes = schema
+            .map(ResourceSchema::read_only_attributes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         result.insert(
             resource.id.clone(),
             ManagedBindingStability::Updating {
-                non_definitive_attributes,
+                changed_attributes,
+                refreshable_attributes,
             },
         );
     }

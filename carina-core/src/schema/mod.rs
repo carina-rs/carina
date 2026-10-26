@@ -209,6 +209,27 @@ fn walk_custom_lookup_on_path<'a>(
         errors.extend(secret_errors.into_iter().map(TypeError::masked_for_secret));
         return;
     }
+    if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
+        walk_custom_lookup_on_path(
+            attr_type,
+            value,
+            attr_name,
+            lookup,
+            defs,
+            errors,
+            visited_refs,
+        );
+        walk_custom_lookup_on_path(
+            attr_type,
+            default,
+            attr_name,
+            lookup,
+            defs,
+            errors,
+            visited_refs,
+        );
+        return;
+    }
     // Skip deferred-resolution values — same convention as
     // `AttrTypeKind::validate`, plus `ResourceRef` / `Interpolation`
     // which only resolve to a concrete string at apply time.
@@ -2583,6 +2604,10 @@ impl AttributeType {
                 .validate_with_defs(inner, defs)
                 .map_err(TypeError::masked_for_secret);
         }
+        if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
+            self.validate_with_defs(value, defs)?;
+            return self.validate_with_defs(default, defs);
+        }
         if matches!(&self.kind, AttrTypeKind::Ref(_)) {
             let resolution = resolve_refs_on_path(self, defs, &mut Vec::new())
                 .map_err(RefResolutionFailure::into_validation_error)?;
@@ -3820,6 +3845,10 @@ pub(crate) enum FitKind<'a> {
     PassThrough,
     Deferred,
     Secret(Box<Fit<'a>>),
+    Coalesce {
+        value: Box<Fit<'a>>,
+        default: Box<Fit<'a>>,
+    },
     Enum {
         canonical: CanonicalEnumValue,
         rewrite: bool,
@@ -3846,6 +3875,7 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
         FitKind::PassThrough
         | FitKind::Deferred
         | FitKind::Secret(_)
+        | FitKind::Coalesce { .. }
         | FitKind::List(_)
         | FitKind::StringList(_)
         | FitKind::Map(_)
@@ -3936,6 +3966,21 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             exactness,
             attr,
             FitKind::Secret(Box::new(inner)),
+        ));
+    }
+
+    if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
+        let value_fit = fit_value_to_type(attr, value, defs, purpose)?;
+        let default_fit = fit_value_to_type(attr, default, defs, purpose)?;
+        let mut exactness = value_fit.exactness;
+        exactness.combine(default_fit.exactness);
+        return Some(Fit::with_kind(
+            exactness,
+            attr,
+            FitKind::Coalesce {
+                value: Box::new(value_fit),
+                default: Box::new(default_fit),
+            },
         ));
     }
 
