@@ -2814,45 +2814,7 @@ fn redact_plaintext_using_persisted_state(
 /// preserves the plaintext for execution while ensuring formatters render
 /// every path marked secret by the desired value as `(secret)`.
 pub fn mask_plaintext_using_secret_shape(plaintext: &Value, shape: &Value) -> Value {
-    if matches!(
-        shape,
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
-    ) {
-        return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone())));
-    }
-    match (plaintext, shape) {
-        (
-            Value::Concrete(ConcreteValue::Map(values)),
-            Value::Concrete(ConcreteValue::Map(shapes)),
-        ) => Value::Concrete(ConcreteValue::Map(
-            values
-                .iter()
-                .map(|(key, value)| {
-                    let masked = shapes.get(key).map_or_else(
-                        || value.clone(),
-                        |shape| mask_plaintext_using_secret_shape(value, shape),
-                    );
-                    (key.clone(), masked)
-                })
-                .collect(),
-        )),
-        (
-            Value::Concrete(ConcreteValue::List(values)),
-            Value::Concrete(ConcreteValue::List(shapes)),
-        ) => Value::Concrete(ConcreteValue::List(
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    shapes.get(index).map_or_else(
-                        || value.clone(),
-                        |shape| mask_plaintext_using_secret_shape(value, shape),
-                    )
-                })
-                .collect(),
-        )),
-        _ => plaintext.clone(),
-    }
+    project_secret_shape(plaintext, shape, SecretShapeProjectionMode::Display)
 }
 
 fn rebuild_projected_string_list(values: Vec<Value>) -> Value {
@@ -2869,32 +2831,63 @@ fn rebuild_projected_string_list(values: Vec<Value>) -> Value {
     )
 }
 
-/// Apply a secret shape to provider plaintext, conservatively promoting the
-/// whole value when the shape contains sensitivity that cannot be projected
-/// structurally.
-///
-/// Apply-time bindings and state writeback use this stricter variant. A
-/// deferred expression such as an interpolation or coalesce can contain a
-/// secret without exposing the selected value's final structure; retaining
-/// plaintext in that case would turn a lost shape into a state-file leak.
-pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &Value) -> Value {
-    if matches!(
-        plaintext,
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
-    ) {
-        return plaintext.clone();
-    }
-    if matches!(
-        shape,
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
-    ) {
-        return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone())));
-    }
-    if !contains_secret(shape) {
-        return plaintext.clone();
+#[derive(Clone, Copy)]
+enum SecretShapeProjectionMode {
+    Display,
+    FailClosed,
+    ResolvedUnion,
+}
+
+impl SecretShapeProjectionMode {
+    fn preserves_secret_value(self) -> bool {
+        matches!(self, Self::FailClosed | Self::ResolvedUnion)
     }
 
-    match (plaintext, shape) {
+    fn deferred_shape(self, value: &Value, shape: &Value) -> Value {
+        if matches!(
+            shape,
+            Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+        ) {
+            return Value::Deferred(DeferredValue::Secret(Box::new(value.clone())));
+        }
+
+        match self {
+            Self::Display => value.clone(),
+            Self::FailClosed => mark_secret(value),
+            Self::ResolvedUnion if matches!(value, Value::Concrete(_)) => value.clone(),
+            Self::ResolvedUnion => mark_secret(value),
+        }
+    }
+
+    fn unprojectable(self, value: &Value) -> Value {
+        match self {
+            Self::Display => value.clone(),
+            Self::FailClosed | Self::ResolvedUnion => mark_secret(value),
+        }
+    }
+}
+
+fn mark_secret(value: &Value) -> Value {
+    Value::Deferred(DeferredValue::Secret(Box::new(value.clone())))
+}
+
+fn project_secret_shape(value: &Value, shape: &Value, mode: SecretShapeProjectionMode) -> Value {
+    if mode.preserves_secret_value()
+        && matches!(
+            value,
+            Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+        )
+    {
+        return value.clone();
+    }
+    if !contains_secret(shape) {
+        return value.clone();
+    }
+    if matches!(shape, Value::Deferred(_)) {
+        return mode.deferred_shape(value, shape);
+    }
+
+    match (value, shape) {
         (
             Value::Concrete(ConcreteValue::Map(values)),
             Value::Concrete(ConcreteValue::Map(shapes)),
@@ -2902,11 +2895,11 @@ pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &
             values
                 .iter()
                 .map(|(key, value)| {
-                    let masked = shapes.get(key).map_or_else(
+                    let projected = shapes.get(key).map_or_else(
                         || value.clone(),
-                        |shape| mask_plaintext_using_secret_shape_fail_closed(value, shape),
+                        |shape| project_secret_shape(value, shape, mode),
                     );
-                    (key.clone(), masked)
+                    (key.clone(), projected)
                 })
                 .collect(),
         )),
@@ -2920,7 +2913,7 @@ pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &
                 .map(|(index, value)| {
                     shapes.get(index).map_or_else(
                         || value.clone(),
-                        |shape| mask_plaintext_using_secret_shape_fail_closed(value, shape),
+                        |shape| project_secret_shape(value, shape, mode),
                     )
                 })
                 .collect(),
@@ -2935,13 +2928,20 @@ pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &
                 .map(|(index, value)| {
                     let value = Value::Concrete(ConcreteValue::String(value.clone()));
                     shapes.get(index).map_or(value.clone(), |shape| {
-                        mask_plaintext_using_secret_shape_fail_closed(&value, shape)
+                        project_secret_shape(&value, shape, mode)
                     })
                 })
                 .collect(),
         ),
-        _ => Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()))),
+        _ => mode.unprojectable(value),
     }
+}
+
+/// Apply a secret shape to provider plaintext, marking only the exact value
+/// whose secret-bearing shape cannot be projected structurally. Containers
+/// and their other children retain their independently projected shapes.
+pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &Value) -> Value {
+    project_secret_shape(plaintext, shape, SecretShapeProjectionMode::FailClosed)
 }
 
 /// Combine the secret shape selected during apply with secret markers from
@@ -2952,71 +2952,7 @@ pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &
 /// recursively so an unprojectable child fails closed at that child without
 /// tainting its container or siblings.
 pub fn union_secret_shapes_after_resolution(applied: &Value, authored: &Value) -> Value {
-    if matches!(
-        applied,
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
-    ) {
-        return applied.clone();
-    }
-    if matches!(
-        authored,
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
-    ) {
-        return mask_plaintext_using_secret_shape_fail_closed(applied, authored);
-    }
-    if !contains_secret(authored) {
-        return applied.clone();
-    }
-
-    match (applied, authored) {
-        (
-            Value::Concrete(ConcreteValue::Map(values)),
-            Value::Concrete(ConcreteValue::Map(shapes)),
-        ) => Value::Concrete(ConcreteValue::Map(
-            values
-                .iter()
-                .map(|(key, value)| {
-                    let protected = shapes.get(key).map_or_else(
-                        || value.clone(),
-                        |shape| union_secret_shapes_after_resolution(value, shape),
-                    );
-                    (key.clone(), protected)
-                })
-                .collect(),
-        )),
-        (
-            Value::Concrete(ConcreteValue::List(values)),
-            Value::Concrete(ConcreteValue::List(shapes)),
-        ) => Value::Concrete(ConcreteValue::List(
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    shapes.get(index).map_or_else(
-                        || value.clone(),
-                        |shape| union_secret_shapes_after_resolution(value, shape),
-                    )
-                })
-                .collect(),
-        )),
-        (
-            Value::Concrete(ConcreteValue::StringList(values)),
-            Value::Concrete(ConcreteValue::List(shapes)),
-        ) => rebuild_projected_string_list(
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    let value = Value::Concrete(ConcreteValue::String(value.clone()));
-                    shapes.get(index).map_or(value.clone(), |shape| {
-                        union_secret_shapes_after_resolution(&value, shape)
-                    })
-                })
-                .collect(),
-        ),
-        (Value::Concrete(_), Value::Deferred(_)) => applied.clone(),
-        _ => mask_plaintext_using_secret_shape_fail_closed(applied, authored),
-    }
+    project_secret_shape(applied, authored, SecretShapeProjectionMode::ResolvedUnion)
 }
 
 /// Apply persisted secret sensitivity to provider plaintext.
@@ -9668,6 +9604,30 @@ mod tests {
             mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
             Value::Deferred(DeferredValue::Secret(Box::new(plaintext))),
             "an unresolved non-structural shape containing a secret must never leave provider plaintext unwrapped",
+        );
+    }
+
+    #[test]
+    fn display_mask_projects_secrets_into_a_string_list() {
+        let plaintext = Value::Concrete(ConcreteValue::StringList(vec![
+            "public".into(),
+            "sensitive".into(),
+        ]));
+        let shape = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("public".into())),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("sensitive".into()),
+            )))),
+        ]));
+
+        assert_eq!(
+            mask_plaintext_using_secret_shape(&plaintext, &shape),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("public".into())),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("sensitive".into()),
+                )))),
+            ])),
         );
     }
 

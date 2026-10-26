@@ -2357,13 +2357,10 @@ impl RefreshableResourceState<'_> {
 }
 
 /// Rebuild the desired resource used by state encoding from the apply-time
-/// values while retaining every secret marker visible in the authored plan.
-///
-/// The apply-time witness normally has the more precise selected shape (for
-/// example a reference that resolved to a secret). The authored value remains
-/// an independent fail-closed authority for explicit secrets hidden inside a
-/// deferred function, interpolation, or coalesce. Combining them here means a
-/// defect on either side cannot downgrade the other side to plaintext.
+/// resolved shape. That shape is authoritative for deferred authored nodes,
+/// while explicit authored `Secret` markers at concrete positions are unioned
+/// into it. If neither shape can be projected, only that unprojectable child
+/// fails closed; its container and siblings retain their own shapes.
 fn resource_with_secret_shape_union(
     resource: &ResolvedResource,
     applied: &SecretPreservingAttributes,
