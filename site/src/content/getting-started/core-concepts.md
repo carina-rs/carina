@@ -40,7 +40,7 @@ Configure a provider in your `.crn` file. `source` and `version` tell `carina in
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
@@ -50,13 +50,13 @@ Multiple providers can be used in the same configuration:
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
 
 provider aws {
-  source  = 'github.com/carina-rs/carina-provider-aws'
+  source  = 'carina-rs/aws'
   version = '0.7.1'
   region  = aws.Region.ap_northeast_1
 }
@@ -82,7 +82,7 @@ Carina uses `.crn` files with a purpose-built DSL. Key constructs:
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }

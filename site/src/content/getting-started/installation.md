@@ -51,7 +51,7 @@ Carina uses WASM-based provider plugins. Declare each provider's `source` and `v
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
@@ -61,16 +61,24 @@ provider awscc {
 carina init
 ```
 
-`carina init` downloads the plugin from the provider's GitHub Releases into `.carina/providers/` and records the resolved version and checksum in `carina-providers.lock`. Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing.
+`carina init` resolves the version through the provider registry (`registry.carina-rs.dev`), verifies the artifact's signature, installs the plugin into `.carina/providers/`, and records the resolved version and checksum in `carina-providers.lock`. Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing.
 
-Instead of `version`, `revision = 'main'` (a branch, tag, or commit SHA) installs the provider's CI build artifact for that commit. Resolving a revision calls the GitHub API, so it needs a token (`GITHUB_TOKEN`, or a logged-in `gh`).
+`source` takes one of three forms:
+
+| Form | Example | Resolved from |
+|------|---------|---------------|
+| Registry | `carina-rs/awscc`, or `host/namespace/name` for another registry | The provider registry (default host `registry.carina-rs.dev`) |
+| GitHub | `github.com/carina-rs/carina-provider-awscc` | The repository's GitHub Releases |
+| Local file | `file:///path/to/provider.wasm` | A locally built component |
+
+With a GitHub source, `revision = 'main'` (a branch, tag, or commit SHA) can be used instead of `version` to install the provider's CI build artifact for that commit. Resolving a revision calls the GitHub API, so it needs a token (`GITHUB_TOKEN`, or a logged-in `gh`).
 
 The two official providers are:
 
 | Provider | Source |
 |----------|--------|
-| AWSCC (Cloud Control API) | `github.com/carina-rs/carina-provider-awscc` |
-| AWS (native SDK) | `github.com/carina-rs/carina-provider-aws` |
+| AWSCC (Cloud Control API) | `carina-rs/awscc` (or `github.com/carina-rs/carina-provider-awscc`) |
+| AWS (native SDK) | `carina-rs/aws` (or `github.com/carina-rs/carina-provider-aws`) |
 
 ### Building from source (optional)
 

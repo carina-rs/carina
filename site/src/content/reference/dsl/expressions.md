@@ -199,6 +199,33 @@ let queue_name = (queue.arn |> split(':'))[5]
 
 Access on a value that is already known is evaluated immediately. Access whose base depends on a resource or upstream value is deferred until that value is available.
 
+## Coalesce Operator (`??`)
+
+`ref ?? default` uses the referenced value when it exists and `default` when it is absent. The left side must be a reference or access chain (`up.accounts`, `vpc.tags`); both sides are type-checked, so a default of the wrong type is rejected by `validate`.
+
+```crn
+let orgs = upstream_state {
+  source = '../organizations'
+}
+
+for account_id in (orgs.accounts ?? []) {
+  awscc.sso.Assignment {
+    target_id = account_id
+    # ...
+  }
+}
+```
+
+Which side is used is decided when the reference resolves, not when the file is parsed:
+
+| Left side | Result |
+|-----------|--------|
+| Exists (an upstream export, or a resource attribute that has a value) | The referenced value |
+| Absent (the loaded upstream state does not export it, or the attribute is unset) | `default` |
+| Not known yet (upstream state not available, or a value computed during apply) | Deferred; resolved at apply time |
+
+Without `??`, iterating over an export that the upstream state does not have is an error. `??` chains are right-associative: `a ?? b ?? c` is `a ?? (b ?? c)`.
+
 ## Pipe Operator (`|>`)
 
 The pipe operator passes the result of the left expression as the last argument to the function on the right. This enables readable left-to-right data transformations.

@@ -18,7 +18,7 @@ carina validate [PATH]
 2. **Resource types** -- Validates that resource types exist in the provider schema (e.g., `aws.s3.Bucket`).
 3. **Attribute types** -- Checks that attribute values match the expected types defined in the resource schema.
 4. **Module resolution** -- Resolves `import` statements and validates module arguments.
-5. **Unused bindings** -- Warns about `let` bindings that are never referenced. These can be replaced with anonymous resources.
+5. **Unused bindings** -- Warns about `let` bindings that are never referenced. These can be replaced with anonymous resources. A binding named as the `to` of an `import` or `moved` block counts as referenced, since those blocks match the resource by its binding.
 6. **Duplicate attributes** -- Warns when the same attribute key appears multiple times in a resource block. The last value wins, but this is likely unintentional.
 
 ## Output

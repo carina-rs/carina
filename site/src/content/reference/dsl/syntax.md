@@ -12,7 +12,7 @@ A `.crn` file contains zero or more top-level statements in any order:
 ```crn
 # Provider configuration
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
@@ -91,25 +91,25 @@ A configuration that declares resources must configure a provider for each provi
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
 ```
 
-`source` is required; `carina init` uses it to install the provider plugin. `version` (a version constraint) or `revision` (a git branch, tag, or commit) pins which build is installed. The two are mutually exclusive.
+`source` is required; `carina init` uses it to install the provider plugin. It is a registry address (`carina-rs/awscc`, or `host/namespace/name`), a GitHub repository (`github.com/owner/repo`), or a local `file://` path to a `.wasm` component. `source`, `version`, and `revision` must be string literals. `version` (a version constraint) or `revision` (a git branch, tag, or commit) pins which build is installed. The two are mutually exclusive.
 
 Multiple providers can be configured in the same directory:
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
 
 provider aws {
-  source  = 'github.com/carina-rs/carina-provider-aws'
+  source  = 'carina-rs/aws'
   version = '0.7.1'
   region  = aws.Region.ap_northeast_1
 }
@@ -121,7 +121,7 @@ A `provider <kind> { ... }` block declares the kind's *default instance* — the
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }

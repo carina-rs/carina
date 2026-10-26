@@ -36,8 +36,9 @@ moving from local state to a remote backend, or changing the
 Without this flag, a backend change is a warning, not a hard error:
 `carina init` still resolves provider plugins and exits successfully, but
 it leaves `carina-backend.lock` unchanged and points you at
-`--migrate-state`. This keeps PR-time `plan` visible across backend-key
-changes while preserving the safety rule: mutating commands refuse until
+`--migrate-state`. `plan` also warns and reads state from the old backend
+recorded in the lock, which keeps PR-time `plan` visible across
+backend-key changes. `apply`, `destroy`, and `state refresh` refuse until
 state migration is explicit.
 
 With the flag, `init` reads the state from the locked (old) backend,

@@ -39,10 +39,11 @@ let cidr = "${base_cidr}"         # => value of base_cidr
 let tag  = "${env}-${service}"    # => 'prod-web'
 ```
 
-Any expression can appear inside `${}`, including function calls:
+Any expression can appear inside `${}`, including function calls, with the same whitespace rules as anywhere else:
 
 ```crn
-let tag = "vpc-${upper(env)}"
+let tag  = "vpc-${upper(env)}"
+let name = "vpc-${join('-', ['prod', 'web'])}"   # => 'vpc-prod-web'
 ```
 
 #### Recommended Style

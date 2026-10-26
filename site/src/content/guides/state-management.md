@@ -71,7 +71,7 @@ backend s3 {
 }
 
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }

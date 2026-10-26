@@ -15,7 +15,7 @@ The simplest form iterates over a list of values:
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
+  source  = 'carina-rs/awscc'
   version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
