@@ -27,6 +27,13 @@ are not exposed by this command.
 
 Output the raw value without the export name or surrounding quotes. Requires a NAME. Useful for piping a single export into another command.
 
+### `--state-url <URL>`
+
+Read exports directly from a state URL without loading the current directory's
+configuration. Accepts `s3://bucket/key`, `file:///absolute/path`, or a bare
+local path. The state file's resource format may be newer than the running
+Carina as long as its exports encoding is supported.
+
 ## Examples
 
 Print every export:
@@ -51,4 +58,10 @@ Emit the full export map as JSON:
 
 ```bash
 carina export --json
+```
+
+Read exports from another state file:
+
+```bash
+carina export --json --state-url s3://my-state-bucket/path/carina.state.json
 ```

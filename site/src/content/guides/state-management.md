@@ -13,6 +13,22 @@ By default, state is stored locally as `carina.state.json`. For team usage, conf
 
 ### State format upgrades
 
+State format v17 adds a top-level `exports_version` that versions the exports
+encoding separately from the rest of the state file. Readers that only need
+exports (`upstream_state` and `carina export`) check `exports_version` instead
+of the state format version, so a later state format bump does not break a
+downstream project that runs an older Carina, as long as that Carina supports
+the exports encoding. `exports_version` changes only when the encoding of
+exported values changes.
+
+This protection starts with v17 itself. A Carina that predates v17 reads
+exports through the full state format check, so it rejects a v17 state with
+"State file version 17 is newer than supported version 16". Upgrade the projects that read an
+upstream state before applying the upstream project with v17.
+
+`carina state lookup` reads resources only. To read exports from another
+project's state, use `carina export --state-url <URL>`.
+
 State format v14 stores a redacted secret structurally as a single-key object:
 
 ```json

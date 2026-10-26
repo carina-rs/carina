@@ -280,6 +280,10 @@ mod tests {
             Ok(None)
         }
 
+        async fn read_state_bytes(&self) -> BackendResult<Option<carina_state::RawState>> {
+            Ok(None)
+        }
+
         async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             if self.lose_lock.load(Ordering::SeqCst) {

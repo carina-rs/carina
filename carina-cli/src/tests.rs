@@ -1669,6 +1669,11 @@ impl StateBackend for MockBackend {
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(Some(LoadedState::Pristine(StateFile::new())))
     }
+    async fn read_state_bytes(
+        &self,
+    ) -> carina_state::BackendResult<Option<carina_state::RawState>> {
+        carina_state::RawState::from_state(&StateFile::new(), "mock backend state").map(Some)
+    }
     async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
         if self.write_state_fails {
             Err(BackendError::Io("simulated write failure".to_string()))
@@ -1795,6 +1800,11 @@ impl LockTrackingBackend {
 impl StateBackend for LockTrackingBackend {
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(Some(LoadedState::Pristine(StateFile::new())))
+    }
+    async fn read_state_bytes(
+        &self,
+    ) -> carina_state::BackendResult<Option<carina_state::RawState>> {
+        carina_state::RawState::from_state(&StateFile::new(), "lock tracking test state").map(Some)
     }
     async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
         self.write_state_called.store(true, Ordering::SeqCst);
@@ -1935,6 +1945,14 @@ impl RefreshTestBackend {
 impl StateBackend for RefreshTestBackend {
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(self.initial_state.clone().map(LoadedState::Pristine))
+    }
+    async fn read_state_bytes(
+        &self,
+    ) -> carina_state::BackendResult<Option<carina_state::RawState>> {
+        self.initial_state
+            .as_ref()
+            .map(|state| carina_state::RawState::from_state(state, "refresh test state"))
+            .transpose()
     }
     async fn write_state(&self, state: &StateFile) -> carina_state::BackendResult<()> {
         *self.written_state.lock().unwrap() = Some(state.clone());
@@ -3181,6 +3199,11 @@ struct CapturingBackend {
 impl StateBackend for CapturingBackend {
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(Some(LoadedState::Pristine(StateFile::new())))
+    }
+    async fn read_state_bytes(
+        &self,
+    ) -> carina_state::BackendResult<Option<carina_state::RawState>> {
+        carina_state::RawState::from_state(&StateFile::new(), "capturing test state").map(Some)
     }
     async fn write_state(&self, state: &StateFile) -> carina_state::BackendResult<()> {
         *self.captured.lock().unwrap() = Some(state.clone());

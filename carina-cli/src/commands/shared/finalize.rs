@@ -393,6 +393,10 @@ mod tests {
             Ok(None)
         }
 
+        async fn read_state_bytes(&self) -> BackendResult<Option<carina_state::RawState>> {
+            Ok(None)
+        }
+
         async fn write_state(&self, _state: &StateFile) -> BackendResult<()> {
             panic!("normal state write must not serve cancellation cleanup")
         }

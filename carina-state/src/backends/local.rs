@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
 
-use crate::backend::{BackendError, BackendResult, StateBackend};
+use crate::backend::{BackendError, BackendResult, RawState, StateBackend};
 use crate::backend_config::LocalBackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
@@ -254,18 +254,14 @@ impl LocalBackend {
             ))),
         }
     }
-}
 
-#[async_trait]
-impl StateBackend for LocalBackend {
-    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
-        let content = match tokio::fs::read_to_string(&self.state_path).await {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
+    async fn read_state_file(&self) -> BackendResult<Option<(Vec<u8>, PathBuf)>> {
+        let bytes = match tokio::fs::read(&self.state_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
                 return Err(BackendError::Io(format!(
-                    "Failed to read state file: {}",
-                    err
+                    "Failed to read state file: {error}"
                 )));
             }
         };
@@ -274,7 +270,17 @@ impl StateBackend for LocalBackend {
             .state_path
             .canonicalize()
             .unwrap_or_else(|_| self.state_path.clone());
-        let outcome = state::check_and_migrate(&content)
+        Ok(Some((bytes, state_location)))
+    }
+}
+
+#[async_trait]
+impl StateBackend for LocalBackend {
+    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+        let Some((bytes, state_location)) = self.read_state_file().await? else {
+            return Ok(None);
+        };
+        let outcome = state::check_and_migrate_bytes(&bytes)
             .map_err(|error| error.with_state_location(state_location.display().to_string()))?;
         let (state, migration) = outcome.into_parts();
         if let Some(info) = migration {
@@ -287,6 +293,16 @@ impl StateBackend for LocalBackend {
         } else {
             Ok(Some(LoadedState::Pristine(state)))
         }
+    }
+
+    async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
+        let Some((bytes, state_location)) = self.read_state_file().await? else {
+            return Ok(None);
+        };
+        Ok(Some(RawState::new(
+            bytes,
+            state_location.display().to_string(),
+        )))
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {

@@ -4641,6 +4641,12 @@ impl StateBackend for BootstrapWriteFailureBackend {
         Ok(None)
     }
 
+    async fn read_state_bytes(
+        &self,
+    ) -> carina_state::BackendResult<Option<carina_state::RawState>> {
+        Ok(None)
+    }
+
     async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
         Err(carina_state::BackendError::Configuration(
             "seed write failed".to_string(),

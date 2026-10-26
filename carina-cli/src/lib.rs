@@ -116,6 +116,7 @@ pub(crate) fn fixture_resource_state_metadata(
     }
     let state = serde_json::json!({
         "version": carina_state::StateFile::CURRENT_VERSION,
+        "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
         "serial": 0,
         "lineage": "fixture-lineage",
         "carina_version": "test",

@@ -20,7 +20,7 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity,
 };
-use carina_state::{StateFile, check_and_migrate};
+use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::{collapse_errors, validate_and_resolve_errors_with_context};
 use crate::wiring::{
@@ -320,10 +320,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             base_dir.join(&us.source)
         };
         let state_path = dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
-        let bindings = std::fs::read_to_string(&state_path)
+        let bindings = std::fs::read(&state_path)
             .ok()
-            .and_then(|content| check_and_migrate(&content).ok())
-            .map(|migrated| migrated.state().build_remote_bindings())
+            .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
+            .map(|exports| exports.build_remote_bindings())
             .unwrap_or_default();
         remote_bindings.insert(us.binding.clone(), bindings);
     }

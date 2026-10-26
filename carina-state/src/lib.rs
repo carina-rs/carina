@@ -67,8 +67,8 @@ pub mod state;
 
 // Re-export main types for convenience
 pub use backend::{
-    BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE,
-    StateBackend,
+    BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE, RawState,
+    S3_BACKEND_TYPE, StateBackend, read_published_exports,
 };
 pub use backend_config::{
     BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors,
@@ -77,13 +77,13 @@ pub use backend_config::{
 pub use backend_lock::BackendLock;
 pub use backends::{
     LocalBackend, StateUrl, anchored_local_path, create_backend, create_remote_backend,
-    load_state_from_url, resolve_backend_for_read,
+    load_published_exports_from_url, load_state_from_url, resolve_backend_for_read,
 };
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, CurrentInstance, DeposedAttributes, DeposedInstance, DeposedKey, LoadedOrphans,
     LoadedState, MigratedStateFile, MigrationInfo, NameOverride, PreviousSecretHashAuthority,
-    ResourceState, ResourceStateEncodingError, RowBasis, StateFile, check_and_migrate,
-    check_and_migrate_bytes, log_state_migration_once, should_apply_override,
+    PublishedExports, ResourceState, ResourceStateEncodingError, RowBasis, StateFile,
+    check_and_migrate, check_and_migrate_bytes, log_state_migration_once, should_apply_override,
 };

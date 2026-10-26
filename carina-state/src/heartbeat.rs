@@ -390,6 +390,10 @@ mod tests {
             Ok(None)
         }
 
+        async fn read_state_bytes(&self) -> BackendResult<Option<crate::RawState>> {
+            Ok(None)
+        }
+
         async fn write_state(&self, _state: &StateFile) -> BackendResult<()> {
             Ok(())
         }
