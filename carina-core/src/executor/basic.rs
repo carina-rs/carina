@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::binding_index::ResolvedBindings;
+use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
@@ -23,7 +23,7 @@ use crate::resolver::resolve_ref_value;
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
-use crate::value::{SerializationContext, SerializationError, mask_plaintext_using_secret_shape};
+use crate::value::{SerializationContext, SerializationError};
 
 use super::{
     AcceptedRequest, Applied, ExecutionAccumulator, ExecutionCheckpointSink, ExecutionEvent,
@@ -43,14 +43,14 @@ pub(super) enum BasicEffectResult {
     Success {
         completed: CompletedEffect,
         resource_id: ResourceId,
-        resolved_attrs: Option<HashMap<String, Value>>,
+        resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<String>,
     },
     PartialSuccess {
         completed: CompletedEffect,
         resource_id: ResourceId,
         diagnostic: PartialReadDiagnostic,
-        resolved_attrs: Option<HashMap<String, Value>>,
+        resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<String>,
     },
     Failure {
@@ -59,7 +59,7 @@ pub(super) enum BasicEffectResult {
     ResumeSuccess {
         created: crate::provider::ObservedCreate,
         resource_id: ResourceId,
-        resolved_attrs: HashMap<String, Value>,
+        resolved_attrs: SecretPreservingAttributes,
         binding: Option<String>,
     },
     ClassifiedFailure {
@@ -150,7 +150,7 @@ pub(super) async fn refresh_pending_states(
 pub(super) async fn resolve_resource(
     input: Result<CheckInput<Resource>, String>,
     context: &ProviderPreparationContext<'_>,
-) -> Result<(ProviderReadyResource, HashMap<String, Value>), String> {
+) -> Result<(ProviderReadyResource, SecretPreservingAttributes), String> {
     let bindings = context.bindings();
     let input = input?;
     let checked = match input {
@@ -207,18 +207,9 @@ pub(super) async fn resolve_resource(
     let provider_ready = prepare_provider_ready_resource_after_resolution(checked, context)
         .await
         .map_err(|err| err.to_string())?;
-    let resolved_desired_attributes = provider_ready
-        .as_resource()
-        .attributes
-        .iter()
-        .map(|(key, plaintext)| {
-            let value = resolved_secret_shapes.get(key).map_or_else(
-                || plaintext.clone(),
-                |shape| mask_plaintext_using_secret_shape(plaintext, shape),
-            );
-            (key.clone(), value)
-        })
-        .collect();
+    let provider_values = provider_ready.as_resource().resolved_attributes();
+    let resolved_desired_attributes =
+        SecretPreservingAttributes::from_provider_values(&resolved_secret_shapes, &provider_values);
     Ok((provider_ready, resolved_desired_attributes))
 }
 
@@ -1037,7 +1028,7 @@ pub(super) async fn execute_basic_effect<'a>(
             }
             let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to);
             let accepted_request =
-                AcceptedRequest::from_update_request(&request, resolved_desired_attributes);
+                AcceptedRequest::from_update_request(&request, resolved_desired_attributes.clone());
             match provider.update(id, identifier, request).await {
                 Ok(outcome) => {
                     let diagnostic = match &outcome {
@@ -1062,7 +1053,7 @@ pub(super) async fn execute_basic_effect<'a>(
                             },
                             resource_id: id.clone(),
                             diagnostic,
-                            resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
+                            resolved_attrs: Some(resolved_desired_attributes),
                             binding: to.binding.clone(),
                         }
                     } else {
@@ -1078,7 +1069,7 @@ pub(super) async fn execute_basic_effect<'a>(
                                 request: accepted_request,
                             },
                             resource_id: id.clone(),
-                            resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
+                            resolved_attrs: Some(resolved_desired_attributes),
                             binding: to.binding.clone(),
                         }
                     }
@@ -1154,7 +1145,7 @@ mod process_basic_result_tests {
     use super::*;
     use crate::executor::ExecutionResult;
     use crate::provider::PartialReadDiagnostic;
-    use crate::resource::{State, Value};
+    use crate::resource::State;
     use std::collections::HashSet;
 
     fn empty_execution_result() -> ExecutionResult {
@@ -1220,7 +1211,7 @@ mod process_basic_result_tests {
                 },
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),
-                resolved_attrs: None::<HashMap<String, Value>>,
+                resolved_attrs: None::<SecretPreservingAttributes>,
                 binding: None,
             },
             &mut exec,

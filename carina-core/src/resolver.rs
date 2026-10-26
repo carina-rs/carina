@@ -791,7 +791,7 @@ fn resolve_ref_value_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binding_index::BindingCompleteness;
+    use crate::binding_index::{BindingCompleteness, SecretPreservingAttributes};
     use crate::resource::ResourceId;
     use std::collections::HashSet;
 
@@ -1194,7 +1194,9 @@ mod tests {
         let state =
             State::existing(resource.id.clone(), HashMap::new()).with_identifier("provider-id");
         let mut bindings = ResolvedBindings::default();
-        bindings.record_applied(Some("producer"), &HashMap::new(), &state);
+        let empty = HashMap::new();
+        let resolved = SecretPreservingAttributes::from_provider_values(&empty, &empty);
+        bindings.record_applied(Some("producer"), &resolved, &state);
         let default = Value::Concrete(ConcreteValue::String("fallback".into()));
         let expression = coalesce(
             Value::resource_ref("producer", "optional", vec![]),

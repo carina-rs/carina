@@ -18,6 +18,7 @@ use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
 };
 
+use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 use crate::resource::{
@@ -1953,7 +1954,7 @@ pub struct ObservedCreate {
     identifier: AppliedIdentifier,
     observation: Observation,
     sent: SentRecord,
-    resolved_desired_attributes: Option<HashMap<String, Value>>,
+    resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
 impl ObservedCreate {
@@ -1975,13 +1976,13 @@ impl ObservedCreate {
 
     pub(crate) fn with_resolved_desired_attributes(
         mut self,
-        attributes: HashMap<String, Value>,
+        attributes: SecretPreservingAttributes,
     ) -> Self {
         self.resolved_desired_attributes = Some(attributes);
         self
     }
 
-    pub fn resolved_desired_attributes(&self) -> Option<&HashMap<String, Value>> {
+    pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
         self.resolved_desired_attributes.as_ref()
     }
 

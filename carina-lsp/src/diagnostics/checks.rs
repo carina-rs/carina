@@ -517,6 +517,17 @@ fn find_for_iterable_binding_column(
     Some((start_col, end_col))
 }
 
+fn find_for_iterable_expression_column(text: &str, line_one_based: usize) -> Option<(u32, u32)> {
+    let line = text.lines().nth(line_one_based.saturating_sub(1))?;
+    let in_byte = line.find(" in ")?;
+    let after_in = &line[in_byte + 4..];
+    let trimmed = after_in.trim_start();
+    let expression = trimmed.strip_suffix('{').unwrap_or(trimmed).trim_end();
+    let start_byte = in_byte + 4 + (after_in.len() - trimmed.len());
+    let start_col = line[..start_byte].chars().count() as u32;
+    Some((start_col, start_col + expression.chars().count() as u32))
+}
+
 /// Binding names declared anywhere in the merged parse. Delegates to
 /// [`carina_core::binding_index::BindingNameSet`] so LSP diagnostics
 /// stay consistent with the CLI's
@@ -573,10 +584,11 @@ fn deferred_in_current_file(
     deferred: &carina_core::parser::DeferredForExpression,
     current_file_name: Option<&str>,
 ) -> bool {
-    let Some(current) = current_file_name else {
-        return false;
-    };
-    let Some(file) = deferred.file.as_deref() else {
+    source_file_is_current(deferred.file.as_deref(), current_file_name)
+}
+
+fn source_file_is_current(file: Option<&str>, current_file_name: Option<&str>) -> bool {
+    let (Some(file), Some(current)) = (file, current_file_name) else {
         return false;
     };
     std::path::Path::new(file)
@@ -1856,6 +1868,30 @@ impl DiagnosticEngine {
                     err.to_string(),
                 ));
             }
+        }
+        for type_error in
+            carina_core::validation::validate_deferred_for_iterable_types(merged, &self.schemas)
+        {
+            if !source_file_is_current(type_error.file.as_deref(), current_file_name) {
+                continue;
+            }
+            let line_zero_based = type_error.line.saturating_sub(1) as u32;
+            let (col, end_col) = find_for_iterable_expression_column(&text, type_error.line)
+                .unwrap_or_else(|| {
+                    let line_chars = text
+                        .lines()
+                        .nth(type_error.line.saturating_sub(1))
+                        .map(|line| line.chars().count() as u32)
+                        .unwrap_or(0);
+                    (0, line_chars)
+                });
+            diagnostics.push(carina_diagnostic(
+                line_zero_based,
+                col,
+                end_col,
+                DiagnosticSeverity::ERROR,
+                type_error.to_string(),
+            ));
         }
         diagnostics
     }

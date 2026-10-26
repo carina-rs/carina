@@ -37,7 +37,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::binding_index::ResolvedBindings;
+use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{
@@ -213,7 +213,7 @@ pub struct AcceptedRequest {
     /// Provider-ready desired attributes accepted for this operation. This is
     /// kept separate from the plan-time authored resource so state writeback
     /// masks secrets against the value shape actually sent to the provider.
-    resolved_desired_attributes: Option<HashMap<String, Value>>,
+    resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
 /// Read-only shape of the request accepted by the provider.
@@ -237,7 +237,7 @@ impl AcceptedRequest {
 
     fn from_update_request(
         request: &UpdateRequest,
-        resolved_desired_attributes: HashMap<String, Value>,
+        resolved_desired_attributes: SecretPreservingAttributes,
     ) -> Self {
         let mut sent = BTreeSet::new();
         let mut removed = BTreeSet::new();
@@ -259,7 +259,7 @@ impl AcceptedRequest {
 
     pub(crate) fn with_resolved_desired_attributes(
         mut self,
-        attributes: HashMap<String, Value>,
+        attributes: SecretPreservingAttributes,
     ) -> Self {
         self.resolved_desired_attributes = Some(attributes);
         self
@@ -289,7 +289,7 @@ impl AcceptedRequest {
         &self.kind
     }
 
-    pub fn resolved_desired_attributes(&self) -> Option<&HashMap<String, Value>> {
+    pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
         self.resolved_desired_attributes.as_ref()
     }
 }

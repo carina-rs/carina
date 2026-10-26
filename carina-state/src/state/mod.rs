@@ -1,5 +1,6 @@
 //! State file structures for persisting infrastructure state
 
+use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::deps::get_resource_dependencies;
 use carina_core::differ::Orphan;
 use carina_core::effect::MoveAuthority;
@@ -26,7 +27,8 @@ use carina_core::resource::{
 use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
-    merge_secrets_into_observation_json, merge_secrets_into_provider_json,
+    mask_plaintext_using_secret_shape_fail_closed, merge_secrets_into_observation_json,
+    merge_secrets_into_provider_json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -2354,6 +2356,35 @@ impl RefreshableResourceState<'_> {
     }
 }
 
+/// Rebuild the desired resource used by state encoding from the apply-time
+/// values while retaining every secret marker visible in the authored plan.
+///
+/// The apply-time witness normally has the more precise selected shape (for
+/// example a reference that resolved to a secret). The authored value remains
+/// an independent fail-closed authority for explicit secrets hidden inside a
+/// deferred function, interpolation, or coalesce. Combining them here means a
+/// defect on either side cannot downgrade the other side to plaintext.
+fn resource_with_secret_shape_union(
+    resource: &ResolvedResource,
+    applied: &SecretPreservingAttributes,
+) -> ResolvedResource {
+    let mut resolved = resource.as_inner().clone();
+    resolved.attributes = applied
+        .values()
+        .iter()
+        .map(|(key, value)| {
+            let protected = resource.attributes.get(key).map_or_else(
+                || value.clone(),
+                |authored_shape| {
+                    mask_plaintext_using_secret_shape_fail_closed(value, authored_shape)
+                },
+            );
+            (key.clone(), protected)
+        })
+        .collect();
+    ResolvedResource::new(resolved)
+}
+
 impl ResourceState {
     /// Borrow the typed current-instance payload.
     pub fn current(&self) -> &CurrentInstance {
@@ -2909,11 +2940,9 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let applied_desired = created.resolved_desired_attributes().map(|attributes| {
-            let mut resolved = resource.as_inner().clone();
-            resolved.attributes = attributes.clone().into_iter().collect();
-            ResolvedResource::new(resolved)
-        });
+        let applied_desired = created
+            .resolved_desired_attributes()
+            .map(|attributes| resource_with_secret_shape_union(resource, attributes));
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
@@ -3112,11 +3141,9 @@ impl ResourceState {
         // desired values that were actually accepted, or a secret selected by a
         // coalesce/function/interpolation can be persisted as provider plaintext.
         let applied_desired = match row_basis {
-            RowBasis::Applied(request) => request.resolved_desired_attributes().map(|attributes| {
-                let mut resolved = resource.as_inner().clone();
-                resolved.attributes = attributes.clone().into_iter().collect();
-                ResolvedResource::new(resolved)
-            }),
+            RowBasis::Applied(request) => request
+                .resolved_desired_attributes()
+                .map(|attributes| resource_with_secret_shape_union(resource, attributes)),
             RowBasis::Imported | RowBasis::Carried => None,
         };
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);

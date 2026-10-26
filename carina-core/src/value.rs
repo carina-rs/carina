@@ -2855,6 +2855,23 @@ pub fn mask_plaintext_using_secret_shape(plaintext: &Value, shape: &Value) -> Va
     }
 }
 
+/// Apply a secret shape to provider plaintext, conservatively promoting the
+/// whole value when the shape contains sensitivity that cannot be projected
+/// structurally.
+///
+/// Apply-time bindings and state writeback use this stricter variant. A
+/// deferred expression such as an interpolation or coalesce can contain a
+/// secret without exposing the selected value's final structure; retaining
+/// plaintext in that case would turn a lost shape into a state-file leak.
+pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &Value) -> Value {
+    let masked = mask_plaintext_using_secret_shape(plaintext, shape);
+    if contains_secret(shape) && !contains_secret(&masked) {
+        Value::Deferred(DeferredValue::Secret(Box::new(masked)))
+    } else {
+        masked
+    }
+}
+
 /// Apply persisted secret sensitivity to provider plaintext.
 ///
 /// This masks values for display and for pre-apply validation without copying
@@ -9488,6 +9505,23 @@ mod tests {
                     .contains("sensitive")
             );
         }
+    }
+
+    #[test]
+    fn fail_closed_mask_promotes_plaintext_for_non_structural_secret_shape() {
+        let plaintext = Value::Concrete(ConcreteValue::String("selected-secret".into()));
+        let shape = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("producer", "comment", vec![])),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback".into())),
+            )))),
+        });
+
+        assert_eq!(
+            mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
+            Value::Deferred(DeferredValue::Secret(Box::new(plaintext))),
+            "an unresolved non-structural shape containing a secret must never leave provider plaintext unwrapped",
+        );
     }
 
     #[test]

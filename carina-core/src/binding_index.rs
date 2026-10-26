@@ -1392,6 +1392,44 @@ pub struct ResolvedBinding {
     removed_sensitive_attributes: HashSet<String>,
 }
 
+/// Attribute values whose provider plaintext has been reconciled with the
+/// fully resolved desired secret shape.
+///
+/// The inner map is deliberately private. Executor binding updates accept
+/// this witness instead of an arbitrary `HashMap`, so provider-ready values
+/// (whose `Secret` wrappers have already been removed) cannot accidentally be
+/// installed as the source for downstream references.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecretPreservingAttributes {
+    attributes: HashMap<String, Value>,
+}
+
+impl SecretPreservingAttributes {
+    /// Combine resolved desired values with the provider-facing values made
+    /// from them. Desired-only keys are retained (notably write-only inputs),
+    /// while provider values win after inheriting every secret marker.
+    pub(crate) fn from_provider_values(
+        resolved_shapes: &HashMap<String, Value>,
+        provider_values: &HashMap<String, Value>,
+    ) -> Self {
+        let mut attributes = resolved_shapes.clone();
+        for (key, value) in provider_values {
+            let protected = resolved_shapes.get(key).map_or_else(
+                || value.clone(),
+                |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(value, shape),
+            );
+            attributes.insert(key.clone(), protected);
+        }
+        Self { attributes }
+    }
+
+    /// Read-only access for state writeback. Construction remains confined to
+    /// the secret-preserving resolution paths above.
+    pub fn values(&self) -> &HashMap<String, Value> {
+        &self.attributes
+    }
+}
+
 /// Value-aware sibling of [`BindingIndex`]. See the module-level doc for
 /// why this is a separate type.
 ///
@@ -1941,17 +1979,17 @@ impl ResolvedBindings {
     pub fn record_applied(
         &mut self,
         binding: Option<&str>,
-        resource_attrs: &HashMap<String, Value>,
+        resource_attrs: &SecretPreservingAttributes,
         state: &State,
     ) {
         let Some(name) = binding else {
             return;
         };
-        let mut merged = resource_attrs.clone();
+        let mut merged = resource_attrs.values().clone();
         for (k, v) in &state.attributes {
-            let value = resource_attrs.get(k).map_or_else(
+            let value = resource_attrs.values().get(k).map_or_else(
                 || v.clone(),
-                |shape| crate::value::mask_plaintext_using_secret_shape(v, shape),
+                |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(v, shape),
             );
             merged.insert(k.clone(), value);
         }
@@ -1967,6 +2005,24 @@ impl ResolvedBindings {
                 removed_sensitive_attributes: HashSet::new(),
             },
         );
+    }
+
+    /// Capture a successful wait read using the wait target's current binding
+    /// as the secret-shape authority. The caller resolves the wait alias to
+    /// its target before dispatch, then this lookup happens again at completion
+    /// so a just-created or just-updated target supplies the current shape.
+    pub(crate) fn secret_preserving_wait_snapshot(
+        &self,
+        target_binding: &str,
+        state: &State,
+    ) -> Result<SecretPreservingAttributes, String> {
+        let target = self.by_name.get(target_binding).ok_or_else(|| {
+            format!("wait target binding `{target_binding}` is unavailable after completion")
+        })?;
+        Ok(SecretPreservingAttributes::from_provider_values(
+            &target.attributes,
+            &state.attributes,
+        ))
     }
 
     /// Set a binding directly to the given attribute map and source.
@@ -2934,6 +2990,10 @@ mod resolved_bindings_tests {
     };
     use std::collections::BTreeSet;
 
+    fn secret_preserving(attributes: &HashMap<String, Value>) -> SecretPreservingAttributes {
+        SecretPreservingAttributes::from_provider_values(attributes, attributes)
+    }
+
     fn make_resource(
         name: &'static str,
         binding: Option<&str>,
@@ -3332,7 +3392,7 @@ mod resolved_bindings_tests {
             partial_read: None,
         };
 
-        resolved.record_applied(Some("vpc"), &resource_attrs, &state);
+        resolved.record_applied(Some("vpc"), &secret_preserving(&resource_attrs), &state);
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -3374,7 +3434,7 @@ mod resolved_bindings_tests {
             partial_read: None,
         };
 
-        resolved.record_applied(Some("secret"), &resource_attrs, &state);
+        resolved.record_applied(Some("secret"), &secret_preserving(&resource_attrs), &state);
 
         assert_eq!(
             resolved
@@ -3400,7 +3460,7 @@ mod resolved_bindings_tests {
             partial_read: None,
         };
 
-        resolved.record_applied(None, &attrs, &state);
+        resolved.record_applied(None, &secret_preserving(&attrs), &state);
         assert!(resolved.get("anon").is_none());
     }
 
@@ -3450,7 +3510,11 @@ mod resolved_bindings_tests {
 
             partial_read: None,
         };
-        child.record_applied(Some("subnet"), &HashMap::new(), &extra_state);
+        child.record_applied(
+            Some("subnet"),
+            &secret_preserving(&HashMap::new()),
+            &extra_state,
+        );
 
         assert!(child.get("subnet").is_some());
         assert!(

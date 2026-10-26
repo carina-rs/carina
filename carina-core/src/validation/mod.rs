@@ -12,7 +12,8 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath, TypeExpr,
+    ForBinding, ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath,
+    TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -1811,10 +1812,190 @@ fn validate_resource_ref_types_inner<E>(
         }
     }
 
+    all_errors.extend(
+        validate_deferred_for_iterable_types_with_bindings(parsed, registry, &inference_bindings)
+            .into_iter()
+            .map(|diagnostic| diagnostic.to_string()),
+    );
+
     if all_errors.is_empty() {
         Ok(())
     } else {
         Err(all_errors.join("\n"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredIterableKind {
+    List,
+    Map,
+}
+
+/// Static type failure for an iterable retained as a
+/// [`crate::parser::DeferredForExpression`].
+///
+/// The file/line identity lets the LSP reuse the exact CLI validator while
+/// anchoring only diagnostics owned by the current editor buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredForIterableTypeDiagnostic {
+    pub file: Option<String>,
+    pub line: usize,
+    pub expression: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for DeferredForIterableTypeDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "deferred-for iterable `{}` at line {}: {}",
+            self.expression, self.line, self.message
+        )
+    }
+}
+
+/// Validate every deferred `for` iterable against its binding pattern.
+///
+/// Coalesce operands are checked independently: even while the left remains
+/// unresolved, a statically known scalar fallback cannot be allowed to reach
+/// apply for a loop that requires a list or map.
+pub fn validate_deferred_for_iterable_types<E>(
+    parsed: &crate::parser::File<E>,
+    schemas: &SchemaRegistry,
+) -> Vec<DeferredForIterableTypeDiagnostic> {
+    let bindings = inference::bindings_from_parsed(parsed);
+    validate_deferred_for_iterable_types_with_bindings(parsed, schemas, &bindings)
+}
+
+fn validate_deferred_for_iterable_types_with_bindings<E>(
+    parsed: &crate::parser::File<E>,
+    schemas: &SchemaRegistry,
+    bindings: &inference::InferenceBindings,
+) -> Vec<DeferredForIterableTypeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for deferred in &parsed.deferred_for_expressions {
+        let expected = match &deferred.binding {
+            ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
+            ForBinding::Map(_, _) => DeferredIterableKind::Map,
+        };
+        validate_deferred_iterable_operand(
+            &deferred.iterable,
+            expected,
+            bindings,
+            schemas,
+            deferred,
+            &mut diagnostics,
+        );
+    }
+    diagnostics
+}
+
+impl std::fmt::Display for DeferredIterableKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::List => f.write_str("list"),
+            Self::Map => f.write_str("map"),
+        }
+    }
+}
+
+fn validate_deferred_iterable_operand(
+    value: &Value,
+    expected: DeferredIterableKind,
+    bindings: &inference::InferenceBindings,
+    schemas: &SchemaRegistry,
+    deferred: &crate::parser::DeferredForExpression,
+    diagnostics: &mut Vec<DeferredForIterableTypeDiagnostic>,
+) {
+    match value {
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            validate_deferred_iterable_operand(
+                value,
+                expected,
+                bindings,
+                schemas,
+                deferred,
+                diagnostics,
+            );
+            validate_deferred_iterable_operand(
+                default,
+                expected,
+                bindings,
+                schemas,
+                deferred,
+                diagnostics,
+            );
+            return;
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            validate_deferred_iterable_operand(
+                inner,
+                expected,
+                bindings,
+                schemas,
+                deferred,
+                diagnostics,
+            );
+            return;
+        }
+        _ => {}
+    }
+
+    let inferred = match value {
+        Value::Concrete(ConcreteValue::List(_)) => {
+            Some(TypeExpr::List(Box::new(TypeExpr::Unknown)))
+        }
+        Value::Concrete(ConcreteValue::Map(_)) => Some(TypeExpr::Map(Box::new(TypeExpr::Unknown))),
+        other => match inference::infer_type_from_value(other, bindings, schemas) {
+            Ok(inferred) => Some(inferred),
+            Err(inference::InferenceError::IncompatibleCoalesceTypes { left, default }) => {
+                diagnostics.push(deferred_iterable_diagnostic(
+                    deferred,
+                    format!("coalesce default type `{default}` does not match left type `{left}`"),
+                ));
+                None
+            }
+            Err(inference::InferenceError::HeterogeneousCollection { reason }) => {
+                diagnostics.push(deferred_iterable_diagnostic(deferred, reason));
+                None
+            }
+            Err(
+                inference::InferenceError::UnknownType { .. }
+                | inference::InferenceError::UnknownBinding { .. }
+                | inference::InferenceError::NonInferableBinding { .. }
+                | inference::InferenceError::UnknownAttribute { .. }
+                | inference::InferenceError::SchemaUnavailable { .. }
+                | inference::InferenceError::InvalidAccess { .. }
+                | inference::InferenceError::CyclicVirtualBinding { .. },
+            ) => None,
+        },
+    };
+
+    let Some(inferred) = inferred else {
+        return;
+    };
+    let matches = matches!(
+        (expected, &inferred),
+        (DeferredIterableKind::List, TypeExpr::List(_))
+            | (DeferredIterableKind::Map, TypeExpr::Map(_))
+    );
+    if !matches {
+        diagnostics.push(deferred_iterable_diagnostic(
+            deferred,
+            format!("expected {expected} iterable, got {inferred}"),
+        ));
+    }
+}
+
+fn deferred_iterable_diagnostic(
+    deferred: &crate::parser::DeferredForExpression,
+    message: String,
+) -> DeferredForIterableTypeDiagnostic {
+    DeferredForIterableTypeDiagnostic {
+        file: deferred.file.clone(),
+        line: deferred.line,
+        expression: crate::value::format_value(&deferred.iterable),
+        message,
     }
 }
 

@@ -6039,6 +6039,49 @@ let consumer = mock.test.resource {
 }
 
 #[test]
+fn for_iterable_coalesce_rejects_wrong_typed_default() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::map(AttributeType::string()),
+            )),
+    );
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+for key, value in (producer.tags ?? 5) {
+  mock.test.resource {
+    name = "${key}-${value}"
+  }
+}
+"#;
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+    let diagnostics = custom_engine(schemas).analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(fixture.path()),
+    );
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            let message = diagnostic.message.to_ascii_lowercase();
+            message.contains("map") && message.contains("int")
+        }),
+        "the LSP must reject a coalesce default incompatible with the for iterable: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn resource_attribute_typo_on_coalesce_lhs_is_still_flagged() {
     let source = r#"provider mock {}
 

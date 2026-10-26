@@ -601,6 +601,157 @@ let s = mock.test.resource {
     );
 }
 
+#[test]
+fn direct_reference_to_updated_secret_is_hashed_in_consumer_state() {
+    const SECRET: &str = "updated-reference-secret-must-not-leak-3961";
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+}
+"#,
+    )
+    .expect("write initial update-secret fixture");
+
+    assert_success(
+        &run_cli(&project, &["init", "."]),
+        "init update-secret fixture",
+    );
+    assert_success(
+        &run_cli_with_env(
+            &project,
+            &["apply", "--auto-approve", "."],
+            &[("SECRET_V", SECRET)],
+        ),
+        "apply initial update-secret fixture",
+    );
+
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+  comment = secret(env("SECRET_V"))
+}
+
+let s = mock.test.resource {
+  name = "consumer"
+  comment = r.comment
+}
+
+let interpolated = mock.test.resource {
+  name = "interpolated-consumer"
+  comment = "prefix-${r.comment}"
+}
+"#,
+    )
+    .expect("write updated secret reference fixture");
+    assert_success(
+        &run_cli_with_env(
+            &project,
+            &["apply", "--auto-approve", "."],
+            &[("SECRET_V", SECRET)],
+        ),
+        "apply updated secret reference fixture",
+    );
+
+    let state = fs::read_to_string(project.join("carina.state.json")).expect("read state");
+    assert!(
+        state.contains("\"$secret\""),
+        "updated and propagated secret values must be persisted as hashes:\n{state}",
+    );
+    assert!(
+        !state.contains(SECRET),
+        "an updated secret propagated through a reference or interpolation leaked into state:\n{state}",
+    );
+}
+
+#[test]
+fn wait_alias_reference_preserves_target_secret_shape_in_consumer_state() {
+    const SECRET: &str = "wait-alias-secret-must-not-leak-3961";
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+  comment = secret(env("SECRET_V"))
+}
+
+let ready = wait r {
+  until = r.name == "seed"
+  timeout = 1min
+}
+
+let s = mock.test.resource {
+  name = "consumer"
+  comment = ready.comment
+}
+"#,
+    )
+    .expect("write wait-alias secret fixture");
+
+    assert_success(
+        &run_cli(&project, &["init", "."]),
+        "init wait-alias secret fixture",
+    );
+    assert_success(
+        &run_cli_with_env(
+            &project,
+            &["apply", "--auto-approve", "."],
+            &[("SECRET_V", SECRET)],
+        ),
+        "apply wait-alias secret fixture",
+    );
+
+    let state = fs::read_to_string(project.join("carina.state.json")).expect("read state");
+    assert!(
+        state.contains("\"$secret\""),
+        "a secret propagated through a wait alias must be persisted as a hash:\n{state}",
+    );
+    assert!(
+        !state.contains(SECRET),
+        "a wait alias discarded its target's secret shape and leaked plaintext:\n{state}",
+    );
+}
+
+#[test]
+fn wrong_typed_coalesce_default_in_for_iterable_is_rejected_before_apply() {
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let producer = mock.test.resource {
+  name = "seed"
+}
+
+for key, value in (producer.tags ?? 5) {
+  mock.test.resource {
+    name = "${key}-${value}"
+  }
+}
+"#,
+    )
+    .expect("write wrong-typed iterable coalesce fixture");
+
+    assert_success(&run_cli(&project, &["init", "."]), "init iterable fixture");
+    for (operation, args) in [
+        ("validate wrong-typed iterable", &["validate", "."][..]),
+        ("plan wrong-typed iterable", &["plan", "."][..]),
+    ] {
+        let output = assert_failure(&run_cli(&project, args), operation);
+        let output = output.to_ascii_lowercase();
+        assert!(
+            output.contains("map") && output.contains("int"),
+            "{operation} must explain the iterable/default type mismatch:\n{output}",
+        );
+    }
+}
+
 fn write_coalesce_chain_fixture(dir: &Path, unparenthesized: bool) {
     let expressions = if unparenthesized {
         vec![
