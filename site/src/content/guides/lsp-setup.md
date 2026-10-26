@@ -28,19 +28,30 @@ cargo install --git https://github.com/carina-rs/carina.git carina-lsp
 
 Make sure the `carina-lsp` binary is in your `PATH`.
 
+### Provider schemas
+
+Resource types, attributes, and schema-based diagnostics come from the provider plugins installed in the configuration directory. The LSP loads the plugins that `carina init` installed under `.carina/providers/`; it does not download them itself. Run `carina init` in the directory first. Until then the LSP reports the missing provider as a diagnostic, and it picks the plugin up once it is installed, without restarting the editor.
+
 ## VS Code setup
 
-1. Install the **Carina** extension from the VS Code marketplace, or configure a generic LSP client extension (such as [vscode-languageclient](https://github.com/microsoft/vscode-languageserver-node)).
+The Carina extension is not published to the VS Code marketplace. Build it from the repository and install the `.vsix`:
 
-2. If using a generic LSP client, add to your VS Code `settings.json`:
+```bash
+make vscode-package
+code --install-extension editors/vscode/carina-0.1.0.vsix
+```
+
+Then reload the VS Code window and open a `.crn` file. The extension launches `carina-lsp` from your `PATH`. To use a binary elsewhere, set its path in `settings.json`:
 
 ```json
 {
-  "carina.lsp.path": "carina-lsp"
+  "carina.server.path": "/path/to/carina-lsp"
 }
 ```
 
-3. Open a `.crn` file. The LSP server starts automatically.
+The extension also provides syntax highlighting and turns on format-on-save for `.crn` files. Install it with `code --install-extension`, not by copying `editors/vscode/` into `~/.vscode/extensions/`: a copied directory lacks its npm dependencies and the language client silently fails to start.
+
+For TextMate, `editors/carina.tmbundle` provides the same syntax highlighting.
 
 ## Neovim setup
 
@@ -57,7 +68,7 @@ if not configs.carina then
     default_config = {
       cmd = { 'carina-lsp' },
       filetypes = { 'crn' },
-      root_dir = lspconfig.util.root_pattern('.git', 'main.crn'),
+      root_dir = lspconfig.util.root_pattern('carina-providers.lock', '.git'),
     },
   }
 end
@@ -81,7 +92,7 @@ vim.filetype.add({
 
 The LSP provides context-aware completions:
 
-- **Top-level keywords**: `provider`, `backend`, `let`, `let use`, `import`, `read`, `fn`, `arguments`, `attributes`, `exports`, `moved`, `removed`, `require`, `upstream_state`
+- **Top-level keywords**: `provider`, `backend`, `let`, `let use`, `import`, `read`, `fn`, `arguments`, `attributes`, `exports`, `moved`, `removed`, `require`, `upstream_state`, `wait`
 - **Resource types**: Type `awscc.` to see available services, then `awscc.ec2.` to see resource types
 - **Attributes**: Inside a resource block, get completions for all valid attributes
 - **Attribute values**: For enum-typed attributes, get valid value completions
@@ -97,7 +108,8 @@ The LSP reports errors and warnings as you type:
 - **Unknown resource types**: Using a resource type that does not exist in the provider schema
 - **Type validation**: Attribute values that do not match the expected type
 - **Missing required attributes**: Required attributes that are not set
-- **Module validation**: Errors in imported modules, missing module files
+- **Module validation**: Errors in imported modules, missing module directories
+- **Provider loading**: Providers that are not installed (run `carina init`) or fail to load
 
 ## Hover
 
@@ -142,7 +154,7 @@ carina fmt --diff
 
 If the LSP is not working:
 
-1. **Check the binary**: Run `carina-lsp --version` to verify it is installed
-2. **Check your PATH**: The LSP client must be able to find `carina-lsp`
-3. **Check logs**: Set the `RUST_LOG=debug` environment variable and check the LSP output in your editor's log panel
+1. **Check the binary**: Run `which carina-lsp` to verify it is installed and on your `PATH` (`carina-lsp` has no `--version` flag; run without arguments it waits for an LSP client on stdin)
+2. **Check providers**: Run `carina init` in the configuration directory so the LSP can load provider schemas
+3. **Check logs**: Set the `RUST_LOG=debug` environment variable and check the LSP output in your editor's log panel (in VS Code: **View → Output → Carina Language Server**)
 4. **File type**: Ensure your editor recognizes `.crn` files and routes them to the Carina LSP

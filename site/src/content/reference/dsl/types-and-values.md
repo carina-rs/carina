@@ -42,7 +42,7 @@ let tag  = "${env}-${service}"    # => 'prod-web'
 Any expression can appear inside `${}`, including function calls:
 
 ```crn
-let tag = "vpc-${join('-', ['prod', 'web'])}"
+let tag = "vpc-${upper(env)}"
 ```
 
 #### Recommended Style
@@ -70,6 +70,34 @@ Double-quoted strings support the following escape sequences:
 | `\$` | Literal dollar sign (prevents interpolation) |
 
 Single-quoted strings recognize only `\'` and `\\`.
+
+#### Heredocs
+
+Multi-line strings use heredoc syntax. The body runs until a line containing only the closing marker:
+
+```crn
+let policy = <<EOT
+{
+  "Version": "2012-10-17"
+}
+EOT
+```
+
+| Form | Interpolation | Indentation |
+|------|---------------|-------------|
+| `<<EOT` | `${...}` is expanded | kept as written |
+| `<<-EOT` | `${...}` is expanded | common leading whitespace is stripped |
+| `<<'EOT'` | literal | kept as written |
+| `<<-'EOT'` | literal | common leading whitespace is stripped |
+
+The marker can be any identifier; `EOT` is only a convention.
+
+```crn
+let user_data = <<-EOT
+  #!/bin/bash
+  echo "${env}"
+  EOT
+```
 
 ### Int
 
@@ -99,6 +127,24 @@ let enabled = true
 let public = false
 ```
 
+### Duration
+
+A duration is an integer followed by a unit, with no space in between:
+
+```crn
+let short = 30s
+let medium = 15min
+let long = 2h
+```
+
+| Unit | Accepted suffixes |
+|------|-------------------|
+| seconds | `s`, `sec`, `second`, `seconds` |
+| minutes | `m`, `min`, `minute`, `minutes` |
+| hours | `h`, `hr`, `hour`, `hours` |
+
+Durations are used for `timeout` in [`wait`](/reference/dsl/expressions/#wait-expression) and for `Duration`-typed arguments.
+
 ## Collection Types
 
 ### List
@@ -123,7 +169,7 @@ let mixed = [
 
 ### Map
 
-Key-value collections enclosed in curly braces. Keys are identifiers (unquoted), values are expressions:
+Key-value collections enclosed in curly braces. Keys are identifiers, or quoted strings for keys that contain characters such as `.`, `/`, or `:`. Values are expressions:
 
 ```crn
 let config = {
@@ -139,8 +185,9 @@ awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name        = 'main'
-    Environment = 'prod'
+    Name                     = 'main'
+    Environment              = 'prod'
+    'kubernetes.io/role/elb' = '1'
   }
 }
 ```
@@ -169,7 +216,7 @@ awscc.Region.ap_northeast_1
 aws.Region.us_east_1
 
 # Resource-level enums
-awscc.ec2.Vpc.InstanceTenancy.default
+aws.ec2.Vpc.InstanceTenancy.default
 ```
 
 Enum identifiers are used directly as attribute values without quotes:
@@ -180,9 +227,11 @@ provider awscc {
 }
 
 awscc.ec2.Vpc {
-  instance_tenancy = awscc.ec2.Vpc.InstanceTenancy.default
+  instance_tenancy = aws.ec2.Vpc.InstanceTenancy.default
 }
 ```
+
+Resource-level enums use the `aws.` namespace for both the `aws` and `awscc` providers. Where the attribute's type is known, the bare value (`instance_tenancy = default`) is also accepted.
 
 ## Resource References
 
@@ -277,7 +326,7 @@ let subnet_id = subnets[0].subnet_id
 
 ## Type Expressions
 
-Type expressions are used in `arguments` and `attributes` blocks in modules, and in function parameters.
+Type expressions are used in `arguments`, `attributes`, and `exports` blocks, and in function parameters and return types.
 
 ### Simple Types
 
@@ -287,10 +336,14 @@ arguments {
   count     : Int
   ratio     : Float
   enabled   : Bool
+  timeout   : Duration
   cidr_block: Ipv4Cidr
-  role_arn  : Arn
+  role_arn  : aws.Arn
+  vpc_id    : aws.ec2.Vpc.Id
 }
 ```
+
+Primitive type names are PascalCase (`String`, not `string`). Besides the primitives, built-in types such as `Ipv4Cidr`, `Ipv4Address`, `Ipv6Cidr`, and `Ipv6Address` are always available, and providers register their own dotted types (for example `aws.Arn` or `aws.ec2.Vpc.Id`). An unknown type name is an error.
 
 ### Generic Types
 
@@ -301,6 +354,28 @@ arguments {
   subnet_ids  : list(String)
   cidr_blocks : list(Ipv4Cidr)
   tags        : map(String)
+}
+```
+
+### String Literal Unions
+
+A union of string literals restricts a value to a closed set:
+
+```crn
+arguments {
+  environment: 'dev' | 'stg' | 'prod'
+}
+```
+
+Passing any other string is an error at the module call.
+
+### Struct Types
+
+`struct { ... }` describes a map with typed fields:
+
+```crn
+arguments {
+  network: struct { cidr: Ipv4Cidr, az: String }
 }
 ```
 

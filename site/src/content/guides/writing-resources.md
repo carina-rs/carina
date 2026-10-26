@@ -7,13 +7,17 @@ This guide walks you through defining infrastructure resources in Carina's `.crn
 
 ## Provider configuration
 
-Every `.crn` file that declares resources needs a provider block to specify which cloud provider and region to use:
+A configuration that declares resources needs a `provider` block for each provider it uses. The block says where to get the provider plugin (`source` and a `version` constraint) and configures it (here, the region):
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'github.com/carina-rs/carina-provider-awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 ```
+
+The provider block can live in any `.crn` file of the directory; all `.crn` files in a directory form one configuration. Run `carina init` once to download the plugin before `validate`, `plan`, or `apply`.
 
 ## Anonymous resources
 
@@ -110,7 +114,7 @@ awscc.ec2.SecurityGroup {
   group_description = 'Web server security group'
 
   security_group_ingress {
-    ip_protocol = 'tcp'
+    ip_protocol = tcp
     from_port   = 80
     to_port     = 80
     cidr_ip     = '0.0.0.0/0'
@@ -118,7 +122,7 @@ awscc.ec2.SecurityGroup {
   }
 
   security_group_ingress {
-    ip_protocol = 'tcp'
+    ip_protocol = tcp
     from_port   = 443
     to_port     = 443
     cidr_ip     = '0.0.0.0/0'
@@ -181,7 +185,9 @@ Here is a complete example that creates a VPC with a public subnet and a route t
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'github.com/carina-rs/carina-provider-awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2.Vpc {
@@ -214,4 +220,4 @@ awscc.ec2.RouteTable {
 }
 ```
 
-Run `carina plan` from the directory containing your `.crn` files to preview the changes, and `carina apply` to create the resources.
+Run `carina init` once in the directory containing your `.crn` files to install the provider, then `carina plan` to preview the changes and `carina apply` to create the resources.

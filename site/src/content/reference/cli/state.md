@@ -17,10 +17,10 @@ carina state <SUBCOMMAND> [OPTIONS]
 List all managed resources from the state file.
 
 ```bash
-carina state list [PATH]
+carina state list [OPTIONS] [PATH]
 ```
 
-Output shows provider, resource type, and binding name (or resource name) for each resource:
+Output shows provider, resource type, and binding (or resource identity when there is no binding) for each resource:
 
 ```
 aws.s3.Bucket my_bucket
@@ -28,7 +28,15 @@ aws.ec2.Vpc main_vpc
 aws.ec2.Subnet public_subnet
 ```
 
+Rows whose state is not a plain applied resource carry a marker: `(no current instance)`, `(missing provider identifier)`, `(create in flight since <time>)`, or `(deposed <key> <identifier>)` for a pre-replacement instance pending delete.
+
 Prints "No resources in state." if the state is empty.
+
+#### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--state-url <URL>` | Read state directly from a URL (`s3://bucket/key`, `file://path`, or a bare local path), bypassing `.crn` / backend resolution. Mutually exclusive with PATH |
 
 ### `show`
 
@@ -53,11 +61,12 @@ restores user map keys exactly as authored, including keys that start with
 
 | Flag | Description |
 |------|-------------|
+| `--state-url <URL>` | Read state directly from a URL, bypassing `.crn` / backend resolution. Mutually exclusive with PATH |
 | `--tui` | Display state in interactive TUI mode |
 | `--json` | Output the raw state-file JSON |
 
 `state show --json` is a state-file inspection command, so its output retains
-the version 14 persisted encoding. Canonical enums use a `$enum` host payload,
+the persisted state-file encoding. Canonical enums use a `$enum` host payload,
 redacted secrets use a `$secret` host payload, and each user map key beginning
 with `$` has one additional leading `$` (for example, `$secret` is stored as
 `$$secret`). This differs intentionally from the decoded output of
@@ -75,7 +84,7 @@ carina state lookup [OPTIONS] <QUERY> [PATH]
 - `<binding_or_name>` -- returns all attributes as a JSON object
 - `<binding_or_name>.<attribute>` -- returns a single attribute value
 
-The lookup searches by binding name first, then falls back to resource name.
+The query is matched against resource bindings and resource identities, picking the longest one that is a prefix of the query, so a module-prefixed binding such as `r.distribution` resolves `r.distribution.id`. On a tie, a binding wins over an identity.
 
 ```bash
 # Get all attributes of a resource
@@ -97,7 +106,10 @@ secret remains distinguishable from a user map whose key is `$secret`.
 
 | Flag | Description |
 |------|-------------|
+| `--state-url <URL>` | Read state directly from a URL, bypassing `.crn` / backend resolution. Mutually exclusive with PATH |
 | `--json` | Always output as JSON |
+
+`state lookup` reads resources only; to read values from an `exports` block, use [`carina export`](/reference/cli/export/).
 
 Shell completions are supported for both resource names and attribute names.
 
@@ -149,9 +161,11 @@ Carina stores state in `carina.state.json` (local backend) or in an S3 bucket (r
 
 - **lineage** -- unique identifier for the state, used for drift detection
 - **serial** -- incrementing version number
-- **resources** -- list of managed resources with their provider, type, name, binding, attributes, and dependency bindings
+- **resources** -- list of managed resources with their provider, type, identity, binding, attributes, and dependency bindings
+- **exports** -- values published by the `exports` block
+- **exports_version** -- version of the exports encoding, independent of the state format version, so older Carina versions can still read exports from a newer state file
 
-State format version 14 reserves single-`$` object keys for host payloads.
+Since state format version 14, Carina reserves single-`$` object keys for host payloads.
 Canonical enums are stored as `$enum` payloads and redacted secrets as
 `$secret` payloads, while user keys beginning with `$` are escaped by adding
 one leading `$`. Carina decodes that representation when values are shown

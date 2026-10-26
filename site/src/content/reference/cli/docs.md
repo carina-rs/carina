@@ -49,7 +49,7 @@ Documents are organized by category:
 | Getting Started | `getting-started/installation`, `getting-started/quick-start`, `getting-started/core-concepts` |
 | Guides | `guides/writing-resources`, `guides/using-modules`, `guides/state-management`, `guides/functions`, `guides/for-if-expressions`, `guides/lsp-setup` |
 | DSL Reference | `reference/dsl/syntax`, `reference/dsl/types-and-values`, `reference/dsl/expressions`, `reference/dsl/modules`, `reference/dsl/built-in-functions` |
-| CLI Reference | `reference/cli/validate`, `reference/cli/plan`, `reference/cli/apply`, `reference/cli/state`, `reference/cli/module-info`, `reference/cli/docs` |
+| CLI Reference | `reference/cli/validate`, `reference/cli/plan`, `reference/cli/apply`, `reference/cli/state`, `reference/cli/module`, `reference/cli/docs`, `reference/cli/skills` |
 
 ## Examples
 

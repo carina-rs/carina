@@ -62,8 +62,8 @@ no-op).
 When migrating, overwrite a target backend that already contains a
 *different* state (different lineage, or any resources). Without
 `--force`, a populated target aborts the migration loudly so a
-mistargeted backend cannot silently clobber live state. Has no effect
-without `--migrate-state`.
+mistargeted backend cannot silently clobber live state. Requires
+`--migrate-state`; passing `--force` alone is a usage error.
 
 ## Examples
 

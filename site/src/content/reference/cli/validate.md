@@ -97,7 +97,7 @@ When warnings are present, they are included in the output:
   "resources": ["aws.s3.Bucket.my-bucket", "aws.ec2.Vpc.main"],
   "warnings": [
     {"type": "unused_binding", "message": "Unused let binding 'temp'"},
-    {"type": "duplicate_attribute", "message": "Duplicate attribute 'tags' at line 12", "file": "main.crn"}
+    {"type": "duplicate_attribute", "message": "Duplicate attribute 'tags' at line 12 (first defined on line 8). The last value will be used.", "file": "main.crn"}
   ]
 }
 ```
