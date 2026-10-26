@@ -207,9 +207,13 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
 /// Update `sent` contains exactly the attributes for which the accepted patch
 /// carried a value. Removals stay separate so writeback can drop a previously
 /// persisted write-only value without treating the absent desired value as sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AcceptedRequest {
     kind: AcceptedRequestKind,
+    /// Provider-ready desired attributes accepted for this operation. This is
+    /// kept separate from the plan-time authored resource so state writeback
+    /// masks secrets against the value shape actually sent to the provider.
+    resolved_desired_attributes: Option<HashMap<String, Value>>,
 }
 
 /// Read-only shape of the request accepted by the provider.
@@ -227,10 +231,14 @@ impl AcceptedRequest {
     pub(crate) fn create() -> Self {
         Self {
             kind: AcceptedRequestKind::Create,
+            resolved_desired_attributes: None,
         }
     }
 
-    fn from_update_request(request: &UpdateRequest) -> Self {
+    fn from_update_request(
+        request: &UpdateRequest,
+        resolved_desired_attributes: HashMap<String, Value>,
+    ) -> Self {
         let mut sent = BTreeSet::new();
         let mut removed = BTreeSet::new();
         for op in &request.patch().ops {
@@ -245,7 +253,16 @@ impl AcceptedRequest {
         }
         Self {
             kind: AcceptedRequestKind::Update { sent, removed },
+            resolved_desired_attributes: Some(resolved_desired_attributes),
         }
+    }
+
+    pub(crate) fn with_resolved_desired_attributes(
+        mut self,
+        attributes: HashMap<String, Value>,
+    ) -> Self {
+        self.resolved_desired_attributes = Some(attributes);
+        self
     }
 
     /// Construct create provenance for fixtures and state-boundary tests.
@@ -264,11 +281,16 @@ impl AcceptedRequest {
                 sent: sent.iter().map(|key| (*key).to_string()).collect(),
                 removed: removed.iter().map(|key| (*key).to_string()).collect(),
             },
+            resolved_desired_attributes: None,
         }
     }
 
     pub fn kind(&self) -> &AcceptedRequestKind {
         &self.kind
+    }
+
+    pub fn resolved_desired_attributes(&self) -> Option<&HashMap<String, Value>> {
+        self.resolved_desired_attributes.as_ref()
     }
 }
 

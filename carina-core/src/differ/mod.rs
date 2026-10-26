@@ -639,16 +639,24 @@ pub(crate) use comparison::{
     type_aware_equal,
 };
 
-/// Returns true when `binding` is `template_binding_name` with one numeric
-/// deferred-for index suffix, e.g. `validation_records[0]`.
+/// Returns true when `binding` is one direct child emitted by the deferred-for
+/// template. List children use a numeric index (`items[0]`); map children use
+/// the canonical address spelling (`items.key` or `items['key with space']`).
 pub fn binding_matches_deferred_template(binding: &str, template_binding_name: &str) -> bool {
     let Some(suffix) = binding.strip_prefix(template_binding_name) else {
         return false;
     };
+    if let Some(key) = suffix.strip_prefix('.') {
+        return crate::utils::is_identifier_safe(key);
+    }
     let Some(inner) = suffix.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
         return false;
     };
-    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
+    (!inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()))
+        || inner
+            .strip_prefix('\'')
+            .and_then(|key| key.strip_suffix('\''))
+            .is_some()
 }
 
 /// Result of a diff operation

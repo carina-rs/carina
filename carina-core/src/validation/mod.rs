@@ -316,18 +316,20 @@ fn visit_refs_with_sink_inner<'a>(
             visit_refs_with_sink_inner(inner, sink, usage, f)
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            let value_usage = if value.is_coalesce_optional_reference() {
+            let value_usage = if value.is_coalesce_optional_operand() {
+                crate::resource::ResourceRefUsage::CoalesceValue
+            } else {
+                crate::resource::ResourceRefUsage::Required
+            };
+            let default_usage = if usage == crate::resource::ResourceRefUsage::CoalesceValue
+                && default.is_coalesce_optional_operand()
+            {
                 crate::resource::ResourceRefUsage::CoalesceValue
             } else {
                 crate::resource::ResourceRefUsage::Required
             };
             visit_refs_with_sink_inner(value, sink, value_usage, f);
-            visit_refs_with_sink_inner(
-                default,
-                sink,
-                crate::resource::ResourceRefUsage::Required,
-                f,
-            );
+            visit_refs_with_sink_inner(default, sink, default_usage, f);
         }
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -2839,6 +2841,22 @@ where
     for param in export_params {
         let mut resolved_param = param.clone();
         if let Some(value) = param.value() {
+            let mut references_removed_secret = false;
+            value.visit_resource_refs_with_usage(&mut |path, usage| {
+                if usage == crate::resource::ResourceRefUsage::Required
+                    && bindings.removed_attribute_was_sensitive(path.binding(), path.attribute())
+                {
+                    references_removed_secret = true;
+                }
+            });
+            if references_removed_secret {
+                errors.push(format!(
+                    "export '{}' cannot hold a secret value",
+                    param.name()
+                ));
+                checked.push(resolved_param);
+                continue;
+            }
             match crate::resolver::resolve_ref_value_with_config(value, bindings, config) {
                 Ok(resolved) if crate::value::contains_secret(&resolved) => {
                     errors.push(format!(

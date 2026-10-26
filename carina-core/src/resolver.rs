@@ -407,7 +407,7 @@ pub fn resolve_ref_value_status(
     value: &Value,
     bindings: &ResolvedBindings,
 ) -> Result<ValueResolution, String> {
-    resolve_ref_value_status_inner(value, bindings, None)
+    resolve_ref_value_status_inner(value, bindings, None, false)
 }
 
 /// Resolve a value using binding data and a provider-aware builtin context.
@@ -447,19 +447,25 @@ fn resolve_ref_value_status_inner(
     value: &Value,
     bindings: &ResolvedBindings,
     config: Option<&crate::parser::ProviderContext>,
+    allow_absent_default: bool,
 ) -> Result<ValueResolution, String> {
     match value {
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
         }) => {
-            let left_resolution = if left.is_coalesce_optional_reference() {
-                resolve_ref_value_status_inner(left, bindings, config)?
+            let left_resolution = if left.is_coalesce_optional_operand() {
+                resolve_ref_value_status_inner(left, bindings, config, true)?
             } else {
                 resolve_required_value_status(left, bindings, config)?
             };
             match left_resolution {
                 ValueResolution::Present(value) => Ok(ValueResolution::Present(value)),
+                ValueResolution::Absent
+                    if allow_absent_default && default.is_coalesce_optional_operand() =>
+                {
+                    resolve_ref_value_status_inner(default, bindings, config, true)
+                }
                 ValueResolution::Absent => resolve_required_value_status(default, bindings, config),
                 ValueResolution::Unknown(_) => Ok(ValueResolution::Unknown(value.clone())),
             }
@@ -537,21 +543,25 @@ fn resolve_ref_value_status_inner(
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            let resolved_base =
-                match resolve_ref_value_status_inner(access.base(), bindings, config)? {
-                    ValueResolution::Present(value) => value,
-                    ValueResolution::Absent => return Ok(ValueResolution::Absent),
-                    ValueResolution::Unknown(_) => {
-                        return Ok(ValueResolution::Unknown(value.clone()));
-                    }
-                };
+            let resolved_base = match resolve_ref_value_status_inner(
+                access.base(),
+                bindings,
+                config,
+                allow_absent_default,
+            )? {
+                ValueResolution::Present(value) => value,
+                ValueResolution::Absent => return Ok(ValueResolution::Absent),
+                ValueResolution::Unknown(_) => {
+                    return Ok(ValueResolution::Unknown(value.clone()));
+                }
+            };
             match access.rebuild_result(
                 resolved_base,
                 access.step().clone(),
                 AccessMissPolicy::Error,
             ) {
                 Ok(ValuePathSegmentResult::Resolved(value)) => {
-                    resolve_ref_value_status_inner(&value, bindings, config)
+                    resolve_ref_value_status_inner(&value, bindings, config, allow_absent_default)
                 }
                 Ok(
                     ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
@@ -594,7 +604,7 @@ fn resolve_ref_value_inner(
 ) -> Result<Value, String> {
     match value {
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
-            match resolve_ref_value_status_inner(value, bindings, config)? {
+            match resolve_ref_value_status_inner(value, bindings, config, false)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
                 // Keep the original expression if a future resolver adds an
                 // absent default form. Residual coalesces are rejected at
@@ -867,6 +877,54 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_groupings_propagate_absence_associatively() {
+        let first = Value::resource_ref("r", "comment", Vec::new());
+        let second = Value::resource_ref("r", "parent", Vec::new());
+        let fallback = Value::Concrete(ConcreteValue::String("default".into()));
+        let left_grouped = coalesce(coalesce(first.clone(), second.clone()), fallback.clone());
+        let right_grouped = coalesce(first, coalesce(second, fallback.clone()));
+        let cases = [
+            (
+                HashMap::from([
+                    (
+                        "comment".to_string(),
+                        Value::Concrete(ConcreteValue::String("first".into())),
+                    ),
+                    (
+                        "parent".to_string(),
+                        Value::Concrete(ConcreteValue::String("second".into())),
+                    ),
+                ]),
+                Value::Concrete(ConcreteValue::String("first".into())),
+            ),
+            (
+                HashMap::from([(
+                    "parent".to_string(),
+                    Value::Concrete(ConcreteValue::String("second".into())),
+                )]),
+                Value::Concrete(ConcreteValue::String("second".into())),
+            ),
+            (HashMap::new(), fallback.clone()),
+        ];
+
+        for (attributes, expected) in cases {
+            let mut bindings = ResolvedBindings::default();
+            bindings.set_with_completeness(
+                "r",
+                attributes,
+                BindingValueSource::Local,
+                BindingCompleteness::Complete,
+            );
+            for expression in [&left_grouped, &right_grouped] {
+                assert_eq!(
+                    resolve_ref_value_status(expression, &bindings),
+                    Ok(ValueResolution::Present(expected.clone())),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn coalesce_does_not_treat_explicit_unknown_as_absent() {
         let unknown_reason = crate::resource::UnknownReason::PostCreateReadIncomplete {
             detail: "provider read incomplete".to_string(),
@@ -957,6 +1015,10 @@ mod tests {
                     "stable".to_string(),
                     Value::Concrete(ConcreteValue::String("same".into())),
                 ),
+                (
+                    "removed".to_string(),
+                    Value::Concrete(ConcreteValue::String("old".into())),
+                ),
             ]),
         )
         .with_identifier("up-id");
@@ -968,7 +1030,7 @@ mod tests {
         let stability = HashMap::from([(
             resource.id.clone(),
             crate::binding_index::ManagedBindingStability::Updating {
-                changed_attributes: HashSet::from(["name".to_string()]),
+                changed_attributes: HashSet::from(["name".to_string(), "removed".to_string()]),
                 refreshable_attributes: HashSet::from([
                     "accounts".to_string(),
                     "missing_output".to_string(),
@@ -994,8 +1056,23 @@ mod tests {
         );
         assert_eq!(
             resolve_ref_value_status(&changed, &bindings),
-            Ok(ValueResolution::Unknown(changed)),
-            "an attribute changed by the planned update is not definitive before apply",
+            Ok(ValueResolution::Present(Value::Concrete(
+                ConcreteValue::String("new".into()),
+            ))),
+            "a resolved authored desired value overrides refreshed state during its update",
+        );
+
+        let removed_default = Value::Concrete(ConcreteValue::String("removed-default".into()));
+        assert_eq!(
+            resolve_ref_value_status(
+                &coalesce(
+                    Value::resource_ref("up", "removed", vec![]),
+                    removed_default.clone(),
+                ),
+                &bindings,
+            ),
+            Ok(ValueResolution::Present(removed_default)),
+            "an attribute removed by the update is definitively absent",
         );
 
         let provisional = coalesce(

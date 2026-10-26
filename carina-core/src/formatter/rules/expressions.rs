@@ -178,6 +178,8 @@ impl Formatter {
                 CstChild::Token(token) => {
                     if token.text == "|>" {
                         self.write(" |> ");
+                    } else if token.text == "??" {
+                        self.write(" ?? ");
                     } else {
                         self.write_token(&token.text);
                     }

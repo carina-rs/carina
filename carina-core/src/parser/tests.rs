@@ -8980,6 +8980,49 @@ awscc.ec2.Subnet {
 }
 
 #[test]
+fn coalesce_chain_is_parsed_right_associatively() {
+    let input = r#"
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+mock.test.resource {
+  name = producer.comment ?? producer.parent ?? "default"
+}
+"#;
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let value = parsed.resources[1].get_attr("name").expect("consumer name");
+    let Value::Deferred(DeferredValue::Coalesce {
+        value: first,
+        default: tail,
+    }) = value
+    else {
+        panic!("expected outer coalesce, got {value:?}");
+    };
+    assert!(matches!(
+        first.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if path.binding() == "producer" && path.attribute() == "comment"
+    ));
+    let Value::Deferred(DeferredValue::Coalesce {
+        value: second,
+        default,
+    }) = tail.as_ref()
+    else {
+        panic!("expected right-associated tail, got {tail:?}");
+    };
+    assert!(matches!(
+        second.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if path.binding() == "producer" && path.attribute() == "parent"
+    ));
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("default".into())),
+    );
+}
+
+#[test]
 fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
     let input = r#"
         let orgs = upstream_state {

@@ -22,6 +22,18 @@ fn run_cli(dir: &Path, args: &[&str]) -> Output {
         .expect("run carina")
 }
 
+fn run_cli_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+    command
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "warn")
+        .env_remove("CLICOLOR_FORCE")
+        .envs(env.iter().copied())
+        .args(args);
+    command.output().expect("run carina with environment")
+}
+
 fn assert_success(output: &Output, operation: &str) {
     assert!(
         output.status.success(),
@@ -178,6 +190,70 @@ fn created_names(plan: &PlanFile) -> Vec<String> {
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+fn assert_converged(dir: &Path, operation: &str) {
+    let plan = plan_json(dir);
+    assert!(
+        plan.plan.effects().is_empty(),
+        "{operation} must converge after the update apply: {:#?}",
+        plan.plan.effects(),
+    );
+    let output = run_cli(dir, &["apply", "--auto-approve", "."]);
+    assert_success(&output, operation);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("No changes"),
+        "{operation} must report no changes after converging:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+fn write_updating_list_iterable(dir: &Path, coalesced: bool, updated: bool) {
+    let values = if updated { r#"["a", "b"]"# } else { r#"["a"]"# };
+    let iterable = if coalesced {
+        "(c.list ?? [])"
+    } else {
+        "c.list"
+    };
+    fs::write(
+        dir.join("main.crn"),
+        format!(
+            r#"let c = mock.example.consumer {{
+  name = "c"
+  list = {values}
+}}
+
+for x in {iterable} {{
+  mock.test.resource {{ name = x }}
+}}
+"#,
+        ),
+    )
+    .expect("write updating list iterable fixture");
+}
+
+fn write_updating_map_iterable(dir: &Path, coalesced: bool, updated: bool) {
+    let b = if updated { "3" } else { "2" };
+    let iterable = if coalesced {
+        "c.nested ?? {}"
+    } else {
+        "c.nested"
+    };
+    fs::write(
+        dir.join("main.crn"),
+        format!(
+            r#"let c = mock.example.consumer {{
+  name = "c"
+  nested = {{ a = "1", b = "{b}" }}
+}}
+
+for k, v in ({iterable}) {{
+  mock.test.resource {{ name = "${{k}}-${{v}}" }}
+}}
+"#,
+        ),
+    )
+    .expect("write updating map iterable fixture");
 }
 
 #[test]
@@ -389,4 +465,205 @@ let consumer = mock.test.resource {
         output.contains("cmment") && output.to_ascii_lowercase().contains("unknown attribute"),
         "validation must retain schema-typed unknown-attribute errors:\n{output}",
     );
+}
+
+#[test]
+fn updating_authored_list_iterable_expands_before_apply_and_converges() {
+    for coalesced in [false, true] {
+        let root = tempfile::tempdir().expect("create temporary root");
+        let project = root
+            .path()
+            .join(if coalesced { "coalesced" } else { "plain" });
+        write_common_files(&project);
+        write_updating_list_iterable(&project, coalesced, false);
+
+        assert_success(&run_cli(&project, &["init", "."]), "init list fixture");
+        assert_success(
+            &run_cli(&project, &["apply", "--auto-approve", "."]),
+            "apply initial list fixture",
+        );
+
+        write_updating_list_iterable(&project, coalesced, true);
+        let update = plan_json(&project);
+        assert!(
+            update
+                .plan
+                .effects()
+                .iter()
+                .all(|effect| !matches!(effect, Effect::DeferredCreate { .. })),
+            "an authored desired list is definitive during its producer update: {:#?}",
+            update.plan.effects(),
+        );
+        assert_success(
+            &run_cli(&project, &["apply", "--auto-approve", "."]),
+            "apply updated list fixture",
+        );
+        assert_converged(&project, "reapply updated list fixture");
+    }
+}
+
+#[test]
+fn updating_authored_map_iterable_keeps_stable_children_and_converges() {
+    for coalesced in [false, true] {
+        let root = tempfile::tempdir().expect("create temporary root");
+        let project = root
+            .path()
+            .join(if coalesced { "coalesced" } else { "plain" });
+        write_common_files(&project);
+        write_updating_map_iterable(&project, coalesced, false);
+
+        assert_success(&run_cli(&project, &["init", "."]), "init map fixture");
+        assert_success(
+            &run_cli(&project, &["apply", "--auto-approve", "."]),
+            "apply initial map fixture",
+        );
+
+        write_updating_map_iterable(&project, coalesced, true);
+        let update = plan_json(&project);
+        assert!(
+            update
+                .plan
+                .effects()
+                .iter()
+                .all(|effect| !matches!(effect, Effect::DeferredCreate { .. })),
+            "an authored desired map is definitive during its producer update: {:#?}",
+            update.plan.effects(),
+        );
+        assert_success(
+            &run_cli(&project, &["apply", "--auto-approve", "."]),
+            "apply updated map fixture",
+        );
+        assert_converged(&project, "reapply updated map fixture");
+    }
+}
+
+#[test]
+fn update_selected_coalesce_secret_is_hashed_in_state() {
+    const SECRET: &str = "coalesce-update-secret-must-not-leak-3961";
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+  comment = "public"
+}
+
+let s = mock.test.resource {
+  name = "consumer"
+  comment = r.comment ?? secret(env("SECRET_V"))
+}
+"#,
+    )
+    .expect("write initial secret coalesce fixture");
+
+    assert_success(&run_cli(&project, &["init", "."]), "init secret fixture");
+    assert_success(
+        &run_cli_with_env(
+            &project,
+            &["apply", "--auto-approve", "."],
+            &[("SECRET_V", SECRET)],
+        ),
+        "apply initial secret fixture",
+    );
+
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+}
+
+let s = mock.test.resource {
+  name = "consumer"
+  comment = r.comment ?? secret(env("SECRET_V"))
+}
+"#,
+    )
+    .expect("write updated secret coalesce fixture");
+    assert_success(
+        &run_cli_with_env(
+            &project,
+            &["apply", "--auto-approve", "."],
+            &[("SECRET_V", SECRET)],
+        ),
+        "apply selected secret default",
+    );
+
+    let state = fs::read_to_string(project.join("carina.state.json")).expect("read state");
+    assert!(
+        state.contains("\"$secret\""),
+        "the selected secret default must be persisted as a secret hash:\n{state}",
+    );
+    assert!(
+        !state.contains(SECRET),
+        "the selected secret default leaked into state plaintext:\n{state}",
+    );
+}
+
+fn write_coalesce_chain_fixture(dir: &Path, unparenthesized: bool) {
+    let expressions = if unparenthesized {
+        vec![
+            ("chain", "r.comment ?? r.parent ?? \"d\""),
+            ("right", "r.comment ?? (r.parent ?? \"d\")"),
+        ]
+    } else {
+        vec![
+            ("left", "(r.comment ?? r.parent) ?? \"d\""),
+            ("right", "r.comment ?? (r.parent ?? \"d\")"),
+        ]
+    };
+    let consumers = expressions
+        .iter()
+        .map(|(name, expression)| {
+            format!(
+                r#"let {name} = mock.test.resource {{
+  name = "{name}"
+  comment = {expression}
+}}
+"#,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        dir.join("main.crn"),
+        format!(
+            r#"let r = mock.test.resource {{
+  name = "seed"
+}}
+
+{consumers}"#,
+        ),
+    )
+    .expect("write coalesce chain fixture");
+}
+
+fn assert_coalesce_chain_applies(dir: &Path, operation: &str) {
+    assert_success(&run_cli(dir, &["validate", "."]), operation);
+    assert_success(&run_cli(dir, &["apply", "--auto-approve", "."]), operation);
+    assert_converged(dir, operation);
+}
+
+#[test]
+fn unparenthesized_coalesce_chain_parses_and_resolves_right_associatively() {
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    write_coalesce_chain_fixture(&project, true);
+    assert_success(&run_cli(&project, &["init", "."]), "init chain fixture");
+    assert_coalesce_chain_applies(&project, "apply unparenthesized coalesce chain");
+}
+
+#[test]
+fn explicitly_grouped_coalesces_are_semantically_associative() {
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    write_coalesce_chain_fixture(&project, false);
+    assert_success(
+        &run_cli(&project, &["init", "."]),
+        "init grouped chain fixture",
+    );
+    assert_coalesce_chain_applies(&project, "apply both grouped coalesce forms");
 }

@@ -5469,6 +5469,36 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
 }
 
 #[test]
+fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
+    let target = deferred_replace_test_target();
+    let mut plan = Plan::new();
+    plan.add(delete_effect_for_binding("validation_records.alpha"));
+    plan.add(delete_effect_for_binding(
+        "validation_records['key with space']",
+    ));
+    plan.add(delete_effect_for_binding("validation_records['']"));
+
+    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
+
+    let payload = plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::DeferredReplace(payload) => Some(payload),
+            _ => None,
+        })
+        .expect("map-key deletes must be paired with their deferred create");
+    assert_eq!(payload.deletes.len(), 3);
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Delete { .. })),
+        "stable map-key children must not remain standalone cleanups beside runtime upserts",
+    );
+}
+
+#[test]
 fn deferred_create_targets_do_not_absorb_deposed_deletes() {
     let target = deferred_replace_test_target();
     let deposed_key = carina_state::DeposedKey::new_unique();

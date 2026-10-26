@@ -1953,6 +1953,7 @@ pub struct ObservedCreate {
     identifier: AppliedIdentifier,
     observation: Observation,
     sent: SentRecord,
+    resolved_desired_attributes: Option<HashMap<String, Value>>,
 }
 
 impl ObservedCreate {
@@ -1970,6 +1971,18 @@ impl ObservedCreate {
 
     pub fn sent(&self) -> &SentRecord {
         &self.sent
+    }
+
+    pub(crate) fn with_resolved_desired_attributes(
+        mut self,
+        attributes: HashMap<String, Value>,
+    ) -> Self {
+        self.resolved_desired_attributes = Some(attributes);
+        self
+    }
+
+    pub fn resolved_desired_attributes(&self) -> Option<&HashMap<String, Value>> {
+        self.resolved_desired_attributes.as_ref()
     }
 
     pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, Observation, SentRecord) {
@@ -2678,6 +2691,7 @@ impl IssuedCreate {
                 identifier: self.identifier,
                 observation,
                 sent: SentRecord::Request(self.sent),
+                resolved_desired_attributes: None,
             },
             error,
         })
@@ -2721,6 +2735,7 @@ impl FinishingCreate {
                 identifier: self.identifier,
                 observation,
                 sent: SentRecord::Request(self.sent),
+                resolved_desired_attributes: None,
             },
             error,
         })
@@ -2991,6 +3006,7 @@ fn observed_from_resume(
         identifier,
         observation,
         sent,
+        resolved_desired_attributes: None,
     }
 }
 

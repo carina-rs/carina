@@ -1344,17 +1344,20 @@ pub enum BindingCompleteness {
 /// Plan-derived knowledge about a managed resource's refreshed attributes.
 ///
 /// A successful refresh is a complete snapshot when the differ schedules no
-/// mutation. During an update, directly changed attributes are provisional;
-/// provider-populated attributes retain a present refreshed value but do not
-/// make a missing value definitive. Every other refreshed value and absence
-/// remains authoritative. Creates, replacements, and unavailable current rows
-/// use [`Self::Unavailable`].
+/// mutation. During an update, directly changed attributes identify where the
+/// desired view must replace (or remove) the refreshed value. Provider-
+/// populated attributes retain a present refreshed value but do not make a
+/// missing value definitive. Every other refreshed value and absence remains
+/// authoritative. Creates, replacements, and unavailable current rows use
+/// [`Self::Unavailable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedBindingStability {
     NoPlannedEffect,
     Updating {
-        /// Attributes directly changed by the planned update. Their old
-        /// values and absence are both unknown until the update completes.
+        /// Attributes directly written or removed by the planned update.
+        /// Their authored desired values/absence override refreshed state;
+        /// unresolved authored values remain deferred through ordinary value
+        /// resolution.
         changed_attributes: HashSet<String>,
         /// Provider-populated attributes which may be refreshed as a side
         /// effect of the update. A value present in refreshed prior state is
@@ -1375,13 +1378,18 @@ pub struct ResolvedBinding {
     /// desired/configured attributes; provider outputs merged from an old or
     /// in-flight snapshot are deliberately excluded.
     definitive_attributes: HashSet<String>,
-    /// Attributes directly changed by a planned update. Neither their old
-    /// value nor their absence is usable before the update completes.
+    /// Attributes directly changed by a planned update. This records which
+    /// refreshed keys were replaced/removed by the authored desired view.
     changed_attributes: HashSet<String>,
     /// Provider-populated attributes which may be refreshed by a planned
     /// update. Present prior-state values remain usable; only their absence
     /// is unknown until refresh/apply completes.
     refreshable_attributes: HashSet<String>,
+    /// Secret-bearing refreshed attributes that this update explicitly
+    /// removes. They are absent from the effective desired view, but callers
+    /// which validate required pre-apply references must retain the taint so
+    /// an unresolved reference cannot make a secret export appear public.
+    removed_sensitive_attributes: HashSet<String>,
 }
 
 /// Value-aware sibling of [`BindingIndex`]. See the module-level doc for
@@ -1514,26 +1522,40 @@ impl ResolvedBindings {
             };
             let mut merged: HashMap<String, Value> = resource.resolved_attributes();
             let definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
-            let mut changed_attributes = HashSet::new();
-            let mut refreshable_attributes = HashSet::new();
+            let (changed_attributes, refreshable_attributes) = match managed_stability
+                .get(&resource.id)
+            {
+                Some(ManagedBindingStability::Updating {
+                    changed_attributes,
+                    refreshable_attributes,
+                }) => (changed_attributes.clone(), refreshable_attributes.clone()),
+                None
+                | Some(
+                    ManagedBindingStability::NoPlannedEffect | ManagedBindingStability::Unavailable,
+                ) => (HashSet::new(), HashSet::new()),
+            };
             let mut completeness = BindingCompleteness::Incomplete;
+            let mut removed_sensitive_attributes = HashSet::new();
             if let Some(current) = managed_current.get(&resource.id) {
                 match current.current() {
                     crate::resource::Current::Absent(_absent) => {}
                     crate::resource::Current::Present(present) => {
                         completeness = BindingCompleteness::Complete;
                         for (k, v) in &present.state().attributes {
+                            if changed_attributes.contains(k) && !definitive_attributes.contains(k)
+                            {
+                                // The update removes this authored key. Do
+                                // not resurrect its refreshed prior value.
+                                if crate::value::contains_secret(v) {
+                                    removed_sensitive_attributes.insert(k.clone());
+                                }
+                                continue;
+                            }
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
                         }
                         match managed_stability.get(&resource.id) {
                             None | Some(ManagedBindingStability::NoPlannedEffect) => {}
-                            Some(ManagedBindingStability::Updating {
-                                changed_attributes: changed,
-                                refreshable_attributes: refreshable,
-                            }) => {
-                                changed_attributes.extend(changed.iter().cloned());
-                                refreshable_attributes.extend(refreshable.iter().cloned());
-                            }
+                            Some(ManagedBindingStability::Updating { .. }) => {}
                             Some(ManagedBindingStability::Unavailable) => {
                                 completeness = BindingCompleteness::Incomplete;
                             }
@@ -1556,6 +1578,7 @@ impl ResolvedBindings {
                     definitive_attributes,
                     changed_attributes,
                     refreshable_attributes,
+                    removed_sensitive_attributes,
                 },
             );
         }
@@ -1570,6 +1593,7 @@ impl ResolvedBindings {
                     definitive_attributes: HashSet::new(),
                     changed_attributes: HashSet::new(),
                     refreshable_attributes: HashSet::new(),
+                    removed_sensitive_attributes: HashSet::new(),
                 },
             );
         }
@@ -1591,6 +1615,7 @@ impl ResolvedBindings {
             let definitive_attributes = target_entry.definitive_attributes.clone();
             let changed_attributes = target_entry.changed_attributes.clone();
             let refreshable_attributes = target_entry.refreshable_attributes.clone();
+            let removed_sensitive_attributes = target_entry.removed_sensitive_attributes.clone();
             self.by_name.insert(
                 spec.binding.as_str().to_string(),
                 ResolvedBinding {
@@ -1602,6 +1627,7 @@ impl ResolvedBindings {
                     definitive_attributes,
                     changed_attributes,
                     refreshable_attributes,
+                    removed_sensitive_attributes,
                 },
             );
         }
@@ -1672,6 +1698,7 @@ impl ResolvedBindings {
                     definitive_attributes,
                     changed_attributes: HashSet::new(),
                     refreshable_attributes: HashSet::new(),
+                    removed_sensitive_attributes: HashSet::new(),
                 },
             );
         }
@@ -1760,6 +1787,7 @@ impl ResolvedBindings {
                     definitive_attributes,
                     changed_attributes: HashSet::new(),
                     refreshable_attributes: HashSet::new(),
+                    removed_sensitive_attributes: HashSet::new(),
                 },
             );
         }
@@ -1780,9 +1808,9 @@ impl ResolvedBindings {
     /// Whether a present attribute value can be consumed before apply.
     pub fn attribute_value_is_definitive(&self, name: &str, attribute: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
-            !binding.changed_attributes.contains(attribute)
-                && (binding.completeness == BindingCompleteness::Complete
-                    || binding.definitive_attributes.contains(attribute))
+            binding.definitive_attributes.contains(attribute)
+                || (!binding.changed_attributes.contains(attribute)
+                    && binding.completeness == BindingCompleteness::Complete)
         })
     }
 
@@ -1790,17 +1818,29 @@ impl ResolvedBindings {
     /// attributes may appear during an update, so their prior absence remains
     /// unknown even though an already-present prior value is usable.
     pub fn attribute_absence_is_definitive(&self, name: &str, attribute: &str) -> bool {
-        self.attribute_value_is_definitive(name, attribute)
-            && self
-                .by_name
-                .get(name)
-                .is_some_and(|binding| !binding.refreshable_attributes.contains(attribute))
+        self.by_name.get(name).is_some_and(|binding| {
+            (binding.changed_attributes.contains(attribute)
+                && !binding.definitive_attributes.contains(attribute))
+                || (self.attribute_value_is_definitive(name, attribute)
+                    && !binding.refreshable_attributes.contains(attribute))
+        })
+    }
+
+    /// Whether a required reference targets a secret-bearing refreshed value
+    /// that this plan removes from the effective desired view.
+    ///
+    /// Resolution still treats the key as absent (so a direct coalesce may
+    /// select its fallback), but validation must not lose the sensitivity of
+    /// a bare unresolved reference before the removal has run.
+    pub fn removed_attribute_was_sensitive(&self, name: &str, attribute: &str) -> bool {
+        self.by_name
+            .get(name)
+            .is_some_and(|binding| binding.removed_sensitive_attributes.contains(attribute))
     }
 
     pub fn binding_is_fully_definitive(&self, name: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
             binding.completeness == BindingCompleteness::Complete
-                && binding.changed_attributes.is_empty()
                 && binding.refreshable_attributes.is_empty()
         })
     }
@@ -1828,6 +1868,7 @@ impl ResolvedBindings {
                 None | Some(ManagedBindingStability::NoPlannedEffect) => {
                     binding.changed_attributes.clear();
                     binding.refreshable_attributes.clear();
+                    binding.removed_sensitive_attributes.clear();
                     if managed_current.get(&resource.id).is_some_and(|current| {
                         matches!(current.current(), crate::resource::Current::Present(_))
                     }) {
@@ -1841,11 +1882,31 @@ impl ResolvedBindings {
                     binding.completeness = BindingCompleteness::Complete;
                     binding.changed_attributes = changed_attributes.clone();
                     binding.refreshable_attributes = refreshable_attributes.clone();
+                    let desired = resource.resolved_attributes();
+                    binding.definitive_attributes = desired.keys().cloned().collect();
+                    binding.removed_sensitive_attributes.clear();
+                    for attribute in changed_attributes {
+                        if let Some(value) = desired.get(attribute) {
+                            binding.attributes.insert(attribute.clone(), value.clone());
+                        } else {
+                            if binding
+                                .attributes
+                                .get(attribute)
+                                .is_some_and(crate::value::contains_secret)
+                            {
+                                binding
+                                    .removed_sensitive_attributes
+                                    .insert(attribute.clone());
+                            }
+                            binding.attributes.remove(attribute);
+                        }
+                    }
                 }
                 Some(ManagedBindingStability::Unavailable) => {
                     binding.completeness = BindingCompleteness::Incomplete;
                     binding.changed_attributes.clear();
                     binding.refreshable_attributes.clear();
+                    binding.removed_sensitive_attributes.clear();
                 }
             }
         }
@@ -1855,7 +1916,6 @@ impl ResolvedBindings {
         let complete = value.root_bindings().iter().all(|name| {
             self.by_name.get(name).is_some_and(|binding| {
                 binding.completeness == BindingCompleteness::Complete
-                    && binding.changed_attributes.is_empty()
                     && binding.refreshable_attributes.is_empty()
             })
         });
@@ -1889,7 +1949,11 @@ impl ResolvedBindings {
         };
         let mut merged = resource_attrs.clone();
         for (k, v) in &state.attributes {
-            merged.insert(k.clone(), v.clone());
+            let value = resource_attrs.get(k).map_or_else(
+                || v.clone(),
+                |shape| crate::value::mask_plaintext_using_secret_shape(v, shape),
+            );
+            merged.insert(k.clone(), value);
         }
         self.by_name.insert(
             name.to_string(),
@@ -1900,6 +1964,7 @@ impl ResolvedBindings {
                 definitive_attributes: HashSet::new(),
                 changed_attributes: HashSet::new(),
                 refreshable_attributes: HashSet::new(),
+                removed_sensitive_attributes: HashSet::new(),
             },
         );
     }
@@ -1942,6 +2007,7 @@ impl ResolvedBindings {
                 definitive_attributes,
                 changed_attributes: HashSet::new(),
                 refreshable_attributes: HashSet::new(),
+                removed_sensitive_attributes: HashSet::new(),
             },
         );
     }
@@ -2080,6 +2146,7 @@ impl<'a> IterableBindings<'a> {
                                 definitive_attributes: HashSet::new(),
                                 changed_attributes: HashSet::new(),
                                 refreshable_attributes: HashSet::new(),
+                                removed_sensitive_attributes: HashSet::new(),
                             },
                         )
                     })
@@ -3286,6 +3353,37 @@ mod resolved_bindings_tests {
             ))),
         );
         assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
+    }
+
+    #[test]
+    fn record_applied_keeps_secret_sensitivity_on_provider_values() {
+        let mut resolved = ResolvedBindings::default();
+        let plaintext = Value::Concrete(ConcreteValue::String("sensitive".into()));
+        let resource_attrs = HashMap::from([(
+            "comment".to_string(),
+            Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
+                plaintext.clone(),
+            ))),
+        )]);
+        let state = State {
+            id: ResourceId::with_identity("test.resource", "secret"),
+            identifier: None,
+            exists: true,
+            attributes: HashMap::from([("comment".to_string(), plaintext.clone())]),
+            dependency_bindings: BTreeSet::new(),
+            partial_read: None,
+        };
+
+        resolved.record_applied(Some("secret"), &resource_attrs, &state);
+
+        assert_eq!(
+            resolved
+                .get("secret")
+                .and_then(|attrs| attrs.get("comment")),
+            Some(&Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(plaintext)
+            )))
+        );
     }
 
     #[test]

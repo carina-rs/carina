@@ -2647,6 +2647,17 @@ impl Value {
         }
     }
 
+    /// Whether this expression can propagate definitive absence when it is
+    /// itself the left operand of another coalesce. Besides a direct optional
+    /// reference, a nested coalesce can do so: in `(a ?? b) ?? c`, both `a`
+    /// and `b` are optional alternatives before `c` is selected.
+    pub fn is_coalesce_optional_operand(&self) -> bool {
+        match self {
+            Value::Deferred(DeferredValue::Coalesce { .. }) => true,
+            _ => self.is_coalesce_optional_reference(),
+        }
+    }
+
     /// Collect the root binding names referenced anywhere in this value.
     /// Resource references and bare binding references share this one helper
     /// so dependency and diagnostic callers cannot drift.
@@ -4245,10 +4256,10 @@ impl Value {
     /// Recursively walk resource references while identifying references whose
     /// existence is guarded by the left operand of `??`.
     ///
-    /// The right operand always starts a required context, including when the
-    /// coalesce itself appears inside another left operand. This keeps missing
-    /// references in defaults diagnostic while allowing only the value being
-    /// tested by a coalesce to be absent.
+    /// The right operand normally starts a required context. When the whole
+    /// coalesce is itself a left operand, a direct-reference default remains
+    /// optional so `(a ?? b) ?? c` has the same existence semantics as
+    /// `a ?? (b ?? c)`. References nested in computations remain required.
     pub fn visit_resource_refs_with_usage(
         &self,
         f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
@@ -4296,13 +4307,20 @@ impl Value {
                 access.base().visit_resource_refs_with_usage_inner(usage, f);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                let usage = if value.is_coalesce_optional_reference() {
+                let value_usage = if value.is_coalesce_optional_operand() {
                     ResourceRefUsage::CoalesceValue
                 } else {
                     ResourceRefUsage::Required
                 };
-                value.visit_resource_refs_with_usage_inner(usage, f);
-                default.visit_resource_refs_with_usage_inner(ResourceRefUsage::Required, f);
+                let default_usage = if usage == ResourceRefUsage::CoalesceValue
+                    && default.is_coalesce_optional_operand()
+                {
+                    ResourceRefUsage::CoalesceValue
+                } else {
+                    ResourceRefUsage::Required
+                };
+                value.visit_resource_refs_with_usage_inner(value_usage, f);
+                default.visit_resource_refs_with_usage_inner(default_usage, f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.visit_resource_refs_with_usage_inner(usage, f)

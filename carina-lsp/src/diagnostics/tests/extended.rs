@@ -6065,6 +6065,27 @@ let consumer = mock.test.resource {
 }
 
 #[test]
+fn coalesce_chain_is_accepted_by_lsp_diagnostics() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = producer.comment ?? producer.identifier ?? "d"
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.is_empty(),
+        "the LSP parser and diagnostics must accept a coalesce chain: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn upstream_state_known_field_passes() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }

@@ -1141,6 +1141,13 @@ mod tests {
     }
 
     #[test]
+    fn format_coalesce_chain_uses_canonical_spacing() {
+        let source = "let x = a.value??b.value  ??  'd'\n";
+        let formatted = format(source, &FormatConfig::default()).expect("format coalesce chain");
+        assert_eq!(formatted, "let x = a.value ?? b.value ?? 'd'\n");
+    }
+
+    #[test]
     fn postfix_field_access_round_trips_for_every_base_shape() {
         let input = "let call = lookup({ a = { b = 'z' } }, 'a').b\n\
                      let map = { a = 'z' }.a\n\

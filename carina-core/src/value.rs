@@ -1620,7 +1620,17 @@ fn format_value_into_context(
             sink.write_token(ValueSpanKind::Reference, binding)
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            let parenthesize_left = matches!(
+                value.as_ref(),
+                Value::Deferred(DeferredValue::Coalesce { .. })
+            );
+            if parenthesize_left {
+                sink.write_token(ValueSpanKind::Structure, "(")?;
+            }
             format_value_into_context(value, sink, context)?;
+            if parenthesize_left {
+                sink.write_token(ValueSpanKind::Structure, ")")?;
+            }
             sink.write_token(ValueSpanKind::Structure, " ?? ")?;
             format_value_into_context(default, sink, context)
         }
@@ -2026,6 +2036,13 @@ fn merge_secrets_into_observation_json_inner(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(observed_items.replacing_children(replacements))
         }
+        // Deferred/non-structural expressions can still contain a secret. The
+        // normal executor resolves them before writeback, but state-boundary
+        // callers must fail closed rather than persisting observed plaintext if
+        // one reaches this walker unresolved.
+        _ if contains_secret(desired) => {
+            mask_mismatched_observation_shape(desired, observed, previous)
+        }
         _ => Ok(observed.to_owned_json()),
     }
 }
@@ -2125,6 +2142,12 @@ fn merge_secrets_into_provider_json_inner(
                 PersistedValue::encode_desired_value_from_view(desired, previous)
                     .map(|value| value.encoded)
             }
+        }
+        // A coalesce, function call, or interpolation does not expose enough
+        // structural information to mask only one child. If it contains any
+        // secret, hash the whole provider value instead of leaking plaintext.
+        _ if contains_secret(desired) => {
+            mask_mismatched_observation_shape(desired, provider, previous)
         }
         _ => Ok(provider.to_owned_json()),
     }
@@ -6463,6 +6486,20 @@ mod tests {
     }
 
     #[test]
+    fn format_value_parenthesizes_a_coalesce_used_as_the_left_operand() {
+        let inner = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("r", "comment", vec![])),
+            default: Box::new(Value::resource_ref("r", "parent", vec![])),
+        });
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(inner),
+            default: Box::new(Value::Concrete(ConcreteValue::String("d".into()))),
+        });
+
+        assert_eq!(format_value(&value), "(r.comment ?? r.parent) ?? 'd'");
+    }
+
+    #[test]
     fn test_value_to_json_interpolation_returns_err() {
         // RFC #2371 #2386: `Value::Deferred(DeferredValue::Interpolation)` reaching JSON
         // serialization is a canonicalize / resolver bug — surface as
@@ -8807,6 +8844,32 @@ mod tests {
         let error = merge_secrets_into_provider_json(&desired, &provider, None)
             .expect_err("top-level null secret material must be rejected without panicking");
         assert!(matches!(error, SerializationError::SecretNotAllowed { .. }));
+    }
+
+    #[test]
+    fn non_structural_expression_containing_secret_masks_whole_observed_value() {
+        let desired = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("resource", "comment", Vec::new())),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback-secret".into())),
+            )))),
+        });
+        let plaintext = "provider-returned-secret";
+        let provider = PersistedValue::encode_provider_value(
+            &Value::Concrete(ConcreteValue::String(plaintext.into())),
+            None,
+        )
+        .expect("provider plaintext is persistable");
+
+        for masked in [
+            merge_secrets_into_provider_json(&desired, &provider, None)
+                .expect("provider writeback masks the whole deferred expression"),
+            merge_secrets_into_observation_json(&desired, &provider, None)
+                .expect("observation writeback masks the whole deferred expression"),
+        ] {
+            assert!(masked.as_json().get(PERSISTED_SECRET_KEY).is_some());
+            assert!(!masked.as_json().to_string().contains(plaintext));
+        }
     }
 
     #[test]

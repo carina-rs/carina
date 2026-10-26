@@ -23,7 +23,7 @@ use crate::resolver::resolve_ref_value;
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
-use crate::value::{SerializationContext, SerializationError};
+use crate::value::{SerializationContext, SerializationError, mask_plaintext_using_secret_shape};
 
 use super::{
     AcceptedRequest, Applied, ExecutionAccumulator, ExecutionCheckpointSink, ExecutionEvent,
@@ -150,7 +150,7 @@ pub(super) async fn refresh_pending_states(
 pub(super) async fn resolve_resource(
     input: Result<CheckInput<Resource>, String>,
     context: &ProviderPreparationContext<'_>,
-) -> Result<ProviderReadyResource, String> {
+) -> Result<(ProviderReadyResource, HashMap<String, Value>), String> {
     let bindings = context.bindings();
     let input = input?;
     let checked = match input {
@@ -203,9 +203,23 @@ pub(super) async fn resolve_resource(
             )
         }
     };
-    prepare_provider_ready_resource_after_resolution(checked, context)
+    let resolved_secret_shapes = checked.value().resolved_attributes();
+    let provider_ready = prepare_provider_ready_resource_after_resolution(checked, context)
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    let resolved_desired_attributes = provider_ready
+        .as_resource()
+        .attributes
+        .iter()
+        .map(|(key, plaintext)| {
+            let value = resolved_secret_shapes.get(key).map_or_else(
+                || plaintext.clone(),
+                |shape| mask_plaintext_using_secret_shape(plaintext, shape),
+            );
+            (key.clone(), value)
+        })
+        .collect();
+    Ok((provider_ready, resolved_desired_attributes))
 }
 
 fn needs_apply_resolution(value: &Value) -> bool {
@@ -692,7 +706,8 @@ pub(super) async fn execute_basic_effect<'a>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let resolved = match resolve_resource(check_input, preparation).await {
+            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -704,13 +719,13 @@ pub(super) async fn execute_basic_effect<'a>(
                     return BasicEffectResult::Failure { refresh: None };
                 }
             };
-            let resolved_attrs = resolved.as_resource().resolved_attributes();
             match super::dispatch_create(provider, &resource.id, CreateRequest::checked(resolved))
                 .await
             {
                 Ok(outcome) => {
                     let (state, request, diagnostic) =
                         super::complete_create_for_writeback(outcome);
+                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
                     if let Some(diagnostic) = diagnostic {
                         observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
                             effect,
@@ -759,6 +774,8 @@ pub(super) async fn execute_basic_effect<'a>(
                         BasicEffectResult::Failure { refresh: None }
                     }
                     CreateFailureKind::Created { created, error } => {
+                        let created =
+                            created.with_resolved_desired_attributes(resolved_attrs.clone());
                         let error_str = format!(
                             "{error}\nresource created; recorded in state, the next apply completes it"
                         );
@@ -794,7 +811,8 @@ pub(super) async fn execute_basic_effect<'a>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let resolved = match resolve_resource(check_input, preparation).await {
+            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+            {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -806,7 +824,6 @@ pub(super) async fn execute_basic_effect<'a>(
                     return BasicEffectResult::Failure { refresh: None };
                 }
             };
-            let resolved_attrs = resolved.as_resource().resolved_attributes();
             let pending = match &ctx.resume_create {
                 Some(pending) => pending.clone(),
                 None => {
@@ -842,6 +859,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 .map(crate::provider::ResumeOutcome::into_kind)
             {
                 Ok(ResumeOutcomeKind::Resumed(created)) => {
+                    let created = created.with_resolved_desired_attributes(resolved_attrs.clone());
                     let state = created.observed_state();
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
@@ -850,7 +868,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         progress,
                     });
                     BasicEffectResult::ResumeSuccess {
-                        created: *created,
+                        created,
                         resource_id: resource.id.clone(),
                         resolved_attrs,
                         binding: resource.binding.clone(),
@@ -859,6 +877,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 Ok(ResumeOutcomeKind::Resent(outcome)) => {
                     let (state, request, diagnostic) =
                         super::complete_create_for_writeback(*outcome);
+                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
                     if let Some(diagnostic) = diagnostic {
                         observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
                             effect,
@@ -910,6 +929,8 @@ pub(super) async fn execute_basic_effect<'a>(
                         }
                     }
                     ResumeFailureKind::Created { created, error } => {
+                        let created =
+                            created.with_resolved_desired_attributes(resolved_attrs.clone());
                         let error = format!(
                             "{error}\nresource created; recorded in state, the next apply completes it"
                         );
@@ -960,18 +981,19 @@ pub(super) async fn execute_basic_effect<'a>(
                     CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
                 })
                 .unwrap_or_else(|| to.as_inner().clone());
-            let resolved_to = match resolve_resource(check_input, preparation).await {
-                Ok(r) => r,
-                Err(e) => {
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &e,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure { refresh: None };
-                }
-            };
+            let (resolved_to, resolved_desired_attributes) =
+                match resolve_resource(check_input, preparation).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &e,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        return BasicEffectResult::Failure { refresh: None };
+                    }
+                };
             // Augment plan-time `changed_attributes` with any
             // ResourceRef-derived attributes whose resolved value at
             // apply time differs from `from`. This catches the case
@@ -1014,7 +1036,8 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
             let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to);
-            let accepted_request = AcceptedRequest::from_update_request(&request);
+            let accepted_request =
+                AcceptedRequest::from_update_request(&request, resolved_desired_attributes);
             match provider.update(id, identifier, request).await {
                 Ok(outcome) => {
                     let diagnostic = match &outcome {
