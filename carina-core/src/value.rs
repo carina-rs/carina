@@ -2855,6 +2855,20 @@ pub fn mask_plaintext_using_secret_shape(plaintext: &Value, shape: &Value) -> Va
     }
 }
 
+fn rebuild_projected_string_list(values: Vec<Value>) -> Value {
+    let strings = values
+        .iter()
+        .map(|value| match value {
+            Value::Concrete(ConcreteValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    strings.map_or_else(
+        || Value::Concrete(ConcreteValue::List(values)),
+        |strings| Value::Concrete(ConcreteValue::StringList(strings)),
+    )
+}
+
 /// Apply a secret shape to provider plaintext, conservatively promoting the
 /// whole value when the shape contains sensitivity that cannot be projected
 /// structurally.
@@ -2864,11 +2878,144 @@ pub fn mask_plaintext_using_secret_shape(plaintext: &Value, shape: &Value) -> Va
 /// secret without exposing the selected value's final structure; retaining
 /// plaintext in that case would turn a lost shape into a state-file leak.
 pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &Value) -> Value {
-    let masked = mask_plaintext_using_secret_shape(plaintext, shape);
-    if contains_secret(shape) && !contains_secret(&masked) {
-        Value::Deferred(DeferredValue::Secret(Box::new(masked)))
-    } else {
-        masked
+    if matches!(
+        plaintext,
+        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+    ) {
+        return plaintext.clone();
+    }
+    if matches!(
+        shape,
+        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+    ) {
+        return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone())));
+    }
+    if !contains_secret(shape) {
+        return plaintext.clone();
+    }
+
+    match (plaintext, shape) {
+        (
+            Value::Concrete(ConcreteValue::Map(values)),
+            Value::Concrete(ConcreteValue::Map(shapes)),
+        ) => Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    let masked = shapes.get(key).map_or_else(
+                        || value.clone(),
+                        |shape| mask_plaintext_using_secret_shape_fail_closed(value, shape),
+                    );
+                    (key.clone(), masked)
+                })
+                .collect(),
+        )),
+        (
+            Value::Concrete(ConcreteValue::List(values)),
+            Value::Concrete(ConcreteValue::List(shapes)),
+        ) => Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    shapes.get(index).map_or_else(
+                        || value.clone(),
+                        |shape| mask_plaintext_using_secret_shape_fail_closed(value, shape),
+                    )
+                })
+                .collect(),
+        )),
+        (
+            Value::Concrete(ConcreteValue::StringList(values)),
+            Value::Concrete(ConcreteValue::List(shapes)),
+        ) => rebuild_projected_string_list(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let value = Value::Concrete(ConcreteValue::String(value.clone()));
+                    shapes.get(index).map_or(value.clone(), |shape| {
+                        mask_plaintext_using_secret_shape_fail_closed(&value, shape)
+                    })
+                })
+                .collect(),
+        ),
+        _ => Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()))),
+    }
+}
+
+/// Combine the secret shape selected during apply with secret markers from
+/// the authored value used to build the plan.
+///
+/// The apply-time value is authoritative when a deferred authored expression
+/// has resolved to a concrete branch. Structural authored values are merged
+/// recursively so an unprojectable child fails closed at that child without
+/// tainting its container or siblings.
+pub fn union_secret_shapes_after_resolution(applied: &Value, authored: &Value) -> Value {
+    if matches!(
+        applied,
+        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+    ) {
+        return applied.clone();
+    }
+    if matches!(
+        authored,
+        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+    ) {
+        return mask_plaintext_using_secret_shape_fail_closed(applied, authored);
+    }
+    if !contains_secret(authored) {
+        return applied.clone();
+    }
+
+    match (applied, authored) {
+        (
+            Value::Concrete(ConcreteValue::Map(values)),
+            Value::Concrete(ConcreteValue::Map(shapes)),
+        ) => Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    let protected = shapes.get(key).map_or_else(
+                        || value.clone(),
+                        |shape| union_secret_shapes_after_resolution(value, shape),
+                    );
+                    (key.clone(), protected)
+                })
+                .collect(),
+        )),
+        (
+            Value::Concrete(ConcreteValue::List(values)),
+            Value::Concrete(ConcreteValue::List(shapes)),
+        ) => Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    shapes.get(index).map_or_else(
+                        || value.clone(),
+                        |shape| union_secret_shapes_after_resolution(value, shape),
+                    )
+                })
+                .collect(),
+        )),
+        (
+            Value::Concrete(ConcreteValue::StringList(values)),
+            Value::Concrete(ConcreteValue::List(shapes)),
+        ) => rebuild_projected_string_list(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let value = Value::Concrete(ConcreteValue::String(value.clone()));
+                    shapes.get(index).map_or(value.clone(), |shape| {
+                        union_secret_shapes_after_resolution(&value, shape)
+                    })
+                })
+                .collect(),
+        ),
+        (Value::Concrete(_), Value::Deferred(_)) => applied.clone(),
+        _ => mask_plaintext_using_secret_shape_fail_closed(applied, authored),
     }
 }
 
@@ -9522,6 +9669,197 @@ mod tests {
             Value::Deferred(DeferredValue::Secret(Box::new(plaintext))),
             "an unresolved non-structural shape containing a secret must never leave provider plaintext unwrapped",
         );
+    }
+
+    #[test]
+    fn fail_closed_mask_isolates_an_unprojectable_nested_secret_shape() {
+        let public = Value::Concrete(ConcreteValue::String("public".into()));
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let plaintext = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), public.clone()),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let shape = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "selected".to_string(),
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                        Value::Concrete(ConcreteValue::String("fallback".into())),
+                    )))),
+                }),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+
+        let masked = mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape);
+        let Value::Concrete(ConcreteValue::Map(values)) = masked else {
+            panic!("fail-closed masking must preserve the map container");
+        };
+        assert_eq!(
+            values["selected"],
+            Value::Deferred(DeferredValue::Secret(Box::new(public))),
+        );
+        assert_eq!(values["sibling"], plain);
+    }
+
+    #[test]
+    fn fail_closed_mask_does_not_taint_siblings_of_an_absent_secret_position() {
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let plaintext = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "sibling".to_string(),
+            plain.clone(),
+        )])));
+        let shape = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "absent".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("not-returned".into()),
+            )))),
+        )])));
+
+        assert_eq!(
+            mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
+            plaintext,
+        );
+    }
+
+    #[test]
+    fn resolved_public_branch_overrides_unselected_authored_secret_fallback() {
+        let applied = Value::Concrete(ConcreteValue::String("selected-public".into()));
+        let authored = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback".into())),
+            )))),
+        });
+
+        assert_eq!(
+            union_secret_shapes_after_resolution(&applied, &authored),
+            applied,
+            "the apply-time branch selection is authoritative for a deferred authored node",
+        );
+    }
+
+    #[test]
+    fn authored_secret_union_projects_nested_values_without_tainting_siblings() {
+        let public = Value::Concrete(ConcreteValue::String("selected-public".into()));
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let authored_coalesce = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback".into())),
+            )))),
+        });
+        let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), public.clone()),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let authored = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), authored_coalesce),
+            ("sibling".to_string(), plain),
+        ])));
+
+        assert_eq!(
+            union_secret_shapes_after_resolution(&applied, &authored),
+            applied,
+        );
+    }
+
+    #[test]
+    fn authored_secret_union_projects_canonical_string_list_elements() {
+        let applied = Value::Concrete(ConcreteValue::StringList(vec![
+            "selected-public".into(),
+            "plain".into(),
+        ]));
+        let authored = Value::Concrete(ConcreteValue::List(vec![
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                    Value::Concrete(ConcreteValue::String("fallback".into())),
+                )))),
+            }),
+            Value::Concrete(ConcreteValue::String("plain".into())),
+        ]));
+
+        assert_eq!(
+            union_secret_shapes_after_resolution(&applied, &authored),
+            applied,
+        );
+    }
+
+    #[test]
+    fn authored_secret_union_retains_selected_and_explicit_secret_children() {
+        let selected_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("selected-secret".into()),
+        ))));
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let authored = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "selected".to_string(),
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(Value::resource_ref("producer", "missing", vec![])),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                        Value::Concrete(ConcreteValue::String("fallback".into())),
+                    )))),
+                }),
+            ),
+            (
+                "explicit".to_string(),
+                Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()))),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), selected_secret.clone()),
+            (
+                "explicit".to_string(),
+                Value::Concrete(ConcreteValue::String("explicit-secret".into())),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+
+        let merged = union_secret_shapes_after_resolution(&applied, &authored);
+        let Value::Concrete(ConcreteValue::Map(values)) = merged else {
+            panic!("merged value must remain a map");
+        };
+        assert_eq!(values["selected"], selected_secret);
+        assert!(matches!(
+            values["explicit"],
+            Value::Deferred(DeferredValue::Secret(_))
+        ));
+        assert_eq!(values["sibling"], plain);
+    }
+
+    #[test]
+    fn unprojectable_authored_secret_fails_closed_at_the_child_only() {
+        let unresolved = Value::resource_ref("runtime", "value", vec![]);
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("unresolved".to_string(), unresolved.clone()),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let authored = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "unresolved".to_string(),
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                        Value::Concrete(ConcreteValue::String("fallback".into())),
+                    )))),
+                }),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+
+        let merged = union_secret_shapes_after_resolution(&applied, &authored);
+        let Value::Concrete(ConcreteValue::Map(values)) = merged else {
+            panic!("merged value must remain a map");
+        };
+        assert_eq!(
+            values["unresolved"],
+            Value::Deferred(DeferredValue::Secret(Box::new(unresolved))),
+        );
+        assert_eq!(values["sibling"], plain);
     }
 
     #[test]

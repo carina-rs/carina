@@ -208,6 +208,26 @@ fn assert_converged(dir: &Path, operation: &str) {
     );
 }
 
+fn state_resource_attributes(
+    dir: &Path,
+    binding: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(dir.join("carina.state.json")).expect("read state file"),
+    )
+    .expect("state file must be valid JSON");
+    state["resources"]
+        .as_array()
+        .expect("state resources must be an array")
+        .iter()
+        .find(|resource| resource["binding"].as_str() == Some(binding))
+        .unwrap_or_else(|| panic!("state must contain binding `{binding}`"))["current"]
+        ["attributes"]
+        .as_object()
+        .expect("current resource attributes must be an object")
+        .clone()
+}
+
 fn write_updating_list_iterable(dir: &Path, coalesced: bool, updated: bool) {
     let values = if updated { r#"["a", "b"]"# } else { r#"["a"]"# };
     let iterable = if coalesced {
@@ -598,6 +618,150 @@ let s = mock.test.resource {
     assert!(
         !state.contains(SECRET),
         "the selected secret default leaked into state plaintext:\n{state}",
+    );
+}
+
+#[test]
+fn selected_public_coalesce_branch_stays_plain_and_plans_only_unrelated_update() {
+    const SECRET: &str = "unselected-nested-secret-must-not-taint-siblings-3961";
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+}
+
+let t = mock.test.resource {
+  name = "target"
+  tags = {
+    k = r.identifier ?? secret(env("SECRET_V"))
+    p = "plain"
+  }
+  rule {
+    action = r.identifier ?? secret(env("SECRET_V"))
+  }
+}
+
+let leaf = mock.test.resource {
+  name = "leaf"
+  comment = r.identifier ?? secret(env("SECRET_V"))
+}
+"#,
+    )
+    .expect("write selected-public nested coalesce fixture");
+
+    assert_success(
+        &run_cli(&project, &["init", "."]),
+        "init selected-public nested fixture",
+    );
+    assert_success(
+        &run_cli_with_env(
+            &project,
+            &["apply", "--auto-approve", "."],
+            &[("SECRET_V", SECRET)],
+        ),
+        "apply selected-public nested fixture",
+    );
+
+    let attributes = state_resource_attributes(&project, "t");
+    assert_eq!(attributes["tags"]["k"], "seed-id");
+    assert_eq!(attributes["tags"]["p"], "plain");
+    assert_eq!(attributes["rules"][0]["action"], "seed-id");
+    let leaf_attributes = state_resource_attributes(&project, "leaf");
+    assert_eq!(leaf_attributes["comment"], "seed-id");
+    let state = fs::read_to_string(project.join("carina.state.json")).expect("read state");
+    assert!(
+        !state.contains("\"$secret\"") && !state.contains(SECRET),
+        "an unselected secret fallback must not taint any state position:\n{state}",
+    );
+
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+}
+
+let t = mock.test.resource {
+  name = "target"
+  comment = "unrelated"
+  tags = {
+    k = r.identifier ?? secret(env("SECRET_V"))
+    p = "plain"
+  }
+  rule {
+    action = r.identifier ?? secret(env("SECRET_V"))
+  }
+}
+
+let leaf = mock.test.resource {
+  name = "leaf"
+  comment = r.identifier ?? secret(env("SECRET_V"))
+}
+"#,
+    )
+    .expect("write unrelated update for selected-public fixture");
+    let plan = run_cli_with_env(&project, &["plan", "."], &[("SECRET_V", SECRET)]);
+    assert_success(&plan, "plan unrelated selected-public update");
+    let rendered = String::from_utf8_lossy(&plan.stdout);
+    assert!(
+        rendered.contains("comment")
+            && rendered.contains("Plan: 0 to add, 1 to change, 0 to destroy."),
+        "the unrelated comment must be the only planned resource update:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("\n      tags:") && !rendered.contains("\n      rules:"),
+        "a selected public branch must not create phantom nested diffs:\n{rendered}",
+    );
+}
+
+#[test]
+fn selected_secret_coalesce_branch_hashes_only_its_nested_child() {
+    const SECRET: &str = "selected-nested-secret-must-not-leak-3961";
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(
+        project.join("main.crn"),
+        r#"let r = mock.test.resource {
+  name = "seed"
+}
+
+let t = mock.test.resource {
+  name = "target"
+  tags = {
+    k = r.comment ?? secret(env("SECRET_V"))
+    p = "plain"
+  }
+}
+"#,
+    )
+    .expect("write selected-secret nested coalesce fixture");
+
+    assert_success(
+        &run_cli(&project, &["init", "."]),
+        "init selected-secret nested fixture",
+    );
+    assert_success(
+        &run_cli_with_env(
+            &project,
+            &["apply", "--auto-approve", "."],
+            &[("SECRET_V", SECRET)],
+        ),
+        "apply selected-secret nested fixture",
+    );
+
+    let attributes = state_resource_attributes(&project, "t");
+    assert!(
+        attributes["tags"]["k"].get("$secret").is_some(),
+        "the selected secret fallback must be hashed at tags.k: {attributes:#?}",
+    );
+    assert_eq!(attributes["tags"]["p"], "plain");
+    let state = fs::read_to_string(project.join("carina.state.json")).expect("read state");
+    assert!(
+        !state.contains(SECRET),
+        "the selected nested secret leaked into state plaintext:\n{state}",
     );
 }
 

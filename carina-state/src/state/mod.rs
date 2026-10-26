@@ -27,8 +27,8 @@ use carina_core::resource::{
 use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
-    mask_plaintext_using_secret_shape_fail_closed, merge_secrets_into_observation_json,
-    merge_secrets_into_provider_json,
+    merge_secrets_into_observation_json, merge_secrets_into_provider_json,
+    union_secret_shapes_after_resolution,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -2375,9 +2375,7 @@ fn resource_with_secret_shape_union(
         .map(|(key, value)| {
             let protected = resource.attributes.get(key).map_or_else(
                 || value.clone(),
-                |authored_shape| {
-                    mask_plaintext_using_secret_shape_fail_closed(value, authored_shape)
-                },
+                |authored_shape| union_secret_shapes_after_resolution(value, authored_shape),
             );
             (key.clone(), protected)
         })
