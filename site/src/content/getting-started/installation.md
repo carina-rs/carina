@@ -71,7 +71,19 @@ carina init
 | GitHub | `github.com/carina-rs/carina-provider-awscc` | The repository's GitHub Releases |
 | Local file | `file:///path/to/provider.wasm` | A locally built component |
 
-With a GitHub source, `revision = 'main'` (a branch, tag, or commit SHA) can be used instead of `version` to install the provider's CI build artifact for that commit. Resolving a revision calls the GitHub API, so it needs a token (`GITHUB_TOKEN`, or a logged-in `gh`).
+Instead of `version`, `revision` installs the build for a branch or tag. `version` only accepts a version constraint, so `version = 'main'` is an error.
+
+With a registry source, the registry resolves the revision to the newest build it has for that branch or tag, so the build must be published there. The public registry serves releases only; branch builds are on the dev registry:
+
+```crn
+provider awscc {
+  source   = 'registry-dev.carina-rs.dev/carina-rs/awscc'
+  revision = 'main'
+  region   = awscc.Region.ap_northeast_1
+}
+```
+
+With a GitHub source, `revision` can also be a commit SHA and installs the CI build artifact for that commit. Resolving it calls the GitHub API, so it needs a token (`GITHUB_TOKEN`, or a logged-in `gh`). A registry source needs no token.
 
 The two official providers are:
 

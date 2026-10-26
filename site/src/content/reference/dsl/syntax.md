@@ -97,7 +97,7 @@ provider awscc {
 }
 ```
 
-`source` is required; `carina init` uses it to install the provider plugin. It is a registry address (`carina-rs/awscc`, or `host/namespace/name`), a GitHub repository (`github.com/owner/repo`), or a local `file://` path to a `.wasm` component. `source`, `version`, and `revision` must be string literals. `version` (a version constraint) or `revision` (a git branch, tag, or commit) pins which build is installed. The two are mutually exclusive.
+`source` is required; `carina init` uses it to install the provider plugin. It is a registry address (`carina-rs/awscc`, or `host/namespace/name`), a GitHub repository (`github.com/owner/repo`), or a local `file://` path to a `.wasm` component. `source`, `version`, and `revision` must be string literals. `version` (a version constraint) or `revision` (a branch or tag; a commit SHA only with a `github.com/...` source) pins which build is installed. The two are mutually exclusive.
 
 Multiple providers can be configured in the same directory:
 
