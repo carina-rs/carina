@@ -135,8 +135,8 @@ carina plan --image plan.png
 ```
 
 In GitHub Actions, keep exit code `2` (changes present) from failing the job,
-fail it on a real error (`1`), and upload the image as a build artifact that
-reviewers can download and drag into a pull request comment:
+fail it on a real error (`1`), and post the image to the pull request with
+`gh pr comment --attach` (GitHub CLI 2.99.0 or later):
 
 ```yaml
 - id: plan
@@ -146,15 +146,17 @@ reviewers can download and drag into a pull request comment:
     code=$?
     echo "exitcode=$code" >> "$GITHUB_OUTPUT"
     [ "$code" -ne 1 ]
-- uses: actions/upload-artifact@v4
-  with:
-    name: carina-plan
-    path: plan.png
-    if-no-files-found: error
+- if: steps.plan.outputs.exitcode == '2'
+  env:
+    GH_TOKEN: ${{ secrets.PLAN_COMMENT_TOKEN }}
+  run: gh pr comment "${{ github.event.pull_request.number }}" --attach 'plan.png#carina plan'
 ```
 
-GitHub has no API for uploading images into a comment, so attaching the image
-to the comment itself is a manual step (or needs a third-party action).
+The workflow's own `GITHUB_TOKEN` cannot upload attachments: the upload
+endpoint answers `404` to it even with `contents`, `issues`, and
+`pull-requests` write permissions. Store a classic personal access token with
+the `repo` scope, from a user with write access to the repository, as a secret
+(`PLAN_COMMENT_TOKEN` above).
 
 ## Examples
 
