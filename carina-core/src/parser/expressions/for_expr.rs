@@ -282,24 +282,36 @@ pub(crate) fn parse_for_expr(
                 );
             }
         }
-        // Unresolved reference — defer expansion to plan/apply when the
-        // upstream values are loaded. Field validity is checked statically
-        // by `upstream_exports::check_upstream_state_field_references`; for
-        // a valid field the deferral is an implementation detail the user
-        // doesn't need to hear about at validate time.
-        (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
+        // Any deferred iterable is retained as a complete expression and
+        // replayed at plan/apply time. In particular, `ref ?? default` must
+        // not collapse to the default before the reference snapshot is known
+        // to be complete.
+        (_, iterable @ Value::Deferred(_)) => {
+            let iterable_surface = crate::value::format_value(iterable);
             // Build the for-expression header string
             let header = match &binding {
                 ForBinding::Simple(var) => {
-                    format!("for {} in {}", var, path.to_dot_string())
+                    format!("for {} in {}", var, iterable_surface)
                 }
                 ForBinding::Indexed(idx, val) => {
-                    format!("for ({}, {}) in {}", idx, val, path.to_dot_string())
+                    format!("for ({}, {}) in {}", idx, val, iterable_surface)
                 }
                 ForBinding::Map(k, v) => {
-                    format!("for {}, {} in {}", k, v, path.to_dot_string())
+                    format!("for {}, {} in {}", k, v, iterable_surface)
                 }
             };
+
+            // Transitional display/effect metadata names the first reference;
+            // semantic resolution and dependency walking use `iterable`.
+            let mut first_path = None;
+            iterable.visit_resource_refs(&mut |path| {
+                if first_path.is_none() {
+                    first_path = Some(path.clone());
+                }
+            });
+            let (iterable_binding, iterable_attr) = first_path
+                .map(|path| (path.binding().to_string(), path.attribute().to_string()))
+                .unwrap_or_default();
 
             // Try to parse the body once with placeholder values for the loop
             // variable(s) to extract the resource type and attribute template.
@@ -359,8 +371,9 @@ pub(crate) fn parse_for_expr(
                     },
                     attributes: attrs,
                     binding_name: binding_name.to_string(),
-                    iterable_binding: path.binding().to_string(),
-                    iterable_attr: path.attribute().to_string(),
+                    iterable: iterable.clone(),
+                    iterable_binding,
+                    iterable_attr,
                     binding: binding.clone(),
                     template_resource: *resource,
                 });
@@ -436,6 +449,7 @@ pub(crate) fn parse_for_expr(
                         },
                         attributes: attrs,
                         binding_name: binding_name.to_string(),
+                        iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
                         iterable_binding: s.clone(),
                         iterable_attr: String::new(),
                         binding: binding.clone(),

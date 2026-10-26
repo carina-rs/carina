@@ -780,6 +780,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         binding_name: "validation_records".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         iterable_binding: "cert".to_string(),
         iterable_attr: "domain_validation_options".to_string(),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
@@ -836,6 +837,7 @@ fn deferred_validation_records_effect() -> Effect {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         binding_name: "validation_records".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         iterable_binding: "cert".to_string(),
         iterable_attr: "domain_validation_options".to_string(),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),

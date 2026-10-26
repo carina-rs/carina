@@ -3797,6 +3797,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
         | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -3855,6 +3856,7 @@ pub fn merge_default_tags(
             Err(
                 error @ (SerializationError::UnknownNotAllowed { .. }
                 | SerializationError::UnresolvedResourceRef { .. }
+                | SerializationError::UnresolvedCoalesce { .. }
                 | SerializationError::UnresolvedInterpolation { .. }
                 | SerializationError::UnresolvedFunctionCall { .. }
                 | SerializationError::UnresolvedAccess { .. }

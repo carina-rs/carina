@@ -5914,6 +5914,64 @@ for name, _ in orgs.account {
 }
 
 #[test]
+fn upstream_state_missing_coalesce_value_is_not_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.account ?? []) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "a missing coalesce value is intentionally optional: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn upstream_state_missing_coalesce_default_is_still_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.accounts ?? orgs.account) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "references in the coalesce default remain required: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn upstream_state_known_field_passes() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }
@@ -6242,6 +6300,36 @@ for name, _ in org.accounts {
             .iter()
             .any(|d| d.message.contains("Undefined identifier `org`")),
         "got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_coalesce_default_undefined_binding_is_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.accounts ?? fallback.accounts) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier `fallback`")),
+        "the coalesce default must be walked, got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

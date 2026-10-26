@@ -1329,12 +1329,28 @@ pub enum BindingValueSource {
 
 /// One entry in [`ResolvedBindings`]: the merged attribute map and the
 /// source it came from. Stored as a single struct (rather than two
-/// parallel maps) so the type system enforces "every name has both
-/// attributes and a source".
+/// parallel maps) so the type system enforces "every name has attributes,
+/// provenance, and an explicit completeness state".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingCompleteness {
+    /// The snapshot was successfully loaded/read/applied. A missing key is
+    /// definitive absence and may select a coalesce default.
+    Complete,
+    /// The snapshot is provisional or unavailable. A missing key is unknown
+    /// and must not select a coalesce default.
+    Incomplete,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedBinding {
     pub attributes: HashMap<String, Value>,
     pub source: BindingValueSource,
+    pub completeness: BindingCompleteness,
+    /// Attributes whose present values are authoritative even when the
+    /// surrounding snapshot is incomplete. For managed resources these are
+    /// desired/configured attributes; provider outputs merged from an old or
+    /// in-flight snapshot are deliberately excluded.
+    definitive_attributes: HashSet<String>,
 }
 
 /// Value-aware sibling of [`BindingIndex`]. See the module-level doc for
@@ -1429,9 +1445,7 @@ impl ResolvedBindings {
             inputs.remote_bindings,
         );
         bindings.layer_data_source_bindings(inputs.data_sources, inputs.data_source_states);
-        bindings
-            .layer_compositions_post_apply(inputs.compositions)
-            .expect("layer_compositions_post_apply is currently infallible");
+        bindings.layer_compositions(inputs.compositions, BindingCompleteness::Incomplete);
         bindings.layer_wait_aliases(inputs.wait_aliases);
         bindings
     }
@@ -1453,16 +1467,53 @@ impl ResolvedBindings {
                 continue;
             };
             let mut merged: HashMap<String, Value> = resource.resolved_attributes();
+            let mut definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
+            let mut completeness = BindingCompleteness::Incomplete;
             if let Some(current) = managed_current.get(&resource.id) {
                 match current.current() {
                     crate::resource::Current::Absent(_absent) => {}
                     crate::resource::Current::Present(present) => {
+                        // A refreshed snapshot is complete only while the
+                        // desired inputs that can affect provider outputs are
+                        // unchanged. During an update, old output attributes
+                        // are provisional and `??` must not treat a missing
+                        // output as definitive absence.
+                        if resource.attributes.iter().all(|(key, desired)| {
+                            present
+                                .state()
+                                .attributes
+                                .get(key)
+                                // Providers may omit write-only or otherwise
+                                // non-persisted inputs from a refreshed state.
+                                // Such an omission is not evidence of a
+                                // change; only a comparable value that differs
+                                // makes provider outputs provisional.
+                                .is_none_or(|current| desired.semantically_equal(current))
+                        }) {
+                            completeness = BindingCompleteness::Complete;
+                        }
                         for (k, v) in &present.state().attributes {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
                         }
                     }
                     crate::resource::Current::CreateInFlight(_pending) => {}
                     crate::resource::Current::MissingIdentifier(unidentified) => {
+                        let snapshot_matches_desired =
+                            resource.attributes.iter().all(|(key, desired)| {
+                                unidentified
+                                    .state()
+                                    .attributes
+                                    .get(key)
+                                    .is_none_or(|current| desired.semantically_equal(current))
+                            });
+                        if snapshot_matches_desired {
+                            // The row is not complete enough to prove a
+                            // missing output absent, but concrete values it
+                            // already carries are usable unless an observable
+                            // desired input changed.
+                            definitive_attributes
+                                .extend(unidentified.state().attributes.keys().cloned());
+                        }
                         for (k, v) in &unidentified.state().attributes {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
                         }
@@ -1474,6 +1525,8 @@ impl ResolvedBindings {
                 ResolvedBinding {
                     attributes: merged,
                     source: BindingValueSource::Local,
+                    completeness,
+                    definitive_attributes,
                 },
             );
         }
@@ -1484,6 +1537,8 @@ impl ResolvedBindings {
                 ResolvedBinding {
                     attributes: remote_attrs.clone(),
                     source: BindingValueSource::Upstream,
+                    completeness: BindingCompleteness::Complete,
+                    definitive_attributes: HashSet::new(),
                 },
             );
         }
@@ -1501,6 +1556,8 @@ impl ResolvedBindings {
                 continue;
             };
             let snapshot = target_entry.attributes.clone();
+            let completeness = target_entry.completeness;
+            let definitive_attributes = target_entry.definitive_attributes.clone();
             self.by_name.insert(
                 spec.binding.as_str().to_string(),
                 ResolvedBinding {
@@ -1508,6 +1565,8 @@ impl ResolvedBindings {
                     source: BindingValueSource::WaitAlias {
                         target: spec.target.clone(),
                     },
+                    completeness,
+                    definitive_attributes,
                 },
             );
         }
@@ -1553,6 +1612,15 @@ impl ResolvedBindings {
         &mut self,
         compositions: &[Composition],
     ) -> Result<(), String> {
+        self.layer_compositions(compositions, BindingCompleteness::Complete);
+        Ok(())
+    }
+
+    fn layer_compositions(
+        &mut self,
+        compositions: &[Composition],
+        completeness: BindingCompleteness,
+    ) {
         for v in compositions.iter() {
             let Some(binding_name) = v.binding.as_ref() else {
                 continue;
@@ -1563,15 +1631,17 @@ impl ResolvedBindings {
                 .iter()
                 .map(|(k, attr)| (k.clone(), attr.to_value()))
                 .collect();
+            let definitive_attributes = value_attrs.keys().cloned().collect();
             self.by_name.insert(
                 binding_name.clone(),
                 ResolvedBinding {
                     attributes: crate::resource::attrs_to_hashmap(&value_attrs),
                     source: BindingValueSource::Local,
+                    completeness,
+                    definitive_attributes,
                 },
             );
         }
-        Ok(())
     }
 
     /// Layer data-source bindings onto the view. carina#3181: a
@@ -1635,11 +1705,17 @@ impl ResolvedBindings {
                 continue;
             };
             let mut merged = crate::resource::attrs_to_hashmap(&d.attributes);
-            if let Some(state) = data_source_states.get(&d.id)
-                && state.exists
-            {
-                for (k, v) in &state.attributes {
-                    merged.insert(k.clone(), v.clone());
+            let definitive_attributes = merged.keys().cloned().collect();
+            let mut completeness = BindingCompleteness::Incomplete;
+            if let Some(state) = data_source_states.get(&d.id) {
+                // Presence in `data_source_states` means the provider read
+                // completed. A not-found result contributes no attributes,
+                // but its missing outputs are still definitive absence.
+                completeness = BindingCompleteness::Complete;
+                if state.exists {
+                    for (k, v) in &state.attributes {
+                        merged.insert(k.clone(), v.clone());
+                    }
                 }
             }
             self.by_name.insert(
@@ -1647,6 +1723,8 @@ impl ResolvedBindings {
                 ResolvedBinding {
                     attributes: merged,
                     source: BindingValueSource::Local,
+                    completeness,
+                    definitive_attributes,
                 },
             );
         }
@@ -1658,6 +1736,38 @@ impl ResolvedBindings {
 
     pub fn source(&self, name: &str) -> Option<&BindingValueSource> {
         self.by_name.get(name).map(|b| &b.source)
+    }
+
+    pub fn completeness(&self, name: &str) -> Option<BindingCompleteness> {
+        self.by_name.get(name).map(|b| b.completeness)
+    }
+
+    pub fn attribute_is_definitive(&self, name: &str, attribute: &str) -> bool {
+        self.by_name.get(name).is_some_and(|binding| {
+            binding.completeness == BindingCompleteness::Complete
+                || binding.definitive_attributes.contains(attribute)
+        })
+    }
+
+    pub fn access_miss_policy_for_value(&self, value: &Value) -> crate::resource::AccessMissPolicy {
+        let mut complete = true;
+        value.visit_resource_refs(&mut |path| {
+            complete &= self
+                .by_name
+                .get(path.binding())
+                .is_some_and(|binding| binding.completeness == BindingCompleteness::Complete);
+        });
+        value.visit_binding_refs(&mut |name| {
+            complete &= self
+                .by_name
+                .get(name)
+                .is_some_and(|binding| binding.completeness == BindingCompleteness::Complete);
+        });
+        if complete {
+            crate::resource::AccessMissPolicy::Error
+        } else {
+            crate::resource::AccessMissPolicy::Defer
+        }
     }
 
     /// Record (or refresh) a binding after a `Create` / `Update` effect
@@ -1690,6 +1800,8 @@ impl ResolvedBindings {
             ResolvedBinding {
                 attributes: merged,
                 source: BindingValueSource::Local,
+                completeness: BindingCompleteness::Complete,
+                definitive_attributes: HashSet::new(),
             },
         );
     }
@@ -1706,11 +1818,30 @@ impl ResolvedBindings {
     /// `HashMap::insert` (which returns the previous value); this method
     /// is fire-and-forget.
     pub fn set(&mut self, name: &str, attrs: HashMap<String, Value>, source: BindingValueSource) {
+        let completeness = match source {
+            BindingValueSource::Upstream => BindingCompleteness::Complete,
+            BindingValueSource::Local | BindingValueSource::WaitAlias { .. } => {
+                BindingCompleteness::Incomplete
+            }
+        };
+        self.set_with_completeness(name, attrs, source, completeness);
+    }
+
+    pub fn set_with_completeness(
+        &mut self,
+        name: &str,
+        attrs: HashMap<String, Value>,
+        source: BindingValueSource,
+        completeness: BindingCompleteness,
+    ) {
+        let definitive_attributes = attrs.keys().cloned().collect();
         self.by_name.insert(
             name.to_string(),
             ResolvedBinding {
                 attributes: attrs,
                 source,
+                completeness,
+                definitive_attributes,
             },
         );
     }
@@ -1777,6 +1908,8 @@ impl IterableBindings {
                         ResolvedBinding {
                             attributes,
                             source: BindingValueSource::Upstream,
+                            completeness: BindingCompleteness::Complete,
+                            definitive_attributes: HashSet::new(),
                         },
                     )
                 })
@@ -1794,6 +1927,26 @@ impl IterableBindings {
     /// as final.
     pub fn source(&self, binding: &str) -> Option<&BindingValueSource> {
         self.by_binding.get(binding).map(|entry| &entry.source)
+    }
+
+    /// Resolve a complete deferred iterable through the same three-state
+    /// evaluator used by ordinary resource attributes.
+    pub fn resolve_value(&self, value: &Value) -> Result<crate::resolver::ValueResolution, String> {
+        crate::resolver::resolve_ref_value_status(
+            value,
+            &ResolvedBindings {
+                by_name: self.by_binding.clone(),
+            },
+        )
+    }
+
+    /// Missing selections may be treated as final only when every binding
+    /// reachable from the iterable is complete.
+    pub fn access_miss_policy(&self, value: &Value) -> crate::resource::AccessMissPolicy {
+        ResolvedBindings {
+            by_name: self.by_binding.clone(),
+        }
+        .access_miss_policy_for_value(value)
     }
 }
 
@@ -3358,6 +3511,39 @@ mod resolved_bindings_tests {
         assert_eq!(
             resolved.source("admin_access_roles"),
             Some(&BindingValueSource::Local)
+        );
+    }
+
+    #[test]
+    fn completed_not_found_data_source_makes_missing_output_absent() {
+        let id = ResourceId::with_identity("test.Lookup", "lookup");
+        let mut data_source = DataSource::new("test.Lookup", "lookup");
+        data_source.id = id.clone();
+        data_source.binding = Some("lookup".to_string());
+        let states = HashMap::from([(id.clone(), State::not_found(id))]);
+
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            data_sources: &[data_source],
+            managed_current: &HashMap::new(),
+            data_source_states: &states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        assert_eq!(
+            resolved.completeness("lookup"),
+            Some(BindingCompleteness::Complete),
+        );
+
+        let fallback = Value::Concrete(ConcreteValue::String("fallback".into()));
+        let expression = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("lookup", "result", Vec::new())),
+            default: Box::new(fallback.clone()),
+        });
+        assert_eq!(
+            crate::resolver::resolve_ref_value_status(&expression, &resolved),
+            Ok(crate::resolver::ValueResolution::Present(fallback)),
         );
     }
 

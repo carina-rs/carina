@@ -549,14 +549,32 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let deferred_create_targets: Vec<_> = deferred_for_expansion
         .deferred_create_targets
         .into_iter()
-        .filter(|target| managed_bindings.contains(&target.upstream_binding))
+        .filter(|target| {
+            let mut references_managed = false;
+            target.template.iterable.visit_resource_refs(&mut |path| {
+                references_managed |= managed_bindings.contains(path.binding());
+            });
+            target.template.iterable.visit_binding_refs(&mut |binding| {
+                references_managed |= managed_bindings.contains(binding);
+            });
+            references_managed
+        })
         .collect();
     let mut residual_deferred_for = deferred_for_expansion.residual_deferred_for;
     residual_deferred_for.extend(
         parsed
             .deferred_for_expressions
             .iter()
-            .filter(|deferred| !managed_bindings.contains(&deferred.iterable_binding))
+            .filter(|deferred| {
+                let mut references_managed = false;
+                deferred.iterable.visit_resource_refs(&mut |path| {
+                    references_managed |= managed_bindings.contains(path.binding());
+                });
+                deferred.iterable.visit_binding_refs(&mut |binding| {
+                    references_managed |= managed_bindings.contains(binding);
+                });
+                !references_managed
+            })
             .cloned(),
     );
     let resolved_resources = carina_core::resource::ResolvedResource::collect_resolved(

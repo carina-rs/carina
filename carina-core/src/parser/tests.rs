@@ -8872,7 +8872,7 @@ exports {
 }
 
 #[test]
-fn coalesce_operator_returns_default_for_unresolved_ref() {
+fn coalesce_operator_retains_unresolved_ref_and_default() {
     let input = r#"
 provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -8887,21 +8887,60 @@ awscc.ec2.Subnet {
 }
 "#;
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    // vpc.missing_attr is a ResourceRef (unresolved at parse time), so ?? returns default
     let subnet = parsed
         .resources
         .iter()
         .find(|r| r.id.resource_type == "ec2.Subnet")
         .unwrap();
     let cidr = subnet.get_attr("cidr_block");
-    // At parse time, vpc.missing_attr is still a ResourceRef (not resolved), so ?? kicks in
-    // Actually, resource refs remain as ResourceRef until resolution, so the left side IS a ResourceRef
+    let Some(Value::Deferred(DeferredValue::Coalesce { value, default })) = cidr else {
+        panic!("unresolved ?? must remain deferred, got {cidr:?}");
+    };
+    let Value::Deferred(DeferredValue::ResourceRef { path }) = value.as_ref() else {
+        panic!("coalesce must retain its reference operand, got {value:?}");
+    };
+    assert_eq!(path.binding(), "vpc");
+    assert_eq!(path.attribute(), "missing_attr");
     assert_eq!(
-        cidr,
-        Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.1.0/24".into()
-        ))),
-        "?? should return default when left is an unresolved ResourceRef"
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
+    );
+}
+
+#[test]
+fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
+    let input = r#"
+        let orgs = upstream_state {
+            source = "../organizations"
+        }
+
+        for account_id in (orgs.accounts ?? []) {
+            awscc.sso.Assignment {
+                instance_arn = 'arn:aws:sso:::instance/ssoins-12345'
+                target_id = account_id
+                target_type = 'AWS_ACCOUNT'
+            }
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let [deferred] = parsed.deferred_for_expressions.as_slice() else {
+        panic!(
+            "coalesced unresolved iterable must produce one deferred for-expression: {:?}",
+            parsed.deferred_for_expressions
+        );
+    };
+    let Value::Deferred(DeferredValue::Coalesce { value, default }) = &deferred.iterable else {
+        panic!("deferred for must retain the full coalesce iterable");
+    };
+    assert!(matches!(
+        value.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if path.binding() == "orgs" && path.attribute() == "accounts"
+    ));
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::List(Vec::new())),
     );
 }
 
@@ -10540,6 +10579,32 @@ fn parse_directory_files_resolves_long_linear_chain_before_iteration_cap() {
     assert_directory_let_chain_resolves(8);
 }
 
+#[test]
+fn parse_directory_files_folds_coalesce_after_later_let_resolves() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("consumer.crn"),
+            "let selected = candidate ?? 'fallback'".to_string(),
+        ),
+        (
+            std::path::PathBuf::from("producer.crn"),
+            "let candidate = 'resolved'".to_string(),
+        ),
+    ];
+
+    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect("later sibling let should resolve through coalesce");
+    let consumer = parsed
+        .iter()
+        .find(|(path, _)| path == &std::path::PathBuf::from("consumer.crn"))
+        .expect("consumer file parsed");
+
+    assert_eq!(
+        consumer.1.parsed().variables.get("selected"),
+        Some(&Value::Concrete(ConcreteValue::String("resolved".into()))),
+    );
+}
+
 fn assert_directory_let_chain_resolves(hops: usize) {
     let files = sibling_let_chain_files(hops);
     let final_name = chain_binding_name(hops);
@@ -11313,6 +11378,26 @@ fn parse_directory_resolves_sibling_user_fn_with_static_args() {
             "expected timestamp() to resolve to a String or be kept as FunctionCall, got {other:?}"
         ),
     }
+}
+
+#[test]
+fn parse_directory_folds_coalesce_after_sibling_function_resolves() {
+    use crate::config_loader::parse_directory;
+    let tmp = sibling_user_fn_fixture("timestamp() ?? 'fallback'");
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("sibling-file function in coalesce must parse");
+    let value = parsed
+        .resources
+        .iter()
+        .find_map(|resource| resource.attributes.get("created_at"))
+        .expect("created_at exists");
+
+    assert_eq!(
+        value,
+        &Value::Concrete(ConcreteValue::String("2026-05-05".into())),
+        "a concrete function result must win over the coalesce default",
+    );
 }
 
 #[test]

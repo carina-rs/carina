@@ -132,6 +132,15 @@ fn value_depends_on_module_output(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             value_depends_on_module_output(inner, module_bindings, variables, visiting_variables)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
+                || value_depends_on_module_output(
+                    default,
+                    module_bindings,
+                    variables,
+                    visiting_variables,
+                )
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -283,6 +292,9 @@ impl<'a> ContextFreeValue<'a> {
                         || matches!(part, carina_core::resource::InterpolationPart::Expr(value) if is_context_free(value))
                 }),
                 Value::Deferred(DeferredValue::Secret(inner)) => is_context_free(inner),
+                Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                    is_context_free(value) && is_context_free(default)
+                }
             }
         }
 
@@ -545,6 +557,10 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             contains_matching_function_call(inner, matches_name)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_matching_function_call(value, matches_name)
+                || contains_matching_function_call(default, matches_name)
         }
         _ => false,
     }
@@ -1806,12 +1822,19 @@ impl DiagnosticEngine {
             if !deferred_in_current_file(deferred, current_file_name) {
                 continue;
             }
-            if known.contains(&deferred.iterable_binding) {
-                continue;
-            }
-            let line_zero_based = deferred.line.saturating_sub(1) as u32;
-            let (col, end_col) =
-                find_for_iterable_binding_column(&text, deferred.line, &deferred.iterable_binding)
+            let mut roots = std::collections::BTreeSet::new();
+            deferred.iterable.visit_resource_refs(&mut |path| {
+                roots.insert(path.binding().to_string());
+            });
+            deferred.iterable.visit_binding_refs(&mut |binding| {
+                roots.insert(binding.to_string());
+            });
+            for root in roots {
+                if known.contains(&root) {
+                    continue;
+                }
+                let line_zero_based = deferred.line.saturating_sub(1) as u32;
+                let (col, end_col) = find_for_iterable_binding_column(&text, deferred.line, &root)
                     .unwrap_or_else(|| {
                         // Multi-line `for` headers put the iterable on a later line;
                         // anchor the squiggle at the `for` keyword line so the user
@@ -1823,22 +1846,23 @@ impl DiagnosticEngine {
                             .unwrap_or(0);
                         (0, line_chars)
                     });
-            // Build the same enriched UndefinedIdentifier the CLI would emit
-            // so the editor shows the did-you-mean suggestion and the list of
-            // in-scope bindings (#2038).
-            let in_scope: Vec<String> = known.iter_names().map(String::from).collect();
-            let err = carina_core::parser::ParseError::undefined_identifier(
-                deferred.iterable_binding.clone(),
-                deferred.line,
-                in_scope,
-            );
-            diagnostics.push(carina_diagnostic(
-                line_zero_based,
-                col,
-                end_col,
-                DiagnosticSeverity::ERROR,
-                err.to_string(),
-            ));
+                // Build the same enriched UndefinedIdentifier the CLI would emit
+                // so the editor shows the did-you-mean suggestion and the list of
+                // in-scope bindings (#2038).
+                let in_scope: Vec<String> = known.iter_names().map(String::from).collect();
+                let err = carina_core::parser::ParseError::undefined_identifier(
+                    root,
+                    deferred.line,
+                    in_scope,
+                );
+                diagnostics.push(carina_diagnostic(
+                    line_zero_based,
+                    col,
+                    end_col,
+                    DiagnosticSeverity::ERROR,
+                    err.to_string(),
+                ));
+            }
         }
         diagnostics
     }
@@ -2970,10 +2994,22 @@ impl DiagnosticEngine {
         binding_index: &BindingIndex<'_>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
-        value.visit_resource_refs(&mut |path| {
+        value.visit_resource_refs_with_usage(&mut |path, usage| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let message = match binding_index.ref_type(path) {
+                RefType::UnknownAttribute(error)
+                    if matches!(
+                        usage,
+                        carina_core::resource::ResourceRefUsage::CoalesceValue
+                    ) && matches!(
+                        error,
+                        RefTypeError::UnknownAttribute { .. }
+                            | RefTypeError::UnknownUpstreamExport { .. }
+                    ) =>
+                {
+                    return;
+                }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
                     known_attributes,
                     target: RefTargetKind::Schema { resource_type },

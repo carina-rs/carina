@@ -247,34 +247,43 @@ fn unique_union_map_member<'a>(
 pub(crate) fn visit_refs_with_sink<'a>(
     value: &Value,
     sink: Option<RefSink<'a>>,
-    f: &mut impl FnMut(ReferencePathRef<'_>, Option<RefSink<'a>>),
+    f: &mut impl FnMut(ReferencePathRef<'_>, Option<RefSink<'a>>, crate::resource::ResourceRefUsage),
+) {
+    visit_refs_with_sink_inner(value, sink, crate::resource::ResourceRefUsage::Required, f);
+}
+
+fn visit_refs_with_sink_inner<'a>(
+    value: &Value,
+    sink: Option<RefSink<'a>>,
+    usage: crate::resource::ResourceRefUsage,
+    f: &mut impl FnMut(ReferencePathRef<'_>, Option<RefSink<'a>>, crate::resource::ResourceRefUsage),
 ) {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            f(ReferencePathRef::Access(path), sink)
+            f(ReferencePathRef::Access(path), sink, usage)
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            f(ReferencePathRef::Binding(binding), sink)
+            f(ReferencePathRef::Binding(binding), sink, usage)
         }
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument { name, .. },
-        )) => f(ReferencePathRef::Binding(name), sink),
+        )) => f(ReferencePathRef::Binding(name), sink, usage),
         Value::Concrete(ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
             for item in items {
-                visit_refs_with_sink(item, child_sink, f);
+                visit_refs_with_sink_inner(item, child_sink, usage, f);
             }
         }
         Value::Concrete(ConcreteValue::Map(entries)) => {
             for (key, value) in entries {
                 let child_sink = sink.and_then(|sink| sink.map_entry(key));
-                visit_refs_with_sink(value, child_sink, f);
+                visit_refs_with_sink_inner(value, child_sink, usage, f);
             }
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    visit_refs_with_sink(value, Some(RefSink::String), f);
+                    visit_refs_with_sink_inner(value, Some(RefSink::String), usage, f);
                 }
             }
         }
@@ -286,7 +295,7 @@ pub(crate) fn visit_refs_with_sink<'a>(
             // inputs. Function parameter sites are walked separately with
             // BindingIndex's signature authority.
             for argument in args {
-                visit_refs_with_sink(argument.walker_value(), None, f);
+                visit_refs_with_sink_inner(argument.walker_value(), None, usage, f);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -295,15 +304,31 @@ pub(crate) fn visit_refs_with_sink<'a>(
                 // structural references. Project their postfix chain through
                 // BindingIndex so `cfg.field` receives the same narrowing and
                 // diagnostic origin as an ordinary path.
-                f(reference.as_ref(), sink);
+                f(reference.as_ref(), sink, usage);
             } else {
                 // Other Access values have computed operands. References
                 // nested inside the computation do not inherit its result
                 // sink.
-                visit_refs_with_sink(access.base(), None, f);
+                visit_refs_with_sink_inner(access.base(), None, usage, f);
             }
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => visit_refs_with_sink(inner, sink, f),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            visit_refs_with_sink_inner(inner, sink, usage, f)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            visit_refs_with_sink_inner(
+                value,
+                sink,
+                crate::resource::ResourceRefUsage::CoalesceValue,
+                f,
+            );
+            visit_refs_with_sink_inner(
+                default,
+                sink,
+                crate::resource::ResourceRefUsage::Required,
+                f,
+            );
+        }
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -369,6 +394,10 @@ fn visit_computed_accesses_with_sink<'a>(
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             visit_computed_accesses_with_sink(inner, sink, f)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            visit_computed_accesses_with_sink(value, sink, f);
+            visit_computed_accesses_with_sink(default, sink, f);
         }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
@@ -496,6 +525,7 @@ fn resolve_resource_reference(
     resource_id: &crate::resource::ResourceId,
     reference: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
+    usage: crate::resource::ResourceRefUsage,
     all_errors: &mut Vec<String>,
 ) -> Option<ResolvedRefType> {
     match bindings.ref_type(reference) {
@@ -508,6 +538,9 @@ fn resolve_resource_reference(
                 reference.binding(),
                 reference.to_dot_string(),
             ));
+            None
+        }
+        RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {
             None
         }
         RefType::UnknownAttribute(error) => {
@@ -531,6 +564,17 @@ pub enum ModuleCallRefErrorKind {
 enum UnknownReferencePolicy {
     Report,
     Defer,
+}
+
+fn suppress_coalesce_existence_error(
+    error: &RefTypeError,
+    usage: crate::resource::ResourceRefUsage,
+) -> bool {
+    matches!(usage, crate::resource::ResourceRefUsage::CoalesceValue)
+        && matches!(
+            error,
+            RefTypeError::UnknownAttribute { .. } | RefTypeError::UnknownUpstreamExport { .. }
+        )
 }
 
 /// Structured module-call reference error shared by CLI and LSP surfaces.
@@ -635,9 +679,9 @@ fn validate_module_call_argument_ref_types_inner(
             visit_refs_with_sink(
                 value.walker_value(),
                 declared_sink.map(RefSink::TypeExpr),
-                &mut |path, sink| {
+                &mut |path, sink, usage| {
                     let Some(kind) =
-                        composition_ref_error_kind(path, sink, bindings, unknown_policy)
+                        composition_ref_error_kind(path, sink, bindings, unknown_policy, usage)
                     else {
                         return;
                     };
@@ -869,6 +913,7 @@ fn composition_ref_error_kind(
     sink: Option<RefSink<'_>>,
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
+    usage: crate::resource::ResourceRefUsage,
 ) -> Option<ModuleCallRefErrorKind> {
     match bindings.ref_type(path) {
         RefType::Typed(source) => {
@@ -884,6 +929,9 @@ fn composition_ref_error_kind(
                     actual: mismatch.actual_type_name().to_string(),
                     declared: mismatch.declared_type_name().map(str::to_string),
                 })
+        }
+        RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {
+            None
         }
         RefType::UnknownAttribute(error) => match unknown_policy {
             UnknownReferencePolicy::Report => Some(ModuleCallRefErrorKind::UnknownAttribute(error)),
@@ -920,11 +968,12 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
         unknown_policy: UnknownReferencePolicy,
         errors: &mut Vec<String>,
     ) {
-        visit_refs_with_sink(value, sink, &mut |path, sink| {
+        visit_refs_with_sink(value, sink, &mut |path, sink, usage| {
             let Some(sink) = sink else {
                 return;
             };
-            let Some(kind) = composition_ref_error_kind(path, Some(sink), bindings, unknown_policy)
+            let Some(kind) =
+                composition_ref_error_kind(path, Some(sink), bindings, unknown_policy, usage)
             else {
                 return;
             };
@@ -1118,6 +1167,24 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
                 unknown_policy,
                 errors,
             ),
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                check_function_calls(
+                    value,
+                    result_sink,
+                    context,
+                    bindings,
+                    unknown_policy,
+                    errors,
+                );
+                check_function_calls(
+                    default,
+                    result_sink,
+                    context,
+                    bindings,
+                    unknown_policy,
+                    errors,
+                );
+            }
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -1301,7 +1368,7 @@ pub fn validate_composition_ref_types_with_bindings(
             visit_refs_with_sink(
                 argument.value(),
                 argument.declared_type().map(RefSink::TypeExpr),
-                &mut |path, sink| {
+                &mut |path, sink, usage| {
                     let current_position = reference_position;
                     reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(
@@ -1309,6 +1376,7 @@ pub fn validate_composition_ref_types_with_bindings(
                         sink,
                         bindings,
                         UnknownReferencePolicy::Report,
+                        usage,
                     ) else {
                         return;
                     };
@@ -1339,7 +1407,7 @@ pub fn validate_composition_ref_types_with_bindings(
             visit_refs_with_sink(
                 &value,
                 attribute.declared_type().map(RefSink::TypeExpr),
-                &mut |path, sink| {
+                &mut |path, sink, usage| {
                     let current_position = reference_position;
                     reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(
@@ -1347,6 +1415,7 @@ pub fn validate_composition_ref_types_with_bindings(
                         sink,
                         bindings,
                         UnknownReferencePolicy::Report,
+                        usage,
                     ) else {
                         return;
                     };
@@ -1650,10 +1719,14 @@ fn validate_resource_ref_types_inner<E>(
                     defs: &schema.defs,
                 });
             let string_sink = AttributeType::string();
-            visit_refs_with_sink(attr_value, sink, &mut |reference, sink| {
-                let Some(source) =
-                    resolve_resource_reference(resource_id, reference, bindings, &mut all_errors)
-                else {
+            visit_refs_with_sink(attr_value, sink, &mut |reference, sink, usage| {
+                let Some(source) = resolve_resource_reference(
+                    resource_id,
+                    reference,
+                    bindings,
+                    usage,
+                    &mut all_errors,
+                ) else {
                     return;
                 };
                 if matches!(
@@ -1761,13 +1834,14 @@ fn validate_attribute_param_ref_types_inner(
         visit_refs_with_sink(
             value,
             param.type_expr.as_ref().map(RefSink::TypeExpr),
-            &mut |path, sink| {
+            &mut |path, sink, usage| {
                 check_attribute_param_ref(
                     &param.name,
                     sink.and_then(RefSink::as_type_expr),
                     path,
                     bindings,
                     unknown_policy,
+                    usage,
                     &mut errors,
                 );
             },
@@ -1787,6 +1861,7 @@ fn check_attribute_param_ref(
     path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
+    usage: crate::resource::ResourceRefUsage,
     errors: &mut Vec<String>,
 ) {
     match bindings.ref_type(path) {
@@ -1805,6 +1880,7 @@ fn check_attribute_param_ref(
                 ));
             }
         }
+        RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {}
         RefType::UnknownAttribute(error) => {
             if matches!(unknown_policy, UnknownReferencePolicy::Report) {
                 errors.push(format!("attribute '{}': {}", param_name, error));
@@ -1859,13 +1935,14 @@ fn validate_export_param_ref_types_inner<E: crate::parser::ExportParamLike>(
         let sink = type_expr
             .filter(|type_expr| !matches!(type_expr, crate::parser::TypeExpr::Unknown))
             .map(RefSink::TypeExpr);
-        visit_refs_with_sink(value, sink, &mut |path, sink| {
+        visit_refs_with_sink(value, sink, &mut |path, sink, usage| {
             check_export_ref(
                 param.name(),
                 sink.and_then(RefSink::as_type_expr),
                 path,
                 bindings,
                 unknown_policy,
+                usage,
                 &mut errors,
             );
         });
@@ -1884,6 +1961,7 @@ fn check_export_ref(
     path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
+    usage: crate::resource::ResourceRefUsage,
     errors: &mut Vec<String>,
 ) {
     match bindings.ref_type(path) {
@@ -1909,6 +1987,7 @@ fn check_export_ref(
                 ));
             }
         }
+        RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {}
         RefType::UnknownAttribute(error) => {
             if matches!(unknown_policy, UnknownReferencePolicy::Report) {
                 errors.push(format!("export '{}': {}", param_name, error));
@@ -2558,6 +2637,7 @@ pub fn value_contains_unresolved_ref(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
         | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -2920,7 +3000,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
         }
     }
     for deferred in &parsed.deferred_for_expressions {
-        referenced.insert(deferred.iterable_binding.clone());
+        collect_dependencies(&deferred.iterable, &mut referenced);
     }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {

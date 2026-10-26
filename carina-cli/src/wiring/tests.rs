@@ -5020,6 +5020,32 @@ fn validate_rejects_empty_interpolation_inside_secret() {
 }
 
 #[test]
+fn validate_rejects_empty_interpolation_in_either_coalesce_operand() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
+
+    let bad = || Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation));
+    let good = || Value::Concrete(ConcreteValue::String("fallback".into()));
+
+    for value in [
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(bad()),
+            default: Box::new(good()),
+        }),
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(good()),
+            default: Box::new(bad()),
+        }),
+    ] {
+        let errors = validate_no_empty_interpolations(&parsed_with_attr("name", value));
+        assert_eq!(
+            errors.len(),
+            1,
+            "both coalesce operands must be checked for empty interpolation",
+        );
+    }
+}
+
+#[test]
 fn validate_rejects_empty_interpolation_inside_function_call() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
@@ -5351,6 +5377,7 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
         resource_type: "aws.route53.Record".to_string(),
         attributes: vec![],
         binding_name: "validation_records".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         iterable_binding: "cert".to_string(),
         iterable_attr: "domain_validation_options".to_string(),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),

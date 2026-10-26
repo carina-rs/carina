@@ -5814,6 +5814,7 @@ impl Value {
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 format!("BindingRef({})", binding)
             }
+            Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
             Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
                 format!("FunctionCall({})", name)

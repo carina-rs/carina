@@ -108,6 +108,10 @@ pub enum SerializationError {
         expression: String,
         context: SerializationContext,
     },
+    /// A coalesce expression reached a concrete-only serialization boundary
+    /// before its left operand became present or definitively absent.
+    #[error("cannot serialize at {context}: unresolved coalesce expression")]
+    UnresolvedCoalesce { context: SerializationContext },
     /// A parser-authored enum identifier reached a serialization boundary
     /// without schema resolution. Provider transports accept only
     /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
@@ -156,6 +160,7 @@ impl SerializationError {
                 expression: MASKED.to_string(),
                 context,
             },
+            Self::UnresolvedCoalesce { context } => Self::UnresolvedCoalesce { context },
             other => other,
         }
     }
@@ -754,6 +759,9 @@ fn value_to_json_inner(
                 context: ctx,
             })
         }
+        Value::Deferred(DeferredValue::Coalesce { .. }) => {
+            Err(SerializationError::UnresolvedCoalesce { context: ctx })
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
@@ -879,6 +887,7 @@ pub(crate) fn canonical_secret_hash_material(value: &Value) -> Result<Vec<u8>, S
             | SerializationError::UnresolvedInterpolation { .. }
             | SerializationError::UnresolvedFunctionCall { .. }
             | SerializationError::UnresolvedAccess { .. }
+            | SerializationError::UnresolvedCoalesce { .. }
             | SerializationError::SecretNotAllowed { .. },
         ) => canonical_secret_template(value)?,
         Err(error) => return Err(error),
@@ -1610,6 +1619,11 @@ fn format_value_into_context(
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             sink.write_token(ValueSpanKind::Reference, binding)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            format_value_into_context(value, sink, context)?;
+            sink.write_token(ValueSpanKind::Structure, " ?? ")?;
+            format_value_into_context(default, sink, context)
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             sink.write_token(ValueSpanKind::StringLiteral, "\"")?;
             for part in parts {
@@ -1832,6 +1846,9 @@ pub fn contains_secret(value: &Value) -> bool {
         ) => args
             .iter()
             .any(|argument| contains_secret(argument.walker_value())),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_secret(value) || contains_secret(default)
+        }
         Value::Deferred(DeferredValue::Access(access)) => contains_secret(access.base()),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -1880,6 +1897,9 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_unredacted_secret(access.base())
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_unredacted_secret(value) || contains_unredacted_secret(default)
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -2121,6 +2141,10 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
         ) => true,
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            secret_value_requires_provider_material(value)
+                || secret_value_requires_provider_material(default)
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             secret_value_requires_provider_material(inner)
         }
@@ -2218,6 +2242,12 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
                 expression: format_value(value),
                 context: SerializationContext::SecretRedaction,
             }),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(redact_secrets_only(value)?),
+                default: Box::new(redact_secrets_only(default)?),
+            }))
+        }
         // `Unknown` and every other deferred / concrete shape pass through.
         other => Ok(other.clone()),
     }
@@ -2325,6 +2355,13 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             tagged("binding_ref", JsonValue::String(binding.clone()))
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => tagged(
+            "coalesce",
+            JsonValue::Array(vec![
+                canonical_secret_template(value)?,
+                canonical_secret_template(default)?,
+            ]),
+        ),
         Value::Deferred(DeferredValue::Interpolation(parts)) => tagged(
             "interpolation",
             JsonValue::Array(
@@ -2415,6 +2452,9 @@ pub fn contains_redacted_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_redacted_secret(access.base())
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_redacted_secret(value) || contains_redacted_secret(default)
+        }
         _ => false,
     }
 }
@@ -2433,12 +2473,14 @@ fn deferred_template_contains_redacted_secret(
         resource_type: _resource_type,
         attributes,
         binding_name: _binding_name,
+        iterable,
         iterable_binding: _iterable_binding,
         iterable_attr: _iterable_attr,
         binding: _binding,
         template_resource,
     } = template;
-    attributes_contain_redacted_secret(attributes.iter().map(|(_, value)| value))
+    contains_redacted_secret(iterable)
+        || attributes_contain_redacted_secret(attributes.iter().map(|(_, value)| value))
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
@@ -3022,6 +3064,29 @@ fn rehydrate_redacted_secrets_impl(
                 .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
                 .map_err(|_| SecretRehydrationError::ShapeMismatch)
         }
+        Value::Deferred(DeferredValue::Coalesce {
+            value: saved_value,
+            default: saved_default,
+        }) => {
+            let Value::Deferred(DeferredValue::Coalesce {
+                value: candidate_value,
+                default: candidate_default,
+            }) = candidate
+            else {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            };
+            let value =
+                rehydrate_redacted_secrets_impl(saved_value, candidate_value, candidate_is_secret)?;
+            let default = rehydrate_redacted_secrets_impl(
+                saved_default,
+                candidate_default,
+                candidate_is_secret,
+            )?;
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(value),
+                default: Box::new(default),
+            }))
+        }
         _ => Err(SecretRehydrationError::ShapeMismatch),
     }
 }
@@ -3043,6 +3108,10 @@ fn secret_candidate_evaluation_is_unavailable(value: &Value) -> bool {
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             secret_candidate_evaluation_is_unavailable(inner)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            secret_candidate_evaluation_is_unavailable(value)
+                || secret_candidate_evaluation_is_unavailable(default)
         }
         Value::Concrete(ConcreteValue::Map(values)) => values
             .values()
@@ -3190,6 +3259,12 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
                 expression: format_value(value),
                 context: SerializationContext::SecretRedaction,
             }),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(redact_secrets_only(value)?),
+                default: Box::new(redact_secrets_only(default)?),
+            }))
+        }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
                 reason: reason.clone(),
@@ -3593,6 +3668,7 @@ fn redact_deferred_template(
     template: &crate::parser::DeferredForExpression,
 ) -> Result<crate::parser::DeferredForExpression, SerializationError> {
     let mut redacted = template.clone();
+    redacted.iterable = redact_secrets_only(&template.iterable)?;
     redacted.template_resource.attributes = template
         .template_resource
         .attributes
@@ -3956,6 +4032,15 @@ fn rehydrate_deferred_template(
                 SecretRehydrationError::ShapeMismatch,
             )
         })?;
+
+    if let Some(value) = rehydrate_secret_entry(
+        &saved.iterable,
+        Some(&candidate.iterable),
+        format!("deferred iterable {}", saved.binding_name),
+        SecretRehydrationCandidate::Evaluated,
+    )? {
+        out.iterable = value;
+    }
 
     for (key, saved_value) in &mut out.template_resource.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -4999,6 +5084,7 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
@@ -5416,6 +5502,10 @@ fn first_enum_identifier_inner(
         Value::Deferred(DeferredValue::Secret(inner)) => first_enum_identifier_inner(inner, true),
         Value::Deferred(DeferredValue::Access(access)) => {
             first_enum_identifier_inner(access.base(), inside_secret)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            first_enum_identifier_inner(value, inside_secret)
+                .or_else(|| first_enum_identifier_inner(default, inside_secret))
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -6356,6 +6446,30 @@ mod tests {
             ),
             "expected UnresolvedResourceRef/vpc.id/ValueToJson, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_value_to_json_coalesce_returns_err() {
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
+        });
+        let error = value_to_json(&value).unwrap_err();
+        assert!(matches!(
+            error,
+            SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::ValueToJson,
+            }
+        ));
+    }
+
+    #[test]
+    fn format_value_renders_residual_coalesce() {
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
+        });
+        assert_eq!(format_value(&value), "up.optional ?? []");
     }
 
     #[test]
@@ -9294,6 +9408,36 @@ mod tests {
     }
 
     #[test]
+    fn secret_walkers_visit_both_coalesce_operands() {
+        let secret = || {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("sensitive".into()),
+            ))))
+        };
+
+        for coalesce in [
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(secret()),
+                default: Box::new(Value::Concrete(ConcreteValue::String("plain".into()))),
+            }),
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::Concrete(ConcreteValue::String("plain".into()))),
+                default: Box::new(secret()),
+            }),
+        ] {
+            assert!(contains_secret(&coalesce));
+            assert!(contains_unredacted_secret(&coalesce));
+            let redacted = redact_secrets_in_value(&coalesce).expect("redact coalesce secret");
+            assert!(contains_redacted_secret(&redacted));
+            assert!(
+                !serde_json::to_string(&redacted)
+                    .expect("serialize redacted coalesce")
+                    .contains("sensitive")
+            );
+        }
+    }
+
+    #[test]
     fn test_redact_secrets_in_value_no_plaintext_in_serialized_output() {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("super-secret-password".into()),
@@ -11865,6 +12009,7 @@ mod tests {
                     ("comment".to_string(), secret),
                 ],
                 binding_name: "validation_records".to_string(),
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 iterable_binding: "cert".to_string(),
                 iterable_attr: "domain_validation_options".to_string(),
                 binding: ForBinding::Simple("opt".to_string()),
@@ -11957,6 +12102,7 @@ mod tests {
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: vec![("comment".to_string(), secret("stale-projection"))],
                 binding_name: "records".to_string(),
+                iterable: Value::resource_ref("cert", "options", Vec::new()),
                 iterable_binding: "cert".to_string(),
                 iterable_attr: "options".to_string(),
                 binding: ForBinding::Simple("opt".to_string()),
@@ -12017,6 +12163,7 @@ mod tests {
                 ("identifier".to_string(), display_only.clone()),
             ],
             binding_name: "children".to_string(),
+            iterable: Value::resource_ref("parent", "children", Vec::new()),
             iterable_binding: "parent".to_string(),
             iterable_attr: "children".to_string(),
             binding: ForBinding::Simple("child".to_string()),

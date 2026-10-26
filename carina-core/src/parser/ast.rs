@@ -7,7 +7,7 @@ use super::error::{ParseWarning, WarningKind};
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
-use crate::binding_index::{BindingValueSource, IterableBindings};
+use crate::binding_index::IterableBindings;
 use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
@@ -43,7 +43,12 @@ pub struct DeferredForExpression {
     pub attributes: Vec<(String, Value)>,
     /// The binding address prefix for generated resources (e.g., `_for0`).
     pub binding_name: String,
+    /// Complete iterable expression. This can remain a deferred coalesce until
+    /// its referenced binding reaches a complete resolution boundary.
+    pub iterable: Value,
     /// The iterable access path segments (e.g., `["orgs", "accounts"]`).
+    /// Retained as display/scheduling metadata while effect payloads migrate
+    /// to dependency sets derived from `iterable`.
     pub iterable_binding: String,
     pub iterable_attr: String,
     /// Binding pattern — records the kind (Simple/Indexed/Map) so the expansion
@@ -72,12 +77,28 @@ pub enum DeferredForExpansionError {
         attribute: String,
         message: String,
     },
+    #[error("deferred-for iterable `{expression}` at line {line}: {message}")]
+    Resolution {
+        line: usize,
+        expression: String,
+        message: String,
+    },
 }
 
 #[derive(Debug)]
 struct PlaceholderAccessError {
     line: usize,
     message: String,
+    /// A missing field/key reached directly through an access chain. A
+    /// surrounding coalesce may consume this as `Absent`; errors nested in a
+    /// collection, interpolation, or function argument are not the absence of
+    /// that enclosing expression.
+    coalesce_absence: bool,
+}
+
+fn nested_placeholder_error(mut error: PlaceholderAccessError) -> PlaceholderAccessError {
+    error.coalesce_absence = false;
+    error
 }
 
 impl ShapeMismatch {
@@ -1938,30 +1959,26 @@ impl<E> File<E> {
         let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
         for (idx, deferred) in self.deferred_for_expressions.iter().enumerate() {
-            // Look up the iterable value in the merged binding view
-            let iterable = bindings
-                .get(&deferred.iterable_binding)
-                .and_then(|attrs| attrs.get(&deferred.iterable_attr));
+            let iterable_value =
+                match bindings
+                    .resolve_value(&deferred.iterable)
+                    .map_err(|message| DeferredForExpansionError::Resolution {
+                        line: deferred.line,
+                        expression: crate::value::format_value(&deferred.iterable),
+                        message,
+                    })? {
+                    crate::resolver::ValueResolution::Present(value) => value,
+                    crate::resolver::ValueResolution::Absent
+                    | crate::resolver::ValueResolution::Unknown(_) => continue,
+                };
+            let miss_policy = bindings.access_miss_policy(&deferred.iterable);
 
-            let Some(iterable_value) = iterable else {
-                continue;
-            };
-            let Some(source) = bindings.source(&deferred.iterable_binding) else {
-                continue;
-            };
-            let miss_policy = match source {
-                BindingValueSource::Local | BindingValueSource::WaitAlias { .. } => {
-                    crate::resource::AccessMissPolicy::Defer
-                }
-                BindingValueSource::Upstream => crate::resource::AccessMissPolicy::Error,
-            };
-
-            match (&deferred.binding, iterable_value) {
+            match (&deferred.binding, &iterable_value) {
                 // Simple binding: only the value var is bound
                 (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(_))) => {
                     expanded_resources.extend(expand_deferred_children(
                         deferred,
-                        iterable_value,
+                        &iterable_value,
                         miss_policy,
                     )?);
                     resolved_indices.push(idx);
@@ -1970,7 +1987,7 @@ impl<E> File<E> {
                 (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(_))) => {
                     expanded_resources.extend(expand_deferred_children(
                         deferred,
-                        iterable_value,
+                        &iterable_value,
                         miss_policy,
                     )?);
                     resolved_indices.push(idx);
@@ -1979,7 +1996,7 @@ impl<E> File<E> {
                 (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
                     expanded_resources.extend(expand_deferred_children(
                         deferred,
-                        iterable_value,
+                        &iterable_value,
                         miss_policy,
                     )?);
                     resolved_indices.push(idx);
@@ -1994,9 +2011,9 @@ impl<E> File<E> {
                         kind: WarningKind::DeferredFor,
                         span: None,
                         message: format!(
-                            "for binding expected map iterable but `{}.{}` resolved to a list. \
+                            "for binding expected map iterable but `{}` resolved to a list. \
                              Fix either the upstream export shape or the downstream binding.",
-                            deferred.iterable_binding, deferred.iterable_attr,
+                            crate::value::format_value(&deferred.iterable),
                         ),
                     });
                 }
@@ -2009,9 +2026,9 @@ impl<E> File<E> {
                         kind: WarningKind::DeferredFor,
                         span: None,
                         message: format!(
-                            "for binding expected list iterable but `{}.{}` resolved to a map. \
+                            "for binding expected list iterable but `{}` resolved to a map. \
                              Fix either the upstream export shape or the downstream binding.",
-                            deferred.iterable_binding, deferred.iterable_attr,
+                            crate::value::format_value(&deferred.iterable),
                         ),
                     });
                 }
@@ -2117,6 +2134,7 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::Map(_)) => "map",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
+        Value::Deferred(DeferredValue::Coalesce { .. }) => "deferred coalesce expression",
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -2140,9 +2158,14 @@ fn build_expanded_child(
         .template_resource
         .instantiate_with_identity(ResourceIdentity::new(address.clone()));
     resource.binding = Some(address);
-    resource
-        .dependency_bindings
-        .insert(deferred.iterable_binding.clone());
+    deferred.iterable.visit_resource_refs(&mut |path| {
+        resource
+            .dependency_bindings
+            .insert(path.binding().to_string());
+    });
+    deferred.iterable.visit_binding_refs(&mut |binding| {
+        resource.dependency_bindings.insert(binding.to_string());
+    });
     if let Err((attribute, error)) = substitute_attrs(&mut resource, index, key, item, miss_policy)
     {
         return Err(DeferredForExpansionError::ValueAccess {
@@ -2237,12 +2260,14 @@ fn substitute_placeholder_with_policy(
         },
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items.iter_mut() {
-                substitute_placeholder_with_policy(item, index, key, value, miss_policy)?;
+                substitute_placeholder_with_policy(item, index, key, value, miss_policy)
+                    .map_err(nested_placeholder_error)?;
             }
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             for val in map.values_mut() {
-                substitute_placeholder_with_policy(val, index, key, value, miss_policy)?;
+                substitute_placeholder_with_policy(val, index, key, value, miss_policy)
+                    .map_err(nested_placeholder_error)?;
             }
         }
         Value::Deferred(
@@ -2256,7 +2281,52 @@ fn substitute_placeholder_with_policy(
                     key,
                     value,
                     miss_policy,
-                )?;
+                )
+                .map_err(nested_placeholder_error)?;
+            }
+        }
+        Value::Deferred(DeferredValue::Coalesce {
+            value: left,
+            default,
+        }) => {
+            let mut resolved_left = left.as_ref().clone();
+            match substitute_placeholder_with_policy(
+                &mut resolved_left,
+                index,
+                key,
+                value,
+                miss_policy,
+            ) {
+                Ok(()) if crate::resolver::value_is_fully_resolved(&resolved_left) => {
+                    // A present left operand wins without touching the fallback.
+                    *v = resolved_left;
+                }
+                Ok(()) => {
+                    let mut resolved_default = default.as_ref().clone();
+                    substitute_placeholder_with_policy(
+                        &mut resolved_default,
+                        index,
+                        key,
+                        value,
+                        miss_policy,
+                    )?;
+                    *v = Value::Deferred(DeferredValue::Coalesce {
+                        value: Box::new(resolved_left),
+                        default: Box::new(resolved_default),
+                    });
+                }
+                Err(error) if error.coalesce_absence => {
+                    let mut resolved_default = default.as_ref().clone();
+                    substitute_placeholder_with_policy(
+                        &mut resolved_default,
+                        index,
+                        key,
+                        value,
+                        miss_policy,
+                    )?;
+                    *v = resolved_default;
+                }
+                Err(error) => return Err(error),
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -2272,9 +2342,15 @@ fn substitute_placeholder_with_policy(
                 | Ok(crate::resource::ValuePathSegmentResult::Deferred(value)) => *v = value,
                 Ok(crate::resource::ValuePathSegmentResult::DeferredMiss(_)) => *v = original,
                 Err(error) => {
+                    let coalesce_absence = matches!(
+                        error,
+                        crate::resource::ValueAccessError::MissingField { .. }
+                            | crate::resource::ValueAccessError::MissingKey { .. }
+                    );
                     return Err(PlaceholderAccessError {
                         line: access.source_line(),
                         message: error.to_string(),
+                        coalesce_absence,
                     });
                 }
             }
@@ -2282,7 +2358,8 @@ fn substitute_placeholder_with_policy(
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts.iter_mut() {
                 if let crate::resource::InterpolationPart::Expr(inner) = part {
-                    substitute_placeholder_with_policy(inner, index, key, value, miss_policy)?;
+                    substitute_placeholder_with_policy(inner, index, key, value, miss_policy)
+                        .map_err(nested_placeholder_error)?;
                 }
             }
         }
@@ -2492,6 +2569,7 @@ mod substitute_placeholder_tests {
             resource_type: "mock.Target".to_string(),
             attributes: Vec::new(),
             binding_name: "children".to_string(),
+            iterable: Value::resource_ref("cert", "options", Vec::new()),
             iterable_binding: "cert".to_string(),
             iterable_attr: "options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
@@ -2522,6 +2600,7 @@ mod substitute_placeholder_tests {
             resource_type: "mock.Target".to_string(),
             attributes: Vec::new(),
             binding_name: "children".to_string(),
+            iterable: Value::resource_ref("source", "children", Vec::new()),
             iterable_binding: "source".to_string(),
             iterable_attr: "children".to_string(),
             binding,
@@ -2577,6 +2656,10 @@ mod substitute_placeholder_tests {
             resource_type: "mock.Target".to_string(),
             attributes: Vec::new(),
             binding_name: "children".to_string(),
+            iterable: Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::resource_ref("cert", "options", Vec::new())),
+                default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
+            }),
             iterable_binding: "cert".to_string(),
             iterable_attr: "options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
@@ -2593,6 +2676,7 @@ mod substitute_placeholder_tests {
             serde_json::from_str(&json).expect("deserialize deferred for expression");
         assert_eq!(decoded.file, None);
         assert_eq!(decoded.line, 0);
+        assert_eq!(decoded.iterable, deferred.iterable);
     }
 
     #[test]
@@ -2606,6 +2690,81 @@ mod substitute_placeholder_tests {
         )
         .unwrap();
         assert_eq!(v, Value::Concrete(ConcreteValue::String("acct-1".into())));
+    }
+
+    fn for_value_field(name: &str) -> Value {
+        crate::resource::apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            PathSegment::Field {
+                name: name.to_string(),
+            },
+            1,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect("deferred for-value access")
+    }
+
+    #[test]
+    fn coalesce_placeholder_uses_present_left_without_evaluating_default() {
+        let mut value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(for_value_field("name")),
+            // This access would fail if the fallback were evaluated eagerly.
+            default: Box::new(for_value_field("missing")),
+        });
+        let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("present".into())),
+        )])));
+
+        substitute_placeholder(&mut value, None, None, &item).expect("substitute coalesce");
+        assert_eq!(
+            value,
+            Value::Concrete(ConcreteValue::String("present".into())),
+        );
+    }
+
+    #[test]
+    fn coalesce_placeholder_uses_default_for_direct_missing_field() {
+        let mut value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(for_value_field("optional")),
+            default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
+        });
+        let item = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+
+        substitute_placeholder(&mut value, None, None, &item).expect("substitute coalesce");
+        assert_eq!(
+            value,
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+    }
+
+    #[test]
+    fn coalesce_placeholder_substitutes_default_when_left_remains_unknown() {
+        let mut value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "optional", Vec::new())),
+            default: Box::new(for_value_field("name")),
+        });
+        let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        )])));
+
+        substitute_placeholder(&mut value, None, None, &item).expect("substitute coalesce");
+        let Value::Deferred(DeferredValue::Coalesce {
+            value: left,
+            default,
+        }) = value
+        else {
+            panic!("unknown left must retain coalesce");
+        };
+        assert!(matches!(
+            left.as_ref(),
+            Value::Deferred(DeferredValue::ResourceRef { .. })
+        ));
+        assert_eq!(
+            default.as_ref(),
+            &Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
     }
 
     #[test]

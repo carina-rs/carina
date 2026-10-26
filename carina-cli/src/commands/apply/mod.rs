@@ -3021,7 +3021,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 21 represents an
+    // Validate version compatibility. Plan-file version 22 persists deferred
+    // coalesce operands and complete deferred-for iterable expressions.
+    // Version 21 represents an
     // in-flight managed current instance as an address-level marker and never
     // serializes its provider token; apply reloads that continuation from
     // locked state. Version 20 explicitly tags current-state ownership and

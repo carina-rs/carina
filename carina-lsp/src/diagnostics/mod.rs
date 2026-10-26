@@ -1108,6 +1108,7 @@ impl DiagnosticEngine {
                                         value,
                                         Value::Deferred(DeferredValue::ResourceRef { .. })
                                             | Value::Deferred(DeferredValue::BindingRef { .. })
+                                            | Value::Deferred(DeferredValue::Coalesce { .. })
                                     ) =>
                                 {
                                     let schema_view =
@@ -1200,6 +1201,7 @@ impl DiagnosticEngine {
                                     resource_attributes.get(attribute),
                                     Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
                                         | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
+                                        | Some(Value::Deferred(DeferredValue::Coalesce { .. }))
                                 )
                             {
                                 continue;

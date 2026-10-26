@@ -1109,6 +1109,10 @@ fn collect_reference_roots(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             collect_reference_roots(inner, variables, structural, roots);
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            collect_reference_roots(value, variables, structural, roots);
+            collect_reference_roots(default, variables, structural, roots);
+        }
         Value::Concrete(
             ConcreteValue::Int(_)
             | ConcreteValue::Float(_)
@@ -1316,12 +1320,18 @@ fn accumulate_deferred_iterable_errors(
     errors: &mut Vec<ParseError>,
 ) {
     for d in &parsed.deferred_for_expressions {
-        if !known.contains(d.iterable_binding.as_str()) {
-            errors.push(undefined_identifier_error(
-                known,
-                d.iterable_binding.clone(),
-                d.line,
-            ));
+        let mut roots = std::collections::BTreeSet::new();
+        d.iterable.visit_resource_refs(&mut |path| {
+            roots.insert(path.binding().to_string());
+        });
+        d.iterable.visit_binding_refs(&mut |binding| {
+            roots.insert(binding.to_string());
+        });
+        for root in roots {
+            if known.contains(root.as_str()) {
+                continue;
+            }
+            errors.push(undefined_identifier_error(known, root, d.line));
         }
     }
 }
@@ -1334,6 +1344,30 @@ fn resolve_value_with_config(
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
     match value {
+        Value::Deferred(DeferredValue::Coalesce {
+            value: left,
+            default,
+        }) => {
+            let left = resolve_value_with_config(
+                left,
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            if matches!(left, Value::Concrete(_)) {
+                Ok(left)
+            } else {
+                // Keep the right operand lazy. It was parsed (so syntax and
+                // immediate diagnostics already ran), but a deferred function
+                // on the fallback side must not execute unless absence is
+                // established at a later resolution boundary.
+                Ok(Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(left),
+                    default: default.clone(),
+                }))
+            }
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             // A suffix is part of the authored reference, not decoration on
             // its base attribute. Resolving only `binding.attribute` would
@@ -1553,7 +1587,8 @@ fn resolve_function_calls_only(
         Value::Deferred(
             DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Access(_),
+            | DeferredValue::Access(_)
+            | DeferredValue::Coalesce { .. },
         ) => resolve_value_with_config(
             value,
             binding_map,
@@ -1705,18 +1740,25 @@ pub fn resolve_provider_attributes_with_remote<E>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     config: &ProviderContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut bindings = crate::binding_index::ResolvedBindings::default();
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
-            binding_map.insert(binding_name.to_string(), rref.resolved_attributes());
+            bindings.set_with_completeness(
+                binding_name,
+                rref.resolved_attributes(),
+                crate::binding_index::BindingValueSource::Local,
+                crate::binding_index::BindingCompleteness::Incomplete,
+            );
         }
     }
     for (binding, attrs) in remote_bindings {
-        binding_map.insert(binding.clone(), attrs.clone());
+        bindings.set_with_completeness(
+            binding,
+            attrs.clone(),
+            crate::binding_index::BindingValueSource::Upstream,
+            crate::binding_index::BindingCompleteness::Complete,
+        );
     }
-
-    let mut fn_ctx = super::ParseContext::new(config);
-    fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     let mut providers = Vec::with_capacity(parsed.providers.len());
     for provider in &parsed.providers {
@@ -1724,7 +1766,8 @@ pub fn resolve_provider_attributes_with_remote<E>(
         for section in [&mut provider.attributes, &mut provider.default_tags] {
             let mut resolved = IndexMap::new();
             for (key, expr) in section.iter() {
-                let value = resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
+                let value = crate::resolver::resolve_ref_value_with_config(expr, &bindings, config)
+                    .map_err(|message| ParseError::InvalidExpression { line: 0, message })?;
                 resolved.insert(key.clone(), value);
             }
             *section = resolved;

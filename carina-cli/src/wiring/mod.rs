@@ -595,6 +595,9 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
             entries.values().any(value_contains_empty_interpolation)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_empty_interpolation(inner),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            value_contains_empty_interpolation(value) || value_contains_empty_interpolation(default)
+        }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
@@ -2132,20 +2135,24 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         .deferred_for_expressions
         .iter()
         .filter_map(|deferred| {
-            let iterable = iterable_bindings
-                .get(&deferred.iterable_binding)
-                .and_then(|attrs| attrs.get(&deferred.iterable_attr));
-
-            match iterable {
-                Some(value) if is_value_fully_concrete_for_expansion(value) => {
+            match iterable_bindings.resolve_value(&deferred.iterable) {
+                Ok(carina_core::resolver::ValueResolution::Present(value))
+                    if is_value_fully_concrete_for_expansion(&value) =>
+                {
                     Some(deferred.clone())
                 }
-                Some(_) | None => {
+                Ok(
+                    carina_core::resolver::ValueResolution::Present(_)
+                    | carina_core::resolver::ValueResolution::Absent
+                    | carina_core::resolver::ValueResolution::Unknown(_),
+                ) => {
                     if let Some(target) = DeferredCreateTarget::from_deferred(deferred) {
                         deferred_create_targets.push(target);
                     }
                     None
                 }
+                // Let the shared expansion path render the path-aware error.
+                Err(_) => Some(deferred.clone()),
             }
         })
         .collect();
@@ -2821,8 +2828,12 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // attribute referencing `<module_instance>.<attr>` (a composition)
     // chains through to the managed sibling literal instead of
     // surviving as an unresolved `ResourceRef` (carina#3246).
-    let upstream_binding_names: std::collections::HashSet<&str> =
-        remote_bindings.keys().map(String::as_str).collect();
+    let upstream_binding_names: std::collections::HashSet<&str> = parsed
+        .upstream_states
+        .iter()
+        .map(|upstream| upstream.binding.as_str())
+        .chain(remote_bindings.keys().map(String::as_str))
+        .collect();
     let pre_apply_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         ctx.schemas(),

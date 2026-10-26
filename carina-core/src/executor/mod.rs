@@ -503,6 +503,10 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
         }
         Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),
         Value::Deferred(DeferredValue::Secret(inner)) => visit_unknowns(inner, f),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            visit_unknowns(value, f);
+            visit_unknowns(default, f);
+        }
         Value::Concrete(_)
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })

@@ -417,6 +417,35 @@ pub(crate) fn infer_type_from_value_without_bindings(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             infer_type_from_value_without_bindings(inner)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            let left = infer_type_from_value_without_bindings(value)?;
+            match infer_type_from_value_without_bindings(default) {
+                Ok(right) if right == left => Ok(left),
+                Ok(right) => Err(InferenceError::UnknownType {
+                    reason: format!(
+                        "coalesce default type `{right}` does not match left type `{left}`"
+                    ),
+                }),
+                Err(InferenceError::UnknownType { .. })
+                    if matches!(
+                        (default.as_ref(), &left),
+                        (
+                            Value::Concrete(ConcreteValue::List(items)),
+                            TypeExpr::List(_)
+                        ) if items.is_empty()
+                    ) || matches!(
+                        (default.as_ref(), &left),
+                        (
+                            Value::Concrete(ConcreteValue::Map(entries)),
+                            TypeExpr::Map(_)
+                        ) if entries.is_empty()
+                    ) =>
+                {
+                    Ok(left)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             let return_type = builtin_functions()
                 .iter()
@@ -525,6 +554,35 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::BindingRef { .. }) => Err(InferenceError::UnknownType {
             reason: "bare binding reference has no attribute to infer".to_string(),
         }),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            let left = infer_type_from_value_with_visiting(value, bindings, schemas, visiting)?;
+            match infer_type_from_value_with_visiting(default, bindings, schemas, visiting) {
+                Ok(right) if right == left => Ok(left),
+                Ok(right) => Err(InferenceError::UnknownType {
+                    reason: format!(
+                        "coalesce default type `{right}` does not match left type `{left}`"
+                    ),
+                }),
+                Err(InferenceError::UnknownType { .. })
+                    if matches!(
+                        (default.as_ref(), &left),
+                        (
+                            Value::Concrete(ConcreteValue::List(items)),
+                            TypeExpr::List(_)
+                        ) if items.is_empty()
+                    ) || matches!(
+                        (default.as_ref(), &left),
+                        (
+                            Value::Concrete(ConcreteValue::Map(entries)),
+                            TypeExpr::Map(_)
+                        ) if entries.is_empty()
+                    ) =>
+                {
+                    Ok(left)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             infer_function_call(name, args, bindings, schemas, visiting)
         }
@@ -1333,6 +1391,51 @@ mod tests {
             &SchemaRegistry::new(),
         );
         assert!(matches!(r, Err(InferenceError::UnknownType { .. })));
+    }
+
+    #[test]
+    fn coalesce_uses_left_list_type_for_empty_default() {
+        let mut bindings = InferenceBindings::new();
+        bindings.insert(
+            "up".to_string(),
+            composition_binding(&[(
+                "accounts",
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("a".into()),
+                )])),
+            )]),
+        );
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "accounts", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
+        });
+
+        assert_eq!(
+            infer_type_from_value(&value, &bindings, &SchemaRegistry::new()),
+            Ok(TypeExpr::List(Box::new(TypeExpr::String))),
+        );
+    }
+
+    #[test]
+    fn coalesce_rejects_default_that_conflicts_with_left_type() {
+        let mut bindings = InferenceBindings::new();
+        bindings.insert(
+            "up".to_string(),
+            composition_binding(&[(
+                "accounts",
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("a".into()),
+                )])),
+            )]),
+        );
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "accounts", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::String("not-a-list".into()))),
+        });
+
+        let error = infer_type_from_value(&value, &bindings, &SchemaRegistry::new())
+            .expect_err("coalesce default must match the left type");
+        assert!(error.to_string().contains("does not match left type"));
     }
 
     #[test]

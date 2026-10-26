@@ -827,6 +827,12 @@ fn validate_selected_provider_values(
 fn unwrap_secret(value: Value) -> Value {
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => unwrap_secret(*inner),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(unwrap_secret(*value)),
+                default: Box::new(unwrap_secret(*default)),
+            })
+        }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items.into_iter().map(unwrap_secret).collect(),
         )),
@@ -1093,6 +1099,27 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::String(
                 "prefix-decrypted:ciphertext-suffix".into()
             ))
+        );
+    }
+
+    #[test]
+    fn provider_boundary_unwraps_secrets_in_both_coalesce_operands() {
+        let secret = |value: &str| {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(value.into()),
+            ))))
+        };
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(secret("left")),
+            default: Box::new(secret("right")),
+        });
+
+        assert_eq!(
+            unwrap_secret(value),
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::Concrete(ConcreteValue::String("left".into()))),
+                default: Box::new(Value::Concrete(ConcreteValue::String("right".into()))),
+            })
         );
     }
 }

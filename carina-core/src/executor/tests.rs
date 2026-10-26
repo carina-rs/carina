@@ -100,6 +100,7 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         binding_name: "validation_records".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         iterable_binding: "cert".to_string(),
         iterable_attr: "domain_validation_options".to_string(),
         binding: crate::parser::ForBinding::Simple("opt".to_string()),

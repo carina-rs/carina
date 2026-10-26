@@ -213,6 +213,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
         Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
@@ -350,6 +351,12 @@ fn assert_fully_resolved(
             binding,
             bindings,
         )),
+        Value::Deferred(DeferredValue::Coalesce { .. }) => {
+            Err(SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::WasmBoundary,
+            }
+            .to_string())
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
             Err(unresolved_binding_message(
@@ -474,6 +481,10 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             collect_unresolved_bindings(access.base(), out)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            collect_unresolved_bindings(value, out);
+            collect_unresolved_bindings(default, out);
         }
         Value::Deferred(DeferredValue::Unknown(_)) => {}
         Value::Concrete(ConcreteValue::List(items)) => {

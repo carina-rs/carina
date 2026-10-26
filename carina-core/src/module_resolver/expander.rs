@@ -1756,6 +1756,7 @@ fn prefix_deferred_for_expression(
         resource_type,
         attributes,
         binding_name,
+        iterable,
         iterable_binding,
         iterable_attr,
         binding,
@@ -1791,6 +1792,9 @@ fn prefix_deferred_for_expression(
         // `Resource.binding`) to isolate each module instance's loop
         // resources.
         binding_name: apply_instance_prefix(instance_prefix, binding_name),
+        // The full iterable is a value expression: rewrite every reference
+        // and substitute module arguments in both coalesce operands.
+        iterable: prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?,
         // Iterable root binding — this IS a reference to an existing
         // binding (`cert` in `for _, opt in cert.dvo`), so it takes
         // the same caller-collision guard as a `ResourceRef` head in
@@ -2043,6 +2047,25 @@ fn substitute_arguments_with_position(
             }
             substituted
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            let value = substitute_arguments_with_position(
+                value,
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            if matches!(value, Value::Concrete(_)) {
+                value
+            } else {
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(value),
+                    default: Box::new(substitute_arguments_with_position(
+                        default,
+                        arguments,
+                        ArgumentSubstitutionPosition::Value,
+                    )?),
+                })
+            }
+        }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
@@ -2267,6 +2290,20 @@ pub(super) fn rewrite_intra_module_refs(
                 crate::resource::AccessMissPolicy::Error,
             )
             .unwrap_or_else(|_| value.clone()),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(rewrite_intra_module_refs(
+                    value,
+                    instance_prefix,
+                    intra_module_bindings,
+                )),
+                default: Box::new(rewrite_intra_module_refs(
+                    default,
+                    instance_prefix,
+                    intra_module_bindings,
+                )),
+            })
+        }
         _ => value.clone(),
     }
 }
@@ -2675,6 +2712,12 @@ fn rewrite_ref_prefixes(
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(rewrite_ref_prefixes(inner, remap)),
         )),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(rewrite_ref_prefixes(value, remap)),
+                default: Box::new(rewrite_ref_prefixes(default, remap)),
+            })
+        }
         _ => value.clone(),
     }
 }

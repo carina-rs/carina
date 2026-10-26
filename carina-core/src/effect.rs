@@ -20,7 +20,7 @@ use crate::non_empty::NonEmptyVec;
 use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
-use crate::resource::{DataSource, Resource};
+use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use crate::resource::{
     DeposedKey, Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
     ResourceIdentity, State,
@@ -837,6 +837,11 @@ impl Effect {
                         resource_type: "route53.Record".to_string(),
                         attributes: vec![],
                         binding_name: "validation_records".to_string(),
+                        iterable: Value::resource_ref(
+                            "cert",
+                            "domain_validation_options",
+                            Vec::new(),
+                        ),
                         iterable_binding: "cert".to_string(),
                         iterable_attr: "domain_validation_options".to_string(),
                         binding: crate::parser::ForBinding::Simple("opt".to_string()),
@@ -872,6 +877,11 @@ impl Effect {
                         resource_type: "route53.Record".to_string(),
                         attributes: vec![],
                         binding_name: "validation_records".to_string(),
+                        iterable: Value::resource_ref(
+                            "cert",
+                            "domain_validation_options",
+                            Vec::new(),
+                        ),
                         iterable_binding: "cert".to_string(),
                         iterable_attr: "domain_validation_options".to_string(),
                         binding: crate::parser::ForBinding::Simple("opt".to_string()),
@@ -1328,11 +1338,36 @@ impl Effect {
                 deps.into_iter().collect()
             }
             Effect::DeferredCreate {
-                upstream_binding, ..
-            } => vec![upstream_binding.clone()],
+                upstream_binding,
+                template,
+                ..
+            } => {
+                let mut deps = BTreeSet::new();
+                if !upstream_binding.is_empty() {
+                    deps.insert(upstream_binding.clone());
+                }
+                template.iterable.visit_resource_refs(&mut |path| {
+                    deps.insert(path.binding().to_string());
+                });
+                template.iterable.visit_binding_refs(&mut |binding| {
+                    deps.insert(binding.to_string());
+                });
+                deps.into_iter().collect()
+            }
             Effect::DeferredReplace(payload) => {
                 let mut deps = deferred_replace_delete_dependencies(&payload.deletes);
-                deps.insert(payload.upstream_binding.clone());
+                if !payload.upstream_binding.is_empty() {
+                    deps.insert(payload.upstream_binding.clone());
+                }
+                payload.template.iterable.visit_resource_refs(&mut |path| {
+                    deps.insert(path.binding().to_string());
+                });
+                payload
+                    .template
+                    .iterable
+                    .visit_binding_refs(&mut |binding| {
+                        deps.insert(binding.to_string());
+                    });
                 deps.into_iter().collect()
             }
         }
@@ -1521,6 +1556,7 @@ mod tests {
             resource_type: "route53.Record".to_string(),
             attributes: vec![],
             binding_name: "validation_records".to_string(),
+            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             iterable_binding: "cert".to_string(),
             iterable_attr: "domain_validation_options".to_string(),
             binding: crate::parser::ForBinding::Simple("opt".to_string()),
@@ -1747,6 +1783,28 @@ mod tests {
     fn deferred_create_blocking_bindings_is_upstream_only() {
         let effect = deferred_create_effect();
         assert_eq!(effect.blocking_bindings(), vec!["cert".to_string()]);
+    }
+
+    #[test]
+    fn deferred_create_blocking_bindings_include_both_coalesce_operands() {
+        let mut template = deferred_for_template();
+        template.iterable = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("primary", "items", Vec::new())),
+            default: Box::new(Value::resource_ref("fallback", "items", Vec::new())),
+        });
+        let effect = Effect::DeferredCreate {
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.Record",
+                "validation_records",
+            )),
+            upstream_binding: "primary".to_string(),
+            template: Box::new(template),
+        };
+
+        assert_eq!(
+            effect.blocking_bindings(),
+            vec!["fallback".to_string(), "primary".to_string()],
+        );
     }
 
     #[test]

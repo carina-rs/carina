@@ -7,13 +7,13 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingValueSource, ResolvedBindings};
+use crate::binding_index::{BindingCompleteness, BindingValueSource, ResolvedBindings};
 #[cfg(test)]
 use crate::resource::State;
 use crate::resource::{
     AccessMissPolicy, Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart,
-    PlanInputCurrent, Resource, ResourceId, Value, ValuePathSegmentResult,
-    apply_value_path_segment, contains_resource_ref,
+    PlanInputCurrent, Resource, ResourceId, Value, ValueAccessError, ValuePathSegmentResult,
+    apply_value_path_segment,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -260,6 +260,12 @@ fn stamp_unresolved_upstream(
                 crate::resource::UnknownReason::UpstreamAllExports { binding },
             ))
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(stamp_unresolved_upstream(*value, upstream_binding_names)),
+                default: Box::new(stamp_unresolved_upstream(*default, upstream_binding_names)),
+            })
+        }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .into_iter()
@@ -387,6 +393,23 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
     resolve_ref_value_inner(value, bindings, None)
 }
 
+/// Three-state result used by null/missing coalescing. A missing value is not
+/// interchangeable with a value whose producing snapshot is still incomplete.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueResolution {
+    Present(Value),
+    Absent,
+    Unknown(Value),
+}
+
+/// Resolve a value while preserving the distinction required by `??`.
+pub fn resolve_ref_value_status(
+    value: &Value,
+    bindings: &ResolvedBindings,
+) -> Result<ValueResolution, String> {
+    resolve_ref_value_status_inner(value, bindings, None)
+}
+
 /// Resolve a value using binding data and a provider-aware builtin context.
 ///
 /// Export validation uses this entry point because a reference may become an
@@ -413,12 +436,176 @@ fn binding_access_miss_policy(binding: &str, bindings: &ResolvedBindings) -> Acc
     }
 }
 
+pub(crate) fn value_is_fully_resolved(value: &Value) -> bool {
+    match value {
+        Value::Concrete(ConcreteValue::List(values)) => values.iter().all(value_is_fully_resolved),
+        Value::Concrete(ConcreteValue::Map(values)) => values.values().all(value_is_fully_resolved),
+        Value::Deferred(DeferredValue::Secret(inner)) => value_is_fully_resolved(inner),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
+        Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::Unknown(_),
+        ) => false,
+    }
+}
+
+fn missing_access(error: &ValueAccessError) -> bool {
+    matches!(
+        error,
+        ValueAccessError::MissingField { .. } | ValueAccessError::MissingKey { .. }
+    )
+}
+
+fn resolve_ref_value_status_inner(
+    value: &Value,
+    bindings: &ResolvedBindings,
+    config: Option<&crate::parser::ProviderContext>,
+) -> Result<ValueResolution, String> {
+    match value {
+        Value::Deferred(DeferredValue::Coalesce {
+            value: left,
+            default,
+        }) => match resolve_ref_value_status_inner(left, bindings, config)? {
+            ValueResolution::Present(value) => Ok(ValueResolution::Present(value)),
+            ValueResolution::Absent => resolve_ref_value_status_inner(default, bindings, config),
+            ValueResolution::Unknown(_) => Ok(ValueResolution::Unknown(value.clone())),
+        },
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            let binding = path.binding();
+            let completeness = bindings.completeness(binding);
+            let Some(attributes) = bindings.get(binding) else {
+                return Ok(ValueResolution::Unknown(value.clone()));
+            };
+            let Some(attribute) = attributes.get(path.attribute()) else {
+                return Ok(match completeness {
+                    Some(BindingCompleteness::Complete) => ValueResolution::Absent,
+                    Some(BindingCompleteness::Incomplete) | None => {
+                        ValueResolution::Unknown(value.clone())
+                    }
+                });
+            };
+            let attribute_is_definitive =
+                bindings.attribute_is_definitive(binding, path.attribute());
+            if !attribute_is_definitive {
+                return Ok(ValueResolution::Unknown(value.clone()));
+            }
+
+            let mut resolved = resolve_ref_value_inner(attribute, bindings, config)?;
+            if !value_is_fully_resolved(&resolved) {
+                return Ok(ValueResolution::Unknown(value.clone()));
+            }
+            for segment in path.segments() {
+                match apply_value_path_segment(
+                    resolved,
+                    segment.clone(),
+                    0,
+                    AccessMissPolicy::Error,
+                ) {
+                    Ok(ValuePathSegmentResult::Resolved(next)) => {
+                        resolved = resolve_ref_value_inner(&next, bindings, config)?;
+                        if !value_is_fully_resolved(&resolved) {
+                            return Ok(ValueResolution::Unknown(value.clone()));
+                        }
+                    }
+                    Ok(
+                        ValuePathSegmentResult::Deferred(_)
+                        | ValuePathSegmentResult::DeferredMiss(_),
+                    ) => return Ok(ValueResolution::Unknown(value.clone())),
+                    Err(error) if missing_access(&error) && attribute_is_definitive => {
+                        return Ok(ValueResolution::Absent);
+                    }
+                    Err(error) if missing_access(&error) => {
+                        return Ok(ValueResolution::Unknown(value.clone()));
+                    }
+                    Err(error) => return Err(error.format_for_path(&path.to_string())),
+                }
+            }
+            Ok(ValueResolution::Present(resolved))
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            let Some(attributes) = bindings.get(binding) else {
+                return Ok(ValueResolution::Unknown(value.clone()));
+            };
+            if bindings.completeness(binding) != Some(BindingCompleteness::Complete) {
+                return Ok(ValueResolution::Unknown(value.clone()));
+            }
+            let mut keys = attributes.keys().collect::<Vec<_>>();
+            keys.sort();
+            let values = keys
+                .into_iter()
+                .map(|key| (key.clone(), attributes[key].clone()))
+                .collect();
+            let resolved = Value::Concrete(ConcreteValue::Map(values));
+            if value_is_fully_resolved(&resolved) {
+                Ok(ValueResolution::Present(resolved))
+            } else {
+                Ok(ValueResolution::Unknown(value.clone()))
+            }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let resolved_base =
+                match resolve_ref_value_status_inner(access.base(), bindings, config)? {
+                    ValueResolution::Present(value) => value,
+                    ValueResolution::Absent => return Ok(ValueResolution::Absent),
+                    ValueResolution::Unknown(_) => {
+                        return Ok(ValueResolution::Unknown(value.clone()));
+                    }
+                };
+            match access.rebuild_result(
+                resolved_base,
+                access.step().clone(),
+                AccessMissPolicy::Error,
+            ) {
+                Ok(ValuePathSegmentResult::Resolved(value)) => {
+                    resolve_ref_value_status_inner(&value, bindings, config)
+                }
+                Ok(
+                    ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
+                ) => Ok(ValueResolution::Unknown(value.clone())),
+                Err(error) if missing_access(&error) => Ok(ValueResolution::Absent),
+                Err(error) => Err(error.format_for_path(&crate::value::format_value(value))),
+            }
+        }
+        Value::Deferred(DeferredValue::Unknown(_)) => Ok(ValueResolution::Unknown(value.clone())),
+        _ => {
+            let resolved = resolve_ref_value_inner(value, bindings, config)?;
+            if !value_is_fully_resolved(&resolved) {
+                Ok(ValueResolution::Unknown(resolved))
+            } else {
+                Ok(ValueResolution::Present(resolved))
+            }
+        }
+    }
+}
+
 fn resolve_ref_value_inner(
     value: &Value,
     bindings: &ResolvedBindings,
     config: Option<&crate::parser::ProviderContext>,
 ) -> Result<Value, String> {
     match value {
+        Value::Deferred(DeferredValue::Coalesce { .. }) => {
+            match resolve_ref_value_status_inner(value, bindings, config)? {
+                ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
+                ValueResolution::Absent => Ok(value.clone()),
+            }
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
@@ -489,9 +676,9 @@ fn resolve_ref_value_inner(
             let resolved_args = resolved_args?;
 
             // Check if all args are fully resolved (no remaining refs)
-            let all_resolved = resolved_args
-                .iter()
-                .all(|argument| !contains_resource_ref(argument.walker_value()));
+            let all_resolved = resolved_args.iter().all(|argument| {
+                argument.handle().is_some() || argument.value().is_some_and(value_is_fully_resolved)
+            });
 
             if all_resolved {
                 // Evaluate the built-in function; propagate errors since args are resolved.
@@ -540,10 +727,7 @@ fn resolve_ref_value_inner(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let all_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some()
-                    || argument
-                        .value()
-                        .is_some_and(|value| !contains_resource_ref(value))
+                argument.handle().is_some() || argument.value().is_some_and(value_is_fully_resolved)
             });
             if !all_resolved {
                 return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
@@ -598,6 +782,7 @@ fn resolve_ref_value_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binding_index::BindingCompleteness;
     use crate::resource::ResourceId;
 
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
@@ -630,6 +815,282 @@ mod tests {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         })
+    }
+
+    fn coalesce(value: Value, default: Value) -> Value {
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(value),
+            default: Box::new(default),
+        })
+    }
+
+    #[test]
+    fn coalesce_resolution_is_present_absent_or_unknown() {
+        let default = Value::Concrete(ConcreteValue::List(Vec::new()));
+        let accounts = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("a".into()),
+        )]));
+        let expression = coalesce(
+            Value::resource_ref("up", "accounts", Vec::new()),
+            default.clone(),
+        );
+
+        let mut present = ResolvedBindings::default();
+        present.set(
+            "up",
+            HashMap::from([("accounts".to_string(), accounts.clone())]),
+            BindingValueSource::Upstream,
+        );
+        assert_eq!(
+            resolve_ref_value_status(&expression, &present),
+            Ok(ValueResolution::Present(accounts)),
+        );
+
+        let mut absent = ResolvedBindings::default();
+        absent.set("up", HashMap::new(), BindingValueSource::Upstream);
+        assert_eq!(
+            resolve_ref_value_status(&expression, &absent),
+            Ok(ValueResolution::Present(default)),
+        );
+
+        let mut unknown = ResolvedBindings::default();
+        unknown.set_with_completeness(
+            "up",
+            HashMap::new(),
+            BindingValueSource::Upstream,
+            BindingCompleteness::Incomplete,
+        );
+        assert_eq!(
+            resolve_ref_value_status(&expression, &unknown),
+            Ok(ValueResolution::Unknown(expression)),
+        );
+    }
+
+    #[test]
+    fn coalesce_does_not_treat_explicit_unknown_as_absent() {
+        let unknown_reason = crate::resource::UnknownReason::PostCreateReadIncomplete {
+            detail: "provider read incomplete".to_string(),
+        };
+        let expression = coalesce(
+            Value::Deferred(DeferredValue::Unknown(unknown_reason)),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+
+        let resolved = resolve_ref_value_status(&expression, &ResolvedBindings::default())
+            .expect("unknown coalesce must remain resolvable");
+        assert!(matches!(
+            resolved,
+            ValueResolution::Unknown(Value::Deferred(DeferredValue::Coalesce { .. }))
+        ));
+    }
+
+    #[test]
+    fn coalesce_does_not_evaluate_function_with_unknown_argument() {
+        let function = Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![
+                Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::PostCreateReadIncomplete {
+                        detail: "producer still running".to_string(),
+                    },
+                ))
+                .into(),
+            ],
+            source_line: 1.into(),
+        });
+        let expression = coalesce(
+            function,
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+
+        assert!(matches!(
+            resolve_ref_value_status(&expression, &ResolvedBindings::default()),
+            Ok(ValueResolution::Unknown(Value::Deferred(
+                DeferredValue::Coalesce { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn coalesce_does_not_treat_function_error_as_absence() {
+        let expression = coalesce(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::upper,
+                args: vec![Value::Concrete(ConcreteValue::Int(1)).into()],
+                source_line: 1.into(),
+            }),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+
+        let error = resolve_ref_value_status(&expression, &ResolvedBindings::default())
+            .expect_err("function errors must not select the coalesce default");
+        assert!(error.contains("upper()"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn incomplete_binding_distinguishes_desired_values_from_provisional_outputs() {
+        let resource = make_resource(
+            "up-resource",
+            Some("up"),
+            vec![("name", Value::Concrete(ConcreteValue::String("new".into())))],
+        );
+        let state = State::existing(
+            resource.id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("old".into())),
+                ),
+                (
+                    "accounts".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("old-account".into()),
+                    )])),
+                ),
+            ]),
+        )
+        .with_identifier("up-id");
+        let current = crate::resource::into_plan_input_current_map_from_states(
+            HashMap::from([(resource.id.clone(), state)]),
+            &crate::schema::SchemaRegistry::new(),
+            std::slice::from_ref(&resource),
+        );
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: std::slice::from_ref(&resource),
+            compositions: &[],
+            data_sources: &[],
+            managed_current: &current,
+            data_source_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+
+        assert_eq!(
+            resolve_ref_value_status(
+                &coalesce(
+                    Value::resource_ref("up", "name", vec![]),
+                    Value::Concrete(ConcreteValue::String("fallback".into())),
+                ),
+                &bindings,
+            ),
+            Ok(ValueResolution::Present(Value::Concrete(
+                ConcreteValue::String("new".into()),
+            ))),
+        );
+
+        let provisional = coalesce(
+            Value::resource_ref("up", "accounts", vec![]),
+            Value::Concrete(ConcreteValue::List(Vec::new())),
+        );
+        assert_eq!(
+            resolve_ref_value_status(&provisional, &bindings),
+            Ok(ValueResolution::Unknown(provisional)),
+        );
+    }
+
+    #[test]
+    fn post_apply_complete_binding_treats_missing_output_as_absent() {
+        let resource = make_resource("producer", Some("producer"), vec![]);
+        let state =
+            State::existing(resource.id.clone(), HashMap::new()).with_identifier("provider-id");
+        let mut bindings = ResolvedBindings::default();
+        bindings.record_applied(Some("producer"), &HashMap::new(), &state);
+        let default = Value::Concrete(ConcreteValue::String("fallback".into()));
+        let expression = coalesce(
+            Value::resource_ref("producer", "optional", vec![]),
+            default.clone(),
+        );
+
+        assert_eq!(
+            resolve_ref_value_status(&expression, &bindings),
+            Ok(ValueResolution::Present(default)),
+        );
+    }
+
+    #[test]
+    fn coalesce_propagates_wrong_shape_errors() {
+        use crate::resource::{AccessPath, PathSegment};
+
+        let mut bindings = ResolvedBindings::default();
+        bindings.set(
+            "up",
+            HashMap::from([(
+                "accounts".to_string(),
+                Value::Concrete(ConcreteValue::String("not-a-map".into())),
+            )]),
+            BindingValueSource::Upstream,
+        );
+        let expression = coalesce(
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::with_segments(
+                    "up",
+                    "accounts",
+                    vec![PathSegment::Field {
+                        name: "missing".to_string(),
+                    }],
+                ),
+            }),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+
+        let error = resolve_ref_value_status(&expression, &bindings)
+            .expect_err("wrong-shaped access must remain an error");
+        assert!(
+            error.contains("cannot apply access"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn coalesce_treats_missing_field_on_resolved_computed_value_as_absent() {
+        use crate::resource::{AccessMissPolicy, PathSegment, apply_postfix_access};
+
+        let mut choices = IndexMap::new();
+        choices.insert(
+            "selected".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "present".to_string(),
+                Value::Concrete(ConcreteValue::String("value".into())),
+            )]))),
+        );
+        let computed = Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::lookup,
+            args: vec![
+                Value::Concrete(ConcreteValue::Map(choices)).into(),
+                Value::resource_ref("selector", "key", vec![]).into(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())).into(),
+            ],
+            source_line: 1.into(),
+        });
+        let missing = apply_postfix_access(
+            computed,
+            PathSegment::Field {
+                name: "missing".to_string(),
+            },
+            1,
+            AccessMissPolicy::Error,
+        )
+        .expect("deferred computed access");
+        let expression = coalesce(
+            missing,
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set(
+            "selector",
+            HashMap::from([(
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String("selected".into())),
+            )]),
+            BindingValueSource::Upstream,
+        );
+
+        assert_eq!(
+            resolve_ref_value_status(&expression, &bindings),
+            Ok(ValueResolution::Present(Value::Concrete(
+                ConcreteValue::String("fallback".into()),
+            ))),
+        );
     }
 
     #[test]

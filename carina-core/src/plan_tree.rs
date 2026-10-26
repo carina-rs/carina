@@ -68,11 +68,7 @@ pub fn is_synthetic_deferred_binding(binding_name: &str) -> bool {
 }
 
 pub fn deferred_for_source(template: &crate::parser::DeferredForExpression) -> String {
-    if template.iterable_attr.is_empty() {
-        template.iterable_binding.clone()
-    } else {
-        format!("{}.{}", template.iterable_binding, template.iterable_attr)
-    }
+    crate::value::format_value(&template.iterable)
 }
 
 pub fn deferred_for_verb(plan: &Plan, upstream_binding: &str) -> &'static str {
@@ -579,6 +575,29 @@ mod tests {
     }
 
     #[test]
+    fn deferred_for_source_renders_the_complete_coalesce_expression() {
+        let template_resource = Resource::new("test.Child", "children");
+        let deferred = DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for x in (up.items ?? fallback.items)".to_string(),
+            resource_type: "test.Child".to_string(),
+            attributes: Vec::new(),
+            binding_name: "children".to_string(),
+            iterable: Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::resource_ref("up", "items", Vec::new())),
+                default: Box::new(Value::resource_ref("fallback", "items", Vec::new())),
+            }),
+            iterable_binding: "up".to_string(),
+            iterable_attr: "items".to_string(),
+            binding: ForBinding::Simple("x".to_string()),
+            template_resource,
+        };
+
+        assert_eq!(deferred_for_source(&deferred), "up.items ?? fallback.items");
+    }
+
+    #[test]
     fn deferred_for_display_hides_direct_placeholder_access_but_keeps_expressions() {
         let placeholder = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
         let direct_access = crate::resource::apply_postfix_access(
@@ -859,6 +878,7 @@ mod tests {
             resource_type: "aws.route53.Record".to_string(),
             attributes: Vec::new(),
             binding_name: "validation_records".to_string(),
+            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             iterable_binding: "cert".to_string(),
             iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
@@ -935,6 +955,7 @@ mod tests {
             resource_type: "aws.route53.Record".to_string(),
             attributes: Vec::new(),
             binding_name: "validation_records".to_string(),
+            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             iterable_binding: "cert".to_string(),
             iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
