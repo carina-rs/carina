@@ -28,8 +28,8 @@ use carina_core::executor::normalized::{
     states_contain_unknown,
 };
 use carina_core::executor::{
-    ProviderReadyConfig, UnresolvedDataSourceInput, prepare_provider_ready_config,
-    unresolved_data_source_inputs,
+    ProviderReadyConfig, UnresolvedDataSourceInput, UnresolvedResource,
+    prepare_provider_ready_config, unresolved_data_source_inputs,
 };
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
@@ -70,8 +70,10 @@ use crate::module_walk::ModuleWalk;
 pub struct PlanContext {
     pub plan: Plan,
     pub provider: ProviderRouter,
-    pub sorted_resources: Vec<Resource>,
-    pub unresolved_resources: Vec<Resource>,
+    /// Evaluated desired resources after the identity-resolution boundary.
+    pub sorted_resources: Vec<ResolvedResource>,
+    /// Pre-value-resolution snapshots with the same resolved identities.
+    pub unresolved_resources: Vec<UnresolvedResource>,
     /// Module compositions after plan-time constraint evaluation. Pending
     /// constraints must survive in saved plans for apply-time re-evaluation.
     pub compositions: Vec<Composition>,
@@ -2935,8 +2937,11 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         return Ok(PlanContext {
             plan,
             provider,
-            sorted_resources: constraint_origin_resources.clone(),
-            unresolved_resources: constraint_origin_resources,
+            // Error plans are aborted before any resolved-resource consumer,
+            // including plan-image rendering. Do not weaken the successful
+            // path's type invariant to retain unusable pending resources.
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
             compositions: prepared_compositions,
             data_sources: data_sources_for_plan,
             managed_current,
@@ -3051,6 +3056,11 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .iter()
         .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
+    let unresolved_resources = resolved_unresolved_resources
+        .into_iter()
+        .map(ResolvedResource::into_inner)
+        .map(UnresolvedResource::from_pre_resolve)
+        .collect();
     Ok(PlanContext {
         plan,
         provider,
@@ -3061,8 +3071,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // restored unevaluated calls such as `secret("...")`. Anonymous
         // resources have no binding and kept this evaluated view, producing
         // the bound/anonymous saved-plan divergence.
-        sorted_resources: override_aware_resources.resources().to_vec(),
-        unresolved_resources: paired_unresolved_resources,
+        sorted_resources: resolved_resources,
+        unresolved_resources,
         compositions: prepared_compositions,
         data_sources: data_sources_for_plan,
         managed_current,

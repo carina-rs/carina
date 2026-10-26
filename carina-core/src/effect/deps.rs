@@ -381,9 +381,9 @@ impl DependencyAnalyzer {
         self.lookup_by_identity(&ResourceIdentity::new(binding))
     }
 
-    fn collect_from_schedule_edges(
+    fn collect_from_schedule_edges<E: AsRef<Effect>>(
         &self,
-        effects: &[Effect],
+        effects: &[E],
         edges: Vec<ScheduleEdge>,
         analysis: &mut DependencyAnalysis,
         self_idx: usize,
@@ -409,7 +409,7 @@ impl DependencyAnalyzer {
                 }
                 ScheduleEdge::BlockedBy(identity) => {
                     let is_delete_fanout_source = self_idx >= effects.len()
-                        || matches!(effects[self_idx], Effect::Delete { .. });
+                        || matches!(effects[self_idx].as_ref(), Effect::Delete { .. });
                     if is_delete_fanout_source {
                         for blocked_idx in self.lookup_deletes_by_identity(&identity) {
                             if blocked_idx != self_idx {
@@ -424,7 +424,7 @@ impl DependencyAnalyzer {
                     for blocked_idx in self.lookup_deletes_by_identity(&identity) {
                         if blocked_idx != self_idx
                             && blocked_idx < effects.len()
-                            && matches!(effects[blocked_idx], Effect::Delete { .. })
+                            && matches!(effects[blocked_idx].as_ref(), Effect::Delete { .. })
                         {
                             analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
                         }
@@ -537,12 +537,47 @@ pub fn build_effect_dependency_analysis(
     compositions: &[crate::resource::Composition],
     inputs: ScheduleInputs<'_>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
+    build_effect_dependency_analysis_with_lookup(effects, compositions, inputs, |id| {
+        unresolved_resources
+            .get(id)
+            .map(UnresolvedResource::as_resource)
+    })
+}
+
+/// Borrowed-resource form of [`build_effect_dependency_analysis`].
+///
+/// Display-only graph builders can preserve the scheduler's exact ordering
+/// semantics without cloning unresolved resources and their attribute values.
+pub(crate) fn build_effect_dependency_analysis_from_resources(
+    effects: &[&Effect],
+    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
+    compositions: &[crate::resource::Composition],
+    inputs: ScheduleInputs<'_>,
+) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
+    build_effect_dependency_analysis_with_lookup(effects, compositions, inputs, |id| {
+        unresolved_resources
+            .get(id)
+            .map(|resource| resource.as_resource())
+    })
+}
+
+fn build_effect_dependency_analysis_with_lookup<'a, E, F>(
+    effects: &[E],
+    compositions: &[crate::resource::Composition],
+    inputs: ScheduleInputs<'_>,
+    unresolved_resource: F,
+) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
+where
+    E: AsRef<Effect>,
+    F: Fn(&ResourceId) -> Option<&'a Resource>,
+{
     let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
         ScheduleInputs::Destroy { aliases } => aliases,
     };
     for (idx, effect) in effects.iter().enumerate() {
+        let effect = effect.as_ref();
         let targets = instance_to_idx.entry(effect.instance_key()).or_default();
         if matches!(effect, Effect::Delete { .. }) {
             targets.insert_delete(idx);
@@ -581,6 +616,7 @@ pub fn build_effect_dependency_analysis(
     add_same_identity_replacement_order_edges(effects, &mut analysis);
 
     for (idx, effect) in effects.iter().enumerate() {
+        let effect = effect.as_ref();
         match inputs {
             ScheduleInputs::Apply => {
                 if effect.is_scheduler_meta() {
@@ -593,12 +629,8 @@ pub fn build_effect_dependency_analysis(
                     continue;
                 }
                 if effect.as_resource_ref().is_some() {
-                    if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                        analyzer.collect_from_resource(
-                            unresolved.as_resource(),
-                            &mut analysis,
-                            idx,
-                        );
+                    if let Some(unresolved) = unresolved_resource(effect.resource_id()) {
+                        analyzer.collect_from_resource(unresolved, &mut analysis, idx);
                     } else if let Some(resource) = effect.as_resource_ref() {
                         analyzer.collect_from_resource_ref(resource, &mut analysis, idx);
                     }
@@ -638,12 +670,13 @@ pub fn build_effect_dependency_analysis(
     }
 }
 
-fn add_same_identity_replacement_order_edges(
-    effects: &[Effect],
+fn add_same_identity_replacement_order_edges<E: AsRef<Effect>>(
+    effects: &[E],
     analysis: &mut DependencyAnalysis,
 ) {
     let mut previous_by_instance: HashMap<EffectInstanceKey, usize> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
+        let effect = effect.as_ref();
         if !matches!(effect, Effect::Create(_) | Effect::Delete { .. }) {
             continue;
         }
@@ -655,16 +688,19 @@ fn add_same_identity_replacement_order_edges(
     }
 }
 
-pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAnalysis) {
+pub fn relax_update_update_edges<E: AsRef<Effect>>(
+    effects: &[E],
+    analysis: &mut DependencyAnalysis,
+) {
     for child in 0..effects.len() {
-        if !matches!(&effects[child], Effect::Update { .. }) {
+        if !matches!(effects[child].as_ref(), Effect::Update { .. }) {
             continue;
         }
         let Some(parents) = analysis.deps_of(child).cloned() else {
             continue;
         };
         for parent in parents {
-            let Some(writes) = WritesSet::from_update(&effects[parent]) else {
+            let Some(writes) = WritesSet::from_update(effects[parent].as_ref()) else {
                 continue;
             };
             let Some(reads) = analysis.reads_for_edge(child, parent) else {

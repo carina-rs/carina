@@ -89,6 +89,73 @@ Output the plan as structured JSON instead of human-readable text. The output us
 carina plan --json
 ```
 
+### `--image <FILE>`
+
+Write the plan as a dependency-graph image, in addition to the normal text,
+`--json`, or `--tui` output. The format is chosen by the file extension:
+`.svg` or `.png` (case-insensitive). Any other extension is rejected before
+planning starts.
+
+The image is meant for reviewing a plan where the text output is hard to scan,
+such as a pull request:
+
+- Each changed resource is a card colored by its effect (create, update,
+  replace, delete, and so on). Update cards list the names of the changed
+  attributes; replace cards list the attributes that force the replacement.
+- Cards are laid out left to right in apply order. Cards in the same column
+  have no ordering dependency on each other and can run in parallel. Solid
+  arrows mean "runs before".
+- Resources downstream of a replace or delete are highlighted with a halo,
+  so the blast radius of a destructive change is visible at a glance.
+- Unchanged resources appear only when they connect two changed resources.
+  Their edges are dashed and mean "references", not ordering. A module call
+  with no changes is collapsed into a single card.
+- Resources inside a module call are grouped in a box labelled with the call.
+- The header shows per-effect counts, with replace and destroy counts in red,
+  and the state lineage and serial the plan was computed against.
+
+The image never contains attribute values, so it can be shared without
+exposing secrets.
+
+The image is written last, after everything else in the command has
+succeeded, so a failed `plan` never leaves a fresh image behind. The image is
+rendered before the `--out` file is saved: if rendering fails, the command
+exits with code `1` and writes neither file. Only an I/O error while writing
+the image file itself can happen after `--out` has been saved. PNG output is
+limited to 64 megapixels; for very large plans, use `.svg` instead.
+
+`--image` does not change exit codes: with `--detailed-exitcode`, the exit
+code is the same as without `--image`.
+
+PNG output uses an embedded font, so it renders identically on every machine,
+including CI runners without any fonts installed.
+
+```bash
+carina plan --image plan.png
+```
+
+In GitHub Actions, keep exit code `2` (changes present) from failing the job,
+fail it on a real error (`1`), and upload the image as a build artifact that
+reviewers can download and drag into a pull request comment:
+
+```yaml
+- id: plan
+  run: |
+    set +e
+    carina plan --detailed-exitcode --image plan.png
+    code=$?
+    echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+    [ "$code" -ne 1 ]
+- uses: actions/upload-artifact@v4
+  with:
+    name: carina-plan
+    path: plan.png
+    if-no-files-found: error
+```
+
+GitHub has no API for uploading images into a comment, so attaching the image
+to the comment itself is a manual step (or needs a third-party action).
+
 ## Examples
 
 Plan from the current directory:

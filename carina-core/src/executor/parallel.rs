@@ -39,22 +39,26 @@ use super::{
 pub(super) struct ExpandedEffects {
     pub(super) effects: Vec<Effect>,
     pub(super) deferred_replace_delete_deps: Vec<(usize, usize)>,
+    pub(super) source_effect_indices: Vec<usize>,
 }
 
 pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> ExpandedEffects {
     let mut effects = Vec::with_capacity(plan_effects.len());
     let mut deferred_replace_delete_deps = Vec::new();
+    let mut source_effect_indices = Vec::with_capacity(plan_effects.len());
 
-    for effect in plan_effects {
+    for (source_effect_idx, effect) in plan_effects.iter().enumerate() {
         if let Effect::DeferredReplace(payload) = effect {
             let mut delete_indices = Vec::with_capacity(payload.deletes.len());
             for delete in payload.deletes.iter() {
                 let delete_idx = effects.len();
                 effects.push(delete.to_delete_effect());
+                source_effect_indices.push(source_effect_idx);
                 delete_indices.push(delete_idx);
             }
             let gate_idx = effects.len();
             effects.push(effect.clone());
+            source_effect_indices.push(source_effect_idx);
             deferred_replace_delete_deps.extend(
                 delete_indices
                     .into_iter()
@@ -62,12 +66,14 @@ pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> Expand
             );
         } else {
             effects.push(effect.clone());
+            source_effect_indices.push(source_effect_idx);
         }
     }
 
     ExpandedEffects {
         effects,
         deferred_replace_delete_deps,
+        source_effect_indices,
     }
 }
 
@@ -249,6 +255,7 @@ pub(super) async fn execute_effects_sequential(
     let ExpandedEffects {
         effects: expanded_effects,
         deferred_replace_delete_deps,
+        source_effect_indices: _,
     } = expand_deferred_replace_effects(input.plan.effects());
     let mut effects = expanded_effects;
     let mut total = count_runtime_effects(&effects, &input.deferred_data_source_reads);

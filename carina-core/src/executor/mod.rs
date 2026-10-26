@@ -32,6 +32,76 @@ pub use provider_ready::{
 };
 pub use replace::compute_full_diff_patch;
 
+/// Phase of an executor scheduler endpoint after deferred replacements have
+/// been expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlanSchedulerPhase {
+    /// The plan effect itself, including a deferred replacement's create gate.
+    Primary,
+    /// A delete absorbed into a [`Effect::DeferredReplace`].
+    DeferredReplaceTeardown,
+}
+
+/// One endpoint of an executor dependency edge, projected back to the plan
+/// effect that produced it while retaining its execution phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlanSchedulerEndpoint {
+    pub effect_index: usize,
+    pub phase: PlanSchedulerPhase,
+}
+
+/// Build the executor's apply-order edges for a plan, projected back to the
+/// original plan effects.
+///
+/// Deferred replacements are expanded exactly as they are at execution time;
+/// endpoint phase preserves whether an edge touches an absorbed teardown.
+/// Dependency-analysis failures retain their partial edge graph, matching the
+/// scheduler's behavior for unaffected effects.
+pub fn build_plan_scheduler_dependency_edges(
+    plan_effects: &[Effect],
+    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
+    compositions: &[crate::resource::Composition],
+) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
+    let parallel::ExpandedEffects {
+        effects,
+        deferred_replace_delete_deps,
+        source_effect_indices,
+    } = parallel::expand_deferred_replace_effects(plan_effects);
+    let deferred_replace_teardowns: HashSet<_> = deferred_replace_delete_deps
+        .iter()
+        .map(|(_, delete_idx)| *delete_idx)
+        .collect();
+    let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps_from_resources(
+        &effects,
+        unresolved_resources,
+        compositions,
+        &deferred_replace_delete_deps,
+    );
+
+    deps_of
+        .into_iter()
+        .flat_map(|(dependent, dependencies)| {
+            let source_effect_indices = &source_effect_indices;
+            let deferred_replace_teardowns = &deferred_replace_teardowns;
+            dependencies.into_iter().filter_map(move |dependency| {
+                let endpoint = |expanded_idx| {
+                    Some(PlanSchedulerEndpoint {
+                        effect_index: *source_effect_indices.get(expanded_idx)?,
+                        phase: if deferred_replace_teardowns.contains(&expanded_idx) {
+                            PlanSchedulerPhase::DeferredReplaceTeardown
+                        } else {
+                            PlanSchedulerPhase::Primary
+                        },
+                    })
+                };
+                let from = endpoint(dependency)?;
+                let to = endpoint(dependent)?;
+                (from != to).then_some((from, to))
+            })
+        })
+        .collect()
+}
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;

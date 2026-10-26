@@ -2,6 +2,7 @@ use super::*;
 
 use colored::Colorize;
 
+use crate::plan_summary::PlanChangeSummary;
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
@@ -63,12 +64,11 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     // Should not panic
     print_plan(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     );
@@ -87,12 +87,11 @@ fn test_print_plan_with_internal_dependency_does_not_panic() {
     // Should not panic
     print_plan(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     );
@@ -632,12 +631,11 @@ fn test_print_plan_compact_does_not_panic() {
     // Should not panic
     print_plan(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::None,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     );
@@ -662,12 +660,11 @@ fn test_print_plan_compact_with_anonymous_resources() {
     // Should not panic; anonymous resources should show hints
     print_plan(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::None,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     );
@@ -798,12 +795,11 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
 
     let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     ));
@@ -915,12 +911,11 @@ fn test_deferred_replace_renders_top_level() {
 
     let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     ));
@@ -956,12 +951,11 @@ fn test_deferred_replace_renders_dependent_children() {
 
     let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     ));
@@ -992,12 +986,11 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
 
     let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
-        &[],
-        &[],
         None,
         None,
     ));
@@ -1574,6 +1567,38 @@ fn plan_export_values_use_the_core_value_formatter() {
 }
 
 #[test]
+fn plan_summary_carries_the_exact_export_changes_rendered_by_text_output() {
+    use crate::commands::plan::ExportChange;
+
+    let plan = Plan::new();
+    let export_changes = vec![ExportChange::Added {
+        name: "region".to_string(),
+        type_expr: None,
+        new_value: Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+    }];
+    let summary = PlanChangeSummary::new(&plan, &export_changes, &[]);
+    let output = strip_ansi(&format_plan_with_delete_instances(
+        &plan,
+        &summary,
+        DetailLevel::None,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        None,
+        None,
+    ));
+
+    assert!(
+        output.contains("Exports:"),
+        "missing export section:\n{output}"
+    );
+    assert!(
+        output.contains("+ region = 'ap-northeast-1'"),
+        "missing export value:\n{output}"
+    );
+}
+
+#[test]
 fn persisted_plan_export_maps_use_the_core_value_formatter() {
     use crate::commands::plan::ExportChange;
 
@@ -1972,12 +1997,11 @@ fn module_children_render_with_tree_connectors() {
 
     let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::None,
         &HashMap::new(),
         Some(&SchemaRegistry::new()),
         &HashMap::new(),
-        &[],
-        &[],
         None,
         Some(&trace),
     ));
@@ -2018,12 +2042,11 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
 
     let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
+        &PlanChangeSummary::new(&plan, &[], &[]),
         DetailLevel::None,
         &HashMap::new(),
         Some(&SchemaRegistry::new()),
         &HashMap::new(),
-        &[],
-        &[],
         None,
         Some(&trace),
     ));

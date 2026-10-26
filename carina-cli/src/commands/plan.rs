@@ -36,6 +36,12 @@ use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
+#[cfg(test)]
+use crate::plan_image::PlanImageError;
+use crate::plan_image::{
+    PlanImageInput, PlanImageTarget, StateMetadata, render_plan_image, write_plan_image,
+};
+use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, create_plan_from_parsed_with_upstream_with_ctx,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
@@ -1297,7 +1303,7 @@ fn build_plan_file<E>(
     let desired_resources: HashMap<ResourceId, Resource> = ctx
         .sorted_resources
         .iter()
-        .map(|resource| (resource.id.clone(), resource.clone()))
+        .map(|resource| (resource.id.clone(), resource.as_inner().clone()))
         .collect();
     let provider_configs = SavedProviderConfigs::from(provider_configs).redact_secrets()?;
     for (binding, attributes) in &ctx.upstream_snapshot {
@@ -1496,7 +1502,7 @@ fn build_plan_file<E>(
             .iter()
             .zip(&ctx.sorted_resources)
             .map(|(source, evaluated)| {
-                redact_secrets_in_resource_using_evaluated(source, evaluated)
+                redact_secrets_in_resource_using_evaluated(source.as_resource(), evaluated)
             })
             .collect::<Result<Vec<_>, _>>()?,
         compositions: ctx
@@ -1701,6 +1707,7 @@ async fn drift_detection_test_barrier() {
 pub async fn run_plan(
     path: &Path,
     out: Option<&Path>,
+    image: Option<&PlanImageTarget>,
     detail: DetailLevel,
     tui: bool,
     refresh: bool,
@@ -1915,8 +1922,6 @@ pub async fn run_plan(
         base_dir,
     )
     .await?;
-    let has_changes = ctx.plan.mutation_count() > 0;
-
     // TOCTOU drift detection (#3111). `plan` took no state lock, so a
     // concurrent apply/destroy may have written state while the diff
     // above was being computed. Re-read state now and compare against
@@ -1979,9 +1984,14 @@ pub async fn run_plan(
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
+    let resources_for_exports: Vec<Resource> = ctx
+        .sorted_resources
+        .iter()
+        .map(|resource| resource.as_inner().clone())
+        .collect();
     let checked_exports = check_exports_pre_apply(CheckExportsPreApplyInput {
         export_params: &parsed.export_params,
-        resources: &ctx.sorted_resources,
+        resources: &resources_for_exports,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
         managed_current: &ctx.managed_current,
@@ -1993,6 +2003,16 @@ pub async fn run_plan(
         provider_context,
     })
     .map_err(AppError::Validation)?;
+    let current_exports = state_file
+        .as_ref()
+        .map(|state| state.exports.clone())
+        .unwrap_or_default();
+    let export_changes = compute_export_diffs(&checked_exports, &current_exports);
+    let summary = PlanChangeSummary::new(&ctx.plan, &export_changes, &ctx.residual_deferred_for);
+    // Preserve the CLI contract from before plan-image summaries existed:
+    // detailed exit code 2 means a managed-resource mutation, not merely
+    // displayable work such as reads, waits, exports, or deferred loops.
+    let has_changes = ctx.plan.mutation_count() > 0;
 
     if json {
         if let Some(note) = drift_note.as_ref() {
@@ -2028,23 +2048,17 @@ pub async fn run_plan(
             crate::commands::iam_preflight::emit_warnings(result);
         }
     } else {
-        let current_exports = state_file
-            .as_ref()
-            .map(|s| s.exports.clone())
-            .unwrap_or_default();
-        let export_changes = compute_export_diffs(&checked_exports, &current_exports);
         // Separate the refresh-progress block (printed above when `refresh`)
         // from the plan's terminal section so they don't read as a run-on
         // (#3148).
         print!("{}", refresh_plan_separator(refresh));
         print_plan(
             &ctx.plan,
+            &summary,
             detail,
             &historical_display,
             Some(wiring.schemas()),
             &ctx.moved_origins,
-            &export_changes,
-            &ctx.residual_deferred_for,
             Some(&ctx.prev_explicit),
             Some(&ctx.expansion_trace),
         );
@@ -2069,8 +2083,7 @@ pub async fn run_plan(
         ));
     }
 
-    // Save plan to file if --out was specified
-    if let Some(out_path) = out {
+    let plan_output = if out.is_some() {
         let plan_file = build_plan_file(
             path,
             &parsed,
@@ -2082,8 +2095,34 @@ pub async fn run_plan(
         .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
-        fs::write(out_path, json_out).map_err(|e| format!("Failed to write plan file: {}", e))?;
+        Some(json_out)
+    } else {
+        None
+    };
 
+    let state = state_file.as_ref().map(|state| StateMetadata {
+        lineage: &state.lineage,
+        serial: state.serial,
+    });
+    write_plan_artifacts(
+        out.zip(plan_output.as_deref()),
+        image.map(|image_target| {
+            (
+                image_target,
+                PlanImageInput {
+                    plan: &ctx.plan,
+                    desired_resources: &ctx.sorted_resources,
+                    unresolved_resources: &ctx.unresolved_resources,
+                    compositions: &ctx.compositions,
+                    expansion_trace: Some(&ctx.expansion_trace),
+                    state,
+                    summary: &summary,
+                },
+            )
+        }),
+    )?;
+
+    if let Some(out_path) = out {
         println!();
         println!(
             "{}",
@@ -2101,7 +2140,35 @@ pub async fn run_plan(
         );
     }
 
+    if let Some(image_target) = image {
+        eprintln!("Plan image written to {}", image_target.path().display());
+    }
+
     Ok(has_changes)
+}
+
+/// Render the image before touching either destination, then preserve the
+/// command's commit order: saved plan first, image last. Consequently render
+/// failures leave no fresh artifacts, while the only fallible operation after
+/// a successful `--out` write is the final image I/O write.
+fn write_plan_artifacts(
+    out: Option<(&Path, &str)>,
+    image: Option<(&PlanImageTarget, PlanImageInput<'_>)>,
+) -> Result<(), AppError> {
+    let rendered_image = image
+        .map(|(target, input)| render_plan_image(target, input))
+        .transpose()?;
+
+    if let Some((out_path, contents)) = out {
+        fs::write(out_path, contents)
+            .map_err(|error| AppError::Config(format!("Failed to write plan file: {error}")))?;
+    }
+
+    if let Some(rendered_image) = rendered_image {
+        write_plan_image(rendered_image)?;
+    }
+
+    Ok(())
 }
 
 /// The state-aware identity and provider-input preparation shared by normal
@@ -2252,6 +2319,7 @@ pub(crate) fn check_exports_pre_apply(
 }
 
 /// Represents a change to an export value between current state and desired.
+#[derive(Clone)]
 pub enum ExportChange {
     Added {
         name: String,
@@ -3406,8 +3474,9 @@ exports { region: String = "ap-northeast-1" }"#,
 
         crate::commands::ensure_backend_lock(&dir_b, None).unwrap();
 
-        run_plan(
+        let has_changes = run_plan(
             &dir_b,
+            None,
             None,
             DetailLevel::None,
             false,
@@ -3419,6 +3488,10 @@ exports { region: String = "ap-northeast-1" }"#,
         )
         .await
         .expect("run_plan should succeed");
+        assert!(
+            !has_changes,
+            "an exports-only plan must preserve main's zero detailed exit code"
+        );
 
         // `run_plan` returns only `has_changes`; reload the downstream via
         // the same loader path to verify the upstream binding value is
@@ -3444,6 +3517,29 @@ exports { region: String = "ap-northeast-1" }"#,
             bindings["a"]["region"],
             Value::Concrete(ConcreteValue::String("ap-northeast-1".into()))
         );
+
+        let managed_current = HashMap::new();
+        let data_source_states = HashMap::new();
+        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &parsed.resources,
+                compositions: &parsed.compositions,
+                data_sources: &parsed.data_sources,
+                managed_current: &managed_current,
+                data_source_states: &data_source_states,
+                remote_bindings: &bindings,
+                wait_aliases: &[],
+            },
+        );
+        let checked_exports = carina_core::validation::check_export_values_pre_apply(
+            &parsed.export_params,
+            &export_bindings,
+            &ProviderContext::default(),
+        )
+        .expect("downstream export resolves from upstream state");
+        let export_changes = compute_export_diffs(&checked_exports, &HashMap::new());
+        assert_eq!(export_changes.len(), 1, "fixture must be exports-only");
+        assert_eq!(export_changes[0].name(), "region");
     }
 
     #[tokio::test]
@@ -3472,6 +3568,7 @@ exports { region: String = "ap-northeast-1" }"#,
         run_plan(
             &project,
             None,
+            None,
             DetailLevel::None,
             false,
             false,
@@ -3492,7 +3589,8 @@ mod run_plan_out_tests {
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
         AccessPath, Composition, CompositionArgument, DataSource, DeferredValue,
-        ModuleConstraintId, PendingModuleConstraint, ResourceId, Signature, Value,
+        ModuleConstraintId, PendingModuleConstraint, ResolvedResource, ResourceId, Signature,
+        Value,
     };
     use std::fs;
 
@@ -3569,8 +3667,15 @@ mod run_plan_out_tests {
         let ctx = crate::wiring::PlanContext {
             plan,
             provider: ProviderRouter::new(),
-            sorted_resources: vec![created.clone(), updated.clone()],
-            unresolved_resources: vec![created, updated],
+            sorted_resources: ResolvedResource::collect_resolved([
+                created.clone(),
+                updated.clone(),
+            ])
+            .unwrap(),
+            unresolved_resources: [created, updated]
+                .into_iter()
+                .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+                .collect(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             managed_current: HashMap::new(),
@@ -3672,6 +3777,7 @@ mod run_plan_out_tests {
         run_plan(
             dir,
             Some(&plan_path),
+            None,
             DetailLevel::None,
             false,
             false,
@@ -3713,6 +3819,7 @@ mod run_plan_out_tests {
         run_plan(
             dir,
             Some(&plan_path),
+            None,
             DetailLevel::None,
             false,
             false,
@@ -3730,6 +3837,94 @@ mod run_plan_out_tests {
             Some(b'\n'),
             "plan --out file must end with a trailing newline; got {:?}",
             bytes.last().map(|b| *b as char),
+        );
+    }
+
+    #[tokio::test]
+    async fn run_plan_does_not_write_image_when_out_file_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("main.crn"),
+            r#"exports { region: String = "ap-northeast-1" }"#,
+        )
+        .unwrap();
+        crate::commands::ensure_backend_lock(dir, None).unwrap();
+
+        let image_path = dir.join("plan.svg");
+        let image = PlanImageTarget::try_from(image_path.clone()).unwrap();
+        let missing_parent_out = dir.join("missing/plan.json");
+        let result = run_plan(
+            dir,
+            Some(&missing_parent_out),
+            Some(&image),
+            DetailLevel::None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &ProviderContext::default(),
+        )
+        .await;
+
+        assert!(result.is_err(), "the invalid --out destination must fail");
+        assert!(
+            !image_path.exists(),
+            "a failed plan command must not leave a fresh image"
+        );
+    }
+
+    #[test]
+    fn png_render_failure_writes_neither_out_nor_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("plan.json");
+        let image_path = tmp.path().join("plan.png");
+        let image_target = PlanImageTarget::try_from(image_path.clone()).unwrap();
+
+        let mut plan = Plan::new();
+        for index in 0..300 {
+            let identity =
+                carina_core::resource::ResourceIdentity::try_from(format!("resource_{index:04}"))
+                    .unwrap();
+            plan.add(Effect::Create(ResolvedResource::new(Resource::new(
+                "test.Resource",
+                identity,
+            ))));
+        }
+        let summary = PlanChangeSummary::new(&plan, &[], &[]);
+        let desired_resources = Vec::new();
+        let unresolved_resources = Vec::new();
+        let compositions = Vec::new();
+        let expansion_trace = carina_core::resource::ExpansionTrace::new();
+
+        let result = write_plan_artifacts(
+            Some((&out_path, "{}\n")),
+            Some((
+                &image_target,
+                PlanImageInput {
+                    plan: &plan,
+                    desired_resources: &desired_resources,
+                    unresolved_resources: &unresolved_resources,
+                    compositions: &compositions,
+                    expansion_trace: Some(&expansion_trace),
+                    state: None,
+                    summary: &summary,
+                },
+            )),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(AppError::PlanImage(PlanImageError::PngPixelBudget { .. }))
+            ),
+            "oversized PNG rendering must fail before either artifact is written"
+        );
+        assert!(!out_path.exists(), "render failure must not write --out");
+        assert!(
+            !image_path.exists(),
+            "render failure must not write --image"
         );
     }
 

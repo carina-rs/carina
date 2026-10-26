@@ -14,7 +14,8 @@ use carina_cli::display::{
     format_destroy_plan_with_delete_instances, format_plan_with_delete_instances,
 };
 use carina_cli::fixture_plan::{
-    build_plan_from_fixture_name, delete_instance_attributes_from_plan,
+    build_fixture_plan_change_summary, build_plan_from_fixture_name,
+    delete_instance_attributes_from_plan,
 };
 
 /// Render a fixture the way the `plan-fixture` example does for a normal
@@ -23,14 +24,14 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
     let fp = build_plan_from_fixture_name(fixture);
     let delete_attributes =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
+    let summary = build_fixture_plan_change_summary(&fp);
     format_plan_with_delete_instances(
         &fp.plan,
+        &summary,
         detail,
         &delete_attributes,
         Some(&fp.schemas),
         &fp.moved_origins,
-        &[],
-        &fp.deferred_for_expressions,
         Some(&fp.prev_explicit),
         None,
     )
@@ -98,4 +99,22 @@ fn plan_fixture_upstream_state_map_subscript() {
 fn plan_fixture_upstream_state_map_dot_notation() {
     let output = render_plan("upstream_state_map_dot_notation", DetailLevel::Full);
     assert_non_empty(&output, "upstream_state_map_dot_notation");
+}
+
+#[test]
+fn plan_fixture_export_changes_match_the_example() {
+    let output = render_plan("exports_multifile_let_chain", DetailLevel::Full);
+
+    assert!(
+        output.contains("Exports:"),
+        "missing export section:\n{output}"
+    );
+    assert!(
+        output.contains("+ z = 'foo'"),
+        "missing export diff:\n{output}"
+    );
+    assert!(
+        output.contains("1 export change(s)"),
+        "missing export summary:\n{output}"
+    );
 }

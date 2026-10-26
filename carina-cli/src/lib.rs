@@ -4,6 +4,8 @@ pub mod display;
 pub mod error;
 pub mod fixture_plan;
 pub mod kms;
+pub mod plan_image;
+pub mod plan_summary;
 pub mod signal;
 pub mod wiring;
 

@@ -107,6 +107,163 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
     }
 }
 
+#[test]
+fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
+    fn origins(resources: &[Resource]) -> HashMap<ResourceId, UnresolvedResource> {
+        resources
+            .iter()
+            .map(|resource| {
+                (
+                    resource.id.clone(),
+                    UnresolvedResource::from_pre_resolve(resource.clone()),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_matches_executor(
+        case: &str,
+        effects: Vec<Effect>,
+        unresolved: HashMap<ResourceId, UnresolvedResource>,
+        expected: BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)>,
+    ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
+        let borrowed: HashMap<_, _> = unresolved
+            .iter()
+            .map(|(id, resource)| (id.clone(), resource))
+            .collect();
+        let actual = build_plan_scheduler_dependency_edges(&effects, &borrowed, &[]);
+
+        assert_eq!(actual, expected, "scheduler-edge export drifted for {case}");
+        actual
+    }
+
+    fn primary(effect_index: usize) -> PlanSchedulerEndpoint {
+        PlanSchedulerEndpoint {
+            effect_index,
+            phase: PlanSchedulerPhase::Primary,
+        }
+    }
+
+    fn teardown(effect_index: usize) -> PlanSchedulerEndpoint {
+        PlanSchedulerEndpoint {
+            effect_index,
+            phase: PlanSchedulerPhase::DeferredReplaceTeardown,
+        }
+    }
+
+    let a = make_resource("plain_a", &[]);
+    let b = make_resource("plain_b", &["plain_a"]);
+    let c = make_resource("plain_c", &["plain_b"]);
+    assert_matches_executor(
+        "plain create/update/delete chain",
+        vec![
+            create_effect(a.clone()),
+            Effect::Update {
+                from: Box::new(State::existing(b.id.clone(), HashMap::new())),
+                identifier: crate::effect::fixture_applied_identifier("plain-b"),
+                to: ResolvedResource::new(b.clone()),
+                changed_attributes: vec!["value".to_string()],
+            },
+            Effect::Delete {
+                id: crate::resource::ResolvedResourceId::new(c.id.clone()),
+                identifier: crate::effect::fixture_applied_identifier("plain-c"),
+                generation: EffectGeneration::Current,
+                directives: Directives::default(),
+                binding: c.binding.clone(),
+                dependencies: c.dependency_bindings.iter().cloned().collect(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            },
+        ],
+        origins(&[a, b, c]),
+        BTreeSet::from([(primary(0), primary(1))]),
+    );
+
+    let replacement = make_resource("replacement", &[]);
+    assert_matches_executor(
+        "replacement pair",
+        vec![
+            create_effect(replacement.clone()),
+            Effect::Delete {
+                id: crate::resource::ResolvedResourceId::new(replacement.id.clone()),
+                identifier: crate::effect::fixture_applied_identifier("replacement-old"),
+                generation: EffectGeneration::Current,
+                directives: Directives::default(),
+                binding: replacement.binding.clone(),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            },
+        ],
+        origins(std::slice::from_ref(&replacement)),
+        BTreeSet::from([(primary(0), primary(1))]),
+    );
+
+    let cert = make_resource("cert", &[]);
+    let deferred_replace_edges = assert_matches_executor(
+        "DeferredReplace with absorbed deletes",
+        vec![
+            create_effect(cert.clone()),
+            Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "test",
+                        "validation_records[0]",
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("validation-old"),
+                    directives: Directives::default(),
+                    binding: Some("validation_records[0]".to_string()),
+                    dependencies: HashSet::new(),
+                    explicit_dependencies: HashSet::new(),
+                    blocked_by_updates: HashSet::new(),
+                }])
+                .expect("fixture has one delete"),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "__deferred_for",
+                    "validation_records",
+                )),
+                upstream_binding: "cert".to_string(),
+                template: Box::new(validation_deferred_for_expression()),
+            })),
+        ],
+        origins(std::slice::from_ref(&cert)),
+        BTreeSet::from([(primary(0), primary(1)), (primary(1), teardown(1))]),
+    );
+    assert!(
+        deferred_replace_edges.contains(&(primary(1), teardown(1))),
+        "DeferredReplace primary phase must precede its absorbed-delete teardown phase"
+    );
+
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+    let wait_target = make_resource("wait_target", &[]);
+    let mut wait_consumer = make_resource("wait_consumer", &["wait_ready"]);
+    wait_consumer
+        .dependency_bindings
+        .insert("wait_ready".to_string());
+    assert_matches_executor(
+        "wait",
+        vec![
+            create_effect(wait_target.clone()),
+            Effect::Wait {
+                identity: ResourceIdentity::new("wait_ready"),
+                target_id: crate::resource::ResolvedResourceId::new(wait_target.id.clone()),
+                until: WaitPredicate::equals(
+                    AttrPath::single("status"),
+                    Value::Concrete(ConcreteValue::String("ready".into())),
+                )
+                .unwrap(),
+                until_surface: "wait_target.status == ready".to_string(),
+                timeout: std::time::Duration::from_secs(60),
+                interval: std::time::Duration::from_secs(1),
+                explicit_dependencies: HashSet::new(),
+            },
+            create_effect(wait_consumer.clone()),
+        ],
+        origins(&[wait_target, wait_consumer]),
+        BTreeSet::from([(primary(0), primary(1)), (primary(1), primary(2))]),
+    );
+}
+
 // -----------------------------------------------------------------------
 // Mock Provider
 // -----------------------------------------------------------------------

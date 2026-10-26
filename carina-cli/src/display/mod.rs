@@ -27,6 +27,7 @@ use carina_core::schema::SchemaRegistry;
 use carina_core::value::{RenderedValue, ValueSpanKind, render_export_json_value, render_value};
 
 use crate::DetailLevel;
+use crate::plan_summary::PlanChangeSummary;
 
 /// Source for the historical values consumed by plan renderers.
 ///
@@ -294,12 +295,11 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
 #[allow(clippy::too_many_arguments)]
 pub fn print_plan<D: HistoricalDisplaySource + ?Sized>(
     plan: &Plan,
+    summary: &PlanChangeSummary,
     detail: DetailLevel,
     historical_display: &D,
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
-    export_changes: &[crate::commands::plan::ExportChange],
-    deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) {
@@ -307,12 +307,11 @@ pub fn print_plan<D: HistoricalDisplaySource + ?Sized>(
         "{}",
         format_plan_with_delete_instances(
             plan,
+            summary,
             detail,
             historical_display,
             schemas,
             moved_origins,
-            export_changes,
-            deferred_for_expressions,
             prev_explicit,
             expansion_trace,
         )
@@ -331,19 +330,17 @@ pub fn print_plan<D: HistoricalDisplaySource + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 pub fn format_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
     plan: &Plan,
+    summary: &PlanChangeSummary,
     detail: DetailLevel,
     historical_display: &D,
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
-    export_changes: &[crate::commands::plan::ExportChange],
-    deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
     let mut out = String::new();
 
-    if plan.effects().is_empty() && deferred_for_expressions.is_empty() && export_changes.is_empty()
-    {
+    if !summary.has_changes() {
         writeln!(
             out,
             "{}",
@@ -368,11 +365,12 @@ pub fn format_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
     ));
 
     // Show deferred for-expressions
-    for deferred in deferred_for_expressions {
+    for deferred in summary.residual_deferred_for() {
         out.push_str(&format_deferred_for_expression(deferred));
     }
 
     // Show export changes if any
+    let export_changes = summary.export_changes();
     if !export_changes.is_empty() {
         writeln!(out).unwrap();
         writeln!(out, "{}", "Exports:".cyan().bold()).unwrap();
@@ -383,10 +381,10 @@ pub fn format_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
     }
 
     writeln!(out).unwrap();
-    let summary = plan.summary();
     let mut parts: Vec<String> = summary
-        .parts()
-        .into_iter()
+        .text_parts()
+        .iter()
+        .copied()
         .map(|part| match part {
             PlanSummaryPart::Read { count } => format!("{} to read", count.to_string().cyan()),
             PlanSummaryPart::Import { count } => format!("{} to import", count.to_string().cyan()),
@@ -420,7 +418,7 @@ pub fn format_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
         ));
     }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
-    for entry in &summary.deferred {
+    for entry in summary.deferred_effects() {
         let action = match entry.action {
             DeferredSummaryAction::Add => "add".green(),
             DeferredSummaryAction::Replace => "replace".magenta(),
@@ -435,7 +433,7 @@ pub fn format_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
         )
         .unwrap();
     }
-    for deferred in deferred_for_expressions {
+    for deferred in summary.residual_deferred_for() {
         writeln!(
             out,
             "       {} to {} after {} resolves.",

@@ -19,6 +19,7 @@ use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::run_validate;
 use carina_cli::error;
+use carina_cli::plan_image::PlanImageTarget;
 use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
 
 /// Version string assembled at build time by `build.rs`. Formatted as
@@ -57,6 +58,10 @@ enum Commands {
         /// Save plan to a file for later apply
         #[arg(long = "out")]
         out: Option<PathBuf>,
+
+        /// Write the dependency graph as SVG or PNG (selected by extension)
+        #[arg(long, value_parser = carina_cli::plan_image::parse_output_target)]
+        image: Option<PlanImageTarget>,
 
         /// Return exit code 2 when changes are present
         #[arg(long = "detailed-exitcode")]
@@ -370,6 +375,7 @@ async fn main() {
         if let Commands::Plan {
             path,
             out,
+            image,
             detailed_exitcode,
             detail,
             tui,
@@ -382,6 +388,7 @@ async fn main() {
             match run_plan(
                 &path,
                 out.as_deref(),
+                image.as_ref(),
                 detail,
                 tui,
                 refresh,
@@ -957,6 +964,40 @@ mod error_format_tests {
     #[test]
     fn plan_check_iam_flag_parses() {
         assert!(Cli::try_parse_from(["carina", "plan", "--check-iam"]).is_ok());
+    }
+
+    #[test]
+    fn plan_image_extension_is_validated_during_cli_parsing() {
+        let error = match Cli::try_parse_from([
+            "carina",
+            "plan",
+            "--image",
+            "review.jpg",
+            "directory-that-must-not-be-read",
+        ]) {
+            Ok(_) => panic!("unsupported image extension must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("plan image path must end in .svg or .png: review.jpg")
+        );
+    }
+
+    #[test]
+    fn plan_image_before_project_path_parses() {
+        let cli = Cli::try_parse_from(["carina", "plan", "--image", "review.PNG", "infra/foo"])
+            .expect("plan --image <file> <dir> should parse");
+
+        match cli.command {
+            Commands::Plan { path, image, .. } => {
+                assert_eq!(path, PathBuf::from("infra/foo"));
+                assert_eq!(image.unwrap().path(), Path::new("review.PNG"));
+            }
+            _ => panic!("expected plan command"),
+        }
     }
 
     #[test]

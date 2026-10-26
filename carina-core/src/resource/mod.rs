@@ -234,6 +234,19 @@ impl ResourceIdentity {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether this identity is a resource address below `ancestor`.
+    ///
+    /// Module expansion encodes ancestry as dot-delimited identity segments.
+    /// Keeping the comparison on the identity type prevents display labels or
+    /// user attributes from being mistaken for graph identity, and requiring
+    /// the delimiter keeps sibling prefixes such as `net` and `network`
+    /// distinct.
+    pub fn is_address_descendant_of(&self, ancestor: &Self) -> bool {
+        self.0
+            .strip_prefix(ancestor.as_str())
+            .is_some_and(|suffix| suffix.starts_with('.'))
+    }
 }
 
 impl From<&'static str> for ResourceIdentity {
@@ -5551,6 +5564,17 @@ impl ModuleSource {
     /// Check if this is the root source
     pub fn is_root(&self) -> bool {
         matches!(self, Self::Root)
+    }
+
+    /// System identity of the outer module instance that owns this leaf.
+    ///
+    /// Expanded nested leaves retain their outermost instance in `instance`;
+    /// the deeper ancestry remains in the private validation scope.
+    pub fn outer_instance_identity(&self) -> Option<ResourceIdentity> {
+        match self {
+            Self::Root => None,
+            Self::Module { instance, .. } => ResourceIdentity::try_from(instance.clone()).ok(),
+        }
     }
 }
 

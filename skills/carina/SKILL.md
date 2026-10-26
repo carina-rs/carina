@@ -100,6 +100,13 @@ carina plan --detailed-exitcode
 # Exit 0 = no changes, Exit 2 = changes present
 ```
 
+### Render the plan as an image for review
+
+```bash
+carina plan --image plan.png   # or plan.svg
+# Dependency graph in apply order, effect-colored cards, blast-radius halos
+```
+
 ### Save and apply a plan
 
 ```bash

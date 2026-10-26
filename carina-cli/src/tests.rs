@@ -812,11 +812,36 @@ fn test_detailed_exitcode_with_changes() {
 
 #[test]
 fn test_detailed_exitcode_read_only_no_changes() {
-    // A plan with only Read effects should NOT count as changes
     let mut plan = Plan::new();
     plan.add(Effect::Read {
         resource: resolved_data_source(DataSource::new("sts.caller_identity", "identity")),
     });
+    let has_changes = plan.mutation_count() > 0;
+    assert!(!has_changes);
+}
+
+#[test]
+fn test_detailed_exitcode_wait_only_no_changes() {
+    use std::time::Duration;
+
+    use carina_core::resource::ResolvedResourceId;
+    use carina_core::wait::predicate::{AttrPath, WaitPredicate};
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Wait {
+        identity: "cert_issued".into(),
+        target_id: ResolvedResourceId::with_identity("acm.Certificate", "cert"),
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+        )
+        .unwrap(),
+        until_surface: "cert.status == ISSUED".to_string(),
+        timeout: Duration::from_secs(60),
+        interval: Duration::from_secs(5),
+        explicit_dependencies: HashSet::new(),
+    });
+
     let has_changes = plan.mutation_count() > 0;
     assert!(!has_changes);
 }

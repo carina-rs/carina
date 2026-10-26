@@ -546,6 +546,10 @@ pub enum AppError {
     #[error(transparent)]
     LockConstraint(#[from] carina_provider_resolver::LockConstraintError),
 
+    /// Plan dependency-graph image construction or output failed.
+    #[error(transparent)]
+    PlanImage(#[from] crate::plan_image::PlanImageError),
+
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),
@@ -803,6 +807,17 @@ mod tests {
     fn config_error() {
         let app_err = AppError::Config("missing path".to_string());
         assert_eq!(app_err.to_string(), "missing path");
+    }
+
+    #[test]
+    fn plan_image_error_stays_typed_in_app_error() {
+        let plan_image_error =
+            crate::plan_image::PlanImageTarget::try_from(PathBuf::from("review.unsupported"))
+                .unwrap_err();
+
+        let app_error = AppError::from(plan_image_error);
+
+        assert!(matches!(app_error, AppError::PlanImage(_)));
     }
 
     #[test]

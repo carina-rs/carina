@@ -3830,26 +3830,26 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     let unresolved_keys: Vec<String> = plan_ctx
         .unresolved_resources
         .iter()
-        .map(|resource| resource.id.to_string())
+        .map(|resource| resource.as_resource().id.to_string())
         .collect();
 
     let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = plan_ctx
         .unresolved_resources
         .iter()
-        .map(|resource| {
-            (
-                resource.id.clone(),
-                UnresolvedResource::from_pre_resolve(resource.clone()),
-            )
-        })
+        .map(|resource| (resource.as_resource().id.clone(), resource.clone()))
+        .collect();
+    let sorted_resources: Vec<Resource> = plan_ctx
+        .sorted_resources
+        .iter()
+        .map(|resource| resource.as_inner().clone())
         .collect();
     let plan_input_states = carina_core::resource::into_plan_input_current_map(
         plan_ctx.managed_current.clone(),
         ctx.schemas(),
-        &plan_ctx.sorted_resources,
+        &sorted_resources,
     );
     let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
-        managed: &plan_ctx.sorted_resources,
+        managed: &sorted_resources,
         compositions: &[],
         data_sources: &plan_ctx.data_sources,
         managed_current: &plan_input_states,

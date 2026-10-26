@@ -1,0 +1,164 @@
+{
+  "version": 7,
+  "serial": 9,
+  "lineage": "test-plan-image-module-cascade",
+  "carina_version": "0.6.0",
+  "resources": [
+    {
+      "resource_type": "test.Widget",
+      "identity": "source",
+      "provider": "test",
+      "identifier": "source-live",
+      "attributes": {
+        "external_name": "source-old",
+        "output_id": "stable-output"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "source",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "connector",
+      "provider": "test",
+      "identifier": "connector-live",
+      "attributes": {
+        "external_name": "connector",
+        "metric_name": "bridge"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "connector",
+      "dependency_bindings": ["source"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "metric_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "sink",
+      "provider": "test",
+      "identifier": "sink-live",
+      "attributes": {
+        "external_name": "sink",
+        "description": "old sink description"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "sink",
+      "dependency_bindings": ["connector"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "cascade",
+      "provider": "test",
+      "identifier": "cascade-live",
+      "attributes": {
+        "external_name": "stable-output",
+        "description": "cascade consumer"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "cascade",
+      "dependency_bindings": ["source"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "review.module_node",
+      "provider": "test",
+      "identifier": "module-live",
+      "attributes": {
+        "external_name": "module-widget",
+        "description": "old module description"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "review.module_node",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "obsolete",
+      "provider": "test",
+      "identifier": "obsolete-live",
+      "attributes": {
+        "external_name": "obsolete"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "obsolete",
+      "dependency_bindings": ["source"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "obsolete_child",
+      "provider": "test",
+      "identifier": "obsolete-child-live",
+      "attributes": {
+        "external_name": "obsolete-child"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "obsolete_child",
+      "dependency_bindings": ["obsolete"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" }
+        }
+      }
+    }
+  ]
+}

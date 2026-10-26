@@ -630,6 +630,12 @@ pub enum Effect {
     DeferredReplace(Box<DeferredReplacePayload>),
 }
 
+impl AsRef<Effect> for Effect {
+    fn as_ref(&self) -> &Effect {
+        self
+    }
+}
+
 /// A type-level narrowing of [`Effect`] to the variants the basic
 /// executor (`execute_basic_effect`) actually handles: `Create`,
 /// `Update`, and `Delete`.

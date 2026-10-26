@@ -12,17 +12,20 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{
     Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
 };
+use carina_core::executor::UnresolvedResource;
 use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
-use carina_core::resource::{Current, ResourceId, State, Value};
+use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity,
 };
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
+use crate::commands::plan::compute_export_diffs;
 use crate::commands::{collapse_errors, validate_and_resolve_errors_with_context};
+use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, PlanPreparationError, PlanPreprocessor, WiringContext,
     add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
@@ -116,6 +119,13 @@ fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
+    /// Resolved desired resources, including unchanged resources omitted from
+    /// `plan.effects()`. Plan-image tests use these to retain only unchanged
+    /// connectors between changed nodes.
+    pub desired_resources: Vec<ResolvedResource>,
+    /// Pre-resolution resource snapshots paired to `desired_resources`.
+    pub unresolved_resources: Vec<UnresolvedResource>,
+    pub compositions: Vec<carina_core::resource::Composition>,
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_states: HashMap<ResourceId, State>,
     pub state_file: Option<StateFile>,
@@ -146,6 +156,22 @@ pub fn build_plan_from_fixture_name(fixture_dir: &str) -> FixturePlan {
         manifest_dir, FIXTURE_SUBPATH, fixture_dir
     ));
     build_plan_from_fixture_path(&fixture_path)
+}
+
+/// Build the exact non-destroy display summary for a fixture, including its
+/// state-aware export diff and residual deferred-for entries.
+pub fn build_fixture_plan_change_summary(fixture: &FixturePlan) -> PlanChangeSummary {
+    let current_exports = fixture
+        .state_file
+        .as_ref()
+        .map(|state| state.exports.clone())
+        .unwrap_or_default();
+    let export_changes = compute_export_diffs(&fixture.resolved_export_params, &current_exports);
+    PlanChangeSummary::new(
+        &fixture.plan,
+        &export_changes,
+        &fixture.deferred_for_expressions,
+    )
 }
 
 /// Build a plan from an absolute fixture path. Loads the configuration,
@@ -463,6 +489,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         managed_current = into_all_prior_states(orphans, managed_current);
         return FixturePlan {
             plan,
+            // Error plans are never rendered, so they intentionally do not
+            // expose a partial resolved-resource view to fixture callers.
+            desired_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: parsed.compositions.clone(),
             managed_current,
             data_source_states,
             state_file,
@@ -559,14 +590,13 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .filter(|deferred| !managed_bindings.contains(&deferred.iterable_binding))
             .cloned(),
     );
-    let resolved_resources = carina_core::resource::ResolvedResource::collect_resolved(
-        override_aware_resources.resources().iter().cloned(),
-    )
-    .expect("fixture resources must have assigned identities");
-    let unresolved_resources = carina_core::resource::ResolvedResource::collect_resolved(
-        override_aware_resources.paired_unresolved_resources(),
-    )
-    .expect("fixture unresolved resources must have paired identities");
+    let image_compositions = parsed.compositions.clone();
+    let resolved_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())
+            .expect("fixture resources must have assigned identities");
+    let resolved_unresolved_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.paired_unresolved_resources())
+            .expect("fixture unresolved resources must have paired identities");
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         wiring.schemas(),
@@ -574,7 +604,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
     let mut plan = create_plan_with_cascades(
         &resolved_resources,
-        &unresolved_resources,
+        &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider_router,
         PlanPriorStates::new(&plan_input_current, &data_source_states, &orphans),
@@ -629,8 +659,16 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("fixture exports must resolve without secrets");
 
+    let unresolved_resources = resolved_unresolved_resources
+        .into_iter()
+        .map(ResolvedResource::into_inner)
+        .map(UnresolvedResource::from_pre_resolve)
+        .collect();
     FixturePlan {
         plan,
+        desired_resources: resolved_resources,
+        unresolved_resources,
+        compositions: image_compositions,
         managed_current,
         data_source_states,
         state_file,
@@ -655,6 +693,7 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
             Some("moved_claims_precede_heuristics") => {
                 vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
             }
+            Some("plan_image_module_cascade") => vec![Box::new(PlanImageFixtureFactory)],
             Some("replace_create_only") | Some("replace_with_non_forcing_diffs") => {
                 vec![Box::new(ReplaceCreateOnlyFixtureFactory)]
             }
@@ -935,19 +974,62 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![replace_create_only_widget_schema()]
+    }
+}
+
+fn replace_create_only_widget_schema() -> ResourceSchema {
+    ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::new("external_name", AttributeType::string()).create_only())
+        .attribute(
+            AttributeSchema::new("legacy_token", AttributeType::string())
+                .create_only()
+                .removable(),
+        )
+        .attribute(AttributeSchema::new("description", AttributeType::string()))
+        .attribute(AttributeSchema::new("metric_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("scope", AttributeType::string()))
+}
+
+struct PlanImageFixtureFactory;
+
+impl ProviderFactory for PlanImageFixtureFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "Plan image fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "test-region".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
         vec![
-            ResourceSchema::new("test.Widget")
-                .attribute(
-                    AttributeSchema::new("external_name", AttributeType::string()).create_only(),
-                )
-                .attribute(
-                    AttributeSchema::new("legacy_token", AttributeType::string())
-                        .create_only()
-                        .removable(),
-                )
-                .attribute(AttributeSchema::new("description", AttributeType::string()))
-                .attribute(AttributeSchema::new("metric_name", AttributeType::string()))
-                .attribute(AttributeSchema::new("scope", AttributeType::string())),
+            replace_create_only_widget_schema()
+                .attribute(AttributeSchema::new("output_id", AttributeType::string()).read_only())
+                .with_unique_name_attribute("external_name"),
         ]
     }
 }

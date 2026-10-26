@@ -69,6 +69,7 @@ use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::{AppError, SavedPlanSecretVerificationError};
+use crate::plan_summary::PlanChangeSummary;
 #[cfg(test)]
 use crate::wiring::read_with_retry;
 use crate::wiring::{
@@ -2371,14 +2372,15 @@ async fn run_apply_locked_owned(
 
                 let historical_display =
                     carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+                let summary =
+                    PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for);
                 print_plan(
                     &plan,
+                    &summary,
                     DetailLevel::Full,
                     &historical_display,
                     Some(ctx.schemas()),
                     &HashMap::new(),
-                    &export_changes,
-                    &residual_deferred_for,
                     None,
                     None,
                 );
@@ -2446,14 +2448,14 @@ async fn run_apply_locked_owned(
                 &checked_exports_pre_apply,
                 &current_exports,
             );
+            let summary = PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for);
             print_plan(
                 &plan,
+                &summary,
                 DetailLevel::Full,
                 &historical_display,
                 Some(ctx.schemas()),
                 &moved_origins,
-                &export_changes,
-                &residual_deferred_for,
                 Some(&prev_explicit),
                 None,
             );
@@ -3528,14 +3530,14 @@ async fn run_apply_from_plan_locked_owned(
             let historical_display =
                 collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
 
+            let summary = PlanChangeSummary::new(plan, &[], &[]);
             print_plan(
                 plan,
+                &summary,
                 DetailLevel::Full,
                 &historical_display,
                 None,
                 &HashMap::new(),
-                &[],
-                &[],
                 None,
                 None,
             );

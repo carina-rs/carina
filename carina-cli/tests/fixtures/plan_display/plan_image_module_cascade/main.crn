@@ -1,0 +1,40 @@
+provider test {}
+
+let source = test.test.Widget {
+  external_name = "source-new"
+  directives { create_before_destroy = true }
+}
+
+# This resource is deliberately unchanged. It remains visible because it is
+# the dependency-path connector between the replaced source and updated sink.
+let connector = test.test.Widget {
+  external_name = "connector"
+  metric_name   = "bridge"
+  directives { depends_on = [source] }
+}
+
+let sink = test.test.Widget {
+  external_name = "sink"
+  description   = "new sink description"
+  directives { depends_on = [connector] }
+}
+
+# external_name is create-only. Replacing source therefore cascades into a
+# replacement here even though the output's cached value did not change.
+let cascade = test.test.Widget {
+  external_name = source.output_id
+  description   = "cascade consumer"
+}
+
+let component = use {
+  source = './review-module'
+}
+
+let review = component {
+  description = "new module description"
+}
+
+exports {
+  sink_description = sink.description
+  cascade_name     = cascade.external_name
+}

@@ -21,9 +21,35 @@ use carina_core::schema::SchemaRegistry;
 use crate::DetailLevel;
 use crate::display::{
     format_destroy_plan_with_delete_instances as format_destroy_plan,
-    format_plan_with_delete_instances as format_plan,
+    format_plan_with_delete_instances,
 };
 use crate::fixture_plan::build_plan_from_fixture_name;
+use crate::plan_summary::PlanChangeSummary;
+
+#[allow(clippy::too_many_arguments)]
+fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
+    plan: &Plan,
+    detail: DetailLevel,
+    historical_display: &D,
+    schemas: Option<&SchemaRegistry>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+    export_changes: &[crate::commands::plan::ExportChange],
+    deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
+) -> String {
+    let summary = PlanChangeSummary::new(plan, export_changes, deferred_for_expressions);
+    format_plan_with_delete_instances(
+        plan,
+        &summary,
+        detail,
+        historical_display,
+        schemas,
+        moved_origins,
+        prev_explicit,
+        expansion_trace,
+    )
+}
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
