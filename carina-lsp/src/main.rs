@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use carina_core::parser::{ProviderConfig, ProviderContext};
 use carina_core::provider::ProviderFactory;
+use carina_core::provider_source::ProviderSource;
 use tower_lsp::{LspService, Server};
 
 use carina_lsp::Backend;
@@ -11,7 +12,6 @@ use carina_lsp::backend::FactoryBuildResult;
 #[derive(Debug, PartialEq, Eq)]
 enum InstallRejection {
     MissingSource,
-    UnsupportedSource { source: String },
     ResolutionFailed { message: String },
 }
 
@@ -19,11 +19,8 @@ impl std::fmt::Display for InstallRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InstallRejection::MissingSource => f.write_str(
-                "no source configured. Add `source = 'github.com/...'` to the provider block.",
+                "no source configured. Add `source = 'carina-rs/aws'` for a registry provider, or `source = 'github.com/owner/repo'` for a direct GitHub source.",
             ),
-            InstallRejection::UnsupportedSource { source } => {
-                write!(f, "unsupported source format: {source}")
-            }
             InstallRejection::ResolutionFailed { message } => f.write_str(message),
         }
     }
@@ -45,16 +42,13 @@ fn resolve_install(
 ) -> Result<carina_provider_resolver::InstalledProvider, InstallRejection> {
     let source = config
         .source
-        .as_deref()
+        .as_ref()
         .ok_or(InstallRejection::MissingSource)?;
-    let installed = if source.starts_with("file://") {
-        carina_provider_resolver::find_file_provider_source(config)
-    } else if source.starts_with("github.com/") {
-        carina_provider_resolver::find_installed_provider(source_dir, config)
-    } else {
-        return Err(InstallRejection::UnsupportedSource {
-            source: source.to_string(),
-        });
+    let installed = match source {
+        ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(config),
+        ProviderSource::Remote(_) => {
+            carina_provider_resolver::find_installed_provider(source_dir, config)
+        }
     }
     .map_err(|message| InstallRejection::ResolutionFailed { message })?;
     // Both resolver functions only construct `InstalledProvider` after their
@@ -176,7 +170,7 @@ mod tests {
                 name: name.to_string(),
                 attributes: IndexMap::new(),
                 default_tags: IndexMap::new(),
-                source: source.map(String::from),
+                source: source.map(|source| source.parse().unwrap()),
                 version: None,
                 revision: None,
                 unresolved_attributes: IndexMap::new(),
@@ -235,6 +229,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_source_hint_advertises_registry_and_github_forms() {
+        let rendered = InstallRejection::MissingSource.to_string();
+
+        assert_eq!(
+            rendered,
+            "no source configured. Add `source = 'carina-rs/aws'` for a registry provider, or `source = 'github.com/owner/repo'` for a direct GitHub source."
+        );
+    }
+
+    #[test]
     fn direct_file_install_retains_non_lock_provenance() {
         let tmp = tempfile::tempdir().unwrap();
         let wasm = tmp.path().join("local-provider.wasm");
@@ -248,5 +252,43 @@ mod tests {
         assert!(rendered.contains("provider resolved from file://"));
         assert!(rendered.contains("not controlled by carina-providers.lock"));
         assert!(!rendered.contains("carina init --upgrade"));
+    }
+
+    #[test]
+    fn registry_source_resolves_installed_lock_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "carina-rs/awscc";
+        let version = "0.5.0";
+        let parsed_source: ProviderSource = source.parse().unwrap();
+        let ProviderSource::Remote(remote_source) = &parsed_source else {
+            panic!("registry source must parse as remote")
+        };
+        let wasm = carina_provider_resolver::cache_path_wasm(
+            tmp.path(),
+            &remote_source.source_key(),
+            version,
+        );
+        std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+        std::fs::write(&wasm, b"fixture").unwrap();
+
+        let mut lock = carina_provider_resolver::LockFile::default();
+        lock.upsert(carina_provider_resolver::LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: carina_provider_resolver::LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: "fixture".into(),
+            registry: None,
+        });
+        lock.save(&tmp.path().join("carina-providers.lock"))
+            .unwrap();
+
+        let (_, config) = cfg("awscc", Some(source), None);
+        let installed = resolve_install(tmp.path(), &config)
+            .expect("registry source should resolve through the shared provider source type");
+
+        assert_eq!(installed.path().as_path(), wasm);
     }
 }

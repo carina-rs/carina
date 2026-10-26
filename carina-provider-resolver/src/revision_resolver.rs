@@ -6,6 +6,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
+use carina_core::provider_source::GithubSource;
 
 use crate::provider_resolver::WasmArtifactPath;
 
@@ -65,20 +66,14 @@ pub fn get_github_token() -> Result<String, String> {
     Ok(token)
 }
 
-/// Extract owner and repo from a source string like "github.com/owner/repo".
-fn parse_source(source: &str) -> Result<(&str, &str), String> {
-    let parts: Vec<&str> = source.split('/').collect();
-    if parts.len() != 3 || parts[0] != "github.com" {
-        return Err(format!(
-            "Invalid source format: {source}. Expected: github.com/{{owner}}/{{repo}}"
-        ));
-    }
-    Ok((parts[1], parts[2]))
-}
-
 /// Resolve a git ref (branch, tag, or SHA) to a full commit SHA.
-pub fn resolve_ref_to_sha(source: &str, revision: &str, token: &str) -> Result<String, String> {
-    let (owner, repo) = parse_source(source)?;
+pub fn resolve_ref_to_sha(
+    source: &GithubSource,
+    revision: &str,
+    token: &str,
+) -> Result<String, String> {
+    let owner = source.owner();
+    let repo = source.repo();
     let url = format!("https://api.github.com/repos/{owner}/{repo}/commits/{revision}");
 
     let response = ureq::get(&url)
@@ -116,8 +111,13 @@ pub fn resolve_ref_to_sha(source: &str, revision: &str, token: &str) -> Result<S
 /// both triggered on push to main). The caller is responsible for picking the
 /// run that actually contains the expected artifact — see
 /// [`select_artifact_from_runs`].
-fn find_workflow_run_ids(source: &str, sha: &str, token: &str) -> Result<Vec<u64>, String> {
-    let (owner, repo) = parse_source(source)?;
+fn find_workflow_run_ids(
+    source: &GithubSource,
+    sha: &str,
+    token: &str,
+) -> Result<Vec<u64>, String> {
+    let owner = source.owner();
+    let repo = source.repo();
     let url = format!(
         "https://api.github.com/repos/{owner}/{repo}/actions/runs?head_sha={sha}&status=success&per_page=10"
     );
@@ -147,8 +147,13 @@ fn find_workflow_run_ids(source: &str, sha: &str, token: &str) -> Result<Vec<u64
 }
 
 /// Fetch the artifacts list for a single workflow run.
-fn fetch_run_artifacts(source: &str, run_id: u64, token: &str) -> Result<Vec<Artifact>, String> {
-    let (owner, repo) = parse_source(source)?;
+fn fetch_run_artifacts(
+    source: &GithubSource,
+    run_id: u64,
+    token: &str,
+) -> Result<Vec<Artifact>, String> {
+    let owner = source.owner();
+    let repo = source.repo();
     let url =
         format!("https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts");
 
@@ -219,7 +224,7 @@ fn pick_artifact_id(artifacts: &[Artifact], expected_name: &str) -> ArtifactMatc
 fn select_artifact_from_runs<F>(
     run_ids: &[u64],
     expected_name: &str,
-    source: &str,
+    source: &GithubSource,
     sha: &str,
     mut fetch: F,
 ) -> Result<u64, String>
@@ -258,12 +263,13 @@ where
 
 /// Download a GitHub Actions artifact (ZIP) and extract the WASM file.
 fn download_artifact(
-    source: &str,
+    source: &GithubSource,
     artifact_id: u64,
     dest: &Path,
     token: &str,
 ) -> Result<(), String> {
-    let (owner, repo) = parse_source(source)?;
+    let owner = source.owner();
+    let repo = source.repo();
     let url =
         format!("https://api.github.com/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip");
 
@@ -293,10 +299,7 @@ fn download_artifact(
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|e| format!("Failed to open artifact ZIP: {e}"))?;
 
-    let expected_wasm = format!(
-        "{}.wasm",
-        source.split('/').next_back().unwrap_or("provider")
-    );
+    let expected_wasm = format!("{}.wasm", source.repo());
 
     for i in 0..archive.len() {
         let mut file = archive
@@ -323,30 +326,28 @@ fn download_artifact(
 
 /// Cache path for revision-based providers.
 /// Uses `rev-{sha_prefix}` as the version directory.
-pub fn cache_path_revision(base_dir: &Path, source: &str, sha: &str) -> PathBuf {
-    let repo = source.split('/').next_back().unwrap_or("provider");
+pub fn cache_path_revision(base_dir: &Path, source: &GithubSource, sha: &str) -> PathBuf {
     let sha_prefix = &sha[..sha.len().min(12)];
     base_dir
         .join(".carina")
         .join("providers")
-        .join(source)
+        .join(source.to_string())
         .join(format!("rev-{sha_prefix}"))
-        .join(format!("{repo}.wasm"))
+        .join(format!("{}.wasm", source.repo()))
 }
 
-pub(crate) fn global_cache_path_revision(source: &str, sha: &str) -> Option<PathBuf> {
-    let repo = source.split('/').next_back().unwrap_or("provider");
+pub(crate) fn global_cache_path_revision(source: &GithubSource, sha: &str) -> Option<PathBuf> {
     let sha_prefix = &sha[..sha.len().min(12)];
     super::provider_resolver::global_cache_dir().map(|dir| {
-        dir.join(source)
+        dir.join(source.to_string())
             .join(format!("rev-{sha_prefix}"))
-            .join(format!("{repo}.wasm"))
+            .join(format!("{}.wasm", source.repo()))
     })
 }
 
 fn checksum_mismatch_error(
     name: &str,
-    source: &str,
+    source: &GithubSource,
     sha: &str,
     expected: &str,
     actual: &str,
@@ -366,17 +367,18 @@ fn checksum_mismatch_error(
 /// Resolve a provider by revision: download from CI artifacts if not cached.
 pub fn resolve_provider_by_revision(
     base_dir: &Path,
-    source: &str,
+    source: &GithubSource,
     revision: &str,
     name: &str,
     lock_file: &mut super::provider_resolver::LockFile,
     upgrade: bool,
 ) -> Result<(WasmArtifactPath, String), String> {
     let token = get_github_token()?;
+    let source_key = source.source_key();
 
     // 1. Resolve revision to SHA
     let sha = if !upgrade
-        && let Some(lock_entry) = lock_file.find_by_source(source)
+        && let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
         && let super::provider_resolver::LockEntryKind::Revision {
             revision: locked_revision,
             resolved_sha,
@@ -398,7 +400,7 @@ pub fn resolve_provider_by_revision(
     if wasm_path.as_path().exists() {
         let actual_hash = super::provider_resolver::sha256_file(wasm_path.as_path())
             .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-        if let Some(lock_entry) = lock_file.find_by_source_and_sha(source, &sha)
+        if let Some(lock_entry) = lock_file.find_by_source_key_and_sha(&source_key, &sha)
             && actual_hash != lock_entry.sha256
         {
             return Err(checksum_mismatch_error(
@@ -414,7 +416,7 @@ pub fn resolve_provider_by_revision(
         // doesn't stomp it with an empty in-memory LockFile (issue #2032).
         lock_file.upsert(super::provider_resolver::LockEntry {
             name: name.to_string(),
-            source: source.to_string(),
+            source: source_key.to_string(),
             kind: super::provider_resolver::LockEntryKind::Revision {
                 revision: revision.to_string(),
                 resolved_sha: sha.clone(),
@@ -438,7 +440,7 @@ pub fn resolve_provider_by_revision(
             .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
         lock_file.upsert(super::provider_resolver::LockEntry {
             name: name.to_string(),
-            source: source.to_string(),
+            source: source_key.to_string(),
             kind: super::provider_resolver::LockEntryKind::Revision {
                 revision: revision.to_string(),
                 resolved_sha: sha.clone(),
@@ -463,10 +465,7 @@ pub fn resolve_provider_by_revision(
     );
 
     let run_ids = find_workflow_run_ids(source, &sha, &token)?;
-    let expected_name = format!(
-        "{}.wasm",
-        source.split('/').next_back().unwrap_or("provider")
-    );
+    let expected_name = format!("{}.wasm", source.repo());
     let artifact_id =
         select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
             fetch_run_artifacts(source, run_id, &token)
@@ -486,7 +485,7 @@ pub fn resolve_provider_by_revision(
 
     lock_file.upsert(super::provider_resolver::LockEntry {
         name: name.to_string(),
-        source: source.to_string(),
+        source: source_key.to_string(),
         kind: super::provider_resolver::LockEntryKind::Revision {
             revision: revision.to_string(),
             resolved_sha: sha.clone(),
@@ -507,27 +506,26 @@ pub fn resolve_provider_by_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
 
     static GITHUB_TOKEN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn test_parse_source_valid() {
-        let (owner, repo) = parse_source("github.com/carina-rs/carina-provider-awscc").unwrap();
-        assert_eq!(owner, "carina-rs");
-        assert_eq!(repo, "carina-provider-awscc");
-    }
-
-    #[test]
-    fn test_parse_source_invalid() {
-        assert!(parse_source("invalid").is_err());
-        assert!(parse_source("gitlab.com/foo/bar").is_err());
+    fn github_source(owner: &str, repo: &str) -> GithubSource {
+        match format!("github.com/{owner}/{repo}")
+            .parse::<ProviderSource>()
+            .unwrap()
+        {
+            ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
+            source => panic!("expected GitHub source: {source}"),
+        }
     }
 
     #[test]
     fn test_cache_path_revision() {
         let base = Path::new("/tmp/project");
         let sha = "abc123def456789012345678901234567890abcd";
-        let path = cache_path_revision(base, "github.com/carina-rs/carina-provider-awscc", sha);
+        let source = github_source("carina-rs", "carina-provider-awscc");
+        let path = cache_path_revision(base, &source, sha);
         assert_eq!(
             path,
             PathBuf::from(
@@ -540,7 +538,8 @@ mod tests {
     fn test_cache_path_revision_short_sha() {
         let base = Path::new("/tmp/project");
         let sha = "abc123";
-        let path = cache_path_revision(base, "github.com/carina-rs/carina-provider-awscc", sha);
+        let source = github_source("carina-rs", "carina-provider-awscc");
+        let path = cache_path_revision(base, &source, sha);
         assert_eq!(
             path,
             PathBuf::from(
@@ -553,7 +552,7 @@ mod tests {
     fn checksum_mismatch_hint_uses_project_dir_and_omits_dot() {
         let nested = checksum_mismatch_error(
             "aws",
-            TEST_SOURCE,
+            &test_source(),
             TEST_SHA,
             "expected",
             "actual",
@@ -566,7 +565,7 @@ mod tests {
 
         let default = checksum_mismatch_error(
             "aws",
-            TEST_SOURCE,
+            &test_source(),
             TEST_SHA,
             "expected",
             "actual",
@@ -586,7 +585,8 @@ mod tests {
         unsafe { std::env::set_var("GITHUB_TOKEN", "test-token") };
 
         let dir = tempfile::tempdir().unwrap();
-        let wasm_path = cache_path_revision(dir.path(), TEST_SOURCE, TEST_SHA);
+        let source = test_source();
+        let wasm_path = cache_path_revision(dir.path(), &source, TEST_SHA);
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         std::fs::write(&wasm_path, b"tampered provider").unwrap();
         let mut lock_file = crate::provider_resolver::LockFile::default();
@@ -601,14 +601,8 @@ mod tests {
             registry: None,
         });
 
-        let result = resolve_provider_by_revision(
-            dir.path(),
-            TEST_SOURCE,
-            "main",
-            "aws",
-            &mut lock_file,
-            false,
-        );
+        let result =
+            resolve_provider_by_revision(dir.path(), &source, "main", "aws", &mut lock_file, false);
         match previous_token {
             Some(token) => unsafe { std::env::set_var("GITHUB_TOKEN", token) },
             None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
@@ -640,6 +634,10 @@ mod tests {
 
     const TEST_SOURCE: &str = "github.com/carina-rs/carina-provider-aws";
     const TEST_SHA: &str = "abc123def456";
+
+    fn test_source() -> GithubSource {
+        github_source("carina-rs", "carina-provider-aws")
+    }
 
     fn artifact(name: &str, id: u64, expired: bool) -> Artifact {
         Artifact {
@@ -707,7 +705,7 @@ mod tests {
         let result = select_artifact_from_runs(
             &run_ids,
             "carina-provider-aws.wasm",
-            TEST_SOURCE,
+            &test_source(),
             TEST_SHA,
             fetch,
         );
@@ -719,7 +717,8 @@ mod tests {
         let run_ids = vec![100u64];
         let fetch = |_| Ok(vec![artifact("my.wasm", 7, false)]);
         assert_eq!(
-            select_artifact_from_runs(&run_ids, "my.wasm", TEST_SOURCE, TEST_SHA, fetch).unwrap(),
+            select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
+                .unwrap(),
             7
         );
     }
@@ -737,7 +736,8 @@ mod tests {
             }
         };
         assert_eq!(
-            select_artifact_from_runs(&run_ids, "my.wasm", TEST_SOURCE, TEST_SHA, fetch).unwrap(),
+            select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
+                .unwrap(),
             2
         );
     }
@@ -746,7 +746,7 @@ mod tests {
     fn test_select_artifact_not_found_anywhere() {
         let run_ids = vec![200u64, 100u64];
         let fetch = |_| Ok(vec![artifact("other.wasm", 1, false)]);
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", TEST_SOURCE, TEST_SHA, fetch)
+        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
             .unwrap_err();
         assert!(err.contains("No artifact named 'my.wasm'"), "err={err}");
         assert!(
@@ -760,7 +760,7 @@ mod tests {
     fn test_select_artifact_expired_in_all_runs() {
         let run_ids = vec![200u64, 100u64];
         let fetch = |_| Ok(vec![artifact("my.wasm", 1, true)]);
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", TEST_SOURCE, TEST_SHA, fetch)
+        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
             .unwrap_err();
         assert!(err.contains("expired"), "err={err}");
         assert!(
@@ -778,7 +778,7 @@ mod tests {
         let fetch = |run_id: u64| -> Result<Vec<Artifact>, String> {
             Err(format!("network error for run {run_id}"))
         };
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", TEST_SOURCE, TEST_SHA, fetch)
+        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
             .unwrap_err();
         assert!(err.contains("network error for run 200"), "err={err}");
     }
@@ -789,7 +789,7 @@ mod tests {
         let fetch = |_| -> Result<Vec<Artifact>, String> {
             panic!("fetch should not be called when there are no runs")
         };
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", TEST_SOURCE, TEST_SHA, fetch)
+        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
             .unwrap_err();
         assert!(err.contains("No successful workflow runs"), "err={err}");
         assert!(

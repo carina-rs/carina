@@ -918,7 +918,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "source".to_string(),
                 kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some("Provider source (e.g., github.com/owner/repo)".to_string()),
+                detail: Some(
+                    "Provider source (e.g., carina-rs/aws; alternatively github.com/owner/repo)"
+                        .to_string(),
+                ),
                 insert_text: Some("source = \"$0\"".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 ..Default::default()

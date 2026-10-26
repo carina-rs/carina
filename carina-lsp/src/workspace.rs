@@ -333,7 +333,9 @@ mod tests {
                 "default and named instances must both survive when default={default_file}, named={named_file}"
             );
             assert!(providers.iter().any(|provider| {
-                provider.is_default() && provider.source.as_deref() == Some("file:///x.wasm")
+                provider.is_default()
+                    && provider.source.as_ref().map(ToString::to_string)
+                        == Some("file:///x.wasm".to_string())
             }));
             assert!(
                 providers
@@ -396,7 +398,10 @@ mod tests {
         let providers = &by_dir[dir.path()];
 
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].source.as_deref(), Some("file:///00.wasm"));
+        assert_eq!(
+            providers[0].source.as_ref().map(ToString::to_string),
+            Some("file:///00.wasm".to_string())
+        );
     }
 
     #[test]

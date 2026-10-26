@@ -47,6 +47,7 @@ use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, LiftedSavedAttrs, Provider, ProviderError,
     ProviderFactory, ProviderNormalizer, ProviderRouter,
 };
+use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
     Composition, ConcreteValue, Current, DataSource, DeferredValue, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, ResourceIdentityError, State,
@@ -303,33 +304,18 @@ fn build_factories_from_providers_impl(
     let mut load_errors: HashMap<String, String> = HashMap::new();
 
     for config in providers {
-        let source = match &config.source {
-            Some(s) => s.clone(),
-            None => continue,
-        };
+        let Some(_) = &config.source else { continue };
 
-        let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
-            match carina_provider_resolver::find_installed_provider(base_dir, config) {
-                Ok(installed) => installed,
-                Err(e) => {
-                    let reason = format!("Provider '{}' {}", config.name, e);
-                    if report_errors {
-                        eprintln!("{}", reason.red());
-                    }
-                    load_errors.insert(config.name.clone(), reason);
-                    continue;
+        let installed = match carina_provider_resolver::find_installed_provider(base_dir, config) {
+            Ok(installed) => installed,
+            Err(e) => {
+                let reason = format!("Provider '{}' {}", config.name, e);
+                if report_errors {
+                    eprintln!("{}", reason.red());
                 }
+                load_errors.insert(config.name.clone(), reason);
+                continue;
             }
-        } else {
-            let reason = format!(
-                "Unsupported source format for provider '{}': {}. Use file:// or github.com/owner/repo.",
-                config.name, source
-            );
-            if report_errors {
-                eprintln!("{}", reason.red());
-            }
-            load_errors.insert(config.name.clone(), reason);
-            continue;
         };
 
         let factory_result = tokio::task::block_in_place(|| {
@@ -1600,7 +1586,10 @@ pub async fn get_provider_with_ctx(
 /// default — the parser rejects `source` on `let <name> = provider
 /// <kind>` — so this is the only way to get the source URL while
 /// processing a named instance's wiring.
-fn kind_default_source<'a>(configs: &'a ResolvedProviderConfigs, kind: &str) -> Option<&'a str> {
+fn kind_default_source<'a>(
+    configs: &'a ResolvedProviderConfigs,
+    kind: &str,
+) -> Option<&'a ProviderSource> {
     configs
         .iter()
         .find(|config| config.is_default() && config.name() == kind)
@@ -1648,7 +1637,7 @@ fn format_provider_using_line(
     kind: &str,
     region: &str,
     binding: Option<&str>,
-    source: Option<&str>,
+    source: Option<&ProviderSource>,
 ) -> String {
     let instance = binding.unwrap_or("default");
     match source {
@@ -1668,7 +1657,7 @@ async fn instantiate_provider_into_router(
     router: &mut ProviderRouter,
     provider_config: &ResolvedProviderConfig,
     base_dir: &Path,
-    inherited_source: Option<&str>,
+    inherited_source: Option<&ProviderSource>,
 ) -> Result<(), AppError> {
     let binding = provider_config.binding();
     // Named instances inherit `source`/`version`/`revision` from the
@@ -1735,7 +1724,7 @@ async fn instantiate_provider_into_router(
 
 async fn try_add_source_provider(
     router: &mut ProviderRouter,
-    source: &str,
+    source: &ProviderSource,
     config: &ResolvedProviderConfig,
     base_dir: &Path,
 ) -> Result<(), AppError> {
@@ -1791,7 +1780,7 @@ fn source_provider_initialization_error(provider_name: &str, error: ProviderErro
 fn ensure_source_provider_kind_matches(
     configured: &str,
     loaded: &str,
-    source: &str,
+    source: &ProviderSource,
 ) -> Result<(), AppError> {
     if configured == loaded {
         return Ok(());
@@ -1826,13 +1815,13 @@ enum LoadSourceError {
             carina_plugin_host::WasmProviderLoadError,
         >,
     ),
-    /// Plumbing failure: artifact not found, unsupported source scheme,
-    /// invalid config, etc. Logged and skipped.
+    /// Plumbing failure such as an artifact lookup or configuration error.
+    /// Logged and skipped.
     Other(String),
 }
 
 async fn load_source_provider(
-    source: &str,
+    source: &ProviderSource,
     config: &ResolvedProviderConfig,
     base_dir: &Path,
 ) -> Result<
@@ -1844,14 +1833,9 @@ async fn load_source_provider(
     ),
     LoadSourceError,
 > {
-    let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
+    let installed =
         carina_provider_resolver::find_installed_provider(base_dir, config.as_provider_config())
-            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?
-    } else {
-        return Err(LoadSourceError::Other(format!(
-            "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
-        )));
-    };
+            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?;
 
     let factory: Box<dyn ProviderFactory> = Box::new(
         load_installed_wasm_provider(&installed)

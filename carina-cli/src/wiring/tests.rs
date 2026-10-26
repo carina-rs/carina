@@ -206,8 +206,8 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
 
 #[test]
 fn source_provider_kind_mismatch_is_rejected() {
-    let source = "file:///tmp/provider.wasm";
-    let error = ensure_source_provider_kind_matches("configured", "reported", source)
+    let source = "file:///tmp/provider.wasm".parse().unwrap();
+    let error = ensure_source_provider_kind_matches("configured", "reported", &source)
         .expect_err("a source provider must report the configured block kind");
 
     assert_eq!(
@@ -6484,13 +6484,11 @@ mod using_line_format_tests {
         // Default instance (no binding). Source is always known on this
         // path because the default instance is the only one that
         // load-sources a factory.
+        let source = "github.com/carina-rs/carina-provider-awscc"
+            .parse()
+            .unwrap();
         assert_eq!(
-            format_provider_using_line(
-                "awscc",
-                "ap-northeast-1",
-                None,
-                Some("github.com/carina-rs/carina-provider-awscc"),
-            ),
+            format_provider_using_line("awscc", "ap-northeast-1", None, Some(&source),),
             "Using awscc (region: ap-northeast-1, instance=default, \
              source: github.com/carina-rs/carina-provider-awscc)",
         );
@@ -6501,13 +6499,9 @@ mod using_line_format_tests {
         // Named instance. Source belongs to the kind, not the instance,
         // and is still included so that one log line is enough to
         // identify what got wired up.
+        let source = "github.com/carina-rs/carina-provider-aws".parse().unwrap();
         assert_eq!(
-            format_provider_using_line(
-                "aws",
-                "us-east-1",
-                Some("us"),
-                Some("github.com/carina-rs/carina-provider-aws"),
-            ),
+            format_provider_using_line("aws", "us-east-1", Some("us"), Some(&source),),
             "Using aws (region: us-east-1, instance=us, \
              source: github.com/carina-rs/carina-provider-aws)",
         );
@@ -6552,7 +6546,7 @@ mod kind_default_source_tests {
             name: name.to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
-            source: source.map(str::to_string),
+            source: source.map(|source| source.parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
@@ -6584,8 +6578,8 @@ mod kind_default_source_tests {
             config("aws", Some("named"), None),
         ]);
         assert_eq!(
-            kind_default_source(&configs, "aws"),
-            Some("github.com/carina-rs/carina-provider-aws"),
+            kind_default_source(&configs, "aws").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-aws".to_string()),
         );
     }
 
@@ -6603,8 +6597,8 @@ mod kind_default_source_tests {
             ),
         ]);
         assert_eq!(
-            kind_default_source(&configs, "aws"),
-            Some("github.com/carina-rs/carina-provider-aws"),
+            kind_default_source(&configs, "aws").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-aws".to_string()),
         );
     }
 
@@ -6625,12 +6619,12 @@ mod kind_default_source_tests {
             ),
         ]);
         assert_eq!(
-            kind_default_source(&configs, "aws"),
-            Some("github.com/carina-rs/carina-provider-aws"),
+            kind_default_source(&configs, "aws").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-aws".to_string()),
         );
         assert_eq!(
-            kind_default_source(&configs, "awscc"),
-            Some("github.com/carina-rs/carina-provider-awscc"),
+            kind_default_source(&configs, "awscc").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-awscc".to_string()),
         );
     }
 
@@ -6662,9 +6656,18 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let source = "github.com/carina-rs/carina-provider-awscc";
     let revision = "main";
     let resolved_sha = "deadbeefcafe1234567890";
+    let github_source = match source
+        .parse::<carina_core::provider_source::ProviderSource>()
+        .unwrap()
+    {
+        carina_core::provider_source::ProviderSource::Remote(
+            carina_core::provider_source::RemoteSource::GithubDirect(source),
+        ) => source,
+        parsed => panic!("expected GitHub source: {parsed}"),
+    };
     let wasm_path = carina_provider_resolver::revision_resolver::cache_path_revision(
         base,
-        source,
+        &github_source,
         resolved_sha,
     );
     std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
@@ -6693,7 +6696,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     lock.save(&base.join("carina-providers.lock")).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: None,
         revision: Some(revision.into()),
         unresolved_attributes: IndexMap::new(),
@@ -6749,7 +6752,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     lock.save(&lock_path).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: None,
         revision: Some(revision.into()),
         unresolved_attributes: IndexMap::new(),
@@ -6776,6 +6779,118 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     assert!(!rendered.contains("carina init --upgrade"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_source_reaches_cli_artifact_loader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "carina-rs/awscc";
+    let version = "0.5.0";
+    let provider_source: ProviderSource = source.parse().unwrap();
+    let ProviderSource::Remote(remote_source) = &provider_source else {
+        panic!("registry source must parse as remote")
+    };
+    let wasm_path =
+        carina_provider_resolver::cache_path_wasm(base, &remote_source.source_key(), version);
+    std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+    std::fs::write(&wasm_path, b"not a wasm component").unwrap();
+
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Version {
+            version: version.into(),
+            constraint: None,
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&base.join("carina-providers.lock")).unwrap();
+
+    let config = ProviderConfig {
+        name: "awscc".into(),
+        source: Some(provider_source),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+
+    let (factories, errors) = build_factories_from_providers(&[config], base).unwrap();
+    let rendered = errors
+        .get("awscc")
+        .expect("the invalid fixture should fail only after registry resolution");
+
+    assert!(factories.is_empty());
+    assert!(rendered.contains("carina-providers.lock"), "{rendered}");
+    assert!(rendered.contains("version 0.5.0"), "{rendered}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_source_reaches_plan_apply_provider_loader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "carina-rs/awscc";
+    let version = "0.5.0";
+    let provider_source: ProviderSource = source.parse().unwrap();
+    let ProviderSource::Remote(remote_source) = &provider_source else {
+        panic!("registry source must parse as remote")
+    };
+    let wasm_path =
+        carina_provider_resolver::cache_path_wasm(base, &remote_source.source_key(), version);
+    std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+    std::fs::write(&wasm_path, b"not a wasm component").unwrap();
+
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Version {
+            version: version.into(),
+            constraint: None,
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&base.join("carina-providers.lock")).unwrap();
+
+    let configs = validated_provider_configs(vec![ProviderConfig {
+        name: "awscc".into(),
+        source: Some(provider_source),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    }]);
+    let config = configs.iter().next().unwrap();
+    let provider_source = config.source().unwrap();
+
+    let load_error = match load_source_provider(provider_source, config, base).await {
+        Err(LoadSourceError::Wasm(error)) => error.to_string(),
+        Err(LoadSourceError::Other(error)) => {
+            panic!("registry source was rejected before artifact loading: {error}")
+        }
+        Err(_) => panic!("unexpected provider load error variant"),
+        Ok(_) => panic!("invalid WASM fixture unexpectedly loaded"),
+    };
+    assert!(
+        load_error.contains("Failed to load WASM component"),
+        "{load_error}"
+    );
+    assert!(load_error.contains("carina-providers.lock"), "{load_error}");
+    assert!(load_error.contains("version 0.5.0"), "{load_error}");
+
+    let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
+    let router = get_provider_with_ctx(&ctx, &configs, base)
+        .await
+        .expect("artifact load errors are rendered by the plan/apply wiring boundary");
+    assert!(router.is_empty());
+}
+
 #[test]
 fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6783,7 +6898,7 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     std::fs::write(&wasm_path, b"fixture").unwrap();
     let config = ProviderConfig {
         name: "local".into(),
-        source: Some(format!("file://{}", wasm_path.display())),
+        source: Some(format!("file://{}", wasm_path.display()).parse().unwrap()),
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
@@ -6833,7 +6948,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     lock.save(&base.join("carina-providers.lock")).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
         revision: None,
         unresolved_attributes: IndexMap::new(),
@@ -6871,7 +6986,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     .unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some("github.com/carina-rs/carina-provider-awscc".into()),
+        source: Some(
+            "github.com/carina-rs/carina-provider-awscc"
+                .parse()
+                .unwrap(),
+        ),
         version: None,
         revision: Some("main".into()),
         unresolved_attributes: IndexMap::new(),
@@ -6966,7 +7085,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     lock.save(&base.join("carina-providers.lock")).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
         revision: None,
         unresolved_attributes: IndexMap::new(),

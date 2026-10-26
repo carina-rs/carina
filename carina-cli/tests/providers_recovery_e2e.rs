@@ -225,7 +225,7 @@ transparency_log_present = true
 fn registry_provider_config() -> ProviderConfig {
     ProviderConfig {
         name: "aws".into(),
-        source: Some("carina-rs/aws".into()),
+        source: Some("carina-rs/aws".parse().unwrap()),
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),

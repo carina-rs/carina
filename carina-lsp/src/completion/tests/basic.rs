@@ -797,6 +797,33 @@ fn provider_block_completion_suggests_region() {
 }
 
 #[test]
+fn provider_source_completion_advertises_registry_and_github_forms() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"provider awscc {
+    s
+}"#,
+    );
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 1,
+            character: 5,
+        },
+        None,
+    );
+    let source = completions
+        .iter()
+        .find(|completion| completion.label == "source")
+        .expect("provider block must offer the source attribute");
+
+    assert_eq!(
+        source.detail.as_deref(),
+        Some("Provider source (e.g., carina-rs/aws; alternatively github.com/owner/repo)")
+    );
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn provider_block_region_value_completion() {
     let provider = test_provider();
