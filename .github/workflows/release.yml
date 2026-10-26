@@ -15,6 +15,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
@@ -22,6 +23,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: linux-x86_64
+            # ubuntu-latest's userland is the amd64v3 variant (gcc, libc, crt objects).
+            # Build linux x86_64 in a baseline Debian userland; see #3963.
+            container: rust:1-bookworm
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: linux-aarch64
@@ -38,13 +42,17 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Trust the checkout inside the container
+        if: matrix.container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.container }}
 
       - name: Install cross
         if: matrix.use_cross
@@ -57,6 +65,15 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }} --bin carina --bin carina-lsp
           fi
+
+      - name: Verify x86-64 baseline compatibility and version stamp
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -o pipefail
+          apt-get update
+          apt-get install -y qemu-user
+          qemu-x86_64 -cpu qemu64 target/x86_64-unknown-linux-gnu/release/carina --version | grep -E '\([0-9a-f]{7,} '
+          timeout 60 qemu-x86_64 -cpu qemu64 target/x86_64-unknown-linux-gnu/release/carina-lsp </dev/null
 
       - name: Create tarball
         run: |
