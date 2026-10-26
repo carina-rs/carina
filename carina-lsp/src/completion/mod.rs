@@ -1165,21 +1165,16 @@ fn detect_interpolation_bare_partial(text: &str, position: Position) -> Option<S
         cursor_prefix.push('\n');
     }
     cursor_prefix.push_str(&line_prefix);
-    let before_partial = cursor_prefix[..cursor_prefix.len() - partial.len()]
-        .trim_end_matches([' ', '\t', '\r', '\n']);
-
-    if !(before_partial.ends_with("${")
-        || before_partial.ends_with('(')
-        || before_partial.ends_with(','))
-    {
+    let lexed = crate::lex::lex(&cursor_prefix);
+    if !lexed.at_end_inside_interpolation_code() {
         return None;
     }
-    let lexed = crate::lex::lex(&cursor_prefix);
-    let classified = lexed.last_classified_char()?;
-    let cursor_inside_interpolation = classified.is_inside_interpolation()
-        && (classified.kind() == crate::lex::LexKind::InterpolationCode
-            || partial.is_empty() && classified.is_interpolation_delimiter());
-    if !cursor_inside_interpolation {
+    let boundary = lexed.last_significant_interpolation_code_token(partial.chars().count())?;
+    if !matches!(
+        boundary,
+        crate::lex::InterpolationCodeToken::Start
+            | crate::lex::InterpolationCodeToken::Character('(' | ',')
+    ) {
         return None;
     }
 
@@ -1431,6 +1426,14 @@ mod helper_tests {
             detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
             Some("ab")
         );
+
+        for text in ["p = \"${\n", "p = \"${join('-',\n"] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, Position::new(1, 0)).as_deref(),
+                Some(""),
+                "completion must fire at column zero inside {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -1440,6 +1443,28 @@ mod helper_tests {
                 detect_interpolation_bare_partial(text, pos_at_end(text)),
                 None,
                 "heredoc interpolation state must end at the physical newline in {text:?}"
+            );
+        }
+
+        let text = "v = <<EOT\n${join(\n";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, Position::new(2, 0)),
+            None,
+            "heredoc interpolation state must be closed before the empty next line"
+        );
+    }
+
+    #[test]
+    fn heredoc_interpolation_bare_partial_on_same_physical_line() {
+        for (text, expected) in [
+            ("v = <<EOT\n${ab", "ab"),
+            ("v = <<EOT\n${join(", ""),
+            ("v = <<EOT\n${join(a, b", "b"),
+        ] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+                Some(expected),
+                "completion must use the heredoc state before its line is finalized in {text:?}"
             );
         }
     }
@@ -1453,6 +1478,21 @@ mod helper_tests {
                 "completion must fire after an expression delimiter in {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn interpolation_bare_partial_after_comment_trivia() {
+        let text = "p = \"${f( // note\n";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, Position::new(1, 0)).as_deref(),
+            Some("")
+        );
+
+        let text = "p = \"${f(/*c*/ ab";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+            Some("ab")
+        );
     }
 
     #[test]
@@ -1495,6 +1535,17 @@ mod helper_tests {
             detect_interpolation_bare_partial(text, pos_at_end(text)),
             None
         );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_rejected_inside_line_comment() {
+        for text in ["policy = \"${x // (ab", "policy = \"${x # ,ab"] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, pos_at_end(text)),
+                None,
+                "completion must not inspect interpolation comment text in {text:?}"
+            );
+        }
     }
 
     #[test]

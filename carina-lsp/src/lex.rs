@@ -19,7 +19,6 @@ pub(crate) enum LexKind {
 pub(crate) struct ClassifiedChar {
     kind: LexKind,
     interpolation_depth: usize,
-    interpolation_delimiter: bool,
 }
 
 impl ClassifiedChar {
@@ -29,10 +28,6 @@ impl ClassifiedChar {
 
     pub(crate) fn is_inside_interpolation(self) -> bool {
         self.interpolation_depth > 0
-    }
-
-    pub(crate) fn is_interpolation_delimiter(self) -> bool {
-        self.interpolation_delimiter
     }
 
     pub(crate) fn is_code_visible(self) -> bool {
@@ -45,6 +40,7 @@ pub(crate) struct LexedLine {
     text: String,
     chars: Vec<ClassifiedChar>,
     heredoc_body: bool,
+    ends_in_line_comment: bool,
 }
 
 /// Code text with every lexer-classified non-code character replaced by one
@@ -110,6 +106,13 @@ impl InterpolationSpan {
 pub(crate) struct LexedDocument {
     lines: Vec<LexedLine>,
     interpolations: Vec<InterpolationSpan>,
+    end_interpolation_span: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterpolationCodeToken {
+    Start,
+    Character(char),
 }
 
 impl LexedDocument {
@@ -121,8 +124,56 @@ impl LexedDocument {
         &self.interpolations
     }
 
-    pub(crate) fn last_classified_char(&self) -> Option<ClassifiedChar> {
-        self.lines.last()?.chars.last().copied()
+    /// Whether end-of-input is directly in interpolation expression code.
+    pub(crate) fn at_end_inside_interpolation_code(&self) -> bool {
+        self.end_interpolation_span.is_some()
+    }
+
+    /// Return the last significant token in the interpolation containing
+    /// end-of-input, before `trailing_chars`. Comments and expression
+    /// whitespace are trivia; nested string content is significant but is not
+    /// interpolation code, so it returns `None`.
+    pub(crate) fn last_significant_interpolation_code_token(
+        &self,
+        trailing_chars: usize,
+    ) -> Option<InterpolationCodeToken> {
+        let span = self.interpolations.get(self.end_interpolation_span?)?;
+        let start_line = span.start.line as usize;
+        let start_character = span.start.character as usize;
+        let mut trailing_chars = trailing_chars;
+
+        for line_index in (start_line..self.lines.len()).rev() {
+            let line = &self.lines[line_index];
+            let source_chars: Vec<char> = line.text.chars().collect();
+            debug_assert_eq!(source_chars.len(), line.chars.len());
+
+            for char_index in (0..source_chars.len()).rev() {
+                if line_index == start_line && char_index <= start_character + 1 {
+                    break;
+                }
+                if trailing_chars > 0 {
+                    trailing_chars -= 1;
+                    continue;
+                }
+
+                let ch = source_chars[char_index];
+                let classified = line.chars[char_index];
+                if classified.kind == LexKind::Comment
+                    || classified.kind == LexKind::InterpolationCode && ch.is_whitespace()
+                {
+                    continue;
+                }
+
+                return (classified.kind == LexKind::InterpolationCode)
+                    .then_some(InterpolationCodeToken::Character(ch));
+            }
+
+            if line_index == start_line {
+                break;
+            }
+        }
+
+        (trailing_chars == 0).then_some(InterpolationCodeToken::Start)
     }
 }
 
@@ -164,6 +215,13 @@ impl LexState {
 
     fn frames(&self) -> &[Frame] {
         &self.frames
+    }
+
+    fn end_interpolation_span(&self) -> Option<usize> {
+        match self.last() {
+            Some(Frame::Interpolation { span_index, .. }) => Some(*span_index),
+            _ => None,
+        }
     }
 
     fn push(&mut self, frame: Frame) {
@@ -214,6 +272,7 @@ pub(crate) fn lex(text: &str) -> LexedDocument {
     let mut interpolations = Vec::new();
     let mut state = LexState::default();
     let mut heredoc: Option<HeredocState> = None;
+    let mut end_interpolation_span = None;
 
     for (line_index, raw_line) in text.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -221,6 +280,7 @@ pub(crate) fn lex(text: &str) -> LexedDocument {
         if let Some(active) = heredoc.as_mut() {
             let is_terminator = line.trim() == active.marker;
             let lexed_line = if active.quoted || is_terminator {
+                end_interpolation_span = None;
                 uniform_heredoc_line(line)
             } else {
                 let lexed_line = scan_line(
@@ -230,6 +290,10 @@ pub(crate) fn lex(text: &str) -> LexedDocument {
                     &mut interpolations,
                     true,
                 );
+                end_interpolation_span = active
+                    .state
+                    .end_interpolation_span()
+                    .filter(|_| !lexed_line.ends_in_line_comment);
                 active.state.finish_heredoc_line();
                 lexed_line
             };
@@ -251,6 +315,9 @@ pub(crate) fn lex(text: &str) -> LexedDocument {
             &mut interpolations,
             false,
         );
+        end_interpolation_span = state
+            .end_interpolation_span()
+            .filter(|_| !lexed_line.ends_in_line_comment);
         lines.push(lexed_line);
         mark_open_interpolations_multiline(state.frames(), &mut interpolations);
 
@@ -262,6 +329,7 @@ pub(crate) fn lex(text: &str) -> LexedDocument {
     LexedDocument {
         lines,
         interpolations,
+        end_interpolation_span,
     }
 }
 
@@ -273,10 +341,10 @@ fn uniform_heredoc_line(line: &str) -> LexedLine {
             .map(|_| ClassifiedChar {
                 kind: LexKind::HeredocBody,
                 interpolation_depth: 0,
-                interpolation_delimiter: false,
             })
             .collect(),
         heredoc_body: true,
+        ends_in_line_comment: false,
     }
 }
 
@@ -288,7 +356,8 @@ fn scan_line(
     heredoc_body: bool,
 ) -> LexedLine {
     let source_chars: Vec<char> = line.chars().collect();
-    let mut chars = vec![classified(LexKind::Code, state, false); source_chars.len()];
+    let mut chars = vec![classified(LexKind::Code, state); source_chars.len()];
+    let mut ends_in_line_comment = false;
     let mut i = 0usize;
 
     while i < source_chars.len() {
@@ -296,6 +365,7 @@ fn scan_line(
             None => {
                 if is_line_comment_start(&source_chars, i) {
                     fill_from(&mut chars, i, LexKind::Comment, state);
+                    ends_in_line_comment = true;
                     break;
                 }
                 if starts_with(&source_chars, i, '/', '*') {
@@ -305,21 +375,21 @@ fn scan_line(
                     continue;
                 }
                 if source_chars[i] == '"' {
-                    chars[i] = classified(LexKind::DoubleQuotedString, state, false);
+                    chars[i] = classified(LexKind::DoubleQuotedString, state);
                     state.push(Frame::DoubleQuotedString);
                 } else if source_chars[i] == '\'' {
-                    chars[i] = classified(LexKind::SingleQuotedString, state, false);
+                    chars[i] = classified(LexKind::SingleQuotedString, state);
                     state.push(Frame::SingleQuotedString);
                 } else {
-                    chars[i] = classified(LexKind::Code, state, false);
+                    chars[i] = classified(LexKind::Code, state);
                 }
                 i += 1;
             }
             Some(Frame::DoubleQuotedString) => {
                 let kind = LexKind::DoubleQuotedString;
-                chars[i] = classified(kind, state, false);
+                chars[i] = classified(kind, state);
                 if source_chars[i] == '\\' && i + 1 < source_chars.len() {
-                    chars[i + 1] = classified(kind, state, false);
+                    chars[i + 1] = classified(kind, state);
                     i += 2;
                     continue;
                 }
@@ -335,9 +405,9 @@ fn scan_line(
             }
             Some(Frame::SingleQuotedString) => {
                 let kind = LexKind::SingleQuotedString;
-                chars[i] = classified(kind, state, false);
+                chars[i] = classified(kind, state);
                 if source_chars[i] == '\\' && i + 1 < source_chars.len() {
-                    chars[i + 1] = classified(kind, state, false);
+                    chars[i + 1] = classified(kind, state);
                     i += 2;
                     continue;
                 }
@@ -348,7 +418,7 @@ fn scan_line(
             }
             Some(Frame::HeredocBody) => {
                 let kind = LexKind::HeredocBody;
-                chars[i] = classified(kind, state, false);
+                chars[i] = classified(kind, state);
                 if starts_with(&source_chars, i, '$', '{') {
                     start_interpolation(&mut chars, i, line_index, state, interpolations, kind);
                     i += 2;
@@ -362,13 +432,14 @@ fn scan_line(
                 delimiter_kind,
             }) => {
                 if source_chars[i] == ' ' || source_chars[i] == '\t' {
-                    chars[i] = classified(LexKind::InterpolationCode, state, false);
+                    chars[i] = classified(LexKind::InterpolationCode, state);
                     i += 1;
                     continue;
                 }
                 if is_line_comment_start(&source_chars, i) {
                     mark_interpolation_nonempty(span_index, interpolations);
                     fill_from(&mut chars, i, LexKind::Comment, state);
+                    ends_in_line_comment = true;
                     break;
                 }
                 if starts_with(&source_chars, i, '/', '*') {
@@ -380,21 +451,21 @@ fn scan_line(
                 }
                 if source_chars[i] == '"' {
                     mark_interpolation_nonempty(span_index, interpolations);
-                    chars[i] = classified(LexKind::DoubleQuotedString, state, false);
+                    chars[i] = classified(LexKind::DoubleQuotedString, state);
                     state.push(Frame::DoubleQuotedString);
                     i += 1;
                     continue;
                 }
                 if source_chars[i] == '\'' {
                     mark_interpolation_nonempty(span_index, interpolations);
-                    chars[i] = classified(LexKind::SingleQuotedString, state, false);
+                    chars[i] = classified(LexKind::SingleQuotedString, state);
                     state.push(Frame::SingleQuotedString);
                     i += 1;
                     continue;
                 }
                 if source_chars[i] == '{' {
                     mark_interpolation_nonempty(span_index, interpolations);
-                    chars[i] = classified(LexKind::InterpolationCode, state, false);
+                    chars[i] = classified(LexKind::InterpolationCode, state);
                     if let Some(Frame::Interpolation { brace_depth, .. }) = state.last_mut() {
                         *brace_depth += 1;
                     }
@@ -403,7 +474,7 @@ fn scan_line(
                 }
                 if source_chars[i] == '}' {
                     if brace_depth == 1 {
-                        chars[i] = classified(delimiter_kind, state, true);
+                        chars[i] = classified(delimiter_kind, state);
                         interpolations[span_index].end = Some(SourcePosition {
                             line: line_index,
                             character: i as u32 + 1,
@@ -411,7 +482,7 @@ fn scan_line(
                         state.pop();
                     } else {
                         mark_interpolation_nonempty(span_index, interpolations);
-                        chars[i] = classified(LexKind::InterpolationCode, state, false);
+                        chars[i] = classified(LexKind::InterpolationCode, state);
                         if let Some(Frame::Interpolation { brace_depth, .. }) = state.last_mut() {
                             *brace_depth -= 1;
                         }
@@ -420,13 +491,13 @@ fn scan_line(
                     continue;
                 }
                 mark_interpolation_nonempty(span_index, interpolations);
-                chars[i] = classified(LexKind::InterpolationCode, state, false);
+                chars[i] = classified(LexKind::InterpolationCode, state);
                 i += 1;
             }
             Some(Frame::BlockComment { depth }) => {
-                chars[i] = classified(LexKind::Comment, state, false);
+                chars[i] = classified(LexKind::Comment, state);
                 if starts_with(&source_chars, i, '/', '*') {
-                    chars[i + 1] = classified(LexKind::Comment, state, false);
+                    chars[i + 1] = classified(LexKind::Comment, state);
                     if let Some(Frame::BlockComment { depth }) = state.last_mut() {
                         *depth += 1;
                     }
@@ -434,7 +505,7 @@ fn scan_line(
                     continue;
                 }
                 if starts_with(&source_chars, i, '*', '/') {
-                    chars[i + 1] = classified(LexKind::Comment, state, false);
+                    chars[i + 1] = classified(LexKind::Comment, state);
                     if depth == 1 {
                         state.pop();
                     } else if let Some(Frame::BlockComment { depth }) = state.last_mut() {
@@ -452,6 +523,7 @@ fn scan_line(
         text: line.to_string(),
         chars,
         heredoc_body,
+        ends_in_line_comment,
     }
 }
 
@@ -477,17 +549,16 @@ fn start_interpolation(
         span_index,
         delimiter_kind,
     });
-    chars[index] = classified(delimiter_kind, state, true);
-    chars[index + 1] = classified(delimiter_kind, state, true);
+    chars[index] = classified(delimiter_kind, state);
+    chars[index + 1] = classified(delimiter_kind, state);
 }
 
-fn classified(kind: LexKind, state: &LexState, interpolation_delimiter: bool) -> ClassifiedChar {
+fn classified(kind: LexKind, state: &LexState) -> ClassifiedChar {
     #[cfg(test)]
     record_interpolation_depth_work(1);
     ClassifiedChar {
         kind,
         interpolation_depth: state.interpolation_depth,
-        interpolation_delimiter,
     }
 }
 
@@ -512,12 +583,12 @@ fn interpolation_depth_work() -> usize {
 }
 
 fn set_pair(chars: &mut [ClassifiedChar], index: usize, kind: LexKind, state: &LexState) {
-    chars[index] = classified(kind, state, false);
-    chars[index + 1] = classified(kind, state, false);
+    chars[index] = classified(kind, state);
+    chars[index + 1] = classified(kind, state);
 }
 
 fn fill_from(chars: &mut [ClassifiedChar], index: usize, kind: LexKind, state: &LexState) {
-    let classified = classified(kind, state, false);
+    let classified = classified(kind, state);
     chars[index..].fill(classified);
 }
 
@@ -578,6 +649,11 @@ mod tests {
             assert_eq!(empty.len(), 1, "body: {body:?}");
             assert_eq!(empty[0].start.line, 3, "body: {body:?}");
         }
+    }
+
+    #[test]
+    fn closed_block_comment_leaves_end_of_input_in_interpolation_code() {
+        assert!(lex("\"${f(/*c*/").at_end_inside_interpolation_code());
     }
 
     #[test]
