@@ -381,6 +381,44 @@ fn validate_still_warns_for_unused_stable_binding() {
 }
 
 #[test]
+fn sibling_import_target_is_used_by_validate_and_plans_only_an_import() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"import {
+  to = mock.test.resource 'imported'
+  id = 'existing-1'
+}
+"#,
+    );
+    fs::write(
+        scenario.project.join("resources.crn"),
+        r#"let imported = mock.test.resource {
+  name = "x"
+}
+"#,
+    )
+    .expect("write sibling resource");
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+
+    let validate = scenario.carina(&["validate", "."]);
+    assert_success("carina validate", &validate);
+    let validate_stdout = String::from_utf8_lossy(&validate.stdout);
+    assert!(
+        !validate_stdout.contains(&unused_binding_warning("imported")),
+        "an import target declared in a sibling file is in use\n{validate_stdout}",
+    );
+
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    assert_success("carina plan", &plan);
+    let plan_stdout = String::from_utf8_lossy(&plan.stdout);
+    assert!(
+        plan_stdout.contains("Plan: 1 to import, 0 to add, 0 to change, 0 to destroy."),
+        "the imported binding must not also plan a create\n{plan_stdout}",
+    );
+}
+
+#[test]
 fn plan_rejects_multiple_attribute_derived_anonymous_resources() {
     let scenario = Scenario::new();
     scenario.write_main(ATTRIBUTE_DERIVED_ALPHA_AND_BETA);

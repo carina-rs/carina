@@ -2372,7 +2372,7 @@ pub fn reconcile_anonymous_module_instances(
             .entry(module.to_string())
             .or_default()
             .insert(simhash);
-        if claims.claims_to(&r.id.provider, &r.id.resource_type, identity) {
+        if claims.claims_to(&r.id) {
             claimed_current_by_module
                 .entry(module.to_string())
                 .or_default()

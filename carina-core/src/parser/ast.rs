@@ -743,12 +743,11 @@ impl ExportParamLike for ParsedExportParam {
 ///   Comparing two state-block addresses cannot silently mismatch on
 ///   a routing field that the DSL never specified.
 /// - It does **not** implement `PartialEq<ResourceId>` and there is no
-///   `From<&StateBlockAddress>` / `From<&ResourceId>` shortcut. The
-///   only way to produce a `ResourceId` from a `StateBlockAddress` is
-///   via a routing-lifting lookup against the plan / state (see
-///   `resolve_import_target` and `find_desired_id` in
-///   `carina-cli/src/wiring/mod.rs`), or — only when no match
-///   exists — via the explicit
+///   `From<&StateBlockAddress>` / `From<&ResourceId>` shortcut.
+///   [`matches_resource_id`](Self::matches_resource_id) is the single
+///   definition of whether an address identifies a configured resource or
+///   persisted state row; plan and state lookups route through it. Only when
+///   no match exists may a caller use the explicit
 ///   [`to_unrouted_resource_id`](Self::to_unrouted_resource_id)
 ///   escape hatch documented on the method itself.
 ///
@@ -824,6 +823,30 @@ impl StateBlockAddress {
         } else {
             format!("{}.{}", self.provider, self.resource_type)
         }
+    }
+
+    /// Whether this routing-agnostic address identifies `resource_id`.
+    ///
+    /// State-block syntax has no provider-instance slot, so matching uses the
+    /// authored `(provider, resource_type, identity)` tuple and deliberately
+    /// ignores [`ResourceId::provider_instance`](crate::resource::ResourceId::provider_instance).
+    /// This is the single cross-type matching rule. Import/move planning,
+    /// state-file lookup, state-block claims, and unused-binding validation
+    /// all share this primitive.
+    pub fn matches_resource_id(&self, resource_id: &crate::resource::ResourceId) -> bool {
+        resource_id.provider == self.provider
+            && resource_id.resource_type == self.resource_type
+            && resource_id.identity() == Some(&self.name)
+    }
+
+    /// Find the configured resource identified by this address.
+    pub fn find_resource<'a>(
+        &self,
+        resources: impl IntoIterator<Item = &'a crate::resource::Resource>,
+    ) -> Option<&'a crate::resource::Resource> {
+        resources
+            .into_iter()
+            .find(|resource| self.matches_resource_id(&resource.id))
     }
 
     /// Last-resort lift to a [`ResourceId`] with no routing.

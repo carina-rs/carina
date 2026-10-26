@@ -2846,11 +2846,14 @@ pub fn validate_attribute_params(
 
 /// Check for unused `let` bindings and return the unused binding names.
 ///
-/// A binding is unused if its name never appears as a value-carried reference:
-/// attribute refs, bare refs, interpolation expressions, function arguments, or
-/// secret inner values in resource attributes, module call arguments, attribute
-/// parameters, export parameters, `directives.depends_on`, wait targets, or wait
-/// `depends_on` entries.
+/// A binding is unused if its name never appears as a value-carried reference
+/// (attribute refs, bare refs, interpolation expressions, function arguments,
+/// or secret inner values) in resource attributes, module call arguments,
+/// attribute parameters, export parameters, or an `import.id`; as a
+/// `directives.depends_on` or wait target/dependency; or as the configured
+/// resource matched by an `import.to` or `moved.to` address.
+/// `moved.from` and `removed.from` identify state rows absent from the desired
+/// configuration and therefore do not count as references.
 ///
 /// Generic over the export-parameter shape so both `ParsedFile` (parser
 /// phase) and `InferredFile` (post-loader phase) can drive it without
@@ -2858,9 +2861,29 @@ pub fn validate_attribute_params(
 pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     parsed: &crate::parser::File<E>,
 ) -> Vec<String> {
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut state_block_targets = Vec::new();
+    for state_block in &parsed.state_blocks {
+        match state_block {
+            crate::parser::StateBlock::Import { to, id } => {
+                collect_dependencies(id, &mut referenced);
+                state_block_targets.push(to.clone());
+            }
+            crate::parser::StateBlock::Moved { addresses } => {
+                state_block_targets.push(addresses.to());
+            }
+            crate::parser::StateBlock::Removed { .. } => {}
+        }
+    }
+    // `moved.from` and `removed.from` identify state rows that should no
+    // longer be configured. Plan rejects a desired resource at either source
+    // address as a collision, so source addresses do not count as binding use.
+
     // Collect all defined binding names (skip discard pattern `_`).
     // Walk top-level and for-body resources so bindings declared inside a
-    // `for` template are also tracked.
+    // `for` template are also tracked. State-block targets count as uses only
+    // for the top-level managed-resource arm, matching plan's `parsed.resources`
+    // target-resolution set.
     let mut defined_bindings: Vec<String> = Vec::new();
     for rref in parsed.iter_all_resources() {
         if let Some(binding_name) = rref.binding() {
@@ -2868,6 +2891,13 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
                 continue;
             }
             defined_bindings.push(binding_name.to_string());
+            if matches!(rref, ResourceRef::Resource(_))
+                && state_block_targets
+                    .iter()
+                    .any(|target| target.matches_resource_id(rref.id()))
+            {
+                referenced.insert(binding_name.to_string());
+            }
         }
     }
 
@@ -2878,7 +2908,6 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     // Collect all referenced binding names. Walk both top-level resources
     // and for-body template resources so bindings referenced only inside a
     // `for` loop are counted as used.
-    let mut referenced: HashSet<String> = HashSet::new();
     for rref in parsed.iter_all_resources() {
         let attrs = rref.attributes();
         for value in attrs.values() {

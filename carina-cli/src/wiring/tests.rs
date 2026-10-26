@@ -3570,11 +3570,7 @@ fn test_stale_moved_block_releases_claims() {
     );
 
     assert!(
-        !claims.claims_to(
-            "awscc",
-            "ec2.SubnetRouteTableAssociation",
-            "ec2_subnet_route_table_association_aaaaaaaa",
-        ),
+        !claims.claims_to(&resources[0].id),
         "ineffective moved block must not pin its to address"
     );
     reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
