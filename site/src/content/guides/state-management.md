@@ -127,11 +127,13 @@ carina init --migrate-state
 ```
 
 `init` compares the configured backend against the one recorded in
-`carina-backend.lock`. If they differ it copies the state from the old
-backend to the new one, verifies the copy, and rewrites the lock. A bare
-`carina init` (and any `plan`/`apply`/`destroy`) **refuses** when the
-backend changed, so you never silently abandon the old state — you have
-to opt in with `--migrate-state` (or revert the backend configuration).
+`carina-backend.lock`. If they differ, a bare `carina init` warns and
+leaves migration pending, while `plan` warns and reads state from the old
+backend recorded in the lock. `apply`, `destroy`, and `state refresh`
+refuse to run until you opt in with `--migrate-state` (or revert the
+backend configuration), so you never silently abandon the old state.
+With `--migrate-state`, `init` copies the state to the new backend,
+verifies the copy, and rewrites the lock.
 
 A local source is deleted after the verified copy; a remote source is
 kept as a recoverable backup. Add `--force` only when a *different*
