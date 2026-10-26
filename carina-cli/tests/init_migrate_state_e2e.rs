@@ -3,8 +3,8 @@
 //! These drive the real `carina` binary against a multi-file project
 //! directory (mirroring the directory-scoped infra shape: `main.crn` +
 //! `backend.crn`), exercising the directory-refactor scenario from the
-//! issue: a backend address change must be a hard error without the
-//! flag, and must move the state file with it.
+//! issue: without the flag, a backend address change warns and leaves the
+//! migration pending; with the flag, it must move the state file.
 //!
 //! Local → local is used so the test needs no AWS credentials while
 //! still exercising the real lock-drift detection + migration path

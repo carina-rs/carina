@@ -154,7 +154,7 @@ pub fn drift_warning(
 ) -> String {
     format!(
         "{}\n\n    plan reads state from the OLD backend recorded in carina-backend.lock.\n    \
-         Before running apply or destroy, run `{}`\n    \
+         Before running apply, destroy, or state refresh, run `{}`\n    \
          to migrate state from the OLD backend to the new one.\n\n    \
          To revert instead, restore the backend block to match the lock.",
         backend_drift_header(existing, configured),
@@ -901,6 +901,7 @@ mod tests {
             assert!(warning.contains("legacy/state.json"));
             assert!(warning.contains("state.json"));
             assert!(warning.contains("carina init --migrate-state"));
+            assert!(warning.contains("Before running apply, destroy, or state refresh"));
         }
 
         #[test]
