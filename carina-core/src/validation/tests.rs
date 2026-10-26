@@ -445,9 +445,9 @@ let orphan = mock.test.resource { name = "orphan" }
 #[test]
 fn state_block_targets_only_count_managed_resources_as_used() {
     let mut parsed = empty_parsed();
-    parsed.resources.push(
-        Resource::with_provider("mock", "test.resource", "managed", None).with_binding("managed"),
-    );
+    let managed =
+        Resource::with_provider("mock", "test.resource", "managed", None).with_binding("managed");
+    parsed.resources.push(managed); // allow: direct — fixture test inspection
     parsed.data_sources.push(
         DataSource::with_provider("mock", "test.resource", "read_target", None)
             .with_binding("read_target"),
