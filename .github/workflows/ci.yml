@@ -197,8 +197,8 @@ jobs:
           shared-key: binary-bookworm
       - run: cargo build --release --bin carina
       - name: Verify x86-64 baseline compatibility and version stamp
+        shell: bash
         run: |
-          set -o pipefail
           apt-get update
           apt-get install -y qemu-user
           qemu-x86_64 -cpu qemu64 target/release/carina --version | grep -E '\([0-9a-f]{7,} '
