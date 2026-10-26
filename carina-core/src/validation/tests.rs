@@ -4,7 +4,7 @@ use crate::parser::{
 };
 use crate::resource::{
     Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
-    Resource, Signature,
+    DataSource, Resource, Signature,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::HashMap;
@@ -421,6 +421,96 @@ fn unused_binding_warns() {
 
     let unused = check_unused_bindings(&parsed);
     assert_eq!(unused, vec!["vpc"]);
+}
+
+#[test]
+fn import_target_counts_as_binding_use_and_other_binding_still_warns() {
+    let parsed = crate::parser::parse(
+        r#"
+import {
+  to = mock.test.resource 'imported'
+  id = 'existing-1'
+}
+
+let imported = mock.test.resource { name = "imported" }
+let orphan = mock.test.resource { name = "orphan" }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+
+    assert_eq!(check_unused_bindings(&parsed), vec!["orphan"]);
+}
+
+#[test]
+fn state_block_targets_only_count_managed_resources_as_used() {
+    let mut parsed = empty_parsed();
+    parsed.resources.push(
+        Resource::with_provider("mock", "test.resource", "managed", None).with_binding("managed"),
+    );
+    parsed.data_sources.push(
+        DataSource::with_provider("mock", "test.resource", "read_target", None)
+            .with_binding("read_target"),
+    );
+    parsed.state_blocks.push(crate::parser::StateBlock::Import {
+        to: crate::parser::StateBlockAddress::new("mock", "test.resource", "managed"),
+        id: Value::Concrete(ConcreteValue::String("existing-1".into())),
+    });
+    parsed.state_blocks.push(crate::parser::StateBlock::Import {
+        to: crate::parser::StateBlockAddress::new("mock", "test.resource", "read_target"),
+        id: Value::Concrete(ConcreteValue::String("existing-2".into())),
+    });
+
+    assert_eq!(check_unused_bindings(&parsed), vec!["read_target"]);
+}
+
+#[test]
+fn moved_target_counts_as_binding_use_but_source_does_not() {
+    let parsed = crate::parser::parse(
+        r#"
+moved {
+  from = mock.test.resource 'old'
+  to = mock.test.resource 'renamed'
+}
+
+removed {
+  from = mock.test.resource 'gone'
+}
+
+let old = mock.test.resource { name = "old" }
+let renamed = mock.test.resource { name = "renamed" }
+let gone = mock.test.resource { name = "gone" }
+let orphan = mock.test.resource { name = "orphan" }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+
+    assert_eq!(
+        check_unused_bindings(&parsed),
+        vec!["old", "gone", "orphan"]
+    );
+}
+
+#[test]
+fn binding_referenced_only_in_import_id_is_not_unused() {
+    let parsed = crate::parser::parse(
+        r#"
+let imported = mock.test.resource { name = "imported" }
+let identifier_source = mock.test.resource { name = "identifier" }
+
+mock.test.resource { name = imported.name }
+
+import {
+  to = mock.test.resource 'imported'
+  id = "${identifier_source.id}|existing"
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+
+    assert!(check_unused_bindings(&parsed).is_empty());
 }
 
 #[test]

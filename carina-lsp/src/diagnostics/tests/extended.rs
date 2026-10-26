@@ -319,6 +319,41 @@ fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
 }
 
 #[test]
+fn import_target_in_sibling_state_block_is_not_unused() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let resource = "let imported = mock.test.resource {\n  name = \"x\"\n}\n";
+    let state_block = r#"provider mock {}
+
+import {
+  to = mock.test.resource 'imported'
+  id = 'existing-1'
+}
+"#;
+    std::fs::write(temp.path().join("resources.crn"), resource).unwrap();
+    std::fs::write(temp.path().join("state.crn"), state_block).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(resource),
+        Some("resources.crn"),
+        Some(temp.path()),
+    );
+
+    assert!(
+        unused_binding_messages(&diagnostics).is_empty(),
+        "import target diagnostics: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn single_unused_attribute_derived_binding_still_warns() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 

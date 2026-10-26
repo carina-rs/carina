@@ -7,6 +7,7 @@ use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
+use carina_core::parser::StateBlockAddress;
 use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
 pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
@@ -898,6 +899,18 @@ impl StateFile {
             r.provider == provider
                 && r.resource_type == resource_type
                 && r.identity.as_str() == identity
+        })
+    }
+
+    /// Find the persisted row identified by a routing-agnostic state-block
+    /// address. Matching delegates to the same typed rule used by planning.
+    pub fn find_resource_by_state_block_address(
+        &self,
+        address: &StateBlockAddress,
+    ) -> Option<&ResourceState> {
+        self.resources.iter().find(|row| {
+            let resource_id = Self::id_for_resource_state(row);
+            address.matches_resource_id(&resource_id)
         })
     }
 
