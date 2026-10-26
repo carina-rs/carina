@@ -6,7 +6,10 @@ use colored::Colorize;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
 use carina_core::value::{PersistedExportValue, render_export_json_value};
-use carina_state::{StateBackend, resolve_backend_for_read};
+use carina_state::{
+    StateBackend, StateUrl, load_published_exports_from_url, read_published_exports,
+    resolve_backend_for_read,
+};
 
 use crate::display::colored_value;
 use crate::error::AppError;
@@ -25,43 +28,42 @@ pub enum OutputFormat {
 /// Run the `carina export` command.
 pub async fn run_export(
     path: &Path,
+    state_url: Option<&str>,
     name: Option<String>,
     format: OutputFormat,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let parsed = load_configuration_with_config(
-        path,
-        provider_context,
-        &carina_core::schema::SchemaRegistry::new(),
-    )?
-    .parsed;
-
-    let base_dir = get_base_dir(path);
-    let backend: Box<dyn StateBackend> =
-        resolve_backend_for_read(parsed.backend.as_ref(), base_dir)
+    let exports = if let Some(raw_url) = state_url {
+        let url = StateUrl::parse(raw_url).map_err(AppError::Backend)?;
+        load_published_exports_from_url(&url)
             .await
-            .map_err(AppError::Backend)?;
-
-    // `carina export` is read-only; drop the pending-migration token
-    // — lock-held callers (apply/destroy/state refresh) persist
-    // schema migrations (carina#3315).
-    let state_file = backend
-        .read_state()
-        .await
-        .map_err(AppError::Backend)?
-        .map(|loaded| loaded.into_state())
-        .ok_or_else(|| {
-            AppError::Config(format!(
-                "No state file found. Run `{}` first.",
-                ProjectCommand::new("apply", path)
-            ))
-        })?;
-
-    let exports = &state_file.exports;
+            .map_err(AppError::Backend)?
+    } else {
+        let parsed = load_configuration_with_config(
+            path,
+            provider_context,
+            &carina_core::schema::SchemaRegistry::new(),
+        )?
+        .parsed;
+        let base_dir = get_base_dir(path);
+        let backend: Box<dyn StateBackend> =
+            resolve_backend_for_read(parsed.backend.as_ref(), base_dir)
+                .await
+                .map_err(AppError::Backend)?;
+        read_published_exports(backend.as_ref())
+            .await
+            .map_err(AppError::Backend)?
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "No state file found. Run `{}` first.",
+                    ProjectCommand::new("apply", path)
+                ))
+            })?
+    };
 
     match name {
-        Some(key) => print_single_export(&key, exports, &format),
-        None => print_all_exports(exports, &format),
+        Some(key) => print_single_export(&key, exports.values(), &format),
+        None => print_all_exports(exports.values(), &format),
     }
 }
 

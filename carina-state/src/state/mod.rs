@@ -388,11 +388,103 @@ enum DesiredAuthoringBasis {
     CarryPrior,
 }
 
+/// Published values read without decoding managed resource rows.
+///
+/// Construction is restricted to [`Self::from_state_bytes`], so exports-only
+/// consumers cannot accidentally cross the full state-format version gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedExports {
+    values: HashMap<String, PersistedExportValue>,
+}
+
+#[derive(Deserialize)]
+struct PublishedExportsEnvelope {
+    version: u32,
+    exports_version: Option<u32>,
+    #[serde(default)]
+    exports: HashMap<String, serde_json::Value>,
+}
+
+impl PublishedExports {
+    /// Current persisted exports encoding version.
+    ///
+    /// Bump this only when [`PersistedExportValue`]'s encoding changes. The
+    /// state-format changes in v12, v13, and v14 would each have required an
+    /// exports-version bump if this independent contract had existed then.
+    pub const CURRENT_VERSION: u32 = 1;
+
+    /// Read the published-exports envelope from raw state-file bytes.
+    ///
+    /// Current exports encodings are decoded directly without deserializing
+    /// resource rows or checking [`StateFile::CURRENT_VERSION`]. State files
+    /// written before the independent exports version existed are migrated
+    /// through the legacy full-state path because their value encoding may
+    /// require the v12-v14 migrations.
+    pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
+        Self::decode_state_bytes(bytes).map(|(exports, _)| exports)
+    }
+
+    pub(crate) fn decode_state_bytes(
+        bytes: &[u8],
+    ) -> Result<(Self, Option<MigrationInfo>), BackendError> {
+        let envelope: PublishedExportsEnvelope =
+            serde_json::from_slice(bytes).map_err(|error| {
+                BackendError::InvalidState(format!(
+                    "Failed to parse published exports envelope: {error}"
+                ))
+            })?;
+
+        match classify_exports_version(envelope.version, envelope.exports_version)
+            .map_err(|error| map_state_file_decode_error(error, None))?
+        {
+            ExportsVersionClassification::Current => decode_persisted_exports(envelope.exports)
+                .map(|values| (Self { values }, None))
+                .map_err(|error| map_state_file_decode_error(error, None)),
+            ExportsVersionClassification::Legacy => {
+                let (state, migration) = check_and_migrate_bytes(bytes)?.into_parts();
+                Ok((
+                    Self {
+                        values: state.exports,
+                    },
+                    migration,
+                ))
+            }
+        }
+    }
+
+    pub fn values(&self) -> &HashMap<String, PersistedExportValue> {
+        &self.values
+    }
+
+    /// Decode published values into the binding map consumed by
+    /// `upstream_state`.
+    pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
+        self.values
+            .iter()
+            .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurrentExportsVersion;
+
+impl Serialize for CurrentExportsVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(PublishedExports::CURRENT_VERSION)
+    }
+}
+
 /// The main state file structure that persists to the backend
 #[derive(Debug, Clone, Serialize)]
 pub struct StateFile {
     /// State file format version
     pub version: u32,
+    #[serde(rename = "exports_version")]
+    exports_version_marker: CurrentExportsVersion,
     /// Monotonically increasing number for each state modification
     pub serial: u64,
     /// Unique identifier for this state lineage (prevents accidental overwrites)
@@ -465,6 +557,7 @@ impl FromIterator<Orphan> for LoadedOrphans {
 #[derive(Deserialize)]
 struct UncheckedStateFile {
     version: u32,
+    exports_version: Option<u32>,
     serial: u64,
     lineage: String,
     carina_version: String,
@@ -490,8 +583,65 @@ impl std::fmt::Display for ErrorSourceChain<'_> {
 #[derive(Debug)]
 pub(crate) enum StateFileDecodeError {
     Json(serde_json::Error),
+    ExportsVersionTooNew { found: u32, supported: u32 },
     InvalidResourceIdentity(InvalidResourceIdentityError),
     Validation(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportsVersionClassification {
+    Current,
+    Legacy,
+}
+
+fn classify_exports_version(
+    state_version: u32,
+    exports_version: Option<u32>,
+) -> Result<ExportsVersionClassification, StateFileDecodeError> {
+    match exports_version {
+        Some(_) if state_version < StateFile::EXPORTS_VERSION_INTRODUCED => {
+            Err(StateFileDecodeError::Validation(format!(
+                "top-level exports_version is invalid before state version {}",
+                StateFile::EXPORTS_VERSION_INTRODUCED
+            )))
+        }
+        Some(found) if found > PublishedExports::CURRENT_VERSION => {
+            Err(StateFileDecodeError::ExportsVersionTooNew {
+                found,
+                supported: PublishedExports::CURRENT_VERSION,
+            })
+        }
+        Some(found) if found < PublishedExports::CURRENT_VERSION => {
+            Err(StateFileDecodeError::Validation(format!(
+                "exports version {found} is older than supported version {}; no exports migration exists",
+                PublishedExports::CURRENT_VERSION
+            )))
+        }
+        Some(_) => Ok(ExportsVersionClassification::Current),
+        None if state_version >= StateFile::EXPORTS_VERSION_INTRODUCED => {
+            Err(StateFileDecodeError::Validation(
+                "missing required top-level exports_version".to_string(),
+            ))
+        }
+        None => Ok(ExportsVersionClassification::Legacy),
+    }
+}
+
+fn decode_persisted_exports(
+    exports: HashMap<String, serde_json::Value>,
+) -> Result<HashMap<String, PersistedExportValue>, StateFileDecodeError> {
+    exports
+        .into_iter()
+        .map(|(name, value)| {
+            serde_json::from_value(value)
+                .map(|value| (name.clone(), value))
+                .map_err(|error| {
+                    StateFileDecodeError::Validation(format!(
+                        "persisted export {name:?} is not valid persisted JSON: {error}"
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn map_state_file_decode_error(
@@ -499,6 +649,9 @@ fn map_state_file_decode_error(
     migration_from: Option<u32>,
 ) -> BackendError {
     match error {
+        StateFileDecodeError::ExportsVersionTooNew { found, supported } => {
+            BackendError::ExportsVersionTooNew { found, supported }
+        }
         StateFileDecodeError::InvalidResourceIdentity(error) => error.into(),
         StateFileDecodeError::Json(error) => match migration_from {
             Some(version) => BackendError::InvalidState(format!(
@@ -525,6 +678,7 @@ impl StateFile {
     pub(crate) fn from_json_str(content: &str) -> Result<Self, StateFileDecodeError> {
         let unchecked: UncheckedStateFile =
             serde_json::from_str(content).map_err(StateFileDecodeError::Json)?;
+        classify_exports_version(unchecked.version, unchecked.exports_version)?;
         let resources = unchecked
             .resources
             .into_iter()
@@ -565,21 +719,10 @@ impl StateFile {
                 serde_json::from_value(value).map_err(StateFileDecodeError::Json)
             })
             .collect::<Result<Vec<ResourceState>, StateFileDecodeError>>()?;
-        let exports = unchecked
-            .exports
-            .into_iter()
-            .map(|(name, value)| {
-                serde_json::from_value(value)
-                    .map(|value| (name.clone(), value))
-                    .map_err(|error| {
-                        StateFileDecodeError::Validation(format!(
-                            "persisted export {name:?} is not valid persisted JSON: {error}"
-                        ))
-                    })
-            })
-            .collect::<Result<_, _>>()?;
+        let exports = decode_persisted_exports(unchecked.exports)?;
         let state = Self {
             version: unchecked.version,
+            exports_version_marker: CurrentExportsVersion,
             serial: unchecked.serial,
             lineage: unchecked.lineage,
             carina_version: unchecked.carina_version,
@@ -624,12 +767,20 @@ impl StateFile {
     /// v16: Added `ExplicitFields::WholeValue` with validated authored-path
     ///      evidence for carried ambiguous-list removals. Older rows need no
     ///      structural rewrite because they cannot contain the new marker.
-    pub const CURRENT_VERSION: u32 = 16;
+    /// v17: Added top-level `exports_version` so published exports have a
+    ///      compatibility contract independent of managed resource rows. See
+    ///      [`Self::EXPORTS_VERSION_INTRODUCED`].
+    pub const CURRENT_VERSION: u32 = 17;
+
+    /// State file version that introduced the independent exports version.
+    /// This value is fixed forever.
+    pub const EXPORTS_VERSION_INTRODUCED: u32 = 17;
 
     /// Create a new empty state file
     pub fn new() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
+            exports_version_marker: CurrentExportsVersion,
             serial: 0,
             lineage: uuid::Uuid::new_v4().to_string(),
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -687,6 +838,7 @@ impl StateFile {
     pub fn with_lineage(lineage: String) -> Self {
         Self {
             version: Self::CURRENT_VERSION,
+            exports_version_marker: CurrentExportsVersion,
             serial: 0,
             lineage,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1144,22 +1296,6 @@ impl StateFile {
             .collect()
     }
 
-    /// Build a map of resource bindings for use as a remote state data source.
-    ///
-    /// Returns a map where each key is a resource binding name and the value is a
-    /// `Value::Concrete(ConcreteValue::Map)` containing that resource's attributes (converted from JSON to DSL values).
-    /// Resources without a binding name are skipped.
-    ///
-    /// This is used by `remote_state` blocks to expose another project's state
-    /// as a nested map: `remote_binding.resource_binding.attribute`.
-    pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
-        // Return only exports — no fallback to let bindings
-        self.exports
-            .iter()
-            .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
-            .collect()
-    }
-
     /// Rewrite every map-key address in the state to its canonical
     /// shape (#1903). State files written by older Carina builds may
     /// store `binding["key"]`; new emissions use `binding.key` (or
@@ -1333,6 +1469,8 @@ impl StateFile {
     }
 }
 
+const _: () = assert!(StateFile::EXPORTS_VERSION_INTRODUCED <= StateFile::CURRENT_VERSION);
+
 impl Default for StateFile {
     fn default() -> Self {
         Self::new()
@@ -1462,10 +1600,11 @@ impl NameOverrideSource for StateFile {
     }
 }
 
-/// Minimal struct for extracting just the version field from a state file.
+/// Minimal struct for extracting the compatibility markers from a state file.
 #[derive(Deserialize)]
 struct VersionCheck {
     version: u32,
+    exports_version: Option<u32>,
 }
 
 /// Reports an in-memory schema upgrade applied to a state file by
@@ -1535,7 +1674,7 @@ impl MigratedStateFile {
 /// persist the upgraded shape before any short-circuit return, so the
 /// carina#3283 warning ("Disk state will be rewritten during the next
 /// apply or state refresh of that project") matches reality —
-/// carina#3315. Read-only call sites (`plan`, exports, `state
+/// carina#3315. Read-only full-state call sites (`plan`, `state
 /// list/show/lookup`, etc.) bind both arms identically and discard
 /// `info` explicitly — the discard is visible in the source rather
 /// than hidden inside an `Option::None`.
@@ -1565,7 +1704,7 @@ pub enum LoadedState {
 impl LoadedState {
     /// Consume the wrapper, returning the state and dropping any
     /// pending-migration indicator. Use this for read-only paths
-    /// (`plan`, exports, `state list/show/lookup`) where the on-disk
+    /// (`plan`, `state list/show/lookup`) where the on-disk
     /// version is reported via a separate warning and not persisted.
     /// Lock-held paths destructure the enum directly so the
     /// `MigrationInfo` is a named binding rather than a hidden drop.
@@ -1600,13 +1739,17 @@ pub fn log_state_migration_once(
     display_target: &str,
 ) {
     if slot.set(info).is_ok() {
-        eprintln!(
-            "Warning: state file {} is v{} on disk; in-memory migration \
-             to v{} applied for this run. Disk state will be rewritten \
-             during the next apply or state refresh of that project.",
-            display_target, info.from, info.to
-        );
+        log_state_migration(info, display_target);
     }
+}
+
+pub(crate) fn log_state_migration(info: MigrationInfo, display_target: &str) {
+    eprintln!(
+        "Warning: state file {} is v{} on disk; in-memory migration \
+         to v{} applied for this run. Disk state will be rewritten \
+         during the next apply or state refresh of that project.",
+        display_target, info.from, info.to
+    );
 }
 
 /// Deserialize a state file from a JSON string, checking the version and
@@ -1634,6 +1777,8 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             });
         }
         v => {
+            classify_exports_version(v, check.exports_version)
+                .map_err(|error| map_state_file_decode_error(error, None))?;
             migration = Some(MigrationInfo {
                 from: v,
                 to: StateFile::CURRENT_VERSION,
@@ -3166,6 +3311,7 @@ fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
         object.insert("current".to_string(), current);
     }
     root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    root["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
     serde_json::to_string(&root).map_err(|error| {
         BackendError::InvalidState(format!("Failed to migrate state file from v14: {error}"))
     })

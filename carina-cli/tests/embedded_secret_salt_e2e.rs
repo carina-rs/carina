@@ -105,6 +105,10 @@ fn resource_by_identity<'a>(state: &'a Value, identity: &str) -> &'a Value {
 
 fn downgrade_state_to_v13(state: &mut Value) {
     state["version"] = Value::from(13);
+    state
+        .as_object_mut()
+        .expect("state object")
+        .remove("exports_version");
     for row in state["resources"].as_array_mut().expect("state resources") {
         let row_object = row.as_object_mut().expect("state resource row");
         let current = row_object

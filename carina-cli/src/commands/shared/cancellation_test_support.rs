@@ -9,7 +9,8 @@ use carina_core::shutdown::testing::{
     TestShutdownTrigger, same_shutdown_channel, shutdown_channel,
 };
 use carina_state::{
-    BackendError, BackendResult, LoadedState, LocalBackend, LockInfo, StateBackend, StateFile,
+    BackendError, BackendResult, LoadedState, LocalBackend, LockInfo, RawState, StateBackend,
+    StateFile,
 };
 use tempfile::TempDir;
 
@@ -46,6 +47,10 @@ impl LockLossBackend {
 impl StateBackend for LockLossBackend {
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         self.inner.read_state().await
+    }
+
+    async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
+        self.inner.read_state_bytes().await
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {

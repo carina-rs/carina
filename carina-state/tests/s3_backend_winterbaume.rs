@@ -16,7 +16,7 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use carina_state::backends::S3Backend;
-use carina_state::{BackendError, StateBackend, StateFile};
+use carina_state::{BackendError, StateBackend, StateFile, read_published_exports};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::future::Future;
@@ -652,6 +652,65 @@ async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
         recorded,
         vec!["GET lock", "PUT lock", "PUT state"],
         "cached cleanup must fit the 900ms lock GET + lock PUT + state PUT budget"
+    );
+}
+
+#[tokio::test]
+async fn published_exports_read_does_not_seed_the_state_etag_cache() {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mock = MockAws::builder()
+        .with_service(RecordingS3Calls {
+            inner: Arc::new(S3Service::new()),
+            enabled: Arc::clone(&enabled),
+            calls: Arc::clone(&calls),
+        })
+        .build();
+    let sdk_config = mock.sdk_config(TEST_REGION).await;
+
+    let seed_backend = S3Backend::from_client(
+        Client::new(&sdk_config),
+        TEST_BUCKET.to_string(),
+        TEST_KEY.to_string(),
+        TEST_REGION.to_string(),
+        false,
+        true,
+    );
+    create_bucket_and_seed_empty_state(&seed_backend).await;
+
+    let backend = S3Backend::from_client(
+        Client::new(&sdk_config),
+        TEST_BUCKET.to_string(),
+        TEST_KEY.to_string(),
+        TEST_REGION.to_string(),
+        false,
+        true,
+    );
+    let mut next_state = StateFile::new();
+    next_state.increment_serial();
+
+    enabled.store(true, Ordering::SeqCst);
+    read_published_exports(&backend).await.unwrap().unwrap();
+    backend.write_state(&next_state).await.unwrap();
+    enabled.store(false, Ordering::SeqCst);
+
+    let recorded: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, uri)| {
+            let object = if uri.contains(TEST_KEY) {
+                "state"
+            } else {
+                "other"
+            };
+            format!("{method} {object}")
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec!["GET state", "HEAD state", "PUT state"],
+        "an exports-only read must leave the write-CAS cache unknown"
     );
 }
 

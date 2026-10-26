@@ -12,7 +12,7 @@ use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::backend::{AwsError, BackendError, BackendResult, StateBackend};
+use crate::backend::{AwsError, BackendError, BackendResult, RawState, StateBackend};
 use crate::backend_config::S3BackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
@@ -20,9 +20,10 @@ use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migrat
 const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
 
 // GitHub Actions cancellation is SIGINT -> 7.5s -> SIGTERM -> 2.5s ->
-// SIGKILL. Cleanup has a 2s hard deadline and a 1s state-flush budget. A state
-// read resolves the ETag cache to either present or absent, so the steady-state
-// locked flush performs lock GET + lock PUT + state PUT: 3 * 300ms = 900ms.
+// SIGKILL. Cleanup has a 2s hard deadline and a 1s state-flush budget. A
+// full-state read resolves the ETag cache to either present or absent, so the
+// steady-state locked flush performs lock GET + lock PUT + state PUT: 3 *
+// 300ms = 900ms.
 // This also holds for a known-absent first state, whose PUT uses If-None-Match
 // directly. Lock release performs GET + DELETE, so all five calls take at most
 // 1.5s and leave 500ms for scheduling and serialization. A conflict is an
@@ -70,10 +71,11 @@ pub struct S3Backend {
     /// `read_state` on this backend instance (carina#3283). See the
     /// equivalent field on `LocalBackend` for the rationale.
     migration_logged: OnceLock<MigrationInfo>,
-    /// Best-known state of the state object's ETag. Successful reads (including
-    /// a 404) and writes resolve this cache so the steady-state conditional
-    /// write needs only one PUT. A stale value is safe: S3 rejects it and the
-    /// writer refreshes via HEAD.
+    /// Best-known state of the state object's ETag. Successful full-state reads
+    /// (including a 404) and writes resolve this cache so the steady-state
+    /// conditional write needs only one PUT. Exports-only reads deliberately do
+    /// not change it. A stale value is safe: S3 rejects it and the writer
+    /// refreshes via HEAD.
     state_etag: Mutex<CachedStateEtag>,
 }
 
@@ -313,6 +315,38 @@ impl S3Backend {
             .state_etag
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = etag;
+    }
+
+    fn state_location(&self) -> String {
+        format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/'))
+    }
+
+    async fn get_state_object(&self) -> BackendResult<Option<(Vec<u8>, Option<String>)>> {
+        let result = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .send()
+            .await;
+
+        match result {
+            Ok(output) => {
+                let etag = output.e_tag().map(ToOwned::to_owned);
+                let body = output
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|error| BackendError::Io(error.to_string()))?;
+                Ok(Some((body.into_bytes().to_vec(), etag)))
+            }
+            Err(error) if is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(BackendError::Aws(Box::new(
+                AwsError::from_sdk_error("s3.GetObject", error)
+                    .bucket(&self.bucket)
+                    .key(&self.key),
+            ))),
+        }
     }
 
     async fn head_state_etag(
@@ -660,29 +694,13 @@ impl S3Backend {
 #[async_trait]
 impl StateBackend for S3Backend {
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
-        let result = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .send()
-            .await;
-
-        match result {
-            Ok(output) => {
-                let etag = output.e_tag().map(ToOwned::to_owned);
-                let body = output
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| BackendError::Io(e.to_string()))?;
-                let bytes = body.into_bytes();
-                let state_location =
-                    format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/'));
+        let state_location = self.state_location();
+        match self.get_state_object().await? {
+            Some((bytes, etag)) => {
                 let outcome = state::check_and_migrate_bytes(&bytes)
                     .map_err(|error| error.with_state_location(state_location.clone()))?;
                 let (state, migration) = outcome.into_parts();
-                let loaded = if let Some(info) = migration {
+                let loaded_state = if let Some(info) = migration {
                     log_state_migration_once(&self.migration_logged, info, &state_location);
                     LoadedState::Migrated { state, info }
                 } else {
@@ -691,21 +709,21 @@ impl StateBackend for S3Backend {
                 self.set_cached_state_etag(
                     etag.map_or(CachedStateEtag::Unknown, CachedStateEtag::Etag),
                 );
-                Ok(Some(loaded))
+                Ok(Some(loaded_state))
             }
-            Err(err) => {
-                if is_not_found_error(&err) {
-                    self.set_cached_state_etag(CachedStateEtag::Absent);
-                    Ok(None)
-                } else {
-                    Err(BackendError::Aws(Box::new(
-                        AwsError::from_sdk_error("s3.GetObject", err)
-                            .bucket(&self.bucket)
-                            .key(&self.key),
-                    )))
-                }
+            None => {
+                self.set_cached_state_etag(CachedStateEtag::Absent);
+                Ok(None)
             }
         }
+    }
+
+    async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
+        let state_location = self.state_location();
+        Ok(self
+            .get_state_object()
+            .await?
+            .map(|(bytes, _)| RawState::new(bytes, state_location)))
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {

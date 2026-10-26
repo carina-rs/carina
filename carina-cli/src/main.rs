@@ -151,6 +151,10 @@ enum Commands {
         /// Output raw value without key or quotes (requires a specific export name)
         #[arg(long)]
         raw: bool,
+
+        /// Read state directly from a URL, bypassing .crn / backend resolution
+        #[arg(long)]
+        state_url: Option<String>,
     },
     /// Format .crn files
     Fmt {
@@ -454,7 +458,12 @@ async fn main() {
             )
             .await
             .map_err(|error| error.with_project_dir(&path)),
-            Commands::Export { name, json, raw } => {
+            Commands::Export {
+                name,
+                json,
+                raw,
+                state_url,
+            } => {
                 let format = if raw {
                     commands::export::OutputFormat::Raw
                 } else if json {
@@ -463,9 +472,15 @@ async fn main() {
                     commands::export::OutputFormat::Human
                 };
                 let path = PathBuf::from(".");
-                commands::export::run_export(&path, name, format, &provider_context)
-                    .await
-                    .map_err(|error| error.with_project_dir(&path))
+                commands::export::run_export(
+                    &path,
+                    state_url.as_deref(),
+                    name,
+                    format,
+                    &provider_context,
+                )
+                .await
+                .map_err(|error| error.with_project_dir(&path))
             }
             Commands::Fmt {
                 path,

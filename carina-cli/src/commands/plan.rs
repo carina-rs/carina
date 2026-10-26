@@ -28,6 +28,7 @@ use carina_core::value::{
 };
 use carina_state::{
     BackendConfig as StateBackendConfig, ResourceState, StateBackend, StateFile, create_backend,
+    read_published_exports,
 };
 
 use super::{BackendDriftStatus, drift_warning, inspect_backend_drift};
@@ -2627,16 +2628,11 @@ pub(crate) async fn load_upstream_states(
         cycle_guard.remove(&source_abs);
         let backend = backend_result?;
 
-        // Upstream-state reads are read-only; drop any pending-migration
-        // token (carina#3315 — only the owning directory's lock-held
-        // apply / destroy / refresh persists).
-        let state_file = backend
-            .read_state()
+        let published_exports = read_published_exports(backend.as_ref())
             .await
-            .map_err(AppError::Backend)?
-            .map(|loaded| loaded.into_state());
-        let bindings = match (state_file, policy) {
-            (Some(sf), _) => sf.build_remote_bindings(),
+            .map_err(AppError::Backend)?;
+        let bindings = match (published_exports, policy) {
+            (Some(exports), _) => exports.build_remote_bindings(),
             (None, UpstreamMissingStatePolicy::Strict) => {
                 return Err(AppError::Config(format!(
                     "upstream_state '{}': no state found at {}",
@@ -3036,6 +3032,55 @@ mod load_upstream_states_tests {
         assert_eq!(
             result["orgs"]["account_id"],
             Value::Concrete(ConcreteValue::String("123".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_upstream_states_reads_supported_exports_from_future_state() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("backend.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            "// The upstream fixture is intentionally split across files.\n",
+        )
+        .unwrap();
+        let state = serde_json::json!({
+            "version": StateFile::CURRENT_VERSION + 1,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 1,
+            "lineage": "future-upstream",
+            "carina_version": "future",
+            "resources": [{ "future_resource_shape": true }],
+            "exports": { "account_id": "123456789012" }
+        });
+        fs::write(
+            dir.path()
+                .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
+            state.to_string(),
+        )
+        .unwrap();
+
+        let upstream_states = vec![UpstreamState {
+            binding: "orgs".to_string(),
+            source: dir.path().to_path_buf(),
+        }];
+        let result = load_upstream_states(
+            &upstream_states,
+            dir.path().parent().unwrap(),
+            &ProviderContext::default(),
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .expect("exports-only upstream read must ignore the future resource schema");
+
+        assert_eq!(
+            result["orgs"]["account_id"],
+            Value::Concrete(ConcreteValue::String("123456789012".into()))
         );
     }
 

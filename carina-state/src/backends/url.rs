@@ -1,6 +1,6 @@
 //! Direct URL-addressed state loading.
 //!
-//! `carina state lookup`, `state list`, and `state show` accept a
+//! `carina state lookup`, `state list`, `state show`, and `carina export` accept a
 //! `--state-url <URL>` flag that bypasses the `.crn` + `backend { ... }`
 //! resolution path entirely (carina#3336). This module owns the URL
 //! parsing and the read-only state loader that backs that flag.
@@ -21,8 +21,8 @@
 
 use std::path::PathBuf;
 
-use crate::backend::{BackendError, BackendResult, StateBackend};
-use crate::state::StateFile;
+use crate::backend::{BackendError, BackendResult, StateBackend, read_published_exports};
+use crate::state::{PublishedExports, StateFile};
 
 /// A parsed `--state-url` argument.
 ///
@@ -143,22 +143,33 @@ impl StateUrl {
 ///
 /// Returns an error if the URL resolves to a missing object/file.
 pub async fn load_state_from_url(url: &StateUrl) -> BackendResult<StateFile> {
-    let loaded = match url {
-        StateUrl::S3 { bucket, key } => {
-            crate::backends::S3Backend::from_url_parts(bucket.clone(), key.clone())
-                .await?
-                .read_state()
-                .await?
-        }
-        StateUrl::File { path } => {
-            crate::backends::LocalBackend::with_path(path.clone())
-                .read_state()
-                .await?
-        }
-    };
+    let loaded = backend_for_url(url).await?.read_state().await?;
 
     loaded
         .map(|l| l.into_state())
+        .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", url.display_target())))
+}
+
+async fn backend_for_url(url: &StateUrl) -> BackendResult<Box<dyn StateBackend>> {
+    match url {
+        StateUrl::S3 { bucket, key } => Ok(Box::new(
+            crate::backends::S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
+        )),
+        StateUrl::File { path } => Ok(Box::new(crate::backends::LocalBackend::with_path(
+            path.clone(),
+        ))),
+    }
+}
+
+/// Load published exports from a parsed `--state-url` without decoding
+/// resource rows or applying the full state-format version gate.
+///
+/// Returns an error if the URL resolves to a missing object or file.
+pub async fn load_published_exports_from_url(url: &StateUrl) -> BackendResult<PublishedExports> {
+    let backend = backend_for_url(url).await?;
+    let loaded = read_published_exports(backend.as_ref()).await?;
+
+    loaded
         .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", url.display_target())))
 }
 
@@ -354,5 +365,23 @@ mod tests {
             err.to_string().contains("No state"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn published_exports_error_includes_the_state_location_and_decode_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future-exports.json");
+        let state = serde_json::json!({
+            "version": StateFile::CURRENT_VERSION,
+            "exports_version": PublishedExports::CURRENT_VERSION + 1,
+            "exports": {}
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+        let url = StateUrl::parse(path.to_str().unwrap()).unwrap();
+        let error = load_published_exports_from_url(&url).await.unwrap_err();
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error.to_string().contains("Please upgrade Carina"));
     }
 }

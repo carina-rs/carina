@@ -7,7 +7,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::lock::LockInfo;
-use crate::state::{LoadedState, StateFile};
+use crate::state::{self, LoadedState, PublishedExports, StateFile};
 
 /// A persisted resource row whose identity cannot be represented by the
 /// resolved-only state model.
@@ -122,6 +122,13 @@ pub enum BackendError {
     #[error("Invalid state file: {0}")]
     InvalidState(String),
 
+    /// State decoding failed at a concrete backend location.
+    #[error("Failed to read state at {location}: {error}")]
+    StateRead {
+        location: String,
+        error: Box<BackendError>,
+    },
+
     /// An identity transformation produced a value that cannot be represented.
     #[error("Invalid state file: {context}: {error}")]
     InvalidStateIdentity {
@@ -138,6 +145,12 @@ pub enum BackendError {
         "State file version {found} is newer than supported version {supported}. Please upgrade Carina."
     )]
     StateVersionTooNew { found: u32, supported: u32 },
+
+    /// The exports were written with a newer encoding than this binary supports
+    #[error(
+        "Exports version {found} is newer than supported version {supported}. Please upgrade Carina."
+    )]
+    ExportsVersionTooNew { found: u32, supported: u32 },
 
     /// State lineage mismatch (prevents accidental state overwrites)
     #[error("State lineage mismatch: expected {expected}, got {actual}")]
@@ -466,6 +479,21 @@ impl BackendError {
         self
     }
 
+    /// Attach a backend location while retaining the typed decoding error.
+    pub fn with_state_read_location(self, location: impl Into<String>) -> Self {
+        let location = location.into();
+        match self {
+            Self::InvalidResourceIdentity(mut error) => {
+                error.set_state_location(location);
+                Self::InvalidResourceIdentity(error)
+            }
+            error => Self::StateRead {
+                location,
+                error: Box::new(error),
+            },
+        }
+    }
+
     /// Return the typed legacy-row error when this is one.
     pub fn invalid_resource_identity(&self) -> Option<&InvalidResourceIdentityError> {
         match self {
@@ -477,6 +505,47 @@ impl BackendError {
 
 /// Result type for backend operations
 pub type BackendResult<T> = Result<T, BackendError>;
+
+/// Raw state-file bytes read from a backend, with their diagnostic location.
+#[derive(Debug)]
+pub struct RawState {
+    bytes: Vec<u8>,
+    display_location: String,
+}
+
+impl RawState {
+    /// Construct a raw state read from backend-owned bytes.
+    pub fn new(bytes: Vec<u8>, display_location: impl Into<String>) -> Self {
+        Self {
+            bytes,
+            display_location: display_location.into(),
+        }
+    }
+
+    /// Serialize an in-memory state with the canonical state writer encoding.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_state(
+        state: &StateFile,
+        display_location: impl Into<String>,
+    ) -> BackendResult<Self> {
+        state
+            .validate_unique_identities()
+            .map_err(BackendError::InvalidState)?;
+        let bytes = carina_core::utils::pretty_with_newline_bytes(state)
+            .map_err(|error| BackendError::Serialization(error.to_string()))?;
+        Ok(Self::new(bytes, display_location))
+    }
+
+    /// Borrow the state-file bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Return the backend location used in diagnostics and migration warnings.
+    pub fn display_location(&self) -> &str {
+        &self.display_location
+    }
+}
 
 /// Trait for state storage backends
 ///
@@ -496,6 +565,13 @@ pub trait StateBackend: Send + Sync {
     /// carina#3283 warning text matches reality — otherwise the
     /// warning re-emits forever (carina#3315).
     async fn read_state(&self) -> BackendResult<Option<LoadedState>>;
+
+    /// Read the raw state-file bytes without applying a decoding policy.
+    ///
+    /// Published-exports consumers pass this result through the crate-level
+    /// [`read_published_exports`] function, so backend implementations cannot
+    /// substitute the full state-version gate.
+    async fn read_state_bytes(&self) -> BackendResult<Option<RawState>>;
 
     /// Write the state to the backend
     ///
@@ -583,6 +659,24 @@ pub trait StateBackend: Send + Sync {
     fn resource_definition(&self, _name: &str) -> Option<String> {
         None
     }
+}
+
+/// Read published exports through the version-independent exports decoder.
+///
+/// This is a free function rather than a [`StateBackend`] method so a backend
+/// cannot replace the exports-only decoder with [`StateBackend::read_state`].
+pub async fn read_published_exports(
+    backend: &dyn StateBackend,
+) -> BackendResult<Option<PublishedExports>> {
+    let Some(raw_state) = backend.read_state_bytes().await? else {
+        return Ok(None);
+    };
+    let (exports, migration) = PublishedExports::decode_state_bytes(raw_state.bytes())
+        .map_err(|error| error.with_state_read_location(raw_state.display_location()))?;
+    if let Some(info) = migration {
+        state::log_state_migration(info, raw_state.display_location());
+    }
+    Ok(Some(exports))
 }
 
 /// Backend type identifier for S3 remote state.

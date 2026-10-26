@@ -713,6 +713,7 @@ fn plan_reports_how_to_repair_a_legacy_empty_identity_row() {
 
     let invalid_state = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
+        "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "empty-identity-error-e2e",
         "carina_version": "older-carina",

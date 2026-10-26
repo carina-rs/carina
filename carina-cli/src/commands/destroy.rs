@@ -2584,6 +2584,7 @@ mod tests {
         let state_file = carina_state::check_and_migrate(
             &serde_json::json!({
                 "version": carina_state::StateFile::CURRENT_VERSION,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
                 "serial": 1,
                 "lineage": "destroy-loader-test",
                 "carina_version": env!("CARGO_PKG_VERSION"),

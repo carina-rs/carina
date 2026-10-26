@@ -3,8 +3,14 @@ use carina_core::resource::DeferredValue;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+fn published_exports_from_state(state: &StateFile) -> PublishedExports {
+    let bytes = carina_core::utils::pretty_with_newline_bytes(state)
+        .expect("test state must serialize with the state writer encoding");
+    PublishedExports::from_state_bytes(&bytes).expect("serialized test exports must decode")
+}
+
 #[test]
-fn v15_migrates_to_v16_and_round_trips_all_current_instance_variants() {
+fn v15_migrates_to_current_and_round_trips_all_current_instance_variants() {
     let json = serde_json::json!({
         "version": 15,
         "serial": 4,
@@ -66,7 +72,10 @@ fn v15_migrates_to_v16_and_round_trips_all_current_instance_variants() {
     let migrated = check_and_migrate(&json.to_string()).expect("v15 state must load");
     assert_eq!(
         migrated.migration(),
-        Some(MigrationInfo { from: 15, to: 16 })
+        Some(MigrationInfo {
+            from: 15,
+            to: StateFile::CURRENT_VERSION,
+        })
     );
     let state = migrated.into_state();
     assert!(matches!(
@@ -363,7 +372,7 @@ fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
 fn test_state_file_new() {
     let state = StateFile::new();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    assert_eq!(StateFile::CURRENT_VERSION, 16);
+    assert_eq!(StateFile::CURRENT_VERSION, 17);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
@@ -373,7 +382,7 @@ fn test_state_file_new() {
 fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 16);
+    assert_eq!(StateFile::CURRENT_VERSION, 17);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -979,6 +988,7 @@ fn name_override_deserializes_struct_form() {
 fn state_file_has_legacy_name_overrides_detects_v7_shape() {
     let legacy_json = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 0,
         "lineage": "lineage",
         "carina_version": "test",
@@ -1023,6 +1033,7 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
 
     let typed_only_json = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 0,
         "lineage": "lineage",
         "carina_version": "test",
@@ -3714,6 +3725,7 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
     let json = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "missing-provider-identifier",
         "carina_version": "0.4.0",
@@ -4019,7 +4031,7 @@ fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
         Some("{\n  \"$x\": \"current\"\n}".to_string())
     );
 
-    let remote = state.build_remote_bindings();
+    let remote = published_exports_from_state(&state).build_remote_bindings();
     assert!(matches!(
         remote.get("legacy_enum"),
         Some(Value::Concrete(ConcreteValue::CanonicalEnum(_)))
@@ -4129,7 +4141,9 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
         "export-user-value"
     );
     assert!(matches!(
-        state.build_remote_bindings().get("self_contained"),
+        published_exports_from_state(&state)
+            .build_remote_bindings()
+            .get("self_contained"),
         Some(Value::Concrete(ConcreteValue::String(value)))
             if value.expose_plaintext() == marker
     ));
@@ -4184,6 +4198,7 @@ fn v13_raw_row_salted_secret_still_verifies_after_structural_migration() {
 fn current_state_rejects_unknown_reserved_payloads_in_attributes_and_exports() {
     let base = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "reserved-payload-validation",
         "carina_version": "0.8.0",
@@ -4224,6 +4239,7 @@ fn current_state_rejects_unknown_reserved_payloads_in_attributes_and_exports() {
 fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_reason() {
     let mut state = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "attribute-error-detail",
         "carina_version": "test",
@@ -4272,6 +4288,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
 fn current_state_export_errors_include_the_export_name_and_payload_reason() {
     let state = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
         "serial": 1,
         "lineage": "export-error-detail",
         "carina_version": "test",
@@ -4335,7 +4352,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 16);
+    assert_eq!(StateFile::CURRENT_VERSION, 17);
     let json = format!(
         r#"{{
         "version": 11,
@@ -4632,14 +4649,17 @@ fn legacy_persisted_resource(
 }
 
 fn state_json_with_resources(version: u32, resources: Vec<serde_json::Value>) -> String {
-    serde_json::json!({
+    let mut state = serde_json::json!({
         "version": version,
         "serial": 1,
         "lineage": "duplicate-identity-test",
         "carina_version": "test",
         "resources": resources
-    })
-    .to_string()
+    });
+    if version >= StateFile::EXPORTS_VERSION_INTRODUCED {
+        state["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
+    }
+    state.to_string()
 }
 
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
@@ -4808,6 +4828,329 @@ fn check_and_migrate_bytes_rejects_duplicate_resource_identity() {
 
     assert!(message.contains("duplicate resource identity"), "{message}");
     assert!(message.contains("network"), "{message}");
+}
+
+#[test]
+fn published_exports_ignore_future_state_version_and_resource_shape() {
+    let found = StateFile::CURRENT_VERSION + 1;
+    let json = serde_json::json!({
+        "version": found,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "future-state",
+        "carina_version": "future",
+        "resources": [{ "shape_from_the_future": [true, 42] }],
+        "exports": { "account_id": "123456789012" }
+    });
+
+    let exports = PublishedExports::from_state_bytes(json.to_string().as_bytes())
+        .expect("supported exports must load independently of resource state");
+    assert_eq!(
+        exports
+            .values()
+            .get("account_id")
+            .expect("fixture export exists")
+            .decoded_json(),
+        serde_json::json!("123456789012")
+    );
+
+    let error = check_and_migrate(&json.to_string())
+        .expect_err("the full state path must retain its state-version gate");
+    assert!(matches!(
+        error,
+        BackendError::StateVersionTooNew {
+            found: actual_found,
+            supported,
+        } if actual_found == found && supported == StateFile::CURRENT_VERSION
+    ));
+}
+
+#[test]
+fn published_exports_reject_newer_exports_version() {
+    let found = PublishedExports::CURRENT_VERSION + 1;
+    let json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION + 1,
+        "exports_version": found,
+        "resources": [{ "shape_from_the_future": true }],
+        "exports": { "account_id": "123456789012" }
+    });
+
+    let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
+        .expect_err("a newer exports encoding must be rejected");
+    assert!(matches!(
+        &error,
+        BackendError::ExportsVersionTooNew {
+            found: actual_found,
+            supported,
+        } if *actual_found == found && *supported == PublishedExports::CURRENT_VERSION
+    ));
+    assert!(error.to_string().contains("Please upgrade Carina"));
+}
+
+#[test]
+fn published_exports_reject_exports_version_before_it_was_introduced() {
+    let json = serde_json::json!({
+        "version": 12,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "resources": [],
+        "exports": { "user_map": { "$$user": true } }
+    });
+
+    let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
+        .expect_err("legacy state must not opt into the current exports decoder");
+    let BackendError::InvalidState(message) = error else {
+        panic!("expected InvalidState, got {error}");
+    };
+    assert_eq!(
+        message,
+        format!(
+            "Failed to parse state file: top-level exports_version is invalid before state version {}",
+            StateFile::EXPORTS_VERSION_INTRODUCED
+        )
+    );
+}
+
+#[test]
+fn full_state_rejects_exports_version_before_it_was_introduced() {
+    let json = serde_json::json!({
+        "version": 14,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "invalid-legacy-state",
+        "carina_version": "legacy",
+        "resources": [],
+        "exports": {}
+    });
+
+    let error = check_and_migrate(&json.to_string())
+        .expect_err("legacy state must reject exports_version before migration");
+    let BackendError::InvalidState(message) = error else {
+        panic!("expected InvalidState, got {error}");
+    };
+    assert_eq!(
+        message,
+        format!(
+            "Failed to parse state file: top-level exports_version is invalid before state version {}",
+            StateFile::EXPORTS_VERSION_INTRODUCED
+        )
+    );
+}
+
+#[test]
+fn published_exports_load_v16_without_exports_version_through_legacy_migration() {
+    let json = serde_json::json!({
+        "version": 16,
+        "serial": 1,
+        "lineage": "legacy-state",
+        "carina_version": "legacy",
+        "resources": [],
+        "exports": {
+            "enum_value": "aws.ec2.Eip.Domain.vpc",
+            "user_map": { "$$user": true }
+        }
+    });
+
+    let exports = PublishedExports::from_state_bytes(json.to_string().as_bytes())
+        .expect("v16 exports must use the legacy full-state migration path");
+    assert_eq!(
+        exports
+            .values()
+            .get("user_map")
+            .expect("fixture export exists")
+            .decoded_json(),
+        serde_json::json!({ "$user": true })
+    );
+}
+
+#[test]
+fn published_exports_reject_current_state_without_exports_version() {
+    let json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "invalid-current-state",
+        "carina_version": "current",
+        "resources": [],
+        "exports": { "account_id": "123456789012" }
+    });
+
+    let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
+        .expect_err("v17 and newer state must declare exports_version");
+    let BackendError::InvalidState(message) = error else {
+        panic!("expected InvalidState, got {error}");
+    };
+    assert_eq!(
+        message,
+        "Failed to parse state file: missing required top-level exports_version"
+    );
+}
+
+#[test]
+fn published_exports_reject_redacted_secret_from_v17_state() {
+    let json = serde_json::json!({
+        "version": 17,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "invalid-secret-export",
+        "carina_version": "current",
+        "resources": [],
+        "exports": {
+            "redacted_secret": { "$secret": "redacted" }
+        }
+    });
+
+    let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
+        .expect_err("v17 exports must reject redacted secrets");
+    let BackendError::InvalidState(message) = error else {
+        panic!("expected invalid state error, got {error}");
+    };
+    assert!(
+        message.contains("invalid host-reserved persisted JSON object with keys [\"$secret\"]"),
+        "{message}"
+    );
+}
+
+#[test]
+fn full_state_and_published_exports_share_the_exports_version_gate() {
+    for exports_version in [
+        None,
+        Some(PublishedExports::CURRENT_VERSION - 1),
+        Some(PublishedExports::CURRENT_VERSION + 1),
+    ] {
+        let mut json = serde_json::json!({
+            "version": StateFile::CURRENT_VERSION,
+            "serial": 1,
+            "lineage": "shared-exports-version-gate",
+            "carina_version": "current",
+            "resources": [],
+            "exports": {}
+        });
+        if let Some(exports_version) = exports_version {
+            json["exports_version"] = serde_json::json!(exports_version);
+        }
+
+        let full_state_error = check_and_migrate(&json.to_string())
+            .expect_err("the full-state decoder must reject this exports version");
+        let published_exports_error =
+            PublishedExports::from_state_bytes(json.to_string().as_bytes())
+                .expect_err("the exports-only decoder must reject this exports version");
+
+        assert_eq!(
+            full_state_error.to_string(),
+            published_exports_error.to_string()
+        );
+    }
+}
+
+#[test]
+fn state_file_serializes_current_exports_version_after_reload() {
+    let state = StateFile::new();
+    let encoded = serde_json::to_string(&state).expect("state serializes");
+    let encoded_json: serde_json::Value =
+        serde_json::from_str(&encoded).expect("serialized state is JSON");
+    assert_eq!(
+        encoded_json["exports_version"],
+        PublishedExports::CURRENT_VERSION
+    );
+
+    let reloaded = check_and_migrate(&encoded)
+        .expect("written state reloads")
+        .into_state();
+    assert_eq!(
+        serde_json::to_value(reloaded).expect("reloaded state serializes")["exports_version"],
+        PublishedExports::CURRENT_VERSION
+    );
+}
+
+#[test]
+fn persisted_exports_encoding_golden() {
+    use carina_core::resource::EnumValueResolver;
+    use carina_core::schema::{AttributeType, TypeIdentity};
+    use std::collections::BTreeMap;
+
+    fn encode(value: Value) -> serde_json::Value {
+        serde_json::to_value(
+            PersistedExportValue::encode(&value).expect("golden export value is persistable"),
+        )
+        .expect("persisted export serializes")
+    }
+
+    let enum_type = AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+        Some(vec!["vpc".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
+    let enum_value = Value::Concrete(ConcreteValue::CanonicalEnum(
+        EnumValueResolver::new(&enum_type)
+            .resolve_state_text("vpc")
+            .expect("golden enum value resolves"),
+    ));
+    let encoded = BTreeMap::from([
+        ("bool", encode(Value::Concrete(ConcreteValue::Bool(true)))),
+        ("canonical_enum", encode(enum_value)),
+        (
+            "list",
+            encode(Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("item".into())),
+                Value::Concrete(ConcreteValue::Int(2)),
+            ]))),
+        ),
+        (
+            "map",
+            encode(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".to_string(),
+                Value::Concrete(ConcreteValue::String("value".into())),
+            )])))),
+        ),
+        ("number", encode(Value::Concrete(ConcreteValue::Int(42)))),
+        (
+            "string",
+            encode(Value::Concrete(ConcreteValue::String("hello".into()))),
+        ),
+        (
+            "user_dollar_key",
+            encode(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "$user".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            )])))),
+        ),
+    ]);
+
+    let actual = serde_json::to_string_pretty(&encoded).expect("golden values serialize");
+    let expected = r#"{
+  "bool": true,
+  "canonical_enum": {
+    "$enum": {
+      "api_value": "vpc",
+      "identity": {
+        "kind": "Domain",
+        "provider": "aws",
+        "segments": [
+          "ec2",
+          "Eip"
+        ]
+      }
+    }
+  },
+  "list": [
+    "item",
+    2
+  ],
+  "map": {
+    "nested": "value"
+  },
+  "number": 42,
+  "string": "hello",
+  "user_dollar_key": {
+    "$$user": true
+  }
+}"#;
+
+    assert_eq!(
+        actual, expected,
+        "if this encoding changed intentionally, bump the exports version"
+    );
 }
 
 fn assert_migration_rejects_canonicalized_duplicate(version: u32) {
@@ -6245,7 +6588,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
 }
 
 #[test]
-fn build_remote_bindings_returns_exports() {
+fn published_exports_build_remote_bindings_returns_exports() {
     let mut state = StateFile::new();
     state.exports.insert(
         "account_id".to_string(),
@@ -6254,7 +6597,7 @@ fn build_remote_bindings_returns_exports() {
         )))
         .expect("test export is persistable"),
     );
-    let bindings = state.build_remote_bindings();
+    let bindings = published_exports_from_state(&state).build_remote_bindings();
     assert_eq!(
         bindings.get("account_id"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -6264,7 +6607,7 @@ fn build_remote_bindings_returns_exports() {
 }
 
 #[test]
-fn build_remote_bindings_keeps_secret_shaped_export_strings_literal() {
+fn published_exports_build_remote_bindings_keeps_secret_shaped_export_strings_literal() {
     let marker = valid_legacy_marker_shaped_string("not-an-export-secret");
     let literal = Value::Concrete(ConcreteValue::String(marker.clone().into()));
 
@@ -6275,20 +6618,22 @@ fn build_remote_bindings_keeps_secret_shaped_export_strings_literal() {
     );
 
     assert_eq!(
-        state.build_remote_bindings().get("literal_marker"),
+        published_exports_from_state(&state)
+            .build_remote_bindings()
+            .get("literal_marker"),
         Some(&Value::Concrete(ConcreteValue::String(marker.into()))),
     );
 }
 
 #[test]
-fn build_remote_bindings_empty_when_no_exports() {
+fn published_exports_build_remote_bindings_empty_when_no_exports() {
     let state = StateFile::new();
-    let bindings = state.build_remote_bindings();
+    let bindings = published_exports_from_state(&state).build_remote_bindings();
     assert!(bindings.is_empty());
 }
 
 #[test]
-fn build_remote_bindings_ignores_resource_bindings() {
+fn published_exports_build_remote_bindings_ignores_resource_bindings() {
     let mut state = StateFile::new();
     // Add a resource with a binding — should NOT appear in remote bindings
     let mut resource = ResourceState::try_applied("ec2.Vpc", "vpc_123", "awscc", "vpc-123")
@@ -6298,7 +6643,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
     state
         .upsert_resource(resource)
         .expect("test state setup must be valid");
-    let bindings = state.build_remote_bindings();
+    let bindings = published_exports_from_state(&state).build_remote_bindings();
     assert!(
         bindings.is_empty(),
         "resource bindings should not be exposed"
