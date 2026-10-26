@@ -1,5 +1,6 @@
 //! State file structures for persisting infrastructure state
 
+use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::deps::get_resource_dependencies;
 use carina_core::differ::Orphan;
 use carina_core::effect::MoveAuthority;
@@ -27,6 +28,7 @@ use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_wri
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
     merge_secrets_into_observation_json, merge_secrets_into_provider_json,
+    union_secret_shapes_after_resolution,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -2354,6 +2356,30 @@ impl RefreshableResourceState<'_> {
     }
 }
 
+/// Rebuild the desired resource used by state encoding from the apply-time
+/// resolved shape. That shape is authoritative for deferred authored nodes,
+/// while explicit authored `Secret` markers at concrete positions are unioned
+/// into it. If neither shape can be projected, only that unprojectable child
+/// fails closed; its container and siblings retain their own shapes.
+fn resource_with_secret_shape_union(
+    resource: &ResolvedResource,
+    applied: &SecretPreservingAttributes,
+) -> ResolvedResource {
+    let mut resolved = resource.as_inner().clone();
+    resolved.attributes = applied
+        .values()
+        .iter()
+        .map(|(key, value)| {
+            let protected = resource.attributes.get(key).map_or_else(
+                || value.clone(),
+                |authored_shape| union_secret_shapes_after_resolution(value, authored_shape),
+            );
+            (key.clone(), protected)
+        })
+        .collect();
+    ResolvedResource::new(resolved)
+}
+
 impl ResourceState {
     /// Borrow the typed current-instance payload.
     pub fn current(&self) -> &CurrentInstance {
@@ -2909,6 +2935,10 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
+        let applied_desired = created
+            .resolved_desired_attributes()
+            .map(|attributes| resource_with_secret_shape_union(resource, attributes));
+        let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
         let (observed_values, incomplete_detail) = match created.observation() {
@@ -2931,8 +2961,12 @@ impl ResourceState {
 
         let (sent_values, sent_write_only) = match created.sent() {
             SentRecord::Request(sent) => {
-                let sent_values =
-                    Self::selected_sent_attributes(resource, sent, existing, preferred_hashes)?;
+                let sent_values = Self::selected_sent_attributes(
+                    writeback_resource,
+                    sent,
+                    existing,
+                    preferred_hashes,
+                )?;
                 let write_only = Self::sent_write_only_keys(schema, &sent_values);
                 (sent_values, write_only)
             }
@@ -2947,11 +2981,14 @@ impl ResourceState {
         let previous_hash_authority = previous
             .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
             .unwrap_or(PreviousSecretHashAuthority::None);
-        let selected =
-            selected.protect_observation(resource, previous_hash_authority, preferred_hashes)?;
+        let selected = selected.protect_observation(
+            writeback_resource,
+            previous_hash_authority,
+            preferred_hashes,
+        )?;
         let (attributes, write_only_attributes) = selected.finish()?;
         let partial_read = incomplete_detail.and_then(|detail| {
-            let missing_attributes = resource
+            let missing_attributes = writeback_resource
                 .attributes
                 .keys()
                 .chain(
@@ -3094,13 +3131,28 @@ impl ResourceState {
         row_basis: RowBasis<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
+        // The resource carried by a saved plan still contains deferred expressions.
+        // Once an operation has run, secret protection must follow the provider-ready
+        // desired values that were actually accepted, or a secret selected by a
+        // coalesce/function/interpolation can be persisted as provider plaintext.
+        let applied_desired = match row_basis {
+            RowBasis::Applied(request) => request
+                .resolved_desired_attributes()
+                .map(|attributes| resource_with_secret_shape_union(resource, attributes)),
+            RowBasis::Imported | RowBasis::Carried => None,
+        };
+        let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
         let mut rs = Self::new(
             &resource.id.resource_type,
             resource.identity().clone(),
             resource.id.provider.clone(),
         );
         let previous = existing.and_then(ResourceState::persisted_attributes);
-        let desired_keys = resource.attributes.keys().cloned().collect::<BTreeSet<_>>();
+        let desired_keys = writeback_resource
+            .attributes
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let schema_write_only = schema_write_only_keys(schema);
         let carried_write_only = previous
             .map(|attributes| recorded_write_only_keys(schema, attributes, &[]))
@@ -3135,7 +3187,7 @@ impl ResourceState {
                 .cloned(),
         );
         let desired_fallback = Self::selected_sent_attributes(
-            resource,
+            writeback_resource,
             &desired_fallback,
             existing,
             preferred_hashes,
@@ -3180,7 +3232,7 @@ impl ResourceState {
             .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
             .unwrap_or(PreviousSecretHashAuthority::None);
         let selected = selected.protect_for_resource(
-            resource,
+            writeback_resource,
             previous_hash_authority,
             preferred_hashes,
             true,

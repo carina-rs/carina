@@ -282,22 +282,22 @@ pub(crate) fn parse_for_expr(
                 );
             }
         }
-        // Unresolved reference — defer expansion to plan/apply when the
-        // upstream values are loaded. Field validity is checked statically
-        // by `upstream_exports::check_upstream_state_field_references`; for
-        // a valid field the deferral is an implementation detail the user
-        // doesn't need to hear about at validate time.
-        (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
+        // Any deferred iterable is retained as a complete expression and
+        // replayed at plan/apply time. In particular, `ref ?? default` must
+        // not collapse to the default before the reference snapshot is known
+        // to be complete.
+        (_, iterable @ Value::Deferred(_)) => {
+            let iterable_surface = crate::value::format_value(iterable);
             // Build the for-expression header string
             let header = match &binding {
                 ForBinding::Simple(var) => {
-                    format!("for {} in {}", var, path.to_dot_string())
+                    format!("for {} in {}", var, iterable_surface)
                 }
                 ForBinding::Indexed(idx, val) => {
-                    format!("for ({}, {}) in {}", idx, val, path.to_dot_string())
+                    format!("for ({}, {}) in {}", idx, val, iterable_surface)
                 }
                 ForBinding::Map(k, v) => {
-                    format!("for {}, {} in {}", k, v, path.to_dot_string())
+                    format!("for {}, {} in {}", k, v, iterable_surface)
                 }
             };
 
@@ -359,8 +359,7 @@ pub(crate) fn parse_for_expr(
                     },
                     attributes: attrs,
                     binding_name: binding_name.to_string(),
-                    iterable_binding: path.binding().to_string(),
-                    iterable_attr: path.attribute().to_string(),
+                    iterable: iterable.clone(),
                     binding: binding.clone(),
                     template_resource: *resource,
                 });
@@ -436,8 +435,7 @@ pub(crate) fn parse_for_expr(
                         },
                         attributes: attrs,
                         binding_name: binding_name.to_string(),
-                        iterable_binding: s.clone(),
-                        iterable_attr: String::new(),
+                        iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
                         binding: binding.clone(),
                         template_resource: *resource,
                     });

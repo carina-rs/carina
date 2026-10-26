@@ -44,9 +44,6 @@ const ALLOWED_MISSING: &[&str] = &[
     "single_quoted_content",
     "line_comment",
     "block_comment",
-    // Operator/precedence intermediate rules — folded into the
-    // formatter's pipe/compose chain and primary.
-    "coalesce_expr",
     // Body wrappers for `fn`, `for`, `if` — the formatter uses
     // `fn_body_content`, `for_body_content`, `if_body_content` silent
     // rules instead.

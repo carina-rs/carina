@@ -5020,6 +5020,32 @@ fn validate_rejects_empty_interpolation_inside_secret() {
 }
 
 #[test]
+fn validate_rejects_empty_interpolation_in_either_coalesce_operand() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
+
+    let bad = || Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation));
+    let good = || Value::Concrete(ConcreteValue::String("fallback".into()));
+
+    for value in [
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(bad()),
+            default: Box::new(good()),
+        }),
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(good()),
+            default: Box::new(bad()),
+        }),
+    ] {
+        let errors = validate_no_empty_interpolations(&parsed_with_attr("name", value));
+        assert_eq!(
+            errors.len(),
+            1,
+            "both coalesce operands must be checked for empty interpolation",
+        );
+    }
+}
+
+#[test]
 fn validate_rejects_empty_interpolation_inside_function_call() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
@@ -5351,8 +5377,7 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
         resource_type: "aws.route53.Record".to_string(),
         attributes: vec![],
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     }
@@ -5366,7 +5391,6 @@ fn deferred_replace_test_target() -> DeferredCreateTarget {
             "validation_records",
             None,
         ),
-        upstream_binding: "cert".to_string(),
         template: deferred_replace_test_template(),
     }
 }
@@ -5398,15 +5422,12 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
     add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
 
     let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
-        Effect::DeferredReplace(payload) => Some((
-            &payload.deletes,
-            &payload.id,
-            &payload.upstream_binding,
-            &payload.template,
-        )),
+        Effect::DeferredReplace(payload) => {
+            Some((&payload.deletes, &payload.id, &payload.template))
+        }
         _ => None,
     });
-    let (deletes, id, upstream_binding, template) = deferred_replaces
+    let (deletes, id, template) = deferred_replaces
         .next()
         .expect("matching delete + deferred target must produce DeferredReplace");
     assert!(
@@ -5414,7 +5435,10 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
         "plan must contain exactly one DeferredReplace"
     );
     assert_eq!(id, &target.id);
-    assert_eq!(upstream_binding, "cert");
+    assert_eq!(
+        template.root_bindings(),
+        std::collections::BTreeSet::from(["cert".to_string()])
+    );
     assert_eq!(template.binding_name, "validation_records");
     assert_eq!(deletes.len(), 1);
     assert_eq!(
@@ -5441,6 +5465,36 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
             .iter()
             .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
         "absorbed target must not also remain as DeferredCreate"
+    );
+}
+
+#[test]
+fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
+    let target = deferred_replace_test_target();
+    let mut plan = Plan::new();
+    plan.add(delete_effect_for_binding("validation_records.alpha"));
+    plan.add(delete_effect_for_binding(
+        "validation_records['key with space']",
+    ));
+    plan.add(delete_effect_for_binding("validation_records['']"));
+
+    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
+
+    let payload = plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::DeferredReplace(payload) => Some(payload),
+            _ => None,
+        })
+        .expect("map-key deletes must be paired with their deferred create");
+    assert_eq!(payload.deletes.len(), 3);
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Delete { .. })),
+        "stable map-key children must not remain standalone cleanups beside runtime upserts",
     );
 }
 
@@ -5580,7 +5634,10 @@ mod expand_same_config_deferred_for_tests {
         let mut attrs = HashMap::new();
         attrs.insert(attr.to_string(), value);
         let mut states = HashMap::new();
-        states.insert(cert.id.clone(), State::existing(cert.id.clone(), attrs));
+        states.insert(
+            cert.id.clone(),
+            State::existing(cert.id.clone(), attrs).with_identifier("cert-id"),
+        );
         states
     }
 
@@ -5614,6 +5671,9 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &HashSet::new(),
@@ -5722,6 +5782,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5784,6 +5847,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5796,7 +5862,10 @@ mod expand_same_config_deferred_for_tests {
             1,
             "one deferred-for expression should be carried for apply-time re-expansion"
         );
-        assert_eq!(out.deferred_create_targets[0].upstream_binding, "cert");
+        assert_eq!(
+            out.deferred_create_targets[0].template.root_bindings(),
+            std::collections::BTreeSet::from(["cert".to_string()])
+        );
         assert!(
             out.sorted_resources
                 .iter()
@@ -5821,6 +5890,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5852,6 +5924,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5889,6 +5964,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5935,6 +6013,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(empty_states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6004,6 +6085,9 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &remote,
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6074,6 +6158,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6179,6 +6266,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6211,6 +6301,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
@@ -6289,6 +6382,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6315,6 +6411,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
@@ -6407,6 +6506,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6441,6 +6543,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),

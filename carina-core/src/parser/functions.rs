@@ -335,6 +335,10 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_deferred_user_function_call(access.base())
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_deferred_user_function_call(value)
+                || contains_deferred_user_function_call(default)
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -388,6 +392,9 @@ fn contains_module_argument(value: &Value) -> bool {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument(value))
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => contains_module_argument(inner),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_module_argument(value) || contains_module_argument(default)
+        }
         Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
@@ -1072,6 +1079,12 @@ fn substitute_fn_params_with_position(
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(substitute_fn_params(inner, substitutions, source_line)?),
         )),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(substitute_fn_params(value, substitutions, source_line)?),
+                default: Box::new(substitute_fn_params(default, substitutions, source_line)?),
+            })
+        }
         Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })

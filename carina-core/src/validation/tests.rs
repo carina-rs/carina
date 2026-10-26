@@ -85,7 +85,7 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     visit_refs_with_sink(
         &value,
         Some(RefSink::TypeExpr(&result_type)),
-        &mut |path, sink| visited.push((path.to_dot_string(), sink.is_none())),
+        &mut |path, sink, _usage| visited.push((path.to_dot_string(), sink.is_none())),
     );
 
     assert_eq!(
@@ -878,6 +878,29 @@ cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
         unused.is_empty(),
         "for-expression bindings should not be warned as unused, got: {:?}",
         unused
+    );
+}
+
+#[test]
+fn bindings_in_both_deferred_for_coalesce_operands_are_not_warned() {
+    let input = r#"
+let primary = test.r.source {}
+let fallback = test.r.source {}
+
+for item in (primary.items ?? fallback.items) {
+  test.r.child { name = item }
+}
+"#;
+    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+    let unused = check_unused_bindings(&parsed);
+
+    assert!(
+        !unused.contains(&"primary".to_string()),
+        "coalesce left dependency must count as used: {unused:?}",
+    );
+    assert!(
+        !unused.contains(&"fallback".to_string()),
+        "coalesce default dependency must count as used: {unused:?}",
     );
 }
 

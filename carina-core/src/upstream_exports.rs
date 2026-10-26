@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
-use crate::resource::{Subscript, Value};
+use crate::resource::{DeferredValue, Subscript, Value};
 use crate::schema::suggest_similar_name;
 
 /// One export's declared type and literal value, as carried through
@@ -330,28 +330,20 @@ fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
     }
 }
 
-/// Walk every resource attribute in the project (managed, composition, data
-/// source, and deferred-for templates), yielding
-/// `(ResourceRef, attr_name, &Value)` for each attribute. Used by all
-/// upstream-ref checks so the `iter_all_resources` walk is written once.
-fn for_each_resource_attr<E, F>(parsed: &crate::parser::File<E>, mut f: F)
-where
-    F: FnMut(ResourceRef<'_>, &str, &Value),
-{
-    for rref in parsed.iter_all_resources() {
-        for (attr_name, value) in rref.attributes().iter() {
-            f(rref, attr_name, value);
-        }
-    }
-}
-
-/// Walk ref-bearing export values and module-call arguments outside resources,
-/// yielding `(value, location_string)` for the upstream shape checks.
-fn for_each_non_resource_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
+/// Walk every project value covered by the upstream export checks, with its
+/// user-facing diagnostic location. Deferred-for body attributes are included
+/// through `iter_all_resources`; iterable expressions are handled separately
+/// because they have their own shape semantics.
+fn for_each_project_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
 where
     E: crate::parser::ExportParamLike,
     F: FnMut(&Value, &str),
 {
+    for rref in parsed.iter_all_resources() {
+        for (attr_name, value) in rref.attributes().iter() {
+            f(value, &resource_attr_location(rref, attr_name));
+        }
+    }
     for export in &parsed.export_params {
         if let Some(value) = export.value() {
             f(value, &format!("exports.{}", export.name()));
@@ -413,7 +405,10 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
     // errors directly below.
     {
         let mut check = |value: &Value, location: &str| {
-            value.visit_resource_refs(&mut |path| {
+            value.visit_resource_refs_with_usage(&mut |path, usage| {
+                if usage == crate::resource::ResourceRefUsage::CoalesceValue {
+                    return;
+                }
                 let binding = path.binding();
                 let field = path.attribute();
                 let Some(keys) = exports.get(binding) else {
@@ -436,17 +431,12 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
         };
 
         if include_typed_consumers {
-            for_each_resource_attr(parsed, |rref, attr_name, value| {
-                check(value, &resource_attr_location(rref, attr_name));
-            });
+            for_each_project_value(parsed, |value, location| check(value, location));
             for attr in &parsed.attribute_params {
                 if let Some(value) = &attr.value {
                     check(value, &format!("attributes.{}", attr.name));
                 }
             }
-            for_each_non_resource_value(parsed, |value, location| {
-                check(value, location);
-            });
         }
 
         // `let` values have no sink-driven validation pass of their own.
@@ -455,26 +445,35 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
         }
     }
 
-    // Deferred for-expression iterables are a direct
-    // (binding, attribute) pair rather than a Value tree, so check them
-    // after the closure block has released its borrow on `errors`.
+    // Deferred iterables are not part of the materialized resource tree yet;
+    // validate their complete expression separately.
     for deferred in &parsed.deferred_for_expressions {
-        let Some(keys) = exports.get(deferred.iterable_binding.as_str()) else {
-            continue;
-        };
-        if keys.contains_key(&deferred.iterable_attr) {
-            continue;
-        }
-        let known = known_by_binding
-            .get(deferred.iterable_binding.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        errors.push(UpstreamFieldError {
-            location: format!("for-expression `{}`", deferred.header),
-            binding: deferred.iterable_binding.clone(),
-            field: deferred.iterable_attr.clone(),
-            suggestion: suggest_similar_name(&deferred.iterable_attr, known),
-        });
+        let location = format!("for-expression `{}`", deferred.header);
+        deferred
+            .iterable
+            .visit_resource_refs_with_usage(&mut |path, usage| {
+                if usage == crate::resource::ResourceRefUsage::CoalesceValue {
+                    return;
+                }
+                let binding = path.binding();
+                let field = path.attribute();
+                let Some(keys) = exports.get(binding) else {
+                    return;
+                };
+                if keys.contains_key(field) {
+                    return;
+                }
+                let known = known_by_binding
+                    .get(binding)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                errors.push(UpstreamFieldError {
+                    location: location.clone(),
+                    binding: binding.to_string(),
+                    field: field.to_string(),
+                    suggestion: suggest_similar_name(field, known),
+                });
+            });
     }
 
     // HashMap-backed walks (parsed.variables, resource.attributes,
@@ -613,36 +612,61 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
     parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamForIterableShapeError> {
+    fn visit_possible_iterables(value: &Value, f: &mut impl FnMut(&crate::resource::AccessPath)) {
+        match value {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                visit_possible_iterables(value, f);
+                visit_possible_iterables(default, f);
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => visit_possible_iterables(inner, f),
+            // References inside a function argument constrain that argument,
+            // not the function result used as the iterable.
+            Value::Concrete(_)
+            | Value::Deferred(
+                DeferredValue::BindingRef { .. }
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall { .. }
+                | DeferredValue::ResolvedFunctionCall { .. }
+                | DeferredValue::Access(_)
+                | DeferredValue::RedactedSecret { .. }
+                | DeferredValue::Unknown(_),
+            ) => {}
+        }
+    }
+
     let mut errors: Vec<UpstreamForIterableShapeError> = Vec::new();
     for deferred in &parsed.deferred_for_expressions {
-        let Some(fields) = exports.get(deferred.iterable_binding.as_str()) else {
-            continue;
-        };
-        let Some(UpstreamExportEntry {
-            type_expr: Some(export_type),
-            has_declared_type: true,
-            ..
-        }) = fields.get(&deferred.iterable_attr)
-        else {
-            continue;
-        };
         let binding_kind = ForIterableBindingKind::from_for_binding(&deferred.binding);
-        let export_kind = match export_type {
-            TypeExpr::List(_) => Some(ForIterableBindingKind::List),
-            TypeExpr::Map(_) => Some(ForIterableBindingKind::Map),
-            _ => None,
-        };
-        // Scalars feeding a `for` are a different kind of bug; the
-        // shape-check fires on them too because no kind matches.
-        if export_kind == Some(binding_kind) {
-            continue;
-        }
-        errors.push(UpstreamForIterableShapeError {
-            location: format!("for-expression `{}`", deferred.header),
-            binding: deferred.iterable_binding.clone(),
-            field: deferred.iterable_attr.clone(),
-            export_type: export_type.clone(),
-            binding_kind,
+        visit_possible_iterables(&deferred.iterable, &mut |path| {
+            let Some(fields) = exports.get(path.binding()) else {
+                return;
+            };
+            let Some(UpstreamExportEntry {
+                type_expr: Some(export_type),
+                has_declared_type: true,
+                ..
+            }) = fields.get(path.attribute())
+            else {
+                return;
+            };
+            let export_kind = match export_type {
+                TypeExpr::List(_) => Some(ForIterableBindingKind::List),
+                TypeExpr::Map(_) => Some(ForIterableBindingKind::Map),
+                _ => None,
+            };
+            // Scalars feeding a `for` are a different kind of bug; the
+            // shape-check fires on them too because no kind matches.
+            if export_kind == Some(binding_kind) {
+                return;
+            }
+            errors.push(UpstreamForIterableShapeError {
+                location: format!("for-expression `{}`", deferred.header),
+                binding: path.binding().to_string(),
+                field: path.attribute().to_string(),
+                export_type: export_type.clone(),
+                binding_kind,
+            });
         });
     }
     errors.sort_by(|a, b| {
@@ -793,20 +817,7 @@ fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportPa
     include_resolver_struct_errors: bool,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     let mut errors: Vec<UpstreamAttributeAccessShapeError> = Vec::new();
-    for_each_resource_attr(parsed, |rref, attr_name, value| {
-        visit_attribute_access(
-            value,
-            exports,
-            &resource_attr_location(rref, attr_name),
-            include_resolver_struct_errors,
-            &mut errors,
-        );
-    });
-    // Module-call arguments and export values are ResourceRef-bearing
-    // too — they aren't iterated by `iter_all_resources`. Walking them
-    // (via the helper) matches the reach of
-    // `check_upstream_state_field_references` for those scopes.
-    for_each_non_resource_value(parsed, |value, location| {
+    for_each_project_value(parsed, |value, location| {
         visit_attribute_access(
             value,
             exports,
@@ -815,6 +826,15 @@ fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportPa
             &mut errors,
         );
     });
+    for deferred in &parsed.deferred_for_expressions {
+        visit_attribute_access(
+            &deferred.iterable,
+            exports,
+            &format!("for-expression `{}`", deferred.header),
+            include_resolver_struct_errors,
+            &mut errors,
+        );
+    }
     errors.sort_by(|a, b| {
         (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
             b.location.as_str(),
@@ -965,17 +985,17 @@ pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
-    for_each_resource_attr(parsed, |rref, attr_name, value| {
-        visit_subscript_access(
-            value,
-            exports,
-            &resource_attr_location(rref, attr_name),
-            &mut errors,
-        );
-    });
-    for_each_non_resource_value(parsed, |value, location| {
+    for_each_project_value(parsed, |value, location| {
         visit_subscript_access(value, exports, location, &mut errors);
     });
+    for deferred in &parsed.deferred_for_expressions {
+        visit_subscript_access(
+            &deferred.iterable,
+            exports,
+            &format!("for-expression `{}`", deferred.header),
+            &mut errors,
+        );
+    }
     errors.sort_by(|a, b| {
         (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
             b.location.as_str(),
@@ -1482,6 +1502,118 @@ mod tests {
         let exports = mk_exports(&[("orgs", &["accounts"])]);
         let errs = check_upstream_state_field_references(&parsed, &exports);
         assert!(errs.is_empty(), "got: {errs:?}");
+    }
+
+    #[test]
+    fn coalesce_lhs_suppresses_only_missing_export_existence_diagnostic() {
+        let parsed = parse_project(
+            r#"
+            let orgs = upstream_state { source = "../organizations" }
+
+            exports {
+                selected: list(String) = orgs.optional ?? orgs.required
+            }
+            "#,
+        );
+        let exports = mk_exports(&[("orgs", &[])]);
+
+        let errs = check_upstream_state_field_references(&parsed, &exports);
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert_eq!(errs[0].field, "required");
+    }
+
+    #[test]
+    fn coalesce_lhs_nested_references_remain_required() {
+        let parsed = parse_project(
+            r#"
+            let orgs = upstream_state { source = "../organizations" }
+
+            exports {
+                list_value: list(String) = [orgs.in_list] ?? []
+                interpolated: String = "${orgs.in_interpolation}" ?? "fallback"
+                function_arg: String = upper(orgs.in_function) ?? "fallback"
+            }
+            "#,
+        );
+        let exports = mk_exports(&[("orgs", &[])]);
+
+        let errs = check_upstream_state_field_references(&parsed, &exports);
+        let fields = errs
+            .iter()
+            .map(|error| error.field.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            fields,
+            std::collections::BTreeSet::from(["in_function", "in_interpolation", "in_list",]),
+            "only a direct reference/access-chain on the left of ?? is optional: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn deferred_for_coalesce_lhs_may_be_absent() {
+        let parsed = parse_project(
+            r#"
+            let orgs = upstream_state { source = "../organizations" }
+
+            for account in (orgs.accounts ?? []) {
+                test.resource.item { name = account }
+            }
+            "#,
+        );
+        let exports = mk_exports(&[("orgs", &[])]);
+
+        let errs = check_upstream_state_field_references(&parsed, &exports);
+        assert!(errs.is_empty(), "got: {errs:?}");
+    }
+
+    #[test]
+    fn deferred_for_coalesce_default_keeps_iterable_shape_validation() {
+        let parsed = parse_project(
+            r#"
+            let orgs = upstream_state { source = "../organizations" }
+
+            for account in (orgs.accounts ?? orgs.fallback) {
+                test.resource.item { name = account }
+            }
+            "#,
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[
+                ("accounts", TypeExpr::List(Box::new(TypeExpr::String))),
+                ("fallback", TypeExpr::String),
+            ],
+        )]);
+
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert_eq!(errs[0].field, "fallback");
+    }
+
+    #[test]
+    fn deferred_for_coalesce_value_keeps_access_shape_validation() {
+        let parsed = parse_project(
+            r#"
+            let orgs = upstream_state { source = "../organizations" }
+
+            for account in (orgs.account.missing ?? []) {
+                test.resource.item { name = account }
+            }
+            "#,
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "account",
+                TypeExpr::Struct {
+                    fields: vec![("id".to_string(), TypeExpr::String)],
+                },
+            )],
+        )]);
+
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert_eq!(errs[0].bad_segment, "missing");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+use crate::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
 use crate::effect::deps::UnresolvedResource;
 use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
@@ -71,7 +71,25 @@ impl OverrideAwareResources {
     where
         S: NameOverrideSource + ?Sized,
     {
-        Self::build_inner(unresolved, state_file, inputs, ResolutionMode::Strict)
+        Self::build_with_stability(unresolved, state_file, inputs, &HashMap::new())
+    }
+
+    pub fn build_with_stability<S>(
+        unresolved: Vec<Resource>,
+        state_file: Option<&S>,
+        inputs: PreApplyInputs<'_>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+    ) -> Result<Self, String>
+    where
+        S: NameOverrideSource + ?Sized,
+    {
+        Self::build_inner(
+            unresolved,
+            state_file,
+            inputs,
+            managed_stability,
+            ResolutionMode::Strict,
+        )
     }
 
     pub fn build_for_plan<S>(
@@ -83,10 +101,30 @@ impl OverrideAwareResources {
     where
         S: NameOverrideSource + ?Sized,
     {
+        Self::build_for_plan_with_stability(
+            unresolved,
+            state_file,
+            inputs,
+            unresolved_upstream_bindings,
+            &HashMap::new(),
+        )
+    }
+
+    pub fn build_for_plan_with_stability<S>(
+        unresolved: Vec<Resource>,
+        state_file: Option<&S>,
+        inputs: PreApplyInputs<'_>,
+        unresolved_upstream_bindings: &HashSet<&str>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+    ) -> Result<Self, String>
+    where
+        S: NameOverrideSource + ?Sized,
+    {
         Self::build_inner(
             unresolved,
             state_file,
             inputs,
+            managed_stability,
             ResolutionMode::Plan {
                 unresolved_upstream_bindings,
             },
@@ -97,6 +135,7 @@ impl OverrideAwareResources {
         unresolved: Vec<Resource>,
         state_file: Option<&S>,
         inputs: PreApplyInputs<'_>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: ResolutionMode<'_>,
     ) -> Result<Self, String>
     where
@@ -113,15 +152,18 @@ impl OverrideAwareResources {
         } = inputs;
 
         let mut resources = unresolved.clone();
-        let mut bindings = ResolvedBindings::pre_apply(PreApplyInputs {
-            managed: &resources,
-            compositions,
-            data_sources,
-            managed_current,
-            data_source_states,
-            remote_bindings,
-            wait_aliases,
-        });
+        let mut bindings = ResolvedBindings::pre_apply_with_stability(
+            PreApplyInputs {
+                managed: &resources,
+                compositions,
+                data_sources,
+                managed_current,
+                data_source_states,
+                remote_bindings,
+                wait_aliases,
+            },
+            managed_stability,
+        );
         resolve_resources(&mut resources, &bindings, &mode)?;
 
         let snapshot = resources.clone();
@@ -159,15 +201,18 @@ impl OverrideAwareResources {
             }
         }
 
-        bindings = ResolvedBindings::pre_apply(PreApplyInputs {
-            managed: &resources,
-            compositions,
-            data_sources,
-            managed_current,
-            data_source_states,
-            remote_bindings,
-            wait_aliases,
-        });
+        bindings = ResolvedBindings::pre_apply_with_stability(
+            PreApplyInputs {
+                managed: &resources,
+                compositions,
+                data_sources,
+                managed_current,
+                data_source_states,
+                remote_bindings,
+                wait_aliases,
+            },
+            managed_stability,
+        );
         resolve_resources(&mut resources, &bindings, &mode)?;
 
         Ok(Self {
@@ -278,11 +323,29 @@ impl OverrideAwareResources {
         &self.bindings
     }
 
+    pub fn apply_plan_stability(
+        &mut self,
+        managed_current: &HashMap<ResourceId, crate::resource::PlanInputCurrent>,
+        plan: &crate::plan::Plan,
+        schemas: &crate::schema::SchemaRegistry,
+    ) {
+        self.bindings
+            .apply_plan_stability(&self.resources, managed_current, plan, schemas);
+    }
+
     /// Rebuild the binding view after late identity reconciliation changes
     /// which provider states belong to the managed resource set.
     pub fn rebuild_bindings_after_identity_reconciliation(
         &mut self,
         inputs: RebuildBindingsInputs<'_>,
+    ) {
+        self.rebuild_bindings_after_identity_reconciliation_with_stability(inputs, &HashMap::new());
+    }
+
+    pub fn rebuild_bindings_after_identity_reconciliation_with_stability(
+        &mut self,
+        inputs: RebuildBindingsInputs<'_>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
     ) {
         let RebuildBindingsInputs {
             compositions,
@@ -292,15 +355,18 @@ impl OverrideAwareResources {
             remote_bindings,
             wait_aliases,
         } = inputs;
-        self.bindings = ResolvedBindings::pre_apply(PreApplyInputs {
-            managed: &self.resources,
-            compositions,
-            data_sources,
-            managed_current,
-            data_source_states,
-            remote_bindings,
-            wait_aliases,
-        });
+        self.bindings = ResolvedBindings::pre_apply_with_stability(
+            PreApplyInputs {
+                managed: &self.resources,
+                compositions,
+                data_sources,
+                managed_current,
+                data_source_states,
+                remote_bindings,
+                wait_aliases,
+            },
+            managed_stability,
+        );
     }
 
     pub fn legacy_overrides_applied(&self) -> &[ResourceId] {

@@ -216,6 +216,26 @@ fn collect_unsynchronized_refs(
                 out,
             );
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            collect_unsynchronized_refs(
+                value,
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+            collect_unsynchronized_refs(
+                default,
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::Int(_)

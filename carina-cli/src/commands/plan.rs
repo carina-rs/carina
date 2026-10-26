@@ -165,7 +165,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 21;
+    pub const CURRENT_VERSION: u32 = 22;
 
     /// Reload state-owned create continuations after the saved-plan apply has
     /// acquired its state lock. The plan contains only an address and marker;
@@ -2232,7 +2232,7 @@ pub(crate) fn check_exports_pre_apply(
         input.schemas,
         input.resources,
     );
-    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+    let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: input.resources,
             compositions: input.compositions,
@@ -2242,6 +2242,12 @@ pub(crate) fn check_exports_pre_apply(
             remote_bindings: &HashMap::new(),
             wait_aliases: input.wait_aliases,
         },
+    );
+    bindings.apply_plan_stability(
+        input.resources,
+        &plan_input_current,
+        input.plan,
+        input.schemas,
     );
 
     carina_core::validation::check_export_values_pre_apply(
@@ -2631,8 +2637,10 @@ pub(crate) async fn load_upstream_states(
         let published_exports = read_published_exports(backend.as_ref())
             .await
             .map_err(AppError::Backend)?;
-        let bindings = match (published_exports, policy) {
-            (Some(exports), _) => exports.build_remote_bindings(),
+        match (published_exports, policy) {
+            (Some(exports), _) => {
+                result.insert(us.binding.clone(), exports.build_remote_bindings());
+            }
             (None, UpstreamMissingStatePolicy::Strict) => {
                 return Err(AppError::Config(format!(
                     "upstream_state '{}': no state found at {}",
@@ -2648,10 +2656,12 @@ pub(crate) async fn load_upstream_states(
                     source_abs.display()
                 );
                 eprintln!("{}", msg.yellow());
-                HashMap::new()
+                // Omit the binding entirely. In the typed resolver, a loaded
+                // empty export map is complete (`Absent`) while no snapshot is
+                // available yet is `Unknown`; representing both as an empty
+                // map would make `??` select its default too early.
             }
-        };
-        result.insert(us.binding.clone(), bindings);
+        }
     }
 
     Ok(result)
@@ -3184,10 +3194,11 @@ mod load_upstream_states_tests {
         );
     }
 
-    /// Lenient policy with the same setup must NOT error — it warns and
-    /// returns an empty binding so downstream display can stamp the marker.
+    /// Lenient policy with the same setup must NOT error. The unavailable
+    /// snapshot is omitted so resolution distinguishes it from a successfully
+    /// loaded upstream that exports no keys.
     #[tokio::test]
-    async fn load_upstream_states_lenient_returns_empty_when_state_file_missing() {
+    async fn load_upstream_states_lenient_omits_unknown_binding_when_state_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("main.crn"),
@@ -3210,12 +3221,8 @@ mod load_upstream_states_tests {
         .await
         .expect("lenient must not error");
         assert!(
-            result.contains_key("orgs"),
-            "binding name must be present so display can stamp the marker"
-        );
-        assert!(
-            result["orgs"].is_empty(),
-            "no exports available, so the inner map must be empty"
+            !result.contains_key("orgs"),
+            "an unavailable snapshot must remain unknown, not look like a complete empty map"
         );
     }
 

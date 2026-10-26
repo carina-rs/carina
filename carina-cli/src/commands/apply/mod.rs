@@ -2098,6 +2098,7 @@ async fn run_apply_locked_owned(
                     state_file: &state_file,
                     saved_dep_bindings: &HashMap::new(),
                     saved_attrs: &saved_attrs,
+                    prev_explicit: &prev_explicit,
                     multi: &multi,
                     schemas: ctx.schemas(),
                 },
@@ -2141,7 +2142,18 @@ async fn run_apply_locked_owned(
                 ctx.schemas(),
                 &sorted_resources,
             );
-            let mut override_aware_resources = OverrideAwareResources::build(
+            let managed_stability = crate::wiring::derive_managed_binding_stability(
+                parsed,
+                &sorted_resources,
+                &managed_current,
+                &data_source_states,
+                ctx.schemas(),
+                &saved_attrs,
+                &prev_explicit,
+                remote_bindings,
+                &wait_aliases,
+            )?;
+            let mut override_aware_resources = OverrideAwareResources::build_with_stability(
                 sorted_resources,
                 state_file.as_ref(),
                 carina_core::binding_index::PreApplyInputs {
@@ -2153,12 +2165,13 @@ async fn run_apply_locked_owned(
                     remote_bindings,
                     wait_aliases: &wait_aliases,
                 },
+                &managed_stability,
             )?;
             crate::legacy_name_overrides::emit_legacy_override_warnings(
                 &override_aware_resources,
                 state_file.as_ref(),
             );
-            let unresolved_override_aware_resources = OverrideAwareResources::build(
+            let unresolved_override_aware_resources = OverrideAwareResources::build_with_stability(
                 unresolved_parsed.resources.clone(), // allow: direct — parser-internal, pre-expansion
                 state_file.as_ref(),
                 carina_core::binding_index::PreApplyInputs {
@@ -2170,6 +2183,7 @@ async fn run_apply_locked_owned(
                     remote_bindings,
                     wait_aliases: &wait_aliases,
                 },
+                &managed_stability,
             )?;
             // Resolve and canonicalize only refresh-time data sources. Deferred
             // reads keep their original input refs so the plan/executor dependency
@@ -2246,7 +2260,17 @@ async fn run_apply_locked_owned(
                 ctx.schemas(),
                 override_aware_resources.resources(),
             );
-            override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+            let stability_resources = ResolvedResource::collect_resolved(
+                override_aware_resources.resources().iter().cloned(),
+            )?;
+            let managed_stability = carina_core::differ::managed_binding_stability(
+                &stability_resources,
+                &reconciled_input_current,
+                ctx.schemas(),
+                &saved_attrs,
+                &prev_explicit,
+            );
+            override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
                 RebuildBindingsInputs {
                     compositions: &pre_resolve_compositions,
                     data_sources: &data_sources,
@@ -2255,6 +2279,7 @@ async fn run_apply_locked_owned(
                     remote_bindings,
                     wait_aliases: &wait_aliases,
                 },
+                &managed_stability,
             );
             let paired_unresolved_resources = override_aware_resources
                 .paired_unresolved_resources_with_binding_sources(
@@ -2289,6 +2314,7 @@ async fn run_apply_locked_owned(
             )?;
             crate::wiring::add_deposed_delete_effects(&mut plan, &state_file, &moved_pairs);
             block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
+            override_aware_resources.apply_plan_stability(&plan_input_current, &plan, schemas);
 
             // Add state block effects (import/removed/moved) only after both
             // identifier-error producers above. `removed` suppresses those
@@ -3021,7 +3047,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 21 represents an
+    // Validate version compatibility. Plan-file version 22 persists deferred
+    // coalesce operands and complete deferred-for iterable expressions.
+    // Version 21 represents an
     // in-flight managed current instance as an address-level marker and never
     // serializes its provider token; apply reloads that continuation from
     // locked state. Version 20 explicitly tags current-state ownership and
@@ -3598,6 +3626,12 @@ async fn run_apply_from_plan_locked_owned(
                     remote_bindings: &upstream_snapshot,
                     wait_aliases: &wait_aliases,
                 });
+            bindings.apply_plan_stability(
+                sorted_resources,
+                &pre_apply_input_current,
+                plan,
+                ctx.schemas(),
+            );
 
             let apply_phase_started = Instant::now();
             println!("{}", "Applying changes...".cyan().bold());

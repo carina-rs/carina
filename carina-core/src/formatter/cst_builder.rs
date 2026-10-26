@@ -234,6 +234,9 @@ impl<'a> CstBuilder<'a> {
                 let inner = pair.into_inner().next()?;
                 self.build_child(inner)
             }
+            // Coalesce uses the same flat operator-expression formatting
+            // node as pipes; its token arm below supplies canonical spacing.
+            Rule::coalesce_expr => Some(CstChild::Node(self.build_node(NodeKind::PipeExpr, pair))),
             Rule::pipe_expr => Some(CstChild::Node(self.build_node(NodeKind::PipeExpr, pair))),
             Rule::compose_expr => {
                 Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
@@ -299,6 +302,7 @@ impl<'a> CstBuilder<'a> {
             Rule::comma => Some(CstChild::Token(Token::new(",".to_string(), span))),
             Rule::pipe_op => Some(CstChild::Token(Token::new("|>".to_string(), span))),
             Rule::compose_op => Some(CstChild::Token(Token::new(">>".to_string(), span))),
+            Rule::coalesce_op => Some(CstChild::Token(Token::new("??".to_string(), span))),
             Rule::dot => Some(CstChild::Token(Token::new(".".to_string(), span))),
 
             // Keywords

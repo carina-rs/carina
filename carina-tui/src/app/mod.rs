@@ -920,21 +920,18 @@ fn effect_to_node(
                 parent: None,
             }
         }
-        Effect::DeferredCreate {
-            upstream_binding,
-            template,
-            ..
-        } => {
-            let verb = deferred_for_verb(plan, upstream_binding);
-            let rows = deferred_for_detail_rows(template, upstream_binding, verb);
+        Effect::DeferredCreate { template, .. } => {
+            let verb = deferred_for_verb(plan, template);
+            let upstream_binding = template.binding_description();
+            let rows = deferred_for_detail_rows(template, &upstream_binding, verb);
             TreeNode {
                 effect_label: format!(
                     "{} {}",
                     template.resource_type,
-                    deferred_for_display_name(template, upstream_binding, verb)
+                    deferred_for_display_name(template, verb)
                 ),
                 resource_type: template.resource_type.clone(),
-                name_part: deferred_for_display_name(template, upstream_binding, verb),
+                name_part: deferred_for_display_name(template, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Create,
                 detail_rows: rows,
@@ -944,20 +941,17 @@ fn effect_to_node(
             }
         }
         Effect::DeferredReplace(payload) => {
-            let verb = deferred_for_verb(plan, &payload.upstream_binding);
-            let rows = deferred_for_detail_rows(&payload.template, &payload.upstream_binding, verb);
+            let verb = deferred_for_verb(plan, &payload.template);
+            let upstream_binding = payload.template.binding_description();
+            let rows = deferred_for_detail_rows(&payload.template, &upstream_binding, verb);
             TreeNode {
                 effect_label: format!(
                     "{} {}",
                     payload.template.resource_type,
-                    deferred_for_display_name(&payload.template, &payload.upstream_binding, verb)
+                    deferred_for_display_name(&payload.template, verb)
                 ),
                 resource_type: payload.template.resource_type.clone(),
-                name_part: deferred_for_display_name(
-                    &payload.template,
-                    &payload.upstream_binding,
-                    verb,
-                ),
+                name_part: deferred_for_display_name(&payload.template, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Replace,
                 detail_rows: rows,

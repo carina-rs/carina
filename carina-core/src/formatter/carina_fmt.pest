@@ -252,7 +252,11 @@ numeric_tail = _{ ASCII_DIGIT ~ (ASCII_ALPHANUMERIC | "_")* }
 subscripted_id = { namespaced_id ~ (trivia* ~ (index_access | field_access))+ }
 
 // Expression
-expression = { pipe_expr }
+expression = { coalesce_expr }
+
+// Null/missing coalesce. Mirrors the main parser and accepts chains; the
+// semantic parser folds them right-associatively.
+coalesce_expr = { pipe_expr ~ (trivia* ~ coalesce_op ~ trivia* ~ pipe_expr)* }
 
 // Pipe operator: value |> func |> func
 pipe_expr = { compose_expr ~ (trivia* ~ pipe_op ~ trivia* ~ function_call)* }
@@ -452,6 +456,7 @@ colon = { ":" }
 comma = { "," }
 pipe_op = { "|>" }
 compose_op = { ">>" }
+coalesce_op = { "??" }
 
 // Keywords
 kw_provider = { "provider" }

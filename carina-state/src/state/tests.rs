@@ -6659,6 +6659,39 @@ fn published_exports_build_remote_bindings_empty_when_no_exports() {
 }
 
 #[test]
+fn published_null_export_is_absent_for_coalesce_resolution() {
+    let mut state = StateFile::new();
+    state.exports.insert(
+        "accounts".to_string(),
+        serde_json::from_value(serde_json::Value::Null)
+            .expect("JSON null is a valid absent persisted export"),
+    );
+
+    let remote = published_exports_from_state(&state).build_remote_bindings();
+    assert!(
+        !remote.contains_key("accounts"),
+        "JSON null must be omitted from a successfully loaded export map",
+    );
+
+    let mut bindings = carina_core::binding_index::ResolvedBindings::default();
+    bindings.set(
+        "up",
+        remote,
+        carina_core::binding_index::BindingValueSource::Upstream,
+    );
+    let default = Value::Concrete(ConcreteValue::List(Vec::new()));
+    let expression = Value::Deferred(DeferredValue::Coalesce {
+        value: Box::new(Value::resource_ref("up", "accounts", Vec::new())),
+        default: Box::new(default.clone()),
+    });
+
+    assert_eq!(
+        carina_core::resolver::resolve_ref_value_status(&expression, &bindings),
+        Ok(carina_core::resolver::ValueResolution::Present(default)),
+    );
+}
+
+#[test]
 fn published_exports_build_remote_bindings_ignores_resource_bindings() {
     let mut state = StateFile::new();
     // Add a resource with a binding — should NOT appear in remote bindings

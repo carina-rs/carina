@@ -408,6 +408,11 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::Coalesce { .. }) => {
+            Err(SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation {
                 context: SerializationContext::WasmBoundary,
@@ -757,6 +762,11 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         CoreValue::Deferred(DeferredValue::BindingRef { binding }) => {
             Err(SerializationError::UnresolvedResourceRef {
                 path: binding.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::Coalesce { .. }) => {
+            Err(SerializationError::UnresolvedCoalesce {
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -3367,6 +3377,22 @@ mod tests {
             } => assert_eq!(p, path.to_dot_string()),
             other => panic!("expected UnresolvedResourceRef/WasmBoundary, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn coalesce_returns_err_in_core_to_wit_value() {
+        let value = CoreValue::Deferred(DeferredValue::Coalesce {
+            value: Box::new(CoreValue::resource_ref("up", "optional", vec![])),
+            default: Box::new(CoreValue::Concrete(ConcreteValue::String(
+                "fallback".into(),
+            ))),
+        });
+        assert!(matches!(
+            core_to_wit_value(&value),
+            Err(SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::WasmBoundary,
+            })
+        ));
     }
 
     #[test]

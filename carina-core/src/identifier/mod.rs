@@ -573,6 +573,11 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             format!("BindingRef({})", binding)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => format!(
+            "Coalesce({}, {})",
+            deterministic_value_string(value),
+            deterministic_value_string(default)
+        ),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let strs: Vec<String> = parts

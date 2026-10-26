@@ -5914,6 +5914,221 @@ for name, _ in orgs.account {
 }
 
 #[test]
+fn upstream_state_missing_coalesce_value_is_not_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.account ?? []) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "a missing coalesce value is intentionally optional: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn upstream_state_nested_coalesce_lhs_reference_is_still_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (["${orgs.account}-suffix"] ?? []) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "a reference nested inside an interpolation is required even on the left of ??: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn upstream_state_missing_coalesce_default_is_still_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.accounts ?? orgs.account) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "references in the coalesce default remain required: {diagnostics:#?}",
+    );
+}
+
+fn coalesce_resource_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn resource_attribute_coalesce_rejects_wrong_typed_default() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = producer.comment ?? 42
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            let message = diagnostic.message.to_ascii_lowercase();
+            message.contains("string") && message.contains("int")
+        }),
+        "the LSP must report a coalesce default that conflicts with the resource attribute schema: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn for_iterable_coalesce_rejects_wrong_typed_default() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::map(AttributeType::string()),
+            )),
+    );
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+for key, value in (producer.tags ?? 5) {
+  mock.test.resource {
+    name = "${key}-${value}"
+  }
+}
+"#;
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+    let diagnostics = custom_engine(schemas).analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(fixture.path()),
+    );
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            let message = diagnostic.message.to_ascii_lowercase();
+            message.contains("map") && message.contains("int")
+        }),
+        "the LSP must reject a coalesce default incompatible with the for iterable: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn resource_attribute_typo_on_coalesce_lhs_is_still_flagged() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = producer.cmment ?? "d"
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("cmment")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        }),
+        "the LSP must not suppress schema-typed unknown attributes on a coalesce lhs: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn coalesce_chain_is_accepted_by_lsp_diagnostics() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = producer.comment ?? producer.identifier ?? "d"
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.is_empty(),
+        "the LSP parser and diagnostics must accept a coalesce chain: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn upstream_state_known_field_passes() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }
@@ -6242,6 +6457,36 @@ for name, _ in org.accounts {
             .iter()
             .any(|d| d.message.contains("Undefined identifier `org`")),
         "got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_coalesce_default_undefined_binding_is_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.accounts ?? fallback.accounts) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier `fallback`")),
+        "the coalesce default must be walked, got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

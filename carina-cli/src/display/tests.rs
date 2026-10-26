@@ -780,8 +780,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -792,7 +791,6 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
 
@@ -836,8 +834,7 @@ fn deferred_validation_records_effect() -> Effect {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -847,7 +844,6 @@ fn deferred_validation_records_effect() -> Effect {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     }
 }
@@ -869,12 +865,7 @@ fn delete_record_effect(binding: &'static str) -> Effect {
 }
 
 fn deferred_replace_validation_records_effect() -> Effect {
-    let Effect::DeferredCreate {
-        id,
-        upstream_binding,
-        template,
-    } = deferred_validation_records_effect()
-    else {
+    let Effect::DeferredCreate { id, template } = deferred_validation_records_effect() else {
         unreachable!("helper constructs DeferredCreate")
     };
     let Effect::Delete {
@@ -903,7 +894,6 @@ fn deferred_replace_validation_records_effect() -> Effect {
         }])
         .expect("fixture has one delete"),
         id,
-        upstream_binding,
         template,
     }))
 }

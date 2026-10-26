@@ -177,6 +177,9 @@ fn format_value(value: &Value) -> String {
             format!("{}.{}", path.binding(), path.attribute())
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => binding.clone(),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            format!("{} ?? {}", format_value(value), format_value(default))
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let inner: String = parts
@@ -537,6 +540,10 @@ impl RootConfigSignature {
                     graph,
                     binding_types,
                 );
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types);
+                Self::collect_typed_dependencies(from, attr_key, default, graph, binding_types);
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -1064,6 +1071,24 @@ impl ModuleSignature {
                     from,
                     attr_key,
                     access.base(),
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    value,
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    default,
                     graph,
                     binding_types,
                     argument_types,

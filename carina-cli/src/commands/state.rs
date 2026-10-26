@@ -1313,6 +1313,10 @@ async fn run_state_refresh_locked_with_ctx(
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default()
         .lift(ctx.schemas());
+    let prev_explicit_for_expansion = state_file
+        .as_ref()
+        .map(StateFile::build_explicit)
+        .unwrap_or_default();
     crate::wiring::hydrate_prior_states(
         &mut managed_current,
         &mut data_source_states,
@@ -1361,6 +1365,7 @@ async fn run_state_refresh_locked_with_ctx(
         state_file: &state_file,
         saved_dep_bindings: &saved_dep_bindings,
         saved_attrs: &saved_attrs_for_expansion,
+        prev_explicit: &prev_explicit_for_expansion,
         multi: &multi,
         schemas: ctx.schemas(),
     })
@@ -3314,13 +3319,16 @@ mod tests {
             .expect("source resource");
         let mut current_states = HashMap::from([(
             source.id.clone(),
-            Current::from_state(State::existing(
-                source.id.clone(),
-                HashMap::from([(
-                    "items".to_string(),
-                    Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
-                )]),
-            )),
+            Current::from_state(
+                State::existing(
+                    source.id.clone(),
+                    HashMap::from([(
+                        "items".to_string(),
+                        Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
+                    )]),
+                )
+                .with_identifier("source-id"),
+            ),
         )]);
 
         let preview = crate::wiring::expand_same_config_deferred_for(
@@ -3329,6 +3337,9 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[],
             &HashSet::new(),
@@ -3413,6 +3424,7 @@ mod tests {
                 state_file: &state_file,
                 saved_dep_bindings: &HashMap::new(),
                 saved_attrs: &saved_attrs_for_expansion,
+                prev_explicit: &HashMap::new(),
                 multi: &multi,
                 schemas: &schemas,
             },
