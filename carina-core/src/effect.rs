@@ -448,9 +448,7 @@ impl ResolvedMove {
     }
 
     fn matches_address(resolved: &ResolvedResourceId, declared: &StateBlockAddress) -> bool {
-        resolved.provider() == declared.provider
-            && resolved.resource_type() == declared.resource_type
-            && resolved.identity() == &declared.name
+        declared.matches_resource_id(resolved.as_inner())
     }
 
     pub fn from(&self) -> &ResolvedResourceId {

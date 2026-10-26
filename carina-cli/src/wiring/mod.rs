@@ -1345,12 +1345,6 @@ pub fn normalize_state_with_ctx(
     result
 }
 
-pub fn check_unused_bindings<E: carina_core::parser::ExportParamLike>(
-    parsed: &carina_core::parser::File<E>,
-) -> Vec<String> {
-    validation::check_unused_bindings(parsed)
-}
-
 pub fn validate_provider_region_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
@@ -3147,14 +3141,13 @@ fn materialize_moved_states_with_warning_sink(
             // `(from, to)` pair matches every downstream consumer's
             // address shape.
             let resolved_from = state_file.as_ref().and_then(|sf| {
-                sf.find_resource(&from.provider, &from.resource_type, from.name_str())
+                sf.find_resource_by_state_block_address(&from)
                     .map(|rs| resolved_state_row_id(rs, rs.directives.provider_instance.clone()))
             });
             let Some(resolved_from) = resolved_from else {
-                let to_exists = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(&to.provider, &to.resource_type, to.name_str())
-                        .is_some()
-                });
+                let to_exists = state_file
+                    .as_ref()
+                    .is_some_and(|sf| sf.find_resource_by_state_block_address(&to).is_some());
                 if !to_exists {
                     warn_missing(format!(
                         "warning: moved block from {} '{}' to {} '{}' was not applied: {} not found in state",
@@ -3244,12 +3237,8 @@ pub fn resolve_state_blocks(
                 let moved_from = addresses.from();
                 let moved_to = addresses.to();
                 if state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(
-                        &moved_from.provider,
-                        &moved_from.resource_type,
-                        moved_from.name_str(),
-                    )
-                    .is_some()
+                    sf.find_resource_by_state_block_address(&moved_from)
+                        .is_some()
                 }) {
                     from.insert(moved_from);
                     to.insert(moved_to);
@@ -3257,12 +3246,10 @@ pub fn resolve_state_blocks(
             }
             StateBlock::Removed { from: removed_from } => {
                 if let Some(id) = state_file.as_ref().and_then(|sf| {
-                    sf.find_resource(
-                        &removed_from.provider,
-                        &removed_from.resource_type,
-                        removed_from.name_str(),
-                    )
-                    .map(|rs| resolved_state_row_id(rs, rs.directives.provider_instance.clone()))
+                    sf.find_resource_by_state_block_address(removed_from)
+                        .map(|rs| {
+                            resolved_state_row_id(rs, rs.directives.provider_instance.clone())
+                        })
                 }) {
                     from.insert(removed_from.clone());
                     resolved_removed_from.push(id.into_inner());
@@ -3273,12 +3260,8 @@ pub fn resolve_state_blocks(
                     continue;
                 };
                 let already_in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(
-                        &resolved_to.provider,
-                        &resolved_to.resource_type,
-                        resolved_to.name_str(),
-                    )
-                    .is_some()
+                    sf.find_resource_by_state_block_address(&resolved_to)
+                        .is_some()
                 });
                 if !already_in_state {
                     to.insert(resolved_to);
@@ -3398,11 +3381,7 @@ fn find_desired_id<'a>(
     mut desired: impl Iterator<Item = &'a ResourceId>,
 ) -> Option<ResolvedResourceId> {
     desired
-        .find(|k| {
-            k.provider == to.provider
-                && k.resource_type == to.resource_type
-                && k.identity_str() == Some(to.name_str())
-        })
+        .find(|resource_id| to.matches_resource_id(resource_id))
         .cloned()
         .and_then(ResolvedResourceId::try_new)
 }
@@ -3411,7 +3390,7 @@ fn resolve_import_target_in_desired(
     to: &StateBlockAddress,
     desired: &[Resource],
 ) -> Option<StateBlockAddress> {
-    match_import_target(to, desired.iter()).and_then(|resource| {
+    to.find_resource(desired).and_then(|resource| {
         let identity = resource.id.identity()?.clone();
         Some(StateBlockAddress::new(
             resource.id.provider.clone(),
@@ -3474,14 +3453,9 @@ pub fn add_state_block_effects(
                 let effective_to = resolve_import_target(to, desired_resources);
 
                 // Skip if resource already exists in state
-                let already_in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(
-                        &effective_to.provider,
-                        &effective_to.resource_type,
-                        effective_to.identity_str(),
-                    )
-                    .is_some()
-                });
+                let already_in_state = state_file
+                    .as_ref()
+                    .is_some_and(|sf| sf.find_resource_by_state_block_address(to).is_some());
                 if !already_in_state {
                     // carina#3329: resolve any `${binding.attr}` segments
                     // in `id` against the same binding view the resource
@@ -3526,28 +3500,23 @@ pub fn add_state_block_effects(
                 // Delete effect's id exactly — same root fix as the
                 // Import arm above (carina#3324).
                 let resolved_from = state_file.as_ref().and_then(|sf| {
-                    sf.find_resource(&from.provider, &from.resource_type, from.name_str())
-                        .map(|rs| {
-                            let id =
-                                resolved_state_row_id(rs, rs.directives.provider_instance.clone());
-                            let abandoned_deposed = rs
-                                .deposed
-                                .iter()
-                                .filter(|deposed| {
-                                    AppliedIdentifier::new(deposed.identifier.as_str()).is_err()
-                                })
-                                .map(|deposed| {
-                                    (
-                                        resolved_state_row_id(
-                                            rs,
-                                            deposed.provider_instance.clone(),
-                                        ),
-                                        deposed.key.clone(),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            (id, abandoned_deposed)
-                        })
+                    sf.find_resource_by_state_block_address(from).map(|rs| {
+                        let id = resolved_state_row_id(rs, rs.directives.provider_instance.clone());
+                        let abandoned_deposed = rs
+                            .deposed
+                            .iter()
+                            .filter(|deposed| {
+                                AppliedIdentifier::new(deposed.identifier.as_str()).is_err()
+                            })
+                            .map(|deposed| {
+                                (
+                                    resolved_state_row_id(rs, deposed.provider_instance.clone()),
+                                    deposed.key.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        (id, abandoned_deposed)
+                    })
                 });
                 if let Some((id, abandoned_deposed)) = resolved_from {
                     suppress_delete.insert(id.as_inner().clone());
@@ -3796,24 +3765,9 @@ pub(crate) fn resolve_import_target(
     to: &StateBlockAddress,
     desired: &[Resource],
 ) -> ResolvedResourceId {
-    match_import_target(to, desired.iter())
+    to.find_resource(desired)
         .map(|resource| ResolvedResourceId::new(resource.id.clone()))
         .unwrap_or_else(|| to.to_unrouted_resource_id())
-}
-
-pub(crate) fn match_import_target<'a>(
-    to: &StateBlockAddress,
-    resources: impl Iterator<Item = &'a Resource>,
-) -> Option<&'a Resource> {
-    for resource in resources {
-        if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
-            continue;
-        }
-        if resource.id.identity_str() == Some(to.name_str()) {
-            return Some(resource);
-        }
-    }
-    None
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.

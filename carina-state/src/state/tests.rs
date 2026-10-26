@@ -2991,6 +2991,32 @@ fn test_multi_provider_resources_do_not_collide() {
 }
 
 #[test]
+fn state_block_address_lookup_ignores_provider_instance() {
+    use carina_core::parser::StateBlockAddress;
+
+    let mut state = StateFile::new();
+    let mut resource = ResourceState::new("test.Resource", "target", "mock");
+    resource.directives.provider_instance = Some("secondary".to_string());
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
+
+    let address = StateBlockAddress::new("mock", "test.Resource", "target");
+    assert!(
+        state
+            .find_resource_by_state_block_address(&address)
+            .is_some()
+    );
+
+    let wrong_provider = StateBlockAddress::new("other", "test.Resource", "target");
+    assert!(
+        state
+            .find_resource_by_state_block_address(&wrong_provider)
+            .is_none()
+    );
+}
+
+#[test]
 fn test_build_directives_provider_scoped() {
     use carina_core::resource::ResourceId;
 
