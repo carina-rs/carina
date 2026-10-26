@@ -422,11 +422,16 @@ duration_unit = @{
     | "hours"   | "hour"   | "hr"  | "h"
 }
 string = ${ single_quoted_string | double_quoted_string }
-double_quoted_string = ${ "\"" ~ inner_string ~ "\"" }
-inner_string = @{ char* }
-char = {
-    !("\"" | "\\") ~ ANY
+double_quoted_string = ${ "\"" ~ string_part* ~ "\"" }
+string_part = ${ interpolation | string_literal }
+interpolation = ${ "${" ~ (interpolation_expr | inline_ws*) ~ "}" }
+interpolation_expr = !{ trivia* ~ expression ~ trivia* }
+inline_ws = _{ " " | "\t" }
+string_literal = @{ string_char+ }
+string_char = {
+    !("\"" | "\\" | "${") ~ ANY
   | "\\" ~ ("\"" | "\\" | "n" | "r" | "t" | "$")
+  | "$" ~ !("{")
 }
 single_quoted_string = ${ "'" ~ single_quoted_inner ~ "'" }
 single_quoted_inner = @{ single_quoted_char* }

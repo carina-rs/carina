@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod document;
 pub mod hover;
 pub(crate) mod let_parse;
+pub(crate) mod lex;
 pub mod position;
 pub mod semantic_tokens;
 pub mod workspace;

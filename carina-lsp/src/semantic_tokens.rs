@@ -1,3 +1,4 @@
+use crate::lex::{self, LexKind, LexedLine, MaskedCode};
 use crate::position;
 use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
 
@@ -45,72 +46,17 @@ impl SemanticTokensProvider {
         let mut tokens = Vec::new();
         let mut prev_line = 0u32;
         let mut prev_start = 0u32;
-        let mut block_comment_depth: usize = 0;
-        // Track both the closing marker and whether the heredoc is
-        // quoted (`<<'EOT'`). Quoted heredocs are literal — `${...}`
-        // is NOT expanded by the parser, so the LSP must not split
-        // MACRO tokens inside their bodies. See #2482.
-        let mut heredoc_state: Option<(String, bool)> = None;
+        let lexed = lex::lex(text);
 
-        for (line_idx, line) in text.lines().enumerate() {
-            // Heredoc bodies allow `${...}` interpolation iff the
-            // marker is unquoted (#2473 / #2482); reuse the same
-            // splitter so the highlight matches the parser. The
-            // helper short-circuits when no `$` is present, so plain
-            // bodies and closing-marker lines still emit a single
-            // STRING token.
-            if let Some((marker, quoted)) = heredoc_state.as_ref() {
-                let trimmed = line.trim();
-                let line_chars: Vec<char> = line.chars().collect();
-                let line_len = line_chars.len() as u32;
-                if line_len > 0 {
-                    let mut body_tokens: Vec<(u32, u32, u32)> = Vec::new();
-                    push_interpolation_aware_string(
-                        &line_chars,
-                        0,
-                        line_len,
-                        !quoted,
-                        &mut body_tokens,
-                    );
-                    push_with_delta(
-                        &mut tokens,
-                        &mut prev_line,
-                        &mut prev_start,
-                        line_idx as u32,
-                        body_tokens,
-                    );
-                }
-                if trimmed == marker {
-                    heredoc_state = None;
-                }
-                continue;
-            }
-
-            // Check if this line starts a heredoc
-            if let Some((marker, quoted)) =
-                carina_core::heredoc::find_heredoc_marker_with_quoted(line)
-            {
-                let line_tokens = self.tokenize_line_with_block_comments(
-                    line,
-                    line_idx as u32,
-                    &mut block_comment_depth,
-                );
-                push_with_delta(
-                    &mut tokens,
-                    &mut prev_line,
-                    &mut prev_start,
-                    line_idx as u32,
-                    line_tokens,
-                );
-                heredoc_state = Some((marker, quoted));
-                continue;
-            }
-
-            let line_tokens = self.tokenize_line_with_block_comments(
-                line,
-                line_idx as u32,
-                &mut block_comment_depth,
-            );
+        for (line_idx, line) in lexed.lines().iter().enumerate() {
+            let mut line_tokens = if line.is_heredoc_body() {
+                Vec::new()
+            } else {
+                self.tokenize_masked_line(&line.masked_code())
+            };
+            line_tokens.extend(lexical_tokens(line));
+            line_tokens.sort_by_key(|(start, _, _)| *start);
+            line_tokens.dedup();
             push_with_delta(
                 &mut tokens,
                 &mut prev_line,
@@ -123,140 +69,21 @@ impl SemanticTokensProvider {
         tokens
     }
 
-    /// Tokenize a single line with block comment tracking across lines.
-    /// `block_comment_depth` is updated in place to track nesting depth.
-    fn tokenize_line_with_block_comments(
-        &self,
-        line: &str,
-        line_idx: u32,
-        block_comment_depth: &mut usize,
-    ) -> Vec<(u32, u32, u32)> {
-        let chars: Vec<char> = line.chars().collect();
-        let char_len = chars.len() as u32;
-
-        // If we're entirely inside a block comment, scan for nested /* and */
-        if *block_comment_depth > 0 {
-            let mut i = 0;
-            while i < chars.len() {
-                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
-                    *block_comment_depth += 1;
-                    i += 2;
-                } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
-                    *block_comment_depth -= 1;
-                    i += 2;
-                    if *block_comment_depth == 0 {
-                        // Block comment ended mid-line.
-                        // Highlight comment portion, then tokenize the rest.
-                        let comment_end = i as u32;
-                        let mut tokens = vec![(0u32, comment_end, 7u32)]; // COMMENT
-                        let rest: String = chars[i..].iter().collect();
-                        if !rest.trim().is_empty() {
-                            let rest_tokens = self.tokenize_line_with_block_comments(
-                                &rest,
-                                line_idx,
-                                block_comment_depth,
-                            );
-                            for (start, len, typ) in rest_tokens {
-                                tokens.push((start + comment_end, len, typ));
-                            }
-                        }
-                        return tokens;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            // Entire line is inside block comment
-            if char_len > 0 {
-                return vec![(0, char_len, 7)]; // COMMENT
-            }
-            return vec![];
-        }
-
-        // Not inside a block comment. Check if this line starts one.
-        // Scan for /* to find inline block comments. While scanning, skip over
-        // single- and double-quoted string literals so a `/*` inside an ARN
-        // like 'arn:aws:s3:::bucket/*' does not open a block comment (#2436).
-        // Also stop at `#` / `//` line-comment markers — pest treats line
-        // and block comments as disjoint productions, so a `/*` inside a
-        // line comment must not open one (#2448).
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '\'' || chars[i] == '"' {
-                i = skip_string_literal(&chars, i);
-                continue;
-            }
-            if chars[i] == '#' || (i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/') {
-                break;
-            }
-            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
-                *block_comment_depth = 1;
-                let comment_start = i as u32;
-                i += 2;
-                // Scan for end of block comment on same line. A nested /*
-                // increments depth; a */ decrements. String literals inside
-                // a block comment are inert in the pest grammar, so we do
-                // not skip them here.
-                while i < chars.len() {
-                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
-                        *block_comment_depth += 1;
-                        i += 2;
-                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
-                        *block_comment_depth -= 1;
-                        i += 2;
-                        if *block_comment_depth == 0 {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                let comment_end = i as u32;
-
-                // Tokenize part before the block comment
-                let before: String = chars[..comment_start as usize].iter().collect();
-                let mut tokens = if !before.trim().is_empty() {
-                    self.tokenize_line(&before, line_idx)
-                } else {
-                    vec![]
-                };
-
-                // Add the block comment token
-                tokens.push((comment_start, comment_end - comment_start, 7)); // COMMENT
-
-                // If comment closed on this line, tokenize the rest
-                if *block_comment_depth == 0 {
-                    let rest: String = chars[i..].iter().collect();
-                    if !rest.trim().is_empty() {
-                        let rest_tokens = self.tokenize_line_with_block_comments(
-                            &rest,
-                            line_idx,
-                            block_comment_depth,
-                        );
-                        for (start, len, typ) in rest_tokens {
-                            tokens.push((start + comment_end, len, typ));
-                        }
-                    }
-                } else if comment_end < char_len {
-                    // Comment extends beyond this line but there's content after /*
-                    // Already included in the comment token above
-                }
-
-                // Sort and dedup
-                tokens.sort_by_key(|(start, _, _)| *start);
-                tokens.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
-                return tokens;
-            }
-            i += 1;
-        }
-
-        // No block comment on this line, use normal tokenization
-        self.tokenize_line(line, line_idx)
+    #[cfg(test)]
+    fn tokenize_line(&self, source: &str) -> Vec<(u32, u32, u32)> {
+        let lexed = lex::lex(source);
+        let line = &lexed.lines()[0];
+        let mut tokens = self.tokenize_masked_line(&line.masked_code());
+        tokens.extend(lexical_tokens(line));
+        tokens.sort_by_key(|(start, _, _)| *start);
+        tokens.dedup();
+        tokens
     }
 
-    /// Tokenize a single line, returning (start_col, length, token_type_index)
-    /// All positions and lengths are in characters (not bytes) for LSP compatibility.
-    fn tokenize_line(&self, line: &str, _line_idx: u32) -> Vec<(u32, u32, u32)> {
+    /// Tokenize a line whose non-code lexical regions have already been masked.
+    /// Positions remain character offsets.
+    fn tokenize_masked_line(&self, masked: &MaskedCode) -> Vec<(u32, u32, u32)> {
+        let line = masked.as_str();
         let mut tokens = Vec::new();
         let trimmed = line.trim_start();
         let indent = position::leading_whitespace_chars(line);
@@ -265,28 +92,6 @@ impl SemanticTokensProvider {
         if trimmed.is_empty() {
             return tokens;
         }
-
-        // Comment
-        if trimmed.starts_with("//") || trimmed.starts_with('#') {
-            tokens.push((indent, position::char_len(line) - indent, 7)); // COMMENT
-            return tokens;
-        }
-
-        // Detect an inline `#` / `//` line comment outside string literals.
-        // If found, split the line so the code-side tokenizers see only the
-        // prefix and we emit one COMMENT token for the trailing comment.
-        // Mirrors the pest grammar's disjoint `line_comment` /
-        // `block_comment` productions. The rest of this function operates
-        // on the truncated `line` shadow — any future code that needs the
-        // full original line must read it before this point.
-        let (line, comment_token) = match find_inline_comment_split(line) {
-            Some(split) => (
-                &line[..split.byte_pos],
-                Some((split.char_pos, split.total_char_len - split.char_pos, 7u32)),
-            ),
-            None => (line, None),
-        };
-        let trimmed = line.trim_start();
 
         // DSL keywords (let, fn, provider, for, if, etc.) are intentionally NOT
         // emitted as semantic tokens: the TextMate grammar paints them via
@@ -398,22 +203,18 @@ impl SemanticTokensProvider {
             }
         }
 
-        // Pattern walkers consume LineSegments so they cannot reach
-        // string-literal text — `StringBody` carries no walker-visible text.
-        let segments = segment_line(line);
-
         // Resource type: aws.service.resource pattern
-        Self::find_resource_types(&segments, &mut tokens);
+        Self::find_resource_types(masked, &mut tokens);
 
         // Bare PascalCase type annotations: after a `:` (type position in
         // arguments/attributes/exports/fn params), tag the following
         // identifier as TYPE if it starts with an ASCII uppercase letter.
         // Dotted forms (aws.ec2.Vpc, awscc.ec2.VpcId) are handled elsewhere.
-        Self::find_pascal_type_annotations(&segments, &mut tokens);
+        Self::find_pascal_type_annotations(masked, &mut tokens);
 
         // Region patterns from registered providers (e.g., aws.Region.us_east_1)
         for region in &self.region_patterns {
-            Self::find_and_add_pattern(&segments, region, 1, &mut tokens);
+            Self::find_and_add_pattern(masked, region, 1, &mut tokens);
         }
 
         // Property names (before =)
@@ -438,41 +239,6 @@ impl SemanticTokensProvider {
                 1,
                 6,
             )); // OPERATOR
-        }
-
-        // String literals (double-quoted and single-quoted). Double-quoted
-        // strings additionally have their `${...}` interpolation spans
-        // split out as MACRO tokens so editor themes can render them
-        // distinctly from the surrounding string body.
-        {
-            let line_chars: Vec<char> = line.chars().collect();
-            let mut in_string = false;
-            let mut string_start_char = 0u32;
-            let mut string_quote_char = '"';
-            let mut escaped = false;
-            for (char_idx, c) in line_chars.iter().copied().enumerate() {
-                let char_idx = char_idx as u32;
-                if in_string {
-                    if escaped {
-                        escaped = false;
-                    } else if c == '\\' {
-                        escaped = true;
-                    } else if c == string_quote_char {
-                        push_interpolation_aware_string(
-                            &line_chars,
-                            string_start_char,
-                            char_idx + 1,
-                            string_quote_char == '"',
-                            &mut tokens,
-                        );
-                        in_string = false;
-                    }
-                } else if c == '"' || c == '\'' {
-                    string_start_char = char_idx;
-                    string_quote_char = c;
-                    in_string = true;
-                }
-            }
         }
 
         // Number literals - use character-level operations for correct UTF-8 handling
@@ -515,13 +281,6 @@ impl SemanticTokensProvider {
         // (`constant.language.boolean.carina`) to avoid a blanket KEYWORD
         // semantic token overriding it.
 
-        // Inline comment tail: added after code-side tokenization so it
-        // does not interfere with property/operator/string scanners that
-        // walk the (now-truncated) `line`.
-        if let Some(comment) = comment_token {
-            tokens.push(comment);
-        }
-
         // Sort by position and deduplicate
         tokens.sort_by_key(|(start, _, _)| *start);
         tokens.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
@@ -532,121 +291,143 @@ impl SemanticTokensProvider {
     /// Tag bare PascalCase identifiers in type-annotation position
     /// (`ident: PascalCase` or `: PascalCase`) as `TYPE`. Dotted forms
     /// like `aws.ec2.Vpc` are handled by `find_resource_types`.
-    fn find_pascal_type_annotations(segments: &[LineSegment], tokens: &mut Vec<(u32, u32, u32)>) {
-        for (seg_start, text) in segments.iter().filter_map(LineSegment::walker_text) {
-            let bytes = text.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if bytes[i] != b':' {
-                    i += 1;
-                    continue;
-                }
-                // Skip `::` (not expected in DSL, but be defensive)
-                if i + 1 < bytes.len() && bytes[i + 1] == b':' {
-                    i += 2;
-                    continue;
-                }
-                let mut j = i + 1;
-                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    break;
-                }
-                if !bytes[j].is_ascii_uppercase() {
-                    i = j;
-                    continue;
-                }
-                let ident_start = j;
-                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                    j += 1;
-                }
-                // Reject dotted forms — those are handled by find_resource_types.
-                if j < bytes.len() && bytes[j] == b'.' {
-                    i = j;
-                    continue;
-                }
-                let length = (j - ident_start) as u32;
-                let start_char =
-                    seg_start + position::byte_offset_to_char_offset(text, ident_start);
-                tokens.push((start_char, length, 1)); // TYPE
-                i = j;
+    fn find_pascal_type_annotations(masked: &MaskedCode, tokens: &mut Vec<(u32, u32, u32)>) {
+        let line = masked.as_str();
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b':' {
+                i += 1;
+                continue;
             }
+            // Skip `::` (not expected in DSL, but be defensive)
+            if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                i += 2;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            if !bytes[j].is_ascii_uppercase() {
+                i = j;
+                continue;
+            }
+            let ident_start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            // Reject dotted forms — those are handled by find_resource_types.
+            if j < bytes.len() && bytes[j] == b'.' {
+                i = j;
+                continue;
+            }
+            let length = (j - ident_start) as u32;
+            let start_char = position::byte_offset_to_char_offset(line, ident_start);
+            tokens.push((start_char, length, 1)); // TYPE
+            i = j;
         }
     }
 
     /// Find resource type patterns like aws.s3.Bucket, aws.ec2.Vpc.
-    fn find_resource_types(segments: &[LineSegment], tokens: &mut Vec<(u32, u32, u32)>) {
-        for (seg_start, text) in segments.iter().filter_map(LineSegment::walker_text) {
-            let chars: Vec<char> = text.chars().collect();
-            let mut i = 0;
+    fn find_resource_types(masked: &MaskedCode, tokens: &mut Vec<(u32, u32, u32)>) {
+        let line = masked.as_str();
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
 
-            while i < chars.len() {
-                // Walker-eligible segments are bordered by string bodies
-                // or `${` / `}` markers, none of which are word chars,
-                // so the segment's left and right edges count as word
-                // boundaries.
-                if chars[i].is_ascii_lowercase() {
-                    let before_ok =
-                        i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
+        while i < chars.len() {
+            if chars[i].is_ascii_lowercase() {
+                let before_ok = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
 
-                    if before_ok && let Some((end, pattern)) = match_resource_type(&chars, i) {
-                        let after_ok = end >= chars.len()
-                            || chars[end] == ' '
-                            || chars[end] == '{'
-                            || chars[end] == '\t'
-                            || chars[end] == '\n';
+                if before_ok && let Some((end, pattern)) = match_resource_type(&chars, i) {
+                    let after_ok = end >= chars.len()
+                        || chars[end] == ' '
+                        || chars[end] == '{'
+                        || chars[end] == '\t'
+                        || chars[end] == '\n';
 
-                        if after_ok {
-                            tokens.push((seg_start + i as u32, pattern.len() as u32, 1));
-                            i = end;
-                            continue;
-                        }
+                    if after_ok {
+                        tokens.push((i as u32, pattern.len() as u32, 1));
+                        i = end;
+                        continue;
                     }
                 }
-                i += 1;
             }
+            i += 1;
         }
     }
 
     fn find_and_add_pattern(
-        segments: &[LineSegment],
+        masked: &MaskedCode,
         pattern: &str,
         token_type: u32,
         tokens: &mut Vec<(u32, u32, u32)>,
     ) {
-        for (seg_start, text) in segments.iter().filter_map(LineSegment::walker_text) {
-            let mut search_start = 0;
-            while let Some(pos) = text[search_start..].find(pattern) {
-                let absolute_byte_pos = search_start + pos;
-                // Patterns and boundary characters are ASCII, so byte access is safe.
-                let before_byte = if absolute_byte_pos > 0 {
-                    Some(text.as_bytes()[absolute_byte_pos - 1])
-                } else {
-                    None
-                };
-                let after_byte_pos = absolute_byte_pos + pattern.len();
-                let after_byte = if after_byte_pos < text.len() {
-                    Some(text.as_bytes()[after_byte_pos])
-                } else {
-                    None
-                };
+        let line = masked.as_str();
+        let mut search_start = 0;
+        while let Some(pos) = line[search_start..].find(pattern) {
+            let absolute_byte_pos = search_start + pos;
+            // Patterns and boundary characters are ASCII, so byte access is safe.
+            let before_byte = if absolute_byte_pos > 0 {
+                Some(line.as_bytes()[absolute_byte_pos - 1])
+            } else {
+                None
+            };
+            let after_byte_pos = absolute_byte_pos + pattern.len();
+            let after_byte = if after_byte_pos < line.len() {
+                Some(line.as_bytes()[after_byte_pos])
+            } else {
+                None
+            };
 
-                let before_ok = before_byte
-                    .is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
-                let after_ok =
-                    after_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
+            let before_ok =
+                before_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
+            let after_ok =
+                after_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
 
-                if before_ok && after_ok {
-                    let char_pos =
-                        seg_start + position::byte_offset_to_char_offset(text, absolute_byte_pos);
-                    // Pattern is ASCII, so byte length == char length
-                    tokens.push((char_pos, pattern.len() as u32, token_type));
-                }
-                search_start = absolute_byte_pos + pattern.len();
+            if before_ok && after_ok {
+                let char_pos = position::byte_offset_to_char_offset(line, absolute_byte_pos);
+                // Pattern is ASCII, so byte length == char length
+                tokens.push((char_pos, pattern.len() as u32, token_type));
             }
+            search_start = absolute_byte_pos + pattern.len();
         }
     }
+}
+
+fn lexical_tokens(line: &LexedLine) -> Vec<(u32, u32, u32)> {
+    fn token_type(classified: crate::lex::ClassifiedChar) -> Option<u32> {
+        if classified.is_inside_interpolation() {
+            return Some(9); // MACRO
+        }
+        match classified.kind() {
+            LexKind::DoubleQuotedString | LexKind::SingleQuotedString | LexKind::HeredocBody => {
+                Some(4) // STRING
+            }
+            LexKind::Comment => Some(7), // COMMENT
+            LexKind::Code | LexKind::InterpolationCode => None,
+        }
+    }
+
+    let classes = line.chars();
+    let mut tokens = Vec::new();
+    let mut start = 0usize;
+    while start < classes.len() {
+        let Some(kind) = token_type(classes[start]) else {
+            start += 1;
+            continue;
+        };
+        let mut end = start + 1;
+        while end < classes.len() && token_type(classes[end]) == Some(kind) {
+            end += 1;
+        }
+        tokens.push((start as u32, (end - start) as u32, kind));
+        start = end;
+    }
+    tokens
 }
 
 /// Match a resource type pattern starting at position i
@@ -686,292 +467,6 @@ fn match_resource_type(chars: &[char], start: usize) -> Option<(usize, String)> 
     None
 }
 
-/// Result of scanning a line for an inline `#` / `//` line-comment marker.
-struct InlineCommentSplit {
-    /// Byte offset of the marker in the original `line`.
-    byte_pos: usize,
-    /// Char offset of the marker (LSP positions use char counts).
-    char_pos: u32,
-    /// Total char length of the line, returned alongside the position so
-    /// callers can compute the comment-token length without re-walking.
-    total_char_len: u32,
-}
-
-/// Locate an inline `#` or `//` line-comment marker in `line`, skipping
-/// over single- and double-quoted string literals. Returns the marker's
-/// byte and char offsets plus the line's total char length, all from a
-/// single pass over the input. Returns `None` if the line has no
-/// line-comment marker outside a string.
-///
-/// Mirrors the pest grammar's `line_comment = ("//" | "#") ~ …` production
-/// (carina-core/src/parser/carina.pest). The block-comment scanner has its
-/// own line-comment short-circuit at the top of
-/// `tokenize_line_with_block_comments` (#2448); this helper covers the
-/// `tokenize_line` (no-block-comment) path.
-fn find_inline_comment_split(line: &str) -> Option<InlineCommentSplit> {
-    let chars: Vec<char> = line.chars().collect();
-    let mut char_idx: usize = 0;
-    let mut byte_idx: usize = 0;
-    let mut marker: Option<(usize, u32)> = None;
-    while char_idx < chars.len() {
-        let c = chars[char_idx];
-        if marker.is_none() {
-            if c == '\'' || c == '"' {
-                let next_char = skip_string_literal(&chars, char_idx);
-                while char_idx < next_char {
-                    byte_idx += chars[char_idx].len_utf8();
-                    char_idx += 1;
-                }
-                continue;
-            }
-            if c == '#' || (c == '/' && char_idx + 1 < chars.len() && chars[char_idx + 1] == '/') {
-                marker = Some((byte_idx, char_idx as u32));
-            }
-        }
-        byte_idx += c.len_utf8();
-        char_idx += 1;
-    }
-    marker.map(|(byte_pos, char_pos)| InlineCommentSplit {
-        byte_pos,
-        char_pos,
-        total_char_len: char_idx as u32,
-    })
-}
-
-/// A contiguous slice of a single source line, classified by whether
-/// pattern walkers (TYPE / region / namespaced enum) are allowed to
-/// fire inside it.
-///
-/// `Code` and `InterpolationExpr` carry their text so walkers can
-/// scan it. `StringBody` is a marker variant with no payload — its
-/// text is structurally inaccessible to walkers, so the boundary
-/// is enforced by the type system rather than by runtime discipline.
-#[derive(Debug, Clone)]
-enum LineSegment {
-    /// Outside any string literal — DSL expression position.
-    Code { start: u32, text: String },
-    /// Inside a `${...}` interpolation expression in a double-quoted
-    /// string or unquoted heredoc body. Also a DSL expression position.
-    InterpolationExpr { start: u32, text: String },
-    /// Literal text inside a single- or double-quoted string body, or
-    /// the body of a quoted heredoc. Text is intentionally absent —
-    /// walkers must not see it.
-    StringBody,
-}
-
-impl LineSegment {
-    /// Returns `(start, &text)` for walker-eligible variants. `StringBody`
-    /// returns `None`, so a walker that iterates only the `Some` results
-    /// is structurally unable to scan inside string literals.
-    fn walker_text(&self) -> Option<(u32, &str)> {
-        match self {
-            LineSegment::Code { start, text } | LineSegment::InterpolationExpr { start, text } => {
-                Some((*start, text.as_str()))
-            }
-            LineSegment::StringBody => None,
-        }
-    }
-}
-
-/// Span of a single string literal inside a line, in char offsets.
-#[derive(Debug, Clone, Copy)]
-struct StringSpan {
-    /// Char offset of the opening quote.
-    open: u32,
-    /// Char offset just past the closing quote (or line end if unclosed).
-    close: u32,
-    /// Quote character — `'` or `"`.
-    quote: char,
-}
-
-/// Find every string-literal span on a line. The scanner skips escape
-/// pairs (`\\` followed by any char) inside double-quoted strings;
-/// single-quoted strings have no escape mechanism in Carina's pest
-/// grammar, so the first matching `'` closes them.
-fn find_string_spans(line_chars: &[char]) -> Vec<StringSpan> {
-    let mut spans = Vec::new();
-    let mut i: usize = 0;
-    while i < line_chars.len() {
-        let c = line_chars[i];
-        if c == '"' || c == '\'' {
-            let open = i as u32;
-            let close = skip_string_literal(line_chars, i) as u32;
-            spans.push(StringSpan {
-                open,
-                close,
-                quote: c,
-            });
-            i = close as usize;
-            continue;
-        }
-        i += 1;
-    }
-    spans
-}
-
-/// Split a line into [`LineSegment`]s for walker dispatch.
-///
-/// Outside string literals: `Code`. Inside double-quoted strings or
-/// unquoted heredoc bodies, `${...}` spans become `InterpolationExpr`
-/// while the surrounding literal text (and quote chars) become
-/// `StringBody`. Single-quoted strings are entirely `StringBody`
-/// because Carina's grammar does not interpolate them.
-fn segment_line(line: &str) -> Vec<LineSegment> {
-    let line_chars: Vec<char> = line.chars().collect();
-    let total = line_chars.len() as u32;
-    let spans = find_string_spans(&line_chars);
-
-    let mut out: Vec<LineSegment> = Vec::new();
-    let mut cursor: u32 = 0;
-    for span in spans {
-        if span.open > cursor {
-            push_code(&mut out, &line_chars, cursor, span.open);
-        }
-        if span.quote == '\'' {
-            push_string_body(&mut out, span.open, span.close);
-        } else {
-            split_double_quoted_body(&mut out, &line_chars, span.open, span.close);
-        }
-        cursor = span.close;
-    }
-    if cursor < total {
-        push_code(&mut out, &line_chars, cursor, total);
-    }
-    out
-}
-
-/// Split a double-quoted string range `[open, close)` into segments,
-/// alternating `StringBody` (literal text + quote chars) with
-/// `InterpolationExpr` (`${...}` body — the chars between `${` and `}`).
-fn split_double_quoted_body(
-    out: &mut Vec<LineSegment>,
-    line_chars: &[char],
-    open: u32,
-    close: u32,
-) {
-    let close_us = close as usize;
-    let mut segment_start = open as usize;
-    let mut i = segment_start;
-    while i + 1 < close_us {
-        let c = line_chars[i];
-        if c == '\\' {
-            i += 2;
-            continue;
-        }
-        if c == '$' && line_chars[i + 1] == '{' {
-            if i > segment_start {
-                push_string_body(out, segment_start as u32, i as u32);
-            }
-            let interp_end = scan_interpolation_end(line_chars, i, close_us);
-            // `${...}` expanded into `${`, expression body, `}` — the
-            // braces stay with StringBody so walkers cannot reach them,
-            // and the body becomes InterpolationExpr so walkers can.
-            // If `}` is missing (unclosed interpolation: line ended inside
-            // `${...`), the body extends to interp_end with no trailing
-            // brace; otherwise interp_end points just past `}`.
-            let body_start = i + 2;
-            let closed = interp_end > body_start && line_chars[interp_end - 1] == '}';
-            let body_end = if closed { interp_end - 1 } else { interp_end };
-            push_string_body(out, i as u32, body_start as u32);
-            if body_end > body_start {
-                push_interpolation(out, line_chars, body_start as u32, body_end as u32);
-            }
-            if closed {
-                push_string_body(out, body_end as u32, interp_end as u32);
-            }
-            i = interp_end;
-            segment_start = i;
-            continue;
-        }
-        i += 1;
-    }
-    if close_us > segment_start {
-        push_string_body(out, segment_start as u32, close);
-    }
-}
-
-/// Scan from a `${` opener at `dollar_idx` to the matching `}`, honoring
-/// `\\` escapes, nested `{}` (depth counter), and string literals inside
-/// the body (skipped via [`skip_string_literal`] so a `}` inside them
-/// does not close early). Returns the index just past the closing `}`,
-/// or `close` if the body runs to the end of the surrounding range.
-///
-/// Shared by [`split_double_quoted_body`] (for walker dispatch) and
-/// [`push_interpolation_aware_string`] (for STRING/MACRO token emit)
-/// so the two stay in sync.
-fn scan_interpolation_end(line_chars: &[char], dollar_idx: usize, close: usize) -> usize {
-    let mut depth = 1usize;
-    let mut j = dollar_idx + 2;
-    while j < close && depth > 0 {
-        match line_chars[j] {
-            '\\' => {
-                j += 2;
-                continue;
-            }
-            '"' | '\'' => {
-                j = skip_string_literal(line_chars, j);
-                continue;
-            }
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    j += 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-    j
-}
-
-fn push_code(out: &mut Vec<LineSegment>, line_chars: &[char], start: u32, end: u32) {
-    if end <= start {
-        return;
-    }
-    let text: String = line_chars[start as usize..end as usize].iter().collect();
-    out.push(LineSegment::Code { start, text });
-}
-
-fn push_interpolation(out: &mut Vec<LineSegment>, line_chars: &[char], start: u32, end: u32) {
-    if end <= start {
-        return;
-    }
-    let text: String = line_chars[start as usize..end as usize].iter().collect();
-    out.push(LineSegment::InterpolationExpr { start, text });
-}
-
-fn push_string_body(out: &mut Vec<LineSegment>, start: u32, end: u32) {
-    if end > start {
-        out.push(LineSegment::StringBody);
-    }
-}
-
-/// Skip past a single- or double-quoted string literal starting at `start`
-/// (which must point at the opening quote). Returns the index of the
-/// character after the closing quote, or `chars.len()` if the line ends
-/// before the string closes. Honors `\\` escapes inside double-quoted
-/// strings; single-quoted strings have no escape mechanism in Carina's
-/// pest grammar, so the first matching `'` closes them.
-fn skip_string_literal(chars: &[char], start: usize) -> usize {
-    let quote = chars[start];
-    let mut i = start + 1;
-    while i < chars.len() {
-        let c = chars[i];
-        if quote == '"' && c == '\\' && i + 1 < chars.len() {
-            i += 2;
-            continue;
-        }
-        if c == quote {
-            return i + 1;
-        }
-        i += 1;
-    }
-    chars.len()
-}
-
 /// Convert raw `(start, length, token_type)` tuples for a single line
 /// into LSP-encoded `SemanticToken`s appended to `tokens`. Updates
 /// `prev_line` / `prev_start` to track the running delta cursor across
@@ -1002,57 +497,6 @@ fn push_with_delta(
     }
 }
 
-/// Emit STRING tokens for the literal segments of `line_chars[start..end]`
-/// and MACRO tokens for any `${...}` interpolation spans inside it, when
-/// `allow_interpolation` is true. Brace-balancing lets nested object /
-/// struct literals like `${ {a = 1}.a }` close at the matching `}`
-/// rather than the first one; nested string literals are skipped via
-/// `skip_string_literal` so a `}` inside them doesn't terminate the
-/// interpolation early.
-///
-/// Callers that host interpolation (double-quoted strings, heredoc
-/// bodies) pass `true`; literal-only contexts (single-quoted strings)
-/// pass `false` and get a single STRING token covering the range.
-fn push_interpolation_aware_string(
-    line_chars: &[char],
-    start: u32,
-    end: u32,
-    allow_interpolation: bool,
-    tokens: &mut Vec<(u32, u32, u32)>,
-) {
-    // Literal-only contexts and ranges without `$` short-circuit to a
-    // single STRING token covering the whole range.
-    if !allow_interpolation || !line_chars[start as usize..end as usize].contains(&'$') {
-        tokens.push((start, end - start, 4));
-        return;
-    }
-
-    let mut i = start as usize;
-    let end = end as usize;
-    let mut segment_start = i;
-    while i + 1 < end {
-        let c = line_chars[i];
-        if c == '\\' {
-            i += 2;
-            continue;
-        }
-        if c == '$' && line_chars[i + 1] == '{' {
-            if i > segment_start {
-                tokens.push((segment_start as u32, (i - segment_start) as u32, 4));
-            }
-            let interp_end = scan_interpolation_end(line_chars, i, end);
-            tokens.push((i as u32, (interp_end - i) as u32, 9));
-            i = interp_end;
-            segment_start = i;
-            continue;
-        }
-        i += 1;
-    }
-    if end > segment_start {
-        tokens.push((segment_start as u32, (end - segment_start) as u32, 4));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,8 +524,9 @@ mod tests {
     #[test]
     fn test_find_resource_types_directly() {
         let mut tokens = Vec::new();
-        let segments = segment_line("aws.s3.Bucket {");
-        SemanticTokensProvider::find_resource_types(&segments, &mut tokens);
+        let lexed = lex::lex("aws.s3.Bucket {");
+        let masked = lexed.lines()[0].masked_code();
+        SemanticTokensProvider::find_resource_types(&masked, &mut tokens);
 
         assert_eq!(tokens.len(), 1, "Should find one resource type");
         assert_eq!(
@@ -1094,7 +539,7 @@ mod tests {
     #[test]
     fn test_tokenize_line_resource_type() {
         let provider = SemanticTokensProvider::new(&[]);
-        let line_tokens = provider.tokenize_line("aws.s3.Bucket {", 0);
+        let line_tokens = provider.tokenize_line("aws.s3.Bucket {");
 
         println!("Line tokens: {:?}", line_tokens);
 
@@ -1112,7 +557,7 @@ mod tests {
     #[test]
     fn test_nested_block_name_highlighted_as_property() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("    security_group_ingress {", 0);
+        let tokens = provider.tokenize_line("    security_group_ingress {");
 
         // Should have PROPERTY token for security_group_ingress
         let property_token = tokens.iter().find(|(_, _, typ)| *typ == 3);
@@ -1131,7 +576,7 @@ mod tests {
         let provider = SemanticTokensProvider::new(&[]);
 
         // "provider aws {" should NOT get PROPERTY for "provider"
-        let tokens = provider.tokenize_line("provider aws {", 0);
+        let tokens = provider.tokenize_line("provider aws {");
         let prop_at_0 = tokens.iter().find(|(s, _, typ)| *s == 0 && *typ == 3);
         assert!(
             prop_at_0.is_none(),
@@ -1179,7 +624,7 @@ mod tests {
         let provider = SemanticTokensProvider::new(&regions);
 
         // Should highlight aws.Region.us_east_1 as TYPE
-        let tokens = provider.tokenize_line("    region = aws.Region.us_east_1", 0);
+        let tokens = provider.tokenize_line("    region = aws.Region.us_east_1");
         let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
         assert!(
             type_token.is_some(),
@@ -1191,7 +636,7 @@ mod tests {
         assert_eq!(*len, "aws.Region.us_east_1".len() as u32);
 
         // Should highlight awscc.Region.ap_northeast_1 as TYPE
-        let tokens = provider.tokenize_line("    region = awscc.Region.ap_northeast_1", 0);
+        let tokens = provider.tokenize_line("    region = awscc.Region.ap_northeast_1");
         let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
         assert!(
             type_token.is_some(),
@@ -1204,7 +649,7 @@ mod tests {
     fn test_non_ascii_comment_no_panic() {
         let provider = SemanticTokensProvider::new(&[]);
         // Japanese comment should not panic and should be highlighted as COMMENT
-        let tokens = provider.tokenize_line("// これはコメントです", 0);
+        let tokens = provider.tokenize_line("// これはコメントです");
         let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 7);
         assert!(
             comment_token.is_some(),
@@ -1225,7 +670,7 @@ mod tests {
     fn test_non_ascii_string_literal_no_panic() {
         let provider = SemanticTokensProvider::new(&[]);
         // String with multi-byte characters
-        let tokens = provider.tokenize_line("    name = \"日本語の名前\"", 0);
+        let tokens = provider.tokenize_line("    name = \"日本語の名前\"");
         // Should not panic and should find the string literal
         let string_token = tokens.iter().find(|(_, _, typ)| *typ == 4);
         assert!(
@@ -1240,7 +685,7 @@ mod tests {
         let provider = SemanticTokensProvider::new(&[]);
         // Number literal appearing after multi-byte characters
         // "// コメント 3" - the number 3 appears after multi-byte chars
-        let tokens = provider.tokenize_line("    count = 3 // 日本語", 0);
+        let tokens = provider.tokenize_line("    count = 3 // 日本語");
         // Should not panic
         let number_token = tokens.iter().find(|(_, _, typ)| *typ == 5);
         assert!(
@@ -1254,8 +699,9 @@ mod tests {
     fn test_find_and_add_pattern_with_non_ascii() {
         // Pattern search after multi-byte characters
         let mut tokens = Vec::new();
-        let segments = segment_line("    value = true // 日本語");
-        SemanticTokensProvider::find_and_add_pattern(&segments, "true", 0, &mut tokens);
+        let lexed = lex::lex("    value = true // 日本語");
+        let masked = lexed.lines()[0].masked_code();
+        SemanticTokensProvider::find_and_add_pattern(&masked, "true", 0, &mut tokens);
         assert!(
             !tokens.is_empty(),
             "Should find 'true' pattern. Got: {:?}",
@@ -1284,7 +730,7 @@ mod tests {
     fn test_indent_with_non_ascii() {
         let provider = SemanticTokensProvider::new(&[]);
         // Indented line with non-ASCII content
-        let tokens = provider.tokenize_line("    name = \"あいう\"", 0);
+        let tokens = provider.tokenize_line("    name = \"あいう\"");
         // indent should be 4 (characters), not affected by multi-byte
         let prop_token = tokens.iter().find(|(_, _, typ)| *typ == 3);
         assert!(
@@ -1299,7 +745,7 @@ mod tests {
     #[test]
     fn test_use_let_binding_variable_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("let web = use { source = \"./modules/web\" }", 0);
+        let tokens = provider.tokenize_line("let web = use { source = \"./modules/web\" }");
         // The module alias `web` is still emitted as VARIABLE even though `let`
         // itself is handled by the TextMate grammar (see #1948).
         let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
@@ -1317,7 +763,7 @@ mod tests {
         // Two-part region patterns like "aws.Region" are excluded by find_resource_types
         // (2nd part starts with uppercase). They need explicit registration to be highlighted.
         let provider_without = SemanticTokensProvider::new(&[]);
-        let tokens = provider_without.tokenize_line("    region = custom.Region.my_region_1", 0);
+        let tokens = provider_without.tokenize_line("    region = custom.Region.my_region_1");
         // find_resource_types will match 3-part pattern, but with registered data it should also match
         let type_count_without = tokens.iter().filter(|(_, _, typ)| *typ == 1).count();
 
@@ -1326,7 +772,7 @@ mod tests {
             "My Region",
         )];
         let provider_with = SemanticTokensProvider::new(&regions);
-        let tokens = provider_with.tokenize_line("    region = custom.Region.my_region_1", 0);
+        let tokens = provider_with.tokenize_line("    region = custom.Region.my_region_1");
         let type_count_with = tokens.iter().filter(|(_, _, typ)| *typ == 1).count();
 
         // Both should highlight as TYPE (find_resource_types catches 3-part patterns),
@@ -1356,7 +802,7 @@ mod tests {
             "My Region",
         )];
         let provider = SemanticTokensProvider::new(&regions);
-        let tokens = provider.tokenize_line("    region = custom.Region.my_region_1", 0);
+        let tokens = provider.tokenize_line("    region = custom.Region.my_region_1");
 
         // Exact duplicates should be removed
         let type_tokens: Vec<_> = tokens.iter().filter(|(_, _, typ)| *typ == 1).collect();
@@ -1402,7 +848,7 @@ mod tests {
     fn test_provider_name_with_extra_whitespace() {
         let provider = SemanticTokensProvider::new(&[]);
         // Double space after "provider" - the name should still be highlighted
-        let tokens = provider.tokenize_line("provider  aws {", 0);
+        let tokens = provider.tokenize_line("provider  aws {");
 
         // Should have TYPE token for "aws"
         let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
@@ -1423,7 +869,7 @@ mod tests {
     fn test_backend_name_with_extra_whitespace() {
         let provider = SemanticTokensProvider::new(&[]);
         // Double space after "backend" - the name should still be highlighted
-        let tokens = provider.tokenize_line("backend  s3 {", 0);
+        let tokens = provider.tokenize_line("backend  s3 {");
 
         // Should have TYPE token for "s3"
         let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
@@ -1443,7 +889,7 @@ mod tests {
     #[test]
     fn test_provider_name_with_many_extra_spaces() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("provider    awscc {", 0);
+        let tokens = provider.tokenize_line("provider    awscc {");
 
         let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
         assert!(
@@ -1460,7 +906,7 @@ mod tests {
     fn test_let_binding_with_extra_whitespace() {
         let provider = SemanticTokensProvider::new(&[]);
         // Double space after "let" - the variable name should still be highlighted
-        let tokens = provider.tokenize_line("let  x = aws.s3.Bucket {", 0);
+        let tokens = provider.tokenize_line("let  x = aws.s3.Bucket {");
 
         // Should have VARIABLE token for "x"
         let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
@@ -1481,7 +927,7 @@ mod tests {
     fn test_let_binding_with_multiple_extra_spaces() {
         let provider = SemanticTokensProvider::new(&[]);
         // Multiple spaces after "let"
-        let tokens = provider.tokenize_line("let    bucket = aws.s3.Bucket {", 0);
+        let tokens = provider.tokenize_line("let    bucket = aws.s3.Bucket {");
 
         let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
         assert!(
@@ -1497,7 +943,7 @@ mod tests {
     #[test]
     fn test_hash_comment_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("# shell-style comment", 0);
+        let tokens = provider.tokenize_line("# shell-style comment");
         let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 7);
         assert!(
             comment_token.is_some(),
@@ -1512,7 +958,7 @@ mod tests {
     #[test]
     fn test_indented_hash_comment_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("    # indented comment", 0);
+        let tokens = provider.tokenize_line("    # indented comment");
         let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 7);
         assert!(
             comment_token.is_some(),
@@ -1728,10 +1174,9 @@ mod tests {
         );
     }
 
-    /// An inline `#` comment on one line must not bleed into the next
-    /// line's tokenization. `tokenize_line` is per-line, but assert it
-    /// explicitly to mirror the line-independence invariants from #2436
-    /// and #2448.
+    /// An inline `#` comment on one line must not bleed into the next line's
+    /// tokenization. Assert the cross-line lexer resets line comments to
+    /// mirror the invariants from #2436 and #2448.
     #[test]
     fn test_inline_comment_does_not_leak_to_next_line() {
         let provider = SemanticTokensProvider::new(&[]);
@@ -1843,7 +1288,7 @@ mod tests {
     fn semantic_tokens_tags_pascal_case_type_annotation() {
         let provider = SemanticTokensProvider::new(&[]);
         let line = "    x: AwsAccountId";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
 
         // Find a TYPE token covering "AwsAccountId"
         let expected_start = line.find("AwsAccountId").unwrap() as u32;
@@ -1863,7 +1308,7 @@ mod tests {
     fn semantic_tokens_tags_pascal_case_primitive_in_type_annotation() {
         let provider = SemanticTokensProvider::new(&[]);
         let line = "    port: Int";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
 
         let expected_start = line.find("Int").unwrap() as u32;
         assert!(
@@ -1882,7 +1327,7 @@ mod tests {
         // a TYPE token.
         let provider = SemanticTokensProvider::new(&[]);
         let line = "    port: int";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
 
         let int_start = line.find("int").unwrap() as u32;
         assert!(
@@ -2053,6 +1498,65 @@ mod tests {
     }
 
     #[test]
+    fn interpolation_split_ignores_brace_inside_block_comment() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "aws = \"${x /* } */}\"";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let macro_tokens: Vec<_> = abs.iter().filter(|(_, _, _, kind)| *kind == 9).collect();
+        let interpolation = "${x /* } */}";
+        let expected_start = input.find(interpolation).unwrap() as u32;
+        let expected_len = interpolation.chars().count() as u32;
+
+        assert_eq!(
+            macro_tokens.len(),
+            1,
+            "commented braces must stay inside one interpolation token: {abs:?}"
+        );
+        assert_eq!(
+            (macro_tokens[0].1, macro_tokens[0].2),
+            (expected_start, expected_len),
+            "the MACRO token must span through the block comment: {abs:?}"
+        );
+    }
+
+    #[test]
+    fn multiline_double_quoted_string_stays_string_on_continuation_lines() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "let value = \"first\naws.Region.us_east_1\nlast\"";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let middle_len = "aws.Region.us_east_1".chars().count() as u32;
+
+        assert!(
+            abs.contains(&(1, 0, middle_len, 4)),
+            "the complete continuation line must be a STRING token: {abs:?}"
+        );
+        assert!(
+            abs.iter()
+                .all(|(line, _, _, kind)| *line != 1 || *kind != 1),
+            "type walkers must not inspect multiline string contents: {abs:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_marker_text_inside_multiline_string_starts_heredoc_like_parser() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "let value = \"first\nfake = <<EOT\n\"\nEOT\n\"\naws.ec2.Vpc {}";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+
+        assert!(
+            abs.contains(&(2, 0, 1, 4)),
+            "the parser-recognized heredoc body must be a STRING token: {abs:?}"
+        );
+        assert!(
+            abs.contains(&(5, 0, 11, 1)),
+            "normal lexical state must resume after the heredoc: {abs:?}"
+        );
+    }
+
+    #[test]
     fn interpolation_split_with_multibyte_chars() {
         // Multi-byte chars (Japanese) before and inside the interpolation.
         // Char-count semantics must not be confused by UTF-8 byte width.
@@ -2202,6 +1706,32 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_interpolation_does_not_carry_across_physical_lines() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "value = <<EOT\n${\n  name // } is part of the comment\n}\nEOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let expression_line_len = "  name // } is part of the comment".chars().count() as u32;
+
+        assert!(
+            abs.contains(&(1, 0, 2, 9)),
+            "the first physical line must contain the unclosed MACRO token: {abs:?}"
+        );
+        assert!(
+            abs.contains(&(2, 0, expression_line_len, 4)),
+            "the next heredoc line must return to STRING classification: {abs:?}"
+        );
+        assert!(
+            abs.contains(&(3, 0, 1, 4)),
+            "a later `}}` must remain heredoc STRING text: {abs:?}"
+        );
+        assert!(
+            abs.iter().all(|(line, _, _, kind)| *line < 2 || *kind != 9),
+            "heredoc interpolation state must not cross a physical newline: {abs:?}"
+        );
+    }
+
+    #[test]
     fn heredoc_quoted_marker_does_not_split_interpolation() {
         // `<<'EOT'` is a literal heredoc — `${name}` is NOT expanded
         // by the parser, so the LSP must not split MACRO tokens
@@ -2234,17 +1764,21 @@ mod tests {
     }
 
     #[test]
-    fn heredoc_escaped_dollar_brace_does_not_split() {
-        // `\${name}` is a literal escape inside the heredoc body —
-        // the splitter must skip the `\$` pair and not emit MACRO.
+    fn heredoc_backslash_before_dollar_brace_still_splits_interpolation() {
+        // Heredoc preprocessing escapes the backslash itself, so `\${name}`
+        // reaches the parser as a literal backslash followed by interpolation.
         let provider = SemanticTokensProvider::new(&[]);
         let input = "policy = <<EOT\n\\${name}\nEOT";
         let tokens = provider.tokenize(input);
         let abs = absolute_tokens(&tokens);
-        assert!(
-            abs.iter().all(|(_, _, _, k)| *k != 9),
-            "escaped `\\${{` must not produce MACRO; got: {:?}",
-            abs
+        let macro_token = abs
+            .iter()
+            .find(|(line, _, _, kind)| *line == 1 && *kind == 9)
+            .expect("`\\${name}` in an unquoted heredoc must emit a MACRO token");
+        assert_eq!(
+            (macro_token.1, macro_token.2),
+            (1, 7),
+            "MACRO must cover `${{name}}` after the literal backslash: {abs:?}"
         );
     }
 
@@ -2280,7 +1814,7 @@ mod tests {
     #[cfg(test)]
     fn assert_no_type_token_overlaps_substring(line: &str, needle: &str) {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
         let chars: Vec<char> = line.chars().collect();
         // Find char-range of `needle` inside `line`. Assumes ASCII needle.
         let byte_pos = line
@@ -2327,6 +1861,19 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_single_quoted_string_does_not_emit_overlapping_property() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "'名前' = 'a'";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+
+        assert!(
+            abs.iter().all(|(_, _, _, kind)| *kind != 3),
+            "non-ASCII string contents must be hidden from PROPERTY walkers: {abs:?}"
+        );
+    }
+
+    #[test]
     fn pascal_type_walker_does_not_fire_inside_string_body() {
         // `: PascalCase` inside a string body must not be tagged as TYPE.
         assert_no_type_token_overlaps_substring("msg = \"field: Vpc is required\"", "Vpc");
@@ -2341,7 +1888,7 @@ mod tests {
         )];
         let provider = SemanticTokensProvider::new(&regions);
         let line = "note = \"deployed to aws.Region.us_east_1 yesterday\"";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
         let needle = "aws.Region.us_east_1";
         let byte_pos = line.find(needle).expect("needle not in line");
         let needle_start = position::byte_offset_to_char_offset(line, byte_pos);
@@ -2367,7 +1914,7 @@ mod tests {
         // `msg = "see ${aws.ec2.Vpc} here"` — the `aws.ec2.Vpc` inside
         // ${...} should be tagged as TYPE.
         let line = "msg = \"see ${aws.ec2.Vpc} here\"";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
         let byte_pos = line.find("aws.ec2.Vpc").expect("needle not in line");
         let needle_start = position::byte_offset_to_char_offset(line, byte_pos);
         let has_type_at_needle = tokens
@@ -2389,7 +1936,7 @@ mod tests {
         )];
         let provider = SemanticTokensProvider::new(&regions);
         let line = "msg = \"region=${aws.Region.us_east_1}\"";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
         let byte_pos = line
             .find("aws.Region.us_east_1")
             .expect("needle not in line");
@@ -2409,7 +1956,7 @@ mod tests {
         // Sanity check: the existing behavior — TYPE on bare resource type
         // — still works after the refactor.
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("aws.ec2.Vpc {", 0);
+        let tokens = provider.tokenize_line("aws.ec2.Vpc {");
         let has_type_at_zero = tokens
             .iter()
             .any(|(start, len, kind)| *start == 0 && *len == 11 && *kind == 1);
@@ -2429,7 +1976,7 @@ mod tests {
         // occurrence.
         let provider = SemanticTokensProvider::new(&[]);
         let line = "x = \"see aws.ec2.Vpc\", aws.ec2.Vpc";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
         // First occurrence is inside the string; its char range overlaps
         // with the string body. Second occurrence is bare code.
         let first_byte = line.find("aws.ec2.Vpc").unwrap();
@@ -2459,10 +2006,10 @@ mod tests {
         // `x = "foo ${aws.ec2.Vpc` — line ends inside `${...`. The
         // expression body still contains a resource type and must be
         // tagged as TYPE; the trailing chars of the unclosed
-        // interpolation must not be silently swallowed into StringBody.
+        // interpolation must not be masked out of the walker text.
         let provider = SemanticTokensProvider::new(&[]);
         let line = "x = \"foo ${aws.ec2.Vpc";
-        let tokens = provider.tokenize_line(line, 0);
+        let tokens = provider.tokenize_line(line);
         let byte_pos = line.find("aws.ec2.Vpc").expect("needle not in line");
         let needle_start = position::byte_offset_to_char_offset(line, byte_pos);
         let has_type_at_needle = tokens
