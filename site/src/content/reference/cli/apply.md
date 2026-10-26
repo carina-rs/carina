@@ -10,7 +10,7 @@ Apply changes to reach the desired infrastructure state. Carina generates a plan
 carina apply [OPTIONS] [PATH]
 ```
 
-**PATH** defaults to `.` (current directory). It must be either a directory containing one or more `.crn` files, or a saved plan JSON file (any path ending in `.json` is treated as a saved plan).
+**PATH** defaults to `.` (current directory). It must be either a directory containing one or more `.crn` files, or a saved plan file written by `carina plan --out` (any path that is not a directory is treated as a saved plan).
 
 ## Flags
 
@@ -31,6 +31,18 @@ When locking is enabled, Carina acquires a lock on the state backend before appl
 ```bash
 carina apply --lock=false
 ```
+
+### `--parallelism <N>`
+
+Maximum number of provider operations run concurrently. Defaults to `8`.
+
+```bash
+carina apply --parallelism=2
+```
+
+### `--accept-legacy-name-overrides`
+
+Accept a state file that still uses the pre-Phase-5 name override format. Without this flag, `carina apply` refuses to run against a state file that has any `name_overrides` entry missing the recorded original DSL value, so the operator reviews the drift first. Run `carina plan` to inspect, then re-run `apply` with this flag.
 
 ## Applying a Saved Plan
 
@@ -79,13 +91,14 @@ When `--auto-approve` is not set, Carina follows this flow:
 3. If no changes are needed, prints "No changes needed." and exits
 4. Prompts: "Do you want to perform these actions?"
 5. Waits for the user to type `yes` to confirm (any other input cancels)
-6. Executes the effects concurrently (up to 5 at a time) with progress spinners
-7. Saves the updated state to the backend
+6. Executes the effects concurrently (up to `--parallelism` at a time, default 8) with progress spinners, saving state to the backend as effects complete
+7. Saves the final state to the backend
 8. Prints a summary of results
 
 ## Error Handling
 
 - If an effect fails, Carina refreshes the resource state from the provider to capture any partial changes
+- State is written incrementally while effects run, so results of completed effects survive even if the process is killed before the final save
 - The state file is always saved after execution, even if some effects failed, to prevent state drift
 - Failed and skipped effects are reported in the summary (e.g., "3 succeeded, 1 failed, 1 skipped")
 - Exit code `1` indicates an error occurred

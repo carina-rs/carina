@@ -13,9 +13,9 @@ Create a file at `modules/network/main.crn` (the filename is up to you):
 
 ```crn
 arguments {
-  cidr_block : String
-  subnet_cidr: String
-  az         : String
+  cidr_block : Ipv4Cidr
+  subnet_cidr: Ipv4Cidr
+  az         : aws.AvailabilityZone.ZoneName
 }
 
 let vpc = awscc.ec2.Vpc {
@@ -53,7 +53,7 @@ arguments {
 }
 ```
 
-Supported types include `String`, `Bool`, `Int`, `Float`, `list(String)`, `map(String)`, and resource type references like `awscc.ec2.Vpc`.
+Supported types include `String`, `Bool`, `Int`, `Float`, `list(String)`, `map(String)`, built-in types such as `Ipv4Cidr`, types registered by providers such as `aws.AvailabilityZone.ZoneName` or `aws.ec2.Vpc.Id`, and resource type references like `awscc.ec2.Vpc`. Arguments are type-checked against the attributes they flow into: passing a `String` argument to a `cidr_block` attribute is an error, because the attribute expects an `Ipv4Cidr`.
 
 ### Attributes block
 
@@ -74,7 +74,9 @@ From your root configuration, load the module with `use` and call it with argume
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 
 let network = use { source = './modules/network' }
@@ -137,9 +139,9 @@ For example, `modules/network_with_rt/main.crn` can load the network module:
 let network = use { source = '../network' }
 
 arguments {
-  cidr_block : String
-  subnet_cidr: String
-  az         : String
+  cidr_block : Ipv4Cidr
+  subnet_cidr: Ipv4Cidr
+  az         : aws.AvailabilityZone.ZoneName
 }
 
 let net = network {

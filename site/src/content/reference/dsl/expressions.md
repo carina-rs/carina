@@ -1,13 +1,15 @@
 ---
 title: Expressions
-description: For loops, if/else conditionals, let bindings, pipe operator, compose operator, and function definitions in the Carina DSL.
+description: For loops, if/else conditionals, let bindings, wait, pipe and compose operators, and function definitions in the Carina DSL.
 ---
 
 Expressions in the Carina DSL produce values. They can appear as attribute values, function arguments, or in any context where a value is expected. Resource and module declarations instead produce structural handles; select an attribute or module output before using one as a value.
 
 ## For Expression
 
-The `for` expression iterates over a list or map to create multiple resources or values.
+The `for` expression iterates over a list or map to create multiple resources, data-source reads, or module instances. The body must end in a resource, a `read`, or a module call.
+
+The iterable is a list literal, a binding, a function call, or a parenthesized expression; an inline map literal must be parenthesized (`for k, v in ({ a = 1 }) { ... }`). Use `_` for a loop variable you do not need.
 
 ### Iterating Over a List
 
@@ -128,6 +130,39 @@ if is_production {
 }
 ```
 
+## Wait Expression
+
+`wait` blocks downstream resources until a target resource reaches a condition. It is the right-hand side of a `let` binding:
+
+```crn
+let cert = aws.acm.Certificate {
+  domain_name       = 'registry.example.com'
+  validation_method = dns
+}
+
+let validation_record = aws.route53.RecordSet {
+  hosted_zone_id   = 'Z123EXAMPLE'
+  name             = cert.domain_validation_options[0].resource_record.name
+  type             = cname
+  ttl              = 60
+  resource_records = [cert.domain_validation_options[0].resource_record.value]
+}
+
+let cert_issued = wait cert {
+  until      = cert.status == aws.acm.Certificate.Status.issued
+  depends_on = [validation_record]
+  timeout    = 75min
+}
+```
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `until` | yes | Condition polled against the target, in the form `<target>.<attribute> == <value>` |
+| `depends_on` | no | Bindings that must complete before polling starts |
+| `timeout` | no | A [duration](/reference/dsl/types-and-values/#duration); defaults to the target schema's wait timeout, or 5 minutes |
+
+Attributes read through the wait binding (`cert_issued.certificate_arn`) are the target's attributes, but a resource that references them is not created until the wait succeeds. Reference the target directly (`cert.certificate_arn`) to skip the wait. A wait is not stored in state.
+
 ## Let Binding
 
 `let` binds a name to a value. At the top level, it binds resources or values. Inside blocks, it creates scoped variables.
@@ -163,6 +198,33 @@ let queue_name = (queue.arn |> split(':'))[5]
 ```
 
 Access on a value that is already known is evaluated immediately. Access whose base depends on a resource or upstream value is deferred until that value is available.
+
+## Coalesce Operator (`??`)
+
+`ref ?? default` uses the referenced value when it exists and `default` when it is absent. The left side must be a reference or access chain (`up.accounts`, `vpc.tags`); both sides are type-checked, so a default of the wrong type is rejected by `validate`.
+
+```crn
+let orgs = upstream_state {
+  source = '../organizations'
+}
+
+for account_id in (orgs.accounts ?? []) {
+  awscc.sso.Assignment {
+    target_id = account_id
+    # ...
+  }
+}
+```
+
+Which side is used is decided when the reference resolves, not when the file is parsed:
+
+| Left side | Result |
+|-----------|--------|
+| Exists (an upstream export, or a resource attribute that has a value) | The referenced value |
+| Absent (the loaded upstream state does not export it, or the attribute is unset) | `default` |
+| Not known yet (upstream state not available, or a value computed during apply) | Deferred; resolved at apply time |
+
+Without `??`, iterating over an export that the upstream state does not have is an error. `??` chains are right-associative: `a ?? b ?? c` is `a ?? (b ?? c)`.
 
 ## Pipe Operator (`|>`)
 

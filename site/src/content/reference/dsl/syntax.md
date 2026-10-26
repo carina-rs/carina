@@ -12,7 +12,9 @@ A `.crn` file contains zero or more top-level statements in any order:
 ```crn
 # Provider configuration
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 
 # Backend configuration (optional)
@@ -78,26 +80,38 @@ The following statements are valid at the top level of a `.crn` file:
 | `attributes` | Define module output values (for callers who bind the module with `let`) |
 | `exports` | Define values published to upstream-state consumers |
 | `use` (in `let` RHS) | Load a module from a directory (`let m = use { source = '...' }`) |
+| Module call | Instantiate a loaded module (`m { ... }` or `let x = m { ... }`) |
+| `read` (in `let` RHS) | Query an existing resource as a data source |
+| `upstream_state` (in `let` RHS) | Reference another Carina project's exports |
+| `wait` (in `let` RHS) | Block downstream resources until a resource reaches a condition |
 
 ## Provider Block
 
-Every `.crn` file that declares resources must configure at least one provider. The provider block specifies which cloud provider to use and its settings.
+A configuration that declares resources must configure a provider for each provider kind it uses. The provider block specifies which provider plugin to load and its settings.
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 ```
 
-Multiple providers can be configured in the same file:
+`source` is required; `carina init` uses it to install the provider plugin. It is a registry address (`carina-rs/awscc`, or `host/namespace/name`), a GitHub repository (`github.com/owner/repo`), or a local `file://` path to a `.wasm` component. `source`, `version`, and `revision` must be string literals. `version` (a version constraint) or `revision` (a branch or tag; a commit SHA only with a `github.com/...` source) pins which build is installed. The two are mutually exclusive.
+
+Multiple providers can be configured in the same directory:
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 
 provider aws {
-  region = aws.Region.ap_northeast_1
+  source  = 'carina-rs/aws'
+  version = '0.7.1'
+  region  = aws.Region.ap_northeast_1
 }
 ```
 
@@ -107,8 +121,8 @@ A `provider <kind> { ... }` block declares the kind's *default instance* — the
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
-  version = '~0.5.0'
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
 
@@ -158,7 +172,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-The resource is identified in state by its `name` attribute or a hash of its attributes.
+Carina generates the resource's state identity from a hash of the attributes its schema marks as create-only or identifying. When none of those are set, the identity is derived from the resource's other (mutable) attributes; two such anonymous resources of the same type in the same scope are rejected as ambiguous. Bind them with `let` to give them distinct, stable identities.
 
 ### Named Resources (Let Bindings)
 
@@ -218,6 +232,20 @@ let identity = read aws.sts.CallerIdentity {}
 awscc.ec2.IpamPool {
   source_resource = {
     resource_owner = identity.account_id
+  }
+}
+```
+
+### Directives
+
+A `directives` block inside a resource carries Carina-side instructions (`depends_on`, `create_before_destroy`, `prevent_destroy`, `force_delete`, `provider`). It is never sent to the provider. See [Directives blocks](/getting-started/core-concepts/#directives-blocks) for the full list.
+
+```crn
+awscc.s3.Bucket {
+  bucket_name = 'my-bucket'
+
+  directives {
+    prevent_destroy = true
   }
 }
 ```
@@ -282,7 +310,7 @@ When no backend is configured, state is stored locally in `carina.state.json`.
 
 ### Import
 
-Import an existing cloud resource into Carina's state:
+Import an existing cloud resource into Carina's state. The address in `to` names the binding of the resource that adopts it:
 
 ```crn
 import {
@@ -290,7 +318,7 @@ import {
   id = 'vpc-0123456789abcdef0'
 }
 
-awscc.ec2.Vpc {
+let imported_vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -334,7 +362,7 @@ awscc.ec2.SecurityGroup {
 }
 ```
 
-`source` is required and points at the upstream project's directory. The path is resolved relative to the enclosing `.crn` file's directory. Carina loads the upstream's configuration, resolves its backend, reads its state, and exposes the values published by its `exports` block through the declared binding.
+`source` is required, must be a string literal without interpolation, and points at the upstream project's directory. The path is resolved relative to the enclosing `.crn` file's directory. Carina loads the upstream's configuration, resolves its backend, reads its state, and exposes the values published by its `exports` block through the declared binding.
 
 ## External References at a Glance
 

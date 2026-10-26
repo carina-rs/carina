@@ -30,6 +30,10 @@ Refresh state from the cloud provider before computing the destroy plan. Default
 
 Destroy even resources that have `prevent_destroy = true` in their `directives` block.
 
+### `--parallelism <N>`
+
+Maximum number of provider operations run concurrently. Defaults to `8`.
+
 ## Backend Drift
 
 Before destroying resources, Carina checks the current project backend

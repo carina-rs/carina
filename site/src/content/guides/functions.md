@@ -70,7 +70,7 @@ awscc.ec2.Vpc {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `cidr_subnet` | `cidr_subnet(prefix, newbits, netnum) -> Ipv4Cidr` | Calculates a subnet CIDR block |
+| `cidr_subnet` | `cidr_subnet(prefix, newbits, netnum) -> String` | Calculates a subnet CIDR block |
 
 Example:
 
@@ -91,9 +91,9 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `env` | `env(name) -> string` | Reads an environment variable; diagnostics never display its contents |
-| `secret` | `secret(value) -> secret` | Marks a value as secret (stored as hash in state) |
-| `decrypt` | `decrypt(ciphertext, key?) -> secret` | Decrypts using the provider's encryption service; the result is automatically masked and hashed in state |
+| `env` | `env(name) -> String` | Reads an environment variable; diagnostics never display its contents |
+| `secret` | `secret(value) -> Secret` | Marks a value as secret (stored as hash in state) |
+| `decrypt` | `decrypt(ciphertext, key?) -> Secret` | Decrypts using the provider's encryption service; the result is automatically masked and hashed in state |
 
 ## User-defined functions
 
@@ -158,7 +158,7 @@ The pipe operator `|>` passes the result of the left side as the **last** argume
 let result = join('-', split('_', upper('hello_world')))
 
 # With pipe -- reads left to right
-let result = 'hello_world' |> upper() |> split('_') |> join('-')
+let piped = 'hello_world' |> upper() |> split('_') |> join('-')
 # Result: 'HELLO-WORLD'
 ```
 

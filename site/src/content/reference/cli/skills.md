@@ -64,7 +64,7 @@ Installed at: /Users/you/.agents/skills/carina/SKILL.md
 
 ### `update`
 
-Update the installed skill if the embedded version is newer. If not installed, performs an install.
+Update the installed skill when its version differs from the embedded version. If not installed, performs an install.
 
 ```bash
 carina skills update
