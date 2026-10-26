@@ -59,8 +59,8 @@ impl ResolvedProviderConfig {
         &self.config.attributes
     }
 
-    pub fn source(&self) -> Option<&str> {
-        self.config.source.as_deref()
+    pub fn source(&self) -> Option<&crate::provider_source::ProviderSource> {
+        self.config.source.as_ref()
     }
 
     pub fn binding(&self) -> Option<&str> {

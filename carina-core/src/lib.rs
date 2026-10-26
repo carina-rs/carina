@@ -34,6 +34,7 @@ pub mod parser;
 pub mod plan;
 pub mod plan_tree;
 pub mod provider;
+pub mod provider_source;
 pub mod resolver;
 #[cfg(test)]
 mod resolver_split_tests;

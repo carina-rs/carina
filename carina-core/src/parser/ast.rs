@@ -9,6 +9,7 @@ use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::{BindingValueSource, IterableBindings};
 use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
+use crate::provider_source::ProviderSource;
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode,
     LeafNode, PathSegment, Resource, ResourceId, ResourceIdentity, StructuralOperand,
@@ -1296,10 +1297,11 @@ pub struct ProviderConfig {
     /// Extracted from `default_tags = { ... }` in the provider block.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub default_tags: IndexMap<String, Value>,
-    /// Provider source (e.g., "github.com/carina-rs/carina-provider-awscc" or "file:///path/to/binary").
+    /// Provider source (e.g., "carina-rs/awscc", "github.com/carina-rs/carina-provider-awscc",
+    /// or "file:///path/to/binary").
     /// Extracted from the provider block and not passed to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: Option<ProviderSource>,
     /// Provider version constraint (e.g., "~0.5.0", "^1.2.0").
     /// Extracted from the provider block and not passed to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]

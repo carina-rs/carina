@@ -5764,11 +5764,11 @@ fn upstream_state_source_check_ignores_same_source_in_provider_block() {
     // line (line 5 here, 0-based 4), not the provider line.
     let doc = create_document(
         r#"provider aws {
-    source = '../nonexistent'
+    source = 'missing/provider'
     region = 'ap-northeast-1'
 }
 let orgs = upstream_state {
-    source = '../nonexistent'
+    source = 'missing/provider'
 }
 "#,
     );

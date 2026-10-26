@@ -9,9 +9,37 @@ use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
-use crate::resource::{ConcreteValue, Value};
+use crate::parser::util::expression_is_plain_string_literal;
+use crate::resource::{ConcreteValue, Value, ValueString};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
+
+fn take_provider_string_attribute(
+    attributes: &mut IndexMap<String, Value>,
+    attribute_lines: &IndexMap<String, usize>,
+    provider_name: &str,
+    attribute: &str,
+) -> Result<Option<(ValueString, usize)>, ParseError> {
+    let Some(value) = attributes.shift_remove(attribute) else {
+        return Ok(None);
+    };
+    let line =
+        attribute_lines
+            .get(attribute)
+            .copied()
+            .ok_or_else(|| ParseError::InternalError {
+                expected: format!("source line for provider attribute '{attribute}'"),
+                context: format!("provider '{provider_name}' block"),
+            })?;
+
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => Ok(Some((value, line))),
+        Value::Concrete(_) | Value::Deferred(_) => Err(ParseError::InvalidExpression {
+            line,
+            message: format!("Provider '{provider_name}': '{attribute}' must be a string literal"),
+        }),
+    }
+}
 
 pub(in crate::parser) fn parse_provider_block(
     pair: pest::iterators::Pair<Rule>,
@@ -23,16 +51,25 @@ pub(in crate::parser) fn parse_provider_block(
         .to_string();
 
     let mut attributes: IndexMap<String, Value> = IndexMap::new();
+    let mut attribute_lines: IndexMap<String, usize> = IndexMap::new();
     for attr_pair in inner {
         if attr_pair.as_rule() == Rule::attribute {
+            let (attr_line, _) = attr_pair.as_span().start_pos().line_col();
             let mut attr_inner = attr_pair.into_inner();
             let key = next_pair(&mut attr_inner, "attribute name", "provider block")?
                 .as_str()
                 .to_string();
-            let value = parse_expression(
-                next_pair(&mut attr_inner, "attribute value", "provider block")?,
-                ctx,
-            )?;
+            let value_pair = next_pair(&mut attr_inner, "attribute value", "provider block")?;
+            // Source classification is syntactic. Version and revision retain
+            // evaluated-string support, but non-string results are rejected below.
+            if key == "source" && !expression_is_plain_string_literal(value_pair.clone()) {
+                return Err(ParseError::InvalidExpression {
+                    line: attr_line,
+                    message: format!("Provider '{name}': '{key}' must be a string literal"),
+                });
+            }
+            let value = parse_expression(value_pair, ctx)?;
+            attribute_lines.insert(key.clone(), attr_line);
             attributes.insert(key, value);
         }
     }
@@ -53,42 +90,42 @@ pub(in crate::parser) fn parse_provider_block(
     };
 
     // Extract source from attributes if present
-    let source = if let Some(Value::Concrete(ConcreteValue::String(s))) =
-        attributes.shift_remove("source")
-    {
-        Some(s.into_plaintext())
-    } else {
-        None
-    };
+    let source =
+        match take_provider_string_attribute(&mut attributes, &attribute_lines, &name, "source")? {
+            Some((source, line)) => Some(source.into_plaintext().parse().map_err(|error| {
+                ParseError::InvalidExpression {
+                    line,
+                    message: format!("Provider '{name}': {error}"),
+                }
+            })?),
+            None => None,
+        };
 
     // Extract version from attributes if present
-    let version = if let Some(Value::Concrete(ConcreteValue::String(v))) =
-        attributes.shift_remove("version")
-    {
-        Some(
-            VersionConstraint::parse(v.expose_plaintext()).map_err(|error| {
-                let message = match v.diagnostic_literal() {
-                    Some(_) => error,
-                    None => "Invalid version constraint: value from env()".to_string(),
+    let version = match take_provider_string_attribute(
+        &mut attributes,
+        &attribute_lines,
+        &name,
+        "version",
+    )? {
+        Some((version, line)) => Some(
+            VersionConstraint::parse(version.expose_plaintext()).map_err(|error| {
+                let message = match version.diagnostic_literal() {
+                    Some(_) => format!("Provider '{name}': {error}"),
+                    None => {
+                        format!("Provider '{name}': Invalid version constraint: value from env()")
+                    }
                 };
-                pest::error::Error::new_from_pos(
-                    pest::error::ErrorVariant::CustomError { message },
-                    pest::Position::from_start(""),
-                )
+                ParseError::InvalidExpression { line, message }
             })?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
 
     // Extract revision from attributes if present
-    let revision = if let Some(Value::Concrete(ConcreteValue::String(r))) =
-        attributes.shift_remove("revision")
-    {
-        Some(r.into_plaintext())
-    } else {
-        None
-    };
+    let revision =
+        take_provider_string_attribute(&mut attributes, &attribute_lines, &name, "revision")?
+            .map(|(revision, _)| revision.into_plaintext());
 
     // Validate that version and revision are mutually exclusive
     if version.is_some() && revision.is_some() {

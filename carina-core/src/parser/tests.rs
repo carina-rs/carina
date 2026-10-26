@@ -3143,13 +3143,132 @@ fn parse_provider_block_with_source_and_version() {
     let provider = &parsed.providers[0];
     assert_eq!(provider.name, "mock");
     assert_eq!(
-        provider.source.as_deref(),
-        Some("github.com/carina-rs/carina-provider-mock")
+        provider.source.as_ref().map(ToString::to_string),
+        Some("github.com/carina-rs/carina-provider-mock".to_string())
     );
     assert_eq!(provider.version.as_ref().unwrap().raw, "0.1.0");
     // source and version should NOT be in attributes
     assert!(!provider.attributes.contains_key("source"));
     assert!(!provider.attributes.contains_key("version"));
+}
+
+fn parse_typed_provider_source(source: &str) -> crate::provider_source::ProviderSource {
+    let input = format!("provider test {{\n    source = '{source}'\n    version = '0.1.0'\n}}");
+    parse(&input, &ProviderContext::default())
+        .unwrap()
+        .providers[0]
+        .source
+        .clone()
+        .expect("provider source should be extracted")
+}
+
+#[test]
+fn parse_provider_block_classifies_supported_source_shapes() {
+    use crate::provider_source::ProviderSource;
+
+    for source in [
+        "carina-rs/awscc",
+        "registry.example.com/ns/name",
+        "github.com/o/r",
+        "file:///x.wasm",
+    ] {
+        assert_eq!(
+            parse_typed_provider_source(source),
+            source.parse::<ProviderSource>().unwrap()
+        );
+    }
+}
+
+#[test]
+fn parse_provider_block_rejects_invalid_source_shapes() {
+    for source in ["a/b/c/d", "/x"] {
+        let input = format!("provider test {{ source = '{source}' }}");
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("invalid provider source must fail at the parser boundary");
+        assert!(
+            error.to_string().contains("Invalid source format"),
+            "unexpected error for {source}: {error}"
+        );
+    }
+}
+
+#[test]
+fn invalid_provider_source_reports_attribute_line_and_provider() {
+    let input = "provider awscc {\n  region = 'ap-northeast-1'\n\n  source = 'a/b/c/d'\n}";
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("invalid provider source must report its authored line");
+
+    match error {
+        ParseError::InvalidExpression { line, message } => {
+            assert_eq!(line, 4);
+            assert!(
+                message.starts_with("Provider 'awscc': Invalid source format: a/b/c/d"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn provider_loading_attributes_reject_values_that_would_be_silently_dropped() {
+    let cases = [
+        (
+            "source",
+            "env(\"CARINA_TEST_PROVIDER_SOURCE_MUST_BE_LITERAL_3958\")",
+        ),
+        ("source", "\"carina-rs/${missing}\""),
+        ("source", "42"),
+        ("version", "\"0.${missing}\""),
+        ("version", "42"),
+        ("revision", "\"main-${missing}\""),
+        ("revision", "42"),
+    ];
+
+    for (attribute, value) in cases {
+        let input = format!("provider test {{\n  {attribute} = {value}\n}}");
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("provider loading attribute must be a plain string literal");
+
+        match error {
+            ParseError::InvalidExpression { line, message } => {
+                assert_eq!(line, 2, "unexpected line for {attribute} = {value}");
+                assert_eq!(
+                    message,
+                    format!("Provider 'test': '{attribute}' must be a string literal")
+                );
+            }
+            other => panic!("unexpected error for {attribute} = {value}: {other}"),
+        }
+    }
+}
+
+#[test]
+fn provider_source_serde_uses_validated_string_wire_form() {
+    use crate::provider_source::ProviderSource;
+
+    let sources = [
+        "file:///x.wasm",
+        "github.com/o/r",
+        "carina-rs/awscc",
+        "registry.example.com/ns/name",
+    ]
+    .map(|source| source.parse::<ProviderSource>().unwrap());
+
+    for source in sources {
+        let json = serde_json::to_string(&source).unwrap();
+        assert_eq!(json, format!("\"{source}\""));
+        assert_eq!(
+            serde_json::from_str::<ProviderSource>(&json).unwrap(),
+            source
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&"carina-rs/awscc".parse::<ProviderSource>().unwrap()).unwrap(),
+        "\"carina-rs/awscc\""
+    );
+    assert!(serde_json::from_str::<ProviderSource>("\"a/b/c/d\"").is_err());
 }
 
 #[test]
@@ -3207,8 +3326,8 @@ fn parse_provider_block_with_revision() {
     let provider = &parsed.providers[0];
     assert_eq!(provider.name, "mock");
     assert_eq!(
-        provider.source.as_deref(),
-        Some("github.com/carina-rs/carina-provider-mock")
+        provider.source.as_ref().map(ToString::to_string),
+        Some("github.com/carina-rs/carina-provider-mock".to_string())
     );
     assert_eq!(provider.revision.as_deref(), Some("feature-branch"));
     assert!(provider.version.is_none());
@@ -11661,8 +11780,8 @@ fn parse_provider_expr_named_instance_in_let_binding() {
     assert_eq!(default.name, "aws");
     assert!(default.binding.is_none());
     assert_eq!(
-        default.source.as_deref(),
-        Some("github.com/carina-rs/carina-provider-aws")
+        default.source.as_ref().map(ToString::to_string),
+        Some("github.com/carina-rs/carina-provider-aws".to_string())
     );
 
     let named = parsed
@@ -11968,7 +12087,7 @@ fn provider_config_default_instance_serde_round_trip() {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
-        source: Some("github.com/x/y".to_string()),
+        source: Some("github.com/x/y".parse().unwrap()),
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
