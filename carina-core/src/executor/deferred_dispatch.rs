@@ -13,23 +13,23 @@ use crate::resource::ResolvedResource;
 /// upstream state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DeferredCreateFailure {
-    /// The upstream binding exists but does not contain the iterable
-    /// attribute named by the deferred-for template.
-    IterableAttrMissing {
-        upstream_binding: String,
-        attr: String,
+    /// Every candidate was complete, but a direct iterable reference was
+    /// absent and there was no coalesce fallback.
+    IterableAbsent {
+        expression: String,
+        candidates: Vec<String>,
     },
     /// The iterable still depends on an incomplete producer even though the
     /// scheduler attempted to dispatch the deferred effect.
     IterableUnknown {
         expression: String,
-        upstream_binding: String,
+        candidates: Vec<String>,
     },
     /// The iterable attribute exists but is not a collection shape supported
     /// by deferred-for expansion.
     ShapeMismatch {
-        upstream_binding: String,
-        attr: String,
+        expression: String,
+        candidates: Vec<String>,
         mismatch: ShapeMismatch,
     },
     ValueAccess {
@@ -40,30 +40,33 @@ pub(super) enum DeferredCreateFailure {
 impl DeferredCreateFailure {
     pub(super) fn message(&self) -> String {
         match self {
-            DeferredCreateFailure::IterableAttrMissing {
-                upstream_binding,
-                attr,
+            DeferredCreateFailure::IterableAbsent {
+                expression,
+                candidates,
             } => {
                 format!(
-                    "deferred-for expansion upstream binding `{upstream_binding}` does not contain iterable attribute `{attr}`"
+                    "deferred-for iterable `{expression}` is absent after resolving candidates: {}",
+                    candidates.join(", ")
                 )
             }
             DeferredCreateFailure::ShapeMismatch {
-                upstream_binding,
-                attr,
+                expression,
+                candidates,
                 mismatch,
             } => {
                 format!(
-                    "deferred-for expansion expected {} for `{upstream_binding}.{attr}` but got {}",
+                    "deferred-for expansion expected {} for `{expression}` but got {} (candidates: {})",
                     mismatch.expected_kind(),
-                    mismatch.got_kind()
+                    mismatch.got_kind(),
+                    candidates.join(", ")
                 )
             }
             DeferredCreateFailure::IterableUnknown {
                 expression,
-                upstream_binding,
+                candidates,
             } => format!(
-                "deferred-for iterable `{expression}` is still unknown at dispatch (scheduled upstream binding: `{upstream_binding}`)"
+                "deferred-for iterable `{expression}` is still unknown at dispatch (candidates: {})",
+                candidates.join(", ")
             ),
             DeferredCreateFailure::ValueAccess { error } => error.to_string(),
         }
@@ -71,12 +74,16 @@ impl DeferredCreateFailure {
 }
 
 /// Materialize `Effect::Create` children for a deferred-for template using the
-/// runtime value published under `upstream_binding`.
+/// runtime values published under every binding referenced by the iterable.
 pub(super) fn materialize_deferred_create(
-    upstream_binding: &str,
     template: &DeferredForExpression,
     bindings: &ResolvedBindings,
 ) -> Result<Vec<Effect>, DeferredCreateFailure> {
+    let expression = crate::value::format_value(&template.iterable);
+    let candidates = template
+        .reference_candidates()
+        .into_iter()
+        .collect::<Vec<_>>();
     let iterable = match crate::resolver::resolve_ref_value_status(&template.iterable, bindings)
         .map_err(|message| DeferredCreateFailure::ValueAccess {
             error: DeferredForExpansionError::Resolution {
@@ -87,15 +94,15 @@ pub(super) fn materialize_deferred_create(
         })? {
         crate::resolver::ValueResolution::Present(value) => value,
         crate::resolver::ValueResolution::Absent => {
-            return Err(DeferredCreateFailure::IterableAttrMissing {
-                upstream_binding: upstream_binding.to_string(),
-                attr: template.iterable_attr.clone(),
+            return Err(DeferredCreateFailure::IterableAbsent {
+                expression,
+                candidates,
             });
         }
         crate::resolver::ValueResolution::Unknown(_) => {
             return Err(DeferredCreateFailure::IterableUnknown {
-                expression: crate::value::format_value(&template.iterable),
-                upstream_binding: upstream_binding.to_string(),
+                expression,
+                candidates,
             });
         }
     };
@@ -105,8 +112,8 @@ pub(super) fn materialize_deferred_create(
         .map_err(|error| match error {
             DeferredForExpansionError::ShapeMismatch(mismatch) => {
                 DeferredCreateFailure::ShapeMismatch {
-                    upstream_binding: upstream_binding.to_string(),
-                    attr: template.iterable_attr.clone(),
+                    expression: crate::value::format_value(&template.iterable),
+                    candidates: template.reference_candidates().into_iter().collect(),
                     mismatch,
                 }
             }
@@ -120,8 +127,9 @@ pub(super) fn materialize_deferred_create(
         .into_iter()
         .map(|resource| {
             debug_assert!(
-                upstream_binding.is_empty()
-                    || resource.dependency_bindings.contains(upstream_binding),
+                template
+                    .root_bindings()
+                    .is_subset(&resource.dependency_bindings),
                 "apply-time deferred-for child must retain iterable dependencies"
             );
             Effect::Create(ResolvedResource::new(resource))
@@ -151,12 +159,11 @@ pub(super) struct PureMetaCtx<'a> {
 /// upstream state is missing or has the wrong shape.
 pub(super) fn dispatch_deferred_create(
     effect: &Effect,
-    upstream_binding: &str,
     template: &DeferredForExpression,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_>,
 ) -> DeferredDispatchResult {
-    match materialize_deferred_create(upstream_binding, template, bindings) {
+    match materialize_deferred_create(template, bindings) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => {
             let message = err.message();
@@ -205,8 +212,6 @@ mod tests {
                 value: Box::new(Value::resource_ref("up", "accounts", vec![])),
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
             }),
-            iterable_binding: "up".to_string(),
-            iterable_attr: "accounts".to_string(),
             binding: ForBinding::Simple("account".to_string()),
             template_resource,
         }
@@ -228,7 +233,7 @@ mod tests {
             BindingCompleteness::Complete,
         );
 
-        let children = materialize_deferred_create("up", &coalesced_template(), &bindings)
+        let children = materialize_deferred_create(&coalesced_template(), &bindings)
             .expect("present iterable should materialize");
         assert_eq!(children.len(), 2);
     }
@@ -243,7 +248,7 @@ mod tests {
             BindingCompleteness::Complete,
         );
 
-        let children = materialize_deferred_create("up", &coalesced_template(), &bindings)
+        let children = materialize_deferred_create(&coalesced_template(), &bindings)
             .expect("complete missing attribute should select []");
         assert!(children.is_empty());
     }
@@ -259,8 +264,30 @@ mod tests {
         );
 
         assert!(matches!(
-            materialize_deferred_create("up", &coalesced_template(), &bindings),
+            materialize_deferred_create(&coalesced_template(), &bindings),
             Err(DeferredCreateFailure::IterableUnknown { .. })
         ));
+    }
+
+    #[test]
+    fn deferred_iterable_error_reports_every_candidate_reference() {
+        let mut template = coalesced_template();
+        template.iterable = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("primary", "items", vec![])),
+            default: Box::new(Value::resource_ref("fallback", "items", vec![])),
+        });
+
+        let error = materialize_deferred_create(&template, &ResolvedBindings::default())
+            .expect_err("both unresolved candidates keep the iterable unknown");
+        let DeferredCreateFailure::IterableUnknown { candidates, .. } = &error else {
+            panic!("expected unknown iterable, got {error:?}");
+        };
+        assert_eq!(
+            candidates,
+            &["fallback.items".to_string(), "primary.items".to_string()],
+        );
+        let message = error.message();
+        assert!(message.contains("fallback.items"), "{message}");
+        assert!(message.contains("primary.items"), "{message}");
     }
 }

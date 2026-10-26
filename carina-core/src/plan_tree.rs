@@ -41,16 +41,14 @@ pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::DeferredCreate {
-                upstream_binding, ..
-            } => Some(DeferredSummaryEntry {
-                upstream_binding: upstream_binding.clone(),
-                verb: deferred_for_verb(plan, upstream_binding).to_string(),
+            Effect::DeferredCreate { template, .. } => Some(DeferredSummaryEntry {
+                upstream_binding: template.binding_description(),
+                verb: deferred_for_verb(plan, template).to_string(),
                 action: DeferredSummaryAction::Add,
             }),
             Effect::DeferredReplace(payload) => Some(DeferredSummaryEntry {
-                upstream_binding: payload.upstream_binding.clone(),
-                verb: deferred_for_verb(plan, &payload.upstream_binding).to_string(),
+                upstream_binding: payload.template.binding_description(),
+                verb: deferred_for_verb(plan, &payload.template).to_string(),
                 action: DeferredSummaryAction::Replace,
             }),
             _ => None,
@@ -71,12 +69,16 @@ pub fn deferred_for_source(template: &crate::parser::DeferredForExpression) -> S
     crate::value::format_value(&template.iterable)
 }
 
-pub fn deferred_for_verb(plan: &Plan, upstream_binding: &str) -> &'static str {
-    if plan
-        .effects()
-        .iter()
-        .any(|effect| effect.binding_name().as_deref() == Some(upstream_binding))
-    {
+pub fn deferred_for_verb(
+    plan: &Plan,
+    template: &crate::parser::DeferredForExpression,
+) -> &'static str {
+    let roots = template.root_bindings();
+    if plan.effects().iter().any(|effect| {
+        effect
+            .binding_name()
+            .is_some_and(|binding| roots.contains(&binding))
+    }) {
         "applies"
     } else {
         "resolves"
@@ -85,9 +87,9 @@ pub fn deferred_for_verb(plan: &Plan, upstream_binding: &str) -> &'static str {
 
 pub fn deferred_for_display_name(
     template: &crate::parser::DeferredForExpression,
-    upstream_binding: &str,
     verb: &str,
 ) -> String {
+    let upstream_binding = template.binding_description();
     let note = format!("(N records after {upstream_binding} {verb})");
     if is_synthetic_deferred_binding(&template.binding_name) {
         note
@@ -235,18 +237,13 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     effect_deps.insert(idx, deps);
                     continue;
                 }
-                Effect::DeferredCreate {
-                    id,
-                    upstream_binding,
-                    template,
-                    ..
-                } => {
+                Effect::DeferredCreate { id, template, .. } => {
                     let fallback = id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
                     binding_to_effect.insert(template.binding_name.clone(), idx);
                     effect_bindings.insert(idx, fallback);
                     effect_types.insert(idx, "deferred_for".to_string());
-                    effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
+                    effect_deps.insert(idx, template.root_bindings().into_iter().collect());
                     continue;
                 }
                 Effect::DeferredReplace(payload) => {
@@ -260,7 +257,7 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     }
                     effect_bindings.insert(idx, fallback);
                     effect_types.insert(idx, "deferred_for".to_string());
-                    effect_deps.insert(idx, HashSet::from([payload.upstream_binding.clone()]));
+                    effect_deps.insert(idx, payload.template.root_bindings().into_iter().collect());
                     continue;
                 }
             };
@@ -588,8 +585,6 @@ mod tests {
                 value: Box::new(Value::resource_ref("up", "items", Vec::new())),
                 default: Box::new(Value::resource_ref("fallback", "items", Vec::new())),
             }),
-            iterable_binding: "up".to_string(),
-            iterable_attr: "items".to_string(),
             binding: ForBinding::Simple("x".to_string()),
             template_resource,
         };
@@ -879,8 +874,6 @@ mod tests {
             attributes: Vec::new(),
             binding_name: "validation_records".to_string(),
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
         };
@@ -904,7 +897,6 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         })));
         plan.add(Effect::Delete {
@@ -956,8 +948,6 @@ mod tests {
             attributes: Vec::new(),
             binding_name: "validation_records".to_string(),
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
         };
@@ -981,7 +971,6 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         })));
         plan.add(Effect::Wait {

@@ -2610,9 +2610,91 @@ impl AccessExpr {
     ) -> Result<Value, ValueAccessError> {
         self.rebuild(base, self.step.clone(), miss_policy)
     }
+
+    /// Rebuild without selecting the access yet.
+    ///
+    /// This is reserved for a lazy coalesce fallback while deferred-for
+    /// placeholders are being substituted. The fallback may never be chosen,
+    /// so a concrete missing-field error must remain dormant until `??`
+    /// selects it at a later resolution boundary.
+    pub(crate) fn rebuild_lazy_with_base(&self, base: Value) -> Value {
+        Value::Deferred(DeferredValue::Access(Self {
+            base: Box::new(base),
+            step: self.step.clone(),
+            source_line: self.source_line,
+            display_root: self.display_root.clone(),
+        }))
+    }
 }
 
 impl Value {
+    /// Whether this value is the one syntactic shape for which `??` may
+    /// interpret a missing selection as absence: a direct reference, or an
+    /// access chain whose base is itself a direct reference.
+    ///
+    /// References nested in collections, interpolations, function arguments,
+    /// or secret wrappers are inputs to a larger computation. Their absence is
+    /// therefore not the absence of that computation.
+    pub fn is_coalesce_optional_reference(&self) -> bool {
+        match self {
+            Value::Deferred(
+                DeferredValue::ResourceRef { .. } | DeferredValue::BindingRef { .. },
+            ) => true,
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().is_coalesce_optional_reference()
+            }
+            _ => false,
+        }
+    }
+
+    /// Collect the root binding names referenced anywhere in this value.
+    /// Resource references and bare binding references share this one helper
+    /// so dependency and diagnostic callers cannot drift.
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+        let mut roots = std::collections::BTreeSet::new();
+        self.visit_resource_refs(&mut |path| {
+            roots.insert(path.binding().to_string());
+        });
+        self.visit_binding_refs(&mut |binding| {
+            roots.insert(binding.to_string());
+        });
+        roots
+    }
+
+    /// Whether this value contains no runtime-deferred computation.
+    pub fn is_fully_resolved(&self) -> bool {
+        match self {
+            Value::Concrete(ConcreteValue::List(values)) => {
+                values.iter().all(Value::is_fully_resolved)
+            }
+            Value::Concrete(ConcreteValue::Map(values)) => {
+                values.values().all(Value::is_fully_resolved)
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => inner.is_fully_resolved(),
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+            )
+            | Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
+            Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::Coalesce { .. }
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall { .. }
+                | DeferredValue::ResolvedFunctionCall { .. }
+                | DeferredValue::Access(_)
+                | DeferredValue::Unknown(_),
+            ) => false,
+        }
+    }
+
     /// Attach authored display context to a valid deferred access. This does
     /// not expose or mutate the access operands; construction and rebuilding
     /// still go through [`apply_value_path_segment`].
@@ -4214,7 +4296,12 @@ impl Value {
                 access.base().visit_resource_refs_with_usage_inner(usage, f);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                value.visit_resource_refs_with_usage_inner(ResourceRefUsage::CoalesceValue, f);
+                let usage = if value.is_coalesce_optional_reference() {
+                    ResourceRefUsage::CoalesceValue
+                } else {
+                    ResourceRefUsage::Required
+                };
+                value.visit_resource_refs_with_usage_inner(usage, f);
                 default.visit_resource_refs_with_usage_inner(ResourceRefUsage::Required, f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {

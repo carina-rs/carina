@@ -1341,6 +1341,21 @@ pub enum BindingCompleteness {
     Incomplete,
 }
 
+/// Plan-derived knowledge about a managed resource's refreshed attributes.
+///
+/// A successful refresh is a complete snapshot when the differ schedules no
+/// mutation. During an update, only the attributes named here are provisional:
+/// every other refreshed value (and absence) remains authoritative. Creates,
+/// replacements, and unavailable current rows use [`Self::Unavailable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedBindingStability {
+    NoPlannedEffect,
+    Updating {
+        non_definitive_attributes: HashSet<String>,
+    },
+    Unavailable,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedBinding {
     pub attributes: HashMap<String, Value>,
@@ -1351,6 +1366,9 @@ pub struct ResolvedBinding {
     /// desired/configured attributes; provider outputs merged from an old or
     /// in-flight snapshot are deliberately excluded.
     definitive_attributes: HashSet<String>,
+    /// Attributes whose old refreshed value, or absence from that refresh,
+    /// cannot be used while a planned update may change them.
+    non_definitive_attributes: HashSet<String>,
 }
 
 /// Value-aware sibling of [`BindingIndex`]. See the module-level doc for
@@ -1439,13 +1457,27 @@ impl ResolvedBindings {
     /// declaration validation, so the order is observable only in test
     /// code that constructs colliding inputs by hand.
     pub fn pre_apply(inputs: PreApplyInputs<'_>) -> Self {
+        Self::pre_apply_with_stability(inputs, &HashMap::new())
+    }
+
+    /// Build the pre-apply view with plan-derived per-resource stability.
+    ///
+    /// An omitted entry means that no mutating effect is planned for a
+    /// successfully refreshed resource. Callers which already have a plan (or
+    /// the differ's pre-expansion projection) pass every mutating resource in
+    /// `managed_stability`.
+    pub fn pre_apply_with_stability(
+        inputs: PreApplyInputs<'_>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+    ) -> Self {
         let mut bindings = Self::build_managed_core(
             inputs.managed,
             inputs.managed_current,
             inputs.remote_bindings,
+            managed_stability,
         );
         bindings.layer_data_source_bindings(inputs.data_sources, inputs.data_source_states);
-        bindings.layer_compositions(inputs.compositions, BindingCompleteness::Incomplete);
+        bindings.layer_compositions(inputs.compositions);
         bindings.layer_wait_aliases(inputs.wait_aliases);
         bindings
     }
@@ -1459,6 +1491,7 @@ impl ResolvedBindings {
         managed: &[Resource],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
     ) -> Self {
         let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
 
@@ -1467,53 +1500,29 @@ impl ResolvedBindings {
                 continue;
             };
             let mut merged: HashMap<String, Value> = resource.resolved_attributes();
-            let mut definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
+            let definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
+            let mut non_definitive_attributes = HashSet::new();
             let mut completeness = BindingCompleteness::Incomplete;
             if let Some(current) = managed_current.get(&resource.id) {
                 match current.current() {
                     crate::resource::Current::Absent(_absent) => {}
                     crate::resource::Current::Present(present) => {
-                        // A refreshed snapshot is complete only while the
-                        // desired inputs that can affect provider outputs are
-                        // unchanged. During an update, old output attributes
-                        // are provisional and `??` must not treat a missing
-                        // output as definitive absence.
-                        if resource.attributes.iter().all(|(key, desired)| {
-                            present
-                                .state()
-                                .attributes
-                                .get(key)
-                                // Providers may omit write-only or otherwise
-                                // non-persisted inputs from a refreshed state.
-                                // Such an omission is not evidence of a
-                                // change; only a comparable value that differs
-                                // makes provider outputs provisional.
-                                .is_none_or(|current| desired.semantically_equal(current))
-                        }) {
-                            completeness = BindingCompleteness::Complete;
-                        }
+                        completeness = BindingCompleteness::Complete;
                         for (k, v) in &present.state().attributes {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                        match managed_stability.get(&resource.id) {
+                            None | Some(ManagedBindingStability::NoPlannedEffect) => {}
+                            Some(ManagedBindingStability::Updating {
+                                non_definitive_attributes: attributes,
+                            }) => non_definitive_attributes.extend(attributes.iter().cloned()),
+                            Some(ManagedBindingStability::Unavailable) => {
+                                completeness = BindingCompleteness::Incomplete;
+                            }
                         }
                     }
                     crate::resource::Current::CreateInFlight(_pending) => {}
                     crate::resource::Current::MissingIdentifier(unidentified) => {
-                        let snapshot_matches_desired =
-                            resource.attributes.iter().all(|(key, desired)| {
-                                unidentified
-                                    .state()
-                                    .attributes
-                                    .get(key)
-                                    .is_none_or(|current| desired.semantically_equal(current))
-                            });
-                        if snapshot_matches_desired {
-                            // The row is not complete enough to prove a
-                            // missing output absent, but concrete values it
-                            // already carries are usable unless an observable
-                            // desired input changed.
-                            definitive_attributes
-                                .extend(unidentified.state().attributes.keys().cloned());
-                        }
                         for (k, v) in &unidentified.state().attributes {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
                         }
@@ -1527,6 +1536,7 @@ impl ResolvedBindings {
                     source: BindingValueSource::Local,
                     completeness,
                     definitive_attributes,
+                    non_definitive_attributes,
                 },
             );
         }
@@ -1539,6 +1549,7 @@ impl ResolvedBindings {
                     source: BindingValueSource::Upstream,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes: HashSet::new(),
+                    non_definitive_attributes: HashSet::new(),
                 },
             );
         }
@@ -1558,6 +1569,7 @@ impl ResolvedBindings {
             let snapshot = target_entry.attributes.clone();
             let completeness = target_entry.completeness;
             let definitive_attributes = target_entry.definitive_attributes.clone();
+            let non_definitive_attributes = target_entry.non_definitive_attributes.clone();
             self.by_name.insert(
                 spec.binding.as_str().to_string(),
                 ResolvedBinding {
@@ -1567,6 +1579,7 @@ impl ResolvedBindings {
                     },
                     completeness,
                     definitive_attributes,
+                    non_definitive_attributes,
                 },
             );
         }
@@ -1612,15 +1625,11 @@ impl ResolvedBindings {
         &mut self,
         compositions: &[Composition],
     ) -> Result<(), String> {
-        self.layer_compositions(compositions, BindingCompleteness::Complete);
+        self.layer_compositions(compositions);
         Ok(())
     }
 
-    fn layer_compositions(
-        &mut self,
-        compositions: &[Composition],
-        completeness: BindingCompleteness,
-    ) {
+    fn layer_compositions(&mut self, compositions: &[Composition]) {
         for v in compositions.iter() {
             let Some(binding_name) = v.binding.as_ref() else {
                 continue;
@@ -1637,8 +1646,9 @@ impl ResolvedBindings {
                 ResolvedBinding {
                     attributes: crate::resource::attrs_to_hashmap(&value_attrs),
                     source: BindingValueSource::Local,
-                    completeness,
+                    completeness: BindingCompleteness::Complete,
                     definitive_attributes,
+                    non_definitive_attributes: HashSet::new(),
                 },
             );
         }
@@ -1725,6 +1735,7 @@ impl ResolvedBindings {
                     source: BindingValueSource::Local,
                     completeness,
                     definitive_attributes,
+                    non_definitive_attributes: HashSet::new(),
                 },
             );
         }
@@ -1744,24 +1755,67 @@ impl ResolvedBindings {
 
     pub fn attribute_is_definitive(&self, name: &str, attribute: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
-            binding.completeness == BindingCompleteness::Complete
-                || binding.definitive_attributes.contains(attribute)
+            !binding.non_definitive_attributes.contains(attribute)
+                && (binding.completeness == BindingCompleteness::Complete
+                    || binding.definitive_attributes.contains(attribute))
         })
     }
 
+    pub fn binding_is_fully_definitive(&self, name: &str) -> bool {
+        self.by_name.get(name).is_some_and(|binding| {
+            binding.completeness == BindingCompleteness::Complete
+                && binding.non_definitive_attributes.is_empty()
+        })
+    }
+
+    /// Apply the final plan's managed-resource effects to an existing binding
+    /// view. This is the authoritative post-diff refinement used by export
+    /// checks and apply scheduling; it also includes cascade-generated updates
+    /// that a pre-expansion differ projection cannot know about.
+    pub fn apply_plan_stability(
+        &mut self,
+        managed: &[Resource],
+        managed_current: &HashMap<ResourceId, PlanInputCurrent>,
+        plan: &crate::plan::Plan,
+        schemas: &crate::schema::SchemaRegistry,
+    ) {
+        let stability = managed_binding_stability_from_plan(managed, plan, schemas);
+        for resource in managed {
+            let Some(binding_name) = resource.binding.as_deref() else {
+                continue;
+            };
+            let Some(binding) = self.by_name.get_mut(binding_name) else {
+                continue;
+            };
+            match stability.get(&resource.id) {
+                None | Some(ManagedBindingStability::NoPlannedEffect) => {
+                    binding.non_definitive_attributes.clear();
+                    if managed_current.get(&resource.id).is_some_and(|current| {
+                        matches!(current.current(), crate::resource::Current::Present(_))
+                    }) {
+                        binding.completeness = BindingCompleteness::Complete;
+                    }
+                }
+                Some(ManagedBindingStability::Updating {
+                    non_definitive_attributes,
+                }) => {
+                    binding.completeness = BindingCompleteness::Complete;
+                    binding.non_definitive_attributes = non_definitive_attributes.clone();
+                }
+                Some(ManagedBindingStability::Unavailable) => {
+                    binding.completeness = BindingCompleteness::Incomplete;
+                    binding.non_definitive_attributes.clear();
+                }
+            }
+        }
+    }
+
     pub fn access_miss_policy_for_value(&self, value: &Value) -> crate::resource::AccessMissPolicy {
-        let mut complete = true;
-        value.visit_resource_refs(&mut |path| {
-            complete &= self
-                .by_name
-                .get(path.binding())
-                .is_some_and(|binding| binding.completeness == BindingCompleteness::Complete);
-        });
-        value.visit_binding_refs(&mut |name| {
-            complete &= self
-                .by_name
-                .get(name)
-                .is_some_and(|binding| binding.completeness == BindingCompleteness::Complete);
+        let complete = value.root_bindings().iter().all(|name| {
+            self.by_name.get(name).is_some_and(|binding| {
+                binding.completeness == BindingCompleteness::Complete
+                    && binding.non_definitive_attributes.is_empty()
+            })
         });
         if complete {
             crate::resource::AccessMissPolicy::Error
@@ -1802,6 +1856,7 @@ impl ResolvedBindings {
                 source: BindingValueSource::Local,
                 completeness: BindingCompleteness::Complete,
                 definitive_attributes: HashSet::new(),
+                non_definitive_attributes: HashSet::new(),
             },
         );
     }
@@ -1842,6 +1897,7 @@ impl ResolvedBindings {
                 source,
                 completeness,
                 definitive_attributes,
+                non_definitive_attributes: HashSet::new(),
             },
         );
     }
@@ -1856,17 +1912,79 @@ impl ResolvedBindings {
     /// `IterableBindings`: a deferred-for iterable resolves against the
     /// exact post-refresh view every non-loop `ResourceRef` resolves
     /// against (carina#3132 — one resolution timing, no upstream-only
-    /// carve-out). The projection is a verbatim clone of the merged
-    /// maps; no new join logic.
-    pub fn project_iterable_bindings(&self) -> IterableBindings {
+    /// carve-out). The projection borrows the already-built merged view; no
+    /// per-call clone or second join exists.
+    pub fn project_iterable_bindings(&self) -> IterableBindings<'_> {
         IterableBindings {
-            by_binding: self
-                .by_name
-                .iter()
-                .map(|(name, rb)| (name.clone(), rb.clone()))
-                .collect(),
+            bindings: std::borrow::Cow::Borrowed(self),
         }
     }
+}
+
+pub fn managed_binding_stability_from_plan(
+    managed: &[Resource],
+    plan: &crate::plan::Plan,
+    schemas: &crate::schema::SchemaRegistry,
+) -> HashMap<ResourceId, ManagedBindingStability> {
+    use crate::effect::Effect;
+    use crate::schema::SchemaKind;
+
+    let managed_ids: HashSet<&ResourceId> = managed.iter().map(|resource| &resource.id).collect();
+    let mut result: HashMap<ResourceId, ManagedBindingStability> = managed
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                ManagedBindingStability::NoPlannedEffect,
+            )
+        })
+        .collect();
+    for effect in plan.effects() {
+        match effect {
+            Effect::Update {
+                to,
+                changed_attributes,
+                ..
+            } if managed_ids.contains(&to.id) => {
+                let mut non_definitive_attributes: HashSet<String> =
+                    changed_attributes.iter().cloned().collect();
+                if let Some(schema) =
+                    schemas.get(&to.id.provider, &to.id.resource_type, SchemaKind::Resource)
+                {
+                    non_definitive_attributes.extend(
+                        schema
+                            .read_only_attributes()
+                            .into_iter()
+                            .map(str::to_string),
+                    );
+                }
+                result.insert(
+                    to.id.clone(),
+                    ManagedBindingStability::Updating {
+                        non_definitive_attributes,
+                    },
+                );
+            }
+            Effect::Create(resource) if managed_ids.contains(&resource.id) => {
+                result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
+            }
+            Effect::ResumeCreate { resource, .. } if managed_ids.contains(&resource.id) => {
+                result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
+            }
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => {}
+        }
+    }
+    result
 }
 
 /// The set of every binding a deferred-for iterable may legally
@@ -1884,12 +2002,20 @@ impl ResolvedBindings {
 /// or the explicitly-named [`Self::from_upstream_only`] for the
 /// upstream-only unit tests — makes "iterable resolved against the wrong
 /// map" unrepresentable.
-#[derive(Debug, Default, Clone)]
-pub struct IterableBindings {
-    by_binding: HashMap<String, ResolvedBinding>,
+#[derive(Debug, Clone)]
+pub struct IterableBindings<'a> {
+    bindings: std::borrow::Cow<'a, ResolvedBindings>,
 }
 
-impl IterableBindings {
+impl Default for IterableBindings<'_> {
+    fn default() -> Self {
+        Self {
+            bindings: std::borrow::Cow::Owned(ResolvedBindings::default()),
+        }
+    }
+}
+
+impl<'a> IterableBindings<'a> {
     /// Construct from an upstream-only binding map.
     ///
     /// Named to make the upstream-only nature explicit at the call site:
@@ -1900,53 +2026,48 @@ impl IterableBindings {
     /// iterable path with hand-built bindings.
     pub fn from_upstream_only(remote_bindings: HashMap<String, HashMap<String, Value>>) -> Self {
         Self {
-            by_binding: remote_bindings
-                .into_iter()
-                .map(|(name, attributes)| {
-                    (
-                        name,
-                        ResolvedBinding {
-                            attributes,
-                            source: BindingValueSource::Upstream,
-                            completeness: BindingCompleteness::Complete,
-                            definitive_attributes: HashSet::new(),
-                        },
-                    )
-                })
-                .collect(),
+            bindings: std::borrow::Cow::Owned(ResolvedBindings {
+                by_name: remote_bindings
+                    .into_iter()
+                    .map(|(name, attributes)| {
+                        (
+                            name,
+                            ResolvedBinding {
+                                attributes,
+                                source: BindingValueSource::Upstream,
+                                completeness: BindingCompleteness::Complete,
+                                definitive_attributes: HashSet::new(),
+                                non_definitive_attributes: HashSet::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+            }),
         }
     }
 
     /// Resolve a binding's attribute map (the iterable's source).
     pub fn get(&self, binding: &str) -> Option<&HashMap<String, Value>> {
-        self.by_binding.get(binding).map(|entry| &entry.attributes)
+        self.bindings.get(binding)
     }
 
     /// Provenance of the iterable container. Expansion uses this to retain
     /// missing local desired-side fields while treating loaded upstream data
     /// as final.
     pub fn source(&self, binding: &str) -> Option<&BindingValueSource> {
-        self.by_binding.get(binding).map(|entry| &entry.source)
+        self.bindings.source(binding)
     }
 
     /// Resolve a complete deferred iterable through the same three-state
     /// evaluator used by ordinary resource attributes.
     pub fn resolve_value(&self, value: &Value) -> Result<crate::resolver::ValueResolution, String> {
-        crate::resolver::resolve_ref_value_status(
-            value,
-            &ResolvedBindings {
-                by_name: self.by_binding.clone(),
-            },
-        )
+        crate::resolver::resolve_ref_value_status(value, self.bindings.as_ref())
     }
 
     /// Missing selections may be treated as final only when every binding
     /// reachable from the iterable is complete.
     pub fn access_miss_policy(&self, value: &Value) -> crate::resource::AccessMissPolicy {
-        ResolvedBindings {
-            by_name: self.by_binding.clone(),
-        }
-        .access_miss_policy_for_value(value)
+        self.bindings.as_ref().access_miss_policy_for_value(value)
     }
 }
 

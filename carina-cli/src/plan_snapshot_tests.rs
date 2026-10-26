@@ -2417,8 +2417,6 @@ fn snapshot_top_level_sigil_alignment() {
         )],
         binding_name: "validation_records".to_string(),
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
         binding: ForBinding::Simple("option".to_string()),
         template_resource: deferred_template,
     };

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingCompleteness, BindingValueSource, ResolvedBindings};
+use crate::binding_index::{BindingValueSource, ResolvedBindings};
 #[cfg(test)]
 use crate::resource::State;
 use crate::resource::{
@@ -436,35 +436,6 @@ fn binding_access_miss_policy(binding: &str, bindings: &ResolvedBindings) -> Acc
     }
 }
 
-pub(crate) fn value_is_fully_resolved(value: &Value) -> bool {
-    match value {
-        Value::Concrete(ConcreteValue::List(values)) => values.iter().all(value_is_fully_resolved),
-        Value::Concrete(ConcreteValue::Map(values)) => values.values().all(value_is_fully_resolved),
-        Value::Deferred(DeferredValue::Secret(inner)) => value_is_fully_resolved(inner),
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
-        Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Coalesce { .. }
-            | DeferredValue::Interpolation(_)
-            | DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Access(_)
-            | DeferredValue::Unknown(_),
-        ) => false,
-    }
-}
-
 fn missing_access(error: &ValueAccessError) -> bool {
     matches!(
         error,
@@ -481,33 +452,34 @@ fn resolve_ref_value_status_inner(
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
-        }) => match resolve_ref_value_status_inner(left, bindings, config)? {
-            ValueResolution::Present(value) => Ok(ValueResolution::Present(value)),
-            ValueResolution::Absent => resolve_ref_value_status_inner(default, bindings, config),
-            ValueResolution::Unknown(_) => Ok(ValueResolution::Unknown(value.clone())),
-        },
+        }) => {
+            let left_resolution = if left.is_coalesce_optional_reference() {
+                resolve_ref_value_status_inner(left, bindings, config)?
+            } else {
+                resolve_required_value_status(left, bindings, config)?
+            };
+            match left_resolution {
+                ValueResolution::Present(value) => Ok(ValueResolution::Present(value)),
+                ValueResolution::Absent => resolve_required_value_status(default, bindings, config),
+                ValueResolution::Unknown(_) => Ok(ValueResolution::Unknown(value.clone())),
+            }
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding = path.binding();
-            let completeness = bindings.completeness(binding);
             let Some(attributes) = bindings.get(binding) else {
                 return Ok(ValueResolution::Unknown(value.clone()));
-            };
-            let Some(attribute) = attributes.get(path.attribute()) else {
-                return Ok(match completeness {
-                    Some(BindingCompleteness::Complete) => ValueResolution::Absent,
-                    Some(BindingCompleteness::Incomplete) | None => {
-                        ValueResolution::Unknown(value.clone())
-                    }
-                });
             };
             let attribute_is_definitive =
                 bindings.attribute_is_definitive(binding, path.attribute());
             if !attribute_is_definitive {
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
+            let Some(attribute) = attributes.get(path.attribute()) else {
+                return Ok(ValueResolution::Absent);
+            };
 
             let mut resolved = resolve_ref_value_inner(attribute, bindings, config)?;
-            if !value_is_fully_resolved(&resolved) {
+            if !resolved.is_fully_resolved() {
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
             for segment in path.segments() {
@@ -519,7 +491,7 @@ fn resolve_ref_value_status_inner(
                 ) {
                     Ok(ValuePathSegmentResult::Resolved(next)) => {
                         resolved = resolve_ref_value_inner(&next, bindings, config)?;
-                        if !value_is_fully_resolved(&resolved) {
+                        if !resolved.is_fully_resolved() {
                             return Ok(ValueResolution::Unknown(value.clone()));
                         }
                     }
@@ -542,7 +514,7 @@ fn resolve_ref_value_status_inner(
             let Some(attributes) = bindings.get(binding) else {
                 return Ok(ValueResolution::Unknown(value.clone()));
             };
-            if bindings.completeness(binding) != Some(BindingCompleteness::Complete) {
+            if !bindings.binding_is_fully_definitive(binding) {
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
             let mut keys = attributes.keys().collect::<Vec<_>>();
@@ -552,7 +524,7 @@ fn resolve_ref_value_status_inner(
                 .map(|key| (key.clone(), attributes[key].clone()))
                 .collect();
             let resolved = Value::Concrete(ConcreteValue::Map(values));
-            if value_is_fully_resolved(&resolved) {
+            if resolved.is_fully_resolved() {
                 Ok(ValueResolution::Present(resolved))
             } else {
                 Ok(ValueResolution::Unknown(value.clone()))
@@ -585,12 +557,27 @@ fn resolve_ref_value_status_inner(
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(ValueResolution::Unknown(value.clone())),
         _ => {
             let resolved = resolve_ref_value_inner(value, bindings, config)?;
-            if !value_is_fully_resolved(&resolved) {
+            if !resolved.is_fully_resolved() {
                 Ok(ValueResolution::Unknown(resolved))
             } else {
                 Ok(ValueResolution::Present(resolved))
             }
         }
+    }
+}
+
+/// Resolve a required expression without interpreting a direct miss as the
+/// absence of an enclosing coalesce operand.
+fn resolve_required_value_status(
+    value: &Value,
+    bindings: &ResolvedBindings,
+    config: Option<&crate::parser::ProviderContext>,
+) -> Result<ValueResolution, String> {
+    let resolved = resolve_ref_value_inner(value, bindings, config)?;
+    if resolved.is_fully_resolved() {
+        Ok(ValueResolution::Present(resolved))
+    } else {
+        Ok(ValueResolution::Unknown(resolved))
     }
 }
 
@@ -603,6 +590,10 @@ fn resolve_ref_value_inner(
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             match resolve_ref_value_status_inner(value, bindings, config)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
+                // Keep the original expression if a future resolver adds an
+                // absent default form. Residual coalesces are rejected at
+                // provider/state boundaries, so this cannot silently cross a
+                // concrete-value boundary.
                 ValueResolution::Absent => Ok(value.clone()),
             }
         }
@@ -677,7 +668,8 @@ fn resolve_ref_value_inner(
 
             // Check if all args are fully resolved (no remaining refs)
             let all_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some() || argument.value().is_some_and(value_is_fully_resolved)
+                argument.handle().is_some()
+                    || argument.value().is_some_and(Value::is_fully_resolved)
             });
 
             if all_resolved {
@@ -727,7 +719,8 @@ fn resolve_ref_value_inner(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let all_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some() || argument.value().is_some_and(value_is_fully_resolved)
+                argument.handle().is_some()
+                    || argument.value().is_some_and(Value::is_fully_resolved)
             });
             if !all_resolved {
                 return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
@@ -784,6 +777,7 @@ mod tests {
     use super::*;
     use crate::binding_index::BindingCompleteness;
     use crate::resource::ResourceId;
+    use std::collections::HashSet;
 
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
         let mut r = Resource::new(
@@ -932,7 +926,13 @@ mod tests {
         let resource = make_resource(
             "up-resource",
             Some("up"),
-            vec![("name", Value::Concrete(ConcreteValue::String("new".into())))],
+            vec![
+                ("name", Value::Concrete(ConcreteValue::String("new".into()))),
+                (
+                    "stable",
+                    Value::Concrete(ConcreteValue::String("same".into())),
+                ),
+            ],
         );
         let state = State::existing(
             resource.id.clone(),
@@ -947,6 +947,10 @@ mod tests {
                         ConcreteValue::String("old-account".into()),
                     )])),
                 ),
+                (
+                    "stable".to_string(),
+                    Value::Concrete(ConcreteValue::String("same".into())),
+                ),
             ]),
         )
         .with_identifier("up-id");
@@ -955,27 +959,36 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
             std::slice::from_ref(&resource),
         );
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
-            managed: std::slice::from_ref(&resource),
-            compositions: &[],
-            data_sources: &[],
-            managed_current: &current,
-            data_source_states: &HashMap::new(),
-            remote_bindings: &HashMap::new(),
-            wait_aliases: &[],
-        });
+        let stability = HashMap::from([(
+            resource.id.clone(),
+            crate::binding_index::ManagedBindingStability::Updating {
+                non_definitive_attributes: HashSet::from([
+                    "name".to_string(),
+                    "accounts".to_string(),
+                ]),
+            },
+        )]);
+        let bindings = ResolvedBindings::pre_apply_with_stability(
+            crate::binding_index::PreApplyInputs {
+                managed: std::slice::from_ref(&resource),
+                compositions: &[],
+                data_sources: &[],
+                managed_current: &current,
+                data_source_states: &HashMap::new(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            },
+            &stability,
+        );
 
+        let changed = coalesce(
+            Value::resource_ref("up", "name", vec![]),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
         assert_eq!(
-            resolve_ref_value_status(
-                &coalesce(
-                    Value::resource_ref("up", "name", vec![]),
-                    Value::Concrete(ConcreteValue::String("fallback".into())),
-                ),
-                &bindings,
-            ),
-            Ok(ValueResolution::Present(Value::Concrete(
-                ConcreteValue::String("new".into()),
-            ))),
+            resolve_ref_value_status(&changed, &bindings),
+            Ok(ValueResolution::Unknown(changed)),
+            "an attribute changed by the planned update is not definitive before apply",
         );
 
         let provisional = coalesce(
@@ -985,6 +998,94 @@ mod tests {
         assert_eq!(
             resolve_ref_value_status(&provisional, &bindings),
             Ok(ValueResolution::Unknown(provisional)),
+        );
+
+        assert_eq!(
+            resolve_ref_value_status(
+                &coalesce(
+                    Value::resource_ref("up", "stable", vec![]),
+                    Value::Concrete(ConcreteValue::String("fallback".into())),
+                ),
+                &bindings,
+            ),
+            Ok(ValueResolution::Present(Value::Concrete(
+                ConcreteValue::String("same".into()),
+            ))),
+            "an unchanged attribute remains definitive during an update",
+        );
+        let missing_default = Value::Concrete(ConcreteValue::String("fallback".into()));
+        assert_eq!(
+            resolve_ref_value_status(
+                &coalesce(
+                    Value::resource_ref("up", "unrelated_optional", vec![]),
+                    missing_default.clone(),
+                ),
+                &bindings,
+            ),
+            Ok(ValueResolution::Present(missing_default)),
+            "absence of an attribute the update cannot change remains definitive",
+        );
+    }
+
+    #[test]
+    fn unchanged_ref_authored_producer_has_complete_refreshed_outputs() {
+        let source = make_resource(
+            "source",
+            Some("source"),
+            vec![(
+                "name",
+                Value::Concrete(ConcreteValue::String("seed".into())),
+            )],
+        );
+        let producer = make_resource(
+            "producer",
+            Some("producer"),
+            vec![("parent_name", Value::resource_ref("source", "name", vec![]))],
+        );
+        let source_state = State::existing(
+            source.id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("seed".into())),
+            )]),
+        )
+        .with_identifier("source-id");
+        let producer_state = State::existing(
+            producer.id.clone(),
+            HashMap::from([(
+                "parent_name".to_string(),
+                Value::Concrete(ConcreteValue::String("seed".into())),
+            )]),
+        )
+        .with_identifier("producer-id");
+        let resources = [source, producer];
+        let current = crate::resource::into_plan_input_current_map_from_states(
+            HashMap::from([
+                (resources[0].id.clone(), source_state),
+                (resources[1].id.clone(), producer_state),
+            ]),
+            &crate::schema::SchemaRegistry::new(),
+            &resources,
+        );
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &resources,
+            compositions: &[],
+            data_sources: &[],
+            managed_current: &current,
+            data_source_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        let fallback = Value::Concrete(ConcreteValue::String("d".into()));
+        let expression = coalesce(
+            Value::resource_ref("producer", "comment", vec![]),
+            fallback.clone(),
+        );
+
+        assert_eq!(
+            resolve_ref_value_status(&expression, &bindings),
+            Ok(ValueResolution::Present(fallback)),
+            "a successful refresh with no planned effect makes a missing output definitively absent",
         );
     }
 
@@ -1042,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_treats_missing_field_on_resolved_computed_value_as_absent() {
+    fn coalesce_does_not_treat_missing_field_on_computed_value_as_optional() {
         use crate::resource::{AccessMissPolicy, PathSegment, apply_postfix_access};
 
         let mut choices = IndexMap::new();
@@ -1085,12 +1186,9 @@ mod tests {
             BindingValueSource::Upstream,
         );
 
-        assert_eq!(
-            resolve_ref_value_status(&expression, &bindings),
-            Ok(ValueResolution::Present(Value::Concrete(
-                ConcreteValue::String("fallback".into()),
-            ))),
-        );
+        let error = resolve_ref_value_status(&expression, &bindings)
+            .expect_err("only an access chain rooted at a reference is optional");
+        assert!(error.contains("missing"), "unexpected error: {error}");
     }
 
     #[test]

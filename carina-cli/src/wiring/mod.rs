@@ -1980,7 +1980,6 @@ impl RefreshableChildIds {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredCreateTarget {
     pub id: ResolvedResourceId,
-    pub upstream_binding: String,
     pub template: carina_core::parser::DeferredForExpression,
 }
 
@@ -1999,7 +1998,6 @@ impl DeferredCreateTarget {
         );
         Some(Self {
             id,
-            upstream_binding: deferred.iterable_binding.clone(),
             template: deferred.clone(),
         })
     }
@@ -2007,7 +2005,6 @@ impl DeferredCreateTarget {
     fn to_effect(&self) -> Effect {
         Effect::DeferredCreate {
             id: self.id.clone(),
-            upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
         }
     }
@@ -2016,7 +2013,6 @@ impl DeferredCreateTarget {
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
             id: self.id.clone(),
-            upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
         }))
     }
@@ -2050,6 +2046,70 @@ pub struct DeferredForExpansion {
     /// this to avoid adding a second, spurious blank line on the
     /// deferred-for-with-warnings TTY path (#3150 Round-4 finding).
     pub printed_warnings: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn derive_managed_binding_stability<E>(
+    parsed: &carina_core::parser::File<E>,
+    resources: &[Resource],
+    managed_current: &HashMap<ResourceId, Current>,
+    data_source_states: &HashMap<ResourceId, State>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[WaitAliasSpec],
+) -> Result<HashMap<ResourceId, carina_core::binding_index::ManagedBindingStability>, AppError> {
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        managed_current.clone(),
+        schemas,
+        resources,
+    );
+    let optimistic_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: resources,
+        compositions: &parsed.compositions,
+        data_sources: &parsed.data_sources,
+        managed_current: &plan_input_current,
+        data_source_states,
+        remote_bindings,
+        wait_aliases,
+    });
+    let mut resolved = resources.to_vec();
+    carina_core::resolver::resolve_refs_for_plan(
+        &mut resolved,
+        &optimistic_bindings,
+        &parsed.upstream_binding_names(),
+    )
+    .map_err(AppError::Validation)?;
+    // Identity derivation runs later in the plan pipeline. Pending resources
+    // cannot have a refreshed row addressed to them yet, so they are
+    // conservatively unavailable; resolved resources can be diffed normally.
+    let mut pending_stability = HashMap::new();
+    let resolved = resolved
+        .into_iter()
+        .filter_map(|resource| {
+            let id = resource.id.clone();
+            match ResolvedResource::try_new(resource) {
+                Some(resource) => Some(resource),
+                None => {
+                    pending_stability.insert(
+                        id,
+                        carina_core::binding_index::ManagedBindingStability::Unavailable,
+                    );
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut stability = carina_core::differ::managed_binding_stability(
+        &resolved,
+        &plan_input_current,
+        schemas,
+        saved_attrs,
+        prev_explicit,
+    );
+    stability.extend(pending_stability);
+    Ok(stability)
 }
 
 /// Pure core of the carina#3132 fix: project the post-refresh
@@ -2093,6 +2153,8 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     managed_current: &HashMap<ResourceId, Current>,
     data_source_states: &HashMap<ResourceId, State>,
     schemas: &carina_core::schema::SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
     moved_targets: &HashSet<ResourceId>,
@@ -2115,20 +2177,35 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         });
     }
 
-    let iterable_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
-        managed: sorted_resources,
-        compositions: &parsed.compositions,
-        data_sources: &parsed.data_sources,
-        managed_current: &carina_core::resource::into_plan_input_current_map(
-            managed_current.clone(),
-            schemas,
-            sorted_resources,
-        ),
+    let managed_stability = derive_managed_binding_stability(
+        parsed,
+        sorted_resources,
+        managed_current,
         data_source_states,
+        schemas,
+        saved_attrs,
+        prev_explicit,
         remote_bindings,
         wait_aliases,
-    })
-    .project_iterable_bindings();
+    )?;
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        managed_current.clone(),
+        schemas,
+        sorted_resources,
+    );
+    let resolved_bindings = ResolvedBindings::pre_apply_with_stability(
+        PreApplyInputs {
+            managed: sorted_resources,
+            compositions: &parsed.compositions,
+            data_sources: &parsed.data_sources,
+            managed_current: &plan_input_current,
+            data_source_states,
+            remote_bindings,
+            wait_aliases,
+        },
+        &managed_stability,
+    );
+    let iterable_bindings = resolved_bindings.project_iterable_bindings();
 
     let mut deferred_create_targets = Vec::new();
     let pre_expandable_deferred_for: Vec<_> = parsed
@@ -2293,6 +2370,7 @@ pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormal
     /// its pipeline — `hydrate_read_state` is idempotent, so passing it here
     /// and re-hydrating downstream of this function is safe.
     pub saved_attrs: &'a LiftedSavedAttrs,
+    pub prev_explicit: &'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub multi: &'a indicatif::MultiProgress,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
 }
@@ -2318,6 +2396,8 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
         inputs.managed_current,
         inputs.data_source_states,
         inputs.schemas,
+        inputs.saved_attrs,
+        inputs.prev_explicit,
         inputs.remote_bindings,
         inputs.wait_aliases,
         inputs.moved_targets,
@@ -2739,6 +2819,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &managed_current,
         &data_source_states,
         ctx.schemas(),
+        &saved_attrs,
+        &prev_explicit,
         remote_bindings,
         &wait_aliases,
         &moved_targets,
@@ -2828,18 +2910,24 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // attribute referencing `<module_instance>.<attr>` (a composition)
     // chains through to the managed sibling literal instead of
     // surviving as an unresolved `ResourceRef` (carina#3246).
-    let upstream_binding_names: std::collections::HashSet<&str> = parsed
-        .upstream_states
-        .iter()
-        .map(|upstream| upstream.binding.as_str())
-        .chain(remote_bindings.keys().map(String::as_str))
-        .collect();
+    let upstream_binding_names = parsed.upstream_binding_names();
+    let managed_stability = derive_managed_binding_stability(
+        parsed,
+        &sorted_resources,
+        &managed_current,
+        &data_source_states,
+        ctx.schemas(),
+        &saved_attrs,
+        &prev_explicit,
+        remote_bindings,
+        &wait_aliases,
+    )?;
     let pre_apply_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         ctx.schemas(),
         &sorted_resources,
     );
-    let mut override_aware_resources = OverrideAwareResources::build_for_plan(
+    let mut override_aware_resources = OverrideAwareResources::build_for_plan_with_stability(
         sorted_resources,
         state_file.as_ref(),
         PreApplyInputs {
@@ -2852,25 +2940,28 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             wait_aliases: &wait_aliases,
         },
         &upstream_binding_names,
+        &managed_stability,
     )?;
     crate::legacy_name_overrides::emit_legacy_override_warnings(
         &override_aware_resources,
         state_file.as_ref(),
     );
-    let unresolved_override_aware_resources = OverrideAwareResources::build_for_plan(
-        unresolved_resources.to_vec(),
-        state_file.as_ref(),
-        PreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            data_sources: &data_sources,
-            managed_current: &pre_apply_current,
-            data_source_states: &data_source_states,
-            remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &upstream_binding_names,
-    )?;
+    let unresolved_override_aware_resources =
+        OverrideAwareResources::build_for_plan_with_stability(
+            unresolved_resources.to_vec(),
+            state_file.as_ref(),
+            PreApplyInputs {
+                managed: &[],
+                compositions: &parsed.compositions,
+                data_sources: &data_sources,
+                managed_current: &pre_apply_current,
+                data_source_states: &data_source_states,
+                remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+            &upstream_binding_names,
+            &managed_stability,
+        )?;
     // Resolve and canonicalize only refresh-time data sources. Deferred
     // reads keep their original input refs so the plan/executor dependency
     // graph still contains the upstream create edge.
@@ -2970,7 +3061,16 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         ctx.schemas(),
         override_aware_resources.resources(),
     );
-    override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+    let stability_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let managed_stability = carina_core::differ::managed_binding_stability(
+        &stability_resources,
+        &reconciled_input_current,
+        ctx.schemas(),
+        &saved_attrs,
+        &prev_explicit,
+    );
+    override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
             data_sources: &data_sources,
@@ -2979,6 +3079,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             remote_bindings,
             wait_aliases: &wait_aliases,
         },
+        &managed_stability,
     );
 
     // Update ordering looks directives up only for Update effects. Orphan
@@ -3012,6 +3113,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     )?;
     add_deposed_delete_effects(&mut plan, state_file, &moved_pairs);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
+    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, ctx.schemas());
 
     // Add state block effects (import/removed/moved) only after both the
     // differ and deposed-generation pass have emitted identifier errors.

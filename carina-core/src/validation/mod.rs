@@ -316,12 +316,12 @@ fn visit_refs_with_sink_inner<'a>(
             visit_refs_with_sink_inner(inner, sink, usage, f)
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            visit_refs_with_sink_inner(
-                value,
-                sink,
-                crate::resource::ResourceRefUsage::CoalesceValue,
-                f,
-            );
+            let value_usage = if value.is_coalesce_optional_reference() {
+                crate::resource::ResourceRefUsage::CoalesceValue
+            } else {
+                crate::resource::ResourceRefUsage::Required
+            };
+            visit_refs_with_sink_inner(value, sink, value_usage, f);
             visit_refs_with_sink_inner(
                 default,
                 sink,

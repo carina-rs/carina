@@ -13,7 +13,10 @@ use std::collections::{BTreeSet, HashMap};
 use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
-use crate::resource::{Composition, ConcreteValue, Resource, ResourceId, Signature, State, Value};
+use crate::resolver::{ValueResolution, resolve_ref_value_status};
+use crate::resource::{
+    Composition, ConcreteValue, DeferredValue, Resource, ResourceId, Signature, State, Value,
+};
 
 fn s(s: &str) -> Value {
     Value::Concrete(ConcreteValue::String(s.into()))
@@ -124,6 +127,31 @@ fn pre_apply_skips_resources_without_binding() {
         wait_aliases: &[],
     });
     assert!(bindings.get("a").is_none());
+}
+
+#[test]
+fn pre_apply_composition_is_complete_for_coalesce_absence() {
+    let composition = make_virtual("module", &[("present", s("value"))]);
+    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        managed: &[],
+        compositions: &[composition],
+        data_sources: &[],
+        managed_current: &HashMap::new(),
+        data_source_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let fallback = s("fallback");
+    let expression = Value::Deferred(DeferredValue::Coalesce {
+        value: Box::new(Value::resource_ref("module", "missing", Vec::new())),
+        default: Box::new(fallback.clone()),
+    });
+
+    assert_eq!(
+        resolve_ref_value_status(&expression, &bindings),
+        Ok(ValueResolution::Present(fallback)),
+        "a composition is fully authored, so a missing attribute is definitive absence",
+    );
 }
 
 #[test]

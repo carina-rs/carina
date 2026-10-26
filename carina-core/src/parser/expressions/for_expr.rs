@@ -301,18 +301,6 @@ pub(crate) fn parse_for_expr(
                 }
             };
 
-            // Transitional display/effect metadata names the first reference;
-            // semantic resolution and dependency walking use `iterable`.
-            let mut first_path = None;
-            iterable.visit_resource_refs(&mut |path| {
-                if first_path.is_none() {
-                    first_path = Some(path.clone());
-                }
-            });
-            let (iterable_binding, iterable_attr) = first_path
-                .map(|path| (path.binding().to_string(), path.attribute().to_string()))
-                .unwrap_or_default();
-
             // Try to parse the body once with placeholder values for the loop
             // variable(s) to extract the resource type and attribute template.
             let mut template_ctx = ctx.clone();
@@ -372,8 +360,6 @@ pub(crate) fn parse_for_expr(
                     attributes: attrs,
                     binding_name: binding_name.to_string(),
                     iterable: iterable.clone(),
-                    iterable_binding,
-                    iterable_attr,
                     binding: binding.clone(),
                     template_resource: *resource,
                 });
@@ -450,8 +436,6 @@ pub(crate) fn parse_for_expr(
                         attributes: attrs,
                         binding_name: binding_name.to_string(),
                         iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
-                        iterable_binding: s.clone(),
-                        iterable_attr: String::new(),
                         binding: binding.clone(),
                         template_resource: *resource,
                     });

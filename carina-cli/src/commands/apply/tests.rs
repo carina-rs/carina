@@ -7105,7 +7105,10 @@ mod apply_deferred_for_parity {
             )])),
         );
         let mut states = HashMap::new();
-        states.insert(cert.id.clone(), State::existing(cert.id.clone(), attrs));
+        states.insert(
+            cert.id.clone(),
+            State::existing(cert.id.clone(), attrs).with_identifier("cert-id"),
+        );
         states
     }
 
@@ -7143,6 +7146,9 @@ mod apply_deferred_for_parity {
             &crate::managed_current_from_states(states),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -7205,6 +7211,9 @@ mod apply_deferred_for_parity {
             &crate::managed_current_from_states(empty),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -7259,6 +7268,9 @@ mod apply_deferred_for_parity {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -7287,6 +7299,9 @@ mod apply_deferred_for_parity {
             &crate::managed_current_from_states(states),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,

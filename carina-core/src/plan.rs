@@ -1015,21 +1015,17 @@ fn format_effect_brief(effect: &Effect) -> String {
             identity,
             until_surface
         ),
-        Effect::DeferredCreate {
-            id,
-            upstream_binding,
-            ..
-        } => format!(
+        Effect::DeferredCreate { id, template, .. } => format!(
             "{} {} (deferred for: waits on {})",
             effect.display_glyph(),
             id,
-            upstream_binding
+            template.binding_description()
         ),
         Effect::DeferredReplace(payload) => format!(
             "{} {} (deferred for replace: waits on {})",
             effect.display_glyph(),
             payload.id,
-            payload.upstream_binding
+            payload.template.binding_description()
         ),
     }
 }
@@ -1287,8 +1283,6 @@ mod tests {
             attributes: Vec::new(),
             binding_name: "validation_records".to_string(),
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
         };
@@ -1301,7 +1295,6 @@ mod tests {
                 "route53.RecordSet",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         });
 
@@ -1333,8 +1326,6 @@ mod tests {
             attributes: Vec::new(),
             binding_name: "validation_records".to_string(),
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
         };
@@ -1363,7 +1354,6 @@ mod tests {
                 "route53.RecordSet",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(template),
         })));
 

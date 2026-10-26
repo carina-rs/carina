@@ -1727,19 +1727,10 @@ fn check_composition_argument_type(
 ///   `_domain_validation_options`) → instance-prefixed
 ///   unconditionally, exactly like `Resource.binding`, so each module
 ///   instance's loop resources are uniquely addressed.
-/// - `iterable_binding` (the iterable's root binding, e.g. `cert`) →
-///   instance-prefixed **only when it is a module-internal binding**,
-///   the same caller-collision guard [`rewrite_intra_module_refs`]
-///   applies to a `ResourceRef` head (a caller-provided binding that
-///   coincidentally shares a name must not be prefixed). This is a
-///   deliberate, more-correct divergence from the design doc's PR-B
-///   table (which prescribed an unconditional prefix); see the
-///   per-field comment in the body for why the design's cited
-///   `prefix_wait_binding` mirror is unsafe to copy here.
 /// - `attributes` and `template_resource` → the full module-resource
 ///   treatment via [`prefix_module_resource`] / the same
 ///   ref-rewrite + arg-substitute + canonicalize as `module.resources`.
-/// - `file`/`line`/`header`/`resource_type`/`iterable_attr`/`binding`
+/// - `file`/`line`/`header`/`resource_type`/`binding`
 ///   → provenance / display / non-binding / loop-local: pass through.
 fn prefix_deferred_for_expression(
     d: &DeferredForExpression,
@@ -1757,8 +1748,6 @@ fn prefix_deferred_for_expression(
         attributes,
         binding_name,
         iterable,
-        iterable_binding,
-        iterable_attr,
         binding,
         template_resource,
     } = d;
@@ -1795,30 +1784,6 @@ fn prefix_deferred_for_expression(
         // The full iterable is a value expression: rewrite every reference
         // and substitute module arguments in both coalesce operands.
         iterable: prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?,
-        // Iterable root binding — this IS a reference to an existing
-        // binding (`cert` in `for _, opt in cert.dvo`), so it takes
-        // the same caller-collision guard as a `ResourceRef` head in
-        // `rewrite_intra_module_refs`: prefix only when it names a
-        // module-internal binding. A caller-passed binding that
-        // coincidentally shares the name must NOT be prefixed.
-        //
-        // NB: this is a *deliberate, more-correct* divergence from the
-        // design doc's PR-B table, which prescribed an *unconditional*
-        // prefix "mirroring `prefix_wait_binding`'s lhs_segments[0]".
-        // That mirror is wrong: `prefix_wait_binding` prefixes the
-        // `until` LHS root unconditionally (a known pre-existing
-        // looseness, safe only because that root is virtually always
-        // the module-internal wait/resource binding). Copying it here
-        // would silently break a module that iterates a caller-passed
-        // binding. The `rewrite_intra_module_refs` model is the right
-        // one — do not "simplify" this back to unconditional.
-        iterable_binding: if intra_module_bindings.contains(iterable_binding) {
-            apply_instance_prefix(instance_prefix, iterable_binding)
-        } else {
-            iterable_binding.clone()
-        },
-        // attribute path tail — not a binding
-        iterable_attr: iterable_attr.clone(),
         // loop-var pattern kind — loop-local, not a module binding
         binding: binding.clone(),
         // Full module-resource treatment — identical to a

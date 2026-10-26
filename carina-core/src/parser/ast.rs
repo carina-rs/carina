@@ -46,17 +46,44 @@ pub struct DeferredForExpression {
     /// Complete iterable expression. This can remain a deferred coalesce until
     /// its referenced binding reaches a complete resolution boundary.
     pub iterable: Value,
-    /// The iterable access path segments (e.g., `["orgs", "accounts"]`).
-    /// Retained as display/scheduling metadata while effect payloads migrate
-    /// to dependency sets derived from `iterable`.
-    pub iterable_binding: String,
-    pub iterable_attr: String,
     /// Binding pattern — records the kind (Simple/Indexed/Map) so the expansion
     /// can verify the resolved iterable's shape matches and substitute the
     /// correct variable(s).
     pub binding: ForBinding,
     /// Template resource for expansion (the for body parsed with placeholders).
     pub template_resource: Resource,
+}
+
+impl DeferredForExpression {
+    /// Every binding that can affect the iterable, including references in a
+    /// coalesce fallback.
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+        self.iterable.root_bindings()
+    }
+
+    /// Every direct reference spelling that may contribute the iterable.
+    pub fn reference_candidates(&self) -> std::collections::BTreeSet<String> {
+        let mut candidates = std::collections::BTreeSet::new();
+        self.iterable.visit_resource_refs(&mut |path| {
+            candidates.insert(path.to_string());
+        });
+        self.iterable.visit_binding_refs(&mut |binding| {
+            candidates.insert(binding.to_string());
+        });
+        candidates
+    }
+
+    /// Compact description of the binding roots that must become available.
+    /// The full iterable spelling remains available through `format_value` for
+    /// unresolved expressions whose display should name the accessed value.
+    pub fn binding_description(&self) -> String {
+        let roots = self.root_bindings();
+        if roots.is_empty() {
+            crate::value::format_value(&self.iterable)
+        } else {
+            roots.into_iter().collect::<Vec<_>>().join(", ")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1810,6 +1837,15 @@ impl<E> File<E> {
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
     }
 
+    /// Names declared by `upstream_state`, independent of whether loading a
+    /// particular state produced a binding-map entry.
+    pub fn upstream_binding_names(&self) -> HashSet<&str> {
+        self.upstream_states
+            .iter()
+            .map(|upstream| upstream.binding.as_str())
+            .collect()
+    }
+
     /// Every non-variable binding name declared in the file.
     ///
     /// This intentionally excludes `variables`: parser-side variables
@@ -1947,7 +1983,7 @@ impl<E> File<E> {
     /// [`crate::binding_index::ResolvedBindings`] in.
     pub fn expand_deferred_for_expressions(
         &mut self,
-        bindings: &IterableBindings,
+        bindings: &IterableBindings<'_>,
     ) -> Result<(), DeferredForExpansionError> {
         let mut expanded_resources = Vec::new();
         let mut resolved_indices = Vec::new();
@@ -2158,14 +2194,9 @@ fn build_expanded_child(
         .template_resource
         .instantiate_with_identity(ResourceIdentity::new(address.clone()));
     resource.binding = Some(address);
-    deferred.iterable.visit_resource_refs(&mut |path| {
-        resource
-            .dependency_bindings
-            .insert(path.binding().to_string());
-    });
-    deferred.iterable.visit_binding_refs(&mut |binding| {
-        resource.dependency_bindings.insert(binding.to_string());
-    });
+    resource
+        .dependency_bindings
+        .extend(deferred.root_bindings());
     if let Err((attribute, error)) = substitute_attrs(&mut resource, index, key, item, miss_policy)
     {
         return Err(DeferredForExpansionError::ValueAccess {
@@ -2297,19 +2328,13 @@ fn substitute_placeholder_with_policy(
                 value,
                 miss_policy,
             ) {
-                Ok(()) if crate::resolver::value_is_fully_resolved(&resolved_left) => {
+                Ok(()) if resolved_left.is_fully_resolved() => {
                     // A present left operand wins without touching the fallback.
                     *v = resolved_left;
                 }
                 Ok(()) => {
                     let mut resolved_default = default.as_ref().clone();
-                    substitute_placeholder_with_policy(
-                        &mut resolved_default,
-                        index,
-                        key,
-                        value,
-                        miss_policy,
-                    )?;
+                    substitute_placeholder_lazily(&mut resolved_default, index, key, value);
                     *v = Value::Deferred(DeferredValue::Coalesce {
                         value: Box::new(resolved_left),
                         default: Box::new(resolved_default),
@@ -2369,6 +2394,105 @@ fn substitute_placeholder_with_policy(
         _ => {}
     }
     Ok(())
+}
+
+/// Substitute loop placeholders without evaluating any surrounding access or
+/// function. Used only for an unselected `??` fallback: the loop item must be
+/// captured now, but errors remain lazy until the fallback is selected.
+fn substitute_placeholder_lazily(
+    value: &mut Value,
+    index: Option<i64>,
+    key: Option<&str>,
+    item: &Value,
+) {
+    match value {
+        Value::Deferred(DeferredValue::Unknown(reason)) => match reason {
+            UnknownReason::ForValue => *value = item.clone(),
+            UnknownReason::ForKey => {
+                if let Some(key) = key {
+                    *value = Value::Concrete(ConcreteValue::String(key.to_string().into()));
+                }
+            }
+            UnknownReason::ForIndex => {
+                if let Some(index) = index {
+                    *value = Value::Concrete(ConcreteValue::Int(index));
+                }
+            }
+            UnknownReason::UpstreamExport { .. }
+            | UnknownReason::UpstreamAllExports { .. }
+            | UnknownReason::EmptyInterpolation
+            | UnknownReason::PostCreateReadIncomplete { .. }
+            | UnknownReason::FnParam { .. }
+            | UnknownReason::FnLocal { .. }
+            | UnknownReason::ModuleArgument { .. } => {}
+        },
+        Value::Concrete(ConcreteValue::List(values)) => {
+            for value in values {
+                substitute_placeholder_lazily(value, index, key, item);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            for value in values.values_mut() {
+                substitute_placeholder_lazily(value, index, key, item);
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let crate::resource::InterpolationPart::Expr(value) = part {
+                    substitute_placeholder_lazily(value, index, key, item);
+                }
+            }
+        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
+            for argument in args {
+                substitute_placeholder_lazily(argument.walker_value_mut(), index, key, item);
+            }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let access = access.clone();
+            let mut base = access.base().clone();
+            substitute_placeholder_lazily(&mut base, index, key, item);
+            *value = match access.rebuild_result(
+                base.clone(),
+                access.step().clone(),
+                crate::resource::AccessMissPolicy::Error,
+            ) {
+                Ok(crate::resource::ValuePathSegmentResult::Resolved(value))
+                | Ok(crate::resource::ValuePathSegmentResult::Deferred(value)) => value,
+                Ok(crate::resource::ValuePathSegmentResult::DeferredMiss(_)) | Err(_) => {
+                    access.rebuild_lazy_with_base(base)
+                }
+            };
+        }
+        Value::Deferred(DeferredValue::Coalesce {
+            value: left,
+            default,
+        }) => {
+            substitute_placeholder_lazily(left, index, key, item);
+            substitute_placeholder_lazily(default, index, key, item);
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            substitute_placeholder_lazily(inner, index, key, item);
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::RedactedSecret { .. },
+        ) => {}
+    }
 }
 
 #[cfg(test)]
@@ -2570,8 +2694,6 @@ mod substitute_placeholder_tests {
             attributes: Vec::new(),
             binding_name: "children".to_string(),
             iterable: Value::resource_ref("cert", "options", Vec::new()),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
         };
@@ -2601,8 +2723,6 @@ mod substitute_placeholder_tests {
             attributes: Vec::new(),
             binding_name: "children".to_string(),
             iterable: Value::resource_ref("source", "children", Vec::new()),
-            iterable_binding: "source".to_string(),
-            iterable_attr: "children".to_string(),
             binding,
             template_resource: Resource::pending_with_provider("mock", "Target", None),
         };
@@ -2660,8 +2780,6 @@ mod substitute_placeholder_tests {
                 value: Box::new(Value::resource_ref("cert", "options", Vec::new())),
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
             }),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "options".to_string(),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource: Resource::new("mock.Target", "children"),
         };
@@ -2765,6 +2883,26 @@ mod substitute_placeholder_tests {
             default.as_ref(),
             &Value::Concrete(ConcreteValue::String("fallback".into())),
         );
+    }
+
+    #[test]
+    fn coalesce_placeholder_defers_missing_default_access_while_left_is_unknown() {
+        let mut value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "optional", Vec::new())),
+            default: Box::new(for_value_field("missing")),
+        });
+        let item = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+
+        substitute_placeholder(&mut value, None, None, &item)
+            .expect("an unselected fallback must not raise its access error");
+
+        let Value::Deferred(DeferredValue::Coalesce { default, .. }) = value else {
+            panic!("unknown left must retain coalesce")
+        };
+        assert!(matches!(
+            default.as_ref(),
+            Value::Deferred(DeferredValue::Access(_))
+        ));
     }
 
     #[test]

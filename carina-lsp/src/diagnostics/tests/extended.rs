@@ -5943,6 +5943,35 @@ for name in (orgs.account ?? []) {
 }
 
 #[test]
+fn upstream_state_nested_coalesce_lhs_reference_is_still_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (["${orgs.account}-suffix"] ?? []) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "a reference nested inside an interpolation is required even on the left of ??: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn upstream_state_missing_coalesce_default_is_still_flagged() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }

@@ -16,7 +16,7 @@ use super::context::{ParseBindingRef, ParseContext, first_inner, next_pair};
 use super::error::ParseError;
 use super::expressions::for_expr::parse_for_expr;
 use super::expressions::if_expr::parse_if_expr;
-use super::expressions::pipe::apply_pipe_step;
+use super::expressions::pipe::{apply_pipe_step, parse_coalesce_expr};
 use super::expressions::primary::{apply_postfix_steps, parse_postfix_eval, parse_primary_eval};
 use super::expressions::wait_expr::parse_wait_expr;
 use super::parse_expression_eval;
@@ -211,6 +211,17 @@ fn parse_expression_with_resource_or_module(
     binding_name: &str,
 ) -> Result<LetBindingRhs, ParseError> {
     let coalesce = first_inner(pair, "expression", "expression with resource or module")?;
+    if coalesce.clone().into_inner().nth(1).is_some() {
+        let value = parse_coalesce_expr(coalesce, ctx)?;
+        return Ok((
+            value,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            LetBindingKind::Value,
+        ));
+    }
     let pipe = first_inner(coalesce, "pipe expression", "coalesce expression")?;
     parse_pipe_expr_with_resource_or_module(pipe, ctx, binding_name)
 }

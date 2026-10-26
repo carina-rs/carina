@@ -1822,14 +1822,7 @@ impl DiagnosticEngine {
             if !deferred_in_current_file(deferred, current_file_name) {
                 continue;
             }
-            let mut roots = std::collections::BTreeSet::new();
-            deferred.iterable.visit_resource_refs(&mut |path| {
-                roots.insert(path.binding().to_string());
-            });
-            deferred.iterable.visit_binding_refs(&mut |binding| {
-                roots.insert(binding.to_string());
-            });
-            for root in roots {
+            for root in deferred.root_bindings() {
                 if known.contains(&root) {
                     continue;
                 }

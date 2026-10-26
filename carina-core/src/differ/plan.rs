@@ -104,7 +104,7 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
 /// A "removal" is an attribute that appears in `changed_attributes` but not in `to`.
 /// Only attributes marked as `removable` in the schema should be kept as removals.
 /// Non-removal changes (attribute present in `to`) are always kept.
-fn filter_non_removable_removals(
+pub(super) fn filter_non_removable_removals(
     provider: &str,
     resource_type: &str,
     to: &Resource,

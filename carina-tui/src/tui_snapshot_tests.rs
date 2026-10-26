@@ -249,8 +249,6 @@ fn build_deferred_for_plan() -> Plan {
         attributes: deferred_record_attributes(),
         binding_name: "validation_records".to_string(),
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -262,7 +260,6 @@ fn build_deferred_for_plan() -> Plan {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
     plan
@@ -278,8 +275,6 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         attributes: deferred_record_attributes(),
         binding_name: "_anon_validation_records".to_string(),
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -291,7 +286,6 @@ fn build_anonymous_deferred_for_plan() -> Plan {
             "__deferred_for",
             "_anon_validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
     plan
@@ -308,8 +302,6 @@ fn build_deferred_replace_plan() -> Plan {
         attributes: deferred_record_attributes(),
         binding_name: "validation_records".to_string(),
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -334,7 +326,6 @@ fn build_deferred_replace_plan() -> Plan {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     })));
     plan

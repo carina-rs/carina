@@ -2232,7 +2232,7 @@ pub(crate) fn check_exports_pre_apply(
         input.schemas,
         input.resources,
     );
-    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+    let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: input.resources,
             compositions: input.compositions,
@@ -2242,6 +2242,12 @@ pub(crate) fn check_exports_pre_apply(
             remote_bindings: &HashMap::new(),
             wait_aliases: input.wait_aliases,
         },
+    );
+    bindings.apply_plan_stability(
+        input.resources,
+        &plan_input_current,
+        input.plan,
+        input.schemas,
     );
 
     carina_core::validation::check_export_values_pre_apply(

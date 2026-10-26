@@ -5759,8 +5759,6 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             attributes: vec![],
             binding_name: "_domain_validation_options".to_string(),
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Map("_".to_string(), "opt".to_string()),
             template_resource: Resource {
                 id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
@@ -5824,7 +5822,10 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     );
     let d = &expanded.deferred_for_expressions[0];
     assert_eq!(d.resource_type, "aws.route53.RecordSet");
-    assert_eq!(d.iterable_attr, "domain_validation_options");
+    assert!(
+        d.reference_candidates()
+            .contains("r.cert.domain_validation_options")
+    );
     // carina#3126 PR-B: binding-name fields are instance-prefixed so
     // the loop-generated resources are isolated per module instance
     // and the iterable resolves against the (now prefixed) module
@@ -5841,7 +5842,8 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // applies to a `ResourceRef` head; a caller-shared name would
     // NOT be prefixed — see prefix_deferred_for_expression).
     assert_eq!(
-        d.iterable_binding, "r.cert",
+        d.root_bindings(),
+        std::collections::BTreeSet::from(["r.cert".to_string()]),
         "PR-B must instance-prefix the intra-module iterable root"
     );
 
@@ -5890,8 +5892,6 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
         attributes: Vec::new(),
         binding_name: "assignments".to_string(),
         iterable: Value::resource_ref("accounts", "items", Vec::new()),
-        iterable_binding: "accounts".to_string(),
-        iterable_attr: "items".to_string(),
         binding: ForBinding::Map("_".to_string(), "account".to_string()),
         template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
     });
@@ -5958,8 +5958,6 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             attributes: vec![],
             binding_name: "_list".to_string(),
             iterable: Value::resource_ref("accounts", "list", Vec::new()),
-            iterable_binding: "accounts".to_string(),
-            iterable_attr: "list".to_string(),
             binding: ForBinding::Map("_".to_string(), "a".to_string()),
             template_resource: Resource {
                 id: ResourceId::with_identity("sso.Assignment", "placeholder"),
@@ -6004,7 +6002,8 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     // (caller-collision guard). A regression to unconditional
     // prefixing would make this `prod.accounts` and fail here.
     assert_eq!(
-        d.iterable_binding, "accounts",
+        d.root_bindings(),
+        std::collections::BTreeSet::from(["accounts".to_string()]),
         "a non-module-internal iterable binding must NOT be prefixed"
     );
 }
@@ -6089,13 +6088,19 @@ let r = registry {
     );
     let d = &parsed.deferred_for_expressions[0];
     assert_eq!(d.resource_type, "aws.route53.RecordSet");
-    assert_eq!(d.iterable_attr, "domain_validation_options");
+    assert!(
+        d.reference_candidates()
+            .contains("r.cert.domain_validation_options")
+    );
     // carina#3126 PR-B: through the full resolve_modules pipeline the
     // deferred-for's binding-name fields are instance-prefixed (call
     // binding is `r`), so the loop resolves against the prefixed
     // module `cert` and its generated resources are instance-scoped.
     assert_eq!(d.binding_name, "r._domain_validation_options");
-    assert_eq!(d.iterable_binding, "r.cert");
+    assert_eq!(
+        d.root_bindings(),
+        std::collections::BTreeSet::from(["r.cert".to_string()])
+    );
 
     // carina#3061: the module-internal wait binding still survives the
     // same pipeline and is instance-prefixed (the existing invariant,

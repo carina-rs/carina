@@ -78,6 +78,38 @@ fn write_downstream(dir: &Path) {
     .expect("write downstream main configuration");
 }
 
+fn write_managed_coalesce_main(dir: &Path, use_reference: bool, include_consumer: bool) {
+    let parent_name = if use_reference {
+        "source.name"
+    } else {
+        r#""seed""#
+    };
+    let consumer = if include_consumer {
+        r#"
+let consumer = mock.test.resource {
+  name = producer.comment ?? "d"
+}
+"#
+    } else {
+        ""
+    };
+    fs::write(
+        dir.join("main.crn"),
+        format!(
+            r#"let source = mock.test.resource {{
+  name = "seed"
+}}
+
+let producer = mock.test.resource {{
+  name = "producer"
+  parent_name = {parent_name}
+}}
+{consumer}"#,
+        ),
+    )
+    .expect("write managed coalesce configuration");
+}
+
 fn plan_json(dir: &Path) -> PlanFile {
     let output = run_cli(dir, &["plan", "--json", "."]);
     assert_success(&output, "plan --json");
@@ -184,5 +216,38 @@ fn coalesced_upstream_iterable_stays_deferred_when_state_is_unavailable() {
         1,
         "an unavailable upstream snapshot must not turn the loop into zero resources: {:#?}",
         unknown.plan.effects(),
+    );
+}
+
+#[test]
+fn unchanged_ref_authored_managed_producer_defaults_at_plan_and_apply() {
+    let root = tempfile::tempdir().expect("create temporary root");
+    let project = root.path().join("project");
+    write_common_files(&project);
+    write_managed_coalesce_main(&project, false, false);
+
+    assert_success(&run_cli(&project, &["init", "."]), "init project");
+    assert_success(
+        &run_cli(&project, &["apply", "--auto-approve", "."]),
+        "apply producer fixture",
+    );
+
+    // The reference resolves to the already-applied value, so the producer
+    // has no planned effect even though its authored input is still deferred
+    // before binding resolution. Its refreshed, missing `comment` is therefore
+    // definitive absence and must select the fallback.
+    write_managed_coalesce_main(&project, true, true);
+    let plan = plan_json(&project);
+    assert_eq!(created_names(&plan), ["d".to_string()]);
+    assert_success(
+        &run_cli(&project, &["apply", "--auto-approve", "."]),
+        "apply managed coalesce fallback",
+    );
+
+    let settled = plan_json(&project);
+    assert!(
+        settled.plan.effects().is_empty(),
+        "the fallback consumer must have been applied without updating its unchanged producer: {:#?}",
+        settled.plan.effects(),
     );
 }

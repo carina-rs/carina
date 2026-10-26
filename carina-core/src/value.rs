@@ -2474,8 +2474,6 @@ fn deferred_template_contains_redacted_secret(
         attributes,
         binding_name: _binding_name,
         iterable,
-        iterable_binding: _iterable_binding,
-        iterable_attr: _iterable_attr,
         binding: _binding,
         template_resource,
     } = template;
@@ -2534,16 +2532,13 @@ pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) ->
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
         } => contains_redacted_secret(until.value()),
-        Effect::DeferredCreate {
-            id: _id,
-            upstream_binding: _upstream_binding,
-            template,
-        } => deferred_template_contains_redacted_secret(template),
+        Effect::DeferredCreate { id: _id, template } => {
+            deferred_template_contains_redacted_secret(template)
+        }
         Effect::DeferredReplace(payload) => {
             let crate::effect::DeferredReplacePayload {
                 deletes: _deletes,
                 id: _id,
-                upstream_binding: _upstream_binding,
                 template,
             } = payload.as_ref();
             deferred_template_contains_redacted_secret(template)
@@ -3753,20 +3748,14 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
-        Effect::DeferredCreate {
-            id,
-            upstream_binding,
-            template,
-        } => Effect::DeferredCreate {
+        Effect::DeferredCreate { id, template } => Effect::DeferredCreate {
             id: id.clone(),
-            upstream_binding: upstream_binding.clone(),
             template: Box::new(redact_deferred_template(template)?),
         },
         Effect::DeferredReplace(payload) => {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                 deletes: payload.deletes.clone(),
                 id: payload.id.clone(),
-                upstream_binding: payload.upstream_binding.clone(),
                 template: Box::new(redact_deferred_template(&payload.template)?),
             }))
         }
@@ -3972,29 +3961,18 @@ pub fn rehydrate_plan_desired_secrets(
                     .expect("guarded by contains_redacted_secret"),
                 })
             }
-            Effect::DeferredCreate {
-                id,
-                upstream_binding,
-                template,
-            } => {
-                let template =
-                    rehydrate_deferred_template(template, upstream_binding, deferred_templates)?;
+            Effect::DeferredCreate { id, template } => {
+                let template = rehydrate_deferred_template(template, deferred_templates)?;
                 Ok(Effect::DeferredCreate {
                     id: id.clone(),
-                    upstream_binding: upstream_binding.clone(),
                     template: Box::new(template),
                 })
             }
             Effect::DeferredReplace(payload) => {
-                let template = rehydrate_deferred_template(
-                    &payload.template,
-                    &payload.upstream_binding,
-                    deferred_templates,
-                )?;
+                let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
                 Ok(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes: payload.deletes.clone(),
                     id: payload.id.clone(),
-                    upstream_binding: payload.upstream_binding.clone(),
                     template: Box::new(template),
                 })))
             }
@@ -4007,7 +3985,6 @@ pub fn rehydrate_plan_desired_secrets(
 
 fn rehydrate_deferred_template(
     saved: &crate::parser::DeferredForExpression,
-    upstream_binding: &str,
     candidates: &[crate::parser::DeferredForExpression],
 ) -> Result<crate::parser::DeferredForExpression, SecretRehydrationSiteError> {
     let has_placeholder = deferred_template_contains_redacted_secret(saved);
@@ -4022,9 +3999,7 @@ fn rehydrate_deferred_template(
         .find(|candidate| {
             candidate.binding_name == saved.binding_name
                 && candidate.resource_type == saved.resource_type
-                && candidate.iterable_binding == saved.iterable_binding
-                && candidate.iterable_binding == upstream_binding
-                && candidate.iterable_attr == saved.iterable_attr
+                && candidate.root_bindings() == saved.root_bindings()
         })
         .ok_or_else(|| {
             SecretRehydrationSiteError::new(
@@ -11998,7 +11973,6 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
@@ -12010,8 +11984,6 @@ mod tests {
                 ],
                 binding_name: "validation_records".to_string(),
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                iterable_binding: "cert".to_string(),
-                iterable_attr: "domain_validation_options".to_string(),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -12094,7 +12066,6 @@ mod tests {
                 "__deferred_for",
                 "records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
@@ -12103,8 +12074,6 @@ mod tests {
                 attributes: vec![("comment".to_string(), secret("stale-projection"))],
                 binding_name: "records".to_string(),
                 iterable: Value::resource_ref("cert", "options", Vec::new()),
-                iterable_binding: "cert".to_string(),
-                iterable_attr: "options".to_string(),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -12164,8 +12133,6 @@ mod tests {
             ],
             binding_name: "children".to_string(),
             iterable: Value::resource_ref("parent", "children", Vec::new()),
-            iterable_binding: "parent".to_string(),
-            iterable_attr: "children".to_string(),
             binding: ForBinding::Simple("child".to_string()),
             template_resource,
         };
@@ -12174,7 +12141,6 @@ mod tests {
                 "__deferred_for",
                 "children",
             )),
-            upstream_binding: "parent".to_string(),
             template: Box::new(template.clone()),
         };
 
@@ -12197,7 +12163,6 @@ mod tests {
                 "__deferred_for",
                 "children",
             )),
-            upstream_binding: "parent".to_string(),
             template: redacted_template,
         });
         let rehydrated = rehydrate_plan_desired_secrets(

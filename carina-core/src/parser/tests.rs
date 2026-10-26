@@ -2966,6 +2966,78 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
 }
 
 #[test]
+fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
+    use crate::config_loader::parse_directory;
+    use crate::parser::resolve_provider_attributes_with_remote;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        "fn provider_region() { 'ap-northeast-1' }",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("provider.crn"),
+        r#"provider mock {
+  source = "carina-rs/mock"
+  region = provider_region()
+}"#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let resolved = resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &ProviderContext::default(),
+    )
+    .expect("provider attributes should use the merged user-function scope");
+    assert_eq!(
+        resolved.as_provider_configs()[0].attributes.get("region"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".into()
+        ))),
+    );
+}
+
+#[test]
+fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
+    use crate::config_loader::parse_directory;
+    use crate::parser::{ProviderConfigResolutionError, resolve_provider_attributes_with_remote};
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        "fn bad_region() { upper(1) }",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("provider.crn"),
+        r#"provider mock {
+  source = "carina-rs/mock"
+  region = bad_region()
+}"#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let error = resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &ProviderContext::default(),
+    )
+    .expect_err("invalid sibling function should fail at the authored provider call");
+    let ProviderConfigResolutionError::Parse(ParseError::Located { path, error }) = error else {
+        panic!("expected an authored expression error, got {error:?}")
+    };
+    assert_eq!(path, tmp.path().join("helpers.crn"));
+    let ParseError::InvalidExpression { line, .. } = *error else {
+        panic!("expected an authored expression error, got {error:?}")
+    };
+    assert_eq!(line, 1, "function body line must not be replaced by 0");
+}
+
+#[test]
 fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them() {
     use crate::parser::resolve_provider_attributes_with_remote;
     use crate::resource::AccessPath;
@@ -10605,6 +10677,43 @@ fn parse_directory_files_folds_coalesce_after_later_let_resolves() {
     );
 }
 
+#[test]
+fn parse_directory_files_resolves_sibling_let_in_coalesce_default() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("consumer.crn"),
+            r#"
+                let up = upstream_state { source = "../up" }
+                let selected = up.optional ?? fallback
+            "#
+            .to_string(),
+        ),
+        (
+            std::path::PathBuf::from("producer.crn"),
+            "let fallback = 'resolved'".to_string(),
+        ),
+    ];
+
+    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect("sibling let in a coalesce default should resolve at the directory fixed point");
+    let consumer = parsed
+        .iter()
+        .find(|(path, _)| path == &std::path::PathBuf::from("consumer.crn"))
+        .expect("consumer file parsed");
+    let selected = consumer.1.parsed().variables.get("selected");
+    let Some(Value::Deferred(DeferredValue::Coalesce { value, default })) = selected else {
+        panic!("unresolved left should retain coalesce, got {selected:?}")
+    };
+    assert!(matches!(
+        value.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+    ));
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("resolved".into())),
+    );
+}
+
 fn assert_directory_let_chain_resolves(hops: usize) {
     let files = sibling_let_chain_files(hops);
     let final_name = chain_binding_name(hops);
@@ -11397,6 +11506,40 @@ fn parse_directory_folds_coalesce_after_sibling_function_resolves() {
         value,
         &Value::Concrete(ConcreteValue::String("2026-05-05".into())),
         "a concrete function result must win over the coalesce default",
+    );
+}
+
+#[test]
+fn parse_directory_resolves_sibling_function_in_coalesce_default() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        r#"
+            fn fallback() {
+                "resolved"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            let up = upstream_state { source = "../up" }
+            let selected = up.optional ?? fallback()
+        "#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("sibling function in a coalesce default should resolve");
+    let selected = parsed.variables.get("selected");
+    let Some(Value::Deferred(DeferredValue::Coalesce { default, .. })) = selected else {
+        panic!("unresolved left should retain coalesce, got {selected:?}")
+    };
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("resolved".into())),
     );
 }
 

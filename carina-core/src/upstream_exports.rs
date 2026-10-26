@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Subscript, Value};
+use crate::resource::{DeferredValue, Subscript, Value};
 use crate::schema::suggest_similar_name;
 
 /// One export's declared type and literal value, as carried through
@@ -330,28 +330,20 @@ fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
     }
 }
 
-/// Walk every resource attribute in the project (managed, composition, data
-/// source, and deferred-for templates), yielding
-/// `(ResourceRef, attr_name, &Value)` for each attribute. Used by all
-/// upstream-ref checks so the `iter_all_resources` walk is written once.
-fn for_each_resource_attr<E, F>(parsed: &crate::parser::File<E>, mut f: F)
-where
-    F: FnMut(ResourceRef<'_>, &str, &Value),
-{
-    for rref in parsed.iter_all_resources() {
-        for (attr_name, value) in rref.attributes().iter() {
-            f(rref, attr_name, value);
-        }
-    }
-}
-
-/// Walk ref-bearing export values and module-call arguments outside resources,
-/// yielding `(value, location_string)` for the upstream shape checks.
-fn for_each_non_resource_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
+/// Walk every project value covered by the upstream export checks, with its
+/// user-facing diagnostic location. Deferred-for body attributes are included
+/// through `iter_all_resources`; iterable expressions are handled separately
+/// because they have their own shape semantics.
+fn for_each_project_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
 where
     E: crate::parser::ExportParamLike,
     F: FnMut(&Value, &str),
 {
+    for rref in parsed.iter_all_resources() {
+        for (attr_name, value) in rref.attributes().iter() {
+            f(value, &resource_attr_location(rref, attr_name));
+        }
+    }
     for export in &parsed.export_params {
         if let Some(value) = export.value() {
             f(value, &format!("exports.{}", export.name()));
@@ -365,70 +357,6 @@ where
                 &format!("module `{}` argument `{}`", caller, arg_name),
             );
         }
-    }
-}
-
-/// Walk references for export-existence diagnostics while tracking the one
-/// syntactic position where absence is intentional: the left operand of
-/// `??`. A nested coalesce resets its right operand to required, even when the
-/// whole nested expression appears on another coalesce's left side.
-fn visit_existence_refs(
-    value: &Value,
-    optional: bool,
-    f: &mut impl FnMut(&crate::resource::AccessPath, bool),
-) {
-    match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, optional),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            visit_existence_refs(value, true, f);
-            visit_existence_refs(default, false, f);
-        }
-        Value::Concrete(ConcreteValue::List(values)) => {
-            for value in values {
-                visit_existence_refs(value, optional, f);
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(values)) => {
-            for value in values.values() {
-                visit_existence_refs(value, optional, f);
-            }
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            for part in parts {
-                if let InterpolationPart::Expr(value) = part {
-                    visit_existence_refs(value, optional, f);
-                }
-            }
-        }
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => {
-            for argument in args {
-                visit_existence_refs(argument.walker_value(), optional, f);
-            }
-        }
-        Value::Deferred(DeferredValue::Access(access)) => {
-            visit_existence_refs(access.base(), optional, f);
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            visit_existence_refs(inner, optional, f);
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
-        ) => {}
     }
 }
 
@@ -477,8 +405,8 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
     // errors directly below.
     {
         let mut check = |value: &Value, location: &str| {
-            visit_existence_refs(value, false, &mut |path, optional| {
-                if optional {
+            value.visit_resource_refs_with_usage(&mut |path, usage| {
+                if usage == crate::resource::ResourceRefUsage::CoalesceValue {
                     return;
                 }
                 let binding = path.binding();
@@ -503,17 +431,12 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
         };
 
         if include_typed_consumers {
-            for_each_resource_attr(parsed, |rref, attr_name, value| {
-                check(value, &resource_attr_location(rref, attr_name));
-            });
+            for_each_project_value(parsed, |value, location| check(value, location));
             for attr in &parsed.attribute_params {
                 if let Some(value) = &attr.value {
                     check(value, &format!("attributes.{}", attr.name));
                 }
             }
-            for_each_non_resource_value(parsed, |value, location| {
-                check(value, location);
-            });
         }
 
         // `let` values have no sink-driven validation pass of their own.
@@ -526,29 +449,31 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
     // validate their complete expression separately.
     for deferred in &parsed.deferred_for_expressions {
         let location = format!("for-expression `{}`", deferred.header);
-        visit_existence_refs(&deferred.iterable, false, &mut |path, optional| {
-            if optional {
-                return;
-            }
-            let binding = path.binding();
-            let field = path.attribute();
-            let Some(keys) = exports.get(binding) else {
-                return;
-            };
-            if keys.contains_key(field) {
-                return;
-            }
-            let known = known_by_binding
-                .get(binding)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            errors.push(UpstreamFieldError {
-                location: location.clone(),
-                binding: binding.to_string(),
-                field: field.to_string(),
-                suggestion: suggest_similar_name(field, known),
+        deferred
+            .iterable
+            .visit_resource_refs_with_usage(&mut |path, usage| {
+                if usage == crate::resource::ResourceRefUsage::CoalesceValue {
+                    return;
+                }
+                let binding = path.binding();
+                let field = path.attribute();
+                let Some(keys) = exports.get(binding) else {
+                    return;
+                };
+                if keys.contains_key(field) {
+                    return;
+                }
+                let known = known_by_binding
+                    .get(binding)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                errors.push(UpstreamFieldError {
+                    location: location.clone(),
+                    binding: binding.to_string(),
+                    field: field.to_string(),
+                    suggestion: suggest_similar_name(field, known),
+                });
             });
-        });
     }
 
     // HashMap-backed walks (parsed.variables, resource.attributes,
@@ -892,20 +817,7 @@ fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportPa
     include_resolver_struct_errors: bool,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     let mut errors: Vec<UpstreamAttributeAccessShapeError> = Vec::new();
-    for_each_resource_attr(parsed, |rref, attr_name, value| {
-        visit_attribute_access(
-            value,
-            exports,
-            &resource_attr_location(rref, attr_name),
-            include_resolver_struct_errors,
-            &mut errors,
-        );
-    });
-    // Module-call arguments and export values are ResourceRef-bearing
-    // too — they aren't iterated by `iter_all_resources`. Walking them
-    // (via the helper) matches the reach of
-    // `check_upstream_state_field_references` for those scopes.
-    for_each_non_resource_value(parsed, |value, location| {
+    for_each_project_value(parsed, |value, location| {
         visit_attribute_access(
             value,
             exports,
@@ -1073,15 +985,7 @@ pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
-    for_each_resource_attr(parsed, |rref, attr_name, value| {
-        visit_subscript_access(
-            value,
-            exports,
-            &resource_attr_location(rref, attr_name),
-            &mut errors,
-        );
-    });
-    for_each_non_resource_value(parsed, |value, location| {
+    for_each_project_value(parsed, |value, location| {
         visit_subscript_access(value, exports, location, &mut errors);
     });
     for deferred in &parsed.deferred_for_expressions {
@@ -1616,6 +1520,33 @@ mod tests {
         let errs = check_upstream_state_field_references(&parsed, &exports);
         assert_eq!(errs.len(), 1, "got: {errs:?}");
         assert_eq!(errs[0].field, "required");
+    }
+
+    #[test]
+    fn coalesce_lhs_nested_references_remain_required() {
+        let parsed = parse_project(
+            r#"
+            let orgs = upstream_state { source = "../organizations" }
+
+            exports {
+                list_value: list(String) = [orgs.in_list] ?? []
+                interpolated: String = "${orgs.in_interpolation}" ?? "fallback"
+                function_arg: String = upper(orgs.in_function) ?? "fallback"
+            }
+            "#,
+        );
+        let exports = mk_exports(&[("orgs", &[])]);
+
+        let errs = check_upstream_state_field_references(&parsed, &exports);
+        let fields = errs
+            .iter()
+            .map(|error| error.field.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            fields,
+            std::collections::BTreeSet::from(["in_function", "in_interpolation", "in_list",]),
+            "only a direct reference/access-chain on the left of ?? is optional: {errs:?}",
+        );
     }
 
     #[test]

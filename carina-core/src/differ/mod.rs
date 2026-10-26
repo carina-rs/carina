@@ -6,18 +6,110 @@
 mod comparison;
 mod plan;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 
+use crate::binding_index::ManagedBindingStability;
 use crate::effect::MoveAuthority;
-use crate::provider::{ProviderError, StateTransformMap};
+use crate::provider::{LiftedSavedAttrs, ProviderError, StateTransformMap};
 use crate::resource::{
     Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
     ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
 };
-use crate::schema::ResourceSchema;
+use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry};
 
 pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
+
+/// Project the differ's managed-resource decision into the attribute
+/// definitiveness required by reference/coalesce resolution.
+///
+/// This deliberately reuses `diff_present` and the same non-removable-removal
+/// filter as plan generation. It does not compare authored values inside the
+/// binding layer: callers first resolve the desired resources, then the differ
+/// says whether the refreshed snapshot has no effect, an in-place update, or
+/// an unavailable/replacement result.
+pub fn managed_binding_stability(
+    managed: &[ResolvedResource],
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+) -> HashMap<ResourceId, ManagedBindingStability> {
+    let mut result = HashMap::new();
+    for resource in managed {
+        let current = current_states
+            .get(&resource.id)
+            .map(PlanInputCurrent::current);
+        let Some(Current::Present(present)) = current else {
+            result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
+            continue;
+        };
+        let schema = registry.get(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            SchemaKind::Resource,
+        );
+        let changed_attributes = match diff_present(
+            resource,
+            present,
+            saved_attrs.get(&resource.id),
+            prev_explicit.get(&resource.id),
+            schema,
+        ) {
+            PresentDiff::NoChange => {
+                result.insert(
+                    resource.id.clone(),
+                    ManagedBindingStability::NoPlannedEffect,
+                );
+                continue;
+            }
+            PresentDiff::Update {
+                changed_attributes, ..
+            } => changed_attributes,
+        };
+        let changed_attributes = plan::filter_non_removable_removals(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            resource.as_resource(),
+            changed_attributes,
+            registry,
+        );
+        if changed_attributes.is_empty() {
+            result.insert(
+                resource.id.clone(),
+                ManagedBindingStability::NoPlannedEffect,
+            );
+            continue;
+        }
+        let create_only = schema
+            .map(ResourceSchema::create_only_attributes)
+            .unwrap_or_default();
+        if changed_attributes
+            .iter()
+            .any(|attribute| create_only.contains(&attribute.as_str()))
+        {
+            result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
+            continue;
+        }
+        let mut non_definitive_attributes: HashSet<String> =
+            changed_attributes.into_iter().collect();
+        if let Some(schema) = schema {
+            non_definitive_attributes.extend(
+                schema
+                    .read_only_attributes()
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+        result.insert(
+            resource.id.clone(),
+            ManagedBindingStability::Updating {
+                non_definitive_attributes,
+            },
+        );
+    }
+    result
+}
 
 /// Provider-observed state paired with all host-owned planning metadata for a
 /// resource that is no longer present in the desired configuration.
@@ -532,7 +624,7 @@ use crate::effect::Effect;
 #[cfg(test)]
 use crate::plan::Plan;
 #[cfg(test)]
-use crate::schema::{AttributeType, SchemaRegistry};
+use crate::schema::AttributeType;
 #[cfg(test)]
 use comparison::find_changed_attributes;
 
