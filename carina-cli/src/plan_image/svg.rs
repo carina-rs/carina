@@ -67,6 +67,7 @@ struct KindStyle {
     symbol: &'static str,
     label: &'static str,
     color: &'static str,
+    tint: &'static str,
 }
 
 fn kind_style(kind: EffectKind) -> KindStyle {
@@ -74,68 +75,101 @@ fn kind_style(kind: EffectKind) -> KindStyle {
         EffectKind::Read => KindStyle {
             symbol: "r",
             label: "read",
-            color: "#0969da",
+            color: "#1b7c83",
+            tint: "#d8f3f6",
         },
         EffectKind::Create => KindStyle {
             symbol: "+",
             label: "create",
             color: "#1a7f37",
+            tint: "#dafbe1",
         },
         EffectKind::ResumeCreate => KindStyle {
             symbol: "↻",
             label: "resume",
             color: "#1a7f37",
+            tint: "#dafbe1",
         },
         EffectKind::Update => KindStyle {
             symbol: "~",
             label: "update",
-            color: "#9a6700",
+            color: "#0969da",
+            tint: "#ddf4ff",
         },
         EffectKind::Replace => KindStyle {
             symbol: "±",
             label: "replace",
-            color: "#bc4c00",
+            color: "#8250df",
+            tint: "#fbefff",
         },
         EffectKind::Delete => KindStyle {
             symbol: "-",
             label: "delete",
             color: "#cf222e",
+            tint: "#ffebe9",
         },
         EffectKind::Import => KindStyle {
             symbol: "i",
             label: "import",
-            color: "#0969da",
+            color: "#1b7c83",
+            tint: "#d8f3f6",
         },
         EffectKind::Remove => KindStyle {
             symbol: "x",
             label: "remove",
             color: "#57606a",
+            tint: "#f6f8fa",
         },
         EffectKind::Move => KindStyle {
             symbol: "→",
             label: "move",
-            color: "#0969da",
+            color: "#1b7c83",
+            tint: "#d8f3f6",
         },
         EffectKind::Wait => KindStyle {
             symbol: "w",
             label: "wait",
             color: "#57606a",
+            tint: "#f6f8fa",
         },
         EffectKind::DeferredCreate => KindStyle {
             symbol: "d+",
             label: "deferred create",
             color: "#57606a",
+            tint: "#f6f8fa",
         },
         EffectKind::DeferredReplace => KindStyle {
             symbol: "d±",
             label: "deferred replace",
             color: "#57606a",
+            tint: "#f6f8fa",
         },
         EffectKind::Unchanged => KindStyle {
             symbol: "=",
             label: "unchanged",
             color: "#6e7781",
+            tint: "#f6f8fa",
         },
+    }
+}
+
+impl BlastKind {
+    fn effect_kind(self) -> EffectKind {
+        match self {
+            Self::Replace => EffectKind::Replace,
+            Self::Delete => EffectKind::Delete,
+        }
+    }
+
+    fn color(self) -> &'static str {
+        kind_style(self.effect_kind()).color
+    }
+
+    fn marker_id(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Delete => "delete",
+        }
     }
 }
 
@@ -178,11 +212,11 @@ fn render_header(out: &mut String, model: &GraphModel) {
             let kind = effect_kind_for_summary(part.kind);
             let style = kind_style(kind);
             let destructive = matches!(kind, EffectKind::Replace | EffectKind::Delete);
-            let color = if destructive { "#cf222e" } else { style.color };
             let weight = if destructive { "700" } else { "600" };
             write!(
                 out,
-                "<tspan fill=\"{color}\" font-weight=\"{weight}\">{} {}</tspan>",
+                "<tspan fill=\"{}\" font-weight=\"{weight}\">{} {}</tspan>",
+                style.color,
                 part.count,
                 summary_label(kind)
             )
@@ -198,7 +232,7 @@ fn render_header(out: &mut String, model: &GraphModel) {
             };
             write!(
                 out,
-                r##"<tspan fill="#0969da" font-weight="600">{export_count} {label}</tspan>"##
+                r##"<tspan fill="#57606a" font-weight="600">{export_count} {label}</tspan>"##
             )
             .unwrap();
         }
@@ -256,11 +290,14 @@ fn effect_kind_for_summary(kind: PlanEffectSummaryKind) -> EffectKind {
 
 fn write_markers(out: &mut String) {
     writeln!(out, "  <defs>").unwrap();
-    for (id, color) in [
-        ("default", "#8c959f"),
-        ("replace", "#bc4c00"),
-        ("delete", "#cf222e"),
-    ] {
+    writeln!(
+        out,
+        "    <marker id=\"arrow-default\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\" markerUnits=\"strokeWidth\"><path d=\"M0,0 L8,4 L0,8 z\" fill=\"#8c959f\"/></marker>"
+    )
+    .unwrap();
+    for blast in [BlastKind::Replace, BlastKind::Delete] {
+        let id = blast.marker_id();
+        let color = blast.color();
         writeln!(
             out,
             "    <marker id=\"arrow-{id}\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\" markerUnits=\"strokeWidth\"><path d=\"M0,0 L8,4 L0,8 z\" fill=\"{color}\"/></marker>"
@@ -352,8 +389,7 @@ fn render_edges(out: &mut String, model: &GraphModel, layout: &Layout) {
             .unwrap();
         }
         let (color, marker, opacity, width) = match edge.highlight {
-            Some(BlastKind::Replace) => ("#bc4c00", "replace", 0.76, 2.2),
-            Some(BlastKind::Delete) => ("#cf222e", "delete", 0.76, 2.2),
+            Some(blast) => (blast.color(), blast.marker_id(), 0.76, 2.2),
             None => ("#8c959f", "default", 0.68, 1.6),
         };
         let dash = if is_reference {
@@ -380,10 +416,7 @@ fn render_nodes(out: &mut String, model: &GraphModel, layout: &Layout) {
 fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     let style = kind_style(node.kind);
     if let Some(halo) = node_halo(node) {
-        let color = match halo {
-            BlastKind::Replace => "#bc4c00",
-            BlastKind::Delete => "#cf222e",
-        };
+        let color = halo.color();
         writeln!(
             out,
             "    <rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"14\" fill=\"none\" stroke=\"{color}\" stroke-width=\"8\" stroke-opacity=\"0.24\"/>",
@@ -398,7 +431,7 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     let (fill, border, fill_opacity) = if node.kind == EffectKind::Unchanged {
         ("#f6f8fa", "#afb8c1", "0.72")
     } else {
-        ("#ffffff", style.color, "1")
+        (style.tint, style.color, "1")
     };
     let dash = if node.kind == EffectKind::Delete {
         " stroke-dasharray=\"6 4\""
@@ -533,10 +566,7 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
 
     if !node.affected_by.is_empty() {
         let halo = node_halo(node).expect("affected node has a halo kind");
-        let color = match halo {
-            BlastKind::Replace => "#bc4c00",
-            BlastKind::Delete => "#cf222e",
-        };
+        let color = halo.color();
         let affected = if node.affected_by.len() == 1 {
             format!("affected by {}", node.affected_by[0].label)
         } else {
@@ -657,9 +687,10 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout) {
         semantics_x += 208.0;
     }
     if has_halo {
+        let color = BlastKind::Replace.color();
         writeln!(
             out,
-            "    <rect x=\"{semantics_x:.1}\" y=\"{:.1}\" width=\"24\" height=\"13\" rx=\"4\" fill=\"none\" stroke=\"#bc4c00\" stroke-width=\"5\" stroke-opacity=\"0.24\"/><text x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"#57606a\">halo = downstream blast radius</text>",
+            "    <rect x=\"{semantics_x:.1}\" y=\"{:.1}\" width=\"24\" height=\"13\" rx=\"4\" fill=\"none\" stroke=\"{color}\" stroke-width=\"5\" stroke-opacity=\"0.24\"/><text x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"#57606a\">halo = downstream blast radius</text>",
             semantics_y - 13.0,
             semantics_x + 34.0,
         )

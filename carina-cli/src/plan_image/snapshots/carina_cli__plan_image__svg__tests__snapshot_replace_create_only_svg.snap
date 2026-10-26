@@ -8,37 +8,37 @@ expression: "fixture_svg(\"replace_create_only\")"
   <desc id="desc">Apply-order dependency graph with destructive-change blast radii.</desc>
   <defs>
     <marker id="arrow-default" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8c959f"/></marker>
-    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#bc4c00"/></marker>
+    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8250df"/></marker>
     <marker id="arrow-delete" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#cf222e"/></marker>
   </defs>
   <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
     <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
-    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#cf222e" font-weight="700">2 to replace</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#0969da" font-weight="600">2 exports to change</tspan></text>
+    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#8250df" font-weight="700">2 to replace</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#57606a" font-weight="600">2 exports to change</tspan></text>
     <text x="28" y="90" font-size="10.5" fill="#6e7781">state test-replace-create-only · serial 1</text>
     <g>
-      <rect x="28.0" y="128.0" width="220.0" height="113.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#bc4c00"/>
-      <rect x="28.0" y="128.0" width="6" height="113.0" rx="3" fill="#bc4c00"/>
-      <text x="45.0" y="155.0" font-size="13" font-weight="700" fill="#bc4c00">±</text>
-      <rect x="66.0" y="138.0" width="58.0" height="20" rx="10" fill="#bc4c00" fill-opacity="0.10"/>
-      <text x="74.0" y="152.5" font-size="10" font-weight="700" fill="#bc4c00">replace</text>
+      <rect x="28.0" y="128.0" width="220.0" height="113.0" rx="9" fill="#fbefff" fill-opacity="1" stroke="#8250df"/>
+      <rect x="28.0" y="128.0" width="6" height="113.0" rx="3" fill="#8250df"/>
+      <text x="45.0" y="155.0" font-size="13" font-weight="700" fill="#8250df">±</text>
+      <rect x="66.0" y="138.0" width="58.0" height="20" rx="10" fill="#8250df" fill-opacity="0.10"/>
+      <text x="74.0" y="152.5" font-size="10" font-weight="700" fill="#8250df">replace</text>
       <text x="46.0" y="177.0" font-size="14" font-weight="700" fill="#1f2328">alpha</text>
       <text x="46.0" y="195.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text x="46.0" y="213.0" font-size="10.5" font-weight="600" fill="#bc4c00">forces replacement:</text>
+      <text x="46.0" y="213.0" font-size="10.5" font-weight="600" fill="#8250df">forces replacement:</text>
       <text x="54.0" y="229.0" font-size="10.5" fill="#24292f">• external_name</text>
     </g>
     <g>
-      <rect x="28.0" y="259.0" width="220.0" height="113.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#bc4c00"/>
-      <rect x="28.0" y="259.0" width="6" height="113.0" rx="3" fill="#bc4c00"/>
-      <text x="45.0" y="286.0" font-size="13" font-weight="700" fill="#bc4c00">±</text>
-      <rect x="66.0" y="269.0" width="58.0" height="20" rx="10" fill="#bc4c00" fill-opacity="0.10"/>
-      <text x="74.0" y="283.5" font-size="10" font-weight="700" fill="#bc4c00">replace</text>
+      <rect x="28.0" y="259.0" width="220.0" height="113.0" rx="9" fill="#fbefff" fill-opacity="1" stroke="#8250df"/>
+      <rect x="28.0" y="259.0" width="6" height="113.0" rx="3" fill="#8250df"/>
+      <text x="45.0" y="286.0" font-size="13" font-weight="700" fill="#8250df">±</text>
+      <rect x="66.0" y="269.0" width="58.0" height="20" rx="10" fill="#8250df" fill-opacity="0.10"/>
+      <text x="74.0" y="283.5" font-size="10" font-weight="700" fill="#8250df">replace</text>
       <text x="46.0" y="308.0" font-size="14" font-weight="700" fill="#1f2328">beta</text>
       <text x="46.0" y="326.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text x="46.0" y="344.0" font-size="10.5" font-weight="600" fill="#bc4c00">forces replacement:</text>
+      <text x="46.0" y="344.0" font-size="10.5" font-weight="600" fill="#8250df">forces replacement:</text>
       <text x="54.0" y="360.0" font-size="10.5" fill="#24292f">• legacy_token</text>
     </g>
     <line x1="28" y1="398.0" x2="872" y2="398.0" stroke="#d8dee4"/>
-    <text x="28.0" y="419.0" font-size="11" font-weight="700" fill="#bc4c00">±</text>
+    <text x="28.0" y="419.0" font-size="11" font-weight="700" fill="#8250df">±</text>
     <text x="40.6" y="419.0" font-size="10" fill="#57606a">replace</text>
   </g>
 </svg>

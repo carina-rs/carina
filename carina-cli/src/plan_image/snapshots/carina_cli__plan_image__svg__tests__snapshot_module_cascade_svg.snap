@@ -8,22 +8,22 @@ expression: "fixture_svg(\"plan_image_module_cascade\")"
   <desc id="desc">Apply-order dependency graph with destructive-change blast radii.</desc>
   <defs>
     <marker id="arrow-default" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8c959f"/></marker>
-    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#bc4c00"/></marker>
+    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8250df"/></marker>
     <marker id="arrow-delete" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#cf222e"/></marker>
   </defs>
   <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
     <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
-    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#9a6700" font-weight="600">2 to update</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#cf222e" font-weight="700">2 to replace</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#cf222e" font-weight="700">2 to destroy</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#0969da" font-weight="600">2 exports to change</tspan></text>
+    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#0969da" font-weight="600">2 to update</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#8250df" font-weight="700">2 to replace</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#cf222e" font-weight="700">2 to destroy</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#57606a" font-weight="600">2 exports to change</tspan></text>
     <text x="28" y="90" font-size="10.5" fill="#6e7781">state test-plan-image-module-cascade · serial 9</text>
     <rect x="18.0" y="739.0" width="864.0" height="175.0" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
     <text x="32.0" y="759.0" font-size="11" font-weight="600" fill="#57606a">module &quot;review&quot; (./review-module)</text>
     <path d="M248.0,177.0 C263.4,177.0 263.4,177.0 278.7,177.0 C312.0,177.0 312.0,219.0 345.3,219.0 C354.6,219.0 354.6,219.0 364.0,219.0" fill="none" stroke="#cf222e" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-delete)"/>
-    <path d="M248.0,309.0 C263.4,309.0 263.4,309.0 278.7,309.0 C312.0,309.0 312.0,352.5 345.3,352.5 C354.6,352.5 354.6,352.5 364.0,352.5" fill="none" stroke="#bc4c00" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
-    <path d="M138.0,514.0 C138.0,514.0 138.0,568.0 138.0,568.0" fill="none" stroke="#bc4c00" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
-    <path d="M138.0,374.0 C138.0,374.0 138.0,428.0 138.0,428.0" fill="none" stroke="#bc4c00" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <path d="M248.0,309.0 C263.4,309.0 263.4,309.0 278.7,309.0 C312.0,309.0 312.0,352.5 345.3,352.5 C354.6,352.5 354.6,352.5 364.0,352.5" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
+    <path d="M138.0,514.0 C138.0,514.0 138.0,568.0 138.0,568.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <path d="M138.0,374.0 C138.0,374.0 138.0,428.0 138.0,428.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
     <rect x="23.0" y="123.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#cf222e" stroke-width="8" stroke-opacity="0.24"/>
     <g>
-      <rect x="28.0" y="128.0" width="220.0" height="98.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
+      <rect x="28.0" y="128.0" width="220.0" height="98.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
       <rect x="28.0" y="128.0" width="6" height="98.0" rx="3" fill="#cf222e"/>
       <text x="45.0" y="155.0" font-size="13" font-weight="700" fill="#cf222e">-</text>
       <rect x="66.0" y="138.0" width="52.0" height="20" rx="10" fill="#cf222e" fill-opacity="0.10"/>
@@ -33,78 +33,78 @@ expression: "fixture_svg(\"plan_image_module_cascade\")"
       <text x="46.0" y="216.0" font-size="10" font-weight="600" fill="#cf222e">affected by 2 changes</text>
     </g>
     <g>
-      <rect x="28.0" y="244.0" width="220.0" height="130.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#bc4c00"/>
-      <rect x="28.0" y="244.0" width="6" height="130.0" rx="3" fill="#bc4c00"/>
-      <text x="45.0" y="271.0" font-size="13" font-weight="700" fill="#bc4c00">±</text>
-      <rect x="66.0" y="254.0" width="58.0" height="20" rx="10" fill="#bc4c00" fill-opacity="0.10"/>
-      <text x="74.0" y="268.5" font-size="10" font-weight="700" fill="#bc4c00">replace</text>
+      <rect x="28.0" y="244.0" width="220.0" height="130.0" rx="9" fill="#fbefff" fill-opacity="1" stroke="#8250df"/>
+      <rect x="28.0" y="244.0" width="6" height="130.0" rx="3" fill="#8250df"/>
+      <text x="45.0" y="271.0" font-size="13" font-weight="700" fill="#8250df">±</text>
+      <rect x="66.0" y="254.0" width="58.0" height="20" rx="10" fill="#8250df" fill-opacity="0.10"/>
+      <text x="74.0" y="268.5" font-size="10" font-weight="700" fill="#8250df">replace</text>
       <text x="46.0" y="293.0" font-size="14" font-weight="700" fill="#1f2328">source</text>
       <text x="46.0" y="311.0" font-size="11" fill="#6e7781">test.test.Widget</text>
       <text x="46.0" y="329.0" font-size="10.5" fill="#57606a">create before destroy</text>
-      <text x="46.0" y="346.0" font-size="10.5" font-weight="600" fill="#bc4c00">forces replacement:</text>
+      <text x="46.0" y="346.0" font-size="10.5" font-weight="600" fill="#8250df">forces replacement:</text>
       <text x="54.0" y="362.0" font-size="10.5" fill="#24292f">• external_name</text>
     </g>
-    <rect x="23.0" y="423.0" width="230.0" height="96.0" rx="14" fill="none" stroke="#bc4c00" stroke-width="8" stroke-opacity="0.24"/>
+    <rect x="23.0" y="423.0" width="230.0" height="96.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
     <g>
       <rect x="28.0" y="428.0" width="220.0" height="86.0" rx="9" fill="#f6f8fa" fill-opacity="0.72" stroke="#afb8c1"/>
       <rect x="42.0" y="438.0" width="70.0" height="20" rx="10" fill="#6e7781" fill-opacity="0.10"/>
       <text x="50.0" y="452.5" font-size="10" font-weight="700" fill="#6e7781">unchanged</text>
       <text x="46.0" y="473.0" font-size="14" font-weight="700" fill="#1f2328">connector</text>
       <text x="46.0" y="489.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text x="46.0" y="504.0" font-size="10" font-weight="600" fill="#bc4c00">affected by source</text>
+      <text x="46.0" y="504.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
     </g>
-    <rect x="23.0" y="563.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#bc4c00" stroke-width="8" stroke-opacity="0.24"/>
+    <rect x="23.0" y="563.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
     <g>
-      <rect x="28.0" y="568.0" width="220.0" height="133.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#9a6700"/>
-      <rect x="28.0" y="568.0" width="6" height="133.0" rx="3" fill="#9a6700"/>
-      <text x="45.0" y="595.0" font-size="13" font-weight="700" fill="#9a6700">~</text>
-      <rect x="66.0" y="578.0" width="52.0" height="20" rx="10" fill="#9a6700" fill-opacity="0.10"/>
-      <text x="74.0" y="592.5" font-size="10" font-weight="700" fill="#9a6700">update</text>
+      <rect x="28.0" y="568.0" width="220.0" height="133.0" rx="9" fill="#ddf4ff" fill-opacity="1" stroke="#0969da"/>
+      <rect x="28.0" y="568.0" width="6" height="133.0" rx="3" fill="#0969da"/>
+      <text x="45.0" y="595.0" font-size="13" font-weight="700" fill="#0969da">~</text>
+      <rect x="66.0" y="578.0" width="52.0" height="20" rx="10" fill="#0969da" fill-opacity="0.10"/>
+      <text x="74.0" y="592.5" font-size="10" font-weight="700" fill="#0969da">update</text>
       <text x="46.0" y="617.0" font-size="14" font-weight="700" fill="#1f2328">sink</text>
       <text x="46.0" y="635.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text x="46.0" y="653.0" font-size="10.5" font-weight="600" fill="#9a6700">changed attributes:</text>
+      <text x="46.0" y="653.0" font-size="10.5" font-weight="600" fill="#0969da">changed attributes:</text>
       <text x="54.0" y="669.0" font-size="10.5" fill="#24292f">• description</text>
-      <text x="46.0" y="691.0" font-size="10" font-weight="600" fill="#bc4c00">affected by source</text>
+      <text x="46.0" y="691.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
     </g>
     <g>
-      <rect x="28.0" y="785.0" width="232.0" height="113.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#9a6700"/>
-      <rect x="28.0" y="785.0" width="6" height="113.0" rx="3" fill="#9a6700"/>
-      <text x="45.0" y="812.0" font-size="13" font-weight="700" fill="#9a6700">~</text>
-      <rect x="66.0" y="795.0" width="52.0" height="20" rx="10" fill="#9a6700" fill-opacity="0.10"/>
-      <text x="74.0" y="809.5" font-size="10" font-weight="700" fill="#9a6700">update</text>
+      <rect x="28.0" y="785.0" width="232.0" height="113.0" rx="9" fill="#ddf4ff" fill-opacity="1" stroke="#0969da"/>
+      <rect x="28.0" y="785.0" width="6" height="113.0" rx="3" fill="#0969da"/>
+      <text x="45.0" y="812.0" font-size="13" font-weight="700" fill="#0969da">~</text>
+      <rect x="66.0" y="795.0" width="52.0" height="20" rx="10" fill="#0969da" fill-opacity="0.10"/>
+      <text x="74.0" y="809.5" font-size="10" font-weight="700" fill="#0969da">update</text>
       <text x="46.0" y="834.0" font-size="14" font-weight="700" fill="#1f2328">review.module_node</text>
       <text x="46.0" y="852.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text x="46.0" y="870.0" font-size="10.5" font-weight="600" fill="#9a6700">changed attributes:</text>
+      <text x="46.0" y="870.0" font-size="10.5" font-weight="600" fill="#0969da">changed attributes:</text>
       <text x="54.0" y="886.0" font-size="10.5" fill="#24292f">• description</text>
     </g>
-    <rect x="359.0" y="165.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#bc4c00" stroke-width="8" stroke-opacity="0.24"/>
+    <rect x="359.0" y="165.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
     <g>
-      <rect x="364.0" y="170.0" width="220.0" height="98.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
+      <rect x="364.0" y="170.0" width="220.0" height="98.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
       <rect x="364.0" y="170.0" width="6" height="98.0" rx="3" fill="#cf222e"/>
       <text x="381.0" y="197.0" font-size="13" font-weight="700" fill="#cf222e">-</text>
       <rect x="402.0" y="180.0" width="52.0" height="20" rx="10" fill="#cf222e" fill-opacity="0.10"/>
       <text x="410.0" y="194.5" font-size="10" font-weight="700" fill="#cf222e">delete</text>
       <text x="382.0" y="219.0" font-size="14" font-weight="700" fill="#1f2328" text-decoration="line-through">obsolete</text>
       <text x="382.0" y="237.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text x="382.0" y="258.0" font-size="10" font-weight="600" fill="#bc4c00">affected by source</text>
+      <text x="382.0" y="258.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
     </g>
-    <rect x="359.0" y="281.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#bc4c00" stroke-width="8" stroke-opacity="0.24"/>
+    <rect x="359.0" y="281.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
     <g>
-      <rect x="364.0" y="286.0" width="220.0" height="133.0" rx="9" fill="#ffffff" fill-opacity="1" stroke="#bc4c00"/>
-      <rect x="364.0" y="286.0" width="6" height="133.0" rx="3" fill="#bc4c00"/>
-      <text x="381.0" y="313.0" font-size="13" font-weight="700" fill="#bc4c00">±</text>
-      <rect x="402.0" y="296.0" width="58.0" height="20" rx="10" fill="#bc4c00" fill-opacity="0.10"/>
-      <text x="410.0" y="310.5" font-size="10" font-weight="700" fill="#bc4c00">replace</text>
+      <rect x="364.0" y="286.0" width="220.0" height="133.0" rx="9" fill="#fbefff" fill-opacity="1" stroke="#8250df"/>
+      <rect x="364.0" y="286.0" width="6" height="133.0" rx="3" fill="#8250df"/>
+      <text x="381.0" y="313.0" font-size="13" font-weight="700" fill="#8250df">±</text>
+      <rect x="402.0" y="296.0" width="58.0" height="20" rx="10" fill="#8250df" fill-opacity="0.10"/>
+      <text x="410.0" y="310.5" font-size="10" font-weight="700" fill="#8250df">replace</text>
       <text x="382.0" y="335.0" font-size="14" font-weight="700" fill="#1f2328">cascade</text>
       <text x="382.0" y="353.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text x="382.0" y="371.0" font-size="10.5" font-weight="600" fill="#bc4c00">forces replacement:</text>
+      <text x="382.0" y="371.0" font-size="10.5" font-weight="600" fill="#8250df">forces replacement:</text>
       <text x="390.0" y="387.0" font-size="10.5" fill="#24292f">• external_name</text>
-      <text x="382.0" y="409.0" font-size="10" font-weight="600" fill="#bc4c00">affected by source</text>
+      <text x="382.0" y="409.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
     </g>
     <line x1="28" y1="924.0" x2="872" y2="924.0" stroke="#d8dee4"/>
-    <text x="28.0" y="945.0" font-size="11" font-weight="700" fill="#9a6700">~</text>
+    <text x="28.0" y="945.0" font-size="11" font-weight="700" fill="#0969da">~</text>
     <text x="40.6" y="945.0" font-size="10" fill="#57606a">update</text>
-    <text x="98.6" y="945.0" font-size="11" font-weight="700" fill="#bc4c00">±</text>
+    <text x="98.6" y="945.0" font-size="11" font-weight="700" fill="#8250df">±</text>
     <text x="111.2" y="945.0" font-size="10" fill="#57606a">replace</text>
     <text x="175.2" y="945.0" font-size="11" font-weight="700" fill="#cf222e">-</text>
     <text x="187.8" y="945.0" font-size="10" fill="#57606a">delete</text>
@@ -112,6 +112,6 @@ expression: "fixture_svg(\"plan_image_module_cascade\")"
     <text x="258.4" y="945.0" font-size="10" fill="#57606a">unchanged</text>
     <line x1="28.0" y1="992.0" x2="72.0" y2="992.0" stroke="#8c959f" stroke-width="1.6" marker-end="url(#arrow-default)"/><text x="82.0" y="996.0" font-size="10" fill="#57606a">runs before</text>
     <line x1="174.0" y1="992.0" x2="218.0" y2="992.0" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#arrow-default)"/><text x="228.0" y="996.0" font-size="10" fill="#57606a">references (unchanged)</text>
-    <rect x="382.0" y="983.0" width="24" height="13" rx="4" fill="none" stroke="#bc4c00" stroke-width="5" stroke-opacity="0.24"/><text x="416.0" y="996.0" font-size="10" fill="#57606a">halo = downstream blast radius</text>
+    <rect x="382.0" y="983.0" width="24" height="13" rx="4" fill="none" stroke="#8250df" stroke-width="5" stroke-opacity="0.24"/><text x="416.0" y="996.0" font-size="10" fill="#57606a">halo = downstream blast radius</text>
   </g>
 </svg>
