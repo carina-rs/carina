@@ -1,8 +1,8 @@
 use std::fmt::Write;
 
 use super::layout::{
-    Layout, MAX_ATTRIBUTE_NAMES, MAX_LABEL_CHARS, MAX_TYPE_CHARS, MONOSPACE_ADVANCE_EM, NodeRect,
-    edge_segment_controls,
+    Layout, MAX_ATTRIBUTE_NAMES, MAX_LABEL_CHARS, MAX_TYPE_CHARS, MONOSPACE_ADVANCE_EM,
+    NODE_HALO_OFFSET, NODE_HALO_STROKE_WIDTH, NodeRect, edge_segment_controls,
 };
 use super::model::{BlastKind, EffectKind, GraphModel, GraphNode, GraphNodeId};
 use super::{SvgTheme, Theme};
@@ -204,8 +204,9 @@ pub(crate) fn render_svg(model: &GraphModel, layout: &Layout, theme: SvgTheme) -
     .unwrap();
 
     render_header(&mut out, model, style);
-    render_module_bands(&mut out, model, layout, style);
+    render_module_band_backgrounds(&mut out, layout, style);
     render_edges(&mut out, model, layout, style);
+    render_module_band_labels(&mut out, model, layout, style);
     render_nodes(&mut out, model, layout, style);
     render_legend(&mut out, model, layout, style);
 
@@ -596,7 +597,25 @@ fn write_markers(out: &mut String, render_style: RenderStyle) {
     writeln!(out, "  </defs>").unwrap();
 }
 
-fn render_module_bands(
+fn render_module_band_backgrounds(out: &mut String, layout: &Layout, render_style: RenderStyle) {
+    let palette = render_style.palette;
+    for rect in &layout.modules {
+        writeln!(
+            out,
+            r#"    <rect{} x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="12" fill="{}" stroke="{}"/>"#,
+            render_style.class("fill-surface stroke-border"),
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            palette.surface,
+            palette.border
+        )
+        .unwrap();
+    }
+}
+
+fn render_module_band_labels(
     out: &mut String,
     model: &GraphModel,
     layout: &Layout,
@@ -607,14 +626,6 @@ fn render_module_bands(
         let Some(module) = model.modules.iter().find(|module| module.id == rect.id) else {
             continue;
         };
-        writeln!(
-            out,
-            r#"    <rect{} x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="12" fill="{}" stroke="{}"/>"#,
-            render_style.class("fill-surface stroke-border"),
-            rect.x, rect.y, rect.width, rect.height
-            , palette.surface, palette.border
-        )
-        .unwrap();
         let source = module
             .source_path
             .as_deref()
@@ -625,6 +636,17 @@ fn render_module_bands(
         } else {
             ""
         };
+        let label = format!("module \"{}\"{source}{collapsed}", module.label);
+        writeln!(
+            out,
+            r#"    <rect{} x="{:.1}" y="{:.1}" width="{:.1}" height="21" rx="4" fill="{}"/>"#,
+            render_style.class("fill-surface"),
+            rect.x + 8.0,
+            rect.y + 5.0,
+            text_width(&label, 11.0) + 12.0,
+            palette.surface,
+        )
+        .unwrap();
         writeln!(
             out,
             r#"    <text{} x="{:.1}" y="{:.1}" font-size="11" font-weight="600" fill="{}">module &quot;{}&quot;{}{}</text>"#,
@@ -732,12 +754,12 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect, render_style
         let color = halo.color(palette);
         writeln!(
             out,
-            "    <rect{} x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"14\" fill=\"none\" stroke=\"{color}\" stroke-width=\"8\" stroke-opacity=\"{}\"/>",
+            "    <rect{} x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"14\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{NODE_HALO_STROKE_WIDTH}\" stroke-opacity=\"{}\"/>",
             render_style.class(&format!("{} halo", halo.stroke_class(palette))),
-            rect.x - 5.0,
-            rect.y - 5.0,
-            rect.width + 10.0,
-            rect.height + 10.0,
+            rect.x - NODE_HALO_OFFSET,
+            rect.y - NODE_HALO_OFFSET,
+            rect.width + NODE_HALO_OFFSET * 2.0,
+            rect.height + NODE_HALO_OFFSET * 2.0,
             palette.halo_opacity,
         )
         .unwrap();
@@ -1029,7 +1051,7 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_s
     if has_reference_edges {
         writeln!(
             out,
-            "    <line{} x1=\"{semantics_x:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" stroke-width=\"1.6\" stroke-dasharray=\"6 5\" marker-end=\"url(#arrow-default)\"/><text{} x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"{}\">references (unchanged)</text>",
+            "    <line{} x1=\"{semantics_x:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" stroke-width=\"1.6\" stroke-dasharray=\"6 5\" marker-end=\"url(#arrow-default)\"/><text{} x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"{}\">references</text>",
             render_style.class("stroke-edge"),
             semantics_y - 4.0,
             semantics_x + LEGEND_EDGE_SAMPLE_WIDTH,
@@ -1040,7 +1062,7 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_s
             palette.muted_text,
         )
         .unwrap();
-        semantics_x += 208.0;
+        semantics_x += 146.0;
     }
     if has_halo {
         let color = BlastKind::Replace.color(palette);
@@ -1273,7 +1295,7 @@ mod tests {
 
         let cascade = fixture_svg("plan_image_module_cascade");
         assert!(cascade.contains(">unchanged</text>"));
-        assert!(cascade.contains(">references (unchanged)</text>"));
+        assert!(cascade.contains(">references</text>"));
         assert!(cascade.contains("halo = downstream blast radius"));
     }
 
@@ -1324,13 +1346,12 @@ mod tests {
         let svg = render_svg(&model, &layout_graph(&model), SvgTheme::Fixed(Theme::Light)).text;
 
         assert!(svg.contains("stroke-dasharray=\"6 5\""));
-        assert!(svg.contains(">references (unchanged)</text>"));
+        assert!(svg.contains(">references</text>"));
         assert!(!svg.contains(">runs before</text>"));
         let sample = svg
             .lines()
             .find(|line| {
-                line.contains("stroke-dasharray=\"6 5\"")
-                    && line.contains(">references (unchanged)</text>")
+                line.contains("stroke-dasharray=\"6 5\"") && line.contains(">references</text>")
             })
             .expect("dashed legend sample");
         assert!(sample.contains("x1=\"28.0\""));
@@ -1346,6 +1367,38 @@ mod tests {
             escape("a\u{0}b\u{8}\t\n\r\u{b}\u{c}\u{1f}z"),
             "a\u{fffd}b\u{fffd}\t\n\r\u{fffd}\u{fffd}\u{fffd}z"
         );
+    }
+
+    #[test]
+    fn module_labels_overlay_reference_edges_with_opaque_theme_surface() {
+        for (theme, surface) in [
+            (SvgTheme::Fixed(Theme::Light), LIGHT_PALETTE.surface),
+            (SvgTheme::Fixed(Theme::Dark), DARK_PALETTE.surface),
+        ] {
+            let svg = fixture_svg_with_theme("plan_image_reference_layout", theme);
+            let label = "module &quot;app&quot; (./app-module)";
+            let label_position = svg.find(label).expect("app module label");
+            let dashed_edge_position = svg
+                .match_indices("<path d=\"M")
+                .map(|(position, _)| position)
+                .filter(|position| {
+                    svg[*position..]
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.contains("stroke-dasharray=\"6 5\""))
+                })
+                .max()
+                .expect("dashed reference edge");
+            assert!(
+                dashed_edge_position < label_position,
+                "module label must be painted after reference edges"
+            );
+            let overlay = &svg[dashed_edge_position..label_position];
+            assert!(
+                overlay.contains("<rect x=\"") && overlay.contains(&format!("fill=\"{surface}\"")),
+                "module label needs an opaque background matching the band surface"
+            );
+        }
     }
 
     #[test]
@@ -1404,5 +1457,10 @@ mod tests {
             "plan_image_module_cascade",
             SvgTheme::Auto,
         ));
+    }
+
+    #[test]
+    fn snapshot_reference_layout_svg() {
+        insta::assert_snapshot!(fixture_svg("plan_image_reference_layout"));
     }
 }

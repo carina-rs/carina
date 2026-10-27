@@ -13,12 +13,16 @@ pub(crate) const MAX_TYPE_CHARS: usize = 42;
 const HEADER_HEIGHT: f32 = 112.0;
 const LEGEND_HEIGHT: f32 = 92.0;
 const CANVAS_SIDE_MARGIN: f32 = 28.0;
-const MODULE_SIDE_MARGIN: f32 = 18.0;
 const COLUMN_GAP: f32 = 104.0;
 const NODE_GAP: f32 = 18.0;
 const SAME_COLUMN_REFERENCE_GAP: f32 = NODE_GAP * 3.0;
 const BAND_GAP: f32 = 22.0;
 const BAND_PADDING: f32 = 16.0;
+pub(crate) const NODE_HALO_OFFSET: f32 = 5.0;
+pub(crate) const NODE_HALO_STROKE_WIDTH: f32 = 8.0;
+const NODE_HALO_OUTSET: f32 = NODE_HALO_OFFSET + NODE_HALO_STROKE_WIDTH / 2.0;
+const MIN_HALO_BAND_MARGIN: f32 = 4.0;
+const _: () = assert!(BAND_PADDING >= NODE_HALO_OUTSET + MIN_HALO_BAND_MARGIN);
 const MODULE_LABEL_HEIGHT: f32 = 30.0;
 const MIN_NODE_WIDTH: f32 = 220.0;
 const MAX_NODE_WIDTH: f32 = 344.0;
@@ -283,11 +287,27 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
     let mut module_rects = Vec::new();
     for (band_idx, band) in bands.iter().enumerate() {
         if let BandId::Module(id) = band {
+            let members: Vec<_> = positioned_nodes
+                .iter()
+                .filter(|rect| {
+                    model
+                        .node(&rect.id)
+                        .is_some_and(|node| node.module.as_ref() == Some(id))
+                })
+                .collect();
+            let Some(member_left) = members.iter().map(|rect| rect.x).reduce(f32::min) else {
+                continue;
+            };
+            let member_right = members
+                .iter()
+                .map(|rect| rect.x + rect.width)
+                .reduce(f32::max)
+                .expect("module band has at least one member");
             module_rects.push(ModuleRect {
                 id: id.clone(),
-                x: MODULE_SIDE_MARGIN,
+                x: member_left - BAND_PADDING,
                 y: band_tops[band_idx],
-                width: width - MODULE_SIDE_MARGIN * 2.0,
+                width: member_right - member_left + BAND_PADDING * 2.0,
                 height: band_heights[band_idx],
             });
         }
@@ -662,9 +682,47 @@ fn cycle_removed_layering(model: &GraphModel) -> Layering {
 
 fn graph_layering(model: &GraphModel) -> Layering {
     let mut layering = cycle_removed_layering(model);
-    place_reference_nodes(model, &mut layering.layers);
+    let mut constraint_edges = layering.edges.clone();
+    let mut accepted: HashMap<GraphNodeId, Vec<GraphNodeId>> = HashMap::new();
+    for edge in &constraint_edges {
+        accepted
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+    }
+    for targets in accepted.values_mut() {
+        targets.sort_by_key(GraphNodeId::stable_key);
+        targets.dedup();
+    }
 
-    for edge in &model.reference_edges {
+    let visible: HashSet<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
+    let mut references = model.reference_edges.clone();
+    references.sort_by_key(|edge| (edge.from.stable_key(), edge.to.stable_key()));
+    // Ordering constraints are already present in `accepted`. Add references
+    // deterministically only while the constraint graph remains acyclic.
+    for edge in &references {
+        if !visible.contains(&edge.from)
+            || !visible.contains(&edge.to)
+            || path_exists(&accepted, &edge.to, &edge.from)
+        {
+            continue;
+        }
+        let targets = accepted.entry(edge.from.clone()).or_default();
+        targets.push(edge.to.clone());
+        targets.sort_by_key(GraphNodeId::stable_key);
+        targets.dedup();
+        constraint_edges.push(OrientedEdge {
+            actual_from: edge.from.clone(),
+            actual_to: edge.to.clone(),
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            reversed: false,
+            is_reference: true,
+        });
+    }
+    layering.layers = longest_path_layers(model, &constraint_edges);
+
+    for edge in references {
         let (Some(from_column), Some(to_column)) = (
             layering.layers.get(&edge.from).copied(),
             layering.layers.get(&edge.to).copied(),
@@ -692,183 +750,46 @@ fn graph_layering(model: &GraphModel) -> Layering {
     layering
 }
 
-fn place_reference_nodes(model: &GraphModel, layers: &mut HashMap<GraphNodeId, usize>) {
-    let unchanged: HashSet<_> = model
-        .nodes
-        .iter()
-        .filter(|node| node.kind == EffectKind::Unchanged)
-        .map(|node| node.id.clone())
-        .collect();
-    if unchanged.is_empty() {
-        return;
-    }
-
-    let forward = reference_adjacency(
-        model
-            .logical_edges
-            .iter()
-            .map(|edge| (&edge.dependency, &edge.dependent)),
-    );
-    let reverse = reference_adjacency(
-        model
-            .logical_edges
-            .iter()
-            .map(|edge| (&edge.dependent, &edge.dependency)),
-    );
-    let fixed_layers = layers.clone();
-    let latest_changed_dependency: HashMap<_, _> = unchanged
-        .iter()
-        .map(|id| {
-            (
-                id.clone(),
-                reachable_changed_columns(id, &reverse, &fixed_layers)
-                    .into_iter()
-                    .max()
-                    .unwrap_or(0),
-            )
-        })
-        .collect();
-    let earliest_changed_dependent: HashMap<_, _> = unchanged
-        .iter()
-        .map(|id| {
-            (
-                id.clone(),
-                reachable_changed_columns(id, &forward, &fixed_layers)
-                    .into_iter()
-                    .min(),
-            )
-        })
-        .collect();
-
-    fn place(
-        id: &GraphNodeId,
-        unchanged: &HashSet<GraphNodeId>,
-        dependencies: &HashMap<GraphNodeId, Vec<GraphNodeId>>,
-        base: &HashMap<GraphNodeId, usize>,
-        ceiling: &HashMap<GraphNodeId, Option<usize>>,
-        layers: &mut HashMap<GraphNodeId, usize>,
-        visiting: &mut HashSet<GraphNodeId>,
-    ) -> usize {
-        if let Some(column) = layers.get(id).copied() {
-            return column;
-        }
-        let fallback = base.get(id).copied().unwrap_or(0);
-        if !visiting.insert(id.clone()) {
-            return fallback;
-        }
-        let latest_dependency = dependencies
-            .get(id)
-            .into_iter()
-            .flatten()
-            .map(|dependency| {
-                if unchanged.contains(dependency) {
-                    place(
-                        dependency,
-                        unchanged,
-                        dependencies,
-                        base,
-                        ceiling,
-                        layers,
-                        visiting,
-                    )
-                } else {
-                    layers.get(dependency).copied().unwrap_or(fallback)
-                }
-            })
-            .max()
-            .unwrap_or(fallback)
-            .max(fallback);
-        let next = latest_dependency.saturating_add(1);
-        let column = if ceiling
-            .get(id)
-            .and_then(|column| *column)
-            .is_some_and(|earliest_dependent| next < earliest_dependent)
-        {
-            next
-        } else {
-            latest_dependency
-        };
-        visiting.remove(id);
-        layers.insert(id.clone(), column);
-        column
-    }
-
-    let mut ordered: Vec<_> = unchanged.iter().cloned().collect();
-    ordered.sort_by_key(|id| layout_node_sort_key(model, id));
-    let mut visiting = HashSet::new();
-    for id in ordered {
-        place(
-            &id,
-            &unchanged,
-            &reverse,
-            &latest_changed_dependency,
-            &earliest_changed_dependent,
-            layers,
-            &mut visiting,
-        );
-    }
-}
-
-fn reference_adjacency<'a>(
-    edges: impl IntoIterator<Item = (&'a GraphNodeId, &'a GraphNodeId)>,
-) -> HashMap<GraphNodeId, Vec<GraphNodeId>> {
-    let mut adjacency: HashMap<GraphNodeId, Vec<GraphNodeId>> = HashMap::new();
-    for (from, to) in edges {
-        adjacency.entry(from.clone()).or_default().push(to.clone());
-    }
-    for adjacent in adjacency.values_mut() {
-        adjacent.sort_by_key(GraphNodeId::stable_key);
-        adjacent.dedup();
-    }
-    adjacency
-}
-
-fn reachable_changed_columns(
-    start: &GraphNodeId,
+fn path_exists(
     adjacency: &HashMap<GraphNodeId, Vec<GraphNodeId>>,
-    changed_layers: &HashMap<GraphNodeId, usize>,
-) -> Vec<usize> {
-    let mut stack = vec![start.clone()];
+    from: &GraphNodeId,
+    to: &GraphNodeId,
+) -> bool {
+    let mut stack = vec![from.clone()];
     let mut visited = HashSet::new();
-    let mut columns = Vec::new();
     while let Some(id) = stack.pop() {
         if !visited.insert(id.clone()) {
             continue;
         }
-        if id != *start
-            && let Some(column) = changed_layers.get(&id).copied()
-        {
-            columns.push(column);
-            continue;
+        if id == *to {
+            return true;
         }
         if let Some(adjacent) = adjacency.get(&id) {
             stack.extend(adjacent.iter().cloned());
         }
     }
-    columns
+    false
 }
 
 fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<GraphNodeId, usize> {
-    let node_ids: HashSet<_> = model
-        .nodes
-        .iter()
-        .filter(|node| node.kind != EffectKind::Unchanged)
-        .map(|node| node.id.clone())
-        .collect();
+    let node_ids: HashSet<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
     let mut indegree: HashMap<_, usize> = node_ids.iter().cloned().map(|id| (id, 0)).collect();
-    let mut outgoing: HashMap<GraphNodeId, Vec<GraphNodeId>> = HashMap::new();
+    let mut outgoing: HashMap<GraphNodeId, Vec<(GraphNodeId, usize)>> = HashMap::new();
     let mut unique_edges = HashSet::new();
     for edge in edges {
         if unique_edges.insert((edge.from.clone(), edge.to.clone())) {
+            // References prevent right-to-left placement but may share a
+            // column. Ordering edges must advance by at least one column.
+            let column_advance = usize::from(!edge.is_reference);
             outgoing
                 .entry(edge.from.clone())
                 .or_default()
-                .push(edge.to.clone());
+                .push((edge.to.clone(), column_advance));
             *indegree.entry(edge.to.clone()).or_default() += 1;
         }
     }
     for targets in outgoing.values_mut() {
-        targets.sort_by_key(GraphNodeId::stable_key);
+        targets.sort_by_key(|(id, _)| id.stable_key());
         targets.dedup();
     }
 
@@ -894,10 +815,10 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
         }
         let parent_layer = layers[&id];
         if let Some(targets) = outgoing.get(&id) {
-            for target in targets {
+            for (target, minimum_advance) in targets {
                 layers
                     .entry(target.clone())
-                    .and_modify(|layer| *layer = (*layer).max(parent_layer + 1));
+                    .and_modify(|layer| *layer = (*layer).max(parent_layer + minimum_advance));
                 let degree = indegree
                     .get_mut(target)
                     .expect("edge target initialized in indegree map");
@@ -1651,6 +1572,20 @@ mod tests {
         })
     }
 
+    fn fixture_model(name: &str) -> GraphModel {
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(name);
+        let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
+        build_model(PlanImageInput {
+            plan: &fixture.plan,
+            desired_resources: &fixture.desired_resources,
+            unresolved_resources: &fixture.unresolved_resources,
+            compositions: &fixture.compositions,
+            expansion_trace: Some(&fixture.expansion_trace),
+            state: None,
+            summary: &summary,
+        })
+    }
+
     fn positioned_vertices_for_test(
         model: &GraphModel,
     ) -> (ExpandedGraph, Vec<PositionedVertex>, Vec<BandBounds>) {
@@ -1873,6 +1808,216 @@ mod tests {
             layout.node(&GraphNodeId::Effect(0)).unwrap().column
                 < layout.node(&GraphNodeId::Effect(1)).unwrap().column
         );
+    }
+
+    #[test]
+    fn reference_layout_draws_changed_to_changed_reference_without_ordering_edge() {
+        let model = fixture_model("plan_image_reference_layout");
+        let subnet = model
+            .nodes
+            .iter()
+            .find(|node| node.label == "subnet")
+            .expect("subnet node")
+            .id
+            .clone();
+        let dns = model
+            .nodes
+            .iter()
+            .find(|node| node.label == "dns")
+            .expect("dns node")
+            .id
+            .clone();
+
+        assert!(
+            model
+                .logical_edges
+                .iter()
+                .any(|edge| { edge.dependency == subnet && edge.dependent == dns })
+        );
+        assert!(!model.ordering_edges.iter().any(|edge| {
+            (edge.from == subnet && edge.to == dns) || (edge.from == dns && edge.to == subnet)
+        }));
+        assert!(
+            model
+                .reference_edges
+                .iter()
+                .any(|edge| { edge.from == subnet && edge.to == dns })
+        );
+        assert!(layout_graph(&model).edge_route(&subnet, &dns).is_some());
+    }
+
+    #[test]
+    fn reference_layout_drawn_edges_never_point_left_except_reversed_delete_ordering() {
+        let model = fixture_model("plan_image_reference_layout");
+        let layout = layout_graph(&model);
+        let ordering_pairs: HashSet<_> = model
+            .ordering_edges
+            .iter()
+            .map(|edge| (edge.from.clone(), edge.to.clone()))
+            .collect();
+
+        // Exact invariant: a rendered reference edge may advance or stay in its
+        // column, and a rendered ordering edge must advance. The only permitted
+        // left-pointing edge is an ordering edge between deletes whose direction
+        // is the reverse of their logical dependency (dependent deletes first).
+        for edge in model.ordering_edges.iter().chain(&model.reference_edges) {
+            let Some(route) = layout.edge_route(&edge.from, &edge.to) else {
+                continue;
+            };
+            assert!(!route.points.is_empty());
+            let from = layout.node(&edge.from).expect("drawn edge source");
+            let to = layout.node(&edge.to).expect("drawn edge target");
+            let is_ordering = ordering_pairs.contains(&(edge.from.clone(), edge.to.clone()));
+            let reversed_delete_ordering = is_ordering
+                && model
+                    .node(&edge.from)
+                    .is_some_and(|node| node.kind == EffectKind::Delete)
+                && model
+                    .node(&edge.to)
+                    .is_some_and(|node| node.kind == EffectKind::Delete)
+                && model
+                    .logical_edges
+                    .iter()
+                    .any(|logical| logical.dependency == edge.to && logical.dependent == edge.from);
+
+            assert!(
+                from.column <= to.column || reversed_delete_ordering,
+                "edge points left without delete-order reversal: {:?} (column {}) -> {:?} (column {})",
+                edge.from,
+                from.column,
+                edge.to,
+                to.column
+            );
+            if is_ordering {
+                assert_ne!(
+                    from.column, to.column,
+                    "cards in one column must have no ordering dependency"
+                );
+            }
+        }
+
+        let legacy = model
+            .nodes
+            .iter()
+            .find(|node| node.label == "legacy")
+            .expect("legacy delete")
+            .id
+            .clone();
+        let worker = model
+            .nodes
+            .iter()
+            .find(|node| node.label == "legacy_worker")
+            .expect("legacy worker delete")
+            .id
+            .clone();
+        assert!(
+            model
+                .logical_edges
+                .iter()
+                .any(|edge| { edge.dependency == legacy && edge.dependent == worker })
+        );
+        assert!(
+            model
+                .ordering_edges
+                .iter()
+                .any(|edge| { edge.from == worker && edge.to == legacy })
+        );
+        assert!(!model.reference_edges.iter().any(|edge| {
+            (edge.from == legacy && edge.to == worker) || (edge.from == worker && edge.to == legacy)
+        }));
+    }
+
+    #[test]
+    fn reference_layout_haloed_module_cards_keep_four_pixel_border_margin() {
+        const HALO_OUTSET: f32 = 5.0 + 8.0 / 2.0;
+        const REQUIRED_MARGIN: f32 = 4.0;
+
+        let model = fixture_model("plan_image_reference_layout");
+        let layout = layout_graph(&model);
+        for band in &layout.modules {
+            for card in &layout.nodes {
+                let Some(node) = model.node(&card.id) else {
+                    continue;
+                };
+                if node.module.as_ref() != Some(&band.id) || node.affected_by.is_empty() {
+                    continue;
+                }
+                let margins = [
+                    card.x - HALO_OUTSET - band.x,
+                    band.x + band.width - (card.x + card.width + HALO_OUTSET),
+                    card.y - HALO_OUTSET - band.y,
+                    band.y + band.height - (card.y + card.height + HALO_OUTSET),
+                ];
+                assert!(
+                    margins.iter().all(|margin| *margin >= REQUIRED_MARGIN),
+                    "halo around {:?} has band-border margins {margins:?}",
+                    card.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_layout_module_band_hugs_members_without_overlapping_non_members() {
+        let model = fixture_model("plan_image_reference_layout");
+        let layout = layout_graph(&model);
+        let overlaps = |left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)| {
+            left.0 < right.0 + right.2
+                && right.0 < left.0 + left.2
+                && left.1 < right.1 + right.3
+                && right.1 < left.1 + left.3
+        };
+
+        for band in &layout.modules {
+            let members: Vec<_> = layout
+                .nodes
+                .iter()
+                .filter(|card| {
+                    model
+                        .node(&card.id)
+                        .is_some_and(|node| node.module.as_ref() == Some(&band.id))
+                })
+                .collect();
+            assert!(!members.is_empty());
+            let member_left = members
+                .iter()
+                .map(|card| card.x)
+                .fold(f32::INFINITY, f32::min);
+            let member_right = members
+                .iter()
+                .map(|card| card.x + card.width)
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!((band.x - (member_left - BAND_PADDING)).abs() < 0.01);
+            assert!(
+                (band.x + band.width - (member_right + BAND_PADDING)).abs() < 0.01,
+                "module band must end one padding width after its rightmost member"
+            );
+
+            for card in &layout.nodes {
+                let is_member = model
+                    .node(&card.id)
+                    .is_some_and(|node| node.module.as_ref() == Some(&band.id));
+                if !is_member {
+                    assert!(
+                        !overlaps(
+                            (band.x, band.y, band.width, band.height),
+                            (card.x, card.y, card.width, card.height)
+                        ),
+                        "module band {:?} overlaps non-member card {:?}",
+                        band.id,
+                        card.id
+                    );
+                }
+            }
+        }
+        for (index, left) in layout.modules.iter().enumerate() {
+            for right in &layout.modules[index + 1..] {
+                assert!(!overlaps(
+                    (left.x, left.y, left.width, left.height),
+                    (right.x, right.y, right.width, right.height)
+                ));
+            }
+        }
     }
 
     #[test]

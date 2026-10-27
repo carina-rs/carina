@@ -107,9 +107,9 @@ such as a pull request:
   arrows mean "runs before".
 - Resources downstream of a replace or delete are highlighted with a halo,
   so the blast radius of a destructive change is visible at a glance.
-- Unchanged resources appear only when they connect two changed resources.
-  Their edges are dashed and mean "references", not ordering. A module call
-  with no changes is collapsed into a single card.
+- Dashed edges mean "references" and impose no ordering. Unchanged resources
+  appear only when they connect two changed resources. A module call with no
+  changes is collapsed into a single card.
 - Resources inside a module call are grouped in a box labelled with the call.
 - The header shows per-effect counts, with replace and destroy counts in bold,
   and the state lineage and serial the plan was computed against.

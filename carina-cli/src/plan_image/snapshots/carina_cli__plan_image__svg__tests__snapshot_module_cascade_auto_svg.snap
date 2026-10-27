@@ -53,12 +53,14 @@ expression: "fixture_svg_with_theme(\"plan_image_module_cascade\", SvgTheme::Aut
     <text class="fill-primary" x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
     <text class="fill-muted" x="28" y="65" font-size="12.5" fill="#57606a"><tspan class="fill-update" fill="#0969da" font-weight="600">2 to update</tspan><tspan class="fill-edge" fill="#8c959f"> · </tspan><tspan class="fill-replace" fill="#8250df" font-weight="700">2 to replace</tspan><tspan class="fill-edge" fill="#8c959f"> · </tspan><tspan class="fill-delete" fill="#cf222e" font-weight="700">2 to destroy</tspan><tspan class="fill-edge" fill="#8c959f"> · </tspan><tspan class="fill-muted" fill="#57606a" font-weight="600">2 exports to change</tspan></text>
     <text class="fill-subtle" x="28" y="90" font-size="10.5" fill="#6e7781">state test-plan-image-module-cascade · serial 9</text>
-    <rect class="fill-surface stroke-border" x="18.0" y="739.0" width="864.0" height="175.0" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
-    <text class="fill-muted" x="32.0" y="759.0" font-size="11" font-weight="600" fill="#57606a">module &quot;review&quot; (./review-module)</text>
-    <path class="stroke-delete" d="M248.0,177.0 C263.4,177.0 263.4,177.0 278.7,177.0 C312.0,177.0 312.0,219.0 345.3,219.0 C354.6,219.0 354.6,219.0 364.0,219.0" fill="none" stroke="#cf222e" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-delete)"/>
-    <path class="stroke-replace" d="M248.0,309.0 C263.4,309.0 263.4,309.0 278.7,309.0 C312.0,309.0 312.0,352.5 345.3,352.5 C354.6,352.5 354.6,352.5 364.0,352.5" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
+    <rect class="fill-surface stroke-border" x="12.0" y="739.0" width="264.0" height="175.0" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+    <path class="stroke-delete" d="M248.0,177.0 C263.4,177.0 263.4,177.0 278.7,177.0 C312.0,177.0 312.0,309.0 345.3,309.0 C354.6,309.0 354.6,309.0 364.0,309.0" fill="none" stroke="#cf222e" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-delete)"/>
+    <path class="stroke-replace" d="M248.0,309.0 C263.4,309.0 263.4,309.0 278.7,309.0 C312.0,309.0 312.0,442.5 345.3,442.5 C354.6,442.5 354.6,442.5 364.0,442.5" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
     <path class="stroke-replace" d="M138.0,514.0 C138.0,514.0 138.0,568.0 138.0,568.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
     <path class="stroke-replace" d="M138.0,374.0 C138.0,374.0 138.0,428.0 138.0,428.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <path class="stroke-replace" d="M248.0,309.0 C263.4,309.0 263.4,309.0 278.7,309.0 C312.0,309.0 312.0,309.0 345.3,309.0 C354.6,309.0 354.6,309.0 364.0,309.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <rect class="fill-surface" x="20.0" y="744.0" width="229.8" height="21" rx="4" fill="#f6f8fa"/>
+    <text class="fill-muted" x="26.0" y="759.0" font-size="11" font-weight="600" fill="#57606a">module &quot;review&quot; (./review-module)</text>
     <rect class="stroke-delete halo" x="23.0" y="123.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#cf222e" stroke-width="8" stroke-opacity="0.24"/>
     <g>
       <rect class="fill-delete-tint stroke-delete" x="28.0" y="128.0" width="220.0" height="98.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
@@ -115,29 +117,29 @@ expression: "fixture_svg_with_theme(\"plan_image_module_cascade\", SvgTheme::Aut
       <text class="fill-update" x="46.0" y="870.0" font-size="10.5" font-weight="600" fill="#0969da">changed attributes:</text>
       <text class="fill-body" x="54.0" y="886.0" font-size="10.5" fill="#24292f">• description</text>
     </g>
-    <rect class="stroke-replace halo" x="359.0" y="165.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
+    <rect class="stroke-replace halo" x="359.0" y="255.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
     <g>
-      <rect class="fill-delete-tint stroke-delete" x="364.0" y="170.0" width="220.0" height="98.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
-      <rect class="fill-delete" x="364.0" y="170.0" width="6" height="98.0" rx="3" fill="#cf222e"/>
-      <text class="fill-delete" x="381.0" y="197.0" font-size="13" font-weight="700" fill="#cf222e">-</text>
-      <rect class="fill-delete" x="402.0" y="180.0" width="52.0" height="20" rx="10" fill="#cf222e" fill-opacity="0.10"/>
-      <text class="fill-delete" x="410.0" y="194.5" font-size="10" font-weight="700" fill="#cf222e">delete</text>
-      <text class="fill-primary" x="382.0" y="219.0" font-size="14" font-weight="700" fill="#1f2328" text-decoration="line-through">obsolete</text>
-      <text class="fill-subtle" x="382.0" y="237.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text class="fill-replace" x="382.0" y="258.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
+      <rect class="fill-delete-tint stroke-delete" x="364.0" y="260.0" width="220.0" height="98.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
+      <rect class="fill-delete" x="364.0" y="260.0" width="6" height="98.0" rx="3" fill="#cf222e"/>
+      <text class="fill-delete" x="381.0" y="287.0" font-size="13" font-weight="700" fill="#cf222e">-</text>
+      <rect class="fill-delete" x="402.0" y="270.0" width="52.0" height="20" rx="10" fill="#cf222e" fill-opacity="0.10"/>
+      <text class="fill-delete" x="410.0" y="284.5" font-size="10" font-weight="700" fill="#cf222e">delete</text>
+      <text class="fill-primary" x="382.0" y="309.0" font-size="14" font-weight="700" fill="#1f2328" text-decoration="line-through">obsolete</text>
+      <text class="fill-subtle" x="382.0" y="327.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text class="fill-replace" x="382.0" y="348.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
     </g>
-    <rect class="stroke-replace halo" x="359.0" y="281.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
+    <rect class="stroke-replace halo" x="359.0" y="371.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
     <g>
-      <rect class="fill-replace-tint stroke-replace" x="364.0" y="286.0" width="220.0" height="133.0" rx="9" fill="#fbefff" fill-opacity="1" stroke="#8250df"/>
-      <rect class="fill-replace" x="364.0" y="286.0" width="6" height="133.0" rx="3" fill="#8250df"/>
-      <text class="fill-replace" x="381.0" y="313.0" font-size="13" font-weight="700" fill="#8250df">±</text>
-      <rect class="fill-replace" x="402.0" y="296.0" width="58.0" height="20" rx="10" fill="#8250df" fill-opacity="0.10"/>
-      <text class="fill-replace" x="410.0" y="310.5" font-size="10" font-weight="700" fill="#8250df">replace</text>
-      <text class="fill-primary" x="382.0" y="335.0" font-size="14" font-weight="700" fill="#1f2328">cascade</text>
-      <text class="fill-subtle" x="382.0" y="353.0" font-size="11" fill="#6e7781">test.test.Widget</text>
-      <text class="fill-replace" x="382.0" y="371.0" font-size="10.5" font-weight="600" fill="#8250df">forces replacement:</text>
-      <text class="fill-body" x="390.0" y="387.0" font-size="10.5" fill="#24292f">• external_name</text>
-      <text class="fill-replace" x="382.0" y="409.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
+      <rect class="fill-replace-tint stroke-replace" x="364.0" y="376.0" width="220.0" height="133.0" rx="9" fill="#fbefff" fill-opacity="1" stroke="#8250df"/>
+      <rect class="fill-replace" x="364.0" y="376.0" width="6" height="133.0" rx="3" fill="#8250df"/>
+      <text class="fill-replace" x="381.0" y="403.0" font-size="13" font-weight="700" fill="#8250df">±</text>
+      <rect class="fill-replace" x="402.0" y="386.0" width="58.0" height="20" rx="10" fill="#8250df" fill-opacity="0.10"/>
+      <text class="fill-replace" x="410.0" y="400.5" font-size="10" font-weight="700" fill="#8250df">replace</text>
+      <text class="fill-primary" x="382.0" y="425.0" font-size="14" font-weight="700" fill="#1f2328">cascade</text>
+      <text class="fill-subtle" x="382.0" y="443.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text class="fill-replace" x="382.0" y="461.0" font-size="10.5" font-weight="600" fill="#8250df">forces replacement:</text>
+      <text class="fill-body" x="390.0" y="477.0" font-size="10.5" fill="#24292f">• external_name</text>
+      <text class="fill-replace" x="382.0" y="499.0" font-size="10" font-weight="600" fill="#8250df">affected by source</text>
     </g>
     <line class="stroke-divider" x1="28" y1="924.0" x2="872" y2="924.0" stroke="#d8dee4"/>
     <text class="fill-update" x="28.0" y="945.0" font-size="11" font-weight="700" fill="#0969da">~</text>
@@ -149,7 +151,7 @@ expression: "fixture_svg_with_theme(\"plan_image_module_cascade\", SvgTheme::Aut
     <text class="fill-unchanged" x="245.8" y="945.0" font-size="11" font-weight="700" fill="#6e7781">=</text>
     <text class="fill-muted" x="258.4" y="945.0" font-size="10" fill="#57606a">unchanged</text>
     <line class="stroke-edge" x1="28.0" y1="992.0" x2="72.0" y2="992.0" stroke="#8c959f" stroke-width="1.6" marker-end="url(#arrow-default)"/><text class="fill-muted" x="82.0" y="996.0" font-size="10" fill="#57606a">runs before</text>
-    <line class="stroke-edge" x1="174.0" y1="992.0" x2="218.0" y2="992.0" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#arrow-default)"/><text class="fill-muted" x="228.0" y="996.0" font-size="10" fill="#57606a">references (unchanged)</text>
-    <rect class="stroke-replace halo" x="382.0" y="983.0" width="24" height="13" rx="4" fill="none" stroke="#8250df" stroke-width="5" stroke-opacity="0.24"/><text class="fill-muted" x="416.0" y="996.0" font-size="10" fill="#57606a">halo = downstream blast radius</text>
+    <line class="stroke-edge" x1="174.0" y1="992.0" x2="218.0" y2="992.0" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#arrow-default)"/><text class="fill-muted" x="228.0" y="996.0" font-size="10" fill="#57606a">references</text>
+    <rect class="stroke-replace halo" x="320.0" y="983.0" width="24" height="13" rx="4" fill="none" stroke="#8250df" stroke-width="5" stroke-opacity="0.24"/><text class="fill-muted" x="354.0" y="996.0" font-size="10" fill="#57606a">halo = downstream blast radius</text>
   </g>
 </svg>

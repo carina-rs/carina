@@ -475,16 +475,20 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
         .iter()
         .map(|node| (node.id.clone(), node.affected_by.clone()))
         .collect();
-    let unchanged_ids: HashSet<_> = nodes
+    // An ordering edge already explains the visible relationship, even when
+    // delete semantics make it run opposite to the logical reference.
+    let ordering_pairs: HashSet<_> = ordering_edges
         .iter()
-        .filter(|node| node.kind == EffectKind::Unchanged)
-        .map(|node| node.id.clone())
+        .flat_map(|edge| {
+            [
+                (edge.from.clone(), edge.to.clone()),
+                (edge.to.clone(), edge.from.clone()),
+            ]
+        })
         .collect();
     let mut reference_edges: Vec<_> = logical_edges
         .iter()
-        .filter(|edge| {
-            unchanged_ids.contains(&edge.dependency) || unchanged_ids.contains(&edge.dependent)
-        })
+        .filter(|edge| !ordering_pairs.contains(&(edge.dependency.clone(), edge.dependent.clone())))
         .map(|edge| GraphEdge {
             from: edge.dependency.clone(),
             to: edge.dependent.clone(),

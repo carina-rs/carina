@@ -1,0 +1,182 @@
+{
+  "version": 7,
+  "serial": 12,
+  "lineage": "test-plan-image-reference-layout",
+  "carina_version": "0.6.0",
+  "exports": {
+    "cache_name": "cache",
+    "dns_metric": "dns-new"
+  },
+  "resources": [
+    {
+      "resource_type": "test.Widget",
+      "identity": "network",
+      "provider": "test",
+      "identifier": "network-live",
+      "attributes": {
+        "external_name": "network-old",
+        "output_id": "network-stable"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "network",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "subnet",
+      "provider": "test",
+      "identifier": "subnet-live",
+      "attributes": {
+        "external_name": "subnet",
+        "description": "network-stable",
+        "metric_name": "subnet-old",
+        "output_id": "subnet-stable"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "subnet",
+      "dependency_bindings": ["network"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" },
+          "metric_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "dns",
+      "provider": "test",
+      "identifier": "dns-live",
+      "attributes": {
+        "external_name": "dns",
+        "description": "subnet-stable",
+        "metric_name": "dns-old",
+        "output_id": "dns-stable"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "dns",
+      "dependency_bindings": ["subnet"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" },
+          "metric_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "app.server",
+      "provider": "test",
+      "identifier": "server-live",
+      "attributes": {
+        "external_name": "app-server",
+        "description": "subnet-stable",
+        "output_id": "server-stable"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "app.server",
+      "dependency_bindings": ["subnet"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "app.sidecar",
+      "provider": "test",
+      "identifier": "sidecar-live",
+      "attributes": {
+        "external_name": "app-sidecar",
+        "description": "server-stable",
+        "metric_name": "sidecar-old",
+        "output_id": "sidecar-stable"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "app.sidecar",
+      "dependency_bindings": ["app.server"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" },
+          "metric_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "legacy",
+      "provider": "test",
+      "identifier": "legacy-live",
+      "attributes": {
+        "external_name": "legacy",
+        "output_id": "legacy-stable"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "legacy",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "identity": "legacy_worker",
+      "provider": "test",
+      "identifier": "legacy-worker-live",
+      "attributes": {
+        "external_name": "legacy-worker",
+        "description": "legacy-stable",
+        "output_id": "legacy-worker-stable"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "legacy_worker",
+      "dependency_bindings": ["legacy"],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "description": { "kind": "leaf" }
+        }
+      }
+    }
+  ]
+}

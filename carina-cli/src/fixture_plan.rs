@@ -693,7 +693,9 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
             Some("moved_claims_precede_heuristics") => {
                 vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
             }
-            Some("plan_image_module_cascade") => vec![Box::new(PlanImageFixtureFactory)],
+            Some("plan_image_module_cascade" | "plan_image_reference_layout") => {
+                vec![Box::new(PlanImageFixtureFactory)]
+            }
             Some("replace_create_only") | Some("replace_with_non_forcing_diffs") => {
                 vec![Box::new(ReplaceCreateOnlyFixtureFactory)]
             }
