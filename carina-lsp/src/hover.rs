@@ -1482,6 +1482,87 @@ EOT
     }
 
     #[test]
+    fn review_round1_assignment_expressions_and_control_blocks_keep_attribute_context() {
+        let nested = AttributeType::struct_(
+            "Nested",
+            vec![
+                StructField::new("field", AttributeType::string())
+                    .with_description("NESTED expression field"),
+            ],
+        );
+        let schema = ResourceSchema::new("Review")
+            .attribute(AttributeSchema::new("outer", nested.clone()))
+            .attribute(AttributeSchema::new("x", nested))
+            .attribute(
+                AttributeSchema::new("field", AttributeType::string())
+                    .with_description("TOP-LEVEL field"),
+            );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+
+        for text in [
+            "test.Review {\n  outer = if true {\n    field = 'value'\n  }\n}\n",
+            "test.Review {\n  x = merge(y, {\n    field = 'value'\n  })\n}\n",
+        ] {
+            let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+            let content = hover_markdown(&provider, &doc, hover_position(text, "field", 0), None)
+                .expect("field in an assignment expression should have nested hover");
+            assert!(content.contains("NESTED expression field"), "{content}");
+            assert!(!content.contains("TOP-LEVEL field"), "{content}");
+        }
+
+        let control_text = "test.Review {\n  if true {\n    field = 'value'\n  }\n}\n";
+        let control_doc = Document::new(
+            control_text.to_string(),
+            Arc::new(ProviderContext::default()),
+        );
+        let content = hover_markdown(
+            &provider,
+            &control_doc,
+            hover_position(control_text, "field", 0),
+            None,
+        )
+        .expect("a control-flow opener should be transparent to resource hover");
+        assert!(content.contains("TOP-LEVEL field"), "{content}");
+    }
+
+    #[test]
+    fn review_round1_module_argument_hover_inside_for_body() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let module_dir = temp_dir.path().join("modules").join("example");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("main.crn"),
+            "arguments {\n  arg: String\n}\n",
+        )
+        .unwrap();
+        let consumer_dir = temp_dir.path().join("consumer");
+        std::fs::create_dir(&consumer_dir).unwrap();
+        std::fs::write(
+            consumer_dir.join("imports.crn"),
+            "let mymod = use { source = '../modules/example' }\n",
+        )
+        .unwrap();
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        for text in [
+            "for a in xs {\n  mymod {\n    arg = a\n  }\n}\n",
+            "if enabled {\n  mymod {\n    arg = 'value'\n  }\n}\n",
+        ] {
+            std::fs::write(consumer_dir.join("main.crn"), text).unwrap();
+            let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+            let content = hover_markdown(
+                &provider,
+                &doc,
+                hover_position(text, "arg", 0),
+                Some(&consumer_dir),
+            )
+            .expect("module argument inside a control-flow body should have hover");
+            assert!(content.contains("mymod.arg"), "{content}");
+        }
+    }
+
+    #[test]
     fn test_builtin_function_hover_join() {
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let doc = Document::new("join".to_string(), Arc::new(ProviderContext::default()));

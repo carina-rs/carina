@@ -16,7 +16,9 @@ use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position
 
 use crate::attribute_path::{resolve_attribute_path, struct_fields_of};
 use crate::document::Document;
-use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, enclosing_block};
+use crate::enclosing_block::{
+    EnclosingBlock, ResourceTypePatterns, cursor_line_segment, enclosing_block,
+};
 use carina_core::schema::{
     AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape,
 };
@@ -467,14 +469,11 @@ impl CompletionProvider {
         if let Some((enclosing_resource_type, struct_path)) = resource_block
             && !struct_path.is_empty()
         {
-            let current_segment = prefix
-                .rsplit(['{', '}', '[', ','])
-                .next()
-                .unwrap_or(prefix.as_str());
+            let current_segment = cursor_line_segment(text, position);
             if current_segment.contains('=') {
                 let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
                 if !after_eq.starts_with('"') || after_eq == "\"" {
-                    let field_name = self.extract_attr_name(current_segment);
+                    let field_name = self.extract_attr_name(&current_segment);
                     return CompletionContext::AfterEqualsInStruct {
                         resource_type: enclosing_resource_type.to_string(),
                         attr_path: struct_path.to_vec(),

@@ -54,6 +54,13 @@ enum SegmentSyntax {
     Bare,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineOpener {
+    Brace,
+    Bracket,
+    Parenthesis,
+}
+
 struct PathSegment {
     name: String,
     syntax: SegmentSyntax,
@@ -80,6 +87,7 @@ pub(crate) fn enclosing_block(
     let mut brace_depth = 0_usize;
     let mut bracket_depth = 0_usize;
     let mut reverse_path = Vec::new();
+    let mut crossed_list_element = false;
 
     for line_index in (0..=current_line).rev() {
         let source_chars: Vec<char> = source_lines[line_index].chars().collect();
@@ -113,8 +121,17 @@ pub(crate) fn enclosing_block(
                         };
                     }
 
+                    if is_control_flow_segment(&segment) {
+                        continue;
+                    }
                     if let Some(path_segment) = parse_path_segment(&segment, true) {
                         reverse_path.push(path_segment);
+                        crossed_list_element = false;
+                    } else if segment.trim().is_empty() {
+                        // A nameless `{` after `[` or `,` is a transparent
+                        // element wrapper. Remember it until the matching
+                        // list opener supplies the attribute name.
+                        crossed_list_element = true;
                     } else if !segment.trim().is_empty() {
                         return EnclosingBlock::Other;
                     }
@@ -122,13 +139,18 @@ pub(crate) fn enclosing_block(
                 ']' => bracket_depth += 1,
                 '[' if bracket_depth > 0 => bracket_depth -= 1,
                 '[' if brace_depth > 0 => {}
-                '[' => {
+                '[' if crossed_list_element => {
+                    // A list name is part of a schema path only while the
+                    // cursor is inside one of its struct elements. Directly
+                    // inside `[value, |]`, the list is a value expression and
+                    // must not masquerade as a struct block.
                     let segment = code_segment_before(&source_chars, classified, char_index);
-                    let Some(path_segment) = parse_path_segment(&segment, false) else {
-                        return EnclosingBlock::Other;
-                    };
-                    reverse_path.push(path_segment);
+                    if let Some(path_segment) = parse_path_segment(&segment, false) {
+                        reverse_path.push(path_segment);
+                        crossed_list_element = false;
+                    }
                 }
+                '[' => {}
                 _ => {}
             }
         }
@@ -142,13 +164,38 @@ fn code_segment_before(
     classified: &[crate::lex::ClassifiedChar],
     opener_index: usize,
 ) -> String {
-    let segment_start = (0..opener_index)
-        .rev()
-        .find(|index| {
-            classified[*index].kind() == LexKind::Code
-                && matches!(source_chars[*index], '{' | '}' | '[' | ',')
-        })
-        .map_or(0, |index| index + 1);
+    let mut segment_start = 0;
+    let mut openers = Vec::new();
+
+    for index in 0..opener_index {
+        if classified[index].kind() != LexKind::Code {
+            continue;
+        }
+        match source_chars[index] {
+            '{' => {
+                openers.push(LineOpener::Brace);
+                segment_start = index + 1;
+            }
+            '}' => {
+                pop_line_opener(&mut openers, LineOpener::Brace);
+                segment_start = index + 1;
+            }
+            '[' => {
+                openers.push(LineOpener::Bracket);
+                segment_start = index + 1;
+            }
+            ']' => pop_line_opener(&mut openers, LineOpener::Bracket),
+            '(' => openers.push(LineOpener::Parenthesis),
+            ')' => pop_line_opener(&mut openers, LineOpener::Parenthesis),
+            ',' => match openers.last() {
+                Some(LineOpener::Parenthesis) => {}
+                Some(LineOpener::Brace) | Some(LineOpener::Bracket) | None => {
+                    segment_start = index + 1;
+                }
+            },
+            _ => {}
+        }
+    }
 
     source_chars[segment_start..opener_index]
         .iter()
@@ -163,10 +210,72 @@ fn code_segment_before(
         .collect()
 }
 
+/// Return the current field/value segment on the cursor line.
+///
+/// Delimiters inside strings, comments, heredocs, or interpolations are
+/// ignored. A comma is a field boundary at line/map scope, but remains part
+/// of the value while nested in a function call or list literal.
+pub(crate) fn cursor_line_segment(text: &str, position: Position) -> String {
+    let lexed = lex(text);
+    let source_lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let line_index = position.line as usize;
+    let Some(source_line) = source_lines.get(line_index) else {
+        return String::new();
+    };
+    let Some(lexed_line) = lexed.lines().get(line_index) else {
+        return String::new();
+    };
+    let source_chars: Vec<char> = source_line.chars().collect();
+    let classified = lexed_line.chars();
+    debug_assert_eq!(source_chars.len(), classified.len());
+    let limit = (position.character as usize).min(source_chars.len());
+    let mut segment_start = 0;
+    let mut openers = Vec::new();
+
+    for index in 0..limit {
+        if classified[index].kind() != LexKind::Code {
+            continue;
+        }
+        match source_chars[index] {
+            '{' => {
+                openers.push(LineOpener::Brace);
+                segment_start = index + 1;
+            }
+            '}' => {
+                pop_line_opener(&mut openers, LineOpener::Brace);
+                segment_start = index + 1;
+            }
+            '[' => openers.push(LineOpener::Bracket),
+            ']' => pop_line_opener(&mut openers, LineOpener::Bracket),
+            '(' => openers.push(LineOpener::Parenthesis),
+            ')' => pop_line_opener(&mut openers, LineOpener::Parenthesis),
+            ',' => match openers.last() {
+                Some(LineOpener::Brace) | None => segment_start = index + 1,
+                Some(LineOpener::Bracket) | Some(LineOpener::Parenthesis) => {}
+            },
+            _ => {}
+        }
+    }
+
+    source_chars[segment_start..limit].iter().collect()
+}
+
+fn pop_line_opener(openers: &mut Vec<LineOpener>, expected: LineOpener) {
+    if openers.last() == Some(&expected) {
+        openers.pop();
+    }
+}
+
 fn parse_path_segment(segment: &str, allow_bare: bool) -> Option<PathSegment> {
     let trimmed = segment.trim();
-    let (candidate, syntax) = match trimmed.strip_suffix('=') {
-        Some(before_equals) => (before_equals.trim(), SegmentSyntax::Assignment),
+    let (candidate, syntax) = match trimmed.split_once('=') {
+        Some((_before_equals, expression)) if expression.trim_start().starts_with('=') => {
+            return None;
+        }
+        Some((before_equals, _expression)) => (before_equals.trim(), SegmentSyntax::Assignment),
         None if allow_bare => (trimmed, SegmentSyntax::Bare),
         None => return None,
     };
@@ -175,6 +284,16 @@ fn parse_path_segment(segment: &str, allow_bare: bool) -> Option<PathSegment> {
         name: candidate.to_string(),
         syntax,
     })
+}
+
+fn is_control_flow_segment(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    trimmed == "else"
+        || trimmed.starts_with("else ")
+        || trimmed == "if"
+        || trimmed.starts_with("if ")
+        || trimmed == "for"
+        || trimmed.starts_with("for ") && trimmed.contains(" in ")
 }
 
 fn is_identifier(candidate: &str) -> bool {
