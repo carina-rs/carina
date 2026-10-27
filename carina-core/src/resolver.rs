@@ -348,10 +348,24 @@ fn stamp_unresolved_upstream(
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(stamp_unresolved_upstream(*inner, upstream_binding_names)),
         )),
-        // An already-stamped `Value::Unknown` (from an earlier pass)
-        // is passed through unchanged — it cannot be resolved further.
-        other @ Value::Deferred(DeferredValue::Unknown(_)) => other,
-        other => other,
+        // Already-stamped or non-reference leaves pass through unchanged.
+        value @ Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | value @ Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => value,
     }
 }
 
@@ -571,7 +585,17 @@ fn resolve_ref_value_status_inner(
             }
         }
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(ValueResolution::Unknown(value.clone())),
-        _ => {
+        Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
+            Err(format!("{name}(): {reason}"))
+        }
+        Value::Concrete(_)
+        | Value::Deferred(
+            DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. },
+        ) => {
             let resolved = resolve_ref_value_inner(value, bindings, config)?;
             if !resolved.is_fully_resolved() {
                 Ok(ValueResolution::Unknown(resolved))
@@ -722,6 +746,9 @@ fn resolve_ref_value_inner(
                 }))
             }
         }
+        Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
+            Err(format!("{name}(): {reason}"))
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -784,7 +811,17 @@ fn resolve_ref_value_inner(
         // `Value::Unknown` is the result of stamping a previously-
         // unresolved upstream ref; it cannot be resolved further.
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(value.clone()),
-        _ => Ok(value.clone()),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
     }
 }
 
@@ -983,6 +1020,36 @@ mod tests {
         let error = resolve_ref_value_status(&expression, &ResolvedBindings::default())
             .expect_err("function errors must not select the coalesce default");
         assert!(error.contains("upper()"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn selected_coalesce_fallback_propagates_unavailable_builtin_error() {
+        let missing = "CARINA_TEST_ISSUE_3974_SELECTED_FALLBACK_MISSING";
+        let expression = coalesce(
+            Value::resource_ref("r", "comment", Vec::new()),
+            Value::Deferred(DeferredValue::Unavailable {
+                name: crate::builtins::BuiltinFunction::env,
+                args: vec![Value::Concrete(ConcreteValue::String(missing.into())).into()],
+                reason: crate::resource::UnavailableReason::from_builtin_error(format!(
+                    "environment variable '{missing}' is not set"
+                )),
+                source_line: 1.into(),
+            }),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "r",
+            HashMap::new(),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+
+        assert_eq!(
+            resolve_ref_value_status(&expression, &bindings),
+            Err(format!(
+                "env(): environment variable '{missing}' is not set"
+            )),
+        );
     }
 
     #[test]

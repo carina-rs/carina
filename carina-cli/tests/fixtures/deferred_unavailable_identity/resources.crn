@@ -1,0 +1,13 @@
+let o = mock.test.resource {
+  name = "o"
+}
+
+mock.test.resource {
+  name            = "p"
+  replacement_key = o.identifier ?? env("CARINA_MISSING_A")
+}
+
+mock.test.resource {
+  name            = "p"
+  replacement_key = o.identifier ?? env("CARINA_MISSING_B")
+}

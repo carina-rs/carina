@@ -43,6 +43,9 @@ impl ValueDescription {
             Value::Deferred(
                 DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
             ) => "function call".to_string(),
+            Value::Deferred(DeferredValue::Unavailable { .. }) => {
+                "unavailable function result".to_string()
+            }
             Value::Deferred(DeferredValue::Access(_)) => "access expression".to_string(),
             Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
                 "secret".to_string()

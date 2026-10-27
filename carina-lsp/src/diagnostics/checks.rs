@@ -112,6 +112,7 @@ fn value_depends_on_module_output(
         }),
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args.iter().any(|argument| {
             argument.value().is_some_and(|value| {
@@ -277,6 +278,7 @@ impl<'a> ContextFreeValue<'a> {
                 | Value::Deferred(DeferredValue::ResourceRef { .. })
                 | Value::Deferred(DeferredValue::BindingRef { .. })
                 | Value::Deferred(DeferredValue::FunctionCall { .. })
+                | Value::Deferred(DeferredValue::Unavailable { .. })
                 | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
                 | Value::Deferred(DeferredValue::Access(_))
                 | Value::Deferred(DeferredValue::Unknown(_))

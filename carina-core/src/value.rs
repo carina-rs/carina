@@ -10,7 +10,8 @@ use thiserror::Error;
 use crate::parser::{display_double_quoted_literal_part, display_string_literal};
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, RedactedSecretHash,
-    UnknownReason, Value,
+    UnavailableCoalescePolicy, UnavailableSecretPolicy, UnknownReason, Value,
+    find_unavailable_evaluation,
 };
 use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
 use crate::utils::is_identifier_safe;
@@ -765,12 +766,12 @@ fn value_to_json_inner(
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
-            Err(SerializationError::UnresolvedFunctionCall {
-                name: name.to_string(),
-                context: ctx,
-            })
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
+        ) => Err(SerializationError::UnresolvedFunctionCall {
+            name: name.to_string(),
+            context: ctx,
+        }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),
@@ -1651,12 +1652,11 @@ fn format_value_into_context(
             }
             sink.write_token(ValueSpanKind::StringLiteral, "\"")
         }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line: _,
-        }) => {
-            sink.write_token(ValueSpanKind::Other, name)?;
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, args, .. }
+            | DeferredValue::Unavailable { name, args, .. },
+        ) => {
+            sink.write_token(ValueSpanKind::Other, name.as_str())?;
             sink.write_token(ValueSpanKind::Structure, "(")?;
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
@@ -1852,6 +1852,7 @@ pub fn contains_secret(value: &Value) -> bool {
             .any(|part| matches!(part, InterpolationPart::Expr(value) if contains_secret(value))),
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args
             .iter()
@@ -1900,6 +1901,7 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         }),
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             args.iter()
@@ -2160,6 +2162,7 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
@@ -2199,7 +2202,7 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
 /// shapes through verbatim.
 fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => redact_secret_inner(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => redact_secret_leaf(inner),
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::Map(map)) => {
             let redacted: Result<IndexMap<String, Value>, _> = map
@@ -2236,6 +2239,23 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
             Ok(Value::Deferred(DeferredValue::FunctionCall {
                 name: *name,
                 args: redacted,
+                source_line: *source_line,
+            }))
+        }
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            args,
+            reason,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_secrets_only))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Deferred(DeferredValue::Unavailable {
+                name: *name,
+                args: redacted,
+                reason: reason.clone(),
                 source_line: *source_line,
             }))
         }
@@ -2276,27 +2296,23 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
     }
 }
 
-/// Redact a secret's inner value without requiring it to be fully resolved.
+/// Redact a typed secret leaf without requiring its material to be fully
+/// resolved.
 ///
 /// Every secret wrapper becomes exactly one placeholder. For a deferred inner
 /// expression, the placeholder hashes a canonical template representation;
 /// references and unknowns are represented structurally, so no individual
 /// literal fragment is exposed to an independent brute-force attempt.
-fn redact_secret_inner(inner: &Value) -> Result<Value, SerializationError> {
+fn redact_secret_leaf(inner: &Value) -> Result<Value, SerializationError> {
     match inner {
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(inner.clone()),
-        _ => Ok(Value::Deferred(DeferredValue::RedactedSecret {
-            hash: secret_hash(inner, None)?,
-        })),
+        _ => {
+            let material = canonical_secret_hash_material(inner)?;
+            Ok(Value::Deferred(DeferredValue::RedactedSecret {
+                hash: RedactedSecretHash::reuse_or_generate(&material, None),
+            }))
+        }
     }
-}
-
-fn secret_hash(
-    inner: &Value,
-    previous: Option<&RedactedSecretHash>,
-) -> Result<RedactedSecretHash, SerializationError> {
-    let material = canonical_secret_hash_material(inner)?;
-    Ok(RedactedSecretHash::reuse_or_generate(&material, previous))
 }
 
 /// Canonical hash material for a secret that is still deferred. Tags keep
@@ -2402,7 +2418,10 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
                     .collect::<Result<_, SerializationError>>()?,
             ),
         ),
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, args, .. }
+            | DeferredValue::Unavailable { name, args, .. },
+        ) => {
             let mut call = Map::new();
             call.insert("name".to_string(), JsonValue::String(name.to_string()));
             call.insert(
@@ -2722,8 +2741,9 @@ fn redact_with_guide(
             return Ok(source.clone());
         }
         let previous = guide.previous_hash();
+        let material = canonical_secret_hash_material(secret_value)?;
         return Ok(Value::Deferred(DeferredValue::RedactedSecret {
-            hash: secret_hash(secret_value, previous.as_ref())?,
+            hash: RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()),
         }));
     }
 
@@ -3018,44 +3038,67 @@ pub fn mask_plaintext_using_persisted_attribute(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecretRehydrationInput {
+    /// A freshly evaluated configuration value. A saved placeholder must align
+    /// with a typed `Secret` leaf.
+    Evaluated,
+    /// Hash material below a typed `Secret` that was temporarily unwrapped so
+    /// a saved structural template can be traversed.
+    EvaluatedHashMaterial,
+    /// Plaintext returned by a provider for historical-state verification.
+    Plaintext,
+}
+
 fn rehydrate_redacted_secrets_impl(
     saved: &Value,
     candidate: &Value,
-    candidate_is_secret: bool,
+    input: SecretRehydrationInput,
 ) -> Result<Value, SecretRehydrationError> {
     if !contains_redacted_secret(saved) {
         return Ok(saved.clone());
-    }
-    if candidate_is_secret && secret_candidate_evaluation_is_unavailable(candidate) {
-        return Err(SecretRehydrationError::EvaluationUnavailable);
     }
 
     // A secret interpolation/function may have been saved as a redacted
     // structural template because its final value depended on an apply-time
     // reference. Verify every template leaf against the fresh secret's inner
     // expression, then return the fresh typed Secret so taint is preserved.
-    if candidate_is_secret
+    if input == SecretRehydrationInput::Evaluated
         && !matches!(saved, Value::Deferred(DeferredValue::RedactedSecret { .. }))
         && let Value::Deferred(DeferredValue::Secret(inner)) = candidate
     {
-        rehydrate_redacted_secrets_impl(saved, inner, false)?;
+        rehydrate_redacted_secrets_impl(
+            saved,
+            inner,
+            SecretRehydrationInput::EvaluatedHashMaterial,
+        )?;
         return Ok(candidate.clone());
     }
 
     match saved {
         Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
-            let (inner, replacement) = if candidate_is_secret {
-                let Value::Deferred(DeferredValue::Secret(inner)) = candidate else {
-                    return Err(SecretRehydrationError::ExpectedSecret);
-                };
-                (inner.as_ref(), candidate.clone())
-            } else {
-                (candidate, candidate.clone())
+            let hash_material = match input {
+                SecretRehydrationInput::Evaluated => match candidate {
+                    Value::Deferred(DeferredValue::Secret(inner)) => inner.as_ref(),
+                    _ => return Err(SecretRehydrationError::ExpectedSecret),
+                },
+                SecretRehydrationInput::EvaluatedHashMaterial
+                | SecretRehydrationInput::Plaintext => candidate,
             };
-            if !hash.verify(canonical_secret_hash_material(inner)?) {
+            if find_unavailable_evaluation(
+                hash_material,
+                UnavailableCoalescePolicy::IncludeDefault,
+                UnavailableSecretPolicy::Include,
+            )
+            .is_some()
+            {
+                return Err(SecretRehydrationError::EvaluationUnavailable);
+            }
+            let material = canonical_secret_hash_material(hash_material)?;
+            if !hash.verify(material) {
                 return Err(SecretRehydrationError::HashMismatch);
             }
-            Ok(replacement)
+            Ok(candidate.clone())
         }
         Value::Concrete(ConcreteValue::Map(saved)) => {
             let Value::Concrete(ConcreteValue::Map(candidate)) = candidate else {
@@ -3068,7 +3111,7 @@ fn rehydrate_redacted_secrets_impl(
                         let candidate = candidate
                             .get(key)
                             .ok_or(SecretRehydrationError::ShapeMismatch)?;
-                        rehydrate_redacted_secrets_impl(value, candidate, candidate_is_secret)?
+                        rehydrate_redacted_secrets_impl(value, candidate, input)?
                     } else {
                         value.clone()
                     };
@@ -3091,7 +3134,7 @@ fn rehydrate_redacted_secrets_impl(
                     let candidate = candidate
                         .get(index)
                         .ok_or(SecretRehydrationError::ShapeMismatch)?;
-                    rehydrate_redacted_secrets_impl(saved, candidate, candidate_is_secret)
+                    rehydrate_redacted_secrets_impl(saved, candidate, input)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Concrete(ConcreteValue::List(values)))
@@ -3112,13 +3155,22 @@ fn rehydrate_redacted_secrets_impl(
                     }
                     InterpolationPart::Expr(saved) => match candidate.get(index) {
                         Some(InterpolationPart::Expr(candidate)) => {
-                            rehydrate_redacted_secrets_impl(saved, candidate, candidate_is_secret)
+                            rehydrate_redacted_secrets_impl(saved, candidate, input)
                                 .map(InterpolationPart::Expr)
                         }
                         Some(InterpolationPart::Literal(candidate)) => {
                             let candidate =
                                 Value::Concrete(ConcreteValue::String(candidate.clone()));
-                            let value = rehydrate_redacted_secrets_impl(saved, &candidate, false)?;
+                            let input = match input {
+                                SecretRehydrationInput::Plaintext => {
+                                    SecretRehydrationInput::Plaintext
+                                }
+                                SecretRehydrationInput::Evaluated
+                                | SecretRehydrationInput::EvaluatedHashMaterial => {
+                                    SecretRehydrationInput::EvaluatedHashMaterial
+                                }
+                            };
+                            let value = rehydrate_redacted_secrets_impl(saved, &candidate, input)?;
                             match value {
                                 Value::Concrete(ConcreteValue::String(value)) => {
                                     Ok(InterpolationPart::Literal(value))
@@ -3137,12 +3189,24 @@ fn rehydrate_redacted_secrets_impl(
             args: saved,
             source_line,
         }) => {
-            let Value::Deferred(DeferredValue::FunctionCall {
-                args: candidate, ..
-            }) = candidate
+            let Value::Deferred(
+                DeferredValue::FunctionCall {
+                    name: candidate_name,
+                    args: candidate,
+                    ..
+                }
+                | DeferredValue::Unavailable {
+                    name: candidate_name,
+                    args: candidate,
+                    ..
+                },
+            ) = candidate
             else {
                 return Err(SecretRehydrationError::ShapeMismatch);
             };
+            if name != candidate_name {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            }
             let args = saved
                 .iter()
                 .enumerate()
@@ -3156,7 +3220,7 @@ fn rehydrate_redacted_secrets_impl(
                     let (Some(saved), Some(candidate)) = (saved.value(), candidate.value()) else {
                         return Err(SecretRehydrationError::ShapeMismatch);
                     };
-                    rehydrate_redacted_secrets_impl(saved, candidate, candidate_is_secret)
+                    rehydrate_redacted_secrets_impl(saved, candidate, input)
                         .map(crate::resource::FunctionArgument::from_value)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3176,7 +3240,7 @@ fn rehydrate_redacted_secrets_impl(
             let base = rehydrate_redacted_secrets_impl(
                 saved_access.base(),
                 candidate_access.base(),
-                candidate_is_secret,
+                input,
             )?;
             saved_access
                 .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
@@ -3193,13 +3257,8 @@ fn rehydrate_redacted_secrets_impl(
             else {
                 return Err(SecretRehydrationError::ShapeMismatch);
             };
-            let value =
-                rehydrate_redacted_secrets_impl(saved_value, candidate_value, candidate_is_secret)?;
-            let default = rehydrate_redacted_secrets_impl(
-                saved_default,
-                candidate_default,
-                candidate_is_secret,
-            )?;
+            let value = rehydrate_redacted_secrets_impl(saved_value, candidate_value, input)?;
+            let default = rehydrate_redacted_secrets_impl(saved_default, candidate_default, input)?;
             Ok(Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(value),
                 default: Box::new(default),
@@ -3209,45 +3268,23 @@ fn rehydrate_redacted_secrets_impl(
     }
 }
 
-fn secret_candidate_evaluation_is_unavailable(value: &Value) -> bool {
-    match value {
-        Value::Deferred(
-            DeferredValue::Unknown(_)
-            | DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Access(_),
-        ) => true,
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                InterpolationPart::Expr(value)
-                    if secret_candidate_evaluation_is_unavailable(value)
-            )
-        }),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            secret_candidate_evaluation_is_unavailable(inner)
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            secret_candidate_evaluation_is_unavailable(value)
-                || secret_candidate_evaluation_is_unavailable(default)
-        }
-        Value::Concrete(ConcreteValue::Map(values)) => values
-            .values()
-            .any(secret_candidate_evaluation_is_unavailable),
-        Value::Concrete(ConcreteValue::List(values)) => values
-            .iter()
-            .any(secret_candidate_evaluation_is_unavailable),
-        _ => false,
-    }
-}
-
 /// Restore saved-plan placeholders from freshly evaluated configuration
 /// values, verifying the plan-time hash at every placeholder.
 pub fn rehydrate_redacted_secrets(
     saved: &Value,
     evaluated: &Value,
 ) -> Result<Value, SecretRehydrationError> {
-    rehydrate_redacted_secrets_impl(saved, evaluated, true)
+    if contains_redacted_secret(saved)
+        && find_unavailable_evaluation(
+            evaluated,
+            UnavailableCoalescePolicy::IncludeDefault,
+            UnavailableSecretPolicy::OnlyInside,
+        )
+        .is_some()
+    {
+        return Err(SecretRehydrationError::EvaluationUnavailable);
+    }
+    rehydrate_redacted_secrets_impl(saved, evaluated, SecretRehydrationInput::Evaluated)
 }
 
 /// Restore historical saved-plan placeholders from a fresh provider read,
@@ -3256,7 +3293,7 @@ pub fn rehydrate_redacted_secrets_from_plaintext(
     saved: &Value,
     plaintext: &Value,
 ) -> Result<Value, SecretRehydrationError> {
-    rehydrate_redacted_secrets_impl(saved, plaintext, false)
+    rehydrate_redacted_secrets_impl(saved, plaintext, SecretRehydrationInput::Plaintext)
 }
 
 /// Whether a saved-plan placeholder candidate is still wrapped as a typed
@@ -3297,7 +3334,7 @@ pub fn rehydrate_secret_entry(
 
 pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationError> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => redact_secret_inner(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => redact_secret_leaf(inner),
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::Map(map)) => {
             let redacted: Result<IndexMap<String, Value>, _> = map
@@ -3348,6 +3385,23 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
             Ok(Value::Deferred(DeferredValue::FunctionCall {
                 name: *name,
                 args: redacted,
+                source_line: *source_line,
+            }))
+        }
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            args,
+            reason,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_secrets_only))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Deferred(DeferredValue::Unavailable {
+                name: *name,
+                args: redacted,
+                reason: reason.clone(),
                 source_line: *source_line,
             }))
         }
@@ -5200,6 +5254,7 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
             | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
@@ -5632,6 +5687,7 @@ fn first_enum_identifier_inner(
         | Value::Deferred(
             DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::ResourceRef { .. }
@@ -9160,6 +9216,256 @@ mod tests {
         ));
     }
 
+    fn upper_with_argument(argument: Value) -> Value {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![argument.into()],
+            source_line: (0).into(),
+        })
+    }
+
+    fn unavailable_upper_with_argument(argument: Value) -> Value {
+        Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![argument.into()],
+            reason: crate::resource::UnavailableReason::from_builtin_error(
+                "upper input could not be evaluated".to_string(),
+            ),
+            source_line: (0).into(),
+        })
+    }
+
+    fn upper_with_secret_hash_material(hash_material: Value) -> Value {
+        upper_with_argument(Value::Deferred(DeferredValue::Secret(Box::new(
+            hash_material,
+        ))))
+    }
+
+    fn deferred_interpolation_hash_material(secret: &str) -> Value {
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::resource_ref("origin", "identifier", vec![])),
+            InterpolationPart::Literal(format!("-{secret}").into()),
+        ]))
+    }
+
+    fn deferred_coalesce_hash_material(default: Value) -> Value {
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("origin", "comment", vec![])),
+            default: Box::new(default),
+        })
+    }
+
+    fn pending_env_call() -> Value {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![
+                Value::Concrete(ConcreteValue::String("SAVED_PLAN_SECRET_3974".into())).into(),
+            ],
+            source_line: (0).into(),
+        })
+    }
+
+    fn unavailable_env_evaluation() -> Value {
+        Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![
+                Value::Concrete(ConcreteValue::String("SAVED_PLAN_SECRET_3974".into())).into(),
+            ],
+            reason: crate::resource::UnavailableReason::from_builtin_error(
+                "environment variable 'SAVED_PLAN_SECRET_3974' is not set".to_string(),
+            ),
+            source_line: (0).into(),
+        })
+    }
+
+    #[test]
+    fn secret_rehydration_verifies_builtin_wrapped_deferred_leaves() {
+        for hash_material in [
+            deferred_interpolation_hash_material("same-secret"),
+            deferred_coalesce_hash_material(Value::Concrete(ConcreteValue::String(
+                "same-secret".into(),
+            ))),
+        ] {
+            let candidate = upper_with_secret_hash_material(hash_material);
+            let saved = redact_secrets_in_value(&candidate).expect("redact builtin secret leaf");
+
+            assert_eq!(
+                rehydrate_redacted_secrets(&saved, &candidate)
+                    .expect("matching deferred secret leaf must rehydrate"),
+                candidate,
+            );
+        }
+    }
+
+    #[test]
+    fn secret_rehydration_allows_non_secret_apply_time_unknowns() {
+        let candidate =
+            upper_with_secret_hash_material(Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+                    UnknownReason::UpstreamExport {
+                        path: crate::resource::AccessPath::new("upstream", "identifier"),
+                    },
+                ))),
+                InterpolationPart::Literal("-same-secret".into()),
+            ])));
+        let saved = redact_secrets_in_value(&candidate).expect("redact builtin secret leaf");
+
+        rehydrate_redacted_secrets(&saved, &candidate)
+            .expect("apply-time unknown is stable secret hash material");
+    }
+
+    #[test]
+    fn secret_rehydration_treats_pending_function_calls_as_hash_material() {
+        let candidate = upper_with_secret_hash_material(pending_env_call());
+        let saved = redact_secrets_in_value(&candidate).expect("redact pending function call");
+
+        assert_eq!(
+            rehydrate_redacted_secrets(&saved, &candidate)
+                .expect("a pending call is not evidence that evaluation failed"),
+            candidate,
+        );
+    }
+
+    #[test]
+    fn secret_rehydration_accepts_matching_unavailable_function_call_shape() {
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("same-secret".into()),
+        ))));
+        let planned = upper_with_argument(secret.clone());
+        let saved = redact_secrets_in_value(&planned).expect("redact function argument");
+        let unavailable = unavailable_upper_with_argument(secret);
+
+        assert_eq!(
+            rehydrate_redacted_secrets(&saved, &unavailable)
+                .expect("an unavailable candidate retains the built-in call shape"),
+            planned,
+        );
+    }
+
+    #[test]
+    fn unavailable_evaluation_serializes_and_hashes_like_its_function_call() {
+        let unavailable = unavailable_env_evaluation();
+        let pending = pending_env_call();
+
+        assert_eq!(
+            serde_json::to_value(&unavailable).expect("serialize unavailable call"),
+            serde_json::to_value(&pending).expect("serialize pending call"),
+        );
+        let decoded: Value = serde_json::from_value(
+            serde_json::to_value(&unavailable).expect("serialize unavailable call for round trip"),
+        )
+        .expect("deserialize unavailable call through persisted representation");
+        assert!(matches!(
+            decoded,
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::env,
+                ..
+            })
+        ));
+        for value in [&unavailable, &pending] {
+            assert!(matches!(
+                PersistedValue::encode_desired_value(value, None),
+                Err(SerializationError::UnresolvedFunctionCall { name, .. }) if name == "env"
+            ));
+        }
+        assert_eq!(
+            canonical_secret_hash_material(&unavailable).expect("hash unavailable call"),
+            canonical_secret_hash_material(&pending).expect("hash pending call"),
+        );
+        assert_eq!(format_value(&unavailable), "env('SAVED_PLAN_SECRET_3974')");
+    }
+
+    #[test]
+    fn secret_rehydration_reports_hash_mismatch_at_builtin_wrapped_deferred_leaves() {
+        for (planned_material, changed_material) in [
+            (
+                deferred_interpolation_hash_material("planned-secret"),
+                deferred_interpolation_hash_material("changed-secret"),
+            ),
+            (
+                deferred_coalesce_hash_material(Value::Concrete(ConcreteValue::String(
+                    "planned-secret".into(),
+                ))),
+                deferred_coalesce_hash_material(Value::Concrete(ConcreteValue::String(
+                    "changed-secret".into(),
+                ))),
+            ),
+        ] {
+            let planned = upper_with_secret_hash_material(planned_material);
+            let saved = redact_secrets_in_value(&planned).expect("redact builtin secret leaf");
+            let changed = upper_with_secret_hash_material(changed_material);
+
+            assert!(matches!(
+                rehydrate_redacted_secrets(&saved, &changed),
+                Err(SecretRehydrationError::HashMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn secret_rehydration_reports_unavailable_at_builtin_wrapped_secret_leaves() {
+        let planned_secret = Value::Concrete(ConcreteValue::String("planned-secret".into()));
+        for (planned_material, unavailable_argument) in [
+            (
+                deferred_interpolation_hash_material("planned-secret"),
+                Value::Deferred(DeferredValue::Interpolation(vec![
+                    InterpolationPart::Expr(Value::resource_ref("origin", "identifier", vec![])),
+                    InterpolationPart::Literal("-".into()),
+                    InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
+                        unavailable_env_evaluation(),
+                    )))),
+                ])),
+            ),
+            (
+                deferred_coalesce_hash_material(planned_secret),
+                deferred_coalesce_hash_material(Value::Deferred(DeferredValue::Secret(Box::new(
+                    unavailable_env_evaluation(),
+                )))),
+            ),
+        ] {
+            let planned = upper_with_secret_hash_material(planned_material);
+            let saved = redact_secrets_in_value(&planned).expect("redact builtin secret leaf");
+            let unavailable = upper_with_argument(unavailable_argument);
+
+            assert!(matches!(
+                rehydrate_redacted_secrets(&saved, &unavailable),
+                Err(SecretRehydrationError::EvaluationUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn secret_rehydration_rejects_unavailable_in_an_unselected_candidate_subtree() {
+        let planned_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("planned-secret".into()),
+        ))));
+        let planned = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("verified".to_string(), planned_secret.clone()),
+            (
+                "ordinary".to_string(),
+                Value::Concrete(ConcreteValue::String("planned-ordinary".into())),
+            ),
+        ])));
+        let saved = redact_secrets_in_value(&planned).expect("redact planned attribute");
+        let unavailable_candidate = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("verified".to_string(), planned_secret),
+            (
+                "ordinary".to_string(),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+                    DeferredValue::Interpolation(vec![
+                        InterpolationPart::Expr(unavailable_env_evaluation()),
+                        InterpolationPart::Literal("-suffix".into()),
+                    ]),
+                )))),
+            ),
+        ])));
+
+        assert!(matches!(
+            rehydrate_redacted_secrets(&saved, &unavailable_candidate),
+            Err(SecretRehydrationError::EvaluationUnavailable)
+        ));
+    }
+
     fn resource_with_comment_secret(identity: &str, plaintext: &str) -> crate::resource::Resource {
         let mut resource = crate::resource::Resource::new(
             "mock.test.resource",
@@ -9200,10 +9506,11 @@ mod tests {
     #[test]
     fn separate_saved_plan_placeholders_get_distinct_random_salts() {
         let inner = Value::Concrete(ConcreteValue::String("SAME_IMPORT_SECRET".into()));
+        let material = canonical_secret_hash_material(&inner).expect("canonical hash material");
 
         assert_ne!(
-            secret_hash(&inner, None).expect("first hash"),
-            secret_hash(&inner, None).expect("second hash"),
+            RedactedSecretHash::reuse_or_generate(&material, None),
+            RedactedSecretHash::reuse_or_generate(&material, None),
             "independent placeholders must not reveal equal plaintexts",
         );
     }

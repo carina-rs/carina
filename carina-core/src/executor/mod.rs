@@ -587,6 +587,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args {

@@ -45,6 +45,37 @@ fn type_aware_int_float_coercion() {
 }
 
 #[test]
+fn differ_treats_saved_function_call_and_fresh_unavailable_as_equal() {
+    let argument = Value::Concrete(ConcreteValue::String("X".into()));
+    let saved = Value::Deferred(DeferredValue::FunctionCall {
+        name: crate::builtins::BuiltinFunction::env,
+        args: vec![argument.clone().into()],
+        source_line: 0.into(),
+    });
+    let fresh = Value::Deferred(DeferredValue::Unavailable {
+        name: crate::builtins::BuiltinFunction::env,
+        args: vec![argument.into()],
+        reason: crate::resource::UnavailableReason::from_builtin_error(
+            "environment variable 'X' is not set".to_string(),
+        ),
+        source_line: 42.into(),
+    });
+
+    assert!(type_aware_equal(
+        &saved,
+        &fresh,
+        Some(&AttributeType::string()),
+        crate::schema::empty_defs_for_schema_walks(),
+    ));
+    assert!(type_aware_equal(
+        &fresh,
+        &saved,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    ));
+}
+
+#[test]
 fn type_aware_int_float_coercion_for_int_type() {
     // Int type also allows coercion (e.g., provider returns Float for an Int field)
     assert!(type_aware_equal(

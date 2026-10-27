@@ -137,6 +137,7 @@ pub fn check_type_expr_value(
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
         )
+        | Value::Deferred(DeferredValue::Unavailable { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => return Ok(()),
         Value::Deferred(DeferredValue::Access(_)) => {

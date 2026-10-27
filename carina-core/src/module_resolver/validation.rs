@@ -832,6 +832,9 @@ impl EvalValue {
             Self::Value(Value::Deferred(DeferredValue::Coalesce { .. })) => "coalesce expression",
             Self::Value(Value::Deferred(DeferredValue::Interpolation(_))) => "interpolation",
             Self::Value(Value::Deferred(DeferredValue::FunctionCall { .. })) => "function call",
+            Self::Value(Value::Deferred(DeferredValue::Unavailable { .. })) => {
+                "unavailable function result"
+            }
             Self::Value(Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })) => {
                 "function call"
             }

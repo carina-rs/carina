@@ -180,6 +180,7 @@ fn collect_unsynchronized_refs(
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args {

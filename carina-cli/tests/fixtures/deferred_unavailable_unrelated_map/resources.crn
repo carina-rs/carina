@@ -1,0 +1,11 @@
+let o = mock.test.resource {
+  name = "unrelated-map-origin"
+}
+
+let dependent = mock.test.resource {
+  name = "unrelated-map-dependent"
+  tags = {
+    s = secret(env("PROBE_SECRET"))
+    q = upper(o.identifier ?? env("PROBE_PLAIN"))
+  }
+}
