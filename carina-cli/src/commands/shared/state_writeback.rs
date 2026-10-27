@@ -4258,7 +4258,6 @@ mod apply_state_save_tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: Some("main.crn".to_string()),
                 line: 1,
@@ -4266,8 +4265,7 @@ mod apply_state_save_tests {
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
                 binding_name: "validation_records".to_string(),
-                iterable_binding: "cert".to_string(),
-                iterable_attr: "domain_validation_options".to_string(),
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource: Resource::with_provider(
                     "aws",
@@ -4340,7 +4338,6 @@ mod apply_state_save_tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: Some("main.crn".to_string()),
                 line: 1,
@@ -4348,8 +4345,7 @@ mod apply_state_save_tests {
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
                 binding_name: "validation_records".to_string(),
-                iterable_binding: "cert".to_string(),
-                iterable_attr: "domain_validation_options".to_string(),
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -6768,6 +6764,21 @@ mod stage4_unknown_err_tests {
             ),
             "expected UnresolvedResourceRef/net.vpc.vpc_id/StateWriteback, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn coalesce_returns_unresolved_err() {
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("net", "optional", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
+        });
+        let error = PersistedExportValue::encode(&value).unwrap_err();
+        assert!(matches!(
+            error,
+            SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::StateWriteback,
+            }
+        ));
     }
 
     /// `Value::Deferred(DeferredValue::Interpolation)` reaching apply-time is a resolver /

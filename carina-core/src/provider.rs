@@ -18,6 +18,7 @@ use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
 };
 
+use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 use crate::resource::{
@@ -1953,6 +1954,7 @@ pub struct ObservedCreate {
     identifier: AppliedIdentifier,
     observation: Observation,
     sent: SentRecord,
+    resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
 impl ObservedCreate {
@@ -1970,6 +1972,18 @@ impl ObservedCreate {
 
     pub fn sent(&self) -> &SentRecord {
         &self.sent
+    }
+
+    pub(crate) fn with_resolved_desired_attributes(
+        mut self,
+        attributes: SecretPreservingAttributes,
+    ) -> Self {
+        self.resolved_desired_attributes = Some(attributes);
+        self
+    }
+
+    pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
+        self.resolved_desired_attributes.as_ref()
     }
 
     pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, Observation, SentRecord) {
@@ -2678,6 +2692,7 @@ impl IssuedCreate {
                 identifier: self.identifier,
                 observation,
                 sent: SentRecord::Request(self.sent),
+                resolved_desired_attributes: None,
             },
             error,
         })
@@ -2721,6 +2736,7 @@ impl FinishingCreate {
                 identifier: self.identifier,
                 observation,
                 sent: SentRecord::Request(self.sent),
+                resolved_desired_attributes: None,
             },
             error,
         })
@@ -2991,6 +3007,7 @@ fn observed_from_resume(
         identifier,
         observation,
         sent,
+        resolved_desired_attributes: None,
     }
 }
 
@@ -3797,6 +3814,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
         | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -3855,6 +3873,7 @@ pub fn merge_default_tags(
             Err(
                 error @ (SerializationError::UnknownNotAllowed { .. }
                 | SerializationError::UnresolvedResourceRef { .. }
+                | SerializationError::UnresolvedCoalesce { .. }
                 | SerializationError::UnresolvedInterpolation { .. }
                 | SerializationError::UnresolvedFunctionCall { .. }
                 | SerializationError::UnresolvedAccess { .. }

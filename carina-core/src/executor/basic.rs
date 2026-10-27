@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::binding_index::ResolvedBindings;
+use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
@@ -43,14 +43,14 @@ pub(super) enum BasicEffectResult {
     Success {
         completed: CompletedEffect,
         resource_id: ResourceId,
-        resolved_attrs: Option<HashMap<String, Value>>,
+        resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<String>,
     },
     PartialSuccess {
         completed: CompletedEffect,
         resource_id: ResourceId,
         diagnostic: PartialReadDiagnostic,
-        resolved_attrs: Option<HashMap<String, Value>>,
+        resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<String>,
     },
     Failure {
@@ -59,7 +59,7 @@ pub(super) enum BasicEffectResult {
     ResumeSuccess {
         created: crate::provider::ObservedCreate,
         resource_id: ResourceId,
-        resolved_attrs: HashMap<String, Value>,
+        resolved_attrs: SecretPreservingAttributes,
         binding: Option<String>,
     },
     ClassifiedFailure {
@@ -150,7 +150,7 @@ pub(super) async fn refresh_pending_states(
 pub(super) async fn resolve_resource(
     input: Result<CheckInput<Resource>, String>,
     context: &ProviderPreparationContext<'_>,
-) -> Result<ProviderReadyResource, String> {
+) -> Result<(ProviderReadyResource, SecretPreservingAttributes), String> {
     let bindings = context.bindings();
     let input = input?;
     let checked = match input {
@@ -203,9 +203,14 @@ pub(super) async fn resolve_resource(
             )
         }
     };
-    prepare_provider_ready_resource_after_resolution(checked, context)
+    let resolved_secret_shapes = checked.value().resolved_attributes();
+    let provider_ready = prepare_provider_ready_resource_after_resolution(checked, context)
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    let provider_values = provider_ready.as_resource().resolved_attributes();
+    let resolved_desired_attributes =
+        SecretPreservingAttributes::from_provider_values(&resolved_secret_shapes, &provider_values);
+    Ok((provider_ready, resolved_desired_attributes))
 }
 
 fn needs_apply_resolution(value: &Value) -> bool {
@@ -213,6 +218,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
         Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
@@ -350,6 +356,12 @@ fn assert_fully_resolved(
             binding,
             bindings,
         )),
+        Value::Deferred(DeferredValue::Coalesce { .. }) => {
+            Err(SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::WasmBoundary,
+            }
+            .to_string())
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
             Err(unresolved_binding_message(
@@ -474,6 +486,10 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             collect_unresolved_bindings(access.base(), out)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            collect_unresolved_bindings(value, out);
+            collect_unresolved_bindings(default, out);
         }
         Value::Deferred(DeferredValue::Unknown(_)) => {}
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -681,7 +697,8 @@ pub(super) async fn execute_basic_effect<'a>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let resolved = match resolve_resource(check_input, preparation).await {
+            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -693,13 +710,13 @@ pub(super) async fn execute_basic_effect<'a>(
                     return BasicEffectResult::Failure { refresh: None };
                 }
             };
-            let resolved_attrs = resolved.as_resource().resolved_attributes();
             match super::dispatch_create(provider, &resource.id, CreateRequest::checked(resolved))
                 .await
             {
                 Ok(outcome) => {
                     let (state, request, diagnostic) =
                         super::complete_create_for_writeback(outcome);
+                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
                     if let Some(diagnostic) = diagnostic {
                         observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
                             effect,
@@ -748,6 +765,8 @@ pub(super) async fn execute_basic_effect<'a>(
                         BasicEffectResult::Failure { refresh: None }
                     }
                     CreateFailureKind::Created { created, error } => {
+                        let created =
+                            created.with_resolved_desired_attributes(resolved_attrs.clone());
                         let error_str = format!(
                             "{error}\nresource created; recorded in state, the next apply completes it"
                         );
@@ -783,7 +802,8 @@ pub(super) async fn execute_basic_effect<'a>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let resolved = match resolve_resource(check_input, preparation).await {
+            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+            {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -795,7 +815,6 @@ pub(super) async fn execute_basic_effect<'a>(
                     return BasicEffectResult::Failure { refresh: None };
                 }
             };
-            let resolved_attrs = resolved.as_resource().resolved_attributes();
             let pending = match &ctx.resume_create {
                 Some(pending) => pending.clone(),
                 None => {
@@ -831,6 +850,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 .map(crate::provider::ResumeOutcome::into_kind)
             {
                 Ok(ResumeOutcomeKind::Resumed(created)) => {
+                    let created = created.with_resolved_desired_attributes(resolved_attrs.clone());
                     let state = created.observed_state();
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
@@ -839,7 +859,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         progress,
                     });
                     BasicEffectResult::ResumeSuccess {
-                        created: *created,
+                        created,
                         resource_id: resource.id.clone(),
                         resolved_attrs,
                         binding: resource.binding.clone(),
@@ -848,6 +868,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 Ok(ResumeOutcomeKind::Resent(outcome)) => {
                     let (state, request, diagnostic) =
                         super::complete_create_for_writeback(*outcome);
+                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
                     if let Some(diagnostic) = diagnostic {
                         observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
                             effect,
@@ -899,6 +920,8 @@ pub(super) async fn execute_basic_effect<'a>(
                         }
                     }
                     ResumeFailureKind::Created { created, error } => {
+                        let created =
+                            created.with_resolved_desired_attributes(resolved_attrs.clone());
                         let error = format!(
                             "{error}\nresource created; recorded in state, the next apply completes it"
                         );
@@ -949,18 +972,19 @@ pub(super) async fn execute_basic_effect<'a>(
                     CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
                 })
                 .unwrap_or_else(|| to.as_inner().clone());
-            let resolved_to = match resolve_resource(check_input, preparation).await {
-                Ok(r) => r,
-                Err(e) => {
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &e,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure { refresh: None };
-                }
-            };
+            let (resolved_to, resolved_desired_attributes) =
+                match resolve_resource(check_input, preparation).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &e,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        return BasicEffectResult::Failure { refresh: None };
+                    }
+                };
             // Augment plan-time `changed_attributes` with any
             // ResourceRef-derived attributes whose resolved value at
             // apply time differs from `from`. This catches the case
@@ -1003,7 +1027,8 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
             let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to);
-            let accepted_request = AcceptedRequest::from_update_request(&request);
+            let accepted_request =
+                AcceptedRequest::from_update_request(&request, resolved_desired_attributes.clone());
             match provider.update(id, identifier, request).await {
                 Ok(outcome) => {
                     let diagnostic = match &outcome {
@@ -1028,7 +1053,7 @@ pub(super) async fn execute_basic_effect<'a>(
                             },
                             resource_id: id.clone(),
                             diagnostic,
-                            resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
+                            resolved_attrs: Some(resolved_desired_attributes),
                             binding: to.binding.clone(),
                         }
                     } else {
@@ -1044,7 +1069,7 @@ pub(super) async fn execute_basic_effect<'a>(
                                 request: accepted_request,
                             },
                             resource_id: id.clone(),
-                            resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
+                            resolved_attrs: Some(resolved_desired_attributes),
                             binding: to.binding.clone(),
                         }
                     }
@@ -1120,7 +1145,7 @@ mod process_basic_result_tests {
     use super::*;
     use crate::executor::ExecutionResult;
     use crate::provider::PartialReadDiagnostic;
-    use crate::resource::{State, Value};
+    use crate::resource::State;
     use std::collections::HashSet;
 
     fn empty_execution_result() -> ExecutionResult {
@@ -1186,7 +1211,7 @@ mod process_basic_result_tests {
                 },
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),
-                resolved_attrs: None::<HashMap<String, Value>>,
+                resolved_attrs: None::<SecretPreservingAttributes>,
                 binding: None,
             },
             &mut exec,

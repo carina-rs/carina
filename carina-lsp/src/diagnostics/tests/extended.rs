@@ -319,6 +319,41 @@ fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
 }
 
 #[test]
+fn import_target_in_sibling_state_block_is_not_unused() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let resource = "let imported = mock.test.resource {\n  name = \"x\"\n}\n";
+    let state_block = r#"provider mock {}
+
+import {
+  to = mock.test.resource 'imported'
+  id = 'existing-1'
+}
+"#;
+    std::fs::write(temp.path().join("resources.crn"), resource).unwrap();
+    std::fs::write(temp.path().join("state.crn"), state_block).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(resource),
+        Some("resources.crn"),
+        Some(temp.path()),
+    );
+
+    assert!(
+        unused_binding_messages(&diagnostics).is_empty(),
+        "import target diagnostics: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn single_unused_attribute_derived_binding_still_warns() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -5764,11 +5799,11 @@ fn upstream_state_source_check_ignores_same_source_in_provider_block() {
     // line (line 5 here, 0-based 4), not the provider line.
     let doc = create_document(
         r#"provider aws {
-    source = '../nonexistent'
+    source = 'missing/provider'
     region = 'ap-northeast-1'
 }
 let orgs = upstream_state {
-    source = '../nonexistent'
+    source = 'missing/provider'
 }
 "#,
     );
@@ -5875,6 +5910,221 @@ for name, _ in orgs.account {
             .any(|d| d.message.contains("does not export `account`")),
         "got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_missing_coalesce_value_is_not_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.account ?? []) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "a missing coalesce value is intentionally optional: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn upstream_state_nested_coalesce_lhs_reference_is_still_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (["${orgs.account}-suffix"] ?? []) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "a reference nested inside an interpolation is required even on the left of ??: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn upstream_state_missing_coalesce_default_is_still_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.accounts ?? orgs.account) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not export `account`")),
+        "references in the coalesce default remain required: {diagnostics:#?}",
+    );
+}
+
+fn coalesce_resource_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn resource_attribute_coalesce_rejects_wrong_typed_default() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = producer.comment ?? 42
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            let message = diagnostic.message.to_ascii_lowercase();
+            message.contains("string") && message.contains("int")
+        }),
+        "the LSP must report a coalesce default that conflicts with the resource attribute schema: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn for_iterable_coalesce_rejects_wrong_typed_default() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::map(AttributeType::string()),
+            )),
+    );
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+for key, value in (producer.tags ?? 5) {
+  mock.test.resource {
+    name = "${key}-${value}"
+  }
+}
+"#;
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+    let diagnostics = custom_engine(schemas).analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(fixture.path()),
+    );
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            let message = diagnostic.message.to_ascii_lowercase();
+            message.contains("map") && message.contains("int")
+        }),
+        "the LSP must reject a coalesce default incompatible with the for iterable: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn resource_attribute_typo_on_coalesce_lhs_is_still_flagged() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = producer.cmment ?? "d"
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("cmment")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        }),
+        "the LSP must not suppress schema-typed unknown attributes on a coalesce lhs: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn coalesce_chain_is_accepted_by_lsp_diagnostics() {
+    let source = r#"provider mock {}
+
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = producer.comment ?? producer.identifier ?? "d"
+}
+"#;
+    let diagnostics = coalesce_resource_engine().analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics.is_empty(),
+        "the LSP parser and diagnostics must accept a coalesce chain: {diagnostics:#?}",
     );
 }
 
@@ -6207,6 +6457,36 @@ for name, _ in org.accounts {
             .iter()
             .any(|d| d.message.contains("Undefined identifier `org`")),
         "got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_coalesce_default_undefined_binding_is_flagged() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name in (orgs.accounts ?? fallback.accounts) {
+    awscc.ec2.Vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: list(String) = ["x"] }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier `fallback`")),
+        "the coalesce default must be walked, got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -8000,6 +8280,148 @@ fn check_attributes_blocks_still_warns_when_truly_undefined() {
 // Empty `${}` interpolation: parser must accept it, LSP surfaces a
 // per-location diagnostic, sibling `let` bindings stay visible (#2480).
 // =====================================================================
+
+#[test]
+fn spaced_interpolation_expression_has_no_error_diagnostic() {
+    let engine = test_engine();
+    let buffer = "let value = \"x-${join('-', ['a'])}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR)),
+        "valid whitespace inside interpolation must not produce an error: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn multiline_interpolation_expression_has_no_spurious_diagnostic() {
+    let engine = test_engine();
+    let buffer = "let value = \"x-${\n  join('-', ['a']) // trailing comment\n}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.severity != Some(DiagnosticSeverity::ERROR)
+                && !diagnostic
+                    .message
+                    .to_lowercase()
+                    .contains("empty interpolation")
+        }),
+        "normal trivia at non-empty interpolation edges must not produce an error or empty hint: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn empty_interpolation_after_multiline_interpolation_still_warns() {
+    let engine = test_engine();
+    let buffer = "let x = 'a'\nlet value = \"a-${\n  x\n} ${}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    let empty_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .collect();
+    assert_eq!(
+        empty_diagnostics.len(),
+        1,
+        "the same string's trailing `${{}}` must still produce a warning: {diagnostics:#?}"
+    );
+    assert_eq!(empty_diagnostics[0].range.start.line, 3);
+}
+
+#[test]
+fn interpolation_like_text_inside_line_comment_does_not_warn() {
+    let engine = test_engine();
+    let buffer = "let x = 'a'\nlet value = \"${ x // ${}\n}\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .to_lowercase()
+            .contains("empty interpolation")),
+        "`${{}}` inside an interpolation line comment is not an empty interpolation: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn inline_whitespace_only_interpolations_emit_warnings() {
+    let engine = test_engine();
+    let buffer = "let value = \"${} / ${ }\"\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+
+    let empty_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .collect();
+    assert_eq!(
+        empty_diagnostics.len(),
+        2,
+        "both `${{}}` and `${{ }}` must produce an empty-interpolation warning: {diagnostics:#?}"
+    );
+    assert!(
+        empty_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING)),
+        "both empty-interpolation diagnostics must be warnings: {empty_diagnostics:#?}"
+    );
+}
+
+#[test]
+fn empty_interpolation_after_heredoc_body_punctuation_still_warns() {
+    let engine = test_engine();
+
+    for body in ["it's", "rm -rf /tmp/*"] {
+        let buffer = format!("let note = <<EOT\n{body}\nEOT\nlet value = \"${{}}\"\n");
+        let diagnostics = engine.analyze(&create_document(&buffer), None);
+        let empty_count = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .to_lowercase()
+                    .contains("empty interpolation")
+            })
+            .count();
+
+        assert_eq!(
+            empty_count, 1,
+            "heredoc body {body:?} must not hide the following empty interpolation: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn backslash_prefixed_empty_interpolation_in_heredoc_warns() {
+    let engine = test_engine();
+    let buffer = "let value = <<EOT\n\\${}\nEOT\n";
+    let diagnostics = engine.analyze(&create_document(buffer), None);
+    let empty = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .unwrap_or_else(|| panic!("`\\${{}}` in an unquoted heredoc must warn: {diagnostics:#?}"));
+
+    assert_eq!(empty.range.start.line, 1);
+    assert_eq!(empty.range.start.character, 1);
+    assert_eq!(empty.range.end.character, 4);
+}
 
 #[test]
 fn empty_interpolation_emits_diagnostic_at_span() {

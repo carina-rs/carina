@@ -43,7 +43,7 @@ trim(string: String) -> String
 
 ```crn
 trim('  hello  ')   # => 'hello'
-trim('\n hello \t')  # => 'hello'
+trim("\n hello \t")  # => 'hello'
 ```
 
 ### `replace`
@@ -76,7 +76,7 @@ split('::', 'a::b::c')   # => ['a', 'b', 'c']
 
 ### `join`
 
-Joins list elements into a string using a separator.
+Joins list elements into a string using a separator. Elements must be scalars (strings, numbers, bools, enum values, or durations); if any element is secret, the result is secret.
 
 ```
 join(separator: String, list: list(String)) -> String
@@ -126,7 +126,7 @@ flatten([[1, [2, 3]]])  # => [1, [2, 3]]
 
 ### `length`
 
-Returns the number of elements in a list or map, or the number of characters in a string.
+Returns the number of elements in a list or map, or the length of a string in bytes (UTF-8).
 
 ```
 length(value: list(Any) | map(Any) | String) -> Int
@@ -248,7 +248,7 @@ max(1, 2.5)    # => 2.5
 Calculates a subnet CIDR block within a given IP network address prefix.
 
 ```
-cidr_subnet(prefix: Ipv4Cidr, newbits: Int, netnum: Int) -> Ipv4Cidr
+cidr_subnet(prefix: String, newbits: Int, netnum: Int) -> String
 ```
 
 - `prefix`: base CIDR string (e.g., `"10.0.0.0/16"`)

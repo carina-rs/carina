@@ -206,8 +206,8 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
 
 #[test]
 fn source_provider_kind_mismatch_is_rejected() {
-    let source = "file:///tmp/provider.wasm";
-    let error = ensure_source_provider_kind_matches("configured", "reported", source)
+    let source = "file:///tmp/provider.wasm".parse().unwrap();
+    let error = ensure_source_provider_kind_matches("configured", "reported", &source)
         .expect_err("a source provider must report the configured block kind");
 
     assert_eq!(
@@ -3570,11 +3570,7 @@ fn test_stale_moved_block_releases_claims() {
     );
 
     assert!(
-        !claims.claims_to(
-            "awscc",
-            "ec2.SubnetRouteTableAssociation",
-            "ec2_subnet_route_table_association_aaaaaaaa",
-        ),
+        !claims.claims_to(&resources[0].id),
         "ineffective moved block must not pin its to address"
     );
     reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
@@ -5024,6 +5020,32 @@ fn validate_rejects_empty_interpolation_inside_secret() {
 }
 
 #[test]
+fn validate_rejects_empty_interpolation_in_either_coalesce_operand() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
+
+    let bad = || Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation));
+    let good = || Value::Concrete(ConcreteValue::String("fallback".into()));
+
+    for value in [
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(bad()),
+            default: Box::new(good()),
+        }),
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(good()),
+            default: Box::new(bad()),
+        }),
+    ] {
+        let errors = validate_no_empty_interpolations(&parsed_with_attr("name", value));
+        assert_eq!(
+            errors.len(),
+            1,
+            "both coalesce operands must be checked for empty interpolation",
+        );
+    }
+}
+
+#[test]
 fn validate_rejects_empty_interpolation_inside_function_call() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
@@ -5355,8 +5377,7 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
         resource_type: "aws.route53.Record".to_string(),
         attributes: vec![],
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     }
@@ -5370,7 +5391,6 @@ fn deferred_replace_test_target() -> DeferredCreateTarget {
             "validation_records",
             None,
         ),
-        upstream_binding: "cert".to_string(),
         template: deferred_replace_test_template(),
     }
 }
@@ -5402,15 +5422,12 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
     add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
 
     let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
-        Effect::DeferredReplace(payload) => Some((
-            &payload.deletes,
-            &payload.id,
-            &payload.upstream_binding,
-            &payload.template,
-        )),
+        Effect::DeferredReplace(payload) => {
+            Some((&payload.deletes, &payload.id, &payload.template))
+        }
         _ => None,
     });
-    let (deletes, id, upstream_binding, template) = deferred_replaces
+    let (deletes, id, template) = deferred_replaces
         .next()
         .expect("matching delete + deferred target must produce DeferredReplace");
     assert!(
@@ -5418,7 +5435,10 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
         "plan must contain exactly one DeferredReplace"
     );
     assert_eq!(id, &target.id);
-    assert_eq!(upstream_binding, "cert");
+    assert_eq!(
+        template.root_bindings(),
+        std::collections::BTreeSet::from(["cert".to_string()])
+    );
     assert_eq!(template.binding_name, "validation_records");
     assert_eq!(deletes.len(), 1);
     assert_eq!(
@@ -5445,6 +5465,36 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
             .iter()
             .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
         "absorbed target must not also remain as DeferredCreate"
+    );
+}
+
+#[test]
+fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
+    let target = deferred_replace_test_target();
+    let mut plan = Plan::new();
+    plan.add(delete_effect_for_binding("validation_records.alpha"));
+    plan.add(delete_effect_for_binding(
+        "validation_records['key with space']",
+    ));
+    plan.add(delete_effect_for_binding("validation_records['']"));
+
+    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
+
+    let payload = plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::DeferredReplace(payload) => Some(payload),
+            _ => None,
+        })
+        .expect("map-key deletes must be paired with their deferred create");
+    assert_eq!(payload.deletes.len(), 3);
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Delete { .. })),
+        "stable map-key children must not remain standalone cleanups beside runtime upserts",
     );
 }
 
@@ -5584,7 +5634,10 @@ mod expand_same_config_deferred_for_tests {
         let mut attrs = HashMap::new();
         attrs.insert(attr.to_string(), value);
         let mut states = HashMap::new();
-        states.insert(cert.id.clone(), State::existing(cert.id.clone(), attrs));
+        states.insert(
+            cert.id.clone(),
+            State::existing(cert.id.clone(), attrs).with_identifier("cert-id"),
+        );
         states
     }
 
@@ -5618,6 +5671,9 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &HashSet::new(),
@@ -5726,6 +5782,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5788,6 +5847,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5800,7 +5862,10 @@ mod expand_same_config_deferred_for_tests {
             1,
             "one deferred-for expression should be carried for apply-time re-expansion"
         );
-        assert_eq!(out.deferred_create_targets[0].upstream_binding, "cert");
+        assert_eq!(
+            out.deferred_create_targets[0].template.root_bindings(),
+            std::collections::BTreeSet::from(["cert".to_string()])
+        );
         assert!(
             out.sorted_resources
                 .iter()
@@ -5825,6 +5890,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5856,6 +5924,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5893,6 +5964,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -5939,6 +6013,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(empty_states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6008,6 +6085,9 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &remote,
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6078,6 +6158,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6183,6 +6266,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6215,6 +6301,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
@@ -6293,6 +6382,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6319,6 +6411,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
@@ -6411,6 +6506,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6445,6 +6543,9 @@ mod expand_same_config_deferred_for_tests {
             &crate::managed_current_from_states(states.clone()),
             &HashMap::new(),
             &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::provider::RawSavedAttrs::default()
+                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -6488,13 +6589,11 @@ mod using_line_format_tests {
         // Default instance (no binding). Source is always known on this
         // path because the default instance is the only one that
         // load-sources a factory.
+        let source = "github.com/carina-rs/carina-provider-awscc"
+            .parse()
+            .unwrap();
         assert_eq!(
-            format_provider_using_line(
-                "awscc",
-                "ap-northeast-1",
-                None,
-                Some("github.com/carina-rs/carina-provider-awscc"),
-            ),
+            format_provider_using_line("awscc", "ap-northeast-1", None, Some(&source),),
             "Using awscc (region: ap-northeast-1, instance=default, \
              source: github.com/carina-rs/carina-provider-awscc)",
         );
@@ -6505,13 +6604,9 @@ mod using_line_format_tests {
         // Named instance. Source belongs to the kind, not the instance,
         // and is still included so that one log line is enough to
         // identify what got wired up.
+        let source = "github.com/carina-rs/carina-provider-aws".parse().unwrap();
         assert_eq!(
-            format_provider_using_line(
-                "aws",
-                "us-east-1",
-                Some("us"),
-                Some("github.com/carina-rs/carina-provider-aws"),
-            ),
+            format_provider_using_line("aws", "us-east-1", Some("us"), Some(&source),),
             "Using aws (region: us-east-1, instance=us, \
              source: github.com/carina-rs/carina-provider-aws)",
         );
@@ -6556,7 +6651,7 @@ mod kind_default_source_tests {
             name: name.to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
-            source: source.map(str::to_string),
+            source: source.map(|source| source.parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
@@ -6588,8 +6683,8 @@ mod kind_default_source_tests {
             config("aws", Some("named"), None),
         ]);
         assert_eq!(
-            kind_default_source(&configs, "aws"),
-            Some("github.com/carina-rs/carina-provider-aws"),
+            kind_default_source(&configs, "aws").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-aws".to_string()),
         );
     }
 
@@ -6607,8 +6702,8 @@ mod kind_default_source_tests {
             ),
         ]);
         assert_eq!(
-            kind_default_source(&configs, "aws"),
-            Some("github.com/carina-rs/carina-provider-aws"),
+            kind_default_source(&configs, "aws").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-aws".to_string()),
         );
     }
 
@@ -6629,12 +6724,12 @@ mod kind_default_source_tests {
             ),
         ]);
         assert_eq!(
-            kind_default_source(&configs, "aws"),
-            Some("github.com/carina-rs/carina-provider-aws"),
+            kind_default_source(&configs, "aws").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-aws".to_string()),
         );
         assert_eq!(
-            kind_default_source(&configs, "awscc"),
-            Some("github.com/carina-rs/carina-provider-awscc"),
+            kind_default_source(&configs, "awscc").map(ToString::to_string),
+            Some("github.com/carina-rs/carina-provider-awscc".to_string()),
         );
     }
 
@@ -6666,9 +6761,18 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let source = "github.com/carina-rs/carina-provider-awscc";
     let revision = "main";
     let resolved_sha = "deadbeefcafe1234567890";
+    let github_source = match source
+        .parse::<carina_core::provider_source::ProviderSource>()
+        .unwrap()
+    {
+        carina_core::provider_source::ProviderSource::Remote(
+            carina_core::provider_source::RemoteSource::GithubDirect(source),
+        ) => source,
+        parsed => panic!("expected GitHub source: {parsed}"),
+    };
     let wasm_path = carina_provider_resolver::revision_resolver::cache_path_revision(
         base,
-        source,
+        &github_source,
         resolved_sha,
     );
     std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
@@ -6697,7 +6801,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     lock.save(&base.join("carina-providers.lock")).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: None,
         revision: Some(revision.into()),
         unresolved_attributes: IndexMap::new(),
@@ -6753,7 +6857,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     lock.save(&lock_path).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: None,
         revision: Some(revision.into()),
         unresolved_attributes: IndexMap::new(),
@@ -6780,6 +6884,118 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     assert!(!rendered.contains("carina init --upgrade"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_source_reaches_cli_artifact_loader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "carina-rs/awscc";
+    let version = "0.5.0";
+    let provider_source: ProviderSource = source.parse().unwrap();
+    let ProviderSource::Remote(remote_source) = &provider_source else {
+        panic!("registry source must parse as remote")
+    };
+    let wasm_path =
+        carina_provider_resolver::cache_path_wasm(base, &remote_source.source_key(), version);
+    std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+    std::fs::write(&wasm_path, b"not a wasm component").unwrap();
+
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Version {
+            version: version.into(),
+            constraint: None,
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&base.join("carina-providers.lock")).unwrap();
+
+    let config = ProviderConfig {
+        name: "awscc".into(),
+        source: Some(provider_source),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+
+    let (factories, errors) = build_factories_from_providers(&[config], base).unwrap();
+    let rendered = errors
+        .get("awscc")
+        .expect("the invalid fixture should fail only after registry resolution");
+
+    assert!(factories.is_empty());
+    assert!(rendered.contains("carina-providers.lock"), "{rendered}");
+    assert!(rendered.contains("version 0.5.0"), "{rendered}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_source_reaches_plan_apply_provider_loader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "carina-rs/awscc";
+    let version = "0.5.0";
+    let provider_source: ProviderSource = source.parse().unwrap();
+    let ProviderSource::Remote(remote_source) = &provider_source else {
+        panic!("registry source must parse as remote")
+    };
+    let wasm_path =
+        carina_provider_resolver::cache_path_wasm(base, &remote_source.source_key(), version);
+    std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+    std::fs::write(&wasm_path, b"not a wasm component").unwrap();
+
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Version {
+            version: version.into(),
+            constraint: None,
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&base.join("carina-providers.lock")).unwrap();
+
+    let configs = validated_provider_configs(vec![ProviderConfig {
+        name: "awscc".into(),
+        source: Some(provider_source),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    }]);
+    let config = configs.iter().next().unwrap();
+    let provider_source = config.source().unwrap();
+
+    let load_error = match load_source_provider(provider_source, config, base).await {
+        Err(LoadSourceError::Wasm(error)) => error.to_string(),
+        Err(LoadSourceError::Other(error)) => {
+            panic!("registry source was rejected before artifact loading: {error}")
+        }
+        Err(_) => panic!("unexpected provider load error variant"),
+        Ok(_) => panic!("invalid WASM fixture unexpectedly loaded"),
+    };
+    assert!(
+        load_error.contains("Failed to load WASM component"),
+        "{load_error}"
+    );
+    assert!(load_error.contains("carina-providers.lock"), "{load_error}");
+    assert!(load_error.contains("version 0.5.0"), "{load_error}");
+
+    let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
+    let router = get_provider_with_ctx(&ctx, &configs, base)
+        .await
+        .expect("artifact load errors are rendered by the plan/apply wiring boundary");
+    assert!(router.is_empty());
+}
+
 #[test]
 fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6787,7 +7003,7 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     std::fs::write(&wasm_path, b"fixture").unwrap();
     let config = ProviderConfig {
         name: "local".into(),
-        source: Some(format!("file://{}", wasm_path.display())),
+        source: Some(format!("file://{}", wasm_path.display()).parse().unwrap()),
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
@@ -6837,7 +7053,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     lock.save(&base.join("carina-providers.lock")).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
         revision: None,
         unresolved_attributes: IndexMap::new(),
@@ -6875,7 +7091,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     .unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some("github.com/carina-rs/carina-provider-awscc".into()),
+        source: Some(
+            "github.com/carina-rs/carina-provider-awscc"
+                .parse()
+                .unwrap(),
+        ),
         version: None,
         revision: Some("main".into()),
         unresolved_attributes: IndexMap::new(),
@@ -6970,7 +7190,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     lock.save(&base.join("carina-providers.lock")).unwrap();
     let config = ProviderConfig {
         name: "awscc".into(),
-        source: Some(source.into()),
+        source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
         revision: None,
         unresolved_attributes: IndexMap::new(),

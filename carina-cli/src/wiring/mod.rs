@@ -47,6 +47,7 @@ use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, LiftedSavedAttrs, Provider, ProviderError,
     ProviderFactory, ProviderNormalizer, ProviderRouter,
 };
+use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
     Composition, ConcreteValue, Current, DataSource, DeferredValue, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, ResourceIdentityError, State,
@@ -305,33 +306,18 @@ fn build_factories_from_providers_impl(
     let mut load_errors: HashMap<String, String> = HashMap::new();
 
     for config in providers {
-        let source = match &config.source {
-            Some(s) => s.clone(),
-            None => continue,
-        };
+        let Some(_) = &config.source else { continue };
 
-        let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
-            match carina_provider_resolver::find_installed_provider(base_dir, config) {
-                Ok(installed) => installed,
-                Err(e) => {
-                    let reason = format!("Provider '{}' {}", config.name, e);
-                    if report_errors {
-                        eprintln!("{}", reason.red());
-                    }
-                    load_errors.insert(config.name.clone(), reason);
-                    continue;
+        let installed = match carina_provider_resolver::find_installed_provider(base_dir, config) {
+            Ok(installed) => installed,
+            Err(e) => {
+                let reason = format!("Provider '{}' {}", config.name, e);
+                if report_errors {
+                    eprintln!("{}", reason.red());
                 }
+                load_errors.insert(config.name.clone(), reason);
+                continue;
             }
-        } else {
-            let reason = format!(
-                "Unsupported source format for provider '{}': {}. Use file:// or github.com/owner/repo.",
-                config.name, source
-            );
-            if report_errors {
-                eprintln!("{}", reason.red());
-            }
-            load_errors.insert(config.name.clone(), reason);
-            continue;
         };
 
         let factory_result = tokio::task::block_in_place(|| {
@@ -611,6 +597,9 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
             entries.values().any(value_contains_empty_interpolation)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_empty_interpolation(inner),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            value_contains_empty_interpolation(value) || value_contains_empty_interpolation(default)
+        }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
@@ -1347,12 +1336,6 @@ pub fn normalize_state_with_ctx(
     result
 }
 
-pub fn check_unused_bindings<E: carina_core::parser::ExportParamLike>(
-    parsed: &carina_core::parser::File<E>,
-) -> Vec<String> {
-    validation::check_unused_bindings(parsed)
-}
-
 pub fn validate_provider_region_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
@@ -1608,7 +1591,10 @@ pub async fn get_provider_with_ctx(
 /// default — the parser rejects `source` on `let <name> = provider
 /// <kind>` — so this is the only way to get the source URL while
 /// processing a named instance's wiring.
-fn kind_default_source<'a>(configs: &'a ResolvedProviderConfigs, kind: &str) -> Option<&'a str> {
+fn kind_default_source<'a>(
+    configs: &'a ResolvedProviderConfigs,
+    kind: &str,
+) -> Option<&'a ProviderSource> {
     configs
         .iter()
         .find(|config| config.is_default() && config.name() == kind)
@@ -1656,7 +1642,7 @@ fn format_provider_using_line(
     kind: &str,
     region: &str,
     binding: Option<&str>,
-    source: Option<&str>,
+    source: Option<&ProviderSource>,
 ) -> String {
     let instance = binding.unwrap_or("default");
     match source {
@@ -1676,7 +1662,7 @@ async fn instantiate_provider_into_router(
     router: &mut ProviderRouter,
     provider_config: &ResolvedProviderConfig,
     base_dir: &Path,
-    inherited_source: Option<&str>,
+    inherited_source: Option<&ProviderSource>,
 ) -> Result<(), AppError> {
     let binding = provider_config.binding();
     // Named instances inherit `source`/`version`/`revision` from the
@@ -1743,7 +1729,7 @@ async fn instantiate_provider_into_router(
 
 async fn try_add_source_provider(
     router: &mut ProviderRouter,
-    source: &str,
+    source: &ProviderSource,
     config: &ResolvedProviderConfig,
     base_dir: &Path,
 ) -> Result<(), AppError> {
@@ -1799,7 +1785,7 @@ fn source_provider_initialization_error(provider_name: &str, error: ProviderErro
 fn ensure_source_provider_kind_matches(
     configured: &str,
     loaded: &str,
-    source: &str,
+    source: &ProviderSource,
 ) -> Result<(), AppError> {
     if configured == loaded {
         return Ok(());
@@ -1834,13 +1820,13 @@ enum LoadSourceError {
             carina_plugin_host::WasmProviderLoadError,
         >,
     ),
-    /// Plumbing failure: artifact not found, unsupported source scheme,
-    /// invalid config, etc. Logged and skipped.
+    /// Plumbing failure such as an artifact lookup or configuration error.
+    /// Logged and skipped.
     Other(String),
 }
 
 async fn load_source_provider(
-    source: &str,
+    source: &ProviderSource,
     config: &ResolvedProviderConfig,
     base_dir: &Path,
 ) -> Result<
@@ -1852,14 +1838,9 @@ async fn load_source_provider(
     ),
     LoadSourceError,
 > {
-    let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
+    let installed =
         carina_provider_resolver::find_installed_provider(base_dir, config.as_provider_config())
-            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?
-    } else {
-        return Err(LoadSourceError::Other(format!(
-            "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
-        )));
-    };
+            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?;
 
     let factory: Box<dyn ProviderFactory> = Box::new(
         load_installed_wasm_provider(&installed)
@@ -2001,7 +1982,6 @@ impl RefreshableChildIds {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredCreateTarget {
     pub id: ResolvedResourceId,
-    pub upstream_binding: String,
     pub template: carina_core::parser::DeferredForExpression,
 }
 
@@ -2020,7 +2000,6 @@ impl DeferredCreateTarget {
         );
         Some(Self {
             id,
-            upstream_binding: deferred.iterable_binding.clone(),
             template: deferred.clone(),
         })
     }
@@ -2028,7 +2007,6 @@ impl DeferredCreateTarget {
     fn to_effect(&self) -> Effect {
         Effect::DeferredCreate {
             id: self.id.clone(),
-            upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
         }
     }
@@ -2037,7 +2015,6 @@ impl DeferredCreateTarget {
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
             id: self.id.clone(),
-            upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
         }))
     }
@@ -2071,6 +2048,70 @@ pub struct DeferredForExpansion {
     /// this to avoid adding a second, spurious blank line on the
     /// deferred-for-with-warnings TTY path (#3150 Round-4 finding).
     pub printed_warnings: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn derive_managed_binding_stability<E>(
+    parsed: &carina_core::parser::File<E>,
+    resources: &[Resource],
+    managed_current: &HashMap<ResourceId, Current>,
+    data_source_states: &HashMap<ResourceId, State>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[WaitAliasSpec],
+) -> Result<HashMap<ResourceId, carina_core::binding_index::ManagedBindingStability>, AppError> {
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        managed_current.clone(),
+        schemas,
+        resources,
+    );
+    let optimistic_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: resources,
+        compositions: &parsed.compositions,
+        data_sources: &parsed.data_sources,
+        managed_current: &plan_input_current,
+        data_source_states,
+        remote_bindings,
+        wait_aliases,
+    });
+    let mut resolved = resources.to_vec();
+    carina_core::resolver::resolve_refs_for_plan(
+        &mut resolved,
+        &optimistic_bindings,
+        &parsed.upstream_binding_names(),
+    )
+    .map_err(AppError::Validation)?;
+    // Identity derivation runs later in the plan pipeline. Pending resources
+    // cannot have a refreshed row addressed to them yet, so they are
+    // conservatively unavailable; resolved resources can be diffed normally.
+    let mut pending_stability = HashMap::new();
+    let resolved = resolved
+        .into_iter()
+        .filter_map(|resource| {
+            let id = resource.id.clone();
+            match ResolvedResource::try_new(resource) {
+                Some(resource) => Some(resource),
+                None => {
+                    pending_stability.insert(
+                        id,
+                        carina_core::binding_index::ManagedBindingStability::Unavailable,
+                    );
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut stability = carina_core::differ::managed_binding_stability(
+        &resolved,
+        &plan_input_current,
+        schemas,
+        saved_attrs,
+        prev_explicit,
+    );
+    stability.extend(pending_stability);
+    Ok(stability)
 }
 
 /// Pure core of the carina#3132 fix: project the post-refresh
@@ -2114,6 +2155,8 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     managed_current: &HashMap<ResourceId, Current>,
     data_source_states: &HashMap<ResourceId, State>,
     schemas: &carina_core::schema::SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
     moved_targets: &HashSet<ResourceId>,
@@ -2136,40 +2179,59 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         });
     }
 
-    let iterable_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
-        managed: sorted_resources,
-        compositions: &parsed.compositions,
-        data_sources: &parsed.data_sources,
-        managed_current: &carina_core::resource::into_plan_input_current_map(
-            managed_current.clone(),
-            schemas,
-            sorted_resources,
-        ),
+    let managed_stability = derive_managed_binding_stability(
+        parsed,
+        sorted_resources,
+        managed_current,
         data_source_states,
+        schemas,
+        saved_attrs,
+        prev_explicit,
         remote_bindings,
         wait_aliases,
-    })
-    .project_iterable_bindings();
+    )?;
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        managed_current.clone(),
+        schemas,
+        sorted_resources,
+    );
+    let resolved_bindings = ResolvedBindings::pre_apply_with_stability(
+        PreApplyInputs {
+            managed: sorted_resources,
+            compositions: &parsed.compositions,
+            data_sources: &parsed.data_sources,
+            managed_current: &plan_input_current,
+            data_source_states,
+            remote_bindings,
+            wait_aliases,
+        },
+        &managed_stability,
+    );
+    let iterable_bindings = resolved_bindings.project_iterable_bindings();
 
     let mut deferred_create_targets = Vec::new();
     let pre_expandable_deferred_for: Vec<_> = parsed
         .deferred_for_expressions
         .iter()
         .filter_map(|deferred| {
-            let iterable = iterable_bindings
-                .get(&deferred.iterable_binding)
-                .and_then(|attrs| attrs.get(&deferred.iterable_attr));
-
-            match iterable {
-                Some(value) if is_value_fully_concrete_for_expansion(value) => {
+            match iterable_bindings.resolve_value(&deferred.iterable) {
+                Ok(carina_core::resolver::ValueResolution::Present(value))
+                    if is_value_fully_concrete_for_expansion(&value) =>
+                {
                     Some(deferred.clone())
                 }
-                Some(_) | None => {
+                Ok(
+                    carina_core::resolver::ValueResolution::Present(_)
+                    | carina_core::resolver::ValueResolution::Absent
+                    | carina_core::resolver::ValueResolution::Unknown(_),
+                ) => {
                     if let Some(target) = DeferredCreateTarget::from_deferred(deferred) {
                         deferred_create_targets.push(target);
                     }
                     None
                 }
+                // Let the shared expansion path render the path-aware error.
+                Err(_) => Some(deferred.clone()),
             }
         })
         .collect();
@@ -2310,6 +2372,7 @@ pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormal
     /// its pipeline — `hydrate_read_state` is idempotent, so passing it here
     /// and re-hydrating downstream of this function is safe.
     pub saved_attrs: &'a LiftedSavedAttrs,
+    pub prev_explicit: &'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub multi: &'a indicatif::MultiProgress,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
 }
@@ -2335,6 +2398,8 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
         inputs.managed_current,
         inputs.data_source_states,
         inputs.schemas,
+        inputs.saved_attrs,
+        inputs.prev_explicit,
         inputs.remote_bindings,
         inputs.wait_aliases,
         inputs.moved_targets,
@@ -2756,6 +2821,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &managed_current,
         &data_source_states,
         ctx.schemas(),
+        &saved_attrs,
+        &prev_explicit,
         remote_bindings,
         &wait_aliases,
         &moved_targets,
@@ -2845,14 +2912,24 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // attribute referencing `<module_instance>.<attr>` (a composition)
     // chains through to the managed sibling literal instead of
     // surviving as an unresolved `ResourceRef` (carina#3246).
-    let upstream_binding_names: std::collections::HashSet<&str> =
-        remote_bindings.keys().map(String::as_str).collect();
+    let upstream_binding_names = parsed.upstream_binding_names();
+    let managed_stability = derive_managed_binding_stability(
+        parsed,
+        &sorted_resources,
+        &managed_current,
+        &data_source_states,
+        ctx.schemas(),
+        &saved_attrs,
+        &prev_explicit,
+        remote_bindings,
+        &wait_aliases,
+    )?;
     let pre_apply_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         ctx.schemas(),
         &sorted_resources,
     );
-    let mut override_aware_resources = OverrideAwareResources::build_for_plan(
+    let mut override_aware_resources = OverrideAwareResources::build_for_plan_with_stability(
         sorted_resources,
         state_file.as_ref(),
         PreApplyInputs {
@@ -2865,25 +2942,28 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             wait_aliases: &wait_aliases,
         },
         &upstream_binding_names,
+        &managed_stability,
     )?;
     crate::legacy_name_overrides::emit_legacy_override_warnings(
         &override_aware_resources,
         state_file.as_ref(),
     );
-    let unresolved_override_aware_resources = OverrideAwareResources::build_for_plan(
-        unresolved_resources.to_vec(),
-        state_file.as_ref(),
-        PreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            data_sources: &data_sources,
-            managed_current: &pre_apply_current,
-            data_source_states: &data_source_states,
-            remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &upstream_binding_names,
-    )?;
+    let unresolved_override_aware_resources =
+        OverrideAwareResources::build_for_plan_with_stability(
+            unresolved_resources.to_vec(),
+            state_file.as_ref(),
+            PreApplyInputs {
+                managed: &[],
+                compositions: &parsed.compositions,
+                data_sources: &data_sources,
+                managed_current: &pre_apply_current,
+                data_source_states: &data_source_states,
+                remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+            &upstream_binding_names,
+            &managed_stability,
+        )?;
     // Resolve and canonicalize only refresh-time data sources. Deferred
     // reads keep their original input refs so the plan/executor dependency
     // graph still contains the upstream create edge.
@@ -2986,7 +3066,16 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         ctx.schemas(),
         override_aware_resources.resources(),
     );
-    override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+    let stability_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let managed_stability = carina_core::differ::managed_binding_stability(
+        &stability_resources,
+        &reconciled_input_current,
+        ctx.schemas(),
+        &saved_attrs,
+        &prev_explicit,
+    );
+    override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
             data_sources: &data_sources,
@@ -2995,6 +3084,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             remote_bindings,
             wait_aliases: &wait_aliases,
         },
+        &managed_stability,
     );
 
     // Update ordering looks directives up only for Update effects. Orphan
@@ -3028,6 +3118,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     )?;
     add_deposed_delete_effects(&mut plan, state_file, &moved_pairs);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
+    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, ctx.schemas());
 
     // Add state block effects (import/removed/moved) only after both the
     // differ and deposed-generation pass have emitted identifier errors.
@@ -3157,14 +3248,13 @@ fn materialize_moved_states_with_warning_sink(
             // `(from, to)` pair matches every downstream consumer's
             // address shape.
             let resolved_from = state_file.as_ref().and_then(|sf| {
-                sf.find_resource(&from.provider, &from.resource_type, from.name_str())
+                sf.find_resource_by_state_block_address(&from)
                     .map(|rs| resolved_state_row_id(rs, rs.directives.provider_instance.clone()))
             });
             let Some(resolved_from) = resolved_from else {
-                let to_exists = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(&to.provider, &to.resource_type, to.name_str())
-                        .is_some()
-                });
+                let to_exists = state_file
+                    .as_ref()
+                    .is_some_and(|sf| sf.find_resource_by_state_block_address(&to).is_some());
                 if !to_exists {
                     warn_missing(format!(
                         "warning: moved block from {} '{}' to {} '{}' was not applied: {} not found in state",
@@ -3254,12 +3344,8 @@ pub fn resolve_state_blocks(
                 let moved_from = addresses.from();
                 let moved_to = addresses.to();
                 if state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(
-                        &moved_from.provider,
-                        &moved_from.resource_type,
-                        moved_from.name_str(),
-                    )
-                    .is_some()
+                    sf.find_resource_by_state_block_address(&moved_from)
+                        .is_some()
                 }) {
                     from.insert(moved_from);
                     to.insert(moved_to);
@@ -3267,12 +3353,10 @@ pub fn resolve_state_blocks(
             }
             StateBlock::Removed { from: removed_from } => {
                 if let Some(id) = state_file.as_ref().and_then(|sf| {
-                    sf.find_resource(
-                        &removed_from.provider,
-                        &removed_from.resource_type,
-                        removed_from.name_str(),
-                    )
-                    .map(|rs| resolved_state_row_id(rs, rs.directives.provider_instance.clone()))
+                    sf.find_resource_by_state_block_address(removed_from)
+                        .map(|rs| {
+                            resolved_state_row_id(rs, rs.directives.provider_instance.clone())
+                        })
                 }) {
                     from.insert(removed_from.clone());
                     resolved_removed_from.push(id.into_inner());
@@ -3283,12 +3367,8 @@ pub fn resolve_state_blocks(
                     continue;
                 };
                 let already_in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(
-                        &resolved_to.provider,
-                        &resolved_to.resource_type,
-                        resolved_to.name_str(),
-                    )
-                    .is_some()
+                    sf.find_resource_by_state_block_address(&resolved_to)
+                        .is_some()
                 });
                 if !already_in_state {
                     to.insert(resolved_to);
@@ -3408,11 +3488,7 @@ fn find_desired_id<'a>(
     mut desired: impl Iterator<Item = &'a ResourceId>,
 ) -> Option<ResolvedResourceId> {
     desired
-        .find(|k| {
-            k.provider == to.provider
-                && k.resource_type == to.resource_type
-                && k.identity_str() == Some(to.name_str())
-        })
+        .find(|resource_id| to.matches_resource_id(resource_id))
         .cloned()
         .and_then(ResolvedResourceId::try_new)
 }
@@ -3421,7 +3497,7 @@ fn resolve_import_target_in_desired(
     to: &StateBlockAddress,
     desired: &[Resource],
 ) -> Option<StateBlockAddress> {
-    match_import_target(to, desired.iter()).and_then(|resource| {
+    to.find_resource(desired).and_then(|resource| {
         let identity = resource.id.identity()?.clone();
         Some(StateBlockAddress::new(
             resource.id.provider.clone(),
@@ -3484,14 +3560,9 @@ pub fn add_state_block_effects(
                 let effective_to = resolve_import_target(to, desired_resources);
 
                 // Skip if resource already exists in state
-                let already_in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(
-                        &effective_to.provider,
-                        &effective_to.resource_type,
-                        effective_to.identity_str(),
-                    )
-                    .is_some()
-                });
+                let already_in_state = state_file
+                    .as_ref()
+                    .is_some_and(|sf| sf.find_resource_by_state_block_address(to).is_some());
                 if !already_in_state {
                     // carina#3329: resolve any `${binding.attr}` segments
                     // in `id` against the same binding view the resource
@@ -3536,28 +3607,23 @@ pub fn add_state_block_effects(
                 // Delete effect's id exactly — same root fix as the
                 // Import arm above (carina#3324).
                 let resolved_from = state_file.as_ref().and_then(|sf| {
-                    sf.find_resource(&from.provider, &from.resource_type, from.name_str())
-                        .map(|rs| {
-                            let id =
-                                resolved_state_row_id(rs, rs.directives.provider_instance.clone());
-                            let abandoned_deposed = rs
-                                .deposed
-                                .iter()
-                                .filter(|deposed| {
-                                    AppliedIdentifier::new(deposed.identifier.as_str()).is_err()
-                                })
-                                .map(|deposed| {
-                                    (
-                                        resolved_state_row_id(
-                                            rs,
-                                            deposed.provider_instance.clone(),
-                                        ),
-                                        deposed.key.clone(),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            (id, abandoned_deposed)
-                        })
+                    sf.find_resource_by_state_block_address(from).map(|rs| {
+                        let id = resolved_state_row_id(rs, rs.directives.provider_instance.clone());
+                        let abandoned_deposed = rs
+                            .deposed
+                            .iter()
+                            .filter(|deposed| {
+                                AppliedIdentifier::new(deposed.identifier.as_str()).is_err()
+                            })
+                            .map(|deposed| {
+                                (
+                                    resolved_state_row_id(rs, deposed.provider_instance.clone()),
+                                    deposed.key.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        (id, abandoned_deposed)
+                    })
                 });
                 if let Some((id, abandoned_deposed)) = resolved_from {
                     suppress_delete.insert(id.as_inner().clone());
@@ -3806,24 +3872,9 @@ pub(crate) fn resolve_import_target(
     to: &StateBlockAddress,
     desired: &[Resource],
 ) -> ResolvedResourceId {
-    match_import_target(to, desired.iter())
+    to.find_resource(desired)
         .map(|resource| ResolvedResourceId::new(resource.id.clone()))
         .unwrap_or_else(|| to.to_unrouted_resource_id())
-}
-
-pub(crate) fn match_import_target<'a>(
-    to: &StateBlockAddress,
-    resources: impl Iterator<Item = &'a Resource>,
-) -> Option<&'a Resource> {
-    for resource in resources {
-        if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
-            continue;
-        }
-        if resource.id.identity_str() == Some(to.name_str()) {
-            return Some(resource);
-        }
-    }
-    None
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.

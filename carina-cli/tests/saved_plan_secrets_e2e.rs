@@ -358,7 +358,9 @@ fn current_state_comment_placeholder_hash<'a>(plan: &'a Value, identity: &str) -
 }
 
 fn assert_secret_hash(value: &Value) {
-    let object = value.as_object().expect("secret state value is an object");
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("secret state value is an object, got {value}"));
     assert_eq!(object.len(), 1, "secret tag must contain exactly one entry");
     let hash = object
         .get(PERSISTED_SECRET_KEY)
@@ -1185,9 +1187,19 @@ let consumer = mock.test.resource {
 }
 "#,
     );
-    assert_success(
+    let initial_apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("initial cascade fixture apply", &initial_apply);
+    assert_output_has_no_plaintext(
         "initial cascade fixture apply",
-        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+        &initial_apply,
+        &["CASCADE_SECRET_PLAIN_3863"],
+    );
+    let initial_state = scenario.state_json();
+    assert_secret_hash(
+        &state_resource_by_name(&initial_state, "cascade-producer")["attributes"]["comment"],
+    );
+    assert_secret_hash(
+        &state_resource_by_name(&initial_state, "cascade-consumer")["attributes"]["comment"],
     );
     scenario.write_main(
         r#"backend local { path = "carina.state.json" }
@@ -1206,7 +1218,13 @@ let consumer = mock.test.resource {
 "#,
     );
 
-    assert_success("cascade saved plan", &scenario.plan());
+    let saved_plan = scenario.plan();
+    assert_success("cascade saved plan", &saved_plan);
+    assert_output_has_no_plaintext(
+        "cascade saved plan",
+        &saved_plan,
+        &["CASCADE_SECRET_PLAIN_3863"],
+    );
     let plan = read_json(&scenario.project.join("plan.json"));
     let consumer_update = plan["plan"]["effects"]
         .as_array()

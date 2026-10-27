@@ -1141,6 +1141,13 @@ mod tests {
     }
 
     #[test]
+    fn format_coalesce_chain_uses_canonical_spacing() {
+        let source = "let x = a.value??b.value  ??  'd'\n";
+        let formatted = format(source, &FormatConfig::default()).expect("format coalesce chain");
+        assert_eq!(formatted, "let x = a.value ?? b.value ?? 'd'\n");
+    }
+
+    #[test]
     fn postfix_field_access_round_trips_for_every_base_shape() {
         let input = "let call = lookup({ a = { b = 'z' } }, 'a').b\n\
                      let map = { a = 'z' }.a\n\
@@ -1668,6 +1675,53 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             "Interpolated string should keep double quotes. Got:\n{}",
             result
         );
+    }
+
+    #[test]
+    fn test_format_preserves_whitespace_inside_interpolation_and_is_idempotent() {
+        let input = "let value = \"x-${join('-', ['a'])}\"\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert!(
+            first.contains(r#""x-${join('-', ['a'])}""#),
+            "formatter must preserve authored interpolation whitespace. Got:\n{first}"
+        );
+        assert_eq!(first, second, "formatting must be idempotent");
+    }
+
+    #[test]
+    fn test_format_preserves_nested_double_quoted_string_inside_interpolation() {
+        let input = "let value = \"${join(\"-\", ['a'])}\"\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert_eq!(first, input, "interpolation contents must remain verbatim");
+        assert_eq!(second, first, "formatting must be idempotent");
+    }
+
+    #[test]
+    fn test_format_preserves_quote_inside_interpolation_comment() {
+        let input = "let value = \"${x /* \" */}\"\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert_eq!(first, input, "interpolation comments must remain verbatim");
+        assert_eq!(second, first, "formatting must be idempotent");
+    }
+
+    #[test]
+    fn test_format_preserves_multiline_interpolation_verbatim() {
+        let input = "let value = \"prefix-${\n  join(\"-\", ['a'])\n}-suffix\"\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert_eq!(first, input, "multiline interpolation must remain verbatim");
+        assert_eq!(second, first, "formatting must be idempotent");
     }
 
     #[test]

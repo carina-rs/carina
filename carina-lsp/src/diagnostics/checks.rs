@@ -132,6 +132,15 @@ fn value_depends_on_module_output(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             value_depends_on_module_output(inner, module_bindings, variables, visiting_variables)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
+                || value_depends_on_module_output(
+                    default,
+                    module_bindings,
+                    variables,
+                    visiting_variables,
+                )
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -283,6 +292,9 @@ impl<'a> ContextFreeValue<'a> {
                         || matches!(part, carina_core::resource::InterpolationPart::Expr(value) if is_context_free(value))
                 }),
                 Value::Deferred(DeferredValue::Secret(inner)) => is_context_free(inner),
+                Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                    is_context_free(value) && is_context_free(default)
+                }
             }
         }
 
@@ -505,6 +517,17 @@ fn find_for_iterable_binding_column(
     Some((start_col, end_col))
 }
 
+fn find_for_iterable_expression_column(text: &str, line_one_based: usize) -> Option<(u32, u32)> {
+    let line = text.lines().nth(line_one_based.saturating_sub(1))?;
+    let in_byte = line.find(" in ")?;
+    let after_in = &line[in_byte + 4..];
+    let trimmed = after_in.trim_start();
+    let expression = trimmed.strip_suffix('{').unwrap_or(trimmed).trim_end();
+    let start_byte = in_byte + 4 + (after_in.len() - trimmed.len());
+    let start_col = line[..start_byte].chars().count() as u32;
+    Some((start_col, start_col + expression.chars().count() as u32))
+}
+
 /// Binding names declared anywhere in the merged parse. Delegates to
 /// [`carina_core::binding_index::BindingNameSet`] so LSP diagnostics
 /// stay consistent with the CLI's
@@ -546,6 +569,10 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
         Value::Deferred(DeferredValue::Secret(inner)) => {
             contains_matching_function_call(inner, matches_name)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_matching_function_call(value, matches_name)
+                || contains_matching_function_call(default, matches_name)
+        }
         _ => false,
     }
 }
@@ -557,10 +584,11 @@ fn deferred_in_current_file(
     deferred: &carina_core::parser::DeferredForExpression,
     current_file_name: Option<&str>,
 ) -> bool {
-    let Some(current) = current_file_name else {
-        return false;
-    };
-    let Some(file) = deferred.file.as_deref() else {
+    source_file_is_current(deferred.file.as_deref(), current_file_name)
+}
+
+fn source_file_is_current(file: Option<&str>, current_file_name: Option<&str>) -> bool {
+    let (Some(file), Some(current)) = (file, current_file_name) else {
         return false;
     };
     std::path::Path::new(file)
@@ -1806,12 +1834,12 @@ impl DiagnosticEngine {
             if !deferred_in_current_file(deferred, current_file_name) {
                 continue;
             }
-            if known.contains(&deferred.iterable_binding) {
-                continue;
-            }
-            let line_zero_based = deferred.line.saturating_sub(1) as u32;
-            let (col, end_col) =
-                find_for_iterable_binding_column(&text, deferred.line, &deferred.iterable_binding)
+            for root in deferred.root_bindings() {
+                if known.contains(&root) {
+                    continue;
+                }
+                let line_zero_based = deferred.line.saturating_sub(1) as u32;
+                let (col, end_col) = find_for_iterable_binding_column(&text, deferred.line, &root)
                     .unwrap_or_else(|| {
                         // Multi-line `for` headers put the iterable on a later line;
                         // anchor the squiggle at the `for` keyword line so the user
@@ -1823,21 +1851,46 @@ impl DiagnosticEngine {
                             .unwrap_or(0);
                         (0, line_chars)
                     });
-            // Build the same enriched UndefinedIdentifier the CLI would emit
-            // so the editor shows the did-you-mean suggestion and the list of
-            // in-scope bindings (#2038).
-            let in_scope: Vec<String> = known.iter_names().map(String::from).collect();
-            let err = carina_core::parser::ParseError::undefined_identifier(
-                deferred.iterable_binding.clone(),
-                deferred.line,
-                in_scope,
-            );
+                // Build the same enriched UndefinedIdentifier the CLI would emit
+                // so the editor shows the did-you-mean suggestion and the list of
+                // in-scope bindings (#2038).
+                let in_scope: Vec<String> = known.iter_names().map(String::from).collect();
+                let err = carina_core::parser::ParseError::undefined_identifier(
+                    root,
+                    deferred.line,
+                    in_scope,
+                );
+                diagnostics.push(carina_diagnostic(
+                    line_zero_based,
+                    col,
+                    end_col,
+                    DiagnosticSeverity::ERROR,
+                    err.to_string(),
+                ));
+            }
+        }
+        for type_error in
+            carina_core::validation::validate_deferred_for_iterable_types(merged, &self.schemas)
+        {
+            if !source_file_is_current(type_error.file.as_deref(), current_file_name) {
+                continue;
+            }
+            let line_zero_based = type_error.line.saturating_sub(1) as u32;
+            let (col, end_col) = find_for_iterable_expression_column(&text, type_error.line)
+                .unwrap_or_else(|| {
+                    let line_chars = text
+                        .lines()
+                        .nth(type_error.line.saturating_sub(1))
+                        .map(|line| line.chars().count() as u32)
+                        .unwrap_or(0);
+                    (0, line_chars)
+                });
             diagnostics.push(carina_diagnostic(
                 line_zero_based,
                 col,
                 end_col,
                 DiagnosticSeverity::ERROR,
-                err.to_string(),
+                type_error.to_string(),
             ));
         }
         diagnostics
@@ -2970,10 +3023,17 @@ impl DiagnosticEngine {
         binding_index: &BindingIndex<'_>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
-        value.visit_resource_refs(&mut |path| {
+        value.visit_resource_refs_with_usage(&mut |path, usage| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let message = match binding_index.ref_type(path) {
+                RefType::UnknownAttribute(error)
+                    if carina_core::validation::suppress_coalesce_existence_error(
+                        &error, usage,
+                    ) =>
+                {
+                    return;
+                }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
                     known_attributes,
                     target: RefTargetKind::Schema { resource_type },
@@ -3081,98 +3141,34 @@ impl DiagnosticEngine {
     /// accepts the empty form (so the rest of the AST stays intact and other
     /// diagnostics keep running), but a buffer that ships with literal `${}`
     /// will produce a meaningless value at apply time — so the user wants a
-    /// hint that the placeholder is unfilled. See #2480.
+    /// hint that the placeholder is unfilled. An empty body only admits spaces
+    /// and tabs, so it cannot cross a line; non-empty expressions use normal
+    /// trivia, including newlines at either edge. See #2480 and #3959.
     ///
-    /// Text scan rather than AST walk: the parser stamps the empty case as
+    /// The shared source lexer is used rather than an AST walk: the parser
+    /// stamps the empty case as
     /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))` but discards the
     /// source span, so the diagnostic range has to come from a source-level
-    /// pass anyway.
+    /// pass anyway. Sharing this lexer also keeps heredoc boundaries aligned
+    /// with semantic tokens and completion.
     pub(super) fn check_empty_interpolations(&self, doc: &Document) -> Vec<Diagnostic> {
-        let text = doc.text();
-        let mut out = Vec::new();
-        for (line_idx, line) in text.lines().enumerate() {
-            // 99% of lines have no `$` — bail before allocating chars.
-            if !line.as_bytes().contains(&b'$') {
-                continue;
-            }
-            let chars: Vec<char> = line.chars().collect();
-            let mut i = 0;
-            let mut in_double_quoted = false;
-            while i < chars.len() {
-                let c = chars[i];
-                if !in_double_quoted {
-                    if c == '"' {
-                        in_double_quoted = true;
-                    } else if c == '\'' {
-                        // Skip past the single-quoted string entirely so a
-                        // `${}` inside it (which is a literal in this DSL)
-                        // doesn't trigger the diagnostic.
-                        i += 1;
-                        while i < chars.len() && chars[i] != '\'' {
-                            i += 1;
-                        }
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if c == '\\' {
-                    i += 2;
-                    continue;
-                }
-                if c == '"' {
-                    in_double_quoted = false;
-                    i += 1;
-                    continue;
-                }
-                if c == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
-                    let start = i;
-                    // Brace-balance the interpolation body so `${ {}.a }`
-                    // closes at the matching `}`, not the first one.
-                    let mut depth = 1usize;
-                    let mut j = i + 2;
-                    let mut only_whitespace = true;
-                    while j < chars.len() && depth > 0 {
-                        match chars[j] {
-                            '\\' if j + 1 < chars.len() => {
-                                only_whitespace = false;
-                                j += 2;
-                                continue;
-                            }
-                            '{' => {
-                                depth += 1;
-                                only_whitespace = false;
-                            }
-                            '}' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    j += 1;
-                                    break;
-                                }
-                                only_whitespace = false;
-                            }
-                            ch if !ch.is_whitespace() => only_whitespace = false,
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    if depth == 0 && only_whitespace {
-                        out.push(carina_diagnostic(
-                            line_idx as u32,
-                            start as u32,
-                            j as u32,
-                            DiagnosticSeverity::WARNING,
-                            "empty interpolation `${}` — fill in the expression or remove it"
-                                .to_string(),
-                        ));
-                    }
-                    i = j;
-                    continue;
-                }
-                i += 1;
-            }
-        }
-        out
+        crate::lex::lex(&doc.text())
+            .interpolations()
+            .iter()
+            .copied()
+            .filter(|span| span.is_inline_empty())
+            .filter_map(|span| {
+                let end = span.end?;
+                debug_assert_eq!(span.start.line, end.line);
+                Some(carina_diagnostic(
+                    span.start.line,
+                    span.start.character,
+                    end.character,
+                    DiagnosticSeverity::WARNING,
+                    "empty interpolation `${}` — fill in the expression or remove it".to_string(),
+                ))
+            })
+            .collect()
     }
 
     /// Mirror `validate_depends_on` errors/warnings in the editor.

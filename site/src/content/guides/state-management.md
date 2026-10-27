@@ -9,7 +9,9 @@ Carina uses a state file to track which resources it manages and their current a
 
 When you run `carina apply`, Carina records each managed resource and its attributes in a state file. On subsequent runs, it compares the desired state (your `.crn` files) with the recorded state to determine what needs to change.
 
-By default, state is stored locally as `carina.state.json`. For team usage, configure a remote S3 backend.
+By default, state is stored locally as `carina.state.json`. Use `backend local { path = '...' }` to store it at another local path, and configure the S3 backend for team usage.
+
+`apply` and `destroy` save state while effects run, not only at the end, so an interrupted run (Ctrl+C, a killed CI job) keeps the results of the operations that already finished. A create that the cloud accepted but that did not finish is recorded as in flight, and the next plan resumes it instead of creating the resource a second time.
 
 ### State format upgrades
 
@@ -69,7 +71,9 @@ backend s3 {
 }
 
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 
 awscc.ec2.Vpc {
@@ -127,11 +131,13 @@ carina init --migrate-state
 ```
 
 `init` compares the configured backend against the one recorded in
-`carina-backend.lock`. If they differ it copies the state from the old
-backend to the new one, verifies the copy, and rewrites the lock. A bare
-`carina init` (and any `plan`/`apply`/`destroy`) **refuses** when the
-backend changed, so you never silently abandon the old state — you have
-to opt in with `--migrate-state` (or revert the backend configuration).
+`carina-backend.lock`. If they differ, a bare `carina init` warns and
+leaves migration pending, while `plan` warns and reads state from the old
+backend recorded in the lock. `apply`, `destroy`, and `state refresh`
+refuse to run until you opt in with `--migrate-state` (or revert the
+backend configuration), so you never silently abandon the old state.
+With `--migrate-state`, `init` copies the state to the new backend,
+verifies the copy, and rewrites the lock.
 
 A local source is deleted after the verified copy; a remote source is
 kept as a recoverable backup. Add `--force` only when a *different*
@@ -146,11 +152,11 @@ To bring an existing cloud resource under Carina management, use the `import` bl
 
 ```crn
 import {
-  to = awscc.ec2.Vpc 'my-vpc'
+  to = awscc.ec2.Vpc 'main_vpc'
   id = 'vpc-0abc123def456'
 }
 
-awscc.ec2.Vpc {
+let main_vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -159,7 +165,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-- `to` specifies the resource type and the name Carina will use in state
+- `to` is the resource type plus the `let` binding name of the resource that adopts the existing one. An address that matches no declared resource does not attach to it: an anonymous resource would be planned as a separate create.
 - `id` is the cloud provider's identifier for the existing resource
 
 Run `carina plan` to verify the import matches the resource definition, then `carina apply` to record it in state.
@@ -174,7 +180,7 @@ moved {
   to   = awscc.ec2.Vpc 'main_vpc'
 }
 
-awscc.ec2.Vpc {
+let main_vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -183,7 +189,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-After the move is applied, you can remove the `moved` block from your code.
+Here the resource was previously bound as `let vpc` and is now bound as `let main_vpc`. `from` and `to` must use the same provider and resource type; changing either is not a move (use `removed` plus `import` instead). After the move is applied, you can remove the `moved` block from your code.
 
 ## Removing resources from state
 
@@ -199,7 +205,16 @@ This removes the resource from Carina's state but leaves the actual cloud resour
 
 ## Referencing upstream state
 
-To read outputs from another Carina project's state, use `upstream_state`:
+To read outputs from another Carina project's state, use `upstream_state`. The upstream project publishes values with an `exports` block:
+
+```crn
+# ../network/exports.crn
+exports {
+  vpc_id: aws.ec2.Vpc.Id = vpc.vpc_id
+}
+```
+
+The downstream project reads them:
 
 ```crn
 let network = upstream_state {
@@ -247,7 +262,7 @@ carina state bucket-delete <bucket-name> --force
 
 ## State locking
 
-When using the S3 backend, Carina automatically locks state during `apply` and `destroy` operations to prevent concurrent modifications. If a lock gets stuck (for example, after a crash), use `carina force-unlock` to release it.
+Carina locks state during `apply` and `destroy` to prevent concurrent modifications, with both backends: the local backend writes a lock file next to the state file, and the S3 backend writes a `<key>.lock` object. `plan` does not take the lock; it warns if the state changed while it was planning. A running operation keeps renewing its lock, and a lock left behind by a crashed run expires after an hour and can then be taken over. To release a stuck lock sooner, use `carina force-unlock <lock-id>`.
 
 You can disable locking with the `--lock=false` flag:
 

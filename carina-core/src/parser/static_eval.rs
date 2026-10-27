@@ -37,6 +37,7 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => false,
         Value::Deferred(DeferredValue::Secret(inner)) => is_static_value(inner),

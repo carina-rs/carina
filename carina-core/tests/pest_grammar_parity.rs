@@ -39,22 +39,11 @@ const ALLOWED_MISSING: &[&str] = &[
     // productions instead of the implicit `WHITESPACE` / `COMMENT` hooks.
     "WHITESPACE",
     "COMMENT",
-    // Silent helper used only inside `interpolation` to admit empty
-    // `${ }` mid-edit. The formatter has its own whitespace handling
-    // and doesn't need a counterpart. See #2480.
-    "inline_ws",
     // Lexer-level string/comment helpers. The formatter consumes these
     // inline via its own string/comment productions.
-    "string_char",
-    "string_literal",
-    "string_part",
     "single_quoted_content",
-    "interpolation",
     "line_comment",
     "block_comment",
-    // Operator/precedence intermediate rules — folded into the
-    // formatter's pipe/compose chain and primary.
-    "coalesce_expr",
     // Body wrappers for `fn`, `for`, `if` — the formatter uses
     // `fn_body_content`, `for_body_content`, `if_body_content` silent
     // rules instead.

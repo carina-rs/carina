@@ -154,7 +154,7 @@ pub fn drift_warning(
 ) -> String {
     format!(
         "{}\n\n    plan reads state from the OLD backend recorded in carina-backend.lock.\n    \
-         Before running apply or destroy, run `{}`\n    \
+         Before running apply, destroy, or state refresh, run `{}`\n    \
          to migrate state from the OLD backend to the new one.\n\n    \
          To revert instead, restore the backend block to match the lock.",
         backend_drift_header(existing, configured),
@@ -183,7 +183,7 @@ pub fn drift_error_message(
 /// so both surfaces report the same text.
 pub fn missing_provider_source_message(name: &str) -> String {
     format!(
-        "Provider '{}' has no source configured. Add `source = 'github.com/...'` to the provider block.",
+        "Provider '{}' has no source configured. Add `source = 'carina-rs/aws'` for a registry provider, or `source = 'github.com/owner/repo'` for a direct GitHub source.",
         name
     )
 }
@@ -901,6 +901,7 @@ mod tests {
             assert!(warning.contains("legacy/state.json"));
             assert!(warning.contains("state.json"));
             assert!(warning.contains("carina init --migrate-state"));
+            assert!(warning.contains("Before running apply, destroy, or state refresh"));
         }
 
         #[test]
@@ -989,15 +990,20 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn test_provider_load_error_shows_actual_reason() {
-        // When a provider with source fails to load, the error message should
-        // contain the actual failure reason, NOT "Run `carina init`".
-        // Use an unsupported source format to trigger a load failure without needing Tokio.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_provider_load_error_shows_actual_reason() {
+        let base = tempfile::tempdir().unwrap();
+        let source_path = base.path().join("local-provider.wasm");
+        let installed_path = base
+            .path()
+            .join(".carina/providers/file/local-provider/local-provider.wasm");
+        std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+        std::fs::write(&installed_path, b"not a wasm component").unwrap();
+
         let mut parsed = empty_parsed_file();
         parsed.providers.push(ProviderConfig {
             name: "fakeprovider".to_string(),
-            source: Some("badscheme://not-a-valid-source".to_string()),
+            source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
             version: None,
@@ -1005,22 +1011,23 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         });
-        let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[], &[]);
 
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        // Should NOT suggest "carina init" when the actual problem is a load failure
+        let error = validate_and_resolve_with_config(&mut parsed, base.path(), false, &[], &[])
+            .unwrap_err();
+        let message = error.to_string();
+
         assert!(
-            !msg.contains("Run `carina init`"),
-            "Error should not suggest 'carina init' when the actual failure is known. Got: {}",
-            msg
+            message.contains("Failed to load WASM component"),
+            "{message}"
         );
-        // Should contain the actual failure reason from build_factories_from_providers
-        assert!(
-            msg.contains("Unsupported source format for provider 'fakeprovider'"),
-            "Error should show actual failure reason. Got: {}",
-            msg
+        assert!(!message.contains("Run `carina init`"), "{message}");
+    }
+
+    #[test]
+    fn missing_provider_source_hint_advertises_registry_and_github_forms() {
+        assert_eq!(
+            missing_provider_source_message("aws"),
+            "Provider 'aws' has no source configured. Add `source = 'carina-rs/aws'` for a registry provider, or `source = 'github.com/owner/repo'` for a direct GitHub source."
         );
     }
 

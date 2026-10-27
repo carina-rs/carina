@@ -1267,7 +1267,7 @@ mock.test.Thing {
         );
         let config = ProviderConfig {
             name: "foo".into(),
-            source: Some("github.com/carina-rs/stub".into()),
+            source: Some("github.com/carina-rs/stub".parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
@@ -1331,7 +1331,7 @@ mod reload_skip_tests {
             name: name.into(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
-            source: source.map(String::from),
+            source: source.map(|source| source.parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),

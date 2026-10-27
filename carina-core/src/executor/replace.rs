@@ -1,18 +1,18 @@
 //! Shared replacement/update patch helpers.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
 use crate::provider::{ProviderReadyResource, UpdatePatch, build_update_patch};
-use crate::resource::{DataSource, Resource, State, Value};
+use crate::resource::{DataSource, Resource, State};
 use crate::schema::SchemaRegistry;
 
 use super::ProgressInfo;
 use super::basic::BasicEffectResult;
 use super::wait::WaitOutcome;
+use crate::binding_index::SecretPreservingAttributes;
 
 /// Build a full attribute-diff [`UpdatePatch`] between an existing
 /// `from` state and a desired `to` resource when no precomputed
@@ -73,8 +73,7 @@ pub(super) enum SingleEffectResult {
     /// downstream effects are scheduled.
     Read {
         resource: Box<DataSource>,
-        resolved_attrs: HashMap<String, Value>,
-        outcome: Result<State, String>,
+        outcome: Result<(SecretPreservingAttributes, State), String>,
         duration: Duration,
         progress: ProgressInfo,
     },
@@ -84,6 +83,7 @@ pub(super) enum SingleEffectResult {
     /// carries the wait binding so dependents can be marked failed.
     Wait {
         binding: String,
+        target_binding: String,
         outcome: WaitOutcome,
         duration: Duration,
         progress: ProgressInfo,

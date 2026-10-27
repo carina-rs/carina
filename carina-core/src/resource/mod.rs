@@ -2498,6 +2498,12 @@ pub enum DeferredValue {
     ResourceRef { path: AccessPath },
     /// Reference to a binding without an attribute selector.
     BindingRef { binding: String },
+    /// Null/missing coalescing deferred until the left operand's resolution
+    /// boundary can distinguish a definitive absence from an unknown value.
+    Coalesce {
+        value: Box<Value>,
+        default: Box<Value>,
+    },
     /// String interpolation: `"prefix-${expr}-suffix"`
     Interpolation(Vec<InterpolationPart>),
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
@@ -2617,9 +2623,102 @@ impl AccessExpr {
     ) -> Result<Value, ValueAccessError> {
         self.rebuild(base, self.step.clone(), miss_policy)
     }
+
+    /// Rebuild without selecting the access yet.
+    ///
+    /// This is reserved for a lazy coalesce fallback while deferred-for
+    /// placeholders are being substituted. The fallback may never be chosen,
+    /// so a concrete missing-field error must remain dormant until `??`
+    /// selects it at a later resolution boundary.
+    pub(crate) fn rebuild_lazy_with_base(&self, base: Value) -> Value {
+        Value::Deferred(DeferredValue::Access(Self {
+            base: Box::new(base),
+            step: self.step.clone(),
+            source_line: self.source_line,
+            display_root: self.display_root.clone(),
+        }))
+    }
 }
 
 impl Value {
+    /// Whether this value is the one syntactic shape for which `??` may
+    /// interpret a missing selection as absence: a direct reference, or an
+    /// access chain whose base is itself a direct reference.
+    ///
+    /// References nested in collections, interpolations, function arguments,
+    /// or secret wrappers are inputs to a larger computation. Their absence is
+    /// therefore not the absence of that computation.
+    pub fn is_coalesce_optional_reference(&self) -> bool {
+        match self {
+            Value::Deferred(
+                DeferredValue::ResourceRef { .. } | DeferredValue::BindingRef { .. },
+            ) => true,
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().is_coalesce_optional_reference()
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this expression can propagate definitive absence when it is
+    /// itself the left operand of another coalesce. Besides a direct optional
+    /// reference, a nested coalesce can do so: in `(a ?? b) ?? c`, both `a`
+    /// and `b` are optional alternatives before `c` is selected.
+    pub fn is_coalesce_optional_operand(&self) -> bool {
+        match self {
+            Value::Deferred(DeferredValue::Coalesce { .. }) => true,
+            _ => self.is_coalesce_optional_reference(),
+        }
+    }
+
+    /// Collect the root binding names referenced anywhere in this value.
+    /// Resource references and bare binding references share this one helper
+    /// so dependency and diagnostic callers cannot drift.
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+        let mut roots = std::collections::BTreeSet::new();
+        self.visit_resource_refs(&mut |path| {
+            roots.insert(path.binding().to_string());
+        });
+        self.visit_binding_refs(&mut |binding| {
+            roots.insert(binding.to_string());
+        });
+        roots
+    }
+
+    /// Whether this value contains no runtime-deferred computation.
+    pub fn is_fully_resolved(&self) -> bool {
+        match self {
+            Value::Concrete(ConcreteValue::List(values)) => {
+                values.iter().all(Value::is_fully_resolved)
+            }
+            Value::Concrete(ConcreteValue::Map(values)) => {
+                values.values().all(Value::is_fully_resolved)
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => inner.is_fully_resolved(),
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+            )
+            | Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
+            Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::Coalesce { .. }
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall { .. }
+                | DeferredValue::ResolvedFunctionCall { .. }
+                | DeferredValue::Access(_)
+                | DeferredValue::Unknown(_),
+            ) => false,
+        }
+    }
+
     /// Attach authored display context to a valid deferred access. This does
     /// not expose or mutate the access operands; construction and rebuilding
     /// still go through [`apply_value_path_segment`].
@@ -2640,6 +2739,10 @@ impl Serialize for DeferredValue {
             },
             BindingRef {
                 binding: &'a str,
+            },
+            Coalesce {
+                value: &'a Value,
+                default: &'a Value,
             },
             Interpolation(&'a [InterpolationPart]),
             FunctionCall {
@@ -2664,6 +2767,9 @@ impl Serialize for DeferredValue {
                 binding: binding.as_str(),
             }
             .serialize(serializer),
+            Self::Coalesce { value, default } => {
+                SerializableDeferredValue::Coalesce { value, default }.serialize(serializer)
+            }
             Self::Interpolation(parts) => {
                 SerializableDeferredValue::Interpolation(parts).serialize(serializer)
             }
@@ -2704,6 +2810,10 @@ impl<'de> Deserialize<'de> for DeferredValue {
             BindingRef {
                 binding: String,
             },
+            Coalesce {
+                value: Box<Value>,
+                default: Box<Value>,
+            },
             Interpolation(Vec<InterpolationPart>),
             FunctionCall {
                 name: String,
@@ -2723,6 +2833,9 @@ impl<'de> Deserialize<'de> for DeferredValue {
         match DeserializableDeferredValue::deserialize(deserializer)? {
             DeserializableDeferredValue::ResourceRef { path } => Ok(Self::ResourceRef { path }),
             DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
+            DeserializableDeferredValue::Coalesce { value, default } => {
+                Ok(Self::Coalesce { value, default })
+            }
             DeserializableDeferredValue::Interpolation(parts) => Ok(Self::Interpolation(parts)),
             DeserializableDeferredValue::FunctionCall { name, args, .. } => {
                 let name = crate::builtins::BuiltinFunction::from_name(&name).ok_or_else(|| {
@@ -2762,6 +2875,11 @@ impl fmt::Debug for DeferredValue {
             Self::BindingRef { binding } => f
                 .debug_struct("BindingRef")
                 .field("binding", binding)
+                .finish(),
+            Self::Coalesce { value, default } => f
+                .debug_struct("Coalesce")
+                .field("value", value)
+                .field("default", default)
                 .finish(),
             Self::Interpolation(parts) => f.debug_tuple("Interpolation").field(parts).finish(),
             Self::FunctionCall {
@@ -3579,6 +3697,10 @@ pub enum DeferredValueRef<'a> {
     BindingRef {
         binding: &'a str,
     },
+    Coalesce {
+        value: &'a Value,
+        default: &'a Value,
+    },
     Interpolation(&'a [InterpolationPart]),
     FunctionCall {
         name: &'a str,
@@ -3632,6 +3754,10 @@ impl Value {
                             index: Subscript::Str { key },
                         } if key.is_diagnostic_sensitive()
                     )
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                value.contains_diagnostic_sensitive_string()
+                    || default.contains_diagnostic_sensitive_string()
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.contains_diagnostic_sensitive_string()
@@ -3691,6 +3817,9 @@ impl Value {
             Value::Deferred(d) => Some(match d {
                 DeferredValue::ResourceRef { path } => DeferredValueRef::ResourceRef { path },
                 DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
+                DeferredValue::Coalesce { value, default } => {
+                    DeferredValueRef::Coalesce { value, default }
+                }
                 DeferredValue::Interpolation(parts) => DeferredValueRef::Interpolation(parts),
                 DeferredValue::FunctionCall {
                     name,
@@ -3878,6 +4007,16 @@ impl PartialEq for Value {
                 Value::Deferred(DeferredValue::BindingRef { binding: b }),
             ) => a == b,
             (
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: av,
+                    default: ad,
+                }),
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: bv,
+                    default: bd,
+                }),
+            ) => av == bv && ad == bd,
+            (
                 Value::Deferred(DeferredValue::Interpolation(a)),
                 Value::Deferred(DeferredValue::Interpolation(b)),
             ) => a == b,
@@ -3996,6 +4135,13 @@ fn value_into_literal(v: Value) -> Result<(ValueString, bool), Value> {
     }
 }
 
+/// Whether a resource reference must exist or is the value tested by `??`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceRefUsage {
+    Required,
+    CoalesceValue,
+}
+
 impl Value {
     /// Recursively normalize this `Value` so that downstream code does not
     /// have to handle redundant `Interpolation` shapes.
@@ -4036,6 +4182,10 @@ impl Value {
                 }
             }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.canonicalize_in_place(),
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                value.canonicalize_in_place();
+                default.canonicalize_in_place();
+            }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
@@ -4113,23 +4263,47 @@ impl Value {
     /// Companion: `visit_binding_refs` for bare `BindingRef` names. A consumer that
     /// needs both must call both — drift is visible at the call site.
     pub fn visit_resource_refs(&self, f: &mut impl FnMut(&AccessPath)) {
+        self.visit_resource_refs_with_usage(&mut |path, _usage| f(path));
+    }
+
+    /// Recursively walk resource references while identifying references whose
+    /// existence is guarded by the left operand of `??`.
+    ///
+    /// The right operand normally starts a required context. When the whole
+    /// coalesce is itself a left operand, a direct-reference default remains
+    /// optional so `(a ?? b) ?? c` has the same existence semantics as
+    /// `a ?? (b ?? c)`. References nested in computations remain required.
+    pub fn visit_resource_refs_with_usage(
+        &self,
+        f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
+    ) {
+        self.visit_resource_refs_with_usage_inner(ResourceRefUsage::Required, f);
+    }
+
+    fn visit_resource_refs_with_usage_inner(
+        &self,
+        usage: ResourceRefUsage,
+        f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
+    ) {
         match self {
-            Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
+            Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
-                    v.visit_resource_refs(f);
+                    v.visit_resource_refs_with_usage_inner(usage, f);
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
-                    v.visit_resource_refs(f);
+                    v.visit_resource_refs_with_usage_inner(usage, f);
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
                     match part {
                         InterpolationPart::Literal(_) => {}
-                        InterpolationPart::Expr(v) => v.visit_resource_refs(f),
+                        InterpolationPart::Expr(v) => {
+                            v.visit_resource_refs_with_usage_inner(usage, f)
+                        }
                     }
                 }
             }
@@ -4138,13 +4312,32 @@ impl Value {
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
-                    arg.walker_value().visit_resource_refs(f);
+                    arg.walker_value()
+                        .visit_resource_refs_with_usage_inner(usage, f);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().visit_resource_refs(f);
+                access.base().visit_resource_refs_with_usage_inner(usage, f);
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_resource_refs(f),
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                let value_usage = if value.is_coalesce_optional_operand() {
+                    ResourceRefUsage::CoalesceValue
+                } else {
+                    ResourceRefUsage::Required
+                };
+                let default_usage = if usage == ResourceRefUsage::CoalesceValue
+                    && default.is_coalesce_optional_operand()
+                {
+                    ResourceRefUsage::CoalesceValue
+                } else {
+                    ResourceRefUsage::Required
+                };
+                value.visit_resource_refs_with_usage_inner(value_usage, f);
+                default.visit_resource_refs_with_usage_inner(default_usage, f);
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                inner.visit_resource_refs_with_usage_inner(usage, f)
+            }
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -4199,6 +4392,10 @@ impl Value {
             }
             Value::Deferred(DeferredValue::Access(access)) => {
                 access.base().visit_binding_refs(f);
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                value.visit_binding_refs(f);
+                default.visit_binding_refs(f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_binding_refs(f),
             Value::Concrete(ConcreteValue::String(_))
@@ -4266,6 +4463,9 @@ pub fn value_contains_unknown(value: &Value) -> bool {
             .any(|argument| value_contains_unknown(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => value_contains_unknown(access.base()),
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            value_contains_unknown(value) || value_contains_unknown(default)
+        }
         _ => false,
     }
 }
@@ -4357,6 +4557,10 @@ impl Value {
             }
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 binding.hash(hasher);
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                value.hash_into(hasher);
+                default.hash_into(hasher);
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 parts.len().hash(hasher);
@@ -6640,6 +6844,9 @@ pub(crate) fn assert_value_fully_resolved(
                 path: binding.clone(),
                 context,
             })
+        }
+        Value::Deferred(DeferredValue::Coalesce { .. }) => {
+            Err(crate::value::SerializationError::UnresolvedCoalesce { context })
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(crate::value::SerializationError::UnresolvedInterpolation { context })

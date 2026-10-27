@@ -15,7 +15,9 @@ The simplest form iterates over a list of values:
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 
 let vpcs = for env in ['dev', 'stg'] {
@@ -75,7 +77,7 @@ let vpcs = for name, cidr in cidrs {
 
 ### Accessing for expression results
 
-The result of a `for` expression is a list. You can access individual elements with index syntax:
+Iterating over a list produces a list, and iterating over a map produces a map with the same keys. Access individual elements with index syntax — `vpcs[0]` for a list result, `vpcs['dev']` for a map result:
 
 ```crn
 let vpcs = for env in ['dev', 'stg'] {
@@ -172,19 +174,19 @@ This creates a single VPC but uses different CIDR blocks and names depending on 
 
 ### Combining for and if
 
-You can use `if` expressions inside `for` bodies and vice versa:
+You can use `if` expressions inside `for` bodies and vice versa. An `if` condition must be a `Bool` value; comparison operators such as `==` are not part of the expression language (they are only available in `validation`, `require`, and `wait` conditions), so carry the flag in the data you iterate over:
 
 ```crn
 let environments = {
-  dev = '10.0.0.0/16'
-  stg = '10.1.0.0/16'
-  prd = '10.2.0.0/16'
+  dev = { cidr = '10.0.0.0/16', production = false }
+  stg = { cidr = '10.1.0.0/16', production = false }
+  prd = { cidr = '10.2.0.0/16', production = true }
 }
 
-let vpcs = for name, cidr in environments {
+let vpcs = for name, env in environments {
   awscc.ec2.Vpc {
-    cidr_block           = cidr
-    enable_dns_hostnames = if name == 'prd' { true } else { false }
+    cidr_block       = env.cidr
+    instance_tenancy = if env.production { dedicated } else { default }
 
     tags = {
       Name        = "vpc-${name}"

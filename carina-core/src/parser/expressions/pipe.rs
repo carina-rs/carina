@@ -119,19 +119,71 @@ pub(crate) fn parse_coalesce_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
-    let mut inner = pair.into_inner();
-    let first = next_pair(&mut inner, "pipe expression", "coalesce expression")?;
-    let value = parse_pipe_expr(first, ctx)?;
+    let line = pair.line_col().0;
+    let mut values = pair
+        .into_inner()
+        .map(|pair| parse_pipe_expr(pair, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut result = values
+        .pop()
+        .expect("coalesce_expr grammar requires at least one pipe_expr");
 
-    // If there's a ?? right-hand side, check if left is an unresolved reference
-    if let Some(rhs_pair) = inner.next() {
-        let default = parse_pipe_expr(rhs_pair, ctx)?;
-        match &value {
-            EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(default),
-            _ => Ok(value),
+    // `??` is right-associative: `a ?? b ?? c` is `a ?? (b ?? c)`.
+    // Parse every operand before folding so syntax and diagnostics in later
+    // defaults are retained even when an earlier concrete value wins.
+    while let Some(value) = values.pop() {
+        result = combine_coalesce_operands(value, result, line)?;
+    }
+    Ok(result)
+}
+
+fn combine_coalesce_operands(
+    value: EvalValue,
+    default: EvalValue,
+    line: usize,
+) -> Result<EvalValue, ParseError> {
+    match value {
+        // A concrete user value is present by construction. Do not fold a
+        // computed structural value merely because its payload currently
+        // looks concrete: doing so would discard its parser metadata.
+        concrete @ EvalValue::User(Value::Concrete(_)) => Ok(concrete),
+        EvalValue::User(value) => {
+            let default = default
+                .into_value()
+                .map_err(|error| ParseError::from_eval_value(error, line))?;
+            Ok(EvalValue::from_value(Value::Deferred(
+                DeferredValue::Coalesce {
+                    value: Box::new(value),
+                    default: Box::new(default),
+                },
+            )))
         }
-    } else {
-        Ok(value)
+        EvalValue::ComputedWithStructuralHandles { value, metadata } => {
+            let default = default
+                .into_value()
+                .map_err(|error| ParseError::from_eval_value(error, line))?;
+            Ok(EvalValue::ComputedWithStructuralHandles {
+                value: Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(value),
+                    default: Box::new(default),
+                }),
+                metadata,
+            })
+        }
+        other => {
+            let value = other
+                .into_value()
+                .map_err(|error| ParseError::from_eval_value(error, line))?;
+            let default = default
+                .into_value()
+                .map_err(|error| ParseError::from_eval_value(error, line))?;
+            Ok(EvalValue::from_value(Value::Deferred(
+                DeferredValue::Coalesce {
+                    value: Box::new(value),
+                    default: Box::new(default),
+                },
+            )))
+        }
     }
 }
 

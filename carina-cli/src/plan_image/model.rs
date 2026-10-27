@@ -712,23 +712,19 @@ fn node_from_effect(
             Vec::new(),
             None,
         ),
-        Effect::DeferredCreate {
-            id,
-            upstream_binding,
-            template,
-        } => (
+        Effect::DeferredCreate { id, template } => (
             deferred_label(&template.binding_name, id),
             id.display_type(),
             EffectKind::DeferredCreate,
             Vec::new(),
-            Some(format!("after {upstream_binding}")),
+            deferred_after_note(template),
         ),
         Effect::DeferredReplace(payload) => (
             deferred_label(&payload.template.binding_name, &payload.id),
             payload.id.display_type(),
             EffectKind::DeferredReplace,
             Vec::new(),
-            Some(format!("after {}", payload.upstream_binding)),
+            deferred_after_note(&payload.template),
         ),
     };
 
@@ -745,6 +741,16 @@ fn node_from_effect(
         module: module.map(|info| info.id.clone()),
         affected_by: Vec::new(),
     }
+}
+
+fn deferred_after_note(template: &carina_core::parser::DeferredForExpression) -> Option<String> {
+    let root_bindings = template.root_bindings();
+    (!root_bindings.is_empty()).then(|| {
+        format!(
+            "after {}",
+            root_bindings.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
 }
 
 fn effect_anonymous_discriminator(effect: &Effect) -> Option<String> {
@@ -1081,6 +1087,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
     use carina_core::provider::AppliedIdentifier;
     use carina_core::resource::{
@@ -1231,6 +1238,31 @@ mod tests {
 
         assert_eq!(node.label, "production_security_group");
         assert_eq!(node.anonymous_discriminator, None);
+    }
+
+    #[test]
+    fn deferred_effect_with_literal_iterable_has_no_value_detail() {
+        const ITERABLE_VALUE: &str = "value-that-must-not-appear";
+        let template = DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for item in literal".to_string(),
+            resource_type: "test.Widget".to_string(),
+            attributes: Vec::new(),
+            binding_name: "widgets".to_string(),
+            iterable: Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
+            binding: ForBinding::Simple("item".to_string()),
+            template_resource: Resource::new("test.Widget", "widgets"),
+        };
+        let effect = Effect::DeferredCreate {
+            id: ResolvedResourceId::new(ResourceId::with_identity("__deferred_for", "widgets")),
+            template: Box::new(template),
+        };
+
+        let node = node_from_effect(0, &effect, None, None);
+
+        assert_eq!(node.note, None);
+        assert!(!format!("{node:?}").contains(ITERABLE_VALUE));
     }
 
     #[test]

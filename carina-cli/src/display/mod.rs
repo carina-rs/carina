@@ -827,13 +827,9 @@ impl<'a> TreeRenderContext<'a> {
                 )
                 .unwrap();
             }
-            Effect::DeferredCreate {
-                upstream_binding,
-                template,
-                ..
-            } => {
-                let verb = deferred_for_verb(self.plan, upstream_binding);
-                let display_name = deferred_for_display_name(template, upstream_binding, verb);
+            Effect::DeferredCreate { template, .. } => {
+                let verb = deferred_for_verb(self.plan, template);
+                let display_name = deferred_for_display_name(template, verb);
                 let display_name = display_name.green().bold();
                 writeln!(
                     self.out,
@@ -853,18 +849,16 @@ impl<'a> TreeRenderContext<'a> {
                     };
                     format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
                 };
-                for row in deferred_for_detail_rows(template, upstream_binding, verb) {
+                let upstream_binding = template.binding_description();
+                for row in deferred_for_detail_rows(template, &upstream_binding, verb) {
                     render_detail_row(&mut self.out, &row, effect, &attr_prefix);
                 }
                 has_displayed_attrs = true;
             }
             Effect::DeferredReplace(payload) => {
-                let upstream_binding = payload.upstream_binding.as_str();
                 let template = payload.template.as_ref();
-                let verb = deferred_for_verb(self.plan, upstream_binding);
-                let display_name = deferred_for_display_name(template, upstream_binding, verb)
-                    .magenta()
-                    .bold();
+                let verb = deferred_for_verb(self.plan, template);
+                let display_name = deferred_for_display_name(template, verb).magenta().bold();
                 writeln!(
                     self.out,
                     "{}{} {}",
@@ -883,7 +877,8 @@ impl<'a> TreeRenderContext<'a> {
                     };
                     format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
                 };
-                for row in deferred_for_detail_rows(template, upstream_binding, verb) {
+                let upstream_binding = template.binding_description();
+                for row in deferred_for_detail_rows(template, &upstream_binding, verb) {
                     render_detail_row(&mut self.out, &row, effect, &attr_prefix);
                 }
                 has_displayed_attrs = true;
@@ -2103,22 +2098,18 @@ pub fn format_effect(effect: &Effect) -> String {
             let binding = identity.to_string();
             format!("Wait {} (until {})", binding, until_surface)
         }
-        Effect::DeferredCreate {
-            id,
-            upstream_binding,
-            ..
-        } => {
+        Effect::DeferredCreate { id, template } => {
             format!(
                 "Expand deferred for {} (waits on {})",
                 id.human(),
-                upstream_binding
+                template.binding_description()
             )
         }
         Effect::DeferredReplace(payload) => {
             format!(
                 "Deferred replace {} (waits on {})",
                 payload.id.human(),
-                payload.upstream_binding
+                payload.template.binding_description()
             )
         }
     }

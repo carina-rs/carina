@@ -113,8 +113,7 @@ fn deferred_create_uses_create_symbol_and_kind() {
         resource_type: "aws.route53.Record".to_string(),
         attributes: Vec::new(),
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -125,7 +124,6 @@ fn deferred_create_uses_create_symbol_and_kind() {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
 

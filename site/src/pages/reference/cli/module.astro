@@ -1,11 +1,11 @@
 ---
 import Doc from '../../../layouts/Doc.astro';
-import { Content, getHeadings, frontmatter } from '../../../content/reference/cli/module-info.md';
+import { Content, getHeadings, frontmatter } from '../../../content/reference/cli/module.md';
 
 const headings = getHeadings();
 ---
 <Doc
-  title={frontmatter.title ?? 'carina module-info'}
+  title={frontmatter.title ?? 'carina module'}
   description={frontmatter.description}
   headings={headings}
 >

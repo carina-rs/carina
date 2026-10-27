@@ -425,7 +425,7 @@ fn fmt_degrades_to_plain_formatting_when_provider_cannot_load() {
     std::fs::write(
         &main,
         r#"provider broken {
-  source = "https://unsupported.example/provider"
+  source = "file:///definitely/missing/carina-provider.wasm"
 }
 
 broken.test.resource {
@@ -454,7 +454,7 @@ fn check_notes_unavailable_providers_without_changing_exit_semantics() {
     std::fs::write(
         &main,
         r#"provider broken {
-  source = "https://unsupported.example/provider"
+  source = "file:///definitely/missing/carina-provider.wasm"
 }
 
 broken.test.resource {
@@ -501,7 +501,7 @@ fn diff_notes_unavailable_providers_without_changing_exit_semantics() {
     let project = tempfile::tempdir().unwrap();
     let main = project.path().join("main.crn");
     let original = r#"provider broken {
-  source = "https://unsupported.example/provider"
+  source = "file:///definitely/missing/carina-provider.wasm"
 }
 
 broken.test.resource {
@@ -621,7 +621,7 @@ fn recursive_check_warns_once_for_multiple_unavailable_provider_directories() {
             directory.join("main.crn"),
             format!(
                 r#"provider {provider} {{
-  source = "https://unsupported.example/provider"
+  source = "file:///definitely/missing/carina-provider.wasm"
 }}
 "#
             ),

@@ -78,27 +78,33 @@ impl StateBlockClaims {
             entries: entries
                 .into_iter()
                 .map(|entry| {
-                    let claimed = self.claims_from(provider, resource_type, name_of(&entry));
+                    let claimed = ResourceIdentity::try_from(name_of(&entry).to_owned()).is_ok_and(
+                        |identity| {
+                            let resource_id = ResourceId::with_provider_identity(
+                                provider.to_owned(),
+                                resource_type.to_owned(),
+                                identity,
+                                None,
+                            );
+                            self.claims_from(&resource_id)
+                        },
+                    );
                     (entry, claimed)
                 })
                 .collect(),
         }
     }
 
-    fn claims_from(&self, provider: &str, resource_type: &str, name: &str) -> bool {
-        self.from.iter().any(|address| {
-            address.provider == provider
-                && address.resource_type == resource_type
-                && address.name_str() == name
-        })
+    fn claims_from(&self, resource_id: &ResourceId) -> bool {
+        self.from
+            .iter()
+            .any(|address| address.matches_resource_id(resource_id))
     }
 
-    pub fn claims_to(&self, provider: &str, resource_type: &str, name: &str) -> bool {
-        self.to.iter().any(|address| {
-            address.provider == provider
-                && address.resource_type == resource_type
-                && address.name_str() == name
-        })
+    pub fn claims_to(&self, resource_id: &ResourceId) -> bool {
+        self.to
+            .iter()
+            .any(|address| address.matches_resource_id(resource_id))
     }
 }
 
@@ -567,6 +573,11 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             format!("BindingRef({})", binding)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => format!(
+            "Coalesce({}, {})",
+            deterministic_value_string(value),
+            deterministic_value_string(default)
+        ),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let strs: Vec<String> = parts
@@ -1207,11 +1218,7 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         }
 
-        if claims.claims_to(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            &resource_identity,
-        ) {
+        if claims.claims_to(&resource.id) {
             continue;
         }
 
@@ -1414,11 +1421,7 @@ pub fn detect_anonymous_to_named_renames(
         let Some(resource_identity) = resource.id.identity_str() else {
             continue;
         };
-        if claims.claims_to(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource_identity,
-        ) {
+        if claims.claims_to(&resource.id) {
             continue;
         }
 

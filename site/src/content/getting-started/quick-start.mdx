@@ -19,8 +19,8 @@ This guide walks you through creating an AWS VPC using Carina.
   ```crn
   // main.crn
   provider awscc {
-    source  = 'github.com/carina-rs/carina-provider-awscc'
-    version = '0.5.0'
+    source  = 'carina-rs/awscc'
+    version = '0.7.1'
     region  = awscc.Region.ap_northeast_1
   }
 
@@ -33,11 +33,21 @@ This guide walks you through creating an AWS VPC using Carina.
   }
   ```
 
-  Carina downloads the WASM provider plugin from the release matching `version` (or use `revision = 'main'` to track the latest commit). The plugin is cached under `.carina/providers/`.
+  </Step>
+
+  <Step number={2} eyebrow="Step 2 · Init" title="Install the provider">
+
+  Download the provider plugins declared in your `provider` blocks:
+
+  ```bash
+  carina init
+  ```
+
+  Carina downloads the WASM plugin from the release matching `version` into `.carina/providers/` and pins it in `carina-providers.lock`. Commit the lock file. Run `carina init` again whenever you add a provider or change its `version`.
 
   </Step>
 
-  <Step number={2} eyebrow="Step 2 · Validate" title="Validate">
+  <Step number={3} eyebrow="Step 3 · Validate" title="Validate">
 
   Check that the syntax and schema are correct:
 
@@ -49,7 +59,7 @@ This guide walks you through creating an AWS VPC using Carina.
 
   </Step>
 
-  <Step number={3} eyebrow="Step 3 · Plan" title="Plan">
+  <Step number={4} eyebrow="Step 4 · Plan" title="Plan">
 
   Preview what Carina will create:
 
@@ -57,11 +67,11 @@ This guide walks you through creating an AWS VPC using Carina.
   carina plan
   ```
 
-  The plan output shows each resource and the action Carina will take (Create, Update, Delete, or Replace).
+  The plan output shows each resource and the action Carina will take (Create, Update, Delete, or Replace). `plan` and `apply` talk to AWS, so run them with credentials available (for example `aws-vault exec <profile> -- carina plan`).
 
   </Step>
 
-  <Step number={4} eyebrow="Step 4 · Apply" title="Apply">
+  <Step number={5} eyebrow="Step 5 · Apply" title="Apply">
 
   Create the resources:
 
@@ -69,11 +79,11 @@ This guide walks you through creating an AWS VPC using Carina.
   carina apply
   ```
 
-  Carina executes the plan and records the result in `carina.state.json`. This state file tracks which resources Carina manages and their current attributes.
+  Carina shows the plan, asks for confirmation (`--auto-approve` skips it), executes it, and records the result in `carina.state.json`. This state file tracks which resources Carina manages and their current attributes.
 
   </Step>
 
-  <Step number={5} eyebrow="Step 5 · Destroy" title="Destroy">
+  <Step number={6} eyebrow="Step 6 · Destroy" title="Destroy">
 
   Tear down all managed resources:
 
@@ -81,7 +91,7 @@ This guide walks you through creating an AWS VPC using Carina.
   carina destroy
   ```
 
-  This deletes every resource recorded in the state file.
+  After you confirm by typing `yes`, this deletes every resource recorded in the state file.
 
   </Step>
 </Stepper>

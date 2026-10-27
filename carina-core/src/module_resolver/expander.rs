@@ -1727,19 +1727,10 @@ fn check_composition_argument_type(
 ///   `_domain_validation_options`) → instance-prefixed
 ///   unconditionally, exactly like `Resource.binding`, so each module
 ///   instance's loop resources are uniquely addressed.
-/// - `iterable_binding` (the iterable's root binding, e.g. `cert`) →
-///   instance-prefixed **only when it is a module-internal binding**,
-///   the same caller-collision guard [`rewrite_intra_module_refs`]
-///   applies to a `ResourceRef` head (a caller-provided binding that
-///   coincidentally shares a name must not be prefixed). This is a
-///   deliberate, more-correct divergence from the design doc's PR-B
-///   table (which prescribed an unconditional prefix); see the
-///   per-field comment in the body for why the design's cited
-///   `prefix_wait_binding` mirror is unsafe to copy here.
 /// - `attributes` and `template_resource` → the full module-resource
 ///   treatment via [`prefix_module_resource`] / the same
 ///   ref-rewrite + arg-substitute + canonicalize as `module.resources`.
-/// - `file`/`line`/`header`/`resource_type`/`iterable_attr`/`binding`
+/// - `file`/`line`/`header`/`resource_type`/`binding`
 ///   → provenance / display / non-binding / loop-local: pass through.
 fn prefix_deferred_for_expression(
     d: &DeferredForExpression,
@@ -1756,8 +1747,7 @@ fn prefix_deferred_for_expression(
         resource_type,
         attributes,
         binding_name,
-        iterable_binding,
-        iterable_attr,
+        iterable,
         binding,
         template_resource,
     } = d;
@@ -1791,30 +1781,9 @@ fn prefix_deferred_for_expression(
         // `Resource.binding`) to isolate each module instance's loop
         // resources.
         binding_name: apply_instance_prefix(instance_prefix, binding_name),
-        // Iterable root binding — this IS a reference to an existing
-        // binding (`cert` in `for _, opt in cert.dvo`), so it takes
-        // the same caller-collision guard as a `ResourceRef` head in
-        // `rewrite_intra_module_refs`: prefix only when it names a
-        // module-internal binding. A caller-passed binding that
-        // coincidentally shares the name must NOT be prefixed.
-        //
-        // NB: this is a *deliberate, more-correct* divergence from the
-        // design doc's PR-B table, which prescribed an *unconditional*
-        // prefix "mirroring `prefix_wait_binding`'s lhs_segments[0]".
-        // That mirror is wrong: `prefix_wait_binding` prefixes the
-        // `until` LHS root unconditionally (a known pre-existing
-        // looseness, safe only because that root is virtually always
-        // the module-internal wait/resource binding). Copying it here
-        // would silently break a module that iterates a caller-passed
-        // binding. The `rewrite_intra_module_refs` model is the right
-        // one — do not "simplify" this back to unconditional.
-        iterable_binding: if intra_module_bindings.contains(iterable_binding) {
-            apply_instance_prefix(instance_prefix, iterable_binding)
-        } else {
-            iterable_binding.clone()
-        },
-        // attribute path tail — not a binding
-        iterable_attr: iterable_attr.clone(),
+        // The full iterable is a value expression: rewrite every reference
+        // and substitute module arguments in both coalesce operands.
+        iterable: prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?,
         // loop-var pattern kind — loop-local, not a module binding
         binding: binding.clone(),
         // Full module-resource treatment — identical to a
@@ -2043,6 +2012,25 @@ fn substitute_arguments_with_position(
             }
             substituted
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            let value = substitute_arguments_with_position(
+                value,
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            if matches!(value, Value::Concrete(_)) {
+                value
+            } else {
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(value),
+                    default: Box::new(substitute_arguments_with_position(
+                        default,
+                        arguments,
+                        ArgumentSubstitutionPosition::Value,
+                    )?),
+                })
+            }
+        }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
@@ -2267,6 +2255,20 @@ pub(super) fn rewrite_intra_module_refs(
                 crate::resource::AccessMissPolicy::Error,
             )
             .unwrap_or_else(|_| value.clone()),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(rewrite_intra_module_refs(
+                    value,
+                    instance_prefix,
+                    intra_module_bindings,
+                )),
+                default: Box::new(rewrite_intra_module_refs(
+                    default,
+                    instance_prefix,
+                    intra_module_bindings,
+                )),
+            })
+        }
         _ => value.clone(),
     }
 }
@@ -2372,7 +2374,7 @@ pub fn reconcile_anonymous_module_instances(
             .entry(module.to_string())
             .or_default()
             .insert(simhash);
-        if claims.claims_to(&r.id.provider, &r.id.resource_type, identity) {
+        if claims.claims_to(&r.id) {
             claimed_current_by_module
                 .entry(module.to_string())
                 .or_default()
@@ -2675,6 +2677,12 @@ fn rewrite_ref_prefixes(
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(rewrite_ref_prefixes(inner, remap)),
         )),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(rewrite_ref_prefixes(value, remap)),
+                default: Box::new(rewrite_ref_prefixes(default, remap)),
+            })
+        }
         _ => value.clone(),
     }
 }

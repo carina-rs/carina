@@ -204,6 +204,22 @@ carina plan --image-theme dark --image plan-dark.png
 </picture>
 ```
 
+### `--check-iam`
+
+Before showing the plan, check whether the AWS caller identity (the role that will run `apply`) has the IAM actions the providers declare for the planned effects. Carina uses `iam:SimulatePrincipalPolicy`, and falls back to reading the role's policies (`iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`) when simulation is denied. Missing actions are reported per effect as warnings; the plan does not fail. If the caller identity or its policies cannot be read, the check is skipped with a warning.
+
+### `--strict-iam`
+
+With `--check-iam`, exit with code `1` instead of warning when permissions are missing. Requires `--check-iam`.
+
+```bash
+carina plan --check-iam --strict-iam
+```
+
+## State Locking
+
+`plan` does not acquire the state lock, so it never blocks or is blocked by other runs. Because a concurrent `apply` or `destroy` can change state while the plan is computed, `plan` re-reads state just before display. If the state's serial or lineage changed (or the state was removed), it prints a warning to stderr that the plan may be stale and still shows the plan. `--out` still writes the plan file; applying a stale saved plan is caught by the lineage/serial check in `carina apply`.
+
 ## Examples
 
 Plan from the current directory:

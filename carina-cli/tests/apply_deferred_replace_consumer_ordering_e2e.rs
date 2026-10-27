@@ -244,8 +244,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         resource_type: "mock.test.resource".to_string(),
         attributes: vec![],
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -271,7 +270,6 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(template),
     })));
     plan.add(Effect::Update {

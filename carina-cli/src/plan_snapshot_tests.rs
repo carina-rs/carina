@@ -4,7 +4,7 @@
 //! using the same logic as `--refresh=false`, formats the plan output, strips
 //! ANSI color codes, and asserts the result against an `insta` snapshot.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
@@ -1243,30 +1243,11 @@ fn collect_unused_let_bindings_in_fixtures(
         }
         let fixture_name = entry.file_name().to_string_lossy().to_string();
         let loaded = load_configuration(&fixture_dir).unwrap();
-        let unused = crate::wiring::check_unused_bindings(&loaded.unresolved_parsed);
+        let unused = carina_core::validation::check_unused_bindings(&loaded.unresolved_parsed);
         if unused.is_empty() {
             continue;
         }
-        // Moved block targets are structurally required bindings
-        let move_targets: HashSet<String> = loaded
-            .unresolved_parsed
-            .state_blocks
-            .iter()
-            .filter_map(|sb| {
-                if let carina_core::parser::StateBlock::Moved { addresses } = sb {
-                    Some(addresses.to().name_str().to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let truly_unused: Vec<String> = unused
-            .into_iter()
-            .filter(|b| !move_targets.contains(b))
-            .collect();
-        if !truly_unused.is_empty() {
-            failures.push((fixture_name, truly_unused));
-        }
+        failures.push((fixture_name, unused));
     }
 
     failures
@@ -2461,8 +2442,7 @@ fn snapshot_top_level_sigil_alignment() {
             Value::resource_ref("option", "name", vec![]),
         )],
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("option".to_string()),
         template_resource: deferred_template,
     };

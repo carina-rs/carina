@@ -10,7 +10,7 @@ use crate::effect::deps::UnresolvedResource;
 use crate::provider::{AppliedIdentifier, Provider};
 #[cfg(test)]
 use crate::resource::Resource;
-use crate::resource::{ResourceId, ResourceIdentity, Value};
+use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 #[cfg(test)]
@@ -576,6 +576,10 @@ pub(super) async fn execute_effects_sequential(
                                     provider_check_inputs.data_source_input(resource.as_inner());
                                 match resolve_data_source(check_input, &binding_snapshot) {
                                     Ok(resolved_input) => {
+                                        let resolved_secret_shapes =
+                                            crate::resource::attrs_to_hashmap(
+                                                &resolved_input.value().attributes,
+                                            );
                                         let unresolved =
                                             unresolved_data_source_inputs(resolved_input.value());
                                         if unresolved.is_empty() {
@@ -585,10 +589,19 @@ pub(super) async fn execute_effects_sequential(
                                             ) {
                                                 Ok(ready) => {
                                                     resolved = ready.as_data_source().clone();
+                                                    let provider_values =
+                                                        crate::resource::attrs_to_hashmap(
+                                                            &resolved.attributes,
+                                                        );
+                                                    let resolved_attrs = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+                                                        &resolved_secret_shapes,
+                                                        &provider_values,
+                                                    );
                                                     super::read_data_source_with_retry(
                                                         provider, &ready,
                                                     )
                                                     .await
+                                                    .map(|state| (resolved_attrs, state))
                                                     .map_err(|err| {
                                                         format!(
                                                             "data source read failed for {}: {err}",
@@ -617,11 +630,8 @@ pub(super) async fn execute_effects_sequential(
                                     )),
                                 }
                             };
-                            let resolved_attrs =
-                                crate::resource::attrs_to_hashmap(&resolved.attributes);
                             SingleEffectResult::Read {
                                 resource: Box::new(resolved),
-                                resolved_attrs,
                                 outcome,
                                 duration: started.elapsed(),
                                 progress,
@@ -658,6 +668,16 @@ pub(super) async fn execute_effects_sequential(
                                 resolve_wait_identifier(&wait_identifiers, target_id)
                             };
                             let cleanup_loop = shutdown.cleanup_aware_loop();
+                            let target_binding = match binding_snapshot.source(identity.as_str()) {
+                                Some(crate::binding_index::BindingValueSource::WaitAlias {
+                                    target,
+                                }) => target.as_str().to_string(),
+                                Some(
+                                    crate::binding_index::BindingValueSource::Local
+                                    | crate::binding_index::BindingValueSource::Upstream,
+                                )
+                                | None => target_id.identity_str().to_string(),
+                            };
                             let outcome = super::wait::execute_wait_effect(
                                 &cleanup_loop,
                                 provider,
@@ -672,6 +692,7 @@ pub(super) async fn execute_effects_sequential(
                             .await;
                             SingleEffectResult::Wait {
                                 binding: identity.to_string(),
+                                target_binding,
                                 outcome,
                                 duration: started.elapsed(),
                                 progress,
@@ -791,12 +812,11 @@ pub(super) async fn execute_effects_sequential(
             SingleEffectResult::ReadNoOp => {}
             SingleEffectResult::Read {
                 resource,
-                resolved_attrs,
                 outcome,
                 duration,
                 progress,
             } => match outcome {
-                Ok(state) => {
+                Ok((resolved_attrs, state)) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect: &effects[finished_idx],
                         state: Some(&state),
@@ -833,17 +853,12 @@ pub(super) async fn execute_effects_sequential(
             },
             SingleEffectResult::Wait {
                 binding,
+                target_binding,
                 outcome,
                 duration,
                 progress,
             } => match outcome {
                 WaitOutcome::Satisfied { state } => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect: &effects[finished_idx],
-                        state: Some(&state),
-                        duration,
-                        progress,
-                    });
                     // Register the captured target snapshot under the
                     // wait's *synthetic* ResourceId so the downstream
                     // resolution layer can deref `<binding>.<attr>` —
@@ -853,22 +868,41 @@ pub(super) async fn execute_effects_sequential(
                     // (handled by `state_writeback_should_skip`).
                     let synthetic =
                         ResourceId::with_identity("__wait", ResourceIdentity::new(binding.clone()));
-                    let attrs: HashMap<String, Value> = state
-                        .attributes
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    accumulated.mutate(|result| {
-                        result.success_count += 1;
-                        result
-                            .bindings
-                            .record_applied(Some(&binding), &attrs, &state);
-                    });
-                    accumulated.insert_published(
-                        synthetic,
-                        crate::executor::Applied::WaitSnapshot(state.clone()),
-                        &state,
-                    );
+                    match accumulated
+                        .result()
+                        .bindings
+                        .secret_preserving_wait_snapshot(&target_binding, &state)
+                    {
+                        Ok(attrs) => {
+                            observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                effect: &effects[finished_idx],
+                                state: Some(&state),
+                                duration,
+                                progress,
+                            });
+                            accumulated.mutate(|result| {
+                                result.success_count += 1;
+                                result
+                                    .bindings
+                                    .record_applied(Some(&binding), &attrs, &state);
+                            });
+                            accumulated.insert_published(
+                                synthetic,
+                                crate::executor::Applied::WaitSnapshot(state.clone()),
+                                &state,
+                            );
+                        }
+                        Err(error) => {
+                            observer.on_event(&ExecutionEvent::EffectFailed {
+                                effect: &effects[finished_idx],
+                                error: &error,
+                                duration,
+                                progress,
+                            });
+                            accumulated.mutate(|result| result.failure_count += 1);
+                            failed_indices.insert(finished_idx);
+                        }
+                    }
                 }
                 WaitOutcome::Unsatisfiable(reason) => {
                     let detail = unsatisfiable_reason_message(&reason);

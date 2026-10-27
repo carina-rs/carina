@@ -172,7 +172,7 @@ fn init_does_not_require_source_on_named_provider_instance() {
     // produces, not just a loose substring, so a future
     // unrelated error from `carina_provider_resolver` that
     // happens to share words doesn't masquerade as a pass.
-    let pre_check_msg = "Provider 'aws' has no source configured. Add `source = 'github.com/...'` to the provider block.";
+    let pre_check_msg = "Provider 'aws' has no source configured. Add `source = 'carina-rs/aws'` for a registry provider, or `source = 'github.com/owner/repo'` for a direct GitHub source.";
     assert!(
         !stderr.contains(pre_check_msg) && !stdout.contains(pre_check_msg),
         "init must not surface the kind-level 'no source configured' \

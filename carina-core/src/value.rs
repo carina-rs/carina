@@ -108,6 +108,10 @@ pub enum SerializationError {
         expression: String,
         context: SerializationContext,
     },
+    /// A coalesce expression reached a concrete-only serialization boundary
+    /// before its left operand became present or definitively absent.
+    #[error("cannot serialize at {context}: unresolved coalesce expression")]
+    UnresolvedCoalesce { context: SerializationContext },
     /// A parser-authored enum identifier reached a serialization boundary
     /// without schema resolution. Provider transports accept only
     /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
@@ -156,6 +160,7 @@ impl SerializationError {
                 expression: MASKED.to_string(),
                 context,
             },
+            Self::UnresolvedCoalesce { context } => Self::UnresolvedCoalesce { context },
             other => other,
         }
     }
@@ -754,6 +759,9 @@ fn value_to_json_inner(
                 context: ctx,
             })
         }
+        Value::Deferred(DeferredValue::Coalesce { .. }) => {
+            Err(SerializationError::UnresolvedCoalesce { context: ctx })
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
@@ -879,6 +887,7 @@ pub(crate) fn canonical_secret_hash_material(value: &Value) -> Result<Vec<u8>, S
             | SerializationError::UnresolvedInterpolation { .. }
             | SerializationError::UnresolvedFunctionCall { .. }
             | SerializationError::UnresolvedAccess { .. }
+            | SerializationError::UnresolvedCoalesce { .. }
             | SerializationError::SecretNotAllowed { .. },
         ) => canonical_secret_template(value)?,
         Err(error) => return Err(error),
@@ -1610,6 +1619,21 @@ fn format_value_into_context(
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             sink.write_token(ValueSpanKind::Reference, binding)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            let parenthesize_left = matches!(
+                value.as_ref(),
+                Value::Deferred(DeferredValue::Coalesce { .. })
+            );
+            if parenthesize_left {
+                sink.write_token(ValueSpanKind::Structure, "(")?;
+            }
+            format_value_into_context(value, sink, context)?;
+            if parenthesize_left {
+                sink.write_token(ValueSpanKind::Structure, ")")?;
+            }
+            sink.write_token(ValueSpanKind::Structure, " ?? ")?;
+            format_value_into_context(default, sink, context)
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             sink.write_token(ValueSpanKind::StringLiteral, "\"")?;
             for part in parts {
@@ -1832,6 +1856,9 @@ pub fn contains_secret(value: &Value) -> bool {
         ) => args
             .iter()
             .any(|argument| contains_secret(argument.walker_value())),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_secret(value) || contains_secret(default)
+        }
         Value::Deferred(DeferredValue::Access(access)) => contains_secret(access.base()),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -1880,6 +1907,9 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_unredacted_secret(access.base())
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_unredacted_secret(value) || contains_unredacted_secret(default)
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -2006,6 +2036,13 @@ fn merge_secrets_into_observation_json_inner(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(observed_items.replacing_children(replacements))
         }
+        // Deferred/non-structural expressions can still contain a secret. The
+        // normal executor resolves them before writeback, but state-boundary
+        // callers must fail closed rather than persisting observed plaintext if
+        // one reaches this walker unresolved.
+        _ if contains_secret(desired) => {
+            mask_mismatched_observation_shape(desired, observed, previous)
+        }
         _ => Ok(observed.to_owned_json()),
     }
 }
@@ -2106,6 +2143,12 @@ fn merge_secrets_into_provider_json_inner(
                     .map(|value| value.encoded)
             }
         }
+        // A coalesce, function call, or interpolation does not expose enough
+        // structural information to mask only one child. If it contains any
+        // secret, hash the whole provider value instead of leaking plaintext.
+        _ if contains_secret(desired) => {
+            mask_mismatched_observation_shape(desired, provider, previous)
+        }
         _ => Ok(provider.to_owned_json()),
     }
 }
@@ -2121,6 +2164,10 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
         ) => true,
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            secret_value_requires_provider_material(value)
+                || secret_value_requires_provider_material(default)
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             secret_value_requires_provider_material(inner)
         }
@@ -2218,6 +2265,12 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
                 expression: format_value(value),
                 context: SerializationContext::SecretRedaction,
             }),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(redact_secrets_only(value)?),
+                default: Box::new(redact_secrets_only(default)?),
+            }))
+        }
         // `Unknown` and every other deferred / concrete shape pass through.
         other => Ok(other.clone()),
     }
@@ -2325,6 +2378,13 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             tagged("binding_ref", JsonValue::String(binding.clone()))
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => tagged(
+            "coalesce",
+            JsonValue::Array(vec![
+                canonical_secret_template(value)?,
+                canonical_secret_template(default)?,
+            ]),
+        ),
         Value::Deferred(DeferredValue::Interpolation(parts)) => tagged(
             "interpolation",
             JsonValue::Array(
@@ -2415,6 +2475,9 @@ pub fn contains_redacted_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_redacted_secret(access.base())
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_redacted_secret(value) || contains_redacted_secret(default)
+        }
         _ => false,
     }
 }
@@ -2433,12 +2496,12 @@ fn deferred_template_contains_redacted_secret(
         resource_type: _resource_type,
         attributes,
         binding_name: _binding_name,
-        iterable_binding: _iterable_binding,
-        iterable_attr: _iterable_attr,
+        iterable,
         binding: _binding,
         template_resource,
     } = template;
-    attributes_contain_redacted_secret(attributes.iter().map(|(_, value)| value))
+    contains_redacted_secret(iterable)
+        || attributes_contain_redacted_secret(attributes.iter().map(|(_, value)| value))
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
@@ -2492,16 +2555,13 @@ pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) ->
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
         } => contains_redacted_secret(until.value()),
-        Effect::DeferredCreate {
-            id: _id,
-            upstream_binding: _upstream_binding,
-            template,
-        } => deferred_template_contains_redacted_secret(template),
+        Effect::DeferredCreate { id: _id, template } => {
+            deferred_template_contains_redacted_secret(template)
+        }
         Effect::DeferredReplace(payload) => {
             let crate::effect::DeferredReplacePayload {
                 deletes: _deletes,
                 id: _id,
-                upstream_binding: _upstream_binding,
                 template,
             } = payload.as_ref();
             deferred_template_contains_redacted_secret(template)
@@ -2754,13 +2814,80 @@ fn redact_plaintext_using_persisted_state(
 /// preserves the plaintext for execution while ensuring formatters render
 /// every path marked secret by the desired value as `(secret)`.
 pub fn mask_plaintext_using_secret_shape(plaintext: &Value, shape: &Value) -> Value {
-    if matches!(
-        shape,
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
-    ) {
-        return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone())));
+    project_secret_shape(plaintext, shape, SecretShapeProjectionMode::Display)
+}
+
+fn rebuild_projected_string_list(values: Vec<Value>) -> Value {
+    let strings = values
+        .iter()
+        .map(|value| match value {
+            Value::Concrete(ConcreteValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    strings.map_or_else(
+        || Value::Concrete(ConcreteValue::List(values)),
+        |strings| Value::Concrete(ConcreteValue::StringList(strings)),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SecretShapeProjectionMode {
+    Display,
+    FailClosed,
+    ResolvedUnion,
+}
+
+impl SecretShapeProjectionMode {
+    fn preserves_secret_value(self) -> bool {
+        matches!(self, Self::FailClosed | Self::ResolvedUnion)
     }
-    match (plaintext, shape) {
+
+    fn deferred_shape(self, value: &Value, shape: &Value) -> Value {
+        if matches!(
+            shape,
+            Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+        ) {
+            return Value::Deferred(DeferredValue::Secret(Box::new(value.clone())));
+        }
+
+        match self {
+            Self::Display => value.clone(),
+            Self::FailClosed => mark_secret(value),
+            Self::ResolvedUnion if matches!(value, Value::Concrete(_)) => value.clone(),
+            Self::ResolvedUnion => mark_secret(value),
+        }
+    }
+
+    fn unprojectable(self, value: &Value) -> Value {
+        match self {
+            Self::Display => value.clone(),
+            Self::FailClosed | Self::ResolvedUnion => mark_secret(value),
+        }
+    }
+}
+
+fn mark_secret(value: &Value) -> Value {
+    Value::Deferred(DeferredValue::Secret(Box::new(value.clone())))
+}
+
+fn project_secret_shape(value: &Value, shape: &Value, mode: SecretShapeProjectionMode) -> Value {
+    if mode.preserves_secret_value()
+        && matches!(
+            value,
+            Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. })
+        )
+    {
+        return value.clone();
+    }
+    if !contains_secret(shape) {
+        return value.clone();
+    }
+    if matches!(shape, Value::Deferred(_)) {
+        return mode.deferred_shape(value, shape);
+    }
+
+    match (value, shape) {
         (
             Value::Concrete(ConcreteValue::Map(values)),
             Value::Concrete(ConcreteValue::Map(shapes)),
@@ -2768,11 +2895,11 @@ pub fn mask_plaintext_using_secret_shape(plaintext: &Value, shape: &Value) -> Va
             values
                 .iter()
                 .map(|(key, value)| {
-                    let masked = shapes.get(key).map_or_else(
+                    let projected = shapes.get(key).map_or_else(
                         || value.clone(),
-                        |shape| mask_plaintext_using_secret_shape(value, shape),
+                        |shape| project_secret_shape(value, shape, mode),
                     );
-                    (key.clone(), masked)
+                    (key.clone(), projected)
                 })
                 .collect(),
         )),
@@ -2786,13 +2913,46 @@ pub fn mask_plaintext_using_secret_shape(plaintext: &Value, shape: &Value) -> Va
                 .map(|(index, value)| {
                     shapes.get(index).map_or_else(
                         || value.clone(),
-                        |shape| mask_plaintext_using_secret_shape(value, shape),
+                        |shape| project_secret_shape(value, shape, mode),
                     )
                 })
                 .collect(),
         )),
-        _ => plaintext.clone(),
+        (
+            Value::Concrete(ConcreteValue::StringList(values)),
+            Value::Concrete(ConcreteValue::List(shapes)),
+        ) => rebuild_projected_string_list(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let value = Value::Concrete(ConcreteValue::String(value.clone()));
+                    shapes.get(index).map_or(value.clone(), |shape| {
+                        project_secret_shape(&value, shape, mode)
+                    })
+                })
+                .collect(),
+        ),
+        _ => mode.unprojectable(value),
     }
+}
+
+/// Apply a secret shape to provider plaintext, marking only the exact value
+/// whose secret-bearing shape cannot be projected structurally. Containers
+/// and their other children retain their independently projected shapes.
+pub fn mask_plaintext_using_secret_shape_fail_closed(plaintext: &Value, shape: &Value) -> Value {
+    project_secret_shape(plaintext, shape, SecretShapeProjectionMode::FailClosed)
+}
+
+/// Combine the secret shape selected during apply with secret markers from
+/// the authored value used to build the plan.
+///
+/// The apply-time value is authoritative when a deferred authored expression
+/// has resolved to a concrete branch. Structural authored values are merged
+/// recursively so an unprojectable child fails closed at that child without
+/// tainting its container or siblings.
+pub fn union_secret_shapes_after_resolution(applied: &Value, authored: &Value) -> Value {
+    project_secret_shape(applied, authored, SecretShapeProjectionMode::ResolvedUnion)
 }
 
 /// Apply persisted secret sensitivity to provider plaintext.
@@ -3022,6 +3182,29 @@ fn rehydrate_redacted_secrets_impl(
                 .rebuild_with_base(base, crate::resource::AccessMissPolicy::Error)
                 .map_err(|_| SecretRehydrationError::ShapeMismatch)
         }
+        Value::Deferred(DeferredValue::Coalesce {
+            value: saved_value,
+            default: saved_default,
+        }) => {
+            let Value::Deferred(DeferredValue::Coalesce {
+                value: candidate_value,
+                default: candidate_default,
+            }) = candidate
+            else {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            };
+            let value =
+                rehydrate_redacted_secrets_impl(saved_value, candidate_value, candidate_is_secret)?;
+            let default = rehydrate_redacted_secrets_impl(
+                saved_default,
+                candidate_default,
+                candidate_is_secret,
+            )?;
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(value),
+                default: Box::new(default),
+            }))
+        }
         _ => Err(SecretRehydrationError::ShapeMismatch),
     }
 }
@@ -3043,6 +3226,10 @@ fn secret_candidate_evaluation_is_unavailable(value: &Value) -> bool {
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             secret_candidate_evaluation_is_unavailable(inner)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            secret_candidate_evaluation_is_unavailable(value)
+                || secret_candidate_evaluation_is_unavailable(default)
         }
         Value::Concrete(ConcreteValue::Map(values)) => values
             .values()
@@ -3190,6 +3377,12 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
                 expression: format_value(value),
                 context: SerializationContext::SecretRedaction,
             }),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(redact_secrets_only(value)?),
+                default: Box::new(redact_secrets_only(default)?),
+            }))
+        }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
                 reason: reason.clone(),
@@ -3593,6 +3786,7 @@ fn redact_deferred_template(
     template: &crate::parser::DeferredForExpression,
 ) -> Result<crate::parser::DeferredForExpression, SerializationError> {
     let mut redacted = template.clone();
+    redacted.iterable = redact_secrets_only(&template.iterable)?;
     redacted.template_resource.attributes = template
         .template_resource
         .attributes
@@ -3677,20 +3871,14 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
-        Effect::DeferredCreate {
-            id,
-            upstream_binding,
-            template,
-        } => Effect::DeferredCreate {
+        Effect::DeferredCreate { id, template } => Effect::DeferredCreate {
             id: id.clone(),
-            upstream_binding: upstream_binding.clone(),
             template: Box::new(redact_deferred_template(template)?),
         },
         Effect::DeferredReplace(payload) => {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                 deletes: payload.deletes.clone(),
                 id: payload.id.clone(),
-                upstream_binding: payload.upstream_binding.clone(),
                 template: Box::new(redact_deferred_template(&payload.template)?),
             }))
         }
@@ -3896,29 +4084,18 @@ pub fn rehydrate_plan_desired_secrets(
                     .expect("guarded by contains_redacted_secret"),
                 })
             }
-            Effect::DeferredCreate {
-                id,
-                upstream_binding,
-                template,
-            } => {
-                let template =
-                    rehydrate_deferred_template(template, upstream_binding, deferred_templates)?;
+            Effect::DeferredCreate { id, template } => {
+                let template = rehydrate_deferred_template(template, deferred_templates)?;
                 Ok(Effect::DeferredCreate {
                     id: id.clone(),
-                    upstream_binding: upstream_binding.clone(),
                     template: Box::new(template),
                 })
             }
             Effect::DeferredReplace(payload) => {
-                let template = rehydrate_deferred_template(
-                    &payload.template,
-                    &payload.upstream_binding,
-                    deferred_templates,
-                )?;
+                let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
                 Ok(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes: payload.deletes.clone(),
                     id: payload.id.clone(),
-                    upstream_binding: payload.upstream_binding.clone(),
                     template: Box::new(template),
                 })))
             }
@@ -3931,7 +4108,6 @@ pub fn rehydrate_plan_desired_secrets(
 
 fn rehydrate_deferred_template(
     saved: &crate::parser::DeferredForExpression,
-    upstream_binding: &str,
     candidates: &[crate::parser::DeferredForExpression],
 ) -> Result<crate::parser::DeferredForExpression, SecretRehydrationSiteError> {
     let has_placeholder = deferred_template_contains_redacted_secret(saved);
@@ -3946,9 +4122,7 @@ fn rehydrate_deferred_template(
         .find(|candidate| {
             candidate.binding_name == saved.binding_name
                 && candidate.resource_type == saved.resource_type
-                && candidate.iterable_binding == saved.iterable_binding
-                && candidate.iterable_binding == upstream_binding
-                && candidate.iterable_attr == saved.iterable_attr
+                && candidate.root_bindings() == saved.root_bindings()
         })
         .ok_or_else(|| {
             SecretRehydrationSiteError::new(
@@ -3956,6 +4130,15 @@ fn rehydrate_deferred_template(
                 SecretRehydrationError::ShapeMismatch,
             )
         })?;
+
+    if let Some(value) = rehydrate_secret_entry(
+        &saved.iterable,
+        Some(&candidate.iterable),
+        format!("deferred iterable {}", saved.binding_name),
+        SecretRehydrationCandidate::Evaluated,
+    )? {
+        out.iterable = value;
+    }
 
     for (key, saved_value) in &mut out.template_resource.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -4854,6 +5037,21 @@ fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
                 .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
                 .map_err(|error| error_policy.mask_secret(error))
         }
+        (
+            Value::Deferred(DeferredValue::Coalesce { value, default }),
+            crate::schema::FitKind::Coalesce {
+                value: value_fit,
+                default: default_fit,
+            },
+        ) => {
+            let value = canonicalize_with_fit(*value, *value_fit, defs, purpose, error_policy)?;
+            let default =
+                canonicalize_with_fit(*default, *default_fit, defs, purpose, error_policy)?;
+            Ok(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(value),
+                default: Box::new(default),
+            }))
+        }
         (value, crate::schema::FitKind::Union { member, fit }) => {
             // The witness retains the declaration member as well as its
             // resolved child fit. Canonicalization needs only the child, but
@@ -4999,6 +5197,7 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
@@ -5416,6 +5615,10 @@ fn first_enum_identifier_inner(
         Value::Deferred(DeferredValue::Secret(inner)) => first_enum_identifier_inner(inner, true),
         Value::Deferred(DeferredValue::Access(access)) => {
             first_enum_identifier_inner(access.base(), inside_secret)
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            first_enum_identifier_inner(value, inside_secret)
+                .or_else(|| first_enum_identifier_inner(default, inside_secret))
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -6356,6 +6559,44 @@ mod tests {
             ),
             "expected UnresolvedResourceRef/vpc.id/ValueToJson, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_value_to_json_coalesce_returns_err() {
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
+        });
+        let error = value_to_json(&value).unwrap_err();
+        assert!(matches!(
+            error,
+            SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::ValueToJson,
+            }
+        ));
+    }
+
+    #[test]
+    fn format_value_renders_residual_coalesce() {
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
+        });
+        assert_eq!(format_value(&value), "up.optional ?? []");
+    }
+
+    #[test]
+    fn format_value_parenthesizes_a_coalesce_used_as_the_left_operand() {
+        let inner = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("r", "comment", vec![])),
+            default: Box::new(Value::resource_ref("r", "parent", vec![])),
+        });
+        let value = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(inner),
+            default: Box::new(Value::Concrete(ConcreteValue::String("d".into()))),
+        });
+
+        assert_eq!(format_value(&value), "(r.comment ?? r.parent) ?? 'd'");
     }
 
     #[test]
@@ -8706,6 +8947,32 @@ mod tests {
     }
 
     #[test]
+    fn non_structural_expression_containing_secret_masks_whole_observed_value() {
+        let desired = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("resource", "comment", Vec::new())),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback-secret".into())),
+            )))),
+        });
+        let plaintext = "provider-returned-secret";
+        let provider = PersistedValue::encode_provider_value(
+            &Value::Concrete(ConcreteValue::String(plaintext.into())),
+            None,
+        )
+        .expect("provider plaintext is persistable");
+
+        for masked in [
+            merge_secrets_into_provider_json(&desired, &provider, None)
+                .expect("provider writeback masks the whole deferred expression"),
+            merge_secrets_into_observation_json(&desired, &provider, None)
+                .expect("observation writeback masks the whole deferred expression"),
+        ] {
+            assert!(masked.as_json().get(PERSISTED_SECRET_KEY).is_some());
+            assert!(!masked.as_json().to_string().contains(plaintext));
+        }
+    }
+
+    #[test]
     fn provider_side_secret_hash_reuses_desired_hash_for_persisted_enum_and_dollar_map() {
         let values = [
             Value::Concrete(ConcreteValue::CanonicalEnum(
@@ -9291,6 +9558,268 @@ mod tests {
         });
         assert!(contains_secret(&persisted));
         assert!(!contains_unredacted_secret(&persisted));
+    }
+
+    #[test]
+    fn secret_walkers_visit_both_coalesce_operands() {
+        let secret = || {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("sensitive".into()),
+            ))))
+        };
+
+        for coalesce in [
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(secret()),
+                default: Box::new(Value::Concrete(ConcreteValue::String("plain".into()))),
+            }),
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::Concrete(ConcreteValue::String("plain".into()))),
+                default: Box::new(secret()),
+            }),
+        ] {
+            assert!(contains_secret(&coalesce));
+            assert!(contains_unredacted_secret(&coalesce));
+            let redacted = redact_secrets_in_value(&coalesce).expect("redact coalesce secret");
+            assert!(contains_redacted_secret(&redacted));
+            assert!(
+                !serde_json::to_string(&redacted)
+                    .expect("serialize redacted coalesce")
+                    .contains("sensitive")
+            );
+        }
+    }
+
+    #[test]
+    fn fail_closed_mask_promotes_plaintext_for_non_structural_secret_shape() {
+        let plaintext = Value::Concrete(ConcreteValue::String("selected-secret".into()));
+        let shape = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("producer", "comment", vec![])),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback".into())),
+            )))),
+        });
+
+        assert_eq!(
+            mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
+            Value::Deferred(DeferredValue::Secret(Box::new(plaintext))),
+            "an unresolved non-structural shape containing a secret must never leave provider plaintext unwrapped",
+        );
+    }
+
+    #[test]
+    fn display_mask_projects_secrets_into_a_string_list() {
+        let plaintext = Value::Concrete(ConcreteValue::StringList(vec![
+            "public".into(),
+            "sensitive".into(),
+        ]));
+        let shape = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("public".into())),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("sensitive".into()),
+            )))),
+        ]));
+
+        assert_eq!(
+            mask_plaintext_using_secret_shape(&plaintext, &shape),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("public".into())),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("sensitive".into()),
+                )))),
+            ])),
+        );
+    }
+
+    #[test]
+    fn fail_closed_mask_isolates_an_unprojectable_nested_secret_shape() {
+        let public = Value::Concrete(ConcreteValue::String("public".into()));
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let plaintext = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), public.clone()),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let shape = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "selected".to_string(),
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                        Value::Concrete(ConcreteValue::String("fallback".into())),
+                    )))),
+                }),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+
+        let masked = mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape);
+        let Value::Concrete(ConcreteValue::Map(values)) = masked else {
+            panic!("fail-closed masking must preserve the map container");
+        };
+        assert_eq!(
+            values["selected"],
+            Value::Deferred(DeferredValue::Secret(Box::new(public))),
+        );
+        assert_eq!(values["sibling"], plain);
+    }
+
+    #[test]
+    fn fail_closed_mask_does_not_taint_siblings_of_an_absent_secret_position() {
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let plaintext = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "sibling".to_string(),
+            plain.clone(),
+        )])));
+        let shape = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "absent".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("not-returned".into()),
+            )))),
+        )])));
+
+        assert_eq!(
+            mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
+            plaintext,
+        );
+    }
+
+    #[test]
+    fn resolved_public_branch_overrides_unselected_authored_secret_fallback() {
+        let applied = Value::Concrete(ConcreteValue::String("selected-public".into()));
+        let authored = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback".into())),
+            )))),
+        });
+
+        assert_eq!(
+            union_secret_shapes_after_resolution(&applied, &authored),
+            applied,
+            "the apply-time branch selection is authoritative for a deferred authored node",
+        );
+    }
+
+    #[test]
+    fn authored_secret_union_projects_nested_values_without_tainting_siblings() {
+        let public = Value::Concrete(ConcreteValue::String("selected-public".into()));
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let authored_coalesce = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("fallback".into())),
+            )))),
+        });
+        let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), public.clone()),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let authored = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), authored_coalesce),
+            ("sibling".to_string(), plain),
+        ])));
+
+        assert_eq!(
+            union_secret_shapes_after_resolution(&applied, &authored),
+            applied,
+        );
+    }
+
+    #[test]
+    fn authored_secret_union_projects_canonical_string_list_elements() {
+        let applied = Value::Concrete(ConcreteValue::StringList(vec![
+            "selected-public".into(),
+            "plain".into(),
+        ]));
+        let authored = Value::Concrete(ConcreteValue::List(vec![
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                    Value::Concrete(ConcreteValue::String("fallback".into())),
+                )))),
+            }),
+            Value::Concrete(ConcreteValue::String("plain".into())),
+        ]));
+
+        assert_eq!(
+            union_secret_shapes_after_resolution(&applied, &authored),
+            applied,
+        );
+    }
+
+    #[test]
+    fn authored_secret_union_retains_selected_and_explicit_secret_children() {
+        let selected_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("selected-secret".into()),
+        ))));
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let authored = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "selected".to_string(),
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(Value::resource_ref("producer", "missing", vec![])),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                        Value::Concrete(ConcreteValue::String("fallback".into())),
+                    )))),
+                }),
+            ),
+            (
+                "explicit".to_string(),
+                Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()))),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("selected".to_string(), selected_secret.clone()),
+            (
+                "explicit".to_string(),
+                Value::Concrete(ConcreteValue::String("explicit-secret".into())),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+
+        let merged = union_secret_shapes_after_resolution(&applied, &authored);
+        let Value::Concrete(ConcreteValue::Map(values)) = merged else {
+            panic!("merged value must remain a map");
+        };
+        assert_eq!(values["selected"], selected_secret);
+        assert!(matches!(
+            values["explicit"],
+            Value::Deferred(DeferredValue::Secret(_))
+        ));
+        assert_eq!(values["sibling"], plain);
+    }
+
+    #[test]
+    fn unprojectable_authored_secret_fails_closed_at_the_child_only() {
+        let unresolved = Value::resource_ref("runtime", "value", vec![]);
+        let plain = Value::Concrete(ConcreteValue::String("plain".into()));
+        let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("unresolved".to_string(), unresolved.clone()),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+        let authored = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "unresolved".to_string(),
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
+                        Value::Concrete(ConcreteValue::String("fallback".into())),
+                    )))),
+                }),
+            ),
+            ("sibling".to_string(), plain.clone()),
+        ])));
+
+        let merged = union_secret_shapes_after_resolution(&applied, &authored);
+        let Value::Concrete(ConcreteValue::Map(values)) = merged else {
+            panic!("merged value must remain a map");
+        };
+        assert_eq!(
+            values["unresolved"],
+            Value::Deferred(DeferredValue::Secret(Box::new(unresolved))),
+        );
+        assert_eq!(values["sibling"], plain);
     }
 
     #[test]
@@ -11854,7 +12383,6 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
@@ -11865,8 +12393,7 @@ mod tests {
                     ("comment".to_string(), secret),
                 ],
                 binding_name: "validation_records".to_string(),
-                iterable_binding: "cert".to_string(),
-                iterable_attr: "domain_validation_options".to_string(),
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -11949,7 +12476,6 @@ mod tests {
                 "__deferred_for",
                 "records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
@@ -11957,8 +12483,7 @@ mod tests {
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: vec![("comment".to_string(), secret("stale-projection"))],
                 binding_name: "records".to_string(),
-                iterable_binding: "cert".to_string(),
-                iterable_attr: "options".to_string(),
+                iterable: Value::resource_ref("cert", "options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -12017,8 +12542,7 @@ mod tests {
                 ("identifier".to_string(), display_only.clone()),
             ],
             binding_name: "children".to_string(),
-            iterable_binding: "parent".to_string(),
-            iterable_attr: "children".to_string(),
+            iterable: Value::resource_ref("parent", "children", Vec::new()),
             binding: ForBinding::Simple("child".to_string()),
             template_resource,
         };
@@ -12027,7 +12551,6 @@ mod tests {
                 "__deferred_for",
                 "children",
             )),
-            upstream_binding: "parent".to_string(),
             template: Box::new(template.clone()),
         };
 
@@ -12050,7 +12573,6 @@ mod tests {
                 "__deferred_for",
                 "children",
             )),
-            upstream_binding: "parent".to_string(),
             template: redacted_template,
         });
         let rehydrated = rehydrate_plan_desired_secrets(

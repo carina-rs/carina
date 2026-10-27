@@ -20,7 +20,7 @@ use crate::non_empty::NonEmptyVec;
 use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
-use crate::resource::{DataSource, Resource};
+use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use crate::resource::{
     DeposedKey, Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
     ResourceIdentity, State,
@@ -269,8 +269,6 @@ pub struct DeferredReplacePayload {
     pub deletes: NonEmptyDeletes,
     /// Synthetic id used for plan-tree display and progress.
     pub id: ResolvedResourceId,
-    /// The iterable's binding name (e.g. "cert").
-    pub upstream_binding: String,
     /// The for-expression body, replayed against the upstream state.
     pub template: Box<DeferredForExpression>,
 }
@@ -448,9 +446,7 @@ impl ResolvedMove {
     }
 
     fn matches_address(resolved: &ResolvedResourceId, declared: &StateBlockAddress) -> bool {
-        resolved.provider() == declared.provider
-            && resolved.resource_type() == declared.resource_type
-            && resolved.identity() == &declared.name
+        declared.matches_resource_id(resolved.as_inner())
     }
 
     pub fn from(&self) -> &ResolvedResourceId {
@@ -618,8 +614,6 @@ pub enum Effect {
     DeferredCreate {
         /// Synthetic id used for plan-tree display and progress.
         id: ResolvedResourceId,
-        /// The iterable's binding name (e.g. "cert").
-        upstream_binding: String,
         /// The for-expression body, replayed against the upstream state.
         template: Box<DeferredForExpression>,
     },
@@ -837,7 +831,6 @@ impl Effect {
                         "route53.Record",
                         "validation_records"
                     )),
-                    upstream_binding: "cert".to_string(),
                     template: Box::new(crate::parser::DeferredForExpression {
                         file: Some("main.crn".to_string()),
                         line: 12,
@@ -845,8 +838,11 @@ impl Effect {
                         resource_type: "route53.Record".to_string(),
                         attributes: vec![],
                         binding_name: "validation_records".to_string(),
-                        iterable_binding: "cert".to_string(),
-                        iterable_attr: "domain_validation_options".to_string(),
+                        iterable: Value::resource_ref(
+                            "cert",
+                            "domain_validation_options",
+                            Vec::new(),
+                        ),
                         binding: crate::parser::ForBinding::Simple("opt".to_string()),
                         template_resource: Resource::new("route53.Record", "validation_records"),
                     }),
@@ -872,7 +868,6 @@ impl Effect {
                         "route53.Record",
                         "validation_records"
                     )),
-                    upstream_binding: "cert".to_string(),
                     template: Box::new(crate::parser::DeferredForExpression {
                         file: Some("main.crn".to_string()),
                         line: 12,
@@ -880,8 +875,11 @@ impl Effect {
                         resource_type: "route53.Record".to_string(),
                         attributes: vec![],
                         binding_name: "validation_records".to_string(),
-                        iterable_binding: "cert".to_string(),
-                        iterable_attr: "domain_validation_options".to_string(),
+                        iterable: Value::resource_ref(
+                            "cert",
+                            "domain_validation_options",
+                            Vec::new(),
+                        ),
                         binding: crate::parser::ForBinding::Simple("opt".to_string()),
                         template_resource: Resource::new("route53.Record", "validation_records"),
                     }),
@@ -1335,12 +1333,12 @@ impl Effect {
                 deps.extend(self.explicit_dependencies());
                 deps.into_iter().collect()
             }
-            Effect::DeferredCreate {
-                upstream_binding, ..
-            } => vec![upstream_binding.clone()],
+            Effect::DeferredCreate { template, .. } => {
+                template.root_bindings().into_iter().collect()
+            }
             Effect::DeferredReplace(payload) => {
                 let mut deps = deferred_replace_delete_dependencies(&payload.deletes);
-                deps.insert(payload.upstream_binding.clone());
+                deps.extend(payload.template.root_bindings());
                 deps.into_iter().collect()
             }
         }
@@ -1529,8 +1527,7 @@ mod tests {
             resource_type: "route53.Record".to_string(),
             attributes: vec![],
             binding_name: "validation_records".to_string(),
-            iterable_binding: "cert".to_string(),
-            iterable_attr: "domain_validation_options".to_string(),
+            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             binding: crate::parser::ForBinding::Simple("opt".to_string()),
             template_resource: Resource::new("route53.Record", "validation_records"),
         }
@@ -1542,7 +1539,6 @@ mod tests {
                 "route53.Record",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(deferred_for_template()),
         }
     }
@@ -1569,7 +1565,6 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(template),
         }))
     }
@@ -1758,6 +1753,27 @@ mod tests {
     }
 
     #[test]
+    fn deferred_create_blocking_bindings_include_both_coalesce_operands() {
+        let mut template = deferred_for_template();
+        template.iterable = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("primary", "items", Vec::new())),
+            default: Box::new(Value::resource_ref("fallback", "items", Vec::new())),
+        });
+        let effect = Effect::DeferredCreate {
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.Record",
+                "validation_records",
+            )),
+            template: Box::new(template),
+        };
+
+        assert_eq!(
+            effect.blocking_bindings(),
+            vec!["fallback".to_string(), "primary".to_string()],
+        );
+    }
+
+    #[test]
     fn deferred_replace_blocking_bindings_includes_upstream_and_delete_deps() {
         let mut template = deferred_for_template();
         template.file = None;
@@ -1780,7 +1796,6 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(template),
         }));
 
@@ -1813,7 +1828,6 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
-            upstream_binding: "cert".to_string(),
             template: Box::new(template),
         }));
 
@@ -1850,8 +1864,10 @@ mod tests {
                 assert_eq!(template.header, "for opt in cert.domain_validation_options");
                 assert_eq!(template.resource_type, "route53.Record");
                 assert_eq!(template.binding_name, "validation_records");
-                assert_eq!(template.iterable_binding, "cert");
-                assert_eq!(template.iterable_attr, "domain_validation_options");
+                assert_eq!(
+                    template.reference_candidates(),
+                    BTreeSet::from(["cert.domain_validation_options".to_string()])
+                );
             }
             other => panic!("expected DeferredCreate, got {other:?}"),
         }

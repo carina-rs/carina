@@ -2456,6 +2456,19 @@ fn resource_ref_serde_roundtrip() {
 }
 
 #[test]
+fn coalesce_serde_roundtrip_preserves_both_operands() {
+    let value = Value::Deferred(DeferredValue::Coalesce {
+        value: Box::new(Value::resource_ref("up", "accounts", vec![])),
+        default: Box::new(Value::Concrete(ConcreteValue::List(vec![
+            Value::resource_ref("fallback", "accounts", vec![]),
+        ]))),
+    });
+    let json = serde_json::to_string(&value).unwrap();
+    let deserialized: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value, deserialized);
+}
+
+#[test]
 fn resource_ref_serde_with_field_path() {
     let value = Value::resource_ref("web", "network", vec!["vpc_id".to_string()]);
     let json = serde_json::to_string(&value).unwrap();
@@ -2508,6 +2521,10 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
             "id",
             vec![],
         )))),
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("f", "id", vec![])),
+            default: Box::new(Value::resource_ref("g", "id", vec![])),
+        }),
         Value::Concrete(ConcreteValue::String("plain".into())),
     ]));
 
@@ -2516,7 +2533,34 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
         collected.push(path.binding().to_string());
     });
     collected.sort();
-    assert_eq!(collected, vec!["a", "b", "c", "d", "e"]);
+    assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f", "g"]);
+}
+
+#[test]
+fn resource_ref_usage_marks_only_the_coalesce_value_optional() {
+    let value = Value::Deferred(DeferredValue::Coalesce {
+        value: Box::new(Value::resource_ref("optional", "id", vec![])),
+        default: Box::new(Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("nested_optional", "id", vec![])),
+            default: Box::new(Value::resource_ref("required", "id", vec![])),
+        })),
+    });
+    let mut collected = Vec::new();
+    value.visit_resource_refs_with_usage(&mut |path, usage| {
+        collected.push((path.binding().to_string(), usage));
+    });
+
+    assert_eq!(
+        collected,
+        vec![
+            ("optional".to_string(), ResourceRefUsage::CoalesceValue),
+            (
+                "nested_optional".to_string(),
+                ResourceRefUsage::CoalesceValue,
+            ),
+            ("required".to_string(), ResourceRefUsage::Required),
+        ],
+    );
 }
 
 #[test]
@@ -2552,6 +2596,14 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
                 binding: "e".to_string(),
             },
         )))),
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::Deferred(DeferredValue::BindingRef {
+                binding: "f".to_string(),
+            })),
+            default: Box::new(Value::Deferred(DeferredValue::BindingRef {
+                binding: "g".to_string(),
+            })),
+        }),
     ]));
 
     let mut collected = Vec::new();
@@ -2560,7 +2612,7 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
     });
     collected.sort();
 
-    assert_eq!(collected, vec!["a", "b", "c", "d", "e"]);
+    assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f", "g"]);
 }
 
 #[test]

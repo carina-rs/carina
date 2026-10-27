@@ -100,8 +100,7 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: crate::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     }
@@ -222,7 +221,6 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                     "__deferred_for",
                     "validation_records",
                 )),
-                upstream_binding: "cert".to_string(),
                 template: Box::new(validation_deferred_for_expression()),
             })),
         ],
@@ -2876,7 +2874,6 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
     let schemas = deferred_child_constraint_schemas();
@@ -8749,7 +8746,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
 }
 
 #[tokio::test]
-async fn deferred_create_returns_error_when_upstream_binding_missing() {
+async fn deferred_create_reports_iterable_reference_when_binding_missing() {
     let provider = MockProvider::new();
     let mut plan = Plan::new();
     plan.add(Effect::DeferredCreate {
@@ -8757,7 +8754,6 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "missing_cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
 
@@ -8782,9 +8778,14 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 1);
-    assert!(observer.events().iter().any(|event| {
-        event.contains("failed:__deferred_for.validation_records") && event.contains("missing_cert")
-    }));
+    assert!(
+        observer.events().iter().any(|event| {
+            event.contains("failed:__deferred_for.validation_records")
+                && event.contains("cert.domain_validation_options")
+        }),
+        "events: {:?}",
+        observer.events(),
+    );
 }
 
 #[tokio::test]
@@ -8805,7 +8806,6 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
 
@@ -8860,7 +8860,6 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
 
@@ -8962,7 +8961,6 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     })));
 
@@ -9060,7 +9058,6 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     })));
 
@@ -9321,7 +9318,6 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             "__deferred_for",
             "validation_records",
         )),
-        upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     })));
 

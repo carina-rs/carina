@@ -21,9 +21,10 @@ Effects are values you can inspect before anything is executed. Running `carina 
 
 The workflow is always:
 
-1. **Validate** -- `carina validate` checks syntax and schema without cloud access
-2. **Plan** -- `carina plan` computes the diff between desired state (`.crn` files) and current state
-3. **Apply** -- `carina apply` executes the plan
+1. **Init** -- `carina init` installs the provider plugins the configuration declares
+2. **Validate** -- `carina validate` checks syntax and schema without cloud access
+3. **Plan** -- `carina plan` computes the diff between desired state (`.crn` files) and current state
+4. **Apply** -- `carina apply` executes the plan
 
 This separation ensures you always see what will change before it happens.
 
@@ -35,27 +36,33 @@ Providers are WASM components loaded at runtime. Each provider runs in a sandbox
 - **Environment variable restriction** -- only explicitly passed variables are visible
 - **Resource limits** -- memory and execution bounds
 
-Configure a provider in your `.crn` file:
+Configure a provider in your `.crn` file. `source` and `version` tell `carina init` which plugin to install; the remaining attributes are the provider's own configuration:
 
 ```crn
 provider awscc {
-  source  = 'github.com/carina-rs/carina-provider-awscc'
-  version = '0.5.0'
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
   region  = awscc.Region.ap_northeast_1
 }
 ```
 
-Multiple providers can be used in the same file:
+Multiple providers can be used in the same configuration:
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 
 provider aws {
-  region = aws.Region.ap_northeast_1
+  source  = 'carina-rs/aws'
+  version = '0.7.1'
+  region  = aws.Region.ap_northeast_1
 }
 ```
+
+A configuration is a directory, not a single file: Carina merges every `.crn` file in the directory, so provider blocks commonly live in their own `providers.crn` next to `main.crn`.
 
 ## State management
 
@@ -75,7 +82,9 @@ Carina uses `.crn` files with a purpose-built DSL. Key constructs:
 
 ```crn
 provider awscc {
-  region = awscc.Region.ap_northeast_1
+  source  = 'carina-rs/awscc'
+  version = '0.7.1'
+  region  = awscc.Region.ap_northeast_1
 }
 ```
 

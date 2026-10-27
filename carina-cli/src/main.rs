@@ -225,7 +225,10 @@ enum Commands {
         locked: bool,
         /// Migrate the state file from the backend recorded in
         /// carina-backend.lock to the currently configured backend when
-        /// they differ. Without this flag, a backend change is a hard error.
+        /// they differ. Without this flag, init only warns about a backend
+        /// change and leaves migration pending; apply, destroy, and state
+        /// refresh refuse to run until the state is migrated. Plan warns and
+        /// reads state from the old backend recorded in carina-backend.lock.
         #[arg(long)]
         migrate_state: bool,
         /// When migrating, overwrite a target backend that already
@@ -1237,6 +1240,26 @@ mod error_format_tests {
                 .unwrap_or_else(|| panic!("{id} argument exists"));
             assert!(arg.get_help().is_some(), "{id} should have help text");
         }
+    }
+
+    #[test]
+    fn init_migrate_state_help_describes_pending_migration() {
+        let mut command = Cli::command();
+        let init = command
+            .find_subcommand_mut("init")
+            .expect("init subcommand exists");
+        let help = init.render_long_help().to_string();
+
+        assert!(!help.contains("hard error"), "{help}");
+        assert!(help.contains("init only warns"), "{help}");
+        assert!(help.contains("migration pending"), "{help}");
+        assert!(help.contains("apply, destroy, and state refresh"), "{help}");
+        assert!(
+            help.contains(
+                "Plan warns and reads state from the old backend recorded in carina-backend.lock"
+            ),
+            "{help}"
+        );
     }
 
     #[test]

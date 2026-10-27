@@ -2991,6 +2991,32 @@ fn test_multi_provider_resources_do_not_collide() {
 }
 
 #[test]
+fn state_block_address_lookup_ignores_provider_instance() {
+    use carina_core::parser::StateBlockAddress;
+
+    let mut state = StateFile::new();
+    let mut resource = ResourceState::new("test.Resource", "target", "mock");
+    resource.directives.provider_instance = Some("secondary".to_string());
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
+
+    let address = StateBlockAddress::new("mock", "test.Resource", "target");
+    assert!(
+        state
+            .find_resource_by_state_block_address(&address)
+            .is_some()
+    );
+
+    let wrong_provider = StateBlockAddress::new("other", "test.Resource", "target");
+    assert!(
+        state
+            .find_resource_by_state_block_address(&wrong_provider)
+            .is_none()
+    );
+}
+
+#[test]
 fn test_build_directives_provider_scoped() {
     use carina_core::resource::ResourceId;
 
@@ -6630,6 +6656,39 @@ fn published_exports_build_remote_bindings_empty_when_no_exports() {
     let state = StateFile::new();
     let bindings = published_exports_from_state(&state).build_remote_bindings();
     assert!(bindings.is_empty());
+}
+
+#[test]
+fn published_null_export_is_absent_for_coalesce_resolution() {
+    let mut state = StateFile::new();
+    state.exports.insert(
+        "accounts".to_string(),
+        serde_json::from_value(serde_json::Value::Null)
+            .expect("JSON null is a valid absent persisted export"),
+    );
+
+    let remote = published_exports_from_state(&state).build_remote_bindings();
+    assert!(
+        !remote.contains_key("accounts"),
+        "JSON null must be omitted from a successfully loaded export map",
+    );
+
+    let mut bindings = carina_core::binding_index::ResolvedBindings::default();
+    bindings.set(
+        "up",
+        remote,
+        carina_core::binding_index::BindingValueSource::Upstream,
+    );
+    let default = Value::Concrete(ConcreteValue::List(Vec::new()));
+    let expression = Value::Deferred(DeferredValue::Coalesce {
+        value: Box::new(Value::resource_ref("up", "accounts", Vec::new())),
+        default: Box::new(default.clone()),
+    });
+
+    assert_eq!(
+        carina_core::resolver::resolve_ref_value_status(&expression, &bindings),
+        Ok(carina_core::resolver::ValueResolution::Present(default)),
+    );
 }
 
 #[test]

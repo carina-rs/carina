@@ -369,14 +369,25 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // carina#3248: build unified pre-apply bindings (managed +
     // composition + data sources) so composition-rooted refs in the fixture
     // resolve through the composition layer to the managed sibling.
-    let upstream_binding_names: std::collections::HashSet<&str> =
-        remote_bindings.keys().map(String::as_str).collect();
+    let upstream_binding_names = parsed.upstream_binding_names();
     let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         wiring.schemas(),
         &sorted_resources,
     );
-    let mut override_aware_resources = OverrideAwareResources::build_for_plan(
+    let managed_stability = crate::wiring::derive_managed_binding_stability(
+        &parsed,
+        &sorted_resources,
+        &managed_current,
+        &data_source_states,
+        wiring.schemas(),
+        &saved_attrs,
+        &prev_explicit,
+        &remote_bindings,
+        &wait_aliases,
+    )
+    .expect("fixture managed binding stability must resolve");
+    let mut override_aware_resources = OverrideAwareResources::build_for_plan_with_stability(
         sorted_resources.clone(),
         state_file.as_ref(),
         carina_core::binding_index::PreApplyInputs {
@@ -389,27 +400,30 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             wait_aliases: &wait_aliases,
         },
         &upstream_binding_names,
+        &managed_stability,
     )
     .expect("Failed to build override-aware resources");
     crate::legacy_name_overrides::emit_legacy_override_warnings(
         &override_aware_resources,
         state_file.as_ref(),
     );
-    let unresolved_override_aware_resources = OverrideAwareResources::build_for_plan(
-        unresolved_resources,
-        state_file.as_ref(),
-        carina_core::binding_index::PreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            data_sources: &data_sources,
-            managed_current: &pre_apply_input_current,
-            data_source_states: &data_source_states,
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &upstream_binding_names,
-    )
-    .expect("Failed to build unresolved override-aware resources");
+    let unresolved_override_aware_resources =
+        OverrideAwareResources::build_for_plan_with_stability(
+            unresolved_resources,
+            state_file.as_ref(),
+            carina_core::binding_index::PreApplyInputs {
+                managed: &[],
+                compositions: &parsed.compositions,
+                data_sources: &data_sources,
+                managed_current: &pre_apply_input_current,
+                data_source_states: &data_source_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+            &upstream_binding_names,
+            &managed_stability,
+        )
+        .expect("Failed to build unresolved override-aware resources");
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
@@ -550,7 +564,18 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         wiring.schemas(),
         override_aware_resources.resources(),
     );
-    override_aware_resources.rebuild_bindings_after_identity_reconciliation(
+    let stability_resources = carina_core::resource::ResolvedResource::collect_resolved(
+        override_aware_resources.resources().iter().cloned(),
+    )
+    .expect("fixture managed resources must have identities");
+    let managed_stability = carina_core::differ::managed_binding_stability(
+        &stability_resources,
+        &reconciled_input_current,
+        wiring.schemas(),
+        &saved_attrs,
+        &prev_explicit,
+    );
+    override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
             data_sources: &data_sources,
@@ -559,6 +584,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
+        &managed_stability,
     );
 
     let deferred_for_expansion = expand_same_config_deferred_for(
@@ -567,6 +593,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &managed_current,
         &data_source_states,
         wiring.schemas(),
+        &saved_attrs,
+        &prev_explicit,
         &remote_bindings,
         &wait_aliases,
         &HashSet::new(),
@@ -580,14 +608,25 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let deferred_create_targets: Vec<_> = deferred_for_expansion
         .deferred_create_targets
         .into_iter()
-        .filter(|target| managed_bindings.contains(&target.upstream_binding))
+        .filter(|target| {
+            target
+                .template
+                .root_bindings()
+                .iter()
+                .any(|binding| managed_bindings.contains(binding))
+        })
         .collect();
     let mut residual_deferred_for = deferred_for_expansion.residual_deferred_for;
     residual_deferred_for.extend(
         parsed
             .deferred_for_expressions
             .iter()
-            .filter(|deferred| !managed_bindings.contains(&deferred.iterable_binding))
+            .filter(|deferred| {
+                !deferred
+                    .root_bindings()
+                    .iter()
+                    .any(|binding| managed_bindings.contains(binding))
+            })
             .cloned(),
     );
     let image_compositions = parsed.compositions.clone();
@@ -616,6 +655,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("fixture providers must return valid satisfier hints");
     crate::wiring::add_deposed_delete_effects(&mut plan, &state_file, &moved_pairs);
+    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, wiring.schemas());
 
     // Keep this after both identifier-error producers. The
     // `removed_missing_identifier` fixture pins the fixture planner's copy of

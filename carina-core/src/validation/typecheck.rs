@@ -161,6 +161,10 @@ pub fn check_type_expr_value(
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            check_type_expr_value(expected, value, config, inference)?;
+            return check_type_expr_value(expected, default, config, inference);
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             return if accepts_interpolation(expected) {
                 Ok(())

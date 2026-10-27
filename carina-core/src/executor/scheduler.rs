@@ -21,25 +21,15 @@ pub(super) struct SchedulerDeps {
 
 pub(super) struct PureMetaStep<'a> {
     effect: &'a Effect,
-    upstream_binding: &'a str,
     template: &'a DeferredForExpression,
 }
 
 impl<'a> PureMetaStep<'a> {
     fn from_effect(effect: &'a Effect) -> Option<Self> {
         match effect {
-            Effect::DeferredCreate {
-                upstream_binding,
-                template,
-                ..
-            } => Some(Self {
-                effect,
-                upstream_binding,
-                template,
-            }),
+            Effect::DeferredCreate { template, .. } => Some(Self { effect, template }),
             Effect::DeferredReplace(payload) => Some(Self {
                 effect,
-                upstream_binding: &payload.upstream_binding,
                 template: payload.template.as_ref(),
             }),
             Effect::Create(_)
@@ -70,13 +60,7 @@ pub(super) fn try_dispatch_pure_meta(
         return PureMetaOutcome::NotPureMeta;
     };
 
-    match dispatch_deferred_create(
-        step.effect,
-        step.upstream_binding,
-        step.template,
-        bindings,
-        ctx,
-    ) {
+    match dispatch_deferred_create(step.effect, step.template, bindings, ctx) {
         DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
         DeferredDispatchResult::MaterializeFailed => PureMetaOutcome::Failed,
     }

@@ -829,6 +829,7 @@ impl EvalValue {
             Self::Value(Value::Deferred(DeferredValue::RedactedSecret { .. })) => "secret",
             Self::Value(Value::Deferred(DeferredValue::ResourceRef { .. })) => "resource reference",
             Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
+            Self::Value(Value::Deferred(DeferredValue::Coalesce { .. })) => "coalesce expression",
             Self::Value(Value::Deferred(DeferredValue::Interpolation(_))) => "interpolation",
             Self::Value(Value::Deferred(DeferredValue::FunctionCall { .. })) => "function call",
             Self::Value(Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })) => {

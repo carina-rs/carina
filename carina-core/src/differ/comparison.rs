@@ -567,6 +567,10 @@ fn contains_post_create_read_incomplete(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             contains_post_create_read_incomplete(inner)
         }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            contains_post_create_read_incomplete(value)
+                || contains_post_create_read_incomplete(default)
+        }
         _ => false,
     }
 }

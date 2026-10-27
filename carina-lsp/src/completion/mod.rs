@@ -1131,61 +1131,54 @@ struct UpstreamDepth2Match {
     source: String,
 }
 
-/// Returns `None` past a dot inside the interpolation (the
-/// depth-1/depth-2 dot detectors cover those), when no unescaped `${`
-/// opens to the left, or when the cursor isn't inside a double-quoted
-/// string on this line. Single-quoted strings are literal-only.
+/// Returns a bare identifier partial after interpolation-expression trivia.
+/// The partial may follow `${`, `(`, or `,`; spaces, tabs, and physical
+/// newlines between that delimiter and the partial are accepted. Returns
+/// `None` past a dot (the depth-1/depth-2 detectors cover those), outside an
+/// interpolation, or inside a nested string/comment.
 fn detect_interpolation_bare_partial(text: &str, position: Position) -> Option<String> {
     let line_idx = position.line as usize;
-    let current_line = text.lines().nth(line_idx)?;
-    // Cheap bail for the 99% common case: no `$` on this line, no
-    // interpolation possible. Avoids the prefix allocation below.
-    if !current_line.as_bytes().contains(&b'$') {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let current_line = *lines.get(line_idx)?;
+    if !lines[..=line_idx]
+        .iter()
+        .any(|line| line.as_bytes().contains(&b'$'))
+    {
         return None;
     }
 
     let col = position.character as usize;
-    let prefix: String = current_line.chars().take(col).collect();
+    let line_prefix: String = current_line.chars().take(col).collect();
 
-    let mut tail_start = prefix.len();
-    for (idx, ch) in prefix.char_indices().rev() {
+    let mut tail_start = line_prefix.len();
+    for (idx, ch) in line_prefix.char_indices().rev() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             tail_start = idx;
         } else {
             break;
         }
     }
-    let partial = &prefix[tail_start..];
-    let before_partial = &prefix[..tail_start];
+    let partial = &line_prefix[tail_start..];
 
-    let before_brace = before_partial.strip_suffix('{')?.strip_suffix('$')?;
-    if before_brace.ends_with('\\') {
+    let mut cursor_prefix = lines[..line_idx].join("\n");
+    if line_idx > 0 {
+        cursor_prefix.push('\n');
+    }
+    cursor_prefix.push_str(&line_prefix);
+    let lexed = crate::lex::lex(&cursor_prefix);
+    if !lexed.at_end_inside_interpolation_code() {
         return None;
     }
-
-    if !is_inside_double_quoted_string(before_brace) {
+    let boundary = lexed.last_significant_interpolation_code_token(partial.chars().count())?;
+    if !matches!(
+        boundary,
+        crate::lex::InterpolationCodeToken::Start
+            | crate::lex::InterpolationCodeToken::Character('(' | ',')
+    ) {
         return None;
     }
 
     Some(partial.to_string())
-}
-
-/// Returns true when an unmatched (odd-count) double quote opens a
-/// string literal somewhere in `prefix`. Backslash-escaped quotes
-/// (`\"`) don't open or close the literal and are skipped.
-fn is_inside_double_quoted_string(prefix: &str) -> bool {
-    let mut open = false;
-    let mut chars = prefix.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            chars.next();
-            continue;
-        }
-        if c == '"' {
-            open = !open;
-        }
-    }
-    open
 }
 
 /// Walk back from the end of `prefix` collecting the trailing run of
@@ -1387,7 +1380,7 @@ fn parse_source_partial_from(s: &str) -> Option<String> {
 mod helper_tests {
     use super::{
         detect_interpolation_bare_partial, extract_source_partial_anywhere,
-        extract_upstream_source_partial, is_inside_double_quoted_string, is_let_use_line,
+        extract_upstream_source_partial, is_let_use_line,
     };
     use tower_lsp::lsp_types::Position;
 
@@ -1397,15 +1390,6 @@ mod helper_tests {
             line: text.lines().count().saturating_sub(1) as u32,
             character: last.chars().count() as u32,
         }
-    }
-
-    #[test]
-    fn double_quote_parity_inside_outside() {
-        assert!(!is_inside_double_quoted_string(""));
-        assert!(is_inside_double_quoted_string("foo = \""));
-        assert!(!is_inside_double_quoted_string("foo = \"bar\""));
-        // Escaped quote is a literal — neither opens nor closes.
-        assert!(is_inside_double_quoted_string("foo = \"a\\\""));
     }
 
     #[test]
@@ -1423,6 +1407,91 @@ mod helper_tests {
         assert_eq!(
             detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
             Some("o")
+        );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_after_inline_whitespace() {
+        let text = "policy = \"arn:${ \t ab";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_after_newline() {
+        let text = "policy = \"arn:${\n  ab";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+            Some("ab")
+        );
+
+        for text in ["p = \"${\n", "p = \"${join('-',\n"] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, Position::new(1, 0)).as_deref(),
+                Some(""),
+                "completion must fire at column zero inside {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_interpolation_bare_partial_does_not_cross_physical_line() {
+        for text in ["v = <<EOT\n${\nab", "v = <<EOT\n${join(\nab"] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, pos_at_end(text)),
+                None,
+                "heredoc interpolation state must end at the physical newline in {text:?}"
+            );
+        }
+
+        let text = "v = <<EOT\n${join(\n";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, Position::new(2, 0)),
+            None,
+            "heredoc interpolation state must be closed before the empty next line"
+        );
+    }
+
+    #[test]
+    fn heredoc_interpolation_bare_partial_on_same_physical_line() {
+        for (text, expected) in [
+            ("v = <<EOT\n${ab", "ab"),
+            ("v = <<EOT\n${join(", ""),
+            ("v = <<EOT\n${join(a, b", "b"),
+        ] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+                Some(expected),
+                "completion must use the heredoc state before its line is finalized in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_bare_partial_after_argument_delimiter() {
+        for text in ["policy = \"${join( ab", "policy = \"${join('-', ab"] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+                Some("ab"),
+                "completion must fire after an expression delimiter in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_bare_partial_after_comment_trivia() {
+        let text = "p = \"${f( // note\n";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, Position::new(1, 0)).as_deref(),
+            Some("")
+        );
+
+        let text = "p = \"${f(/*c*/ ab";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+            Some("ab")
         );
     }
 
@@ -1466,6 +1535,17 @@ mod helper_tests {
             detect_interpolation_bare_partial(text, pos_at_end(text)),
             None
         );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_rejected_inside_line_comment() {
+        for text in ["policy = \"${x // (ab", "policy = \"${x # ,ab"] {
+            assert_eq!(
+                detect_interpolation_bare_partial(text, pos_at_end(text)),
+                None,
+                "completion must not inspect interpolation comment text in {text:?}"
+            );
+        }
     }
 
     #[test]

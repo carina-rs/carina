@@ -164,7 +164,14 @@ pub(crate) fn parse_string_value(
                     // — the LSP surfaces it as a diagnostic; downstream
                     // resolvers carry it as an unresolved value. See #2480.
                     let value = match inner.into_inner().next() {
-                        Some(expr_pair) => parse_expression(expr_pair, ctx)?,
+                        Some(expr_wrapper) => {
+                            let expr_pair = first_inner(
+                                expr_wrapper,
+                                "expression",
+                                "interpolation expression",
+                            )?;
+                            parse_expression(expr_pair, ctx)?
+                        }
                         None => Value::Deferred(DeferredValue::Unknown(
                             UnknownReason::EmptyInterpolation,
                         )),

@@ -2966,6 +2966,78 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
 }
 
 #[test]
+fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
+    use crate::config_loader::parse_directory;
+    use crate::parser::resolve_provider_attributes_with_remote;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        "fn provider_region() { 'ap-northeast-1' }",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("provider.crn"),
+        r#"provider mock {
+  source = "carina-rs/mock"
+  region = provider_region()
+}"#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let resolved = resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &ProviderContext::default(),
+    )
+    .expect("provider attributes should use the merged user-function scope");
+    assert_eq!(
+        resolved.as_provider_configs()[0].attributes.get("region"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".into()
+        ))),
+    );
+}
+
+#[test]
+fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
+    use crate::config_loader::parse_directory;
+    use crate::parser::{ProviderConfigResolutionError, resolve_provider_attributes_with_remote};
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        "fn bad_region() { upper(1) }",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("provider.crn"),
+        r#"provider mock {
+  source = "carina-rs/mock"
+  region = bad_region()
+}"#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let error = resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &ProviderContext::default(),
+    )
+    .expect_err("invalid sibling function should fail at the authored provider call");
+    let ProviderConfigResolutionError::Parse(ParseError::Located { path, error }) = error else {
+        panic!("expected an authored expression error, got {error:?}")
+    };
+    assert_eq!(path, tmp.path().join("helpers.crn"));
+    let ParseError::InvalidExpression { line, .. } = *error else {
+        panic!("expected an authored expression error, got {error:?}")
+    };
+    assert_eq!(line, 1, "function body line must not be replaced by 0");
+}
+
+#[test]
 fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them() {
     use crate::parser::resolve_provider_attributes_with_remote;
     use crate::resource::AccessPath;
@@ -3143,13 +3215,132 @@ fn parse_provider_block_with_source_and_version() {
     let provider = &parsed.providers[0];
     assert_eq!(provider.name, "mock");
     assert_eq!(
-        provider.source.as_deref(),
-        Some("github.com/carina-rs/carina-provider-mock")
+        provider.source.as_ref().map(ToString::to_string),
+        Some("github.com/carina-rs/carina-provider-mock".to_string())
     );
     assert_eq!(provider.version.as_ref().unwrap().raw, "0.1.0");
     // source and version should NOT be in attributes
     assert!(!provider.attributes.contains_key("source"));
     assert!(!provider.attributes.contains_key("version"));
+}
+
+fn parse_typed_provider_source(source: &str) -> crate::provider_source::ProviderSource {
+    let input = format!("provider test {{\n    source = '{source}'\n    version = '0.1.0'\n}}");
+    parse(&input, &ProviderContext::default())
+        .unwrap()
+        .providers[0]
+        .source
+        .clone()
+        .expect("provider source should be extracted")
+}
+
+#[test]
+fn parse_provider_block_classifies_supported_source_shapes() {
+    use crate::provider_source::ProviderSource;
+
+    for source in [
+        "carina-rs/awscc",
+        "registry.example.com/ns/name",
+        "github.com/o/r",
+        "file:///x.wasm",
+    ] {
+        assert_eq!(
+            parse_typed_provider_source(source),
+            source.parse::<ProviderSource>().unwrap()
+        );
+    }
+}
+
+#[test]
+fn parse_provider_block_rejects_invalid_source_shapes() {
+    for source in ["a/b/c/d", "/x"] {
+        let input = format!("provider test {{ source = '{source}' }}");
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("invalid provider source must fail at the parser boundary");
+        assert!(
+            error.to_string().contains("Invalid source format"),
+            "unexpected error for {source}: {error}"
+        );
+    }
+}
+
+#[test]
+fn invalid_provider_source_reports_attribute_line_and_provider() {
+    let input = "provider awscc {\n  region = 'ap-northeast-1'\n\n  source = 'a/b/c/d'\n}";
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("invalid provider source must report its authored line");
+
+    match error {
+        ParseError::InvalidExpression { line, message } => {
+            assert_eq!(line, 4);
+            assert!(
+                message.starts_with("Provider 'awscc': Invalid source format: a/b/c/d"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn provider_loading_attributes_reject_values_that_would_be_silently_dropped() {
+    let cases = [
+        (
+            "source",
+            "env(\"CARINA_TEST_PROVIDER_SOURCE_MUST_BE_LITERAL_3958\")",
+        ),
+        ("source", "\"carina-rs/${missing}\""),
+        ("source", "42"),
+        ("version", "\"0.${missing}\""),
+        ("version", "42"),
+        ("revision", "\"main-${missing}\""),
+        ("revision", "42"),
+    ];
+
+    for (attribute, value) in cases {
+        let input = format!("provider test {{\n  {attribute} = {value}\n}}");
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("provider loading attribute must be a plain string literal");
+
+        match error {
+            ParseError::InvalidExpression { line, message } => {
+                assert_eq!(line, 2, "unexpected line for {attribute} = {value}");
+                assert_eq!(
+                    message,
+                    format!("Provider 'test': '{attribute}' must be a string literal")
+                );
+            }
+            other => panic!("unexpected error for {attribute} = {value}: {other}"),
+        }
+    }
+}
+
+#[test]
+fn provider_source_serde_uses_validated_string_wire_form() {
+    use crate::provider_source::ProviderSource;
+
+    let sources = [
+        "file:///x.wasm",
+        "github.com/o/r",
+        "carina-rs/awscc",
+        "registry.example.com/ns/name",
+    ]
+    .map(|source| source.parse::<ProviderSource>().unwrap());
+
+    for source in sources {
+        let json = serde_json::to_string(&source).unwrap();
+        assert_eq!(json, format!("\"{source}\""));
+        assert_eq!(
+            serde_json::from_str::<ProviderSource>(&json).unwrap(),
+            source
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&"carina-rs/awscc".parse::<ProviderSource>().unwrap()).unwrap(),
+        "\"carina-rs/awscc\""
+    );
+    assert!(serde_json::from_str::<ProviderSource>("\"a/b/c/d\"").is_err());
 }
 
 #[test]
@@ -3207,8 +3398,8 @@ fn parse_provider_block_with_revision() {
     let provider = &parsed.providers[0];
     assert_eq!(provider.name, "mock");
     assert_eq!(
-        provider.source.as_deref(),
-        Some("github.com/carina-rs/carina-provider-mock")
+        provider.source.as_ref().map(ToString::to_string),
+        Some("github.com/carina-rs/carina-provider-mock".to_string())
     );
     assert_eq!(provider.revision.as_deref(), Some("feature-branch"));
     assert!(provider.version.is_none());
@@ -3519,6 +3710,202 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
         has_empty,
         "whitespace-only `${{}}` must stamp EmptyInterpolation; got {:?}",
         parts
+    );
+}
+
+#[test]
+fn parse_interpolation_expression_uses_ordinary_whitespace_rules() {
+    let spaced = parse(
+        r#"let value = "x-${join('-', ['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("whitespace between interpolation function arguments must parse");
+    let compact = parse(
+        r#"let value = "x-${join('-',['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+    let commented = parse(
+        r#"let value = "x-${join('-', /* elements */ ['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("comments between interpolation expression tokens must parse");
+
+    assert_eq!(
+        spaced.variables.get("value"),
+        compact.variables.get("value"),
+        "whitespace inside an interpolation expression must not change its value"
+    );
+    assert_eq!(
+        commented.variables.get("value"),
+        compact.variables.get("value"),
+        "comments inside an interpolation expression must not change its value"
+    );
+}
+
+#[test]
+fn parse_interpolation_expression_allows_spaced_operators_and_arguments() {
+    let spaced = parse(
+        r#"let value = "x-${ ['a', 'b'] |> join('-') }""#,
+        &ProviderContext::default(),
+    )
+    .expect("ordinary expression spacing inside interpolation must parse");
+    let compact = parse(
+        r#"let value = "x-${['a','b']|>join('-')}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact operator expression inside interpolation must parse");
+
+    assert_eq!(
+        spaced.variables.get("value"),
+        compact.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_interpolation_allows_normal_trivia_at_non_empty_edges() {
+    let compact = parse(
+        "let x = 'a'\nlet value = \"x-${x}\"",
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+
+    for (input, description) in [
+        (
+            "let x = 'a'\nlet value = \"x-${ x }\"",
+            "spaces around an interpolation expression",
+        ),
+        (
+            "let x = 'a'\nlet value = \"x-${\nx\n}\"",
+            "newlines around an interpolation expression",
+        ),
+        (
+            "let x = 'a'\nlet value = \"x-${x // trailing comment\n}\"",
+            "a line comment after an interpolation expression",
+        ),
+    ] {
+        let parsed = parse(input, &ProviderContext::default())
+            .unwrap_or_else(|error| panic!("{description} must parse: {error}"));
+        assert_eq!(
+            parsed.variables.get("value"),
+            compact.variables.get("value"),
+            "{description} must not change the interpolation value"
+        );
+    }
+}
+
+#[test]
+fn parse_interpolation_allows_newlines_inside_expression() {
+    let multiline = parse(
+        "let value = \"x-${join('-',\n    ['a'])}\"",
+        &ProviderContext::default(),
+    )
+    .expect("a newline between interpolation function arguments must parse");
+    let compact = parse(
+        r#"let value = "x-${join('-',['a'])}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+
+    assert_eq!(
+        multiline.variables.get("value"),
+        compact.variables.get("value")
+    );
+
+    let multiline_nested_brace = parse(
+        "let value = \"x-${{value = 'a'\n}.value}\"",
+        &ProviderContext::default(),
+    )
+    .expect("a newline before a nested expression brace must not look like edge trivia");
+    let compact_nested_brace = parse(
+        r#"let value = "x-${{value = 'a'}.value}""#,
+        &ProviderContext::default(),
+    )
+    .expect("compact nested-brace interpolation must parse");
+    assert_eq!(
+        multiline_nested_brace.variables.get("value"),
+        compact_nested_brace.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_interpolation_rejects_multiline_empty_body() {
+    for input in ["let value = \"x-${\n}\"", "let value = \"x-${ \n }\""] {
+        assert!(
+            parse(input, &ProviderContext::default()).is_err(),
+            "an empty interpolation that spans a newline must be rejected: {input:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_interpolation_rejects_comment_only_body() {
+    assert!(
+        parse("let value = \"${ /* c */ }\"", &ProviderContext::default()).is_err(),
+        "a comment without an expression must not satisfy interpolation_expr"
+    );
+}
+
+#[test]
+fn parse_interpolation_line_comment_consumes_closing_syntax_to_newline() {
+    let commented = parse(
+        "let x = 'a'\nlet value = \"${x # c }\"\n}\"",
+        &ProviderContext::default(),
+    )
+    .expect("the interpolation must close on the line after a line comment");
+    let compact = parse(
+        "let x = 'a'\nlet value = \"${x}\"",
+        &ProviderContext::default(),
+    )
+    .expect("compact interpolation must parse");
+
+    assert_eq!(
+        commented.variables.get("value"),
+        compact.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_heredoc_inside_multiline_interpolation() {
+    let heredoc = parse(
+        "let value = \"x-${join('-',\n  [<<EOT\nhello\nEOT\n  ])}\"",
+        &ProviderContext::default(),
+    )
+    .expect("a heredoc expression inside a multiline interpolation must parse");
+    let compact = parse(
+        "let value = \"x-${join('-', ['hello'])}\"",
+        &ProviderContext::default(),
+    )
+    .expect("compact equivalent must parse");
+
+    assert_eq!(
+        heredoc.variables.get("value"),
+        compact.variables.get("value")
+    );
+}
+
+#[test]
+fn parse_heredoc_interpolation_is_confined_to_one_physical_body_line() {
+    for body in ["${\n  name\n}", "${join(\"-\", [name])}", "${ name # c }"] {
+        let input = format!("let name = 'value'\nlet value = <<EOT\n{body}\nEOT\n");
+        assert!(
+            parse(&input, &ProviderContext::default()).is_err(),
+            "heredoc interpolation body must follow preprocessed string rules: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_heredoc_backslash_does_not_escape_interpolation() {
+    let parsed = parse(
+        "let name = 'value'\nlet value = <<EOT\n\\${name}\nEOT\n",
+        &ProviderContext::default(),
+    )
+    .expect("a backslash before `${name}` must not suppress heredoc interpolation");
+
+    assert_eq!(
+        parsed.variables.get("value"),
+        Some(&Value::Concrete(ConcreteValue::String("\\value".into())))
     );
 }
 
@@ -8557,7 +8944,7 @@ exports {
 }
 
 #[test]
-fn coalesce_operator_returns_default_for_unresolved_ref() {
+fn coalesce_operator_retains_unresolved_ref_and_default() {
     let input = r#"
 provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -8572,21 +8959,103 @@ awscc.ec2.Subnet {
 }
 "#;
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    // vpc.missing_attr is a ResourceRef (unresolved at parse time), so ?? returns default
     let subnet = parsed
         .resources
         .iter()
         .find(|r| r.id.resource_type == "ec2.Subnet")
         .unwrap();
     let cidr = subnet.get_attr("cidr_block");
-    // At parse time, vpc.missing_attr is still a ResourceRef (not resolved), so ?? kicks in
-    // Actually, resource refs remain as ResourceRef until resolution, so the left side IS a ResourceRef
+    let Some(Value::Deferred(DeferredValue::Coalesce { value, default })) = cidr else {
+        panic!("unresolved ?? must remain deferred, got {cidr:?}");
+    };
+    let Value::Deferred(DeferredValue::ResourceRef { path }) = value.as_ref() else {
+        panic!("coalesce must retain its reference operand, got {value:?}");
+    };
+    assert_eq!(path.binding(), "vpc");
+    assert_eq!(path.attribute(), "missing_attr");
     assert_eq!(
-        cidr,
-        Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.1.0/24".into()
-        ))),
-        "?? should return default when left is an unresolved ResourceRef"
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
+    );
+}
+
+#[test]
+fn coalesce_chain_is_parsed_right_associatively() {
+    let input = r#"
+let producer = mock.test.resource {
+  name = "seed"
+}
+
+mock.test.resource {
+  name = producer.comment ?? producer.parent ?? "default"
+}
+"#;
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let value = parsed.resources[1].get_attr("name").expect("consumer name");
+    let Value::Deferred(DeferredValue::Coalesce {
+        value: first,
+        default: tail,
+    }) = value
+    else {
+        panic!("expected outer coalesce, got {value:?}");
+    };
+    assert!(matches!(
+        first.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if path.binding() == "producer" && path.attribute() == "comment"
+    ));
+    let Value::Deferred(DeferredValue::Coalesce {
+        value: second,
+        default,
+    }) = tail.as_ref()
+    else {
+        panic!("expected right-associated tail, got {tail:?}");
+    };
+    assert!(matches!(
+        second.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if path.binding() == "producer" && path.attribute() == "parent"
+    ));
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("default".into())),
+    );
+}
+
+#[test]
+fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
+    let input = r#"
+        let orgs = upstream_state {
+            source = "../organizations"
+        }
+
+        for account_id in (orgs.accounts ?? []) {
+            awscc.sso.Assignment {
+                instance_arn = 'arn:aws:sso:::instance/ssoins-12345'
+                target_id = account_id
+                target_type = 'AWS_ACCOUNT'
+            }
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let [deferred] = parsed.deferred_for_expressions.as_slice() else {
+        panic!(
+            "coalesced unresolved iterable must produce one deferred for-expression: {:?}",
+            parsed.deferred_for_expressions
+        );
+    };
+    let Value::Deferred(DeferredValue::Coalesce { value, default }) = &deferred.iterable else {
+        panic!("deferred for must retain the full coalesce iterable");
+    };
+    assert!(matches!(
+        value.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if path.binding() == "orgs" && path.attribute() == "accounts"
+    ));
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::List(Vec::new())),
     );
 }
 
@@ -10225,6 +10694,69 @@ fn parse_directory_files_resolves_long_linear_chain_before_iteration_cap() {
     assert_directory_let_chain_resolves(8);
 }
 
+#[test]
+fn parse_directory_files_folds_coalesce_after_later_let_resolves() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("consumer.crn"),
+            "let selected = candidate ?? 'fallback'".to_string(),
+        ),
+        (
+            std::path::PathBuf::from("producer.crn"),
+            "let candidate = 'resolved'".to_string(),
+        ),
+    ];
+
+    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect("later sibling let should resolve through coalesce");
+    let consumer = parsed
+        .iter()
+        .find(|(path, _)| path == &std::path::PathBuf::from("consumer.crn"))
+        .expect("consumer file parsed");
+
+    assert_eq!(
+        consumer.1.parsed().variables.get("selected"),
+        Some(&Value::Concrete(ConcreteValue::String("resolved".into()))),
+    );
+}
+
+#[test]
+fn parse_directory_files_resolves_sibling_let_in_coalesce_default() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("consumer.crn"),
+            r#"
+                let up = upstream_state { source = "../up" }
+                let selected = up.optional ?? fallback
+            "#
+            .to_string(),
+        ),
+        (
+            std::path::PathBuf::from("producer.crn"),
+            "let fallback = 'resolved'".to_string(),
+        ),
+    ];
+
+    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect("sibling let in a coalesce default should resolve at the directory fixed point");
+    let consumer = parsed
+        .iter()
+        .find(|(path, _)| path == &std::path::PathBuf::from("consumer.crn"))
+        .expect("consumer file parsed");
+    let selected = consumer.1.parsed().variables.get("selected");
+    let Some(Value::Deferred(DeferredValue::Coalesce { value, default })) = selected else {
+        panic!("unresolved left should retain coalesce, got {selected:?}")
+    };
+    assert!(matches!(
+        value.as_ref(),
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+    ));
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("resolved".into())),
+    );
+}
+
 fn assert_directory_let_chain_resolves(hops: usize) {
     let files = sibling_let_chain_files(hops);
     let final_name = chain_binding_name(hops);
@@ -11001,6 +11533,60 @@ fn parse_directory_resolves_sibling_user_fn_with_static_args() {
 }
 
 #[test]
+fn parse_directory_folds_coalesce_after_sibling_function_resolves() {
+    use crate::config_loader::parse_directory;
+    let tmp = sibling_user_fn_fixture("timestamp() ?? 'fallback'");
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("sibling-file function in coalesce must parse");
+    let value = parsed
+        .resources
+        .iter()
+        .find_map(|resource| resource.attributes.get("created_at"))
+        .expect("created_at exists");
+
+    assert_eq!(
+        value,
+        &Value::Concrete(ConcreteValue::String("2026-05-05".into())),
+        "a concrete function result must win over the coalesce default",
+    );
+}
+
+#[test]
+fn parse_directory_resolves_sibling_function_in_coalesce_default() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        r#"
+            fn fallback() {
+                "resolved"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            let up = upstream_state { source = "../up" }
+            let selected = up.optional ?? fallback()
+        "#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("sibling function in a coalesce default should resolve");
+    let selected = parsed.variables.get("selected");
+    let Some(Value::Deferred(DeferredValue::Coalesce { default, .. })) = selected else {
+        panic!("unresolved left should retain coalesce, got {selected:?}")
+    };
+    assert_eq!(
+        default.as_ref(),
+        &Value::Concrete(ConcreteValue::String("resolved".into())),
+    );
+}
+
+#[test]
 fn parse_directory_truly_undefined_fn_with_static_args_still_errors() {
     use crate::config_loader::parse_directory;
     let tmp = sibling_user_fn_fixture("no_such_fn()");
@@ -11661,8 +12247,8 @@ fn parse_provider_expr_named_instance_in_let_binding() {
     assert_eq!(default.name, "aws");
     assert!(default.binding.is_none());
     assert_eq!(
-        default.source.as_deref(),
-        Some("github.com/carina-rs/carina-provider-aws")
+        default.source.as_ref().map(ToString::to_string),
+        Some("github.com/carina-rs/carina-provider-aws".to_string())
     );
 
     let named = parsed
@@ -11968,7 +12554,7 @@ fn provider_config_default_instance_serde_round_trip() {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
-        source: Some("github.com/x/y".to_string()),
+        source: Some("github.com/x/y".parse().unwrap()),
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),

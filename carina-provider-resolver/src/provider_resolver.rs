@@ -15,6 +15,9 @@ use time::format_description::well_known::Rfc3339;
 
 use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
+use carina_core::provider_source::{
+    GithubSource, ProviderSource, RegistrySource, RemoteSource, RemoteSourceKey,
+};
 use carina_core::version_constraint::VersionConstraint;
 
 use crate::signing;
@@ -3492,31 +3495,47 @@ impl LockFile {
 
     /// Find an entry matching `(source, version)` for modes with a published
     /// version pin. Git revision and file entries never match.
-    pub fn find(&self, source: &str, version: &str) -> Option<&LockEntry<RegistryLock>> {
+    fn find(&self, source: &str, version: &str) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|e| {
             Self::sources_match(&e.source, source) && e.kind.resolved_version() == Some(version)
         })
     }
 
-    pub fn find_by_source(&self, source: &str) -> Option<&LockEntry<RegistryLock>> {
+    /// Find a version pin selected by a validated remote provider source.
+    pub fn find_by_source_key_and_version(
+        &self,
+        source: &RemoteSourceKey,
+        version: &str,
+    ) -> Option<&LockEntry<RegistryLock>> {
+        self.find(source.as_str(), version)
+    }
+
+    fn find_by_source(&self, source: &str) -> Option<&LockEntry<RegistryLock>> {
         self.provider
             .iter()
             .find(|e| Self::sources_match(&e.source, source))
+    }
+
+    /// Find a lock entry selected by a validated remote provider source.
+    pub fn find_by_source_key(&self, source: &RemoteSourceKey) -> Option<&LockEntry<RegistryLock>> {
+        self.find_by_source(source.as_str())
     }
 
     fn resolve_registry_recovery(
         &self,
         provider: &str,
     ) -> Result<ResolvedRegistryRecovery, RegistryLockRecoveryError> {
-        let source = parse_provider_source(provider).map_err(|reason| {
+        let source = provider.parse::<ProviderSource>().map_err(|reason| {
             RegistryLockRecoveryError::InvalidProvider {
                 provider: provider.to_string(),
-                reason,
+                reason: reason.to_string(),
             }
         })?;
         let source_key = match source {
-            ProviderSource::Registry(source) => source.source_key(),
-            ProviderSource::GithubDirect { .. } => {
+            ProviderSource::Remote(RemoteSource::Registry(source)) => {
+                source.source_key().to_string()
+            }
+            ProviderSource::File(_) | ProviderSource::Remote(RemoteSource::GithubDirect(_)) => {
                 return Err(RegistryLockRecoveryError::NotRegistryProvider {
                     provider: provider.to_string(),
                 });
@@ -3688,11 +3707,7 @@ impl LockFile {
 
     /// Find a revision-mode entry whose `resolved_sha` matches. Version and
     /// file entries can't have a resolved SHA, so they never match.
-    pub fn find_by_source_and_sha(
-        &self,
-        source: &str,
-        sha: &str,
-    ) -> Option<&LockEntry<RegistryLock>> {
+    fn find_by_source_and_sha(&self, source: &str, sha: &str) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|e| {
             Self::sources_match(&e.source, source)
                 && matches!(
@@ -3700,6 +3715,15 @@ impl LockFile {
                     LockEntryKind::Revision { resolved_sha, .. } if resolved_sha == sha
                 )
         })
+    }
+
+    /// Find a revision pin selected by a validated remote provider source.
+    pub fn find_by_source_key_and_sha(
+        &self,
+        source: &RemoteSourceKey,
+        sha: &str,
+    ) -> Option<&LockEntry<RegistryLock>> {
+        self.find_by_source_and_sha(source.as_str(), sha)
     }
 
     fn known_registry_ratchets(
@@ -3718,11 +3742,25 @@ impl LockFile {
         }
     }
 
+    fn known_registry_ratchets_by_source_key(
+        &self,
+        source: &RemoteSourceKey,
+    ) -> Result<RegistryRatchets, RegistryIdentityPinConflict> {
+        self.known_registry_ratchets(source.as_str())
+    }
+
     fn registry_sequence_anchor(&self, source: &str) -> RegistrySequenceAnchor {
         self.find_by_source(source)
             .and_then(|entry| entry.registry.as_ref())
             .map(|registry| registry.sequence_anchor)
             .unwrap_or(RegistrySequenceAnchor::Unestablished)
+    }
+
+    fn registry_sequence_anchor_by_source_key(
+        &self,
+        source: &RemoteSourceKey,
+    ) -> RegistrySequenceAnchor {
+        self.registry_sequence_anchor(source.as_str())
     }
 
     fn attach_unpinned_registry_ratchets(
@@ -3849,7 +3887,7 @@ fn load_lock_file_for_test(path: &Path) -> Result<Option<LockFile>, LockFileErro
 /// obtain them only from [`PersistentLockFile`].
 struct RegistryProviderLockEntry {
     name: String,
-    source: String,
+    source: RemoteSourceKey,
     kind: LockEntryKind,
     sha256: String,
     registry: ResolvedRegistry,
@@ -3881,18 +3919,17 @@ impl<'a> PersistentLockFile<'a> {
 
     fn persist_registry_ratchets(
         &mut self,
-        source: &str,
+        source: &RemoteSourceKey,
         observation: &str,
         update: impl FnOnce(&mut RegistryRatchets) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut persisted = self.lock_file.clone();
-        let source_key = canonical_lock_source(source);
         let mut ratchets = persisted
-            .known_registry_ratchets(&source_key)
+            .known_registry_ratchets_by_source_key(source)
             .map_err(|error| error.to_string())?;
         update(&mut ratchets)?;
         persisted
-            .store_registry_ratchets(&source_key, ratchets)
+            .store_registry_ratchets(source.as_str(), ratchets)
             .map_err(|error| error.to_string())?;
         persisted.save(&self.path).map_err(|error| {
             format!(
@@ -3907,14 +3944,16 @@ impl<'a> PersistentLockFile<'a> {
     fn validate_and_record_registry_listing(
         &mut self,
         source: &RegistrySource,
+        source_key: &RemoteSourceKey,
         versions: &RegistryVersions,
     ) -> Result<ValidatedRegistrySequence, String> {
-        let source_key = source.source_key();
         let locked = self
             .lock_file
-            .known_registry_ratchets(&source_key)
+            .known_registry_ratchets_by_source_key(source_key)
             .map_err(|error| error.to_string())?;
-        let sequence_anchor = self.lock_file.registry_sequence_anchor(&source_key);
+        let sequence_anchor = self
+            .lock_file
+            .registry_sequence_anchor_by_source_key(source_key);
         let validated = ValidatedRegistryListing::validate(
             source,
             versions,
@@ -3925,7 +3964,7 @@ impl<'a> PersistentLockFile<'a> {
         let (observations, validated_sequence) = validated.into_parts();
 
         if let Some(observations) = observations {
-            self.persist_registry_ratchets(&source_key, "validated listing", |ratchets| {
+            self.persist_registry_ratchets(source_key, "validated listing", |ratchets| {
                 *ratchets = ratchets
                     .clone()
                     .merge(&observations)
@@ -3938,7 +3977,7 @@ impl<'a> PersistentLockFile<'a> {
 
     fn record_registry_transparency_log_presence(
         &mut self,
-        source: &str,
+        source: &RemoteSourceKey,
         present: bool,
     ) -> Result<(), String> {
         if !present {
@@ -3952,7 +3991,7 @@ impl<'a> PersistentLockFile<'a> {
 
     fn record_registry_signature_presence(
         &mut self,
-        source: &str,
+        source: &RemoteSourceKey,
         present: bool,
     ) -> Result<(), String> {
         if !present {
@@ -3971,13 +4010,13 @@ impl<'a> PersistentLockFile<'a> {
 
     fn record_signer_acceptance(
         &mut self,
-        source: &str,
+        source: &RemoteSourceKey,
         acceptance: SignerAcceptance,
     ) -> Result<(), String> {
         let SignerAcceptance { next, transition } = acceptance;
         if transition == SignerTransition::LegacyConverted {
             let mut persisted = self.lock_file.clone();
-            persisted.replace_legacy_signer_pin(source, next)?;
+            persisted.replace_legacy_signer_pin(source.as_str(), next)?;
             persisted.save(&self.path).map_err(|error| {
                 format!(
                     "Failed to persist registry verified signature observation to {}: {error}",
@@ -4011,14 +4050,14 @@ impl<'a> PersistentLockFile<'a> {
         } = entry;
         let ratchets = self
             .lock_file
-            .known_registry_ratchets(&source)
+            .known_registry_ratchets_by_source_key(&source)
             .map_err(|error| error.to_string())?;
         let registry_with_host =
             RegistryLock::from_resolved_registry(registry, ratchets, validated_sequence);
         self.lock_file.upsert_registry_with_host(
             LockEntry {
                 name,
-                source,
+                source: source.to_string(),
                 kind,
                 sha256,
                 registry: None,
@@ -4224,22 +4263,15 @@ fn missing_locked_artifact_error(
 }
 
 /// Construct the download URL for a WASM provider component.
-pub fn download_url_wasm(source: &str, version: &str) -> Result<String, String> {
-    let parts: Vec<&str> = source.split('/').collect();
-    if parts.len() != 3 || parts[0] != "github.com" {
-        return Err(format!(
-            "Invalid source format: {source}. Expected: github.com/{{owner}}/{{repo}}"
-        ));
-    }
-    let owner = parts[1];
-    let repo = parts[2];
-
-    Ok(format!(
-        "https://github.com/{owner}/{repo}/releases/download/v{version}/{repo}-v{version}.wasm"
-    ))
+pub fn download_url_wasm(source: &GithubSource, version: &str) -> String {
+    format!(
+        "https://github.com/{}/{}/releases/download/v{version}/{}-v{version}.wasm",
+        source.owner(),
+        source.repo(),
+        source.repo()
+    )
 }
 
-const DEFAULT_REGISTRY_HOST: &str = "registry.carina-rs.dev";
 // Registry sequence advances only when the canonical version-set digest changes;
 // timestamp-only re-issues reuse it. Once a successful resolve establishes an
 // anchor, later successful pins can advance it by at most this amount. A failed
@@ -4268,20 +4300,6 @@ fn discovery_repin_remediation(target: &str, project_dir: &Path) -> String {
         ProjectCommand::new("providers repin-discovery", project_dir).with_argument(target),
         ProjectCommand::new("init", project_dir),
     )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProviderSource {
-    GithubDirect { source: String },
-    Registry(RegistrySource),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RegistrySource {
-    source: String,
-    hostname: String,
-    namespace: String,
-    name: String,
 }
 
 /// A registry whose hostname and API base were resolved through §1 discovery.
@@ -4724,6 +4742,7 @@ mod registry_listing_validation {
             sequence_anchor: RegistrySequenceAnchor,
             project_dir: &Path,
         ) -> Result<Self, String> {
+            let source_key = source.source_key();
             let valid_until = versions
                 .valid_until
                 .as_deref()
@@ -4740,23 +4759,32 @@ mod registry_listing_validation {
                     let Some(sequence) = versions.sequence else {
                         return Err(format!(
                             "registry sequence field disappeared for {}/{}",
-                            source.namespace, source.name
+                            source.namespace(),
+                            source.name()
                         ));
                     };
                     if sequence < previous {
                         let remediation =
-                            sequence_rebootstrap_remediation(&source.source_key(), project_dir);
+                            sequence_rebootstrap_remediation(source_key.as_str(), project_dir);
                         return Err(format!(
                             "registry sequence rollback for {}/{}: previous {}, got {}. {}",
-                            source.namespace, source.name, previous, sequence, remediation
+                            source.namespace(),
+                            source.name(),
+                            previous,
+                            sequence,
+                            remediation
                         ));
                     }
                     if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD {
                         let remediation =
-                            sequence_rebootstrap_remediation(&source.source_key(), project_dir);
+                            sequence_rebootstrap_remediation(source_key.as_str(), project_dir);
                         return Err(format!(
                             "registry sequence fast-forward for {}/{} is too large: established anchor {}, got {}. {}",
-                            source.namespace, source.name, previous, sequence, remediation
+                            source.namespace(),
+                            source.name(),
+                            previous,
+                            sequence,
+                            remediation
                         ));
                     }
                 }
@@ -4766,21 +4794,23 @@ mod registry_listing_validation {
             if !stripped_versions.is_empty() {
                 return Err(format!(
                     "registry yanked flag disappeared for {}/{} version(s): {}",
-                    source.namespace,
-                    source.name,
+                    source.namespace(),
+                    source.name(),
                     stripped_versions.join(", ")
                 ));
             }
             if locked.valid_until_present && !valid_until_present {
                 return Err(format!(
                     "registry valid_until field disappeared for {}/{}",
-                    source.namespace, source.name
+                    source.namespace(),
+                    source.name()
                 ));
             }
             if valid_until.is_some_and(|valid_until| valid_until < OffsetDateTime::now_utc()) {
                 return Err(format!(
                     "registry versions listing valid_until is expired for {}/{}",
-                    source.namespace, source.name
+                    source.namespace(),
+                    source.name()
                 ));
             }
 
@@ -4946,77 +4976,11 @@ where
         })
 }
 
-fn parse_provider_source(source: &str) -> Result<ProviderSource, String> {
-    let parts: Vec<&str> = source.split('/').collect();
-    match parts.as_slice() {
-        ["github.com", _owner, _repo] => Ok(ProviderSource::GithubDirect {
-            source: source.to_string(),
-        }),
-        [namespace, name] if !namespace.is_empty() && !name.is_empty() => {
-            Ok(ProviderSource::Registry(RegistrySource {
-                source: format!("{namespace}/{name}"),
-                hostname: DEFAULT_REGISTRY_HOST.to_string(),
-                namespace: (*namespace).to_string(),
-                name: (*name).to_string(),
-            }))
-        }
-        [hostname, namespace, name]
-            if !hostname.is_empty() && !namespace.is_empty() && !name.is_empty() =>
-        {
-            let hostname = hostname.to_ascii_lowercase();
-            let source = canonical_registry_source(&hostname, namespace, name);
-            Ok(ProviderSource::Registry(RegistrySource {
-                source,
-                hostname,
-                namespace: (*namespace).to_string(),
-                name: (*name).to_string(),
-            }))
-        }
-        _ => Err(format!(
-            "Invalid source format: {source}. Expected: github.com/{{owner}}/{{repo}} or [hostname/]namespace/name"
-        )),
-    }
-}
-
-fn canonical_provider_source(source: &str) -> Result<String, String> {
-    Ok(parse_provider_source(source)?.source_key())
-}
-
-fn canonical_registry_source(hostname: &str, namespace: &str, name: &str) -> String {
-    if hostname == DEFAULT_REGISTRY_HOST {
-        format!("{namespace}/{name}")
-    } else {
-        format!("{hostname}/{namespace}/{name}")
-    }
-}
-
 fn canonical_lock_source(source: &str) -> String {
-    let parts: Vec<&str> = source.split('/').collect();
-    match parts.as_slice() {
-        ["github.com", _owner, _repo] => source.to_string(),
-        [namespace, name] if !namespace.is_empty() && !name.is_empty() => {
-            format!("{namespace}/{name}")
-        }
-        [hostname, namespace, name]
-            if !hostname.is_empty() && !namespace.is_empty() && !name.is_empty() =>
-        {
-            canonical_registry_source(&hostname.to_ascii_lowercase(), namespace, name)
-        }
-        _ => source.to_string(),
-    }
-}
-
-fn registry_revision<'a>(
-    source: &str,
-    config: &'a ProviderConfig,
-) -> Result<Option<&'a str>, String> {
-    let Some(revision) = config.revision.as_deref() else {
-        return Ok(None);
-    };
-    match parse_provider_source(source)? {
-        ProviderSource::Registry(_) => Ok(Some(revision)),
-        ProviderSource::GithubDirect { .. } => Ok(None),
-    }
+    source
+        .parse::<ProviderSource>()
+        .map(|source| source.to_string())
+        .unwrap_or_else(|_| source.to_string())
 }
 
 fn fetch_json<T: for<'de> Deserialize<'de>, H: RegistryHttp>(
@@ -5077,15 +5041,15 @@ fn resolve_registry<H: RegistryHttp>(
 ) -> Result<ResolvedRegistry, String> {
     let existing_discovery = match existing_host {
         Some(host) => Some(host.authorized_discovery().map_err(|_| {
-            let remediation = discovery_repin_remediation(&source.hostname, project_dir);
+            let remediation = discovery_repin_remediation(source.hostname(), project_dir);
             format!(
                 "registry discovery for host {} is blocked because its legacy lock-format migration requires operator authorization. {remediation}",
-                source.hostname
+                source.hostname()
             )
         })?),
         None => None,
     };
-    let discovery_url = registry_discovery_url(&source.hostname)?;
+    let discovery_url = registry_discovery_url(source.hostname())?;
     let discovery: DiscoveryDocument = fetch_discovery_json(http, discovery_url.as_str())?;
     let api_base_url = resolve_api_base_url(&discovery_url, &discovery.providers_v1)?;
     let additional = existing_discovery
@@ -5102,7 +5066,7 @@ fn resolve_registry<H: RegistryHttp>(
         .and_then(AuthorizedRegistryDiscoveryState::pin)
         && !same_consumed_discovery_values(existing_pin, &discovery_pin)
     {
-        let host = source.hostname.as_str();
+        let host = source.hostname();
         let remediation = discovery_repin_remediation(host, project_dir);
         return Err(format!(
             "registry pinned discovery values mismatch for host {host}: pinned providers.v1 was {}; resolved providers.v1 is {}. {remediation}",
@@ -5111,7 +5075,7 @@ fn resolve_registry<H: RegistryHttp>(
         ));
     }
     Ok(ResolvedRegistry {
-        hostname: source.hostname.clone(),
+        hostname: source.hostname().to_string(),
         discovery_pin,
     })
 }
@@ -5201,35 +5165,22 @@ struct RecordedRegistryListing {
 fn fetch_registry_versions<H: RegistryHttp>(
     registry: &ResolvedRegistry,
     source: &RegistrySource,
+    source_key: &RemoteSourceKey,
     lock_file: &mut PersistentLockFile<'_>,
     http: &H,
 ) -> Result<RecordedRegistryListing, String> {
     let url = join_registry_url(
         registry.api_base_url(),
-        &format!("/{}/{}/versions", source.namespace, source.name),
+        &format!("/{}/{}/versions", source.namespace(), source.name()),
     );
     let url = parse_registry_resource_url(&url, "registry versions URL")?;
     let versions: RegistryVersions = fetch_json(http, &url)?;
-    let validated_sequence = lock_file.validate_and_record_registry_listing(source, &versions)?;
+    let validated_sequence =
+        lock_file.validate_and_record_registry_listing(source, source_key, &versions)?;
     Ok(RecordedRegistryListing {
         versions,
         validated_sequence,
     })
-}
-
-impl RegistrySource {
-    fn source_key(&self) -> String {
-        self.source.clone()
-    }
-}
-
-impl ProviderSource {
-    fn source_key(&self) -> String {
-        match self {
-            ProviderSource::GithubDirect { source } => source.clone(),
-            ProviderSource::Registry(source) => source.source_key(),
-        }
-    }
 }
 
 fn select_registry_version(
@@ -5290,7 +5241,11 @@ fn fetch_registry_download<H: RegistryHttp>(
 ) -> Result<RegistryDownload, String> {
     let url = join_registry_url(
         registry.api_base_url(),
-        &format!("/{}/{}/{version}/download", source.namespace, source.name),
+        &format!(
+            "/{}/{}/{version}/download",
+            source.namespace(),
+            source.name()
+        ),
     );
     let url = parse_registry_resource_url(&url, "registry download metadata URL")?;
     let download: RegistryDownload = fetch_json(http, &url)?;
@@ -5311,8 +5266,8 @@ fn fetch_registry_revision_download<H: RegistryHttp>(
             .map_err(|_| "registry API base URL cannot accept path segments".to_string())?;
         segments.pop_if_empty();
         segments.extend([
-            source.namespace.as_str(),
-            source.name.as_str(),
+            source.namespace(),
+            source.name(),
             "revisions",
             revision,
             "download",
@@ -5470,7 +5425,11 @@ fn fetch_registry_download_for_legacy_conversion<H: RegistryHttp>(
 ) -> Result<LegacyFetch<RegistryDownload>, String> {
     let url = join_registry_url(
         registry.api_base_url(),
-        &format!("/{}/{}/{version}/download", source.namespace, source.name),
+        &format!(
+            "/{}/{}/{version}/download",
+            source.namespace(),
+            source.name()
+        ),
     );
     let url = parse_registry_resource_url(&url, "registry download metadata URL")?;
     let body = match http.get(RegistryHttpRequest::Resource(&url)) {
@@ -5526,14 +5485,14 @@ fn fetch_signature_bundle_for_legacy_conversion<H: RegistryHttp>(
 fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
     registry: &ResolvedRegistry,
     source: &RegistrySource,
+    source_key: &RemoteSourceKey,
     candidate_version: Option<&str>,
     lock_file: &mut PersistentLockFile<'_>,
     http: &H,
 ) -> Result<(), String> {
-    let source_key = source.source_key();
     let Some((locked_name, locked_version, locked_sha256, legacy_pin)) = lock_file
         .lock_file()
-        .find_by_source(&source_key)
+        .find_by_source_key(source_key)
         .and_then(|entry| {
             let locked_version = entry.kind.resolved_version()?;
             let registry = entry.registry.as_ref()?;
@@ -5586,7 +5545,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
     let artifact = match obtain_registry_artifact(
         RegistryArtifactRequest {
             base_dir: &lock_file.project_dir,
-            source: &source_key,
+            source: source_key,
             version: &locked_version,
             provider_name: &locked_name,
             download_url: &download_url,
@@ -5614,7 +5573,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
         &bundle,
         &expected_signer,
         &version,
-        &source_key,
+        source_key.as_str(),
         &lock_file.project_dir,
     ) {
         Ok(verified) => verified,
@@ -5626,7 +5585,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
         }
     };
     debug_assert_eq!(acceptance.transition, SignerTransition::LegacyConverted);
-    lock_file.record_signer_acceptance(&source_key, acceptance)
+    lock_file.record_signer_acceptance(source_key, acceptance)
 }
 
 /// Get the global plugin cache directory.
@@ -5642,20 +5601,22 @@ pub fn global_cache_dir() -> Option<PathBuf> {
 }
 
 /// Resolve the global cache path for a WASM provider.
-fn global_cache_path_wasm(source: &str, version: &str) -> Option<PathBuf> {
-    let repo = source.split('/').next_back().unwrap_or("provider");
-    global_cache_dir().map(|dir| dir.join(source).join(version).join(format!("{repo}.wasm")))
+fn global_cache_path_wasm(source: &RemoteSourceKey, version: &str) -> Option<PathBuf> {
+    global_cache_dir().map(|dir| {
+        dir.join(source.as_str())
+            .join(version)
+            .join(format!("{}.wasm", source.artifact_name()))
+    })
 }
 
 /// Resolve the cache path for a WASM provider component.
-pub fn cache_path_wasm(base_dir: &Path, source: &str, version: &str) -> PathBuf {
-    let repo = source.split('/').next_back().unwrap_or("provider");
+pub fn cache_path_wasm(base_dir: &Path, source: &RemoteSourceKey, version: &str) -> PathBuf {
     base_dir
         .join(".carina")
         .join("providers")
-        .join(source)
+        .join(source.as_str())
         .join(version)
-        .join(format!("{repo}.wasm"))
+        .join(format!("{}.wasm", source.artifact_name()))
 }
 
 /// Compute SHA256 hex digest of a file.
@@ -5720,7 +5681,7 @@ impl fmt::Display for RegistryArtifactError {
 
 struct RegistryArtifactRequest<'a> {
     base_dir: &'a Path,
-    source: &'a str,
+    source: &'a RemoteSourceKey,
     version: &'a str,
     provider_name: &'a str,
     download_url: &'a RegistryResourceUrl,
@@ -5796,7 +5757,7 @@ fn verify_and_decide_signer(
 /// disk and stomps the on-disk record (issue #2032).
 fn verify_or_record_version_cache(
     wasm_path: &Path,
-    source: &str,
+    source: &RemoteSourceKey,
     version: &str,
     name: &str,
     lock_file: &mut LockFile,
@@ -5806,7 +5767,7 @@ fn verify_or_record_version_cache(
         sha256_file(wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
     // Preserve any constraint already recorded; the resolver callers
     // overwrite it afterwards when the `.crn` specifies one.
-    let existing_constraint = match lock_file.find(source, version) {
+    let existing_constraint = match lock_file.find_by_source_key_and_version(source, version) {
         Some(entry) => {
             if actual_hash != entry.sha256 {
                 return Err(format!(
@@ -5846,16 +5807,15 @@ struct VerifiedRegistryLockPin {
 
 fn verify_registry_lock_pin(
     lock_file: &mut PersistentLockFile<'_>,
-    source: &RegistrySource,
+    source_key: &RemoteSourceKey,
     version: &str,
     expected_shasum: &str,
     registry: &ResolvedRegistry,
     signature: Option<&RegistrySignature>,
     transparency_log_present: bool,
 ) -> Result<VerifiedRegistryLockPin, String> {
-    let source_key = source.source_key();
     let current_lock = lock_file.lock_file();
-    let entry = current_lock.find_by_source(&source_key);
+    let entry = current_lock.find_by_source_key(source_key);
     let existing_constraint = entry.and_then(|entry| match &entry.kind {
         LockEntryKind::Version { constraint, .. } => constraint.clone(),
         _ => None,
@@ -5881,10 +5841,10 @@ fn verify_registry_lock_pin(
         ));
     }
     let ratchets = current_lock
-        .known_registry_ratchets(&source_key)
+        .known_registry_ratchets(source_key.as_str())
         .map_err(|error| error.to_string())?;
     if ratchets.signature.is_required() && signature.is_none() {
-        let remediation = identity_repin_remediation(&source_key, &lock_file.project_dir);
+        let remediation = identity_repin_remediation(source_key.as_str(), &lock_file.project_dir);
         return Err(format!(
             "the resolved version of {source_key} has no registry signature, but carina-providers.lock records signatures as required for this provider; downgrades from signed to unsigned versions are refused and have no override. {remediation}"
         ));
@@ -5905,8 +5865,8 @@ fn verify_registry_lock_pin(
     // Persist both independent presence ratchets before later signature-type
     // and artifact checks; a failed signature must never make a later
     // unsigned response acceptable.
-    lock_file.record_registry_signature_presence(&source_key, signature.is_some())?;
-    lock_file.record_registry_transparency_log_presence(&source_key, transparency_log_present)?;
+    lock_file.record_registry_signature_presence(source_key, signature.is_some())?;
+    lock_file.record_registry_transparency_log_presence(source_key, transparency_log_present)?;
     Ok(VerifiedRegistryLockPin {
         existing_constraint,
         expected_signer,
@@ -5949,40 +5909,41 @@ fn fetch_signature_bundle<H: RegistryHttp>(
 fn resolve_registry_provider_with_http<H: RegistryHttp>(
     base_dir: &Path,
     source: &RegistrySource,
+    source_key: &RemoteSourceKey,
     version: &str,
     name: &str,
     lock_file: &mut LockFile,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
-    let existing_host = lock_file.registry_host_lock(&source.hostname).cloned();
+    let existing_host = lock_file.registry_host_lock(source.hostname()).cloned();
     let registry = resolve_registry(source, existing_host.as_ref(), base_dir, http)?;
     let mut persistent_lock = PersistentLockFile::new(lock_file, base_dir);
     let RecordedRegistryListing {
         versions,
         validated_sequence,
-    } = fetch_registry_versions(&registry, source, &mut persistent_lock, http)?;
+    } = fetch_registry_versions(&registry, source, source_key, &mut persistent_lock, http)?;
     convert_obtainable_legacy_signer_pin(
         &registry,
         source,
+        source_key,
         Some(version),
         &mut persistent_lock,
         http,
     )?;
-    let source_key = source.source_key();
     let listed_version = require_listed_registry_version(
         &versions,
         version,
-        &source_key,
+        source_key.as_str(),
         persistent_lock
             .lock_file()
-            .find(&source_key, version)
+            .find_by_source_key_and_version(source_key, version)
             .is_some(),
     )?;
     let download = fetch_registry_download(&registry, source, version, http)?;
     accept_registry_download_with_http(
         PendingRegistryDownload {
             base_dir,
-            source,
+            source_key,
             version: listed_version,
             name,
             registry,
@@ -6004,20 +5965,20 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
     mode: LockMode,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
-    let existing_host = lock_file.registry_host_lock(&source.hostname).cloned();
+    let source_key = source.source_key();
+    let existing_host = lock_file.registry_host_lock(source.hostname()).cloned();
     let registry = resolve_registry(source, existing_host.as_ref(), base_dir, http)?;
     let mut persistent_lock = PersistentLockFile::new(lock_file, base_dir);
     let RecordedRegistryListing {
         versions,
         validated_sequence,
-    } = fetch_registry_versions(&registry, source, &mut persistent_lock, http)?;
-    let source_key = source.source_key();
+    } = fetch_registry_versions(&registry, source, &source_key, &mut persistent_lock, http)?;
     let locked_version = if mode == LockMode::Upgrade {
         None
     } else {
         persistent_lock
             .lock_file()
-            .find_by_source(&source_key)
+            .find_by_source_key(&source_key)
             .and_then(|entry| match &entry.kind {
                 LockEntryKind::RegistryRevision {
                     revision: locked_revision,
@@ -6033,19 +5994,31 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
         convert_obtainable_legacy_signer_pin(
             &registry,
             source,
+            &source_key,
             Some(&locked_version),
             &mut persistent_lock,
             http,
         )?;
         let listed_version =
-            require_listed_registry_version(&versions, &locked_version, &source_key, true)?;
+            require_listed_registry_version(&versions, &locked_version, source_key.as_str(), true)?;
         let download = fetch_registry_download(&registry, source, &locked_version, http)?;
         (listed_version, download, RegistryRevisionSelection::Locked)
     } else {
-        convert_obtainable_legacy_signer_pin(&registry, source, None, &mut persistent_lock, http)?;
+        convert_obtainable_legacy_signer_pin(
+            &registry,
+            source,
+            &source_key,
+            None,
+            &mut persistent_lock,
+            http,
+        )?;
         let response = fetch_registry_revision_download(&registry, source, revision, http)?;
-        let listed_version =
-            require_listed_registry_version(&versions, &response.version, &source_key, false)?;
+        let listed_version = require_listed_registry_version(
+            &versions,
+            &response.version,
+            source_key.as_str(),
+            false,
+        )?;
         (
             listed_version,
             response.download,
@@ -6055,7 +6028,7 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
     accept_registry_download_with_http(
         PendingRegistryDownload {
             base_dir,
-            source,
+            source_key: &source_key,
             version: listed_version,
             name,
             registry,
@@ -6109,7 +6082,7 @@ enum RegistryDownloadIntent<'a> {
 
 struct PendingRegistryDownload<'a> {
     base_dir: &'a Path,
-    source: &'a RegistrySource,
+    source_key: &'a RemoteSourceKey,
     version: ListedVersion,
     name: &'a str,
     registry: ResolvedRegistry,
@@ -6125,7 +6098,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
 ) -> Result<WasmArtifactPath, String> {
     let PendingRegistryDownload {
         base_dir,
-        source,
+        source_key,
         version,
         name,
         registry,
@@ -6134,7 +6107,6 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         intent,
     } = pending;
     let version_string = version.raw.as_str();
-    let source_key = source.source_key();
     let download_url =
         parse_registry_resource_url(&download.download_url, "registry download URL")?;
     let transparency_log_present = download.transparency_log.is_some();
@@ -6143,7 +6115,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         expected_signer,
     } = verify_registry_lock_pin(
         persistent_lock,
-        source,
+        source_key,
         version_string,
         &download.shasum,
         &registry,
@@ -6161,7 +6133,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
     let artifact = obtain_registry_artifact(
         RegistryArtifactRequest {
             base_dir,
-            source: &source_key,
+            source: source_key,
             version: version_string,
             provider_name: name,
             download_url: &download_url,
@@ -6181,7 +6153,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
                 &bundle,
                 &expected_signer,
                 &version,
-                &source_key,
+                source_key.as_str(),
                 base_dir,
             ) {
                 Ok(verified) => Some(verified),
@@ -6223,7 +6195,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
 
     if let Some((_, acceptance)) = verified_signature {
         let transition = acceptance.transition.clone();
-        persistent_lock.record_signer_acceptance(&source_key, acceptance)?;
+        persistent_lock.record_signer_acceptance(source_key, acceptance)?;
         if transition != SignerTransition::Unchanged {
             eprintln!("carina: updated verified signer pins for {source_key}: {transition:?}");
         }
@@ -6231,7 +6203,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
 
     persistent_lock.upsert_registry_provider(RegistryProviderLockEntry {
         name: name.to_string(),
-        source: source_key,
+        source: source_key.clone(),
         kind,
         sha256: download.shasum,
         registry,
@@ -6241,11 +6213,14 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
 }
 
 fn annotate_version_lock_entry(
-    source: &str,
+    source: &RemoteSourceKey,
     constraint: Option<&VersionConstraint>,
     lock_file: &mut LockFile,
 ) {
-    if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source)
+    if let Some(entry) = lock_file
+        .provider
+        .iter_mut()
+        .find(|entry| LockFile::sources_match(&entry.source, source.as_str()))
         && let LockEntryKind::Version {
             constraint: locked_constraint,
             ..
@@ -6263,7 +6238,7 @@ fn annotate_version_lock_entry(
 /// 3. Download the WASM component.
 pub fn resolve_provider(
     base_dir: &Path,
-    source: &str,
+    source: &RemoteSource,
     version: &str,
     name: &str,
     lock_file: &mut LockFile,
@@ -6280,29 +6255,34 @@ pub fn resolve_provider(
 
 fn resolve_provider_with_http<H: RegistryHttp>(
     base_dir: &Path,
-    source: &str,
+    source: &RemoteSource,
     version: &str,
     name: &str,
     lock_file: &mut LockFile,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
-    if let ProviderSource::Registry(registry_source) = parse_provider_source(source)? {
-        return resolve_registry_provider_with_http(
-            base_dir,
-            &registry_source,
-            version,
-            name,
-            lock_file,
-            http,
-        );
-    }
+    let source_key = source.source_key();
+    let github_source = match source {
+        RemoteSource::Registry(registry_source) => {
+            return resolve_registry_provider_with_http(
+                base_dir,
+                registry_source,
+                &source_key,
+                version,
+                name,
+                lock_file,
+                http,
+            );
+        }
+        RemoteSource::GithubDirect(github_source) => github_source,
+    };
 
     // 1. Check local WASM cache first.
-    let wasm_path = WasmArtifactPath::new(cache_path_wasm(base_dir, source, version), name)?;
+    let wasm_path = WasmArtifactPath::new(cache_path_wasm(base_dir, &source_key, version), name)?;
     if wasm_path.as_path().exists() {
         verify_or_record_version_cache(
             wasm_path.as_path(),
-            source,
+            &source_key,
             version,
             name,
             lock_file,
@@ -6312,7 +6292,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     }
 
     // 2. Check global plugin cache for WASM.
-    if let Some(global_wasm) = global_cache_path_wasm(source, version)
+    if let Some(global_wasm) = global_cache_path_wasm(&source_key, version)
         && global_wasm.exists()
     {
         // Copy from global cache to local project
@@ -6325,7 +6305,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
             .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
         lock_file.upsert(LockEntry {
             name: name.to_string(),
-            source: source.to_string(),
+            source: source_key.to_string(),
             kind: LockEntryKind::Version {
                 version: version.to_string(),
                 constraint: None,
@@ -6335,13 +6315,13 @@ fn resolve_provider_with_http<H: RegistryHttp>(
         });
         eprintln!(
             "Installed WASM provider '{}' from global cache ({}@{})",
-            name, source, version
+            name, source_key, version
         );
         return Ok(wasm_path);
     }
 
     // 3. Download the WASM component.
-    let wasm_url = download_url_wasm(source, version)?;
+    let wasm_url = download_url_wasm(github_source, version);
     let wasm_download_url = parse_registry_resource_url(&wasm_url, "provider download URL")?;
     eprintln!("Downloading WASM provider '{}' from {}", name, wasm_url);
     match http.download_to_file(&wasm_download_url, wasm_path.as_path()) {
@@ -6350,7 +6330,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
                 .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
             lock_file.upsert(LockEntry {
                 name: name.to_string(),
-                source: source.to_string(),
+                source: source_key.to_string(),
                 kind: LockEntryKind::Version {
                     version: version.to_string(),
                     constraint: None,
@@ -6359,7 +6339,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
                 registry: None,
             });
             // Save to global cache
-            if let Some(global_wasm) = global_cache_path_wasm(source, version) {
+            if let Some(global_wasm) = global_cache_path_wasm(&source_key, version) {
                 if let Some(parent) = global_wasm.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
@@ -6367,7 +6347,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
             }
             eprintln!(
                 "Installed WASM provider '{}' ({}@{})",
-                name, source, version
+                name, source_key, version
             );
             Ok(wasm_path)
         }
@@ -6396,66 +6376,161 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
 ) -> Result<WasmArtifactPath, String> {
     let source = config
         .source
-        .as_deref()
+        .as_ref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
-    let source = canonical_provider_source(source)?;
 
     let lock_path = provider_lock_path(base_dir);
     let mut lock_file = load_lock_file(base_dir)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
-    let artifact_path = if let Some(revision) = registry_revision(&source, config)? {
-        let ProviderSource::Registry(registry_source) = parse_provider_source(&source)? else {
-            unreachable!("registry_revision only returns Some for registry sources")
-        };
-        resolve_registry_revision_with_http(
-            base_dir,
-            &registry_source,
-            revision,
-            &config.name,
-            &mut lock_file,
-            LockMode::Normal,
-            http,
-        )?
-    } else if let Some(revision) = &config.revision {
-        let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
-            base_dir,
-            &source,
-            revision,
-            &config.name,
-            &mut lock_file,
-            false,
-        )?;
-        path
-    } else {
-        let version = resolve_version(
-            base_dir,
-            &source,
-            &config.name,
-            config.version.as_ref(),
-            &mut lock_file,
-            false,
-            http,
-        )?;
-        let path = resolve_provider_with_http(
-            base_dir,
-            &source,
-            &version,
-            &config.name,
-            &mut lock_file,
-            http,
-        )?;
-
-        annotate_version_lock_entry(&source, config.version.as_ref(), &mut lock_file);
-        path
-    };
+    let artifact_path = resolve_config_with_http(
+        base_dir,
+        config,
+        source,
+        &mut lock_file,
+        LockMode::Normal,
+        http,
+    )?;
 
     lock_file
         .save(&lock_path)
         .map_err(|e| format!("Failed to save carina-providers.lock: {e}"))?;
 
     Ok(artifact_path)
+}
+
+fn resolve_config_with_http<H: RegistryHttp>(
+    base_dir: &Path,
+    config: &ProviderConfig,
+    source: &ProviderSource,
+    lock_file: &mut LockFile,
+    mode: LockMode,
+    http: &H,
+) -> Result<WasmArtifactPath, String> {
+    match (source, config.revision.as_deref()) {
+        (ProviderSource::File(file_source), _) => resolve_file_provider(
+            base_dir,
+            &config.name,
+            &source.to_string(),
+            file_source.path(),
+            lock_file,
+        ),
+        (ProviderSource::Remote(RemoteSource::Registry(registry_source)), Some(revision)) => {
+            resolve_registry_revision_with_http(
+                base_dir,
+                registry_source,
+                revision,
+                &config.name,
+                lock_file,
+                mode,
+                http,
+            )
+        }
+        (ProviderSource::Remote(RemoteSource::GithubDirect(github_source)), Some(revision)) => {
+            let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
+                base_dir,
+                github_source,
+                revision,
+                &config.name,
+                lock_file,
+                mode == LockMode::Upgrade,
+            )?;
+            Ok(path)
+        }
+        (ProviderSource::Remote(remote_source), None) => {
+            let source_key = remote_source.source_key();
+            let version = resolve_version(
+                base_dir,
+                remote_source,
+                &config.name,
+                config.version.as_ref(),
+                lock_file,
+                mode == LockMode::Upgrade,
+                http,
+            )?;
+            let path = resolve_provider_with_http(
+                base_dir,
+                remote_source,
+                &version,
+                &config.name,
+                lock_file,
+                http,
+            )?;
+
+            annotate_version_lock_entry(&source_key, config.version.as_ref(), lock_file);
+            Ok(path)
+        }
+    }
+}
+
+fn resolve_file_provider(
+    base_dir: &Path,
+    provider_name: &str,
+    source: &str,
+    file_path: &str,
+    lock_file: &mut LockFile,
+) -> Result<WasmArtifactPath, String> {
+    let src_path = WasmArtifactPath::new(PathBuf::from(file_path), provider_name)?;
+    if !src_path.as_path().exists() {
+        return Err(format!(
+            "Provider '{}': file source not found: {}",
+            provider_name, file_path
+        ));
+    }
+    let dest = file_provider_cache_path(base_dir, &src_path, provider_name)?;
+    if let Some(parent) = dest.as_path().parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create provider directory: {e}"))?;
+    }
+    let _ = fs::remove_file(dest.as_path());
+    link_or_copy(src_path.as_path(), dest.as_path())
+        .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
+    let sha = sha256_file(dest.as_path())
+        .map_err(|e| format!("Failed to compute SHA256 for file:// provider: {e}"))?;
+
+    if let Some(entry) = lock_file
+        .provider
+        .iter_mut()
+        .find(|entry| LockFile::sources_match(&entry.source, source))
+    {
+        entry.sha256 = sha;
+    } else {
+        lock_file.provider.push(LockEntry {
+            name: provider_name.to_string(),
+            source: source.to_string(),
+            kind: LockEntryKind::File,
+            sha256: sha,
+            registry: None,
+        });
+    }
+
+    Ok(dest)
+}
+
+fn file_provider_cache_path(
+    base_dir: &Path,
+    src_path: &WasmArtifactPath,
+    provider_name: &str,
+) -> Result<WasmArtifactPath, String> {
+    let file_name = src_path
+        .as_path()
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("provider");
+    let dest = base_dir
+        .join(".carina")
+        .join("providers")
+        .join("file")
+        .join(file_name)
+        .join(
+            src_path
+                .as_path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("provider.wasm"),
+        );
+    WasmArtifactPath::new(dest, provider_name)
 }
 
 /// Resolve a `file://` provider at its source path without copying it.
@@ -6465,11 +6540,17 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
 pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledProvider, String> {
     let source = config
         .source
-        .as_deref()
+        .as_ref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
-    let file_path = source
-        .strip_prefix("file://")
-        .ok_or_else(|| format!("Provider '{}' is not a file:// source", config.name))?;
+    let file_path = match source {
+        ProviderSource::File(file_source) => file_source.path(),
+        ProviderSource::Remote(_) => {
+            return Err(format!(
+                "Provider '{}' is not a file:// source",
+                config.name
+            ));
+        }
+    };
     let path = PathBuf::from(file_path);
     if !path.exists() {
         return Err(format!("file not found: {file_path}"));
@@ -6496,42 +6577,30 @@ pub fn find_installed_provider(
 ) -> Result<InstalledProvider, String> {
     let source = config
         .source
-        .as_deref()
+        .as_ref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
-    // For file:// sources, look in .carina/providers/file/
-    if let Some(file_path) = source.strip_prefix("file://") {
-        let src = WasmArtifactPath::new(PathBuf::from(file_path), &config.name)?;
-        let src = src.as_path();
-        let file_name = src
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("provider");
-        let dest = base_dir
-            .join(".carina")
-            .join("providers")
-            .join("file")
-            .join(file_name)
-            .join(
-                src.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("provider.wasm"),
-            );
-        if dest.exists() {
-            return Ok(InstalledProvider {
-                path: WasmArtifactPath::new(dest, &config.name)?,
-                provider_name: config.name.clone(),
-                provenance: ProviderArtifactProvenance::File {
-                    source: source.to_string(),
-                },
-            });
+    let remote_source = match source {
+        ProviderSource::File(file_source) => {
+            let src = WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)?;
+            let dest = file_provider_cache_path(base_dir, &src, &config.name)?;
+            if dest.as_path().exists() {
+                return Ok(InstalledProvider {
+                    path: dest,
+                    provider_name: config.name.clone(),
+                    provenance: ProviderArtifactProvenance::File {
+                        source: source.to_string(),
+                    },
+                });
+            }
+            return Err(format!(
+                "not installed. Run `{}`",
+                ProjectCommand::new("init", base_dir)
+            ));
         }
-        return Err(format!(
-            "not installed. Run `{}`",
-            ProjectCommand::new("init", base_dir)
-        ));
-    }
-    let source = canonical_provider_source(source)?;
+        ProviderSource::Remote(remote_source) => remote_source,
+    };
+    let source_key = remote_source.source_key();
 
     let lock_file = load_lock_file(base_dir)
         .map_err(|error| error.to_string())?
@@ -6543,63 +6612,69 @@ pub fn find_installed_provider(
     // project already pulled this provider and the current project has no
     // local install yet (issue #2018).
     if let Some(revision) = &config.revision {
-        if registry_revision(&source, config)?.is_some() {
-            if let Some(lock_entry) = lock_file.find_by_source(&source)
-                && let LockEntryKind::RegistryRevision {
-                    version,
-                    revision: locked_revision,
-                } = &lock_entry.kind
-                && locked_revision == revision
-            {
-                let wasm_path = cache_path_wasm(base_dir, &source, version);
-                let pin = LockedProviderPin::RegistryRevision {
-                    revision: locked_revision.clone(),
-                    version: version.clone(),
-                };
-                if wasm_path.exists() {
-                    return Ok(InstalledProvider {
-                        path: WasmArtifactPath::new(wasm_path, &config.name)?,
-                        provider_name: config.name.clone(),
-                        provenance: ProviderArtifactProvenance::LockFile {
-                            project_dir: base_dir.to_path_buf(),
-                            pin,
-                        },
-                    });
+        match remote_source {
+            RemoteSource::Registry(_) => {
+                if let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
+                    && let LockEntryKind::RegistryRevision {
+                        version,
+                        revision: locked_revision,
+                    } = &lock_entry.kind
+                    && locked_revision == revision
+                {
+                    let wasm_path = cache_path_wasm(base_dir, &source_key, version);
+                    let pin = LockedProviderPin::RegistryRevision {
+                        revision: locked_revision.clone(),
+                        version: version.clone(),
+                    };
+                    if wasm_path.exists() {
+                        return Ok(InstalledProvider {
+                            path: WasmArtifactPath::new(wasm_path, &config.name)?,
+                            provider_name: config.name.clone(),
+                            provenance: ProviderArtifactProvenance::LockFile {
+                                project_dir: base_dir.to_path_buf(),
+                                pin,
+                            },
+                        });
+                    }
+                    return Err(missing_locked_artifact_error(
+                        base_dir,
+                        &pin,
+                        Some(revision),
+                    ));
                 }
-                return Err(missing_locked_artifact_error(
-                    base_dir,
-                    &pin,
-                    Some(revision),
-                ));
             }
-        } else {
-            if let Some(lock_entry) = lock_file.find_by_source(&source)
-                && let LockEntryKind::Revision {
-                    revision: locked_revision,
-                    resolved_sha,
-                } = &lock_entry.kind
-            {
-                let wasm_path =
-                    crate::revision_resolver::cache_path_revision(base_dir, &source, resolved_sha);
-                let pin = LockedProviderPin::Revision {
-                    revision: locked_revision.clone(),
-                    resolved_sha: resolved_sha.clone(),
-                };
-                if wasm_path.exists() {
-                    return Ok(InstalledProvider {
-                        path: WasmArtifactPath::new(wasm_path, &config.name)?,
-                        provider_name: config.name.clone(),
-                        provenance: ProviderArtifactProvenance::LockFile {
-                            project_dir: base_dir.to_path_buf(),
-                            pin,
-                        },
-                    });
+            RemoteSource::GithubDirect(github_source) => {
+                if let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
+                    && let LockEntryKind::Revision {
+                        revision: locked_revision,
+                        resolved_sha,
+                    } = &lock_entry.kind
+                {
+                    let wasm_path = crate::revision_resolver::cache_path_revision(
+                        base_dir,
+                        github_source,
+                        resolved_sha,
+                    );
+                    let pin = LockedProviderPin::Revision {
+                        revision: locked_revision.clone(),
+                        resolved_sha: resolved_sha.clone(),
+                    };
+                    if wasm_path.exists() {
+                        return Ok(InstalledProvider {
+                            path: WasmArtifactPath::new(wasm_path, &config.name)?,
+                            provider_name: config.name.clone(),
+                            provenance: ProviderArtifactProvenance::LockFile {
+                                project_dir: base_dir.to_path_buf(),
+                                pin,
+                            },
+                        });
+                    }
+                    return Err(missing_locked_artifact_error(
+                        base_dir,
+                        &pin,
+                        Some(revision),
+                    ));
                 }
-                return Err(missing_locked_artifact_error(
-                    base_dir,
-                    &pin,
-                    Some(revision),
-                ));
             }
         }
         return Err(format!(
@@ -6608,13 +6683,13 @@ pub fn find_installed_provider(
         ));
     }
 
-    if let Some(lock_entry) = lock_file.find_by_source(&source)
+    if let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
         && let LockEntryKind::Version {
             version,
             constraint,
         } = &lock_entry.kind
     {
-        let wasm_path = cache_path_wasm(base_dir, &source, version);
+        let wasm_path = cache_path_wasm(base_dir, &source_key, version);
         let pin = LockedProviderPin::Version {
             version: version.clone(),
             constraint: constraint.clone(),
@@ -6646,11 +6721,11 @@ pub fn find_installed_provider(
 /// version-mode URL — the type rules out the #2028 failure mode at the call
 /// site, no runtime check needed.
 fn try_reuse_locked_version(
-    source: &str,
+    source: &RemoteSourceKey,
     constraint: Option<&VersionConstraint>,
     lock_file: &LockFile,
 ) -> Option<String> {
-    let entry = lock_file.find_by_source(source)?;
+    let entry = lock_file.find_by_source_key(source)?;
     match &entry.kind {
         LockEntryKind::Version {
             version,
@@ -6671,33 +6746,34 @@ fn try_reuse_locked_version(
 /// Resolve the exact version to use for a provider.
 fn resolve_version<H: RegistryHttp>(
     project_dir: &Path,
-    source: &str,
+    source: &RemoteSource,
     provider_name: &str,
     constraint: Option<&VersionConstraint>,
     lock_file: &mut LockFile,
     upgrade: bool,
     http: &H,
 ) -> Result<String, String> {
-    if !upgrade && let Some(version) = try_reuse_locked_version(source, constraint, lock_file) {
+    let source_key = source.source_key();
+    if !upgrade && let Some(version) = try_reuse_locked_version(&source_key, constraint, lock_file)
+    {
         return Ok(version);
     }
 
-    if let ProviderSource::Registry(registry_source) = parse_provider_source(source)? {
-        return resolve_registry_version_with_http(
+    match source {
+        RemoteSource::Registry(registry_source) => resolve_registry_version_with_http(
             project_dir,
-            &registry_source,
+            registry_source,
+            &source_key,
             provider_name,
             constraint,
             lock_file,
             http,
-        );
-    }
-
-    match constraint {
-        Some(constraint) => {
-            let tags = crate::version_resolver::fetch_release_tags(source)?;
-            let resolved = crate::version_resolver::resolve_from_tags(&tags, &constraint.req)
-                .ok_or_else(|| {
+        ),
+        RemoteSource::GithubDirect(github_source) => match constraint {
+            Some(constraint) => {
+                let tags = crate::version_resolver::fetch_release_tags(github_source)?;
+                let resolved = crate::version_resolver::resolve_from_tags(&tags, &constraint.req)
+                    .ok_or_else(|| {
                     format!(
                         "No release of '{}' matches constraint '{}'. Available: {}",
                         provider_name,
@@ -6705,30 +6781,40 @@ fn resolve_version<H: RegistryHttp>(
                         tags.join(", ")
                     )
                 })?;
-            Ok(resolved.version.to_string())
-        }
-        None => {
-            let tag = crate::version_resolver::fetch_latest_tag(source)?;
-            let version = tag.strip_prefix('v').unwrap_or(&tag);
-            Ok(version.to_string())
-        }
+                Ok(resolved.version.to_string())
+            }
+            None => {
+                let tag = crate::version_resolver::fetch_latest_tag(github_source)?;
+                let version = tag.strip_prefix('v').unwrap_or(&tag);
+                Ok(version.to_string())
+            }
+        },
     }
 }
 
 fn resolve_registry_version_with_http<H: RegistryHttp>(
     project_dir: &Path,
     source: &RegistrySource,
+    source_key: &RemoteSourceKey,
     provider_name: &str,
     constraint: Option<&VersionConstraint>,
     lock_file: &mut LockFile,
     http: &H,
 ) -> Result<String, String> {
-    let existing_host = lock_file.registry_host_lock(&source.hostname).cloned();
+    let existing_host = lock_file.registry_host_lock(source.hostname()).cloned();
     let registry = resolve_registry(source, existing_host.as_ref(), project_dir, http)?;
     let RecordedRegistryListing { versions, .. } = {
         let mut persistent_lock = PersistentLockFile::new(lock_file, project_dir);
-        let listing = fetch_registry_versions(&registry, source, &mut persistent_lock, http)?;
-        convert_obtainable_legacy_signer_pin(&registry, source, None, &mut persistent_lock, http)?;
+        let listing =
+            fetch_registry_versions(&registry, source, source_key, &mut persistent_lock, http)?;
+        convert_obtainable_legacy_signer_pin(
+            &registry,
+            source,
+            source_key,
+            None,
+            &mut persistent_lock,
+            http,
+        )?;
         listing
     };
     let candidates = SelectableRegistryVersions::from_listing(&versions.versions);
@@ -6780,14 +6866,14 @@ pub fn check_lock_mismatch(
         |name, lock_shape, crn_shape| mismatch_error(name, lock_shape, crn_shape, project_dir);
 
     for config in providers {
-        let source = match &config.source {
-            Some(s) if !s.starts_with("file://") => s.as_str(),
-            // No source or file:// — either the resolver skips it or the
+        let source_key = match &config.source {
+            Some(ProviderSource::Remote(source)) => source.source_key(),
+            // No source or file source — either the resolver skips it or the
             // sha256 is refreshed every run, so there's nothing to mismatch.
-            _ => continue,
+            Some(ProviderSource::File(_)) | None => continue,
         };
 
-        let lock_entry = match lock_file.find_by_source(source) {
+        let lock_entry = match lock_file.find_by_source_key(&source_key) {
             Some(entry) => entry,
             None => {
                 if mode == LockMode::Locked {
@@ -6989,7 +7075,7 @@ fn mismatch_error(name: &str, lock_shape: &str, crn_shape: &str, project_dir: &P
     )
 }
 
-/// Resolve all providers that need GitHub source resolution.
+/// Resolve all configured provider sources.
 pub fn resolve_all(
     base_dir: &Path,
     providers: &[ProviderConfig],
@@ -7024,116 +7110,16 @@ fn resolve_all_with_http<H: RegistryHttp>(
     // require every provider to be present in the lock too.
     check_lock_mismatch(providers, &lock_file, mode, base_dir)?;
 
-    let upgrade = mode == LockMode::Upgrade;
     let mut resolved = HashMap::new();
 
     for config in providers {
         let source = match &config.source {
-            Some(s) => s.as_str(),
-            _ => continue,
+            Some(source) => source,
+            None => continue,
         };
 
-        // Handle file:// sources: copy into .carina/providers/
-        if let Some(file_path) = source.strip_prefix("file://") {
-            let src_path = WasmArtifactPath::new(PathBuf::from(file_path), &config.name)?;
-            if !src_path.as_path().exists() {
-                return Err(format!(
-                    "Provider '{}': file source not found: {}",
-                    config.name, file_path
-                ));
-            }
-            let file_name = src_path
-                .as_path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("provider");
-            let dest = base_dir
-                .join(".carina")
-                .join("providers")
-                .join("file")
-                .join(file_name)
-                .join(
-                    src_path
-                        .as_path()
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("provider.wasm"),
-                );
-            let dest = WasmArtifactPath::new(dest, &config.name)?;
-            if let Some(parent) = dest.as_path().parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create provider directory: {e}"))?;
-            }
-            // Remove existing file before hard-linking (hard_link fails if dest exists)
-            let _ = fs::remove_file(dest.as_path());
-            link_or_copy(src_path.as_path(), dest.as_path())
-                .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
-            let sha = sha256_file(dest.as_path())
-                .map_err(|e| format!("Failed to compute SHA256 for file:// provider: {e}"))?;
-
-            // Update or add lock entry
-            if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
-                entry.sha256 = sha;
-            } else {
-                lock_file.provider.push(LockEntry {
-                    name: config.name.clone(),
-                    source: source.to_string(),
-                    kind: LockEntryKind::File,
-                    sha256: sha,
-                    registry: None,
-                });
-            }
-
-            resolved.insert(config.name.clone(), dest);
-            continue;
-        }
-        let source = canonical_provider_source(source)?;
-
-        let artifact_path = if let Some(revision) = registry_revision(&source, config)? {
-            let ProviderSource::Registry(registry_source) = parse_provider_source(&source)? else {
-                unreachable!("registry_revision only returns Some for registry sources")
-            };
-            resolve_registry_revision_with_http(
-                base_dir,
-                &registry_source,
-                revision,
-                &config.name,
-                &mut lock_file,
-                mode,
-                http,
-            )?
-        } else if let Some(revision) = &config.revision {
-            let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
-                base_dir,
-                &source,
-                revision,
-                &config.name,
-                &mut lock_file,
-                upgrade,
-            )?;
-            path
-        } else {
-            let version = resolve_version(
-                base_dir,
-                &source,
-                &config.name,
-                config.version.as_ref(),
-                &mut lock_file,
-                upgrade,
-                http,
-            )?;
-            let path = resolve_provider_with_http(
-                base_dir,
-                &source,
-                &version,
-                &config.name,
-                &mut lock_file,
-                http,
-            )?;
-
-            annotate_version_lock_entry(&source, config.version.as_ref(), &mut lock_file);
-            path
-        };
+        let artifact_path =
+            resolve_config_with_http(base_dir, config, source, &mut lock_file, mode, http)?;
 
         resolved.insert(config.name.clone(), artifact_path);
     }
@@ -7166,9 +7152,9 @@ pub fn validate_lock_constraints(
             continue;
         }
 
-        let source = match &config.source {
-            Some(s) if !s.starts_with("file://") => s.as_str(),
-            _ => continue,
+        let source_key = match &config.source {
+            Some(ProviderSource::Remote(source)) => source.source_key(),
+            Some(ProviderSource::File(_)) | None => continue,
         };
 
         let constraint = match &config.version {
@@ -7176,7 +7162,7 @@ pub fn validate_lock_constraints(
             None => continue,
         };
 
-        if let Some(lock_entry) = lock_file.find_by_source(source)
+        if let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
             && let LockEntryKind::Version { version, .. } = &lock_entry.kind
             && !constraint.matches(version).unwrap_or(false)
         {
@@ -7232,6 +7218,31 @@ mod tests {
     );
     const CAPTURED_AWSCC_STABLE_BUNDLE: &[u8] =
         include_bytes!("signing/testdata/issue-3928/awscc-0.7.0/bundle.sigstore.json");
+
+    fn provider_source(source: &str) -> RemoteSource {
+        match source.parse::<ProviderSource>().unwrap() {
+            ProviderSource::Remote(source) => source,
+            ProviderSource::File(_) => panic!("expected remote source: {source}"),
+        }
+    }
+
+    fn source_key(source: &str) -> RemoteSourceKey {
+        provider_source(source).source_key()
+    }
+
+    fn github_source(source: &str) -> GithubSource {
+        match provider_source(source) {
+            RemoteSource::GithubDirect(source) => source,
+            RemoteSource::Registry(_) => panic!("expected GitHub source: {source}"),
+        }
+    }
+
+    fn registry_source(source: &str) -> RegistrySource {
+        match provider_source(source) {
+            RemoteSource::Registry(source) => source,
+            RemoteSource::GithubDirect(_) => panic!("expected registry source: {source}"),
+        }
+    }
 
     fn captured_listing(raw: &[u8]) -> Vec<u8> {
         let mut listing: serde_json::Value = serde_json::from_slice(raw).unwrap();
@@ -7311,7 +7322,7 @@ mod tests {
         let mut lock = LockFile::default();
         resolve_provider_with_http(
             base_dir,
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock,
@@ -7683,7 +7694,7 @@ mod tests {
         let mut lock = signed_fixture_legacy_lock(dir.path());
         fs::remove_file(cache_path_wasm(
             dir.path(),
-            "carina-rs/aws",
+            &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         ))
         .unwrap();
@@ -7691,7 +7702,7 @@ mod tests {
         let http = signed_fixture_registry();
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_CANDIDATE_VERSION,
             "aws",
             &mut lock,
@@ -7780,14 +7791,14 @@ mod tests {
             let mut lock = signed_fixture_legacy_lock(dir.path());
             fs::remove_file(cache_path_wasm(
                 dir.path(),
-                "carina-rs/aws",
+                &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
             ))
             .unwrap();
 
             let error = resolve_provider_with_http(
                 dir.path(),
-                "carina-rs/aws",
+                &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_CANDIDATE_VERSION,
                 "aws",
                 &mut lock,
@@ -7809,14 +7820,18 @@ mod tests {
     fn downloaded_legacy_artifact_hash_mismatch_fails_closed_and_removes_cache_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut lock = signed_fixture_legacy_lock(dir.path());
-        let locked_path = cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION);
+        let locked_path = cache_path_wasm(
+            dir.path(),
+            &source_key("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
+        );
         fs::remove_file(&locked_path).unwrap();
         let http = signed_fixture_registry()
             .downloadable_bytes(SIGNED_FIXTURE_LOCKED_ARTIFACT_URL, b"tampered".to_vec());
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_CANDIDATE_VERSION,
             "aws",
             &mut lock,
@@ -7845,13 +7860,17 @@ mod tests {
     fn cached_legacy_artifact_is_hash_checked_before_signature_verification() {
         let dir = tempfile::tempdir().unwrap();
         let mut lock = signed_fixture_legacy_lock(dir.path());
-        let locked_path = cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION);
+        let locked_path = cache_path_wasm(
+            dir.path(),
+            &source_key("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
+        );
         fs::write(&locked_path, b"tampered cached artifact").unwrap();
         let http = signed_fixture_registry();
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_CANDIDATE_VERSION,
             "aws",
             &mut lock,
@@ -7942,14 +7961,14 @@ mod tests {
             let mut lock = signed_fixture_legacy_lock(dir.path());
             fs::remove_file(cache_path_wasm(
                 dir.path(),
-                "carina-rs/aws",
+                &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
             ))
             .unwrap();
 
             let error = resolve_provider_with_http(
                 dir.path(),
-                "carina-rs/aws",
+                &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_CANDIDATE_VERSION,
                 "aws",
                 &mut lock,
@@ -8031,10 +8050,7 @@ mod tests {
         let artifact_url = download["download_url"].as_str().unwrap();
         let http = captured_registry_base(captured_listing(CAPTURED_AWS_LISTING))
             .json(endpoint, CAPTURED_AWS_PRERELEASE_DOWNLOAD);
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let mut lock = LockFile::default();
 
         let error = resolve_registry_revision_with_http(
@@ -8711,10 +8727,7 @@ transparency_log_present = false
     }
 
     fn assert_known_yank_is_still_refused(lock: &LockFile) {
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let known = lock.known_registry_ratchets("carina-rs/aws").unwrap();
         assert!(
             known.yanked_versions.contains("0.4.0"),
@@ -8784,7 +8797,7 @@ transparency_log_present = false
     fn provider_config(source: &str, revision: Option<&str>) -> ProviderConfig {
         ProviderConfig {
             name: "awscc".into(),
-            source: Some(source.into()),
+            source: Some(source.parse().unwrap()),
             version: None,
             revision: revision.map(|r| r.into()),
             attributes: IndexMap::new(),
@@ -8876,7 +8889,8 @@ transparency_log_present = false
 
     #[test]
     fn download_url_wasm_builds_wasm_url() {
-        let url = download_url_wasm("github.com/carina-rs/carina-provider-awscc", "0.1.0").unwrap();
+        let source = github_source("github.com/carina-rs/carina-provider-awscc");
+        let url = download_url_wasm(&source, "0.1.0");
         assert_eq!(
             url,
             "https://github.com/carina-rs/carina-provider-awscc/releases/download/v0.1.0/carina-provider-awscc-v0.1.0.wasm"
@@ -8884,20 +8898,27 @@ transparency_log_present = false
     }
 
     #[test]
-    fn download_url_wasm_rejects_invalid_source() {
-        assert!(download_url_wasm("invalid-source", "0.1.0").is_err());
-    }
-
-    #[test]
-    fn cache_path_wasm_lays_out_project_local_directory() {
+    fn cache_path_wasm_preserves_github_and_registry_layouts() {
         let base = Path::new("/tmp/project");
-        let source = "github.com/carina-rs/carina-provider-awscc";
-        assert_eq!(
-            cache_path_wasm(base, source, "0.1.0"),
-            PathBuf::from(
-                "/tmp/project/.carina/providers/github.com/carina-rs/carina-provider-awscc/0.1.0/carina-provider-awscc.wasm"
-            )
-        );
+        for (source, expected) in [
+            (
+                "github.com/carina-rs/carina-provider-awscc",
+                "/tmp/project/.carina/providers/github.com/carina-rs/carina-provider-awscc/0.1.0/carina-provider-awscc.wasm",
+            ),
+            (
+                "carina-rs/awscc",
+                "/tmp/project/.carina/providers/carina-rs/awscc/0.1.0/awscc.wasm",
+            ),
+            (
+                "registry.example.com/carina-rs/awscc",
+                "/tmp/project/.carina/providers/registry.example.com/carina-rs/awscc/0.1.0/awscc.wasm",
+            ),
+        ] {
+            assert_eq!(
+                cache_path_wasm(base, &source_key(source), "0.1.0"),
+                PathBuf::from(expected)
+            );
+        }
     }
 
     /// Issue #2032: when `resolve_provider` hits the project-local WASM cache,
@@ -8911,7 +8932,7 @@ transparency_log_present = false
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
 
-        let wasm_path = cache_path_wasm(base, source, version);
+        let wasm_path = cache_path_wasm(base, &source_key(source), version);
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::File::create(&wasm_path)
             .unwrap()
@@ -8919,7 +8940,14 @@ transparency_log_present = false
             .unwrap();
 
         let mut lock_file = LockFile::default();
-        resolve_provider(base, source, version, "awscc", &mut lock_file).unwrap();
+        resolve_provider(
+            base,
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock_file,
+        )
+        .unwrap();
 
         let entry = lock_file
             .find_by_source(source)
@@ -10410,10 +10438,7 @@ discovery_pin_present = false
             "an empty migration must not prescribe authorization: {report}"
         );
 
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let http = FakeRegistryHttp::default().json(
             "https://registry.carina-rs.dev/.well-known/carina.json",
             r#"{"providers.v1":"/v2/providers/"}"#,
@@ -10505,10 +10530,7 @@ discovery_pin_present = false
             Path::new("carina-providers.lock"),
         )
         .expect("v2 migration must keep recovery commands reachable");
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let http = FakeRegistryHttp::default().json(
             "https://registry.carina-rs.dev/.well-known/carina.json",
             r#"{"providers.v1":"/v2/providers/"}"#,
@@ -10870,14 +10892,12 @@ discovery_pin_present = true
 
         assert_eq!(lock.registry_host.len(), 1);
         for (_, source, version, shasum) in providers {
-            let source = match parse_provider_source(source).unwrap() {
-                ProviderSource::Registry(source) => source,
-                ProviderSource::GithubDirect { .. } => unreachable!(),
-            };
+            let source = registry_source(source);
+            let source_key = RemoteSource::Registry(source.clone()).source_key();
             let mut persistent = PersistentLockFile::new(&mut lock, dir.path());
             verify_registry_lock_pin(
                 &mut persistent,
-                &source,
+                &source_key,
                 version,
                 shasum,
                 &resolved,
@@ -10902,10 +10922,7 @@ discovery_pin_present = true
         pin.api_base_url = "https://EVIL.example.com/v1/providers/".into();
 
         for (_, source, _, _) in providers {
-            let source = match parse_provider_source(source).unwrap() {
-                ProviderSource::Registry(source) => source,
-                ProviderSource::GithubDirect { .. } => unreachable!(),
-            };
+            let source = registry_source(source);
             let error = match super::resolve_registry(
                 &source,
                 lock.registry_host.get(hostname),
@@ -10932,7 +10949,7 @@ discovery_pin_present = true
                 )),
                 "{error}"
             );
-            assert!(!error.contains(&source.source_key()), "{error}");
+            assert!(!error.contains(source.source_key().as_str()), "{error}");
         }
     }
 
@@ -10942,10 +10959,8 @@ discovery_pin_present = true
             "old.registry.example",
             RegistrySignatureProtection::NotRequired,
         );
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
+        let source_key = RemoteSource::Registry(source.clone()).source_key();
         let resolved = resolved_registry(
             "registry.carina-rs.dev",
             "https://registry.carina-rs.dev/v1/providers/",
@@ -10953,7 +10968,7 @@ discovery_pin_present = true
         let mut persistent = PersistentLockFile::new(&mut lock, Path::new("."));
         let error = match verify_registry_lock_pin(
             &mut persistent,
-            &source,
+            &source_key,
             "0.5.0",
             "pinned-shasum",
             &resolved,
@@ -10977,10 +10992,7 @@ discovery_pin_present = true
     #[test]
     fn discovery_values_mismatch_reports_the_host_and_repin_operation() {
         let project_dir = tempfile::tempdir().unwrap();
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let locked_pin = discovery_pin_with_unconsumed_values(
             "https://registry.carina-rs.dev/v1/providers/",
             [("modules.v1", "opaque-retained-value-from-a-newer-client")],
@@ -11927,10 +11939,7 @@ transparency_log_present = false
             "retained unconsumed values must not re-arm the consumed API-base pin"
         );
 
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let resolved = resolve_registry(
             &source,
             Some(reloaded_host),
@@ -12006,10 +12015,8 @@ transparency_log_present = false
             .unwrap()
             .commit()
             .unwrap();
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
+        let source_key = RemoteSource::Registry(source.clone()).source_key();
         let registry = resolved_registry(
             "registry.carina-rs.dev",
             "https://registry.carina-rs.dev/v1/providers/",
@@ -12018,7 +12025,7 @@ transparency_log_present = false
 
         let error = match verify_registry_lock_pin(
             &mut persistent,
-            &source,
+            &source_key,
             "0.5.0",
             "pinned-shasum",
             &registry,
@@ -12080,10 +12087,7 @@ transparency_log_present = false
 
     #[test]
     fn rebootstrap_makes_missing_sequence_first_contact_instead_of_downgrade() {
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let listing_without_sequence = RegistryVersions {
             sequence: None,
             valid_until: Some("2999-01-01T00:00:00Z".into()),
@@ -12458,10 +12462,7 @@ transparency_log_present = true
                 "registry.example.test",
             ),
         ] {
-            let registry_source = match parse_provider_source(source).unwrap() {
-                ProviderSource::Registry(source) => source,
-                ProviderSource::GithubDirect { .. } => unreachable!(),
-            };
+            let registry_source = registry_source(source);
             let validated = ValidatedRegistryListing::validate(
                 &registry_source,
                 &RegistryVersions {
@@ -12480,7 +12481,7 @@ transparency_log_present = true
             persistent
                 .upsert_registry_provider(RegistryProviderLockEntry {
                     name: name.into(),
-                    source: source.into(),
+                    source: source_key(source),
                     kind: LockEntryKind::Version {
                         version: "1.0.0".into(),
                         constraint: None,
@@ -12656,7 +12657,7 @@ transparency_log_present = true
 
         let error = verify_or_record_version_cache(
             &artifact,
-            "github.com/acme/aws",
+            &source_key("github.com/acme/aws"),
             "1.0.0",
             "aws",
             &mut lock,
@@ -12728,7 +12729,7 @@ transparency_log_present = true
         lock.upsert(revision_entry(source, "main", "deadbeefcafe"));
 
         assert!(
-            try_reuse_locked_version(source, None, &lock).is_none(),
+            try_reuse_locked_version(&source_key(source), None, &lock).is_none(),
             "revision-mode lock entries must not be reused for version-mode configs"
         );
     }
@@ -12740,7 +12741,7 @@ transparency_log_present = true
         lock.upsert(version_entry(source, "0.5.2"));
 
         assert_eq!(
-            try_reuse_locked_version(source, None, &lock),
+            try_reuse_locked_version(&source_key(source), None, &lock),
             Some("0.5.2".to_string())
         );
     }
@@ -12761,7 +12762,7 @@ transparency_log_present = true
         });
 
         assert!(
-            try_reuse_locked_version(source, None, &lock).is_none(),
+            try_reuse_locked_version(&source_key(source), None, &lock).is_none(),
             "unconstrained version-mode configs must not reuse registry-revision locks"
         );
     }
@@ -12773,7 +12774,7 @@ transparency_log_present = true
         lock.upsert(version_entry(source, "0.5.0"));
 
         assert_eq!(
-            try_reuse_locked_version(source, None, &lock),
+            try_reuse_locked_version(&source_key(source), None, &lock),
             Some("0.5.0".into())
         );
     }
@@ -12787,7 +12788,7 @@ transparency_log_present = true
         let source = format!("file://{}", wasm_path.display());
         let providers = vec![ProviderConfig {
             name: "test".into(),
-            source: Some(source.clone()),
+            source: Some(source.parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
@@ -12817,7 +12818,7 @@ transparency_log_present = true
         let tmp = tempfile::tempdir().unwrap();
         let providers = vec![ProviderConfig {
             name: "test".into(),
-            source: Some("file:///nonexistent/path.wasm".into()),
+            source: Some("file:///nonexistent/path.wasm".parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
@@ -13016,13 +13017,19 @@ transparency_log_present = true
         let dir = tempfile::tempdir().unwrap();
         let source = "github.com/carina-test-only/provider";
         let version = "1.2.3";
-        let wasm_url = download_url_wasm(source, version).unwrap();
+        let wasm_url = download_url_wasm(&github_source(source), version);
         let http = FakeRegistryHttp::default();
         let mut lock_file = LockFile::default();
 
-        let error =
-            resolve_provider_with_http(dir.path(), source, version, "test", &mut lock_file, &http)
-                .expect_err("a failed WASM download must be returned directly");
+        let error = resolve_provider_with_http(
+            dir.path(),
+            &provider_source(source),
+            version,
+            "test",
+            &mut lock_file,
+            &http,
+        )
+        .expect_err("a failed WASM download must be returned directly");
 
         assert_eq!(error, format!("unexpected test download URL: {wasm_url}"));
         assert_eq!(http.request_count(&wasm_url), 1);
@@ -13912,7 +13919,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -13938,7 +13945,7 @@ transparency_log_present = true
         );
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut reloaded,
@@ -13955,10 +13962,7 @@ transparency_log_present = true
         const ARTIFACT: &[u8] = b"version-selection ratchet artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let config = provider_config("carina-rs/aws", None);
         let lock_path = dir.path().join("carina-providers.lock");
         let mut lock_file = LockFile::default();
@@ -13971,6 +13975,7 @@ transparency_log_present = true
         let selected = resolve_registry_version_with_http(
             dir.path(),
             &source,
+            &source_key("carina-rs/aws"),
             &config.name,
             config.version.as_ref(),
             &mut lock_file,
@@ -13995,6 +14000,7 @@ transparency_log_present = true
         let selected = resolve_registry_version_with_http(
             dir.path(),
             &source,
+            &source_key("carina-rs/aws"),
             &config.name,
             config.version.as_ref(),
             &mut reloaded,
@@ -14085,7 +14091,7 @@ transparency_log_present = true
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -14121,7 +14127,7 @@ transparency_log_present = true
             );
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.4.0",
             "aws",
             &mut lock_round1,
@@ -14145,7 +14151,7 @@ transparency_log_present = true
             );
         let result = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.4.0",
             "aws",
             &mut lock_round2,
@@ -14172,7 +14178,7 @@ transparency_log_present = true
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -14196,7 +14202,7 @@ transparency_log_present = true
         );
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -14223,7 +14229,7 @@ transparency_log_present = true
         );
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -14242,10 +14248,7 @@ transparency_log_present = true
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
         let versions_url = "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions";
-        let source = match parse_provider_source("carina-rs/aws").unwrap() {
-            ProviderSource::Registry(source) => source,
-            ProviderSource::GithubDirect { .. } => unreachable!(),
-        };
+        let source = registry_source("carina-rs/aws");
         let config = provider_config("carina-rs/aws", None);
         let mut lock_file = LockFile::default();
         let selection_http = registry_http(ARTIFACT, &shasum).json(
@@ -14256,6 +14259,7 @@ transparency_log_present = true
         let selected = resolve_registry_version_with_http(
             dir.path(),
             &source,
+            &source_key("carina-rs/aws"),
             &config.name,
             config.version.as_ref(),
             &mut lock_file,
@@ -14270,7 +14274,7 @@ transparency_log_present = true
         );
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             &selected,
             "aws",
             &mut lock_file,
@@ -14291,7 +14295,7 @@ transparency_log_present = true
 
         let path = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14334,7 +14338,7 @@ transparency_log_present = true
             let mut lock_file = LockFile::default();
             resolve_provider_with_http(
                 dir.path(),
-                "carina-rs/aws",
+                &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
                 "aws",
                 &mut lock_file,
@@ -14343,7 +14347,7 @@ transparency_log_present = true
             .unwrap();
             resolve_provider_with_http(
                 dir.path(),
-                "carina-rs/aws",
+                &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
                 "aws",
                 &mut lock_file,
@@ -14372,7 +14376,7 @@ transparency_log_present = true
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14381,7 +14385,7 @@ transparency_log_present = true
         .unwrap();
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14410,7 +14414,7 @@ transparency_log_present = true
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14483,7 +14487,7 @@ transparency_log_present = true
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14503,7 +14507,12 @@ transparency_log_present = true
             before
         );
         assert!(
-            !cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION).exists(),
+            !cache_path_wasm(
+                dir.path(),
+                &source_key("carina-rs/aws"),
+                SIGNED_FIXTURE_VERSION
+            )
+            .exists(),
             "an artifact rejected with SourceMismatch must not remain cached"
         );
     }
@@ -14515,7 +14524,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14532,7 +14541,7 @@ transparency_log_present = true
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14586,7 +14595,7 @@ transparency_log_present = true
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14617,7 +14626,7 @@ transparency_log_present = true
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14630,7 +14639,7 @@ transparency_log_present = true
         assert_eq!(
             fs::read(cache_path_wasm(
                 dir.path(),
-                "carina-rs/aws",
+                &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION
             ))
             .unwrap(),
@@ -14653,7 +14662,7 @@ transparency_log_present = true
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14667,7 +14676,7 @@ transparency_log_present = true
         assert_eq!(
             fs::read(cache_path_wasm(
                 dir.path(),
-                "carina-rs/aws",
+                &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION
             ))
             .unwrap(),
@@ -14689,7 +14698,7 @@ transparency_log_present = true
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -14718,7 +14727,7 @@ transparency_log_present = true
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -14742,7 +14751,7 @@ transparency_log_present = true
 
         let path = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -14819,7 +14828,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14835,7 +14844,14 @@ transparency_log_present = false
             )),
             "{error}"
         );
-        assert!(!cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION).exists());
+        assert!(
+            !cache_path_wasm(
+                dir.path(),
+                &source_key("carina-rs/aws"),
+                SIGNED_FIXTURE_VERSION
+            )
+            .exists()
+        );
     }
 
     #[test]
@@ -14852,7 +14868,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14878,7 +14894,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14903,7 +14919,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14914,7 +14930,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14942,7 +14958,11 @@ transparency_log_present = false
             !error.contains("Sigstore signature verification failed"),
             "{error}"
         );
-        let wasm_path = cache_path_wasm(dir.path(), "carina-rs/aws", SIGNED_FIXTURE_VERSION);
+        let wasm_path = cache_path_wasm(
+            dir.path(),
+            &source_key("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
+        );
         assert_eq!(fs::read(wasm_path).unwrap(), SIGNED_FIXTURE_ARTIFACT);
         assert_eq!(
             http.request_count("https://downloads.example.test/aws.wasm"),
@@ -14965,7 +14985,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -14996,7 +15016,7 @@ transparency_log_present = false
         assert_eq!(
             fs::read(cache_path_wasm(
                 dir.path(),
-                "carina-rs/aws",
+                &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION
             ))
             .unwrap(),
@@ -15018,7 +15038,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -15045,7 +15065,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
             "aws",
             &mut lock_file,
@@ -15072,7 +15092,7 @@ transparency_log_present = false
 
         let path = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15113,7 +15133,7 @@ transparency_log_present = false
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15123,7 +15143,7 @@ transparency_log_present = false
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15143,7 +15163,7 @@ transparency_log_present = false
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15153,7 +15173,7 @@ transparency_log_present = false
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15172,7 +15192,7 @@ transparency_log_present = false
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15189,7 +15209,7 @@ transparency_log_present = false
         );
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15271,7 +15291,7 @@ transparency_log_present = false
         let api_base_url = "https://registry.carina-rs.dev/v1/providers/";
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15290,7 +15310,7 @@ transparency_log_present = false
         );
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15317,7 +15337,7 @@ transparency_log_present = false
 
         resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15330,7 +15350,7 @@ transparency_log_present = false
 
         let error = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15388,7 +15408,7 @@ transparency_log_present = false
             .downloadable_bytes("https://downloads.example.test/aws-main.wasm", body);
         let config = ProviderConfig {
             name: "aws".into(),
-            source: Some("carina-rs/aws".into()),
+            source: Some("carina-rs/aws".parse().unwrap()),
             version: None,
             revision: Some("main".into()),
             attributes: IndexMap::new(),
@@ -15471,7 +15491,7 @@ transparency_log_present = false
             .downloadable_bytes("https://downloads.example.test/aws-main-10.wasm", new_body);
         let config = ProviderConfig {
             name: "aws".into(),
-            source: Some("carina-rs/aws".into()),
+            source: Some("carina-rs/aws".parse().unwrap()),
             version: None,
             revision: Some("main".into()),
             attributes: IndexMap::new(),
@@ -15551,7 +15571,7 @@ transparency_log_present = false
             .downloadable_bytes("https://downloads.example.test/aws-main-1.wasm", body);
             let config = ProviderConfig {
                 name: "aws".into(),
-                source: Some("carina-rs/aws".into()),
+                source: Some("carina-rs/aws".parse().unwrap()),
                 version: None,
                 revision: Some("main".into()),
                 attributes: IndexMap::new(),
@@ -15627,7 +15647,7 @@ transparency_log_present = false
             );
         let config = ProviderConfig {
             name: "aws".into(),
-            source: Some("carina-rs/aws".into()),
+            source: Some("carina-rs/aws".parse().unwrap()),
             version: None,
             revision: Some("main".into()),
             attributes: IndexMap::new(),
@@ -15694,7 +15714,7 @@ transparency_log_present = false
             .downloadable_bytes("https://downloads.example.test/aws-main-1.wasm", body);
         let config = ProviderConfig {
             name: "aws".into(),
-            source: Some("carina-rs/aws".into()),
+            source: Some("carina-rs/aws".parse().unwrap()),
             version: None,
             revision: Some("main".into()),
             attributes: IndexMap::new(),
@@ -15711,31 +15731,6 @@ transparency_log_present = false
     }
 
     #[test]
-    fn github_direct_revision_does_not_use_registry_resolution() {
-        let config = ProviderConfig {
-            name: "aws".into(),
-            source: None,
-            version: None,
-            revision: Some("main".into()),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-        };
-
-        assert_eq!(
-            registry_revision("github.com/carina-rs/carina-provider-aws", &config),
-            Ok(None),
-            "github-direct revisions must not route through registry resolution"
-        );
-        assert_eq!(
-            registry_revision("carina-rs/aws", &config),
-            Ok(Some("main")),
-            "registry source revisions must route through registry resolution"
-        );
-    }
-
-    #[test]
     fn registry_source_rejects_wasm_when_registry_shasum_mismatches() {
         let dir = tempfile::tempdir().unwrap();
         let http = registry_http(
@@ -15746,7 +15741,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15771,13 +15766,13 @@ transparency_log_present = false
         let shasum = sha256_bytes(body);
         let http = registry_http(body, &shasum);
         let mut lock_file = LockFile::default();
-        let cached_path = cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0");
+        let cached_path = cache_path_wasm(dir.path(), &source_key("carina-rs/aws"), "0.5.0");
         fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
         fs::write(&cached_path, b"stale cached wasm bytes").unwrap();
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15844,7 +15839,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15897,7 +15892,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15943,7 +15938,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -15989,7 +15984,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -16044,7 +16039,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -16121,7 +16116,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.6.0",
             "aws",
             &mut lock_file,
@@ -16181,7 +16176,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "registry.carina-rs.dev/carina-rs/aws",
+            &provider_source("registry.carina-rs.dev/carina-rs/aws"),
             "0.6.0",
             "aws",
             &mut lock_file,
@@ -16233,7 +16228,7 @@ transparency_log_present = false
 
             let installed_path = resolve_provider_with_http(
                 dir.path(),
-                installed_source,
+                &provider_source(installed_source),
                 "0.5.0",
                 "aws",
                 &mut lock_file,
@@ -16251,7 +16246,7 @@ transparency_log_present = false
             assert_eq!(found_path.path().as_path(), installed_path.as_path());
             assert_eq!(
                 installed_path.as_path(),
-                cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")
+                cache_path_wasm(dir.path(), &source_key("carina-rs/aws"), "0.5.0")
             );
             assert_eq!(lock_file.provider.len(), 1);
             assert_eq!(lock_file.provider[0].source, "carina-rs/aws");
@@ -16272,7 +16267,7 @@ transparency_log_present = false
 
             let installed_path = resolve_provider_with_http(
                 dir.path(),
-                installed_source,
+                &provider_source(installed_source),
                 "0.5.0",
                 "aws",
                 &mut lock_file,
@@ -16321,7 +16316,7 @@ transparency_log_present = false
 
             let installed_path = resolve_provider_with_http(
                 dir.path(),
-                installed_source,
+                &provider_source(installed_source),
                 "0.5.0",
                 "aws",
                 &mut lock_file,
@@ -16395,7 +16390,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -16418,7 +16413,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -16439,7 +16434,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -16556,7 +16551,7 @@ transparency_log_present = false
 
         let err = resolve_provider_with_http(
             dir.path(),
-            "Registry.Carina-RS.dev/carina-rs/aws",
+            &provider_source("Registry.Carina-RS.dev/carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -16591,7 +16586,7 @@ transparency_log_present = false
 
         let path = resolve_provider_with_http(
             dir.path(),
-            "carina-rs/aws",
+            &provider_source("carina-rs/aws"),
             "0.5.0",
             "aws",
             &mut lock_file,
@@ -16612,6 +16607,41 @@ transparency_log_present = false
     fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn global_cache_path_wasm_preserves_github_and_registry_layouts() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CARINA_PLUGIN_CACHE_DIR");
+        // SAFETY: env_lock() serializes every test in this module that mutates
+        // CARINA_PLUGIN_CACHE_DIR.
+        unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", root.path()) };
+
+        for (source, relative) in [
+            (
+                "github.com/carina-rs/carina-provider-awscc",
+                "github.com/carina-rs/carina-provider-awscc/0.1.0/carina-provider-awscc.wasm",
+            ),
+            ("carina-rs/awscc", "carina-rs/awscc/0.1.0/awscc.wasm"),
+            (
+                "registry.example.com/carina-rs/awscc",
+                "registry.example.com/carina-rs/awscc/0.1.0/awscc.wasm",
+            ),
+        ] {
+            assert_eq!(
+                global_cache_path_wasm(&source_key(source), "0.1.0").unwrap(),
+                root.path().join(relative)
+            );
+        }
+
+        // SAFETY: still holding env_lock().
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", value) },
+            None => unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") },
+        }
     }
 
     /// Issue #2018: a lock file + global-cache hit must not mask a missing
@@ -16636,7 +16666,8 @@ transparency_log_present = false
         lock.save(&lock_path).unwrap();
 
         let global_wasm =
-            crate::revision_resolver::global_cache_path_revision(source, sha).unwrap();
+            crate::revision_resolver::global_cache_path_revision(&github_source(source), sha)
+                .unwrap();
         fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
         fs::File::create(&global_wasm)
             .unwrap()
@@ -16670,7 +16701,7 @@ transparency_log_present = false
         lock.upsert(version_entry(source, version));
         lock.save(&lock_path).unwrap();
 
-        let global_wasm = global_cache_path_wasm(source, version).unwrap();
+        let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
         fs::File::create(&global_wasm)
             .unwrap()
@@ -16860,7 +16891,7 @@ transparency_log_present = false
         let base = tmp.path();
         let source = "carina-rs/aws";
         let version = "0.0.0-main.10.bbb";
-        let wasm_path = cache_path_wasm(base, source, version);
+        let wasm_path = cache_path_wasm(base, &source_key(source), version);
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, b"registry revision wasm").unwrap();
 
@@ -16894,7 +16925,11 @@ transparency_log_present = false
         let source = "github.com/carina-rs/carina-provider-awscc";
         let revision = "main";
         let resolved_sha = "deadbeefcafe1234567890";
-        let wasm_path = crate::revision_resolver::cache_path_revision(base, source, resolved_sha);
+        let wasm_path = crate::revision_resolver::cache_path_revision(
+            base,
+            &github_source(source),
+            resolved_sha,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, b"stale provider wasm").unwrap();
 
@@ -16952,7 +16987,7 @@ transparency_log_present = false
     fn versioned_config(source: &str, constraint: &str) -> ProviderConfig {
         ProviderConfig {
             name: "awscc".into(),
-            source: Some(source.into()),
+            source: Some(source.parse().unwrap()),
             version: Some(
                 carina_core::version_constraint::VersionConstraint::parse(constraint).unwrap(),
             ),
@@ -17205,7 +17240,7 @@ transparency_log_present = false
         });
         let cfg = ProviderConfig {
             name: "test".into(),
-            source: Some("file:///tmp/provider.wasm".into()),
+            source: Some("file:///tmp/provider.wasm".parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),

@@ -153,8 +153,7 @@ mod tests {
             resource_type: "test.Widget".to_string(),
             attributes: Vec::new(),
             binding_name: "widgets".to_string(),
-            iterable_binding: "upstream".to_string(),
-            iterable_attr: "items".to_string(),
+            iterable: Value::resource_ref("upstream", "items", Vec::new()),
             binding: ForBinding::Simple("item".to_string()),
             template_resource: Resource::new("test.Widget", "widgets"),
         }

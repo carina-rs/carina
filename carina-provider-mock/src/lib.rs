@@ -1505,7 +1505,7 @@ mod tests {
         assert!(!uses_builtin_provider([&source_less], |_| true));
 
         let mut sourced = source_less.clone();
-        sourced.source = Some("file:///missing/mock.wasm".to_string());
+        sourced.source = Some("file:///missing/mock.wasm".parse().unwrap());
         assert!(!uses_builtin_provider([&sourced], |_| false));
 
         let mut named = source_less.clone();

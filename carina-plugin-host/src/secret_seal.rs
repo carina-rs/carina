@@ -316,6 +316,9 @@ impl Unsealer {
                     TokenIndex::Mangled => false,
                 }
             }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                self.restore_value(value) && self.restore_value(default)
+            }
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -455,6 +458,7 @@ fn preserve_equal_json_subtrees(
             | Value::Deferred(
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
+                | DeferredValue::Coalesce { .. }
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
