@@ -11,11 +11,15 @@ use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
 use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
-use carina_core::deps::sort_resources_by_dependencies;
+use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
+use carina_core::deps::{
+    get_composition_dependencies, get_data_source_dependencies, get_resource_dependencies,
+    sort_resources_by_dependencies,
+};
 use carina_core::differ::{
     Orphan, Orphans, PlanPriorStates, binding_matches_deferred_template, into_all_prior_states,
     lift_prior_state_enum_leaves, provider_states_for, rekey_current_for_move,
-    transform_prior_provider_states,
+    transform_prior_managed_provider_states, transform_prior_provider_states,
 };
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
@@ -51,7 +55,7 @@ use carina_core::provider::{
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
-    Composition, ConcreteValue, Current, DataSource, DeferredValue, ResolvedResource,
+    Composition, ConcreteValue, Current, DataSource, DeferredValue, ModuleSource, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, ResourceIdentityError, State,
     Value,
 };
@@ -61,6 +65,7 @@ use carina_core::schema::{
     BlockNameConflict, CustomTypeLookup, ResourceSchema, SchemaRegistry, TypeError,
     resolve_config_block_names_with_schemas, resolve_file_block_names_with_schemas,
 };
+use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
 use carina_state::{BackendError, LoadedOrphans, StateFile};
@@ -86,7 +91,7 @@ pub struct PlanContext {
     /// saved-plan apply can reconstruct the same deferred-read set.
     pub data_sources: Vec<DataSource>,
     pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_states: HashMap<ResourceId, State>,
+    pub data_source_values: DataSourceValues,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
     /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
     pub moved_origins: HashMap<ResourceId, ResourceId>,
@@ -1173,17 +1178,37 @@ pub struct PlanPreprocessor<'a> {
     ctx: &'a WiringContext,
 }
 
-pub(crate) async fn hydrate_prior_states(
+pub(crate) async fn hydrate_prior_managed_states(
     managed_current: &mut HashMap<ResourceId, Current>,
-    data_source_states: &mut HashMap<ResourceId, State>,
     orphans: &mut Orphans,
     normalizer: &dyn ProviderNormalizer,
     saved_attrs: &LiftedSavedAttrs,
     state_file: Option<&StateFile>,
 ) -> Result<(), ProviderError> {
+    transform_prior_managed_provider_states(managed_current, orphans, async |states| {
+        normalizer
+            .hydrate_read_state(states, saved_attrs.as_provider_saved_attrs())
+            .await?;
+        if let Some(state_file) = state_file {
+            state_file.restore_partial_read_markers(states);
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub(crate) async fn hydrate_prior_data_source_values(
+    managed_current: &mut HashMap<ResourceId, Current>,
+    data_source_values: &mut DataSourceValues,
+    orphans: &mut Orphans,
+    normalizer: &dyn ProviderNormalizer,
+    saved_attrs: &LiftedSavedAttrs,
+    state_file: Option<&StateFile>,
+) -> Result<(), ProviderError> {
+    let mut read_states = data_source_values.read_states_map();
     transform_prior_provider_states(
         managed_current,
-        data_source_states,
+        &mut read_states,
         orphans,
         async |states| {
             normalizer
@@ -1195,16 +1220,37 @@ pub(crate) async fn hydrate_prior_states(
             Ok(())
         },
         async |states| {
-            // Data sources have no persisted managed row of their own. Keep
-            // same-ID orphan attributes and partial-read metadata confined to
-            // the managed/orphan transform above.
             let empty_saved_attrs = provider_mod::SavedAttrs::new();
             normalizer
                 .hydrate_read_state(states, &empty_saved_attrs)
                 .await
         },
     )
-    .await
+    .await?;
+    data_source_values
+        .merge_read_states(&read_states)
+        .map_err(|error| ProviderError::internal(error.to_string()))?;
+    Ok(())
+}
+
+pub(crate) fn lift_data_source_value_enum_leaves(
+    data_source_values: &mut DataSourceValues,
+    data_sources: &[DataSource],
+    schemas: &SchemaRegistry,
+) {
+    let schemas_by_id = data_sources
+        .iter()
+        .filter_map(|data_source| {
+            schemas
+                .get_for_data_source(data_source)
+                .map(|schema| (&data_source.id, schema))
+        })
+        .collect::<HashMap<_, _>>();
+    for (id, state) in data_source_values.iter_read_states_mut() {
+        if let Some(schema) = schemas_by_id.get(id) {
+            carina_core::utils::lift_state_enum_leaves(&mut state.attributes, schema);
+        }
+    }
 }
 
 async fn normalize_prior_states(
@@ -1239,6 +1285,20 @@ async fn normalize_prior_states(
         },
     )
     .await
+}
+
+async fn normalize_prior_data_source_values(
+    managed_current: &mut HashMap<ResourceId, Current>,
+    data_source_values: &mut DataSourceValues,
+    orphans: &mut Orphans,
+    normalizer: &dyn ProviderNormalizer,
+) -> Result<(), ProviderError> {
+    let mut read_states = data_source_values.read_states_map();
+    normalize_prior_states(managed_current, &mut read_states, orphans, normalizer).await?;
+    data_source_values
+        .merge_read_states(&read_states)
+        .map_err(|error| ProviderError::internal(error.to_string()))?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1401,7 +1461,7 @@ fn append_resolved_value_constraint_errors(
     }
 }
 
-fn module_constraint_plan_errors(
+pub(crate) fn module_constraint_plan_errors(
     error: carina_core::executor::ModuleConstraintGateError,
 ) -> Vec<PlanError> {
     error
@@ -1437,7 +1497,7 @@ impl<'a> PlanPreprocessor<'a> {
         resource_origins: &[Resource],
         module_gate: &carina_core::executor::ModuleConstraintGate,
         managed_current: &mut HashMap<ResourceId, Current>,
-        data_source_states: &mut HashMap<ResourceId, State>,
+        data_source_values: &mut DataSourceValues,
         orphans: &mut Orphans,
         provider_configs: &[ProviderConfig],
         data_sources: &mut [DataSource],
@@ -1466,9 +1526,9 @@ impl<'a> PlanPreprocessor<'a> {
             self.ctx,
         )
         .await?;
-        normalize_prior_states(
+        normalize_prior_data_source_values(
             managed_current,
-            data_source_states,
+            data_source_values,
             orphans,
             self.normalizer,
         )
@@ -2297,7 +2357,6 @@ pub struct ReconcileDeferredForExpansionInputs<'a, E> {
     pub provider_configs: &'a [ProviderConfig],
     pub state_block_claims: &'a StateBlockClaims,
     pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_states: HashMap<ResourceId, State>,
     pub orphans: Orphans,
     /// Addresses already read by the pre-expansion refresh pass. The prepared
     /// expansion owns this exact set so no later caller can substitute an
@@ -2310,7 +2369,6 @@ pub struct ReconcileDeferredForExpansionInputs<'a, E> {
 /// to change state-row ownership.
 pub struct PreserveDeferredForExpansionInputs {
     pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_states: HashMap<ResourceId, State>,
     pub orphans: Orphans,
     pub already_refreshed: HashSet<ResourceId>,
 }
@@ -2429,17 +2487,18 @@ impl<'state> DeferredForExpansionPrelude<'state> {
             self.state_file,
             inputs.state_block_claims,
         )?);
-        Ok(ReconciledDeferredForExpansion(DeferredForExpansionInputs {
-            sorted_resources: self.sorted_resources,
-            saved_attrs: self.saved_attrs,
-            prev_explicit: self.prev_explicit,
-            wait_aliases: self.wait_aliases,
-            moved_pairs,
-            already_refreshed: inputs.already_refreshed,
-            managed_current: inputs.managed_current,
-            data_source_states: inputs.data_source_states,
-            orphans: inputs.orphans,
-        }))
+        Ok(ReconciledDeferredForExpansion(
+            AddressedDeferredForExpansionInputs {
+                sorted_resources: self.sorted_resources,
+                saved_attrs: self.saved_attrs,
+                prev_explicit: self.prev_explicit,
+                wait_aliases: self.wait_aliases,
+                moved_pairs,
+                already_refreshed: inputs.already_refreshed,
+                managed_current: inputs.managed_current,
+                orphans: inputs.orphans,
+            },
+        ))
     }
 
     /// Preserve persisted addresses for `state refresh`. This transition is a
@@ -2449,7 +2508,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
         self,
         inputs: PreserveDeferredForExpansionInputs,
     ) -> AddressPreservingDeferredForExpansion {
-        AddressPreservingDeferredForExpansion(DeferredForExpansionInputs {
+        AddressPreservingDeferredForExpansion(AddressedDeferredForExpansionInputs {
             sorted_resources: self.sorted_resources,
             saved_attrs: self.saved_attrs,
             prev_explicit: self.prev_explicit,
@@ -2457,13 +2516,12 @@ impl<'state> DeferredForExpansionPrelude<'state> {
             moved_pairs: Vec::new(),
             already_refreshed: inputs.already_refreshed,
             managed_current: inputs.managed_current,
-            data_source_states: inputs.data_source_states,
             orphans: inputs.orphans,
         })
     }
 }
 
-struct DeferredForExpansionInputs {
+struct AddressedDeferredForExpansionInputs {
     sorted_resources: Vec<Resource>,
     saved_attrs: LiftedSavedAttrs,
     prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -2471,14 +2529,94 @@ struct DeferredForExpansionInputs {
     moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
     already_refreshed: HashSet<ResourceId>,
     managed_current: HashMap<ResourceId, Current>,
-    data_source_states: HashMap<ResourceId, State>,
     orphans: Orphans,
+}
+
+struct DeferredForExpansionInputs {
+    addressed: AddressedDeferredForExpansionInputs,
+    data_source_values: DataSourceValues,
 }
 
 /// Address-reconciled state before the plan path's data-source I/O phase has
 /// finished. This type deliberately has no expansion method: callers must
 /// populate its owned data-source snapshot and seal the complete view first.
-pub struct ReconciledDeferredForExpansion(DeferredForExpansionInputs);
+pub struct ReconciledDeferredForExpansion(AddressedDeferredForExpansionInputs);
+
+/// Inputs shared by plan, live apply, and state refresh after each path has
+/// completed its address transition and before deferred-`for` expansion.
+pub(crate) struct AddressedDataSourceReadInputs<'a, 'backend> {
+    pub provider: &'a dyn Provider,
+    pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
+    pub compositions: &'a [Composition],
+    pub data_sources: &'a [DataSource],
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub schemas: &'a SchemaRegistry,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub factories: &'a [Box<dyn ProviderFactory>],
+    pub cancel: Option<&'a ShutdownToken>,
+}
+
+async fn read_addressed_data_sources_phase2(
+    addressed: &AddressedDeferredForExpansionInputs,
+    inputs: AddressedDataSourceReadInputs<'_, '_>,
+) -> Result<ReadDataSourcesPhase2, AppError> {
+    if inputs.data_sources.is_empty() {
+        return Ok(ReadDataSourcesPhase2 {
+            values: DataSourceValues::empty(),
+            module_constraint_error: None,
+        });
+    }
+
+    let mut managed_ids = addressed
+        .sorted_resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect::<HashSet<_>>();
+    let mut occupied_bindings = addressed
+        .sorted_resources
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .collect::<HashSet<_>>();
+    let mut orphan_resources = Vec::new();
+    for (id, orphan) in &addressed.orphans {
+        if !managed_ids.insert(id.clone()) {
+            continue;
+        }
+        if let Some(binding) = orphan.binding()
+            && !occupied_bindings.insert(binding.to_string())
+        {
+            continue;
+        }
+        orphan_resources.push(orphan.binding_resource());
+    }
+    let managed = addressed
+        .sorted_resources
+        .iter()
+        .chain(orphan_resources.iter())
+        .collect::<Vec<_>>();
+
+    read_data_sources_phase2_to_fixpoint(
+        ReadDataSourcesInputs {
+            provider: inputs.provider,
+            refresh_phase: inputs.refresh_phase,
+            managed: &managed,
+            compositions: inputs.compositions,
+            data_sources: inputs.data_sources,
+            managed_current: ManagedCurrentView::with_orphans(
+                &addressed.managed_current,
+                &addressed.orphans,
+            ),
+            remote_bindings: inputs.remote_bindings,
+            schemas: inputs.schemas,
+            wait_aliases: &addressed.wait_aliases,
+            saved_dep_bindings: inputs.saved_dep_bindings,
+            factories: inputs.factories,
+            cancel: inputs.cancel,
+        },
+        Phase2DataSourceStart::Unread,
+    )
+    .await
+}
 
 impl ReconciledDeferredForExpansion {
     pub fn sorted_resources(&self) -> &[Resource] {
@@ -2497,16 +2635,8 @@ impl ReconciledDeferredForExpansion {
         &self.0.managed_current
     }
 
-    pub fn data_source_states(&self) -> &HashMap<ResourceId, State> {
-        &self.0.data_source_states
-    }
-
     pub fn orphans(&self) -> &Orphans {
         &self.0.orphans
-    }
-
-    pub fn insert_data_source_state(&mut self, id: ResourceId, state: State) {
-        self.0.data_source_states.insert(id, state);
     }
 
     pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
@@ -2517,19 +2647,51 @@ impl ReconciledDeferredForExpansion {
         &self.0.moved_pairs
     }
 
+    pub(crate) async fn read_data_sources_phase2(
+        &self,
+        inputs: AddressedDataSourceReadInputs<'_, '_>,
+    ) -> Result<ReadDataSourcesPhase2, AppError> {
+        read_addressed_data_sources_phase2(&self.0, inputs).await
+    }
+
     /// Seal the reconciled managed/data-source/orphan snapshots into the only
     /// state accepted by deferred `for` expansion.
-    pub fn seal(self) -> PreparedDeferredForExpansion {
-        PreparedDeferredForExpansion(self.0)
+    pub fn seal(self, data_source_values: DataSourceValues) -> PreparedDeferredForExpansion {
+        PreparedDeferredForExpansion(DeferredForExpansionInputs {
+            addressed: self.0,
+            data_source_values,
+        })
     }
 }
 
 /// Address-preserving state prepared specifically for `state refresh`.
-pub struct AddressPreservingDeferredForExpansion(DeferredForExpansionInputs);
+pub struct AddressPreservingDeferredForExpansion(AddressedDeferredForExpansionInputs);
 
 impl AddressPreservingDeferredForExpansion {
-    pub fn seal(self) -> PreparedDeferredForExpansion {
-        PreparedDeferredForExpansion(self.0)
+    pub fn sorted_resources(&self) -> &[Resource] {
+        &self.0.sorted_resources
+    }
+
+    pub fn managed_current(&self) -> &HashMap<ResourceId, Current> {
+        &self.0.managed_current
+    }
+
+    pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
+        &self.0.wait_aliases
+    }
+
+    pub(crate) async fn read_data_sources_phase2(
+        &self,
+        inputs: AddressedDataSourceReadInputs<'_, '_>,
+    ) -> Result<ReadDataSourcesPhase2, AppError> {
+        read_addressed_data_sources_phase2(&self.0, inputs).await
+    }
+
+    pub fn seal(self, data_source_values: DataSourceValues) -> PreparedDeferredForExpansion {
+        PreparedDeferredForExpansion(DeferredForExpansionInputs {
+            addressed: self.0,
+            data_source_values,
+        })
     }
 }
 
@@ -2544,7 +2706,7 @@ pub struct PreparedDeferredForExpansion(DeferredForExpansionInputs);
 /// callers that need both must expand first, then consume the preparation.
 pub(crate) struct PreparedDeferredForExpansionParts {
     pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_states: HashMap<ResourceId, State>,
+    pub data_source_values: DataSourceValues,
     pub orphans: Orphans,
     pub saved_attrs: LiftedSavedAttrs,
     pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -2555,13 +2717,13 @@ pub(crate) struct PreparedDeferredForExpansionParts {
 impl PreparedDeferredForExpansion {
     pub(crate) fn into_parts(self) -> PreparedDeferredForExpansionParts {
         PreparedDeferredForExpansionParts {
-            managed_current: self.0.managed_current,
-            data_source_states: self.0.data_source_states,
-            orphans: self.0.orphans,
-            saved_attrs: self.0.saved_attrs,
-            prev_explicit: self.0.prev_explicit,
-            wait_aliases: self.0.wait_aliases,
-            moved_pairs: self.0.moved_pairs,
+            managed_current: self.0.addressed.managed_current,
+            data_source_values: self.0.data_source_values,
+            orphans: self.0.addressed.orphans,
+            saved_attrs: self.0.addressed.saved_attrs,
+            prev_explicit: self.0.addressed.prev_explicit,
+            wait_aliases: self.0.addressed.wait_aliases,
+            moved_pairs: self.0.addressed.moved_pairs,
         }
     }
 }
@@ -2672,7 +2834,7 @@ pub fn derive_managed_binding_stability<E>(
     parsed: &carina_core::parser::File<E>,
     resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
-    data_source_states: &HashMap<ResourceId, State>,
+    data_source_values: &DataSourceValues,
     schemas: &carina_core::schema::SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -2687,9 +2849,8 @@ pub fn derive_managed_binding_stability<E>(
     let optimistic_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed: resources,
         compositions: &parsed.compositions,
-        data_sources: &parsed.data_sources,
         managed_current: &plan_input_current,
-        data_source_states,
+        data_source_values,
         remote_bindings,
         wait_aliases,
     });
@@ -2744,16 +2905,16 @@ impl PreparedDeferredForExpansion {
     ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
         let expansion = expand_same_config_deferred_for_target(
             &mut resources,
-            &self.0.sorted_resources,
-            &self.0.managed_current,
-            &self.0.data_source_states,
+            &self.0.addressed.sorted_resources,
+            &self.0.addressed.managed_current,
+            &self.0.data_source_values,
             schemas,
-            &self.0.saved_attrs,
-            &self.0.prev_explicit,
+            &self.0.addressed.saved_attrs,
+            &self.0.addressed.prev_explicit,
             remote_bindings,
-            &self.0.wait_aliases,
-            &self.0.moved_pairs,
-            &self.0.already_refreshed,
+            &self.0.addressed.wait_aliases,
+            &self.0.addressed.moved_pairs,
+            &self.0.addressed.already_refreshed,
             warning_policy,
         )?;
         Ok((ExpandedCanonicalResources { resources }, expansion))
@@ -2771,16 +2932,16 @@ impl PreparedDeferredForExpansion {
     ) -> Result<DeferredForExpansion, AppError> {
         expand_same_config_deferred_for_target(
             parsed,
-            &self.0.sorted_resources,
-            &self.0.managed_current,
-            &self.0.data_source_states,
+            &self.0.addressed.sorted_resources,
+            &self.0.addressed.managed_current,
+            &self.0.data_source_values,
             schemas,
-            &self.0.saved_attrs,
-            &self.0.prev_explicit,
+            &self.0.addressed.saved_attrs,
+            &self.0.addressed.prev_explicit,
             remote_bindings,
-            &self.0.wait_aliases,
-            &self.0.moved_pairs,
-            &self.0.already_refreshed,
+            &self.0.addressed.wait_aliases,
+            &self.0.addressed.moved_pairs,
+            &self.0.addressed.already_refreshed,
             warning_policy,
         )
     }
@@ -2894,7 +3055,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     target: &mut T,
     sorted_resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
-    data_source_states: &HashMap<ResourceId, State>,
+    data_source_values: &DataSourceValues,
     schemas: &carina_core::schema::SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -2930,7 +3091,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         parsed,
         sorted_resources,
         managed_current,
-        data_source_states,
+        data_source_values,
         schemas,
         saved_attrs,
         prev_explicit,
@@ -2946,9 +3107,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         PreApplyInputs {
             managed: sorted_resources,
             compositions: &parsed.compositions,
-            data_sources: &parsed.data_sources,
             managed_current: &plan_input_current,
-            data_source_states,
+            data_source_values,
             remote_bindings,
             wait_aliases,
         },
@@ -3055,7 +3215,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     sorted_resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
-    data_source_states: &HashMap<ResourceId, State>,
+    data_source_values: &DataSourceValues,
     schemas: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -3072,15 +3232,17 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         })
         .collect();
     let prepared = PreparedDeferredForExpansion(DeferredForExpansionInputs {
-        sorted_resources: sorted_resources.to_vec(),
-        saved_attrs: saved_attrs.clone(),
-        prev_explicit: prev_explicit.clone(),
-        wait_aliases: wait_aliases.to_vec(),
-        moved_pairs,
-        already_refreshed: already_refreshed.clone(),
-        managed_current: managed_current.clone(),
-        data_source_states: data_source_states.clone(),
-        orphans: Orphans::new(),
+        addressed: AddressedDeferredForExpansionInputs {
+            sorted_resources: sorted_resources.to_vec(),
+            saved_attrs: saved_attrs.clone(),
+            prev_explicit: prev_explicit.clone(),
+            wait_aliases: wait_aliases.to_vec(),
+            moved_pairs,
+            already_refreshed: already_refreshed.clone(),
+            managed_current: managed_current.clone(),
+            orphans: Orphans::new(),
+        },
+        data_source_values: data_source_values.clone(),
     });
     let mut expanded = parsed.clone();
     prepared.expand_parsed(
@@ -3108,9 +3270,9 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// 2. `refresh_resource_set` — read each materialised child through
 ///    the provider (filtered through `refreshable_child_ids` so a
 ///    `moved`-target or orphan-pre-read child is not re-read).
-/// 3. `hydrate_prior_states` over `managed_current`, `data_source_states`, and
-///    `orphans`; persisted managed attributes and partial-read markers are
-///    restored only to the managed/orphan key space.
+/// 3. Hydrate the managed/orphan and typed data-source snapshots; persisted
+///    managed attributes and partial-read markers are restored only to the
+///    managed/orphan key space.
 /// 4. `lift_prior_state_enum_leaves` on both prior-state owners using the
 ///    **post-expansion** `sorted_resources`, so enum-typed attrs on new
 ///    children are not surfaced as phantom case diffs (carina#3272).
@@ -3218,11 +3380,14 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
     // (apply/mod.rs ~1098); collapsing it into this constructor stops
     // the next caller from forgetting it.
     let DeferredForExpansionInputs {
-        managed_current,
-        data_source_states,
-        orphans,
-        saved_attrs,
-        ..
+        addressed:
+            AddressedDeferredForExpansionInputs {
+                managed_current,
+                orphans,
+                saved_attrs,
+                ..
+            },
+        data_source_values,
     } = &mut inputs.expansion.0;
     if !new_child_ids.is_empty() {
         let children = refreshable_child_ids.select(&sorted_resources, orphans);
@@ -3236,9 +3401,9 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
             managed_current,
         )
         .await?;
-        hydrate_prior_states(
+        hydrate_prior_data_source_values(
             managed_current,
-            data_source_states,
+            data_source_values,
             orphans,
             inputs.provider,
             saved_attrs,
@@ -3301,7 +3466,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let provider = get_provider_with_ctx(ctx, provider_configs, base_dir, progress_sink).await?;
 
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
-    let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
 
     // The prelude owns lifted saved attributes, authoring metadata, wait
     // aliases, and the pre-expansion resource order. It is consumed only
@@ -3318,37 +3482,36 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
     let mut orphans = Orphans::new();
 
-    let mut deferred_data_source_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
-    let mut refresh_module_constraint_errors = Vec::new();
     let progress_backend = ProgressBackend::new(progress_sink);
     let refresh_phase = refresh.then(|| RefreshPhase::start(&progress_backend));
-    let prepared_expansion = if let Some(refresh_phase) = refresh_phase.as_ref() {
+    // Provider reads do not retain Carina-only dependency metadata. Build the
+    // restoration map once so both managed refresh and the unconditional
+    // data-source phase consume the same snapshot.
+    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
+        .as_ref()
+        .map(|sf| {
+            sorted_resources
+                .iter()
+                .filter_map(|resource| {
+                    let identity = resource.id.identity_str()?;
+                    let state = sf.find_resource(
+                        &resource.id.provider,
+                        &resource.id.resource_type,
+                        identity,
+                    )?;
+                    (!state.dependency_bindings.is_empty())
+                        .then(|| (resource.id.clone(), state.dependency_bindings.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let reconciled_expansion = if let Some(refresh_phase) = refresh_phase.as_ref() {
         // Read states for all resources concurrently using the identifier from
         // state. An address with no row is absent; a persisted row without an
         // identifier remains present and invalid so planning can fail closed.
         // Skip composition resources (module attribute containers) — they have no infrastructure.
         let provider_ref = &provider;
-        // Pre-build a map of dependency_bindings from the state file so we can
-        // restore them after refresh. Provider.read() returns fresh attributes but
-        // doesn't know about dependency_bindings (carina-only metadata).
-        let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
-            .as_ref()
-            .map(|sf| {
-                sorted_resources
-                    .iter()
-                    .filter_map(|r| {
-                        let identity = r.id.identity_str()?;
-                        let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
-                        if rs.dependency_bindings.is_empty() {
-                            None
-                        } else {
-                            Some((r.id.clone(), rs.dependency_bindings.clone()))
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         // Refresh in two phases so data sources can see concrete values
         // from their dependencies (#1683). Phase 1: managed resources in
         // parallel. Phase 2: data sources whose input attributes have
@@ -3398,9 +3561,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // Hydrate now — before phase 2 resolves data source refs — so
         // any attributes the provider's read() didn't return are
         // available when building the binding map (#1685).
-        hydrate_prior_states(
+        hydrate_prior_managed_states(
             &mut managed_current,
-            &mut data_source_states,
             &mut orphans,
             &provider,
             expansion_prelude.saved_attrs(),
@@ -3415,91 +3577,18 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // is sufficient for the common case of literal create-only
         // attributes; resources with ResourceRef create-only values are
         // an orthogonal edge case that pre-dates this fix.
-        let mut reconciled_expansion = expansion_prelude.reconcile_addresses(
+        expansion_prelude.reconcile_addresses(
             ReconcileDeferredForExpansionInputs {
                 ctx,
                 parsed,
                 provider_configs: raw_provider_configs,
                 state_block_claims,
                 managed_current,
-                data_source_states,
                 orphans,
                 already_refreshed: orphan_refreshed_ids,
             },
             DeferredForWarningPolicy::Print,
-        )?;
-        // Phase 2: resolve data source refs against the consolidated
-        // managed and data-source state, then refresh each via `read_data_source`.
-        let data_source_bindings = data_source_refresh_bindings(
-            reconciled_expansion.sorted_resources(),
-            &parsed.compositions,
-            &data_sources,
-            reconciled_expansion.managed_current(),
-            reconciled_expansion.data_source_states(),
-            remote_bindings,
-            ctx.schemas(),
-            reconciled_expansion.wait_aliases(),
-        );
-        let data_source_refreshes = resolve_data_source_refs_for_refresh(
-            reconciled_expansion.sorted_resources(),
-            &parsed.compositions,
-            &data_sources,
-            reconciled_expansion.managed_current(),
-            reconciled_expansion.data_source_states(),
-            remote_bindings,
-            ctx.schemas(),
-            reconciled_expansion.wait_aliases(),
-        )?;
-        let mut resolved_data_sources = Vec::new();
-        for resolution in data_source_refreshes {
-            match resolution {
-                DataSourceRefreshResolution::Resolved(resource) => {
-                    resolved_data_sources.push(resource);
-                }
-                DataSourceRefreshResolution::DeferredToApply { resource, .. } => {
-                    deferred_data_source_ids.insert(resource.id);
-                }
-            }
-        }
-        if let Err(error) = module_gate.check(&data_source_bindings) {
-            refresh_module_constraint_errors.extend(module_constraint_plan_errors(error));
-        }
-        let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
-            if refresh_module_constraint_errors.is_empty() {
-                stream::iter(resolved_data_sources.iter())
-                    .map(|resource| {
-                        let progress = refresh_phase.begin(&resource.id);
-                        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                        let data_source_bindings = &data_source_bindings;
-                        let module_gate = &module_gate;
-                        async move {
-                            let mut state = read_data_source_with_retry(
-                                provider_ref,
-                                resource,
-                                data_source_bindings,
-                                module_gate,
-                                ctx.factories(),
-                                ctx.schemas(),
-                            )
-                            .await?;
-                            if let Some(deps) = dep_bindings {
-                                state.dependency_bindings = deps;
-                            }
-                            progress.finish();
-                            Ok((resource.id.clone(), state))
-                        }
-                    })
-                    .buffer_unordered(5)
-                    .collect()
-                    .await
-            } else {
-                Vec::new()
-            };
-        for result in phase2_results {
-            let (id, state) = result?;
-            reconciled_expansion.insert_data_source_state(id, state);
-        }
-        reconciled_expansion.seal()
+        )?
     } else {
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if let Some(sf) = state_file.as_ref() {
@@ -3517,9 +3606,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             // renames so the later `resolve_refs_with_state_and_remote`
             // call (and data-source-input resolution) sees entries
             // under their current binding names (#1685).
-            hydrate_prior_states(
+            hydrate_prior_managed_states(
                 &mut managed_current,
-                &mut data_source_states,
                 &mut orphans,
                 &provider,
                 expansion_prelude.saved_attrs(),
@@ -3532,22 +3620,40 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
             }
         }
-        expansion_prelude
-            .reconcile_addresses(
-                ReconcileDeferredForExpansionInputs {
-                    ctx,
-                    parsed,
-                    provider_configs: raw_provider_configs,
-                    state_block_claims,
-                    managed_current,
-                    data_source_states,
-                    orphans,
-                    already_refreshed: orphan_refreshed_ids,
-                },
-                DeferredForWarningPolicy::Print,
-            )?
-            .seal()
+        expansion_prelude.reconcile_addresses(
+            ReconcileDeferredForExpansionInputs {
+                ctx,
+                parsed,
+                provider_configs: raw_provider_configs,
+                state_block_claims,
+                managed_current,
+                orphans,
+                already_refreshed: orphan_refreshed_ids,
+            },
+            DeferredForWarningPolicy::Print,
+        )?
     };
+
+    // Phase 2 is unconditional: `--refresh=false` skips only managed-resource
+    // refresh. Data sources are queries and are always read for this plan.
+    let phase2 = reconciled_expansion
+        .read_data_sources_phase2(AddressedDataSourceReadInputs {
+            provider: &provider,
+            refresh_phase: refresh_phase.as_ref(),
+            compositions: &parsed.compositions,
+            data_sources: &data_sources,
+            remote_bindings,
+            schemas: ctx.schemas(),
+            saved_dep_bindings: &saved_dep_bindings,
+            factories: ctx.factories(),
+            cancel: None,
+        })
+        .await?;
+    let refresh_module_constraint_errors = phase2
+        .module_constraint_error
+        .map(module_constraint_plan_errors);
+    let data_source_values = phase2.values;
+    let prepared_expansion = reconciled_expansion.seal(data_source_values);
 
     // carina#3132: expand same-config deferred-for loops after refresh,
     // against the same post-refresh `ResolvedBindings` view every
@@ -3576,7 +3682,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let sorted_resources = resorted;
     let PreparedDeferredForExpansionParts {
         mut managed_current,
-        mut data_source_states,
+        mut data_source_values,
         mut orphans,
         saved_attrs,
         prev_explicit,
@@ -3615,9 +3721,9 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &mut managed_current,
             )
             .await?;
-            hydrate_prior_states(
+            hydrate_prior_data_source_values(
                 &mut managed_current,
-                &mut data_source_states,
+                &mut data_source_values,
                 &mut orphans,
                 &provider,
                 &saved_attrs,
@@ -3633,9 +3739,9 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 let current = sf.build_state_for_resource(&resource.id);
                 managed_current.insert(resource.id.clone(), current);
             }
-            hydrate_prior_states(
+            hydrate_prior_data_source_values(
                 &mut managed_current,
-                &mut data_source_states,
+                &mut data_source_values,
                 &mut orphans,
                 &provider,
                 &saved_attrs,
@@ -3653,11 +3759,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
 
     // awscc#251 (follow-up to #3055): data-source lifting stays here
     // because data sources do not flow through `into_plan_input_current_map`.
-    carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
-        &mut data_source_states,
-        &data_sources,
-        ctx.schemas(),
-    );
+    lift_data_source_value_enum_leaves(&mut data_source_values, &data_sources, ctx.schemas());
     // Build the unified pre-apply bindings view once (carina#3248):
     // every kind of binding the configuration declares (managed,
     // composition, data source) is in the same view, so a managed
@@ -3669,7 +3771,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         parsed,
         &sorted_resources,
         &managed_current,
-        &data_source_states,
+        &data_source_values,
         ctx.schemas(),
         &saved_attrs,
         &prev_explicit,
@@ -3688,9 +3790,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             PreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
-                data_sources: &data_sources,
                 managed_current: &pre_apply_current,
-                data_source_states: &data_source_states,
+                data_source_values: &data_source_values,
                 remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -3707,8 +3808,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // reads keep their original input refs so the plan/executor dependency
     // graph still contains the upstream create edge.
     let mut data_sources_for_plan = prepare_data_sources_for_plan(
-        &data_sources,
-        &deferred_data_source_ids,
+        &data_source_values,
         override_aware_resources.bindings(),
         Some(&upstream_binding_names),
     )?;
@@ -3722,22 +3822,22 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // seam. `create_plan` resolves typed wait RHS values itself.
     let wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, ctx);
-    let preparation = if refresh_module_constraint_errors.is_empty() {
+    let preparation = if let Some(errors) = refresh_module_constraint_errors {
+        Err(PlanPreparationError::Plan(errors))
+    } else {
         preprocessor
             .prepare(
                 &mut override_aware_resources,
                 &constraint_origin_resources,
                 &module_gate,
                 &mut managed_current,
-                &mut data_source_states,
+                &mut data_source_values,
                 &mut orphans,
                 raw_provider_configs,
                 &mut data_sources_for_plan,
                 &data_sources,
             )
             .await
-    } else {
-        Err(PlanPreparationError::Plan(refresh_module_constraint_errors))
     };
     if let Err(error) = preparation {
         let errors = match error {
@@ -3765,7 +3865,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 compositions: prepared_compositions,
                 data_sources: data_sources_for_plan,
                 managed_current,
-                data_source_states,
+                data_source_values,
                 moved_origins,
                 upstream_snapshot: remote_bindings.clone(),
                 prev_explicit,
@@ -3820,9 +3920,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
-            data_sources: &data_sources,
             managed_current: &reconciled_input_current,
-            data_source_states: &data_source_states,
+            data_source_values: &data_source_values,
             remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -3910,7 +4009,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             compositions: prepared_compositions,
             data_sources: data_sources_for_plan,
             managed_current,
-            data_source_states,
+            data_source_values,
             moved_origins,
             upstream_snapshot: remote_bindings.clone(),
             prev_explicit,
@@ -4869,6 +4968,460 @@ pub(crate) enum DataSourceRefreshResolution {
     },
 }
 
+/// Complete inputs for the phase-2 data-source fixpoint shared by plan, apply,
+/// and state refresh.
+pub(crate) struct ReadDataSourcesInputs<'a, 'backend> {
+    pub provider: &'a dyn Provider,
+    pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
+    pub managed: &'a [&'a Resource],
+    pub compositions: &'a [Composition],
+    pub data_sources: &'a [DataSource],
+    managed_current: ManagedCurrentView<'a>,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub schemas: &'a SchemaRegistry,
+    pub wait_aliases: &'a [WaitAliasSpec],
+    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub factories: &'a [Box<dyn ProviderFactory>],
+    /// When present, stop dispatching new provider reads as soon as the
+    /// command enters graceful shutdown. Reads already in flight are drained.
+    pub cancel: Option<&'a ShutdownToken>,
+}
+
+#[derive(Clone, Copy)]
+enum Phase2DataSourceBindings<'a> {
+    Unread(&'a [DataSource]),
+    Outcomes(&'a DataSourceValues),
+}
+
+enum Phase2DataSourceStart {
+    Unread,
+    Outcomes(DataSourceValues),
+}
+
+impl Phase2DataSourceBindings<'_> {
+    fn data_sources(&self) -> &[DataSource] {
+        match self {
+            Self::Unread(data_sources) => data_sources,
+            Self::Outcomes(values) => values.data_sources(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ManagedCurrentView<'a> {
+    base: &'a HashMap<ResourceId, Current>,
+    orphans: Option<&'a Orphans>,
+}
+
+impl<'a> ManagedCurrentView<'a> {
+    #[cfg(test)]
+    fn base(base: &'a HashMap<ResourceId, Current>) -> Self {
+        Self {
+            base,
+            orphans: None,
+        }
+    }
+
+    fn with_orphans(base: &'a HashMap<ResourceId, Current>, orphans: &'a Orphans) -> Self {
+        Self {
+            base,
+            orphans: Some(orphans),
+        }
+    }
+
+    fn get(&self, id: &ResourceId) -> Option<&'a Current> {
+        self.base.get(id).or_else(|| {
+            self.orphans
+                .and_then(|orphans| orphans.get(id))
+                .map(|orphan| orphan.current())
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&'a ResourceId, &'a Current)> {
+        self.base
+            .iter()
+            .chain(self.orphans.into_iter().flat_map(move |orphans| {
+                orphans.iter().filter_map(move |(id, orphan)| {
+                    (!self.base.contains_key(id)).then_some((id, orphan.current()))
+                })
+            }))
+    }
+}
+
+pub(crate) struct ReadDataSourcesPhase2 {
+    pub values: DataSourceValues,
+    pub module_constraint_error: Option<carina_core::executor::ModuleConstraintGateError>,
+}
+
+/// Post-expansion inputs for resuming the shared phase-2 fixpoint. Existing
+/// `Read` outcomes are retained; only `DeferredToApply` outcomes are retried.
+pub(crate) struct ExpandedDataSourceReadInputs<'a, 'backend> {
+    pub provider: &'a dyn Provider,
+    pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
+    pub managed: &'a [Resource],
+    pub compositions: &'a [Composition],
+    pub data_sources: &'a [DataSource],
+    pub managed_current: &'a HashMap<ResourceId, Current>,
+    pub orphans: &'a Orphans,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub schemas: &'a SchemaRegistry,
+    pub wait_aliases: &'a [WaitAliasSpec],
+    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub factories: &'a [Box<dyn ProviderFactory>],
+    pub cancel: Option<&'a ShutdownToken>,
+}
+
+pub(crate) async fn read_expanded_data_sources_phase2(
+    values: DataSourceValues,
+    inputs: ExpandedDataSourceReadInputs<'_, '_>,
+) -> Result<ReadDataSourcesPhase2, AppError> {
+    if inputs.data_sources.is_empty() {
+        return Ok(ReadDataSourcesPhase2 {
+            values,
+            module_constraint_error: None,
+        });
+    }
+    let managed = inputs.managed.iter().collect::<Vec<_>>();
+    read_data_sources_phase2_to_fixpoint(
+        ReadDataSourcesInputs {
+            provider: inputs.provider,
+            refresh_phase: inputs.refresh_phase,
+            managed: &managed,
+            compositions: inputs.compositions,
+            data_sources: inputs.data_sources,
+            managed_current: ManagedCurrentView::with_orphans(
+                inputs.managed_current,
+                inputs.orphans,
+            ),
+            remote_bindings: inputs.remote_bindings,
+            schemas: inputs.schemas,
+            wait_aliases: inputs.wait_aliases,
+            saved_dep_bindings: inputs.saved_dep_bindings,
+            factories: inputs.factories,
+            cancel: inputs.cancel,
+        },
+        Phase2DataSourceStart::Outcomes(values),
+    )
+    .await
+}
+
+impl ReadDataSourcesPhase2 {
+    pub fn into_values(self) -> Result<DataSourceValues, AppError> {
+        if let Some(error) = self.module_constraint_error {
+            return Err(AppError::from(error));
+        }
+        Ok(self.values)
+    }
+}
+
+fn collect_data_source_values(
+    data_sources: &[DataSource],
+    mut values_by_id: HashMap<ResourceId, DataSourceValue>,
+) -> Result<DataSourceValues, AppError> {
+    DataSourceValues::try_from_data_sources(data_sources, |data_source| {
+        values_by_id.remove(&data_source.id).ok_or_else(|| {
+            AppError::Config(format!(
+                "data-source read phase produced no outcome for `{}`",
+                data_source.id
+            ))
+        })
+    })
+}
+
+/// Keep the module gate scoped to constraints that govern at least one query.
+///
+/// A data source can consume a composition directly, through another data
+/// source, or through a managed resource. Walk that binding dependency closure
+/// and retain only the compositions it reaches. A data source declared inside
+/// a module is also governed by that module call even when argument
+/// substitution has already made its provider inputs literal.
+fn relevant_compositions_for_data_source_reads(
+    managed: &[&Resource],
+    compositions: &[Composition],
+    queries: &[DataSource],
+    binding_data_sources: &[DataSource],
+) -> Vec<Composition> {
+    let managed_by_binding = managed
+        .iter()
+        .filter_map(|resource| {
+            resource
+                .binding
+                .as_deref()
+                .map(|binding| (binding, get_resource_dependencies(resource)))
+        })
+        .collect::<HashMap<_, _>>();
+    let data_sources_by_binding = binding_data_sources
+        .iter()
+        .filter_map(|data_source| {
+            data_source
+                .binding
+                .as_deref()
+                .map(|binding| (binding, get_data_source_dependencies(data_source)))
+        })
+        .collect::<HashMap<_, _>>();
+    let compositions_by_binding = compositions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, composition)| {
+            composition
+                .binding
+                .as_deref()
+                .map(|binding| (binding, (index, get_composition_dependencies(composition))))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut pending = queries
+        .iter()
+        .flat_map(get_data_source_dependencies)
+        .collect::<Vec<_>>();
+    let mut visited_bindings = HashSet::new();
+    let mut relevant_indices = HashSet::new();
+
+    for data_source in queries {
+        let Some(ModuleSource::Module { name, instance, .. }) = &data_source.module_source else {
+            continue;
+        };
+        for (index, composition) in compositions.iter().enumerate() {
+            if composition.module_name == *name && composition.instance == *instance {
+                relevant_indices.insert(index);
+                pending.extend(get_composition_dependencies(composition));
+            }
+        }
+    }
+
+    while let Some(binding) = pending.pop() {
+        if !visited_bindings.insert(binding.clone()) {
+            continue;
+        }
+        if let Some(dependencies) = managed_by_binding.get(binding.as_str()) {
+            pending.extend(dependencies.iter().cloned());
+        }
+        if let Some(dependencies) = data_sources_by_binding.get(binding.as_str()) {
+            pending.extend(dependencies.iter().cloned());
+        }
+        if let Some((index, dependencies)) = compositions_by_binding.get(binding.as_str()) {
+            relevant_indices.insert(*index);
+            pending.extend(dependencies.iter().cloned());
+        }
+    }
+
+    compositions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| relevant_indices.contains(index))
+        .map(|(_, composition)| composition.clone())
+        .collect()
+}
+
+/// Drive phase-2 data-source reads to a fixpoint.
+///
+/// The first pass reads every query that is resolvable from managed state.
+/// Later passes retain those `Read` outcomes as bindings and reconsider only
+/// `DeferredToApply` outcomes. The loop stops when a pass produces no new read
+/// state, leaving only queries that depend on genuinely apply-time values.
+async fn read_data_sources_phase2_to_fixpoint(
+    inputs: ReadDataSourcesInputs<'_, '_>,
+    start: Phase2DataSourceStart,
+) -> Result<ReadDataSourcesPhase2, AppError> {
+    if inputs.data_sources.is_empty() {
+        let values = match start {
+            Phase2DataSourceStart::Unread => DataSourceValues::empty(),
+            Phase2DataSourceStart::Outcomes(values) => values,
+        };
+        return Ok(ReadDataSourcesPhase2 {
+            values,
+            module_constraint_error: None,
+        });
+    }
+
+    let mut values = match start {
+        Phase2DataSourceStart::Unread => {
+            let initial = read_data_sources_phase2_pass(
+                &inputs,
+                inputs.data_sources,
+                Phase2DataSourceBindings::Unread(inputs.data_sources),
+            )
+            .await?;
+            if initial.module_constraint_error.is_some() {
+                return Ok(initial);
+            }
+            initial.values
+        }
+        Phase2DataSourceStart::Outcomes(values) => values,
+    };
+
+    loop {
+        let deferred_ids = values
+            .iter()
+            .filter_map(|(data_source, value)| {
+                matches!(value, DataSourceValue::DeferredToApply(_))
+                    .then_some(data_source.id.clone())
+            })
+            .collect::<HashSet<_>>();
+        if deferred_ids.is_empty() {
+            return Ok(ReadDataSourcesPhase2 {
+                values,
+                module_constraint_error: None,
+            });
+        }
+        let retry_data_sources = inputs
+            .data_sources
+            .iter()
+            .filter(|data_source| deferred_ids.contains(&data_source.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let retry = read_data_sources_phase2_pass(
+            &inputs,
+            &retry_data_sources,
+            Phase2DataSourceBindings::Outcomes(&values),
+        )
+        .await?;
+        if let Some(error) = retry.module_constraint_error {
+            return Ok(ReadDataSourcesPhase2 {
+                values,
+                module_constraint_error: Some(error),
+            });
+        }
+        let read_states = retry.values.read_states_map();
+        if read_states.is_empty() {
+            return Ok(ReadDataSourcesPhase2 {
+                values,
+                module_constraint_error: None,
+            });
+        }
+        values
+            .merge_read_states(&read_states)
+            .map_err(|error| AppError::Config(error.to_string()))?;
+    }
+}
+
+/// Execute one pass of the shared fixpoint. Callers outside the fixpoint must
+/// not bypass [`read_data_sources_phase2_to_fixpoint`].
+async fn read_data_sources_phase2_pass(
+    inputs: &ReadDataSourcesInputs<'_, '_>,
+    data_sources: &[DataSource],
+    data_source_bindings: Phase2DataSourceBindings<'_>,
+) -> Result<ReadDataSourcesPhase2, AppError> {
+    if data_sources.is_empty() {
+        return Ok(ReadDataSourcesPhase2 {
+            values: DataSourceValues::empty(),
+            module_constraint_error: None,
+        });
+    }
+    let bindings = data_source_refresh_bindings_from_refs(
+        inputs.managed,
+        inputs.compositions,
+        data_source_bindings,
+        inputs.managed_current,
+        inputs.remote_bindings,
+        inputs.schemas,
+        inputs.wait_aliases,
+    );
+    let relevant_compositions = relevant_compositions_for_data_source_reads(
+        inputs.managed,
+        inputs.compositions,
+        data_sources,
+        data_source_bindings.data_sources(),
+    );
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&relevant_compositions);
+    let resolutions = resolve_data_source_refs_for_refresh_from_refs(
+        inputs.managed,
+        inputs.compositions,
+        data_sources,
+        data_source_bindings,
+        inputs.managed_current,
+        inputs.remote_bindings,
+        inputs.schemas,
+        inputs.wait_aliases,
+    )?;
+
+    if let Err(error) = module_gate.check(&bindings) {
+        let values_by_id = resolutions
+            .into_iter()
+            .map(|resolution| match resolution {
+                DataSourceRefreshResolution::DeferredToApply {
+                    resource,
+                    unresolved,
+                } => (resource.id, DataSourceValue::deferred_to_apply(unresolved)),
+                DataSourceRefreshResolution::Resolved(resource) => {
+                    (resource.id, DataSourceValue::blocked_by_plan_error())
+                }
+            })
+            .collect();
+        return Ok(ReadDataSourcesPhase2 {
+            values: collect_data_source_values(data_sources, values_by_id)?,
+            module_constraint_error: Some(error),
+        });
+    }
+
+    let results: Vec<Result<Option<(ResourceId, DataSourceValue)>, AppError>> =
+        stream::iter(resolutions)
+            .map(|resolution| {
+                let bindings = &bindings;
+                let module_gate = &module_gate;
+                async move {
+                    if inputs
+                        .cancel
+                        .is_some_and(|cancel| !matches!(cancel.phase(), ShutdownPhase::Running))
+                    {
+                        return Ok(None);
+                    }
+                    match resolution {
+                        DataSourceRefreshResolution::DeferredToApply {
+                            resource,
+                            unresolved,
+                        } => Ok(Some((
+                            resource.id,
+                            DataSourceValue::deferred_to_apply(unresolved),
+                        ))),
+                        DataSourceRefreshResolution::Resolved(resource) => {
+                            let progress = inputs
+                                .refresh_phase
+                                .map(|refresh_phase| refresh_phase.begin(&resource.id));
+                            let mut state = read_data_source_with_retry(
+                                inputs.provider,
+                                &resource,
+                                bindings,
+                                module_gate,
+                                inputs.factories,
+                                inputs.schemas,
+                            )
+                            .await?;
+                            if let Some(dependencies) =
+                                inputs.saved_dep_bindings.get(&resource.id).cloned()
+                            {
+                                state.dependency_bindings = dependencies;
+                            }
+                            if let Some(progress) = progress {
+                                progress.finish();
+                            }
+                            Ok(Some((resource.id, DataSourceValue::read(state))))
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(5)
+            .collect()
+            .await;
+    let mut values_by_id = HashMap::with_capacity(results.len());
+    for result in results {
+        if let Some((id, value)) = result? {
+            values_by_id.insert(id, value);
+        }
+    }
+    if inputs
+        .cancel
+        .is_some_and(|cancel| !matches!(cancel.phase(), ShutdownPhase::Running))
+    {
+        return Err(AppError::Interrupted);
+    }
+
+    Ok(ReadDataSourcesPhase2 {
+        values: collect_data_source_values(data_sources, values_by_id)?,
+        module_constraint_error: None,
+    })
+}
+
 /// Resolve `ResourceRef` values in refreshable data-source input attributes
 /// against already-refreshed managed current state, and explicitly classify reads
 /// that must wait for apply-time publication.
@@ -4877,12 +5430,36 @@ pub(crate) enum DataSourceRefreshResolution {
 /// resolver builds its binding map from every managed resource with a
 /// `binding` — data sources reference those.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn resolve_data_source_refs_for_refresh(
     managed: &[Resource],
     compositions: &[carina_core::resource::Composition],
     data_sources: &[DataSource],
     managed_current: &HashMap<ResourceId, Current>,
-    data_source_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    wait_aliases: &[WaitAliasSpec],
+) -> Result<Vec<DataSourceRefreshResolution>, AppError> {
+    let managed_refs = managed.iter().collect::<Vec<_>>();
+    resolve_data_source_refs_for_refresh_from_refs(
+        &managed_refs,
+        compositions,
+        data_sources,
+        Phase2DataSourceBindings::Unread(data_sources),
+        ManagedCurrentView::base(managed_current),
+        remote_bindings,
+        schemas,
+        wait_aliases,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_data_source_refs_for_refresh_from_refs(
+    managed: &[&Resource],
+    compositions: &[carina_core::resource::Composition],
+    data_sources: &[DataSource],
+    data_source_bindings: Phase2DataSourceBindings<'_>,
+    managed_current: ManagedCurrentView<'_>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[WaitAliasSpec],
@@ -4890,18 +5467,20 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     // carina#3248: unified pre-apply bindings include compositions so a
     // data-source input referencing `<module_instance>.<attr>` chains
     // through the composition layer to the managed sibling literal.
-    let bindings = data_source_refresh_bindings(
+    let bindings = data_source_refresh_bindings_from_refs(
         managed,
         compositions,
-        data_sources,
+        data_source_bindings,
         managed_current,
-        data_source_states,
         remote_bindings,
         schemas,
         wait_aliases,
     );
-    let deferred =
-        classify_apply_time_data_source_read_inputs(data_sources, managed, managed_current);
+    let deferred = classify_apply_time_data_source_read_inputs_from_refs(
+        data_sources,
+        managed,
+        managed_current,
+    );
 
     let mut resolutions = Vec::with_capacity(data_sources.len());
     for resource in data_sources {
@@ -4937,42 +5516,65 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     Ok(resolutions)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn data_source_refresh_bindings(
-    managed: &[Resource],
+fn data_source_refresh_bindings_from_refs(
+    managed: &[&Resource],
     compositions: &[carina_core::resource::Composition],
-    data_sources: &[DataSource],
-    managed_current: &HashMap<ResourceId, Current>,
-    data_source_states: &HashMap<ResourceId, State>,
+    data_source_bindings: Phase2DataSourceBindings<'_>,
+    managed_current: ManagedCurrentView<'_>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[WaitAliasSpec],
 ) -> ResolvedBindings {
-    ResolvedBindings::pre_apply(PreApplyInputs {
-        managed,
-        compositions,
-        data_sources,
-        managed_current: &carina_core::resource::into_plan_input_current_map(
-            managed_current.clone(),
-            schemas,
-            managed,
+    let managed_current = carina_core::resource::plan_input_current_map_from_refs(
+        managed_current.iter(),
+        schemas,
+        managed.iter().copied(),
+    );
+    match data_source_bindings {
+        Phase2DataSourceBindings::Unread(data_sources) => {
+            ResolvedBindings::pre_data_source_read_from_managed(
+                managed.iter().copied(),
+                compositions,
+                data_sources,
+                &managed_current,
+                remote_bindings,
+                wait_aliases,
+            )
+        }
+        Phase2DataSourceBindings::Outcomes(values) => ResolvedBindings::pre_apply_from_managed(
+            managed.iter().copied(),
+            compositions,
+            &managed_current,
+            values,
+            remote_bindings,
+            wait_aliases,
         ),
-        data_source_states,
-        remote_bindings,
-        wait_aliases,
-    })
+    }
 }
 
 /// Classify data-source reads that must run after apply-time publication.
 ///
-/// This is shared with saved-plan apply so both live and persisted plans use
-/// the expanded data-source set plus its preserved dependency metadata. The
-/// returned map is keyed by data-source id; an empty input-details vector is
-/// valid when parsing folded the value but retained `dependency_bindings`.
+/// Test-facing adapter for the production phase-2 classifier. The returned map
+/// is keyed by data-source id; an empty input-details vector is valid when
+/// parsing folded the value but retained `dependency_bindings`.
+#[cfg(test)]
 pub(crate) fn classify_apply_time_data_source_read_inputs(
     data_sources: &[DataSource],
     managed: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
+) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
+    let managed = managed.iter().collect::<Vec<_>>();
+    classify_apply_time_data_source_read_inputs_from_refs(
+        data_sources,
+        &managed,
+        ManagedCurrentView::base(managed_current),
+    )
+}
+
+fn classify_apply_time_data_source_read_inputs_from_refs(
+    data_sources: &[DataSource],
+    managed: &[&Resource],
+    managed_current: ManagedCurrentView<'_>,
 ) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
     let mut deferred =
         classify_apply_time_data_source_reads(data_sources, managed, managed_current);
@@ -4982,8 +5584,8 @@ pub(crate) fn classify_apply_time_data_source_read_inputs(
 
 fn classify_apply_time_data_source_reads(
     data_sources: &[DataSource],
-    managed: &[Resource],
-    managed_current: &HashMap<ResourceId, Current>,
+    managed: &[&Resource],
+    managed_current: ManagedCurrentView<'_>,
 ) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
     let managed_by_binding: HashMap<&str, &Resource> = managed
         .iter()
@@ -4991,7 +5593,7 @@ fn classify_apply_time_data_source_reads(
             resource
                 .binding
                 .as_deref()
-                .map(|binding| (binding, resource))
+                .map(|binding| (binding, *resource))
         })
         .collect();
 
@@ -5054,7 +5656,7 @@ fn classify_apply_time_data_source_reads(
 /// attributes, and has caused false deferrals after successful applies.
 fn managed_resource_is_missing_from_state(
     resource: &Resource,
-    managed_current: &HashMap<ResourceId, Current>,
+    managed_current: ManagedCurrentView<'_>,
 ) -> bool {
     let Some(current) = managed_current.get(&resource.id) else {
         return true;
@@ -5127,15 +5729,14 @@ fn propagate_deferred_data_source_chains(
 }
 
 pub(crate) fn prepare_data_sources_for_plan(
-    data_sources: &[DataSource],
-    deferred_data_source_ids: &HashSet<ResourceId>,
+    data_source_values: &DataSourceValues,
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: Option<&std::collections::HashSet<&str>>,
 ) -> Result<Vec<DataSource>, AppError> {
-    let mut prepared = Vec::with_capacity(data_sources.len());
-    for resource in data_sources {
+    let mut prepared = Vec::new();
+    for (resource, value) in data_source_values.iter() {
         let mut resource = resource.clone();
-        if !deferred_data_source_ids.contains(&resource.id) {
+        if matches!(value, DataSourceValue::Read(_)) {
             if let Some(upstream_bindings) = unresolved_upstream_bindings {
                 carina_core::resolver::resolve_data_source_refs_for_plan(
                     std::slice::from_mut(&mut resource),

@@ -24,7 +24,7 @@ Enable or disable state locking during the destroy. Defaults to `true`. Disable 
 
 ### `--refresh <BOOL>`
 
-Refresh state from the cloud provider before computing the destroy plan. Defaults to `true`.
+Refresh managed-resource state from the cloud provider before computing the destroy plan. Defaults to `true`. When set to `false`, Carina uses cached managed-resource state. Destroy does not evaluate data sources because they do not contribute managed objects to the destroy set.
 
 ### `--force`
 

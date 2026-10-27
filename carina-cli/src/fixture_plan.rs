@@ -1,13 +1,15 @@
 //! Build plan output from `tests/fixtures/plan_display` directories.
 //!
 //! Shared between the plan snapshot tests and the `plan-fixture` example
-//! binary. The logic mirrors `--refresh=false` but skips provider plugin
-//! loading so fixture rendering works without installed providers.
+//! binary. It builds from fixture state without loading provider plugins or
+//! performing live provider reads, so rendering works without installed
+//! providers.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{
     Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
 };
@@ -199,7 +201,7 @@ pub fn build_fixture_plan_change_summary(fixture: &FixturePlan) -> PlanChangeSum
 
 /// Build a plan from an absolute fixture path. Loads the configuration,
 /// validates with `skip_resource_validation=true` (no provider plugin load),
-/// and produces a plan equivalent to `carina plan --refresh=false`.
+/// and produces a provider-less fixture plan from the persisted state.
 pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let fixture_pathbuf = fixture_path.to_path_buf();
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
@@ -339,6 +341,15 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
         }
     }
+    let mut data_source_values =
+        DataSourceValues::from_data_sources(&data_sources, |data_source| {
+            DataSourceValue::read(
+                data_source_states
+                    .get(&data_source.id)
+                    .cloned()
+                    .expect("fixture initialized every data-source state"),
+            )
+        });
 
     let directives_map = state_file
         .as_ref()
@@ -393,7 +404,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         parsed,
         sorted_resources,
         &managed_current,
-        &data_source_states,
+        &data_source_values,
         wiring.schemas(),
         expansion_prelude.saved_attrs(),
         expansion_prelude.prev_explicit(),
@@ -408,9 +419,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
-                data_sources: &data_sources,
                 managed_current: &pre_apply_input_current,
-                data_source_states: &data_source_states,
+                data_source_values: &data_source_values,
                 remote_bindings: &remote_bindings,
                 wait_aliases: expansion_prelude.wait_aliases(),
             },
@@ -434,8 +444,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("Failed to resolve data source refs with state");
 
-    carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
-        &mut data_source_states,
+    crate::wiring::lift_data_source_value_enum_leaves(
+        &mut data_source_values,
         &data_sources,
         wiring.schemas(),
     );
@@ -480,7 +490,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                     &constraint_origin_resources,
                     &module_gate,
                     &mut managed_current,
-                    &mut data_source_states,
+                    &mut data_source_values,
                     &mut orphans,
                     raw_provider_configs,
                     &mut data_sources_for_plan,
@@ -511,7 +521,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             unresolved_resources: Vec::new(),
             compositions: parsed.compositions.clone(),
             managed_current,
-            data_source_states,
+            data_source_states: data_source_values.read_states_map(),
             state_file,
             schemas: wiring.schemas().clone(),
             moved_origins: HashMap::new(),
@@ -563,7 +573,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                 provider_configs: raw_provider_configs,
                 state_block_claims: &state_block_claims,
                 managed_current,
-                data_source_states,
                 orphans,
                 already_refreshed: HashSet::new(),
             },
@@ -602,16 +611,15 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
-            data_sources: &data_sources,
             managed_current: &reconciled_input_current,
-            data_source_states: reconciled_expansion.data_source_states(),
+            data_source_values: &data_source_values,
             remote_bindings: &remote_bindings,
             wait_aliases: reconciled_expansion.wait_aliases(),
         },
         &managed_stability,
     );
 
-    let prepared_expansion = reconciled_expansion.seal();
+    let prepared_expansion = reconciled_expansion.seal(data_source_values);
     let (expanded_canonical_resources, deferred_for_expansion) = prepared_expansion
         .expand(
             canonical_resources,
@@ -622,7 +630,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .expect("fixture deferred-for expansion failed");
     let crate::wiring::PreparedDeferredForExpansionParts {
         mut managed_current,
-        data_source_states,
+        data_source_values,
         orphans,
         saved_attrs,
         prev_explicit,
@@ -701,9 +709,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             export_params: &parsed.export_params,
             resources: override_aware_resources.resources(),
             compositions: &parsed.compositions,
-            data_sources: &data_sources_for_plan,
             managed_current: &managed_current,
-            data_source_states: &data_source_states,
+            data_source_values: &data_source_values,
             state_file: state_file.as_ref(),
             plan: &plan,
             schemas: wiring.schemas(),
@@ -724,7 +731,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         unresolved_resources,
         compositions: image_compositions,
         managed_current,
-        data_source_states,
+        data_source_states: data_source_values.into_read_states(),
         state_file,
         schemas: wiring.schemas().clone(),
         moved_origins,

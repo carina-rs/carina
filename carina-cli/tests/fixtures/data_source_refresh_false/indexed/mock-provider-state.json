@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "states": {
+    "iam.Roles.roles": {
+      "name_regex": "x",
+      "names": ["r1", "r2"]
+    }
+  }
+}

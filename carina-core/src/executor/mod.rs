@@ -22,6 +22,7 @@ mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
 
+pub use crate::data_source_value::UnresolvedDataSourceInput;
 pub use crate::effect::deps::UnresolvedResource;
 pub use provider_ready::{
     ModuleConstraintFailure, ModuleConstraintGate, ModuleConstraintGateError,
@@ -115,8 +116,8 @@ use crate::provider::{
     ResumeFailureKind, ResumeOutcome, UpdateRequest,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
-    ResolvedResource, Resource, ResourceId, State, UnknownReason, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ResolvedResource,
+    Resource, ResourceId, State, UnknownReason, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -407,11 +408,9 @@ pub struct ExecutionInput<'a> {
     pub compositions: &'a [crate::resource::Composition],
     pub bindings: ResolvedBindings,
     pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_states: HashMap<ResourceId, State>,
-    /// Data-source `Read` effects whose input refs depend on upstream
-    /// apply-time publication, even when the referenced attribute value was
-    /// computable from desired config during refresh.
-    pub deferred_data_source_reads: DeferredDataSourceReads,
+    /// One executor-safe outcome for every configured data source. This type
+    /// cannot contain a plan-error-blocked read.
+    pub data_source_values: crate::data_source_value::ExecutableDataSourceValues,
     /// The same provider normalizer that ran at plan time
     /// (`PlanPreprocessor`). Apply-time reference re-resolution rebuilds
     /// attributes from the un-normalized source, so the executor must
@@ -525,43 +524,6 @@ impl ProviderCheckInputs<'_> {
                 })
             }
         }
-    }
-}
-
-/// A data-source input attribute whose unresolved value shapes make the read
-/// apply-time dependent or unsafe to hand to a provider.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UnresolvedDataSourceInput {
-    pub attribute: String,
-    pub paths: Vec<AccessPath>,
-    pub bindings: Vec<String>,
-    pub unknowns: Vec<UnknownReason>,
-}
-
-/// Explicit classification for data-source reads that the apply
-/// executor must run at runtime. A read absent from this set is a
-/// pre-apply read: refresh has already populated `data_source_states`, so
-/// the executor should keep treating its `Effect::Read` as a no-op.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct DeferredDataSourceReads {
-    by_id: HashMap<ResourceId, Vec<UnresolvedDataSourceInput>>,
-}
-
-impl DeferredDataSourceReads {
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, id: ResourceId, unresolved: Vec<UnresolvedDataSourceInput>) {
-        self.by_id.insert(id, unresolved);
-    }
-
-    pub fn contains(&self, id: &ResourceId) -> bool {
-        self.by_id.contains_key(id)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
     }
 }
 

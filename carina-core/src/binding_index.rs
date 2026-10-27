@@ -42,6 +42,7 @@
 //! }
 //! ```
 
+use crate::data_source_value::{DataSourceValue, DataSourceValues};
 use crate::parser::{BindingName, ResourceRef};
 use crate::resource::{
     AccessPath, Composition, PathSegment, PlanInputCurrent, ReferencePathRef, Resource, ResourceId,
@@ -1457,9 +1458,23 @@ pub struct ResolvedBindings {
 pub struct PreApplyInputs<'a> {
     pub managed: &'a [Resource],
     pub compositions: &'a [Composition],
+    pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
+    pub data_source_values: &'a DataSourceValues,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub wait_aliases: &'a [WaitAliasSpec],
+}
+
+/// Inputs available while data-source queries are still being resolved.
+///
+/// This is deliberately distinct from [`PreApplyInputs`]: data sources in
+/// this view contribute only their authored input attributes and are always
+/// incomplete. Once provider reads have been classified, all plan/apply
+/// binding construction must cross the total [`DataSourceValues`] boundary.
+pub struct PreDataSourceReadInputs<'a> {
+    pub managed: &'a [Resource],
+    pub compositions: &'a [Composition],
     pub data_sources: &'a [crate::resource::DataSource],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
-    pub data_source_states: &'a HashMap<ResourceId, State>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [WaitAliasSpec],
 }
@@ -1479,15 +1494,73 @@ impl ResolvedBindings {
             .iter()
             .map(WaitAliasSpec::from)
             .collect::<Vec<_>>();
-        Self::pre_apply(PreApplyInputs {
+        Self::pre_data_source_read(PreDataSourceReadInputs {
             managed: &parsed.resources,
             compositions: &parsed.compositions,
             data_sources: &parsed.data_sources,
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &wait_aliases,
         })
+    }
+
+    /// Build the explicitly incomplete value view used to resolve query
+    /// inputs before provider reads run.
+    pub fn pre_data_source_read(inputs: PreDataSourceReadInputs<'_>) -> Self {
+        let mut bindings = Self::build_managed_core(
+            inputs.managed,
+            inputs.managed_current,
+            inputs.remote_bindings,
+            &HashMap::new(),
+        );
+        bindings.layer_unread_data_source_bindings(inputs.data_sources);
+        bindings.layer_compositions(inputs.compositions);
+        bindings.layer_wait_aliases(inputs.wait_aliases);
+        bindings
+    }
+
+    /// Borrowing variant for a managed view assembled from multiple owners.
+    pub fn pre_data_source_read_from_managed<'a>(
+        managed: impl IntoIterator<Item = &'a Resource>,
+        compositions: &[Composition],
+        data_sources: &[crate::resource::DataSource],
+        managed_current: &HashMap<ResourceId, PlanInputCurrent>,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        wait_aliases: &[WaitAliasSpec],
+    ) -> Self {
+        let mut bindings = Self::build_managed_core_from_iter(
+            managed,
+            managed_current,
+            remote_bindings,
+            &HashMap::new(),
+        );
+        bindings.layer_unread_data_source_bindings(data_sources);
+        bindings.layer_compositions(compositions);
+        bindings.layer_wait_aliases(wait_aliases);
+        bindings
+    }
+
+    /// Borrowing pre-apply variant for a managed view assembled from multiple
+    /// owners. Unlike the unread-query constructor, this requires the total
+    /// typed data-source outcomes and therefore exposes completed read values.
+    pub fn pre_apply_from_managed<'a>(
+        managed: impl IntoIterator<Item = &'a Resource>,
+        compositions: &[Composition],
+        managed_current: &HashMap<ResourceId, PlanInputCurrent>,
+        data_source_values: &DataSourceValues,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        wait_aliases: &[WaitAliasSpec],
+    ) -> Self {
+        let mut bindings = Self::build_managed_core_from_iter(
+            managed,
+            managed_current,
+            remote_bindings,
+            &HashMap::new(),
+        );
+        bindings.layer_data_source_bindings(data_source_values);
+        bindings.layer_compositions(compositions);
+        bindings.layer_wait_aliases(wait_aliases);
+        bindings
     }
 
     /// Single typed pre-apply constructor (carina#3248).
@@ -1535,7 +1608,7 @@ impl ResolvedBindings {
             inputs.remote_bindings,
             managed_stability,
         );
-        bindings.layer_data_source_bindings(inputs.data_sources, inputs.data_source_states);
+        bindings.layer_data_source_bindings(inputs.data_source_values);
         bindings.layer_compositions(inputs.compositions);
         bindings.layer_wait_aliases(inputs.wait_aliases);
         bindings
@@ -1552,9 +1625,23 @@ impl ResolvedBindings {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
     ) -> Self {
+        Self::build_managed_core_from_iter(
+            managed.iter(),
+            managed_current,
+            remote_bindings,
+            managed_stability,
+        )
+    }
+
+    fn build_managed_core_from_iter<'a>(
+        managed: impl IntoIterator<Item = &'a Resource>,
+        managed_current: &HashMap<ResourceId, PlanInputCurrent>,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+    ) -> Self {
         let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
 
-        for resource in managed.iter() {
+        for resource in managed {
             let Some(binding_name) = resource.binding.as_ref() else {
                 continue;
             };
@@ -1784,37 +1871,34 @@ impl ResolvedBindings {
     /// values).
     ///
     /// The shared structural pattern with [`Self::build_managed_core`]
-    /// is that *both* merge their `data_source_states` row into the
-    /// binding — the carina#3252 gap was a data-source binding that
-    /// dropped state entirely. The merge-direction divergence above is
-    /// intentional.
+    /// is that *both* merge their provider-read value into the binding —
+    /// the carina#3252 gap was a data-source binding that dropped state
+    /// entirely. The merge-direction divergence above is intentional.
     ///
     /// **Scope:** the only documented caller is
     /// [`ResolvedBindings::pre_apply`]. The function is `pub(crate)`
-    /// so a new call site cannot recreate the carina#3252 gap by
-    /// forgetting to pass `data_source_states`.
-    pub(crate) fn layer_data_source_bindings(
-        &mut self,
-        data_sources: &[crate::resource::DataSource],
-        data_source_states: &HashMap<ResourceId, State>,
-    ) {
-        for d in data_sources.iter() {
+    /// so a new call site cannot recreate the carina#3252 gap by bypassing
+    /// the total [`DataSourceValues`] collection.
+    pub(crate) fn layer_data_source_bindings(&mut self, data_source_values: &DataSourceValues) {
+        for (d, value) in data_source_values.iter() {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
             };
             let mut merged = crate::resource::attrs_to_hashmap(&d.attributes);
             let definitive_attributes = merged.keys().cloned().collect();
             let mut completeness = BindingCompleteness::Incomplete;
-            if let Some(state) = data_source_states.get(&d.id) {
-                // Presence in `data_source_states` means the provider read
-                // completed. A not-found result contributes no attributes,
-                // but its missing outputs are still definitive absence.
-                completeness = BindingCompleteness::Complete;
-                if state.exists {
-                    for (k, v) in &state.attributes {
-                        merged.insert(k.clone(), v.clone());
+            match value {
+                DataSourceValue::Read(state) => {
+                    // A completed not-found read contributes no attributes,
+                    // but its missing outputs are still definitive absence.
+                    completeness = BindingCompleteness::Complete;
+                    if state.exists {
+                        for (k, v) in &state.attributes {
+                            merged.insert(k.clone(), v.clone());
+                        }
                     }
                 }
+                DataSourceValue::DeferredToApply(_) | DataSourceValue::BlockedByPlanError => {}
             }
             self.by_name.insert(
                 binding_name.clone(),
@@ -1822,6 +1906,28 @@ impl ResolvedBindings {
                     attributes: merged,
                     source: BindingValueSource::Local,
                     completeness,
+                    definitive_attributes,
+                    changed_attributes: HashSet::new(),
+                    refreshable_attributes: HashSet::new(),
+                    removed_sensitive_attributes: HashSet::new(),
+                },
+            );
+        }
+    }
+
+    fn layer_unread_data_source_bindings(&mut self, data_sources: &[crate::resource::DataSource]) {
+        for data_source in data_sources {
+            let Some(binding_name) = data_source.binding.as_ref() else {
+                continue;
+            };
+            let attributes = crate::resource::attrs_to_hashmap(&data_source.attributes);
+            let definitive_attributes = attributes.keys().cloned().collect();
+            self.by_name.insert(
+                binding_name.clone(),
+                ResolvedBinding {
+                    attributes,
+                    source: BindingValueSource::Local,
+                    completeness: BindingCompleteness::Incomplete,
                     definitive_attributes,
                     changed_attributes: HashSet::new(),
                     refreshable_attributes: HashSet::new(),
@@ -2984,6 +3090,7 @@ let vpc = aws.ec2.Vpc {
 #[cfg(test)]
 mod resolved_bindings_tests {
     use super::*;
+    use crate::data_source_value::{DataSourceValue, DataSourceValues};
     use crate::resource::{
         ConcreteValue, DataSource, DeferredValue, PartialReadMarker, Resource, ResourceId, State,
         UnknownReason, Value,
@@ -2992,6 +3099,18 @@ mod resolved_bindings_tests {
 
     fn secret_preserving(attributes: &HashMap<String, Value>) -> SecretPreservingAttributes {
         SecretPreservingAttributes::from_provider_values(attributes, attributes)
+    }
+
+    fn test_data_source_values(
+        data_sources: &[DataSource],
+        states: &HashMap<ResourceId, State>,
+    ) -> DataSourceValues {
+        DataSourceValues::from_data_sources(data_sources, |data_source| {
+            states.get(&data_source.id).map_or_else(
+                || DataSourceValue::deferred_to_apply(Vec::new()),
+                |state| DataSourceValue::read(state.clone()),
+            )
+        })
     }
 
     fn make_resource(
@@ -3015,15 +3134,13 @@ mod resolved_bindings_tests {
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )],
         )];
-        let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &states,
+            data_source_values: &DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3079,13 +3196,12 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3141,9 +3257,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &plan_input_states,
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3192,13 +3307,12 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3230,13 +3344,12 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3272,13 +3385,12 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3331,13 +3443,12 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3484,13 +3595,12 @@ mod resolved_bindings_tests {
         let parent = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
                 states.clone(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -3590,9 +3700,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[cert],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "cert")],
         });
@@ -3622,9 +3731,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "nonexistent")],
         });
@@ -3649,9 +3757,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote,
             wait_aliases: &[wait_spec("waited", "up")],
         });
@@ -3677,9 +3784,8 @@ mod resolved_bindings_tests {
         let mut resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[cert],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "cert")],
         });
@@ -3718,9 +3824,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[cert],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[wait_spec("cert_issued", "cert")],
         });
@@ -3805,9 +3910,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[ds],
             managed_current: &HashMap::new(),
-            data_source_states: &states,
+            data_source_values: &test_data_source_values(&[ds], &states),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -3850,9 +3954,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[data_source],
             managed_current: &HashMap::new(),
-            data_source_states: &states,
+            data_source_values: &test_data_source_values(&[data_source], &states),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -3892,13 +3995,12 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[data_source],
             managed_current: &crate::resource::into_plan_input_current_map(
                 HashMap::new(),
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             ),
-            data_source_states: &data_source_states,
+            data_source_values: &test_data_source_values(&[data_source], &data_source_states),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -3953,9 +4055,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[ds],
             managed_current: &HashMap::new(),
-            data_source_states: &states,
+            data_source_values: &test_data_source_values(&[ds], &states),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -4005,9 +4106,8 @@ mod resolved_bindings_tests {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[ds],
             managed_current: &HashMap::new(),
-            data_source_states: &states,
+            data_source_values: &test_data_source_values(&[ds], &states),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -4185,9 +4285,8 @@ let chosen = if true { "primary" } else { "fallback" }
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &parsed.resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });

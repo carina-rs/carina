@@ -28,11 +28,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use carina_core::config_loader::parse_directory;
+use carina_core::data_source_value::DataSourceValues;
+use carina_core::data_source_value::ExecutableDataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
 use carina_core::executor::{
-    DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    ProviderCheckInputs, UnresolvedResource, execute_plan,
+    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, ProviderCheckInputs,
+    UnresolvedResource, execute_plan,
 };
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
@@ -295,13 +297,12 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
             carina_core::binding_index::PreApplyInputs {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
-                data_sources: &[],
                 managed_current: &plan_input_current(
                     current_states.clone(),
                     &carina_core::schema::SchemaRegistry::new(),
                     &[],
                 ),
-                data_source_states: &HashMap::new(),
+                data_source_values: &DataSourceValues::empty(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -365,8 +366,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         managed_current: managed_current(current_states),
-        data_source_states: HashMap::new(),
-        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -473,13 +473,12 @@ async fn nested_module_wait_binding_survives_two_expansions() {
             carina_core::binding_index::PreApplyInputs {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
-                data_sources: &[],
                 managed_current: &plan_input_current(
                     current_states.clone(),
                     &carina_core::schema::SchemaRegistry::new(),
                     &[],
                 ),
-                data_source_states: &HashMap::new(),
+                data_source_values: &DataSourceValues::empty(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -542,8 +541,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         managed_current: managed_current(current_states),
-        data_source_states: HashMap::new(),
-        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -629,13 +627,12 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
             carina_core::binding_index::PreApplyInputs {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
-                data_sources: &[],
                 managed_current: &plan_input_current(
                     current_states.clone(),
                     &carina_core::schema::SchemaRegistry::new(),
                     &[],
                 ),
-                data_source_states: &HashMap::new(),
+                data_source_values: &DataSourceValues::empty(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
