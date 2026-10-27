@@ -111,6 +111,26 @@ pub struct PlanContext {
     pub expansion_trace: carina_core::resource::ExpansionTrace,
 }
 
+/// Pre-value-resolution resources whose schema block aliases were resolved at
+/// the same wiring boundary as the evaluated configuration.
+///
+/// The field is private so planner and executor call sites cannot accidentally
+/// pass the raw `LoadedConfig::unresolved_parsed` snapshot. Construction is
+/// limited to [`resolve_config_block_names_with_ctx`].
+#[derive(Debug, Clone)]
+pub(crate) struct CanonicalUnresolvedResources(Vec<Resource>);
+
+impl CanonicalUnresolvedResources {
+    pub(crate) fn to_vec(&self) -> Vec<Resource> {
+        self.0.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(resources: &[Resource]) -> Self {
+        Self(resources.to_vec())
+    }
+}
+
 /// State-block targets resolved while constructing [`StateBlockClaims`].
 ///
 /// This keeps plan-time collision checks on the same effectiveness
@@ -615,11 +635,93 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
     }
 }
 
-/// Resolve block name aliases and attribute prefixes in one step.
+fn resolve_file_block_names<E>(
+    parsed: &mut carina_core::parser::File<E>,
+    schemas: &SchemaRegistry,
+) -> Vec<AppError> {
+    let mut errors = lift_validation_result(resolve_block_names(&mut parsed.resources, schemas));
+
+    // Deferred-for templates do not live in `File::resources`, but they can
+    // cross the same later provider boundary after apply-time expansion.
+    // Keep the display projection in sync with the canonical template map.
+    for deferred in &mut parsed.deferred_for_expressions {
+        errors.extend(lift_validation_result(resolve_block_names(
+            std::slice::from_mut(&mut deferred.template_resource),
+            schemas,
+        )));
+        deferred.attributes = deferred
+            .template_resource
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+    }
+
+    errors
+}
+
+/// Resolve schema block aliases and attribute-derived names for a single
+/// resource slice.
 pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -> Vec<AppError> {
     let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas()));
     errors.extend(resolve_attr_prefixes_with_ctx(ctx, resources));
     errors
+}
+
+/// File-level name resolution also covers residual deferred-for templates.
+pub(crate) fn resolve_file_names_with_ctx<E>(
+    ctx: &WiringContext,
+    parsed: &mut carina_core::parser::File<E>,
+) -> Vec<AppError> {
+    let mut errors = resolve_file_block_names(parsed, ctx.schemas());
+    errors.extend(resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources));
+    errors
+}
+
+/// Resolve block aliases in the evaluated and authored snapshots together.
+///
+/// This is the only production constructor for
+/// [`CanonicalUnresolvedResources`]. The parser intentionally preserves the
+/// authored block spelling; once provider schemas become available here, both
+/// snapshots must cross the boundary together so an alias cannot survive only
+/// in the source snapshot later paired by `OverrideAwareResources`.
+pub(crate) fn resolve_config_block_names_with_ctx<E>(
+    ctx: &WiringContext,
+    parsed: &mut carina_core::parser::File<E>,
+    mut unresolved: carina_core::parser::ParsedFile,
+) -> Result<CanonicalUnresolvedResources, Vec<AppError>> {
+    let mut errors = resolve_file_block_names(parsed, ctx.schemas());
+    for error in resolve_file_block_names(&mut unresolved, ctx.schemas()) {
+        let duplicate = match &error {
+            AppError::Validation(message) => errors.iter().any(
+                |existing| matches!(existing, AppError::Validation(other) if other == message),
+            ),
+            _ => false,
+        };
+        if !duplicate {
+            errors.push(error);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(CanonicalUnresolvedResources(unresolved.resources))
+    } else {
+        Err(errors)
+    }
+}
+
+pub(crate) fn resolve_config_names_with_ctx<E>(
+    ctx: &WiringContext,
+    parsed: &mut carina_core::parser::File<E>,
+    unresolved: carina_core::parser::ParsedFile,
+) -> Result<CanonicalUnresolvedResources, Vec<AppError>> {
+    let canonical_unresolved = resolve_config_block_names_with_ctx(ctx, parsed, unresolved)?;
+    let errors = resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources);
+    if errors.is_empty() {
+        Ok(canonical_unresolved)
+    } else {
+        Err(errors)
+    }
 }
 
 pub fn resolve_attr_prefixes_with_ctx(
@@ -2464,7 +2566,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
     provider_configs: &ResolvedProviderConfigs,
-    unresolved_resources: &[Resource],
+    unresolved_resources: &CanonicalUnresolvedResources,
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,

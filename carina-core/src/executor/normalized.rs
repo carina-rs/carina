@@ -70,10 +70,15 @@ use crate::provider::{ProviderNormalizer, ProviderResult, merge_default_tags};
 use crate::resource::{
     ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, value_contains_unknown,
 };
-use crate::schema::SchemaRegistry;
+use crate::schema::{SchemaRegistry, find_resource_block_name_alias};
 
 /// A `Resource` that has been through the full plan-time desired-side
 /// normalization pipeline.
+///
+/// Parsed block aliases are canonicalized for both the evaluated and authored
+/// snapshots at the wiring boundary, and provider normalizers are rejected if
+/// they introduce one again. Consequently every schema-known map behind this
+/// wrapper uses canonical attribute names.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedResource(Resource);
 
@@ -108,8 +113,9 @@ pub async fn apply_desired_normalization(
 ///
 /// 1. Canonicalize resource values with their schemas.
 /// 2. Run [`ProviderNormalizer::normalize_desired`].
-/// 3. Re-canonicalize guest-returned enum strings using state-text semantics.
-/// 4. Run [`merge_default_tags`] for each provider instance.
+/// 3. Reject block-name aliases introduced by the provider normalizer.
+/// 4. Re-canonicalize guest-returned enum strings using state-text semantics.
+/// 5. Run [`merge_default_tags`] for each provider instance.
 ///
 /// An error stops the pipeline before later stages run.
 pub async fn apply_desired_normalization_slice(
@@ -120,9 +126,31 @@ pub async fn apply_desired_normalization_slice(
 ) -> ProviderResult<()> {
     crate::value::canonicalize_resources_with_schemas(resources, schemas)?;
     normalizer.normalize_desired(resources).await?;
+    reject_normalizer_block_aliases(resources, schemas)?;
     crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas)?;
     for config in provider_configs {
         merge_default_tags(config, resources, schemas)?;
+    }
+    Ok(())
+}
+
+fn reject_normalizer_block_aliases(
+    resources: &[Resource],
+    schemas: &SchemaRegistry,
+) -> ProviderResult<()> {
+    for resource in resources {
+        let Some(schema) = schemas.get_for(resource) else {
+            continue;
+        };
+        if let Some(alias) = find_resource_block_name_alias(resource, schema) {
+            return Err(crate::provider::ProviderError::invalid_input(format!(
+                "{}: provider normalizer returned block-name alias `{}` at `{}`; return canonical attribute `{}`",
+                alias.resource_id(),
+                alias.alias(),
+                alias.path(),
+                alias.canonical(),
+            )));
+        }
     }
     Ok(())
 }

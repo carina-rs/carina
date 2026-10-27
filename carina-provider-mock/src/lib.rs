@@ -111,11 +111,62 @@ pub fn builtin_schemas() -> Vec<ResourceSchema> {
                     "rules",
                     AttributeType::list(AttributeType::struct_(
                         "Rule",
-                        vec![StructField::new("action", AttributeType::string())],
+                        vec![
+                            StructField::new("action", AttributeType::string()),
+                            StructField::new(
+                                "conditions",
+                                AttributeType::list(AttributeType::struct_(
+                                    "Condition",
+                                    vec![StructField::new("value", AttributeType::string())],
+                                )),
+                            )
+                            .with_block_name("condition"),
+                        ],
                     )),
                 )
                 .with_block_name("rule"),
             )
+            .attribute(AttributeSchema::new(
+                "lifecycle_configuration",
+                AttributeType::struct_(
+                    "LifecycleConfiguration",
+                    vec![
+                        StructField::new(
+                            "transitions",
+                            AttributeType::list(AttributeType::struct_(
+                                "Transition",
+                                vec![StructField::new("storage_class", AttributeType::string())],
+                            )),
+                        )
+                        .with_block_name("transition"),
+                        StructField::new(
+                            "transition",
+                            AttributeType::struct_(
+                                "Transition",
+                                vec![StructField::new("storage_class", AttributeType::string())],
+                            ),
+                        ),
+                    ],
+                ),
+            ))
+            .attribute(AttributeSchema::new(
+                "mode",
+                AttributeType::enum_(
+                    carina_core::schema::TypeIdentity::new(
+                        Some("mock"),
+                        ["test", "resource"],
+                        "Mode",
+                    ),
+                    Some(vec![
+                        "active".to_string(),
+                        "fast".to_string(),
+                        "slow".to_string(),
+                    ]),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            ))
             .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only())
             .attribute(AttributeSchema::new("comment", AttributeType::string()))
             .attribute(
@@ -552,6 +603,51 @@ impl MockProvider {
         }
     }
 
+    fn add_unknown_observed_fields_for(id: &ResourceId) -> bool {
+        env::var("CARINA_MOCK_UNKNOWN_OBSERVED_FIELDS_FOR")
+            .ok()
+            .is_some_and(|target| Some(target) == Self::resource_key(id))
+    }
+
+    fn populate_unknown_observed_fields_json(
+        id: &ResourceId,
+        attrs: &mut HashMap<String, PersistedValue>,
+    ) {
+        if !Self::add_unknown_observed_fields_for(id) {
+            return;
+        }
+        for (key, value) in [
+            ("arn", "provider-arn"),
+            ("id", "provider-id"),
+            ("created_at", "2026-10-27T00:00:00Z"),
+        ] {
+            attrs.insert(
+                key.to_string(),
+                PersistedValue::encode_provider_value(
+                    &Value::Concrete(ConcreteValue::String(value.into())),
+                    None,
+                )
+                .expect("mock unknown observed field is persistable"),
+            );
+        }
+    }
+
+    fn populate_unknown_observed_fields_value(id: &ResourceId, attrs: &mut HashMap<String, Value>) {
+        if !Self::add_unknown_observed_fields_for(id) {
+            return;
+        }
+        for (key, value) in [
+            ("arn", "provider-arn"),
+            ("id", "provider-id"),
+            ("created_at", "2026-10-27T00:00:00Z"),
+        ] {
+            attrs.insert(
+                key.to_string(),
+                Value::Concrete(ConcreteValue::String(value.into())),
+            );
+        }
+    }
+
     fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
         let target = env::var("CARINA_MOCK_DELETE_DELAY_MS_FOR").ok()?;
         if Some(target) != Self::resource_key(id) {
@@ -678,6 +774,7 @@ impl MockProvider {
             Err(error) => return Err(attempt.untracked(error)),
         };
         Self::populate_test_resource_identifier_json(&id, &mut attrs);
+        Self::populate_unknown_observed_fields_json(&id, &mut attrs);
 
         let partial_create = self.partial_create_config_for(&id);
         if let Some(config) = partial_create {
@@ -696,6 +793,7 @@ impl MockProvider {
 
         let mut state_attrs = resource.resolved_attributes();
         Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
+        Self::populate_unknown_observed_fields_value(&id, &mut state_attrs);
         if let Some(config) = partial_create {
             for attr in &config.missing_attributes {
                 state_attrs.remove(attr);

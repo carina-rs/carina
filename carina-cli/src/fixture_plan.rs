@@ -31,6 +31,7 @@ use crate::wiring::{
     add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
     expand_same_config_deferred_for, reconcile_anonymous_identifiers_with_ctx,
     reconcile_late_anonymous_identities, reconcile_prefixed_names,
+    resolve_config_block_names_with_ctx,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -184,7 +185,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let loaded = load_configuration(&fixture_pathbuf).unwrap();
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let unresolved_resources = loaded.unresolved_parsed.resources;
+    let unresolved_parsed = loaded.unresolved_parsed;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&fixture_pathbuf);
     // Fixture planning deliberately skips loading provider artifacts. Supply
@@ -226,6 +227,14 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.providers,
         fixture_schemas(),
     );
+    let unresolved_resources =
+        resolve_config_block_names_with_ctx(&wiring, &mut parsed, unresolved_parsed)
+            .unwrap_or_else(|errors| {
+                panic!(
+                    "fixture block-name resolution failed: {}",
+                    collapse_errors(errors)
+                )
+            });
 
     if fixture_pathbuf
         .file_name()
@@ -409,7 +418,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
     let unresolved_override_aware_resources =
         OverrideAwareResources::build_for_plan_with_stability(
-            unresolved_resources,
+            unresolved_resources.to_vec(),
             state_file.as_ref(),
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],
@@ -1268,4 +1277,46 @@ pub fn delete_instance_attributes_from_plan(
     state_file: Option<&StateFile>,
 ) -> carina_core::detail_rows::HistoricalDisplayAttributes {
     crate::commands::plan::collect_historical_display_attributes(plan, managed_current, state_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn providerless_fixture_plan_canonicalizes_block_names_in_both_snapshots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("main.crn"),
+            r#"provider mock {}
+
+let item = mock.test.resource {
+  name = "fixture-block"
+  rule { action = "allow" }
+}
+"#,
+        )
+        .expect("write fixture");
+
+        let fixture = build_plan_from_fixture_path(temp.path());
+        let desired = fixture
+            .desired_resources
+            .iter()
+            .find(|resource| resource.id.resource_type == "test.resource")
+            .expect("desired fixture resource")
+            .as_resource();
+        assert!(desired.attributes.contains_key("rules"));
+        assert!(!desired.attributes.contains_key("rule"));
+
+        let unresolved = fixture
+            .unresolved_resources
+            .iter()
+            .find(|resource| resource.as_resource().id.resource_type == "test.resource")
+            .expect("unresolved fixture resource")
+            .as_resource();
+        assert!(unresolved.attributes.contains_key("rules"));
+        assert!(!unresolved.attributes.contains_key("rule"));
+    }
 }

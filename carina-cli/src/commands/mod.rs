@@ -32,14 +32,16 @@ use carina_state::{
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
-    resolve_names_with_ctx, validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
-    validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
-    validate_module_internal_ref_types, validate_no_backend_in_modules,
-    validate_no_empty_interpolations, validate_no_exports_in_modules,
-    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    CanonicalUnresolvedResources, WiringContext, build_factories_from_providers,
+    compute_anonymous_identifiers_with_ctx, resolve_config_names_with_ctx,
+    resolve_file_names_with_ctx, validate_deferred_populate_refs_with_ctx,
+    validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
+    validate_module_calls_with_imported, validate_module_internal_ref_types,
+    validate_no_backend_in_modules, validate_no_empty_interpolations,
+    validate_no_exports_in_modules, validate_no_provider_in_modules,
+    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
+    validate_provider_region_with_ctx, validate_resources_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -364,6 +366,86 @@ pub(crate) fn validate_and_resolve_errors_with_context(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
+    validate_and_resolve_errors_with_context_inner(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+        None,
+        &mut None,
+    )
+}
+
+/// Validate the evaluated file and canonicalize its authored resource
+/// snapshot at the same schema-aware name-resolution boundary.
+pub(crate) fn validate_and_resolve_config_pair(
+    parsed: &mut carina_core::parser::InferredFile,
+    unresolved: carina_core::parser::ParsedFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+) -> Result<CanonicalUnresolvedResources, AppError> {
+    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let ctx = WiringContext::new(factories, &parsed.providers);
+    validate_and_resolve_config_pair_with_context(
+        parsed,
+        unresolved,
+        base_dir,
+        skip_resource_validation,
+        &ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_and_resolve_config_pair_with_context(
+    parsed: &mut carina_core::parser::InferredFile,
+    unresolved: carina_core::parser::ParsedFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    ctx: &WiringContext,
+    load_errors: HashMap<String, String>,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+) -> Result<CanonicalUnresolvedResources, AppError> {
+    let mut canonical_unresolved = None;
+    let errors = validate_and_resolve_errors_with_context_inner(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+        Some(unresolved),
+        &mut canonical_unresolved,
+    );
+    if errors.is_empty() {
+        Ok(canonical_unresolved
+            .expect("successful paired validation must cross the block-name resolution boundary"))
+    } else {
+        Err(collapse_errors(errors))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_and_resolve_errors_with_context_inner(
+    parsed: &mut carina_core::parser::InferredFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    ctx: &WiringContext,
+    load_errors: HashMap<String, String>,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+    mut unresolved: Option<carina_core::parser::ParsedFile>,
+    canonical_unresolved: &mut Option<CanonicalUnresolvedResources>,
+) -> Vec<AppError> {
     let module_walk = if skip_resource_validation {
         ModuleWalk::default()
     } else {
@@ -577,7 +659,14 @@ pub(crate) fn validate_and_resolve_errors_with_context(
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
-    errors.extend(resolve_names_with_ctx(ctx, &mut parsed.resources));
+    if let Some(unresolved) = unresolved.take() {
+        match resolve_config_names_with_ctx(ctx, parsed, unresolved) {
+            Ok(resources) => *canonical_unresolved = Some(resources),
+            Err(name_errors) => errors.extend(name_errors),
+        }
+    } else {
+        errors.extend(resolve_file_names_with_ctx(ctx, parsed));
+    }
     if !errors.is_empty() {
         return errors;
     }

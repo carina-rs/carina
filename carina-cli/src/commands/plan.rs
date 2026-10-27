@@ -1730,11 +1730,11 @@ pub async fn run_plan(
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
-    let unresolved_parsed = loaded.unresolved_parsed;
 
     let base_dir = get_base_dir(path);
-    crate::commands::validate_and_resolve_with_config(
+    let unresolved_resources = crate::commands::validate_and_resolve_config_pair(
         &mut parsed,
+        loaded.unresolved_parsed,
         base_dir,
         false,
         &inference_errors,
@@ -1919,7 +1919,7 @@ pub async fn run_plan(
         &wiring,
         &parsed,
         provider_inputs.configs(),
-        &unresolved_parsed.resources,
+        &unresolved_resources,
         &state_file,
         refresh,
         provider_inputs.remote_bindings(),

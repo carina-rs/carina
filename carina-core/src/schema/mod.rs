@@ -7158,6 +7158,163 @@ fn recurse_block_names_into_value(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockNameAlias {
+    resource_id: String,
+    path: String,
+    alias: String,
+    canonical: String,
+}
+
+impl BlockNameAlias {
+    pub(crate) fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub(crate) fn canonical(&self) -> &str {
+        &self.canonical
+    }
+}
+
+struct AliasLocation {
+    path: String,
+    alias: String,
+    canonical: String,
+}
+
+fn nested_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}.{name}")
+    }
+}
+
+fn find_block_name_alias_in_map(
+    map: &IndexMap<String, Value>,
+    fields: &[StructField],
+    defs: &BTreeMap<String, AttributeType>,
+    parent_path: &str,
+) -> Option<AliasLocation> {
+    for field in fields {
+        let Some(block_name) = field.block_name.as_deref() else {
+            continue;
+        };
+        if block_name != field.name
+            && matches!(
+                map.get(block_name),
+                Some(Value::Concrete(ConcreteValue::List(_)))
+            )
+        {
+            return Some(AliasLocation {
+                path: nested_path(parent_path, block_name),
+                alias: block_name.to_string(),
+                canonical: field.name.clone(),
+            });
+        }
+    }
+
+    for field in fields {
+        let Some(value) = map.get(&field.name) else {
+            continue;
+        };
+        if let Some(alias) = find_block_name_alias_in_value(
+            value,
+            &field.field_type,
+            defs,
+            &nested_path(parent_path, &field.name),
+        ) {
+            return Some(alias);
+        }
+    }
+    None
+}
+
+fn find_block_name_alias_in_value(
+    value: &Value,
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    path: &str,
+) -> Option<AliasLocation> {
+    match attr_type.shape_with_defs(defs) {
+        Shape::Struct { .. } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let fields = struct_fields_with_defs(attr_type, defs)
+                .expect("Shape::Struct must expose struct fields internally");
+            find_block_name_alias_in_map(map, fields, defs, path)
+        }
+        Shape::List { element_type, .. } => {
+            if !matches!(element_type.shape_with_defs(defs), Shape::Struct { .. }) {
+                return None;
+            }
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return None;
+            };
+            let fields = struct_fields_with_defs(element_type, defs)
+                .expect("Shape::Struct must expose struct fields internally");
+            items.iter().enumerate().find_map(|(index, item)| {
+                let Value::Concrete(ConcreteValue::Map(map)) = item else {
+                    return None;
+                };
+                find_block_name_alias_in_map(map, fields, defs, &format!("{path}[{index}]"))
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Find the first List-valued block alias without cloning or mutating the
+/// resource. This deliberately mirrors [`resolve_block_names`]: Map-valued
+/// assignments can be legitimate fields whose names happen to collide with a
+/// sibling field's `block_name`, and Union values are left to normal schema
+/// validation.
+pub(crate) fn find_resource_block_name_alias(
+    resource: &Resource,
+    schema: &ResourceSchema,
+) -> Option<BlockNameAlias> {
+    let location = schema.attributes.values().find_map(|attribute| {
+        let block_name = attribute.block_name.as_deref()?;
+        (block_name != attribute.name
+            && matches!(
+                resource.attributes.get(block_name),
+                Some(Value::Concrete(ConcreteValue::List(_)))
+            ))
+        .then(|| AliasLocation {
+            path: block_name.to_string(),
+            alias: block_name.to_string(),
+            canonical: attribute.name.clone(),
+        })
+    });
+    let location = location.or_else(|| {
+        schema.attributes.values().find_map(|attribute| {
+            let value = resource.attributes.get(&attribute.name)?;
+            find_block_name_alias_in_value(
+                value,
+                &attribute.attr_type,
+                &schema.defs,
+                &attribute.name,
+            )
+        })
+    })?;
+
+    Some(BlockNameAlias {
+        resource_id: resource.id.to_string(),
+        path: location.path,
+        alias: location.alias,
+        canonical: location.canonical,
+    })
+}
+
 /// Resolve block name aliases in resources.
 ///
 /// For each resource attribute key that matches a `block_name` in the schema,

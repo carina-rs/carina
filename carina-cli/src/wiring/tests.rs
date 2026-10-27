@@ -14,6 +14,7 @@ use carina_core::provider::{
 use carina_core::resource::{
     Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
+use carina_core::schema::StructField;
 use carina_core::value::canonicalize_resources_with_schemas;
 
 macro_rules! unexpected_resume_create {
@@ -257,7 +258,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         &ctx,
         parsed,
         provider_configs,
-        unresolved_resources,
+        &CanonicalUnresolvedResources::for_test(unresolved_resources),
         state_file,
         refresh,
         remote_bindings,
@@ -975,7 +976,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &ctx,
         &parsed,
         &provider_configs,
-        &[],
+        &CanonicalUnresolvedResources::for_test(&[]),
         &None,
         false,
         &HashMap::new(),
@@ -1428,7 +1429,7 @@ let shared = read test.shared.Type {}
         &ctx,
         &parsed,
         &provider_configs,
-        &parsed.resources,
+        &CanonicalUnresolvedResources::for_test(&parsed.resources),
         &state_file,
         true,
         &HashMap::new(),
@@ -3794,7 +3795,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &ctx,
         &parsed,
         &provider_configs,
-        &unresolved_parsed.resources,
+        &CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
         &Some(state_file),
         false,
         &HashMap::new(),
@@ -4645,6 +4646,102 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     assert!(
         errors.is_empty(),
         "compute_anonymous_identifiers: got {errors:?}",
+    );
+}
+
+#[test]
+fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
+    let schema = ResourceSchema::new("thing").attribute(
+        AttributeSchema::new(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![StructField::new("action", AttributeType::string())],
+            )),
+        )
+        .with_block_name("rule"),
+    );
+    let ctx =
+        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
+    let rule = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::String("allow".into())),
+        )])),
+    )]));
+    let resource = Resource::with_provider("test", "thing", "direct", None)
+        .with_attribute("rule", rule.clone());
+    let template_resource = Resource::with_provider("test", "thing", "deferred", None)
+        .with_attribute("rule", rule.clone());
+    let deferred = carina_core::parser::DeferredForExpression {
+        file: Some("main.crn".to_string()),
+        line: 4,
+        header: "for item in pending.items".to_string(),
+        resource_type: "test.thing".to_string(),
+        attributes: vec![("rule".to_string(), rule)],
+        binding_name: "items".to_string(),
+        iterable: Value::resource_ref("pending", "items", Vec::new()),
+        binding: carina_core::parser::ForBinding::Simple("item".to_string()),
+        template_resource,
+    };
+    let mut evaluated = carina_core::parser::ParsedFile {
+        resources: vec![resource],
+        deferred_for_expressions: vec![deferred],
+        ..Default::default()
+    };
+    let unresolved = evaluated.clone();
+
+    let canonical_unresolved =
+        resolve_config_block_names_with_ctx(&ctx, &mut evaluated, unresolved)
+            .expect("paired block aliases must resolve");
+
+    assert!(evaluated.resources[0].attributes.contains_key("rules"));
+    assert!(!evaluated.resources[0].attributes.contains_key("rule"));
+    let evaluated_deferred = &evaluated.deferred_for_expressions[0];
+    assert!(
+        evaluated_deferred
+            .template_resource
+            .attributes
+            .contains_key("rules")
+    );
+    assert_eq!(evaluated_deferred.attributes[0].0, "rules");
+
+    let unresolved_resources = canonical_unresolved.to_vec();
+    assert!(unresolved_resources[0].attributes.contains_key("rules"));
+    assert!(!unresolved_resources[0].attributes.contains_key("rule"));
+}
+
+#[test]
+fn paired_block_name_resolution_reports_shared_conflict_once() {
+    let schema = ResourceSchema::new("thing").attribute(
+        AttributeSchema::new(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![StructField::new("action", AttributeType::string())],
+            )),
+        )
+        .with_block_name("rule"),
+    );
+    let ctx =
+        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
+    let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
+    let resource = Resource::with_provider("test", "thing", "direct", None)
+        .with_attribute("rule", rules.clone())
+        .with_attribute("rules", rules);
+    let mut evaluated = carina_core::parser::ParsedFile {
+        resources: vec![resource],
+        ..Default::default()
+    };
+    let unresolved = evaluated.clone();
+
+    let errors = resolve_config_block_names_with_ctx(&ctx, &mut evaluated, unresolved)
+        .expect_err("mixed block and attribute syntax must fail");
+
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        "test.thing.direct: cannot use both 'rule' and 'rules' (they refer to the same attribute)"
     );
 }
 
@@ -7912,7 +8009,7 @@ exports { team_prefix: String = "x" }"#,
             &ctx,
             &parsed,
             &provider_configs,
-            &unresolved_resources,
+            &CanonicalUnresolvedResources::for_test(&unresolved_resources),
             &None,
             true,
             &remote_bindings,
@@ -7987,7 +8084,7 @@ exports { team_prefix: String = "x" }"#,
             &ctx,
             &parsed,
             &provider_configs,
-            &[],
+            &CanonicalUnresolvedResources::for_test(&[]),
             &None,
             true,
             &HashMap::new(),

@@ -73,8 +73,8 @@ use crate::plan_summary::PlanChangeSummary;
 #[cfg(test)]
 use crate::wiring::read_with_retry;
 use crate::wiring::{
-    DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
-    build_factories_from_providers, create_normalizers_from_configs_with_ctx,
+    CanonicalUnresolvedResources, DataSourceRefreshResolution, LateAnonymousIdentityInputs,
+    WiringContext, build_factories_from_providers, create_normalizers_from_configs_with_ctx,
     create_providers_from_configs_with_ctx, data_source_refresh_bindings, get_provider_with_ctx,
     prepare_data_sources_for_plan, prepare_default_provider_ready_config,
     prepare_desired_side_for_plan, read_data_source_with_retry, read_managed_state_with_retry,
@@ -1353,12 +1353,12 @@ async fn run_apply_with_observer_factory(
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
-    let unresolved_parsed = loaded.unresolved_parsed;
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    crate::commands::validate_and_resolve_with_config(
+    let unresolved_resources = crate::commands::validate_and_resolve_config_pair(
         &mut parsed,
+        loaded.unresolved_parsed,
         base_dir,
         false,
         &inference_errors,
@@ -1489,7 +1489,7 @@ async fn run_apply_with_observer_factory(
                     // reuses the heavier preflight pipeline only for its
                     // resolve+anon-id steps; the schema validation already
                     // ran on the pre-injection configuration.
-                    // Keep the authored pre-injection `unresolved_parsed` for
+                    // Keep the authored pre-injection canonical snapshot for
                     // resource pairing; replace only the resolved snapshot so
                     // the lock-held path sees the injected bucket row.
                     parsed = reload_apply_configuration_after_bootstrap(
@@ -1566,7 +1566,7 @@ async fn run_apply_with_observer_factory(
     let outcome = run_apply_locked_owned(
         &ctx,
         &mut parsed,
-        &unresolved_parsed,
+        &unresolved_resources,
         auto_approve,
         Arc::clone(&backend),
         state_lock,
@@ -1698,7 +1698,7 @@ struct SavedPlanApplyExecuted {
 async fn run_apply_locked_owned(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::InferredFile,
-    unresolved_parsed: &carina_core::parser::ParsedFile,
+    unresolved_resources: &CanonicalUnresolvedResources,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     lock: StateLock,
@@ -2173,7 +2173,7 @@ async fn run_apply_locked_owned(
                 state_file.as_ref(),
             );
             let unresolved_override_aware_resources = OverrideAwareResources::build_with_stability(
-                unresolved_parsed.resources.clone(), // allow: direct — parser-internal, pre-expansion
+                unresolved_resources.to_vec(),
                 state_file.as_ref(),
                 carina_core::binding_index::PreApplyInputs {
                     managed: &[],
@@ -2686,10 +2686,11 @@ async fn run_apply_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let unresolved_resources = CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources);
     let outcome = run_apply_locked_owned(
         ctx,
         parsed,
-        unresolved_parsed,
+        &unresolved_resources,
         auto_approve,
         Arc::clone(&backend),
         lock,

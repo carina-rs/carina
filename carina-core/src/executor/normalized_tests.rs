@@ -29,6 +29,181 @@ fn string_value(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string().into()))
 }
 
+struct AttributeReturningNormalizer {
+    name: &'static str,
+    value: Value,
+}
+
+impl ProviderNormalizer for AttributeReturningNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            resources[0].set_attr(self.name, self.value.clone());
+            Ok(())
+        })
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _current_states: &'a mut crate::provider::StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _current_states: &'a mut crate::provider::StateTransformMap,
+        _saved_attrs: &'a crate::provider::SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        ready_noop()
+    }
+}
+
+#[tokio::test]
+async fn normalized_resource_rejects_block_aliases_returned_by_provider_normalizer() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("thing").attribute(
+            AttributeSchema::new(
+                "rules",
+                AttributeType::list(AttributeType::struct_(
+                    "Rule",
+                    vec![StructField::new("action", AttributeType::string())],
+                )),
+            )
+            .with_block_name("rule"),
+        ),
+    );
+    let normalizer = AttributeReturningNormalizer {
+        name: "rule",
+        value: Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "action".to_string(),
+                string_value("allow"),
+            )])),
+        )])),
+    };
+
+    let error = apply_desired_normalization(
+        Resource::with_provider("test", "thing", "example", None),
+        &[],
+        &normalizer,
+        &schemas,
+    )
+    .await
+    .expect_err("provider normalizers must return canonical attribute names");
+
+    assert!(matches!(error, ProviderError::InvalidInput(_)));
+    assert!(error.to_string().contains("block-name alias `rule`"));
+    assert!(error.to_string().contains("canonical attribute `rules`"));
+}
+
+#[tokio::test]
+async fn normalized_resource_rejects_nested_block_aliases_returned_by_provider_normalizer() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let condition = AttributeType::struct_(
+        "Condition",
+        vec![StructField::new("value", AttributeType::string())],
+    );
+    let rule = AttributeType::struct_(
+        "Rule",
+        vec![
+            StructField::new("conditions", AttributeType::list(condition))
+                .with_block_name("condition"),
+        ],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("thing")
+            .attribute(AttributeSchema::new("rules", AttributeType::list(rule))),
+    );
+    let normalizer = AttributeReturningNormalizer {
+        name: "rules",
+        value: Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "condition".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Map(IndexMap::from([(
+                        "value".to_string(),
+                        string_value("ready"),
+                    )])),
+                )])),
+            )])),
+        )])),
+    };
+
+    let error = apply_desired_normalization(
+        Resource::with_provider("test", "thing", "example", None),
+        &[],
+        &normalizer,
+        &schemas,
+    )
+    .await
+    .expect_err("nested provider-normalizer aliases must be rejected");
+
+    assert!(matches!(error, ProviderError::InvalidInput(_)));
+    assert!(error.to_string().contains("block-name alias `condition`"));
+    assert!(error.to_string().contains("`rules[0].condition`"));
+    assert!(
+        error
+            .to_string()
+            .contains("canonical attribute `conditions`")
+    );
+}
+
+#[tokio::test]
+async fn normalizer_alias_guard_respects_canonical_keys_in_another_union_arm() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let canonical_arm = AttributeType::struct_(
+        "CanonicalRule",
+        vec![StructField::new("rule", AttributeType::string())],
+    );
+    let alias_arm = AttributeType::struct_(
+        "RepeatedRules",
+        vec![
+            StructField::new(
+                "rules",
+                AttributeType::list(AttributeType::struct_(
+                    "Rule",
+                    vec![StructField::new("action", AttributeType::string())],
+                )),
+            )
+            .with_block_name("rule"),
+        ],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("thing").attribute(AttributeSchema::new(
+            "choice",
+            AttributeType::union(vec![canonical_arm, alias_arm]),
+        )),
+    );
+    let resource = Resource::with_provider("test", "thing", "example", None).with_attribute(
+        "choice",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "rule".to_string(),
+            string_value("canonical-in-this-arm"),
+        )]))),
+    );
+
+    let normalized = apply_desired_normalization(resource, &[], &NoopNormalizer, &schemas)
+        .await
+        .expect(
+            "a canonical key must not be rejected because another union arm uses it as an alias",
+        );
+
+    assert!(normalized.as_resource().get_attr("choice").is_some());
+}
+
 #[tokio::test]
 async fn normalization_error_stops_later_stages() {
     struct FailingNormalizer;

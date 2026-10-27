@@ -111,6 +111,18 @@ fn assert_success(label: &str, output: &Output) {
     );
 }
 
+fn assert_failure_contains(label: &str, output: &Output, expected: &str) {
+    let rendered = output_text(output);
+    assert!(
+        !output.status.success(),
+        "{label} unexpectedly succeeded:\n{rendered}",
+    );
+    assert!(
+        rendered.contains(expected),
+        "{label} did not contain {expected:?}:\n{rendered}",
+    );
+}
+
 fn assert_output_has_no_plaintext(label: &str, output: &Output, plaintexts: &[&str]) {
     let rendered = output_text(output);
     for plaintext in plaintexts {
@@ -391,6 +403,532 @@ fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
             .and_then(Value::as_str)
             .expect("structural test secret carries a digest")
     )
+}
+
+#[test]
+fn live_apply_canonicalizes_repeated_block_keys_before_provider_and_state_writeback() {
+    const ENV: &[(&str, &str)] = &[("SECRET_V", "topsecret-plain-42")];
+    const PLAINTEXT: &str = "topsecret-plain-42";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let r = mock.test.resource { name = "seed" }
+let b = mock.test.resource {
+  name = "b"
+  rule { action = r.identifier }
+  rule { action = secret(env("SECRET_V")) }
+}
+"#,
+        ENV,
+    );
+
+    let apply = scenario.carina_with_env(&["apply", "--auto-approve", "--lock=false", "."], ENV);
+    assert_success("live apply with repeated blocks", &apply);
+    assert_output_has_no_plaintext("live apply with repeated blocks", &apply, &[PLAINTEXT]);
+
+    let state_text =
+        fs::read_to_string(scenario.project.join("carina.state.json")).expect("read Carina state");
+    assert!(
+        !state_text.contains(PLAINTEXT),
+        "Carina state leaked repeated-block secret plaintext:\n{state_text}",
+    );
+    let state = scenario.state_json();
+    let attributes = state_resource_by_name(&state, "b")["attributes"]
+        .as_object()
+        .expect("resource attributes");
+    assert!(
+        !attributes.contains_key("rule"),
+        "surface block-name key must not survive state writeback: {attributes:#?}",
+    );
+    let rules = attributes["rules"]
+        .as_array()
+        .expect("canonical rules list");
+    assert_eq!(rules[0]["action"], "seed-id");
+    assert_secret_hash(&rules[1]["action"]);
+
+    let provider = scenario.provider_json();
+    let provider_attributes = provider_resource_by_name(&provider, "b")
+        .as_object()
+        .expect("provider resource attributes");
+    assert!(
+        !provider_attributes.contains_key("rule"),
+        "surface block-name key crossed the provider boundary: {provider_attributes:#?}",
+    );
+}
+
+#[test]
+fn singular_field_matching_another_fields_block_name_is_not_renamed() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name = "transition-assignment"
+  lifecycle_configuration = {
+    transition = { storage_class = "GLACIER" }
+  }
+}
+"#,
+    );
+
+    let apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("apply with singular transition assignment", &apply);
+
+    let state = scenario.state_json();
+    let provider = scenario.provider_json();
+    for (label, attributes) in [
+        (
+            "Carina state",
+            &state_resource_by_name(&state, "transition-assignment")["attributes"],
+        ),
+        (
+            "mock provider state",
+            provider_resource_by_name(&provider, "transition-assignment"),
+        ),
+    ] {
+        let lifecycle = &attributes["lifecycle_configuration"];
+        assert_eq!(lifecycle["transition"]["storage_class"], "GLACIER");
+        assert!(
+            lifecycle.get("transitions").is_none(),
+            "{label} incorrectly renamed the singular field: {lifecycle:#?}",
+        );
+    }
+}
+
+#[test]
+fn unknown_block_name_keeps_main_validation_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        temp.path().join("main.crn"),
+        "provider mock {}\nlet item = mock.test.resource {\n  rul { action = \"allow\" }\n}\n",
+    )
+    .expect("write main.crn");
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(temp.path())
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["validate", "."])
+        .output()
+        .expect("run carina validate");
+    let rendered = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "unknown block unexpectedly validated"
+    );
+    assert!(
+        rendered.contains("Unknown attribute 'rul', did you mean 'rule'?"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn untyped_export_block_syntax_is_rejected_before_plan_or_mutation() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let r = mock.test.resource { name = "f1" }
+exports {
+  out = {
+    a = "x"
+    blk { v = r.identifier }
+  }
+}
+"#,
+    );
+
+    let provider_before = fs::read(&scenario.mock_state).ok();
+    let plan = scenario.carina(&["plan", "."]);
+    assert_failure_contains(
+        "untyped export block plan",
+        &plan,
+        "type annotation required: collection element types disagree",
+    );
+    assert_eq!(
+        fs::read(&scenario.mock_state).ok(),
+        provider_before,
+        "a rejected untyped export plan mutated the provider",
+    );
+    assert!(
+        !scenario.project.join("carina.state.json").exists(),
+        "a rejected untyped export plan wrote state",
+    );
+}
+
+#[test]
+fn typed_export_struct_accepts_nested_block_syntax() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let r = mock.test.resource { name = "f2" }
+exports {
+  out: struct { a: String, blk: list(struct { v: String }) } = {
+    a = "x"
+    blk { v = "y" }
+  }
+}
+"#,
+    );
+
+    assert_success(
+        "typed export block validate",
+        &scenario.carina(&["validate", "."]),
+    );
+    assert_success("typed export block plan", &scenario.plan());
+}
+
+#[test]
+fn typed_module_argument_accepts_nested_block_syntax() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    scenario.write_module(
+        "component",
+        r#"arguments {
+  rs: list(struct { action: String, condition: list(struct { value: String }) })
+}
+
+let r = mock.test.resource {
+  name = "module-argument-block"
+  comment = rs[0].condition[0].value
+}
+"#,
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let component = use { source = "./component" }
+let instance = component {
+  rs = [{
+    action = "a"
+    condition { value = "v" }
+  }]
+}
+"#,
+    );
+
+    assert_success(
+        "typed module argument block validate",
+        &scenario.carina(&["validate", "."]),
+    );
+    assert_success("typed module argument block plan", &scenario.plan());
+}
+
+#[test]
+fn typed_module_attribute_accepts_nested_block_syntax() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    scenario.write_module(
+        "component",
+        r#"let inner = mock.test.resource { name = "module-attribute-inner" }
+
+attributes {
+  out: struct { blk: list(struct { v: String }) } = {
+    blk { v = "q" }
+  }
+}
+"#,
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let component = use { source = "./component" }
+let instance = component {}
+mock.test.resource {
+  name = "module-attribute-outer"
+  comment = instance.out.blk[0].v
+}
+"#,
+    );
+
+    assert_success(
+        "typed module attribute block validate",
+        &scenario.carina(&["validate", "."]),
+    );
+    assert_success("typed module attribute block plan", &scenario.plan());
+}
+
+#[test]
+fn invalid_provider_default_tags_matches_main_validation_boundary() {
+    const ENV: &[(&str, &str)] = &[("SECRET_V", "topsecret-plain-42")];
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {
+  default_tags = [secret(env("SECRET_V"))]
+}
+
+mock.test.resource { name = "g1" }
+"#,
+    );
+
+    for (label, output) in [
+        (
+            "invalid provider default_tags validate",
+            scenario.carina_with_env(&["validate", "."], ENV),
+        ),
+        (
+            "invalid provider default_tags plan",
+            scenario.carina_with_env(&["plan", "."], ENV),
+        ),
+    ] {
+        assert_failure_contains(label, &output, "default_tags must resolve to a map");
+        let rendered = output_text(&output);
+        assert!(!rendered.contains("ParsedMap"), "{label}:\n{rendered}");
+        assert!(
+            !rendered.contains("unresolved block syntax"),
+            "{label}:\n{rendered}",
+        );
+    }
+}
+
+#[test]
+fn canonical_attribute_name_keeps_working_as_block_syntax() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+mock.test.resource {
+  name = "canonical-block"
+  rules { action = "allow" }
+}
+"#,
+    );
+
+    assert_success(
+        "canonical-name block validate",
+        &scenario.carina(&["validate", "."]),
+    );
+    assert_success("canonical-name block plan", &scenario.plan());
+}
+
+#[test]
+fn local_map_with_nested_block_still_supports_field_access() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let m = {
+  action = "x"
+  condition { value = "v" }
+}
+mock.test.resource {
+  name = "local-map-block"
+  comment = m.action
+}
+"#,
+    );
+
+    assert_success(
+        "local map block field access validate",
+        &scenario.carina(&["validate", "."]),
+    );
+    assert_success("local map block field access plan", &scenario.plan());
+}
+
+#[test]
+fn unknown_provider_attributes_stay_plaintext_when_desired_has_a_secret() {
+    const ENV: &[(&str, &str)] = &[(
+        "CARINA_MOCK_UNKNOWN_OBSERVED_FIELDS_FOR",
+        "test.resource.item",
+    )];
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name = "observed-fields"
+  comment = secret("desired-secret")
+}
+"#,
+        ENV,
+    );
+
+    let apply = scenario.carina_with_env(&["apply", "--auto-approve", "--lock=false", "."], ENV);
+    assert_success("apply with unknown observed provider fields", &apply);
+
+    let state = scenario.state_json();
+    let attributes = &state_resource_by_name(&state, "observed-fields")["attributes"];
+    assert_eq!(attributes["arn"], "provider-arn");
+    assert_eq!(attributes["id"], "provider-id");
+    assert_eq!(attributes["created_at"], "2026-10-27T00:00:00Z");
+    assert_secret_hash(&attributes["comment"]);
+}
+
+#[test]
+fn saved_plan_repeated_block_secret_applies_masked_and_converges() {
+    const ENV: &[(&str, &str)] = &[("SECRET_V", "topsecret-plain-42")];
+    const PLAINTEXT: &str = "topsecret-plain-42";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let t = mock.test.resource {
+  name = "t"
+  rule { action = secret(env("SECRET_V")) }
+}
+"#,
+        ENV,
+    );
+
+    let plan = scenario.plan_with_env(ENV);
+    assert_success("saved plan with repeated-block secret", &plan);
+    assert_output_has_no_plaintext("saved plan with repeated-block secret", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+    let saved_plan = read_json(&scenario.project.join("plan.json"));
+    let origin_attributes = saved_plan["unresolved_resources"]
+        .as_array()
+        .expect("saved-plan unresolved resources")
+        .iter()
+        .find(|resource| {
+            resource.pointer("/attributes/name/String") == Some(&Value::String("t".to_string()))
+        })
+        .and_then(|resource| resource["attributes"].as_object())
+        .expect("saved-plan origin attributes for t");
+    assert!(
+        !origin_attributes.contains_key("rule") && origin_attributes.contains_key("rules"),
+        "saved-plan secret positions must use the canonical attribute name: {origin_attributes:#?}",
+    );
+
+    let apply = scenario.apply_plan_with_env(ENV);
+    assert_success("saved-plan apply with repeated-block secret", &apply);
+    assert_output_has_no_plaintext(
+        "saved-plan apply with repeated-block secret",
+        &apply,
+        &[PLAINTEXT],
+    );
+
+    let state_text =
+        fs::read_to_string(scenario.project.join("carina.state.json")).expect("read Carina state");
+    assert!(
+        !state_text.contains(PLAINTEXT),
+        "Carina state leaked repeated-block secret plaintext:\n{state_text}",
+    );
+    let state = scenario.state_json();
+    let attributes = state_resource_by_name(&state, "t")["attributes"]
+        .as_object()
+        .expect("resource attributes");
+    assert!(
+        !attributes.contains_key("rule"),
+        "surface block-name key must not survive saved-plan state writeback: {attributes:#?}",
+    );
+    let rules = attributes["rules"]
+        .as_array()
+        .expect("canonical rules list");
+    assert_secret_hash(&rules[0]["action"]);
+
+    let second_plan = scenario.carina_with_env(&["plan", "."], ENV);
+    assert_success("second plan after saved-plan apply", &second_plan);
+    assert_output_has_no_plaintext(
+        "second plan after saved-plan apply",
+        &second_plan,
+        &[PLAINTEXT],
+    );
+    assert!(
+        output_text(&second_plan).contains("No changes. Infrastructure is up-to-date."),
+        "second plan must be empty after repeated-block saved-plan apply:\n{}",
+        output_text(&second_plan),
+    );
+}
+
+#[test]
+fn saved_plan_nested_repeated_block_alias_applies_masked_and_converges() {
+    const ENV: &[(&str, &str)] = &[("SECRET_V", "nested-topsecret-3973")];
+    const PLAINTEXT: &str = "nested-topsecret-3973";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let t = mock.test.resource {
+  name = "nested"
+  rule {
+    action = "allow"
+    condition { value = secret(env("SECRET_V")) }
+  }
+}
+"#,
+        ENV,
+    );
+
+    let plan = scenario.plan_with_env(ENV);
+    assert_success("saved plan with nested repeated-block secret", &plan);
+    assert_output_has_no_plaintext(
+        "saved plan with nested repeated-block secret",
+        &plan,
+        &[PLAINTEXT],
+    );
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+
+    let apply = scenario.apply_plan_with_env(ENV);
+    assert_success("saved-plan apply with nested repeated-block secret", &apply);
+    assert_output_has_no_plaintext(
+        "saved-plan apply with nested repeated-block secret",
+        &apply,
+        &[PLAINTEXT],
+    );
+
+    let state_text =
+        fs::read_to_string(scenario.project.join("carina.state.json")).expect("read Carina state");
+    assert!(
+        !state_text.contains(PLAINTEXT),
+        "Carina state leaked nested repeated-block secret plaintext:\n{state_text}",
+    );
+    let state = scenario.state_json();
+    let attributes = state_resource_by_name(&state, "nested")["attributes"]
+        .as_object()
+        .expect("resource attributes");
+    assert!(
+        !attributes.contains_key("rule"),
+        "top-level surface block-name key survived state writeback: {attributes:#?}",
+    );
+    let rule = &attributes["rules"][0];
+    assert!(
+        rule.get("condition").is_none(),
+        "nested surface block-name key survived state writeback: {rule:#?}",
+    );
+    assert_secret_hash(&rule["conditions"][0]["value"]);
+
+    let provider = scenario.provider_json();
+    let provider_rule = &provider_resource_by_name(&provider, "nested")["rules"][0];
+    assert!(
+        provider_rule.get("condition").is_none(),
+        "nested surface block-name key crossed the provider boundary: {provider_rule:#?}",
+    );
+
+    let second_plan = scenario.carina_with_env(&["plan", "."], ENV);
+    assert_success(
+        "second plan after nested-block saved-plan apply",
+        &second_plan,
+    );
+    assert!(
+        output_text(&second_plan).contains("No changes. Infrastructure is up-to-date."),
+        "second plan must be empty after nested repeated-block apply:\n{}",
+        output_text(&second_plan),
+    );
 }
 
 #[test]
@@ -796,6 +1334,116 @@ let item = mock.test.resource {
     );
     let state = scenario.state_json();
     assert_secret_hash(&state_resource_by_name(&state, "module-secret")["attributes"]["comment"]);
+}
+
+#[test]
+fn saved_plan_module_repeated_block_secret_is_canonical_masked_and_converges() {
+    const ENV: &[(&str, &str)] = &[("MODULE_RULE_SECRET", "module-rule-plain-3973")];
+    const PLAINTEXT: &str = "module-rule-plain-3973";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let component = use { source = "./component" }
+let instance = component {
+  value = secret(env("MODULE_RULE_SECRET"))
+}
+"#,
+        ENV,
+    );
+    scenario.write_module(
+        "component",
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name = "module-rule-secret"
+  rule {
+    action = "allow"
+    condition { value = value }
+  }
+}
+"#,
+    );
+
+    let plan = scenario.plan_with_env(ENV);
+    assert_success("module repeated-block plan", &plan);
+    assert_output_has_no_plaintext("module repeated-block plan", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+
+    let apply = scenario.apply_plan_with_env(ENV);
+    assert_success("module repeated-block saved-plan apply", &apply);
+    assert_output_has_no_plaintext(
+        "module repeated-block saved-plan apply",
+        &apply,
+        &[PLAINTEXT],
+    );
+
+    let state_text =
+        fs::read_to_string(scenario.project.join("carina.state.json")).expect("read Carina state");
+    assert!(!state_text.contains(PLAINTEXT), "{state_text}");
+    let state = scenario.state_json();
+    let attributes = state_resource_by_name(&state, "module-rule-secret")["attributes"]
+        .as_object()
+        .expect("resource attributes");
+    assert!(!attributes.contains_key("rule"), "{attributes:#?}");
+    let rule = &attributes["rules"][0];
+    assert!(rule.get("condition").is_none(), "{rule:#?}");
+    assert_secret_hash(&rule["conditions"][0]["value"]);
+
+    let provider = scenario.provider_json();
+    let provider_attributes = provider_resource_by_name(&provider, "module-rule-secret")
+        .as_object()
+        .expect("provider resource attributes");
+    assert!(
+        !provider_attributes.contains_key("rule"),
+        "{provider_attributes:#?}"
+    );
+    assert!(
+        provider_attributes["rules"][0].get("condition").is_none(),
+        "{provider_attributes:#?}",
+    );
+
+    let second_plan = scenario.carina_with_env(&["plan", "."], ENV);
+    assert_success("module repeated-block second plan", &second_plan);
+    assert!(
+        output_text(&second_plan).contains("No changes. Infrastructure is up-to-date."),
+        "{}",
+        output_text(&second_plan),
+    );
+}
+
+#[test]
+fn module_argument_enum_placeholder_validates_and_plans_before_expansion() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let component = use { source = "./component" }
+let instance = component {
+  mode = mock.test.resource.Mode.fast
+}
+"#,
+    );
+    scenario.write_module(
+        "component",
+        r#"arguments {
+  mode: mock.test.resource.Mode
+}
+
+let item = mock.test.resource {
+  name = "module-enum"
+  mode = mode
+}
+"#,
+    );
+
+    assert_success(
+        "module enum placeholder validate",
+        &scenario.carina(&["validate", "."]),
+    );
+    assert_success("module enum placeholder plan", &scenario.plan());
 }
 
 #[test]
