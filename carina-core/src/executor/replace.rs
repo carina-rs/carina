@@ -2,66 +2,12 @@
 
 use std::time::Duration;
 
-use crate::differ::{
-    AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
-};
-use crate::provider::{ProviderReadyResource, UpdatePatch, build_update_patch};
-use crate::resource::{DataSource, Resource, State};
-use crate::schema::SchemaRegistry;
+use crate::resource::{DataSource, State};
 
 use super::ProgressInfo;
 use super::basic::BasicEffectResult;
 use super::wait::WaitOutcome;
 use crate::binding_index::SecretPreservingAttributes;
-
-/// Build a full attribute-diff [`UpdatePatch`] between an existing
-/// `from` state and a desired `to` resource when no precomputed
-/// `changed_attributes` list is available.
-pub fn compute_full_diff_patch(
-    from: &State,
-    to: &ProviderReadyResource,
-    to_source: &Resource,
-    schemas: &SchemaRegistry,
-) -> UpdatePatch {
-    use std::collections::HashSet;
-
-    let to_resource = to.as_resource();
-    let schema = schemas.get_for(to_resource);
-    let mut keys: HashSet<&str> = HashSet::new();
-    keys.extend(from.attributes.keys().map(String::as_str));
-    keys.extend(to_resource.attributes.keys().map(String::as_str));
-    let mut sorted_keys: Vec<&str> = keys.into_iter().collect();
-    sorted_keys.sort();
-
-    let changed: Vec<String> = sorted_keys
-        .into_iter()
-        .filter_map(|key| match to_resource.attributes.get(key) {
-            Some(new_value) => {
-                let type_info = schema.and_then(|s| {
-                    s.attributes.get(key).map(|attr| TypedAttr {
-                        attr_type: &attr.attr_type,
-                        defs: &s.defs,
-                    })
-                });
-                let comparison_value =
-                    secret_grafted_comparison_view(new_value, to_source.attributes.get(key))?;
-                key_should_enter_patch(
-                    key,
-                    schema,
-                    AttrComparison {
-                        from: from.attributes.get(key),
-                        to: comparison_value.as_ref(),
-                        saved: None,
-                        type_info,
-                    },
-                )
-                .then(|| key.to_string())
-            }
-            None => Some(key.to_string()),
-        })
-        .collect();
-    build_update_patch(&changed, to, from)
-}
 
 /// Result of executing a single effect.
 pub(super) enum SingleEffectResult {

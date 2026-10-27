@@ -3,7 +3,7 @@
 //! A Provider defines operations for a specific infrastructure (AWS, GCP, etc.).
 //! It is responsible for converting Effects into actual API calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ use crate::resource::{
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
-use crate::schema::{SchemaRegistry, Shape, TypeIdentity};
+use crate::schema::{ResourceSchema, SchemaRegistry, Shape, TypeIdentity};
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
 };
@@ -581,12 +581,12 @@ pub struct ReadRequest;
 /// Per-operation request record for [`Provider::update`].
 ///
 /// Mirrors `update-request` in `wit/types.wit`. `from` is the current
-/// provider-side state; `patch` carries only the user's intended
-/// changes. The patch is the sole source of truth for what the
-/// provider should write — there is no separate `to: Resource`
-/// because exposing the full desired resource invites providers to
-/// touch fields the user never specified (the root cause of
-/// `carina-rs/carina#2559`).
+/// provider-side state; `patch` carries the user's intended changes plus any
+/// desired, updatable write-only values that must be reasserted alongside an
+/// update. The patch is the sole source of truth for what the provider should
+/// write — there is no separate `to: Resource` because exposing the full
+/// desired resource invites providers to touch fields the user never specified
+/// (the root cause of `carina-rs/carina#2559`).
 ///
 /// External callers cannot assemble an update request from raw state and
 /// patch data; the private witness is supplied only by the checked provider
@@ -616,7 +616,8 @@ pub struct UpdateRequest {
     /// paths or for resolving server-assigned identifiers; MUST NOT be
     /// used to derive additional fields to write back.
     from: State,
-    /// Structured description of the user's intended change.
+    /// Structured description of the user's intended change and any write-only
+    /// values reasserted alongside it.
     patch: UpdatePatch,
 }
 
@@ -625,8 +626,9 @@ impl UpdateRequest {
         from: State,
         changed_attributes: &[String],
         resource: &ProviderReadyResource,
+        schema: &ResourceSchema,
     ) -> Self {
-        let patch = build_update_patch(changed_attributes, resource, &from);
+        let patch = build_update_patch(changed_attributes, resource, &from, schema);
         Self { from, patch }
     }
 
@@ -653,14 +655,14 @@ pub struct DeleteRequest {
 /// A structured description of the user's intended change to a resource.
 ///
 /// Mirrors `update-patch` in `wit/types.wit`. Each [`PatchOp`]
-/// corresponds to a key the user explicitly specified or removed in
-/// the desired state. Fields the user has never specified do not
-/// appear in the patch.
+/// corresponds to a key the user explicitly specified or removed in the
+/// desired state, or to an unchanged desired write-only key re-sent through
+/// [`PatchOp::Reassert`] alongside another change. Fields the user has never
+/// specified do not appear in the patch.
 ///
 /// Providers MUST NOT modify any attribute that is not represented in
-/// `ops`. Although patch values remain source-compatible for provider helper
-/// code, an [`UpdateRequest`] cannot be constructed without the private
-/// provider-readiness witness.
+/// `ops`. An [`UpdateRequest`] cannot be constructed without the private
+/// provider-readiness witness and its managed-resource schema.
 #[derive(Debug, Clone, Default)]
 pub struct UpdatePatch {
     /// Operations derived from the desired resource.
@@ -670,80 +672,116 @@ pub struct UpdatePatch {
 /// A single operation inside an [`UpdatePatch`].
 ///
 /// Mirrors `patch-op` in `wit/types.wit`.
-#[derive(Debug, Clone)]
-pub struct PatchOp {
-    pub kind: PatchOpKind,
-    /// Top-level attribute name. Nested-field patches are a future
-    /// extension.
-    pub key: String,
-    /// `Some(_)` for `Add` and `Replace`; `None` for `Remove`.
-    pub value: Option<Value>,
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatchOp {
+    /// User added a key that did not previously appear in the desired state.
+    Add { key: String, value: Value },
+    /// User changed the value of an existing key in the desired state.
+    Replace { key: String, value: Value },
+    /// Unchanged; re-sent because it is write-only and the backend cannot read
+    /// it back.
+    Reassert { key: String, value: Value },
+    /// User removed a key that previously appeared in the desired state.
+    Remove { key: String },
 }
 
-/// Kind of a single [`PatchOp`].
-///
-/// Mirrors `patch-op-kind` in `wit/types.wit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatchOpKind {
-    /// User added a key that did not previously appear in the desired state.
-    Add,
-    /// User changed the value of an existing key in the desired state.
-    Replace,
-    /// User removed a key that previously appeared in the desired state.
-    Remove,
+impl PatchOp {
+    /// Top-level attribute name. Nested-field patches are a future extension.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Add { key, .. }
+            | Self::Replace { key, .. }
+            | Self::Reassert { key, .. }
+            | Self::Remove { key } => key,
+        }
+    }
+
+    /// Return the value sent by `Add`, `Replace`, or `Reassert`.
+    pub fn sent_value(&self) -> Option<&Value> {
+        match self {
+            Self::Add { value, .. }
+            | Self::Replace { value, .. }
+            | Self::Reassert { value, .. } => Some(value),
+            Self::Remove { .. } => None,
+        }
+    }
 }
 
 /// Build an [`UpdatePatch`] from a list of changed attribute names plus
 /// the desired (`to`) and current (`from`) views.
 ///
 /// For each `key` in `changed_attributes`:
-/// - present in `to` but missing in `from` → [`PatchOpKind::Add`]
-/// - present in both                       → [`PatchOpKind::Replace`]
-/// - missing in `to` but present in `from` → [`PatchOpKind::Remove`]
+/// - present in `to` but missing in `from` → [`PatchOp::Add`]
+/// - present in both                       → [`PatchOp::Replace`]
+/// - missing in `to` but present in `from` → [`PatchOp::Remove`]
+/// - missing from both                     → no operation
 ///
-/// `Remove` ops carry `value: None`; others carry a clone of the
-/// value from `to`.
+/// When at least one changed-key operation exists, desired attributes that the
+/// schema marks write-only but not create-only are appended as sorted
+/// [`PatchOp::Reassert`] operations unless that key is already in the patch.
 ///
 /// ```compile_fail
 /// use carina_core::provider::build_update_patch;
 /// use carina_core::resource::{ResolvedResource, Resource, State};
+/// use carina_core::schema::ResourceSchema;
 ///
 /// let resource = ResolvedResource::new(Resource::new("test", "example"));
 /// let state: State = unimplemented!();
-/// let _patch = build_update_patch(&[], &resource, &state);
+/// let schema = ResourceSchema::new("test");
+/// let _patch = build_update_patch(&[], &resource, &state, &schema);
 /// ```
 pub fn build_update_patch(
     changed_attributes: &[String],
     to: &ProviderReadyResource,
     from: &State,
+    schema: &ResourceSchema,
 ) -> UpdatePatch {
     let to = to.as_resource();
-    let ops = changed_attributes
+    let mut patched_keys = HashSet::new();
+    let mut ops = changed_attributes
         .iter()
-        .map(|key| {
-            let in_to = to.attributes.contains_key(key);
+        .filter_map(|key| {
+            let value = to.attributes.get(key);
             let in_from = from.attributes.contains_key(key);
-            let kind = match (in_to, in_from) {
-                (true, false) => PatchOpKind::Add,
-                (true, true) => PatchOpKind::Replace,
-                (false, true) => PatchOpKind::Remove,
-                // Neither side has it. Treat as Replace with None value;
-                // this should not happen with well-formed inputs but the
-                // provider will see a no-op-ish entry rather than a panic.
-                (false, false) => PatchOpKind::Remove,
-            };
-            let value = if matches!(kind, PatchOpKind::Remove) {
-                None
-            } else {
-                to.attributes.get(key).cloned()
-            };
-            PatchOp {
-                kind,
-                key: key.clone(),
-                value,
+            if value.is_none() && !in_from {
+                return None;
+            }
+            if !patched_keys.insert(key.clone()) {
+                return None;
+            }
+            match (value, in_from) {
+                (Some(value), false) => Some(PatchOp::Add {
+                    key: key.clone(),
+                    value: value.clone(),
+                }),
+                (Some(value), true) => Some(PatchOp::Replace {
+                    key: key.clone(),
+                    value: value.clone(),
+                }),
+                (None, true) => Some(PatchOp::Remove { key: key.clone() }),
+                (None, false) => None,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    if ops.is_empty() {
+        return UpdatePatch { ops };
+    }
+
+    let mut reasserts =
+        to.attributes
+            .iter()
+            .filter_map(|(key, value)| {
+                let attribute = schema.attributes.get(key)?;
+                (attribute.write_only && !attribute.create_only && !patched_keys.contains(key))
+                    .then(|| PatchOp::Reassert {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+    reasserts.sort_by(|left, right| left.key().cmp(right.key()));
+    ops.extend(reasserts);
     UpdatePatch { ops }
 }
 
@@ -3478,9 +3516,10 @@ pub trait Provider: Send + Sync {
 
     /// Update an existing resource by applying `request.patch()`.
     ///
-    /// Each [`PatchOp`] corresponds to a key the user explicitly
-    /// specified or removed in the desired state. Fields the user has
-    /// never specified do not appear in the patch.
+    /// Each [`PatchOp`] corresponds to a key the user explicitly specified or
+    /// removed in the desired state, or to a desired write-only key that must
+    /// be reasserted alongside another change. Fields the user has never
+    /// specified do not appear in the patch.
     ///
     /// **Providers MUST NOT modify any attribute that is not
     /// represented in `request.patch().ops`.** The patch is the sole
@@ -5644,18 +5683,18 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             let id = id.clone();
             let identifier = identifier.to_string();
-            // Apply the patch on top of `from` so the test sees the
-            // user-specified changes round-tripped into State.
+            // Apply the patch on top of `from` so the test sees changes and
+            // write-only reassertions round-tripped into State.
             let mut attrs = request.from().attributes.clone();
             for op in &request.patch().ops {
-                match op.kind {
-                    PatchOpKind::Add | PatchOpKind::Replace => {
-                        if let Some(v) = &op.value {
-                            attrs.insert(op.key.clone(), v.clone());
-                        }
+                match op {
+                    PatchOp::Add { key, value }
+                    | PatchOp::Replace { key, value }
+                    | PatchOp::Reassert { key, value } => {
+                        attrs.insert(key.clone(), value.clone());
                     }
-                    PatchOpKind::Remove => {
-                        attrs.remove(&op.key);
+                    PatchOp::Remove { key } => {
+                        attrs.remove(key);
                     }
                 }
             }
@@ -6500,6 +6539,8 @@ mod tests {
 
     #[test]
     fn build_update_patch_classifies_ops() {
+        use crate::schema::ResourceSchema;
+
         let id = ResourceId::with_identity("test", "example");
         let mut from_attrs = HashMap::new();
         from_attrs.insert(
@@ -6523,27 +6564,268 @@ mod tests {
         );
 
         let to = resolved_for_test(to);
+        let schema = ResourceSchema::new("test");
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let patch = build_update_patch(&changed, &to, &from);
+        let patch = build_update_patch(&changed, &to, &from, &schema);
         assert_eq!(patch.ops.len(), 3);
 
-        let by_key: HashMap<&str, &PatchOp> =
-            patch.ops.iter().map(|op| (op.key.as_str(), op)).collect();
+        let by_key: HashMap<&str, &PatchOp> = patch.ops.iter().map(|op| (op.key(), op)).collect();
         let a = by_key["a"];
-        assert_eq!(a.kind, PatchOpKind::Replace);
-        assert_eq!(
-            a.value,
-            Some(Value::Concrete(ConcreteValue::String("new".into())))
-        );
+        assert!(matches!(
+            a,
+            PatchOp::Replace {
+                value: Value::Concrete(ConcreteValue::String(value)),
+                ..
+            } if value == "new"
+        ));
         let b = by_key["b"];
-        assert_eq!(b.kind, PatchOpKind::Add);
-        assert_eq!(
-            b.value,
-            Some(Value::Concrete(ConcreteValue::String("added".into())))
-        );
+        assert!(matches!(
+            b,
+            PatchOp::Add {
+                value: Value::Concrete(ConcreteValue::String(value)),
+                ..
+            } if value == "added"
+        ));
         let c = by_key["c"];
-        assert_eq!(c.kind, PatchOpKind::Remove);
-        assert_eq!(c.value, None);
+        assert!(matches!(c, PatchOp::Remove { .. }));
+        assert_eq!(c.sent_value(), None);
+    }
+
+    fn patch_test_value(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    #[test]
+    fn build_update_patch_reasserts_only_desired_updatable_write_only_keys() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let id = ResourceId::with_identity("test", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                ("token_b".to_string(), patch_test_value("token-b")),
+                ("token_a".to_string(), patch_test_value("token-a")),
+                ("create_token".to_string(), patch_test_value("create")),
+                ("omitted_token".to_string(), patch_test_value("omitted")),
+            ]),
+        );
+        let to = resolved_for_test(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("token_b", patch_test_value("token-b"))
+                .with_attribute("token_a", patch_test_value("token-a"))
+                .with_attribute("create_token", patch_test_value("create")),
+        );
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::new("description", AttributeType::string()))
+            .attribute(AttributeSchema::new("token_b", AttributeType::string()).write_only())
+            .attribute(AttributeSchema::new("token_a", AttributeType::string()).write_only())
+            .attribute(
+                AttributeSchema::new("create_token", AttributeType::string())
+                    .write_only()
+                    .create_only(),
+            )
+            .attribute(AttributeSchema::new("omitted_token", AttributeType::string()).write_only());
+
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+
+        assert!(matches!(
+            &patch.ops[0],
+            PatchOp::Replace { key, .. } if key == "description"
+        ));
+        assert!(matches!(
+            &patch.ops[1],
+            PatchOp::Reassert { key, value } if key == "token_a" && value == &patch_test_value("token-a")
+        ));
+        assert!(matches!(
+            &patch.ops[2],
+            PatchOp::Reassert { key, value } if key == "token_b" && value == &patch_test_value("token-b")
+        ));
+        assert_eq!(patch.ops.len(), 3);
+    }
+
+    #[test]
+    fn build_update_patch_does_not_duplicate_changed_write_only_keys() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let id = ResourceId::with_identity("test", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([
+                ("replaced".to_string(), patch_test_value("before")),
+                ("removed".to_string(), patch_test_value("removed")),
+            ]),
+        );
+        let to = resolved_for_test(
+            Resource::new("test", "example")
+                .with_attribute("replaced", patch_test_value("after"))
+                .with_attribute("added", patch_test_value("added")),
+        );
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::new("replaced", AttributeType::string()).write_only())
+            .attribute(AttributeSchema::new("added", AttributeType::string()).write_only())
+            .attribute(AttributeSchema::new("removed", AttributeType::string()).write_only());
+
+        let patch = build_update_patch(
+            &[
+                "replaced".to_string(),
+                "added".to_string(),
+                "removed".to_string(),
+            ],
+            &to,
+            &from,
+            &schema,
+        );
+
+        assert!(matches!(
+            &patch.ops[0],
+            PatchOp::Replace { key, .. } if key == "replaced"
+        ));
+        assert!(matches!(
+            &patch.ops[1],
+            PatchOp::Add { key, .. } if key == "added"
+        ));
+        assert!(matches!(
+            &patch.ops[2],
+            PatchOp::Remove { key } if key == "removed"
+        ));
+        assert_eq!(patch.ops.len(), 3);
+    }
+
+    #[test]
+    fn build_update_patch_never_creates_a_reassert_only_patch() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let id = ResourceId::with_identity("test", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([("token".to_string(), patch_test_value("same"))]),
+        );
+        let to = resolved_for_test(
+            Resource::new("test", "example").with_attribute("token", patch_test_value("same")),
+        );
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::new("token", AttributeType::string()).write_only());
+
+        assert!(build_update_patch(&[], &to, &from, &schema).ops.is_empty());
+        assert!(
+            build_update_patch(&["absent".to_string()], &to, &from, &schema)
+                .ops
+                .is_empty(),
+            "a changed key absent from both sides must be dropped and cannot trigger reassertion"
+        );
+    }
+
+    #[test]
+    fn build_update_patch_generated_inputs_preserve_reassert_invariants() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        const KEYS: [&str; 3] = ["a", "b", "c"];
+        for desired_mask in 0_u8..8 {
+            for from_mask in 0_u8..8 {
+                for write_only_mask in 0_u8..8 {
+                    for create_only_mask in 0_u8..8 {
+                        for changed_mask in 0_u8..8 {
+                            let id = ResourceId::with_identity("test", "generated");
+                            let mut from_attributes = HashMap::new();
+                            let mut desired = Resource::new("test", "generated");
+                            let mut schema = ResourceSchema::new("test");
+                            let mut changed = Vec::new();
+
+                            for (index, key) in KEYS.iter().enumerate() {
+                                let bit = 1 << index;
+                                if from_mask & bit != 0 {
+                                    from_attributes
+                                        .insert((*key).to_string(), patch_test_value("from"));
+                                }
+                                if desired_mask & bit != 0 {
+                                    desired.set_attr((*key).to_string(), patch_test_value("to"));
+                                }
+                                let mut attribute =
+                                    AttributeSchema::new(*key, AttributeType::string());
+                                if write_only_mask & bit != 0 {
+                                    attribute = attribute.write_only();
+                                }
+                                if create_only_mask & bit != 0 {
+                                    attribute = attribute.create_only();
+                                }
+                                schema = schema.attribute(attribute);
+                                if changed_mask & bit != 0 {
+                                    changed.push((*key).to_string());
+                                }
+                            }
+
+                            let from = State::existing(id, from_attributes);
+                            let desired = resolved_for_test(desired);
+                            let patch = build_update_patch(&changed, &desired, &from, &schema);
+                            let patch_keys: Vec<&str> =
+                                patch.ops.iter().map(PatchOp::key).collect();
+                            let unique: std::collections::HashSet<_> =
+                                patch_keys.iter().copied().collect();
+                            assert_eq!(unique.len(), patch_keys.len());
+                            if changed.is_empty() {
+                                assert!(patch.ops.is_empty());
+                            }
+
+                            for op in &patch.ops {
+                                let key = op.key();
+                                let index =
+                                    KEYS.iter().position(|candidate| candidate == &key).unwrap();
+                                let bit = 1 << index;
+                                let is_changed = changed_mask & bit != 0;
+                                let satisfies_reassert = desired_mask & bit != 0
+                                    && write_only_mask & bit != 0
+                                    && create_only_mask & bit == 0
+                                    && !is_changed;
+                                assert!(is_changed || satisfies_reassert);
+                                if matches!(op, PatchOp::Reassert { .. }) {
+                                    assert!(satisfies_reassert);
+                                }
+                            }
+
+                            for (index, key) in KEYS.iter().enumerate() {
+                                let bit = 1 << index;
+                                let is_desired = desired_mask & bit != 0;
+                                let is_from = from_mask & bit != 0;
+                                let is_changed = changed_mask & bit != 0;
+                                let operation = patch.ops.iter().find(|op| op.key() == *key);
+
+                                if is_changed && (is_desired || is_from) {
+                                    match (is_desired, is_from) {
+                                        (true, false) => assert!(
+                                            matches!(operation, Some(PatchOp::Add { .. })),
+                                            "changed desired-only key {key} must be Add"
+                                        ),
+                                        (true, true) => assert!(
+                                            matches!(operation, Some(PatchOp::Replace { .. })),
+                                            "changed key {key} present on both sides must be Replace"
+                                        ),
+                                        (false, true) => assert!(
+                                            matches!(operation, Some(PatchOp::Remove { .. })),
+                                            "changed current-only key {key} must be Remove"
+                                        ),
+                                        (false, false) => unreachable!(),
+                                    }
+                                }
+
+                                let must_reassert = !patch.ops.is_empty()
+                                    && is_desired
+                                    && write_only_mask & bit != 0
+                                    && create_only_mask & bit == 0
+                                    && !is_changed;
+                                if must_reassert {
+                                    assert!(
+                                        matches!(operation, Some(PatchOp::Reassert { .. })),
+                                        "eligible unchanged write-only key {key} must be Reassert"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -6554,7 +6836,8 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
-        let request = UpdateRequest::checked(from, &[], &ready);
+        let schema = crate::schema::ResourceSchema::new("test");
+        let request = UpdateRequest::checked(from, &[], &ready, &schema);
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
         let state = router

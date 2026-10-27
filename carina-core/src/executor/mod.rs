@@ -30,8 +30,6 @@ pub use provider_ready::{
     prepare_create_request, prepare_provider_ready_config, prepare_provider_ready_data_source,
     prepare_provider_ready_resource, prepare_update_request, provider_custom_type_lookup,
 };
-pub use replace::compute_full_diff_patch;
-
 /// Phase of an executor scheduler endpoint after deferred replacements have
 /// been expanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,7 +110,7 @@ use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{
     AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
-    InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOpKind, Provider, ProviderError,
+    InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
     ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
     ResumeFailureKind, ResumeOutcome, UpdateRequest,
 };
@@ -312,12 +310,14 @@ impl AcceptedRequest {
         let mut sent = BTreeSet::new();
         let mut removed = BTreeSet::new();
         for op in &request.patch().ops {
-            match op.kind {
-                PatchOpKind::Add | PatchOpKind::Replace => {
-                    sent.insert(op.key.clone());
+            match op {
+                PatchOp::Add { key, .. }
+                | PatchOp::Replace { key, .. }
+                | PatchOp::Reassert { key, .. } => {
+                    sent.insert(key.clone());
                 }
-                PatchOpKind::Remove => {
-                    removed.insert(op.key.clone());
+                PatchOp::Remove { key } => {
+                    removed.insert(key.clone());
                 }
             }
         }

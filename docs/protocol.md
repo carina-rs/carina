@@ -1,5 +1,33 @@
 # Provider protocol versions
 
+## Version 11
+
+In protocol v11 an update patch op is a sum type, so its shape enforces its own
+invariants. WIT `patch-op` is a variant:
+
+- `add`, `replace` and `reassert` carry a `patch-value { key, value }`.
+- `remove` carries only the key.
+
+The `patch-op-kind` enum and the optional `value` field are removed. As a
+result, an op that sends a value can no longer omit it, and a removal can no
+longer carry one. Core and protocol `PatchOp` have the same four variants, with
+`key()` and `sent_value()` accessors.
+
+`reassert` is a desired, updatable write-only key: write-only in the schema and
+not create-only. Core re-sends it because the backend cannot read it back. It
+is never a user change. Core emits it only when another key already causes an
+Update, so a difference in write-only values alone still plans no Update.
+
+`UpdateRequest` cannot be built without the managed resource schema. An update
+whose resource has no registered managed schema fails provider preparation
+before the provider is called. The host records `reassert` keys as sent in the
+accepted-request provenance, and state writeback treats them like `replace`.
+
+Nested `writeOnlyProperties` are not represented yet; see carina#3984.
+
+Hosts and providers must both use protocol v11. The minimum supported protocol
+version is 11.
+
 ## Version 10
 
 Protocol v10's SDK and native core adapters make create recovery an explicit

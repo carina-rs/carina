@@ -367,6 +367,9 @@ pub enum ProviderPreparationError {
     /// A pending module argument constraint became decidable and failed.
     #[error(transparent)]
     ModuleConstraint(#[from] ModuleConstraintGateError),
+    /// The managed resource has no schema to classify write-only attributes.
+    #[error("{resource}: no managed schema is registered")]
+    MissingManagedSchema { resource: ResourceId },
     /// Provider-specific normalization failed before dispatch.
     #[error("{0}")]
     Provider(crate::provider::ProviderError),
@@ -741,6 +744,18 @@ pub async fn prepare_create_request(
     Ok(CreateRequest::checked(resource))
 }
 
+/// Look up the schema required to construct an update request.
+pub(super) fn managed_update_schema<'a>(
+    schemas: &'a SchemaRegistry,
+    resource: &Resource,
+) -> Result<&'a ResourceSchema, ProviderPreparationError> {
+    schemas
+        .get_for(resource)
+        .ok_or_else(|| ProviderPreparationError::MissingManagedSchema {
+            resource: resource.id.clone(),
+        })
+}
+
 /// Prepare a checked update request through the provider-boundary gate.
 pub async fn prepare_update_request(
     resource: Resource,
@@ -749,7 +764,13 @@ pub async fn prepare_update_request(
     context: &ProviderPreparationContext<'_>,
 ) -> Result<UpdateRequest, ProviderPreparationError> {
     let resource = prepare_provider_ready_resource(resource, context).await?;
-    Ok(UpdateRequest::checked(from, changed_attributes, &resource))
+    let schema = managed_update_schema(context.schemas, resource.as_resource())?;
+    Ok(UpdateRequest::checked(
+        from,
+        changed_attributes,
+        &resource,
+        schema,
+    ))
 }
 
 /// Build the schema lookup used for provider-defined custom value types.
@@ -858,6 +879,39 @@ mod provider_config_tests {
     use crate::provider::{Provider, ProviderResult};
     use crate::resource::ConcreteValue;
     use crate::schema::AttributeType;
+
+    #[tokio::test]
+    async fn prepare_update_request_rejects_a_missing_managed_schema() {
+        let resource = Resource::with_provider("test", "widget", "example", None);
+        let id = resource.id.clone();
+        let from = crate::resource::State::existing(id.clone(), HashMap::new());
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::new(&[]);
+        let schemas = SchemaRegistry::new();
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            &[],
+            &crate::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+
+        let error = prepare_update_request(resource, from, &[], &context)
+            .await
+            .expect_err("updates without a managed schema must fail preparation");
+
+        assert!(matches!(
+            &error,
+            ProviderPreparationError::MissingManagedSchema { resource } if resource == &id
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains(&id.to_string()), "{rendered}");
+        assert!(
+            rendered.contains("no managed schema is registered"),
+            "{rendered}"
+        );
+    }
 
     struct EnumConfigFactory;
 

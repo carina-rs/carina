@@ -11,7 +11,7 @@ use crate::differ::{
 };
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
-    CheckInput, ProviderPreparationContext, ResolvedCheckInput,
+    CheckInput, ProviderPreparationContext, ResolvedCheckInput, managed_update_schema,
     prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
@@ -1001,16 +1001,26 @@ pub(super) async fn execute_basic_effect<'a>(
             // to update it.
             let mut effective_changed: Vec<String> = changed_attributes.to_vec();
             let resolved_resource = resolved_to.as_resource();
-            let schema = preparation.schemas().get_for(resolved_resource);
+            let schema = match managed_update_schema(preparation.schemas(), resolved_resource) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    let error = error.to_string();
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &error,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    return BasicEffectResult::Failure { refresh: None };
+                }
+            };
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.iter().any(|k| k == key) {
                     continue;
                 }
-                let type_info = schema.and_then(|s| {
-                    s.attributes.get(key).map(|attr| TypedAttr {
-                        attr_type: &attr.attr_type,
-                        defs: &s.defs,
-                    })
+                let type_info = schema.attributes.get(key).map(|attr| TypedAttr {
+                    attr_type: &attr.attr_type,
+                    defs: &schema.defs,
                 });
                 let Some(comparison_value) =
                     secret_grafted_comparison_view(new_value, resolve_source.attributes.get(key))
@@ -1019,7 +1029,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 };
                 if key_should_enter_patch(
                     key,
-                    schema,
+                    Some(schema),
                     AttrComparison {
                         from: from.attributes.get(key),
                         to: comparison_value.as_ref(),
@@ -1030,7 +1040,8 @@ pub(super) async fn execute_basic_effect<'a>(
                     effective_changed.push(key.clone());
                 }
             }
-            let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to);
+            let request =
+                UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to, schema);
             let accepted_request =
                 AcceptedRequest::from_update_request(&request, resolved_desired_attributes.clone());
             match provider.update(id, identifier, request).await {
