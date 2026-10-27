@@ -24,14 +24,13 @@ use carina_core::schema::{
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
-use crate::commands::{collapse_errors, validate_and_resolve_errors_with_context};
+use crate::commands::validate_and_resolve_config_pair_with_context;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, PlanPreparationError, PlanPreprocessor, WiringContext,
     add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
     expand_same_config_deferred_for, reconcile_anonymous_identifiers_with_ctx,
     reconcile_late_anonymous_identities, reconcile_prefixed_names,
-    resolve_config_block_names_with_ctx,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -197,19 +196,17 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
-    let validation_errors = validate_and_resolve_errors_with_context(
+    let unresolved_resources = validate_and_resolve_config_pair_with_context(
         &mut parsed,
+        unresolved_parsed,
         base_dir,
         true,
         &validation_wiring,
         HashMap::new(),
         &inference_errors,
         &duplicate_declarations,
-    );
-    if !validation_errors.is_empty() {
-        let error = collapse_errors(validation_errors);
-        panic!("fixture validation failed: {error}");
-    }
+    )
+    .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
         // Go through check_and_migrate so v5 fixtures (with the legacy
@@ -227,15 +224,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.providers,
         fixture_schemas(),
     );
-    let unresolved_resources =
-        resolve_config_block_names_with_ctx(&wiring, &mut parsed, unresolved_parsed)
-            .unwrap_or_else(|errors| {
-                panic!(
-                    "fixture block-name resolution failed: {}",
-                    collapse_errors(errors)
-                )
-            });
-
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")
@@ -396,29 +384,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &wait_aliases,
     )
     .expect("fixture managed binding stability must resolve");
-    let mut override_aware_resources = OverrideAwareResources::build_for_plan_with_stability(
-        sorted_resources.clone(),
-        state_file.as_ref(),
-        carina_core::binding_index::PreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            data_sources: &data_sources,
-            managed_current: &pre_apply_input_current,
-            data_source_states: &data_source_states,
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &upstream_binding_names,
-        &managed_stability,
-    )
-    .expect("Failed to build override-aware resources");
-    crate::legacy_name_overrides::emit_legacy_override_warnings(
-        &override_aware_resources,
-        state_file.as_ref(),
-    );
-    let unresolved_override_aware_resources =
-        OverrideAwareResources::build_for_plan_with_stability(
-            unresolved_resources.to_vec(),
+    let (mut override_aware_resources, unresolved_override_aware_resources) =
+        OverrideAwareResources::build_pair_for_plan_with_stability(
+            sorted_resources.clone(),
+            unresolved_resources,
             state_file.as_ref(),
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],
@@ -432,7 +401,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             &upstream_binding_names,
             &managed_stability,
         )
-        .expect("Failed to build unresolved override-aware resources");
+        .expect("Failed to build override-aware resources");
+    crate::legacy_name_overrides::emit_legacy_override_warnings(
+        &override_aware_resources,
+        state_file.as_ref(),
+    );
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();

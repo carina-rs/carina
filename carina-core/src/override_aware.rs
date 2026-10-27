@@ -7,6 +7,30 @@ use crate::effect::deps::UnresolvedResource;
 use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
 
+/// Pre-value-resolution resources whose provider-schema block aliases have
+/// been folded into canonical attribute names.
+///
+/// The inner vector is deliberately private. Production construction is
+/// limited to the schema block-name resolver, and
+/// [`OverrideAwareResources`] consumes this type instead of a raw
+/// `Vec<Resource>` so an authored parser snapshot cannot bypass that resolver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalUnresolvedResources(Vec<Resource>);
+
+impl CanonicalUnresolvedResources {
+    pub(crate) fn new(resources: Vec<Resource>) -> Self {
+        Self(resources)
+    }
+
+    pub fn as_slice(&self) -> &[Resource] {
+        &self.0
+    }
+
+    fn into_vec(self) -> Vec<Resource> {
+        self.0
+    }
+}
+
 /// Two paired resources resolved to the same identity before execution.
 #[derive(Debug, thiserror::Error)]
 #[error("override-aware resources contain duplicate resolved id {id}")]
@@ -31,6 +55,22 @@ impl NameOverrideSource for HashMap<ResourceId, HashMap<String, NameOverride>> {
     }
 }
 
+/// Resources whose authored inputs have crossed schema block-name resolution.
+///
+/// Raw resource vectors cannot be passed to the constructor:
+///
+/// ```compile_fail
+/// # use std::collections::HashMap;
+/// # use carina_core::binding_index::PreApplyInputs;
+/// # use carina_core::name_override::NameOverride;
+/// # use carina_core::override_aware::OverrideAwareResources;
+/// # use carina_core::resource::{Resource, ResourceId};
+/// # fn bypass(raw: Vec<Resource>, inputs: PreApplyInputs<'_>) {
+/// let _ = OverrideAwareResources::build::<
+///     HashMap<ResourceId, HashMap<String, NameOverride>>,
+/// >(raw, None, inputs);
+/// # }
+/// ```
 pub struct OverrideAwareResources {
     resources: Vec<Resource>,
     unresolved_resources: Vec<Resource>,
@@ -64,7 +104,7 @@ enum ResolutionMode<'a> {
 
 impl OverrideAwareResources {
     pub fn build<S>(
-        unresolved: Vec<Resource>,
+        unresolved: CanonicalUnresolvedResources,
         state_file: Option<&S>,
         inputs: PreApplyInputs<'_>,
     ) -> Result<Self, String>
@@ -75,7 +115,7 @@ impl OverrideAwareResources {
     }
 
     pub fn build_with_stability<S>(
-        unresolved: Vec<Resource>,
+        unresolved: CanonicalUnresolvedResources,
         state_file: Option<&S>,
         inputs: PreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
@@ -84,7 +124,7 @@ impl OverrideAwareResources {
         S: NameOverrideSource + ?Sized,
     {
         Self::build_inner(
-            unresolved,
+            unresolved.into_vec(),
             state_file,
             inputs,
             managed_stability,
@@ -93,7 +133,7 @@ impl OverrideAwareResources {
     }
 
     pub fn build_for_plan<S>(
-        unresolved: Vec<Resource>,
+        unresolved: CanonicalUnresolvedResources,
         state_file: Option<&S>,
         inputs: PreApplyInputs<'_>,
         unresolved_upstream_bindings: &HashSet<&str>,
@@ -111,7 +151,7 @@ impl OverrideAwareResources {
     }
 
     pub fn build_for_plan_with_stability<S>(
-        unresolved: Vec<Resource>,
+        unresolved: CanonicalUnresolvedResources,
         state_file: Option<&S>,
         inputs: PreApplyInputs<'_>,
         unresolved_upstream_bindings: &HashSet<&str>,
@@ -121,7 +161,7 @@ impl OverrideAwareResources {
         S: NameOverrideSource + ?Sized,
     {
         Self::build_inner(
-            unresolved,
+            unresolved.into_vec(),
             state_file,
             inputs,
             managed_stability,
@@ -129,6 +169,106 @@ impl OverrideAwareResources {
                 unresolved_upstream_bindings,
             },
         )
+    }
+
+    /// Build the evaluated and authored views together. The evaluated set can
+    /// be re-sorted or expanded after the canonicalization seam, while the
+    /// authored side must carry the opaque proof returned by that seam.
+    pub fn build_pair_with_stability<S>(
+        evaluated: Vec<Resource>,
+        unresolved: CanonicalUnresolvedResources,
+        state_file: Option<&S>,
+        inputs: PreApplyInputs<'_>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+    ) -> Result<(Self, Self), String>
+    where
+        S: NameOverrideSource + ?Sized,
+    {
+        let PreApplyInputs {
+            managed: _,
+            compositions,
+            data_sources,
+            managed_current,
+            data_source_states,
+            remote_bindings,
+            wait_aliases,
+        } = inputs;
+        let evaluated = Self::build_inner(
+            evaluated,
+            state_file,
+            PreApplyInputs {
+                managed: &[],
+                compositions,
+                data_sources,
+                managed_current,
+                data_source_states,
+                remote_bindings,
+                wait_aliases,
+            },
+            managed_stability,
+            ResolutionMode::Strict,
+        )?;
+        let unresolved = Self::build_inner(
+            unresolved.into_vec(),
+            state_file,
+            PreApplyInputs {
+                managed: &[],
+                compositions,
+                data_sources,
+                managed_current,
+                data_source_states,
+                remote_bindings,
+                wait_aliases,
+            },
+            managed_stability,
+            ResolutionMode::Strict,
+        )?;
+        Ok((evaluated, unresolved))
+    }
+
+    /// Plan-mode counterpart to [`Self::build_pair_with_stability`].
+    pub fn build_pair_for_plan_with_stability<S>(
+        evaluated: Vec<Resource>,
+        unresolved: CanonicalUnresolvedResources,
+        state_file: Option<&S>,
+        inputs: PreApplyInputs<'_>,
+        unresolved_upstream_bindings: &HashSet<&str>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+    ) -> Result<(Self, Self), String>
+    where
+        S: NameOverrideSource + ?Sized,
+    {
+        let PreApplyInputs {
+            managed: _,
+            compositions,
+            data_sources,
+            managed_current,
+            data_source_states,
+            remote_bindings,
+            wait_aliases,
+        } = inputs;
+        let build = |resources| {
+            Self::build_inner(
+                resources,
+                state_file,
+                PreApplyInputs {
+                    managed: &[],
+                    compositions,
+                    data_sources,
+                    managed_current,
+                    data_source_states,
+                    remote_bindings,
+                    wait_aliases,
+                },
+                managed_stability,
+                ResolutionMode::Plan {
+                    unresolved_upstream_bindings,
+                },
+            )
+        };
+        let evaluated = build(evaluated)?;
+        let unresolved = build(unresolved.into_vec())?;
+        Ok((evaluated, unresolved))
     }
 
     fn build_inner<S>(
@@ -547,7 +687,7 @@ mod tests {
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
         OverrideAwareResources::build(
-            resources,
+            CanonicalUnresolvedResources::new(resources),
             Some(overrides),
             PreApplyInputs {
                 managed: &[],

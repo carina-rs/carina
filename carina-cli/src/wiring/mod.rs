@@ -35,7 +35,9 @@ use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
 use carina_core::module_resolver;
-use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
+use carina_core::override_aware::{
+    CanonicalUnresolvedResources, OverrideAwareResources, RebuildBindingsInputs,
+};
 #[cfg(test)]
 use carina_core::parser::MovedAddresses;
 use carina_core::parser::{
@@ -56,7 +58,8 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    CustomTypeLookup, ResourceSchema, SchemaRegistry, TypeError, resolve_block_names,
+    BlockNameConflict, CustomTypeLookup, ResourceSchema, SchemaRegistry, TypeError,
+    resolve_config_block_names_with_schemas, resolve_file_block_names_with_schemas,
 };
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
@@ -109,26 +112,6 @@ pub struct PlanContext {
     /// that produced them (#3306, #3307). Forwarded to the display
     /// layer so the rendered tree folds leaves under composition rows.
     pub expansion_trace: carina_core::resource::ExpansionTrace,
-}
-
-/// Pre-value-resolution resources whose schema block aliases were resolved at
-/// the same wiring boundary as the evaluated configuration.
-///
-/// The field is private so planner and executor call sites cannot accidentally
-/// pass the raw `LoadedConfig::unresolved_parsed` snapshot. Construction is
-/// limited to [`resolve_config_block_names_with_ctx`].
-#[derive(Debug, Clone)]
-pub(crate) struct CanonicalUnresolvedResources(Vec<Resource>);
-
-impl CanonicalUnresolvedResources {
-    pub(crate) fn to_vec(&self) -> Vec<Resource> {
-        self.0.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(resources: &[Resource]) -> Self {
-        Self(resources.to_vec())
-    }
 }
 
 /// State-block targets resolved while constructing [`StateBlockClaims`].
@@ -635,37 +618,11 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
     }
 }
 
-fn resolve_file_block_names<E>(
-    parsed: &mut carina_core::parser::File<E>,
-    schemas: &SchemaRegistry,
-) -> Vec<AppError> {
-    let mut errors = lift_validation_result(resolve_block_names(&mut parsed.resources, schemas));
-
-    // Deferred-for templates do not live in `File::resources`, but they can
-    // cross the same later provider boundary after apply-time expansion.
-    // Keep the display projection in sync with the canonical template map.
-    for deferred in &mut parsed.deferred_for_expressions {
-        errors.extend(lift_validation_result(resolve_block_names(
-            std::slice::from_mut(&mut deferred.template_resource),
-            schemas,
-        )));
-        deferred.attributes = deferred
-            .template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-    }
-
-    errors
-}
-
-/// Resolve schema block aliases and attribute-derived names for a single
-/// resource slice.
-pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -> Vec<AppError> {
-    let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas()));
-    errors.extend(resolve_attr_prefixes_with_ctx(ctx, resources));
-    errors
+fn block_name_errors(conflicts: Vec<BlockNameConflict>) -> Vec<AppError> {
+    conflicts
+        .into_iter()
+        .map(|conflict| AppError::Validation(conflict.to_string()))
+        .collect()
 }
 
 /// File-level name resolution also covers residual deferred-for templates.
@@ -673,7 +630,10 @@ pub(crate) fn resolve_file_names_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::File<E>,
 ) -> Vec<AppError> {
-    let mut errors = resolve_file_block_names(parsed, ctx.schemas());
+    let mut errors = resolve_file_block_names_with_schemas(parsed, ctx.schemas())
+        .err()
+        .map(block_name_errors)
+        .unwrap_or_default();
     errors.extend(resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources));
     errors
 }
@@ -688,32 +648,16 @@ pub(crate) fn resolve_file_names_with_ctx<E>(
 pub(crate) fn resolve_config_block_names_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::File<E>,
-    mut unresolved: carina_core::parser::ParsedFile,
+    unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<CanonicalUnresolvedResources, Vec<AppError>> {
-    let mut errors = resolve_file_block_names(parsed, ctx.schemas());
-    for error in resolve_file_block_names(&mut unresolved, ctx.schemas()) {
-        let duplicate = match &error {
-            AppError::Validation(message) => errors.iter().any(
-                |existing| matches!(existing, AppError::Validation(other) if other == message),
-            ),
-            _ => false,
-        };
-        if !duplicate {
-            errors.push(error);
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(CanonicalUnresolvedResources(unresolved.resources))
-    } else {
-        Err(errors)
-    }
+    resolve_config_block_names_with_schemas(parsed, unresolved, ctx.schemas())
+        .map_err(block_name_errors)
 }
 
 pub(crate) fn resolve_config_names_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::File<E>,
-    unresolved: carina_core::parser::ParsedFile,
+    unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<CanonicalUnresolvedResources, Vec<AppError>> {
     let canonical_unresolved = resolve_config_block_names_with_ctx(ctx, parsed, unresolved)?;
     let errors = resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources);
@@ -3031,28 +2975,10 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         ctx.schemas(),
         &sorted_resources,
     );
-    let mut override_aware_resources = OverrideAwareResources::build_for_plan_with_stability(
-        sorted_resources,
-        state_file.as_ref(),
-        PreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            data_sources: &data_sources,
-            managed_current: &pre_apply_current,
-            data_source_states: &data_source_states,
-            remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &upstream_binding_names,
-        &managed_stability,
-    )?;
-    crate::legacy_name_overrides::emit_legacy_override_warnings(
-        &override_aware_resources,
-        state_file.as_ref(),
-    );
-    let unresolved_override_aware_resources =
-        OverrideAwareResources::build_for_plan_with_stability(
-            unresolved_resources.to_vec(),
+    let (mut override_aware_resources, unresolved_override_aware_resources) =
+        OverrideAwareResources::build_pair_for_plan_with_stability(
+            sorted_resources,
+            unresolved_resources.clone(),
             state_file.as_ref(),
             PreApplyInputs {
                 managed: &[],
@@ -3066,6 +2992,10 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             &upstream_binding_names,
             &managed_stability,
         )?;
+    crate::legacy_name_overrides::emit_legacy_override_warnings(
+        &override_aware_resources,
+        state_file.as_ref(),
+    );
     // Resolve and canonicalize only refresh-time data sources. Deferred
     // reads keep their original input refs so the plan/executor dependency
     // graph still contains the upstream create edge.
@@ -4573,7 +4503,13 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
 #[cfg(test)]
 pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![], &[]);
-    errors_to_legacy_result(resolve_names_with_ctx(&ctx, resources))
+    let mut parsed = carina_core::parser::ParsedFile {
+        resources: resources.to_vec(),
+        ..Default::default()
+    };
+    let errors = resolve_file_names_with_ctx(&ctx, &mut parsed);
+    resources.clone_from_slice(&parsed.resources);
+    errors_to_legacy_result(errors)
 }
 
 #[cfg(test)]

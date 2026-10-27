@@ -3253,6 +3253,14 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
         .collect()
 }
 
+/// Check the opaque pre-resolution snapshot retained by the config loader for
+/// unused bindings without exposing its raw parsed resources to callers.
+pub fn check_unused_bindings_in_snapshot(
+    snapshot: &crate::config_loader::UnresolvedConfigSnapshot,
+) -> Vec<String> {
+    check_unused_bindings(snapshot.parsed())
+}
+
 /// Check for unused bindings while retaining bindings that provide stable
 /// identities for otherwise-conflicting attribute-derived resources.
 pub fn check_unused_bindings_with_identity_requirements<E: crate::parser::ExportParamLike>(
@@ -3265,6 +3273,15 @@ pub fn check_unused_bindings_with_identity_requirements<E: crate::parser::Export
         .into_iter()
         .filter(|binding| !identity_required.contains(binding))
         .collect()
+}
+
+/// Identity-aware unused-binding check for the config loader's opaque
+/// pre-resolution snapshot.
+pub fn check_unused_bindings_with_identity_requirements_in_snapshot(
+    snapshot: &crate::config_loader::UnresolvedConfigSnapshot,
+    registry: &crate::schema::SchemaRegistry,
+) -> Vec<String> {
+    check_unused_bindings_with_identity_requirements(snapshot.parsed(), registry)
 }
 
 /// Walk `field_path` against `start`. Return `Ok(tail_type)` on a

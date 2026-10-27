@@ -10,10 +10,12 @@ use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 
+use crate::config_loader::UnresolvedConfigSnapshot;
+use crate::override_aware::CanonicalUnresolvedResources;
 use crate::parser::display_string_literal;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver,
-    RawEnumIdentifier, Resource, Value, ValueString,
+    RawEnumIdentifier, Resource, ResourceId, Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::{CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value};
@@ -7030,134 +7032,6 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
     }
 }
 
-/// Resolve block name aliases in a map using struct field definitions.
-///
-/// For each key in `map` that matches a `block_name` on a struct field,
-/// renames it to the canonical field name. Also recurses into nested
-/// struct values to resolve block names at all nesting levels.
-///
-/// `defs` is the resource schema's `defs` map; nested fields typed as
-/// [`AttrTypeKind::Ref`] are peeled against it via
-/// [`AttrTypeKind::resolve_refs`] before recursion so block-name
-/// resolution reaches inside cyclic CFN-style schemas (carina#3340 /
-/// carina#3349). A `Ref` whose name is not in `defs` is a schema
-/// invariant violation and panics through `resolve_refs`.
-fn resolve_block_names_in_map(
-    map: &mut IndexMap<String, Value>,
-    fields: &[StructField],
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-    resource_id: &str,
-    errors: &mut Vec<String>,
-) {
-    // Build block_name -> canonical field name mapping
-    let bn_map: HashMap<String, String> = fields
-        .iter()
-        .filter_map(|f| f.block_name.as_ref().map(|bn| (bn.clone(), f.name.clone())))
-        .collect();
-
-    // Rename block name keys to canonical names, but only when the value
-    // is a List (from block syntax). Non-list values (e.g., Value::Concrete(ConcreteValue::Map) from
-    // attribute assignment) target the actual field with that name.
-    let renames: Vec<(String, String)> = map
-        .keys()
-        .filter_map(|key| {
-            bn_map.get(key).and_then(|canon| {
-                // Only rename if the value is a List (block-originated)
-                if matches!(map.get(key), Some(Value::Concrete(ConcreteValue::List(_)))) {
-                    Some((key.clone(), canon.clone()))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-
-    for (block_key, canon_key) in renames {
-        // When block_name == canonical name, no rename is needed
-        if block_key == canon_key {
-            continue;
-        }
-        if map.contains_key(&canon_key) {
-            errors.push(format!(
-                "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
-                resource_id, block_key, canon_key
-            ));
-            continue;
-        }
-        let value = map.shift_remove(&block_key).unwrap();
-        map.insert(canon_key, value);
-    }
-
-    // Recurse into nested struct values
-    for field in fields {
-        let value = match map.get_mut(&field.name) {
-            Some(v) => v,
-            None => continue,
-        };
-        recurse_block_names_into_value(&field.field_type, value, defs, resource_id, errors);
-    }
-}
-
-/// Drive the block-name recursion through a single `(field_type, value)`
-/// pair, peeling any [`AttrTypeKind::Ref`] hops against `defs` before
-/// dispatching on `Struct` / `List`. Factored out so the top-level
-/// `resolve_block_names` walk and the nested `resolve_block_names_in_map`
-/// walk share the same Ref-handling code path — both used to drop `Ref`
-/// into a `_ => {}` arm (carina#3349).
-///
-/// `Ref` peeling delegates to [`AttrTypeKind::resolve_refs`] for both
-/// the outer type and a nested `List<Ref>` element, so the panic
-/// semantics on dangling refs match every other walk-site (carina#3340).
-fn recurse_block_names_into_value(
-    field_type: &AttributeType,
-    value: &mut Value,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-    resource_id: &str,
-    errors: &mut Vec<String>,
-) {
-    // Project onto `Shape` so `Ref` is peeled at the type level
-    // (carina#3349). The `Shape` enum has no `Ref` variant, so the
-    // wildcard arm below cannot silently swallow a `Ref` — the bug
-    // class is structurally impossible.
-    match field_type.shape_with_defs(defs) {
-        Shape::Struct { .. } => {
-            if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
-                let inner = struct_fields_with_defs(field_type, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                resolve_block_names_in_map(inner_map, inner, defs, resource_id, errors);
-            }
-        }
-        Shape::List {
-            element_type: inner,
-            ..
-        } => {
-            // `List<Ref>`: peel the element type too via `shape(defs)`
-            // so the walk reaches the underlying struct fields.
-            if let Shape::Struct { .. } = inner.shape_with_defs(defs)
-                && let Value::Concrete(ConcreteValue::List(items)) = value
-            {
-                let inner_fields = struct_fields_with_defs(inner, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                for item in items.iter_mut() {
-                    if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
-                        resolve_block_names_in_map(
-                            item_map,
-                            inner_fields,
-                            defs,
-                            resource_id,
-                            errors,
-                        );
-                    }
-                }
-            }
-        }
-        // Other shapes (primitives, Enum, Custom, Map, Union) do
-        // not carry block-name aliases reachable from here. `Ref` is
-        // structurally absent from `Shape`.
-        _ => {}
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockNameAlias {
     resource_id: String,
@@ -7184,10 +7058,47 @@ impl BlockNameAlias {
     }
 }
 
-struct AliasLocation {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlockNameConflict {
+    resource_id: String,
     path: String,
     alias: String,
     canonical: String,
+}
+
+impl fmt::Display for BlockNameConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
+            self.resource_id, self.alias, self.canonical
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockValuePathSegment {
+    Field(String),
+    Index(usize),
+}
+
+struct BlockNameOccurrence {
+    alias: BlockNameAlias,
+    map_path: Vec<BlockValuePathSegment>,
+    conflicts: bool,
+}
+
+#[derive(Default)]
+struct BlockNameWalk {
+    occurrences: Vec<BlockNameOccurrence>,
+    conflicts: Vec<BlockNameConflict>,
+}
+
+#[derive(Clone, Copy)]
+struct BlockFieldRef<'a> {
+    name: &'a str,
+    block_name: Option<&'a str>,
+    field_type: &'a AttributeType,
 }
 
 fn nested_path(parent: &str, name: &str) -> String {
@@ -7198,213 +7109,350 @@ fn nested_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn find_block_name_alias_in_map(
+fn walk_block_names_in_map(
     map: &IndexMap<String, Value>,
-    fields: &[StructField],
+    fields: &[BlockFieldRef<'_>],
     defs: &BTreeMap<String, AttributeType>,
+    resource_id: &str,
+    map_path: &[BlockValuePathSegment],
     parent_path: &str,
-) -> Option<AliasLocation> {
-    for field in fields {
-        let Some(block_name) = field.block_name.as_deref() else {
+    walk: &mut BlockNameWalk,
+) {
+    let block_fields = fields
+        .iter()
+        .filter_map(|field| {
+            let block_name = field.block_name?;
+            (block_name != field.name).then_some((block_name, *field))
+        })
+        .collect::<HashMap<_, _>>();
+
+    // Preserve the source map's order, matching the pre-walker resolver: each
+    // renamed key is removed in authored order and appended under its canonical
+    // spelling in that same order.
+    for (block_name, value) in map {
+        let Some(field) = block_fields.get(block_name.as_str()) else {
             continue;
         };
-        if block_name != field.name
-            && matches!(
-                map.get(block_name),
-                Some(Value::Concrete(ConcreteValue::List(_)))
-            )
-        {
-            return Some(AliasLocation {
-                path: nested_path(parent_path, block_name),
+        if !matches!(value, Value::Concrete(ConcreteValue::List(_))) {
+            continue;
+        }
+
+        let path = nested_path(parent_path, block_name);
+        let conflicts = map.contains_key(field.name);
+        walk.occurrences.push(BlockNameOccurrence {
+            alias: BlockNameAlias {
+                resource_id: resource_id.to_string(),
+                path: path.clone(),
                 alias: block_name.to_string(),
-                canonical: field.name.clone(),
+                canonical: field.name.to_string(),
+            },
+            map_path: map_path.to_vec(),
+            conflicts,
+        });
+        if conflicts {
+            walk.conflicts.push(BlockNameConflict {
+                resource_id: resource_id.to_string(),
+                path,
+                alias: block_name.to_string(),
+                canonical: field.name.to_string(),
             });
         }
     }
 
     for field in fields {
-        let Some(value) = map.get(&field.name) else {
+        let canonical = map.get(field.name);
+        let aliased = field.block_name.and_then(|block_name| {
+            (block_name != field.name
+                && canonical.is_none()
+                && block_fields
+                    .get(block_name)
+                    .is_some_and(|selected| selected.name == field.name)
+                && matches!(
+                    map.get(block_name),
+                    Some(Value::Concrete(ConcreteValue::List(_)))
+                ))
+            .then(|| map.get(block_name))
+            .flatten()
+        });
+        let Some(value) = canonical.or(aliased) else {
             continue;
         };
-        if let Some(alias) = find_block_name_alias_in_value(
+        let mut value_path = map_path.to_vec();
+        value_path.push(BlockValuePathSegment::Field(field.name.to_string()));
+        walk_block_names_in_value(
             value,
-            &field.field_type,
+            field.field_type,
             defs,
-            &nested_path(parent_path, &field.name),
-        ) {
-            return Some(alias);
-        }
+            resource_id,
+            &value_path,
+            &nested_path(parent_path, field.name),
+            walk,
+        );
     }
-    None
 }
 
-fn find_block_name_alias_in_value(
+fn walk_block_names_in_value(
     value: &Value,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
+    resource_id: &str,
+    value_path: &[BlockValuePathSegment],
     path: &str,
-) -> Option<AliasLocation> {
+    walk: &mut BlockNameWalk,
+) {
     match attr_type.shape_with_defs(defs) {
         Shape::Struct { .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
-                return None;
+                return;
             };
             let fields = struct_fields_with_defs(attr_type, defs)
-                .expect("Shape::Struct must expose struct fields internally");
-            find_block_name_alias_in_map(map, fields, defs, path)
+                .expect("Shape::Struct must expose struct fields internally")
+                .iter()
+                .map(|field| BlockFieldRef {
+                    name: &field.name,
+                    block_name: field.block_name.as_deref(),
+                    field_type: &field.field_type,
+                })
+                .collect::<Vec<_>>();
+            walk_block_names_in_map(map, &fields, defs, resource_id, value_path, path, walk);
         }
         Shape::List { element_type, .. } => {
             if !matches!(element_type.shape_with_defs(defs), Shape::Struct { .. }) {
-                return None;
+                return;
             }
             let Value::Concrete(ConcreteValue::List(items)) = value else {
-                return None;
+                return;
             };
             let fields = struct_fields_with_defs(element_type, defs)
-                .expect("Shape::Struct must expose struct fields internally");
-            items.iter().enumerate().find_map(|(index, item)| {
+                .expect("Shape::Struct must expose struct fields internally")
+                .iter()
+                .map(|field| BlockFieldRef {
+                    name: &field.name,
+                    block_name: field.block_name.as_deref(),
+                    field_type: &field.field_type,
+                })
+                .collect::<Vec<_>>();
+            for (index, item) in items.iter().enumerate() {
                 let Value::Concrete(ConcreteValue::Map(map)) = item else {
-                    return None;
+                    continue;
                 };
-                find_block_name_alias_in_map(map, fields, defs, &format!("{path}[{index}]"))
-            })
+                let mut item_path = value_path.to_vec();
+                item_path.push(BlockValuePathSegment::Index(index));
+                walk_block_names_in_map(
+                    map,
+                    &fields,
+                    defs,
+                    resource_id,
+                    &item_path,
+                    &format!("{path}[{index}]"),
+                    walk,
+                );
+            }
         }
-        _ => None,
+        _ => {}
     }
 }
 
+fn walk_attribute_block_names(
+    resource_id: &ResourceId,
+    attributes: &IndexMap<String, Value>,
+    schema: &ResourceSchema,
+) -> BlockNameWalk {
+    let fields = schema
+        .attributes
+        .values()
+        .map(|attribute| BlockFieldRef {
+            name: &attribute.name,
+            block_name: attribute.block_name.as_deref(),
+            field_type: &attribute.attr_type,
+        })
+        .collect::<Vec<_>>();
+    let mut walk = BlockNameWalk::default();
+    walk_block_names_in_map(
+        attributes,
+        &fields,
+        &schema.defs,
+        &resource_id.to_string(),
+        &[],
+        "",
+        &mut walk,
+    );
+    walk
+}
+
+fn map_at_block_path_mut<'a>(
+    root: &'a mut IndexMap<String, Value>,
+    path: &[BlockValuePathSegment],
+) -> Option<&'a mut IndexMap<String, Value>> {
+    let Some((first, rest)) = path.split_first() else {
+        return Some(root);
+    };
+    let BlockValuePathSegment::Field(name) = first else {
+        return None;
+    };
+    map_in_block_value_mut(root.get_mut(name)?, rest)
+}
+
+fn map_in_block_value_mut<'a>(
+    value: &'a mut Value,
+    path: &[BlockValuePathSegment],
+) -> Option<&'a mut IndexMap<String, Value>> {
+    let Some((first, rest)) = path.split_first() else {
+        return match value {
+            Value::Concrete(ConcreteValue::Map(map)) => Some(map),
+            _ => None,
+        };
+    };
+    match first {
+        BlockValuePathSegment::Field(name) => match value {
+            Value::Concrete(ConcreteValue::Map(map)) => {
+                map_in_block_value_mut(map.get_mut(name)?, rest)
+            }
+            _ => None,
+        },
+        BlockValuePathSegment::Index(index) => match value {
+            Value::Concrete(ConcreteValue::List(items)) => {
+                map_in_block_value_mut(items.get_mut(*index)?, rest)
+            }
+            _ => None,
+        },
+    }
+}
+
+fn resolve_attribute_block_names(
+    resource_id: &ResourceId,
+    attributes: &mut IndexMap<String, Value>,
+    schema: &ResourceSchema,
+) -> Vec<BlockNameConflict> {
+    let walk = walk_attribute_block_names(resource_id, attributes, schema);
+    for occurrence in walk
+        .occurrences
+        .iter()
+        .filter(|occurrence| !occurrence.conflicts)
+    {
+        let map = map_at_block_path_mut(attributes, &occurrence.map_path)
+            .expect("block-name walk paths must resolve during the rename pass");
+        let value = map
+            .shift_remove(occurrence.alias.alias())
+            .expect("block-name alias found by the walk must still exist");
+        map.insert(occurrence.alias.canonical().to_string(), value);
+    }
+    walk.conflicts
+}
+
 /// Find the first List-valued block alias without cloning or mutating the
-/// resource. This deliberately mirrors [`resolve_block_names`]: Map-valued
-/// assignments can be legitimate fields whose names happen to collide with a
-/// sibling field's `block_name`, and Union values are left to normal schema
-/// validation.
+/// resource. This uses the same walk as the rename pass: Map-valued assignments
+/// can be legitimate fields whose names happen to collide with a sibling
+/// field's `block_name`, and Union values are left to normal schema validation.
 pub(crate) fn find_resource_block_name_alias(
     resource: &Resource,
     schema: &ResourceSchema,
 ) -> Option<BlockNameAlias> {
-    let location = schema.attributes.values().find_map(|attribute| {
-        let block_name = attribute.block_name.as_deref()?;
-        (block_name != attribute.name
-            && matches!(
-                resource.attributes.get(block_name),
-                Some(Value::Concrete(ConcreteValue::List(_)))
-            ))
-        .then(|| AliasLocation {
-            path: block_name.to_string(),
-            alias: block_name.to_string(),
-            canonical: attribute.name.clone(),
-        })
-    });
-    let location = location.or_else(|| {
-        schema.attributes.values().find_map(|attribute| {
-            let value = resource.attributes.get(&attribute.name)?;
-            find_block_name_alias_in_value(
-                value,
-                &attribute.attr_type,
-                &schema.defs,
-                &attribute.name,
-            )
-        })
-    })?;
-
-    Some(BlockNameAlias {
-        resource_id: resource.id.to_string(),
-        path: location.path,
-        alias: location.alias,
-        canonical: location.canonical,
-    })
+    walk_attribute_block_names(&resource.id, &resource.attributes, schema)
+        .occurrences
+        .into_iter()
+        .next()
+        .map(|occurrence| occurrence.alias)
 }
 
-/// Resolve block name aliases in resources.
-///
-/// For each resource attribute key that matches a `block_name` in the schema,
-/// renames it to the canonical attribute name. Errors if both the block_name
-/// (singular) and the canonical attribute name (plural) are present.
-///
-/// Also recursively resolves block names in nested struct values.
-pub fn resolve_block_names(
+fn resolve_block_names_detailed(
+    resources: &mut [Resource],
+    registry: &SchemaRegistry,
+) -> Vec<BlockNameConflict> {
+    resources
+        .iter_mut()
+        .filter_map(|resource| {
+            let schema = registry.get_for(resource)?;
+            Some(resolve_attribute_block_names(
+                &resource.id,
+                &mut resource.attributes,
+                schema,
+            ))
+        })
+        .flatten()
+        .collect()
+}
+
+#[cfg(test)]
+fn resolve_block_names(
     resources: &mut [Resource],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
-    let mut all_errors = Vec::new();
-
-    for resource in resources.iter_mut() {
-        let schema = match registry.get_for(resource) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let bn_map = schema.block_name_map();
-
-        // Collect keys to rename: (block_name_key, canonical_attr_name)
-        // Only rename when the value is a List (from block syntax). Non-list values
-        // (e.g., Value::Concrete(ConcreteValue::Map) from attribute assignment) target the actual field with that name.
-        let renames: Vec<(String, String)> = resource
-            .attributes
-            .keys()
-            .filter_map(|key| {
-                bn_map.get(key).and_then(|canon| {
-                    if matches!(
-                        resource.get_attr(key),
-                        Some(Value::Concrete(ConcreteValue::List(_)))
-                    ) {
-                        Some((key.clone(), canon.clone()))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-
-        for (block_key, canon_key) in renames {
-            // When block_name == canonical name, no rename is needed
-            if block_key == canon_key {
-                continue;
-            }
-            if resource.attributes.contains_key(&canon_key) {
-                all_errors.push(format!(
-                    "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
-                    resource.id, block_key, canon_key
-                ));
-                continue;
-            }
-
-            // `shift_remove` keeps the rest of the source-authored
-            // order intact; `swap_remove` would reorder remaining
-            // attributes — see #2222.
-            let expr = resource.attributes.shift_remove(&block_key).unwrap();
-            resource.attributes.insert(canon_key, expr);
-        }
-
-        // Recurse into nested struct values to resolve block names at
-        // all levels. `recurse_block_names_into_value` peels
-        // `AttrTypeKind::Ref` against `schema.defs` so cyclic CFN
-        // schemas (carina#3340) still see their block-name aliases
-        // (carina#3349). The top-level walk previously dropped `Ref`
-        // into a `_ => {}` arm, which made `awscc.s3.Bucket`'s
-        // `lifecycle_configuration` (typed `Ref("LifecycleConfiguration")`)
-        // reject the documented `rule { }` block syntax with
-        // "Required attribute 'rules' is missing".
-        let resource_id = resource.id.to_string();
-        for (attr_name, attr_schema) in &schema.attributes {
-            let value = match resource.attributes.get_mut(attr_name) {
-                Some(v) => v,
-                None => continue,
-            };
-            recurse_block_names_into_value(
-                &attr_schema.attr_type,
-                value,
-                &schema.defs,
-                &resource_id,
-                &mut all_errors,
-            );
-        }
-    }
-
-    if all_errors.is_empty() {
+    let conflicts = resolve_block_names_detailed(resources, registry);
+    if conflicts.is_empty() {
         Ok(())
     } else {
-        Err(all_errors.join("\n"))
+        Err(conflicts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+fn resolve_file_block_names<E>(
+    parsed: &mut crate::parser::File<E>,
+    registry: &SchemaRegistry,
+) -> Vec<BlockNameConflict> {
+    let mut conflicts = resolve_block_names_detailed(&mut parsed.resources, registry);
+    for data_source in &mut parsed.data_sources {
+        if let Some(schema) = registry.get_for_data_source(data_source) {
+            conflicts.extend(resolve_attribute_block_names(
+                &data_source.id,
+                &mut data_source.attributes,
+                schema,
+            ));
+        }
+    }
+    for deferred in &mut parsed.deferred_for_expressions {
+        conflicts.extend(resolve_block_names_detailed(
+            std::slice::from_mut(&mut deferred.template_resource),
+            registry,
+        ));
+        deferred.attributes = deferred
+            .template_resource
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+    }
+    conflicts
+}
+
+/// Resolve block names in one evaluated file, including deferred-for
+/// templates that can materialize after refresh.
+pub fn resolve_file_block_names_with_schemas<E>(
+    parsed: &mut crate::parser::File<E>,
+    registry: &SchemaRegistry,
+) -> Result<(), Vec<BlockNameConflict>> {
+    let conflicts = resolve_file_block_names(parsed, registry);
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(conflicts)
+    }
+}
+
+/// Resolve an evaluated configuration and its authored snapshot in one
+/// schema-aware operation, returning the only resource type accepted by the
+/// override-aware authored-input boundary.
+pub fn resolve_config_block_names_with_schemas<E>(
+    parsed: &mut crate::parser::File<E>,
+    unresolved: UnresolvedConfigSnapshot,
+    registry: &SchemaRegistry,
+) -> Result<CanonicalUnresolvedResources, Vec<BlockNameConflict>> {
+    let mut unresolved = unresolved.into_inner();
+    let mut conflicts = resolve_file_block_names(parsed, registry);
+    let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();
+    for conflict in resolve_file_block_names(&mut unresolved, registry) {
+        if seen.insert(conflict.clone()) {
+            conflicts.push(conflict);
+        }
+    }
+    if conflicts.is_empty() {
+        Ok(CanonicalUnresolvedResources::new(unresolved.resources))
+    } else {
+        Err(conflicts)
     }
 }
 

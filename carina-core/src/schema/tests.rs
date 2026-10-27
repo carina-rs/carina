@@ -2858,6 +2858,48 @@ fn resolve_block_names_renames_key() {
 }
 
 #[test]
+fn resolve_block_names_preserves_authored_order_across_multiple_aliases() {
+    let block_value = || {
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::new()),
+        )]))
+    };
+    let mut resource = Resource::new("test.thing", "example");
+    resource.set_attr("second", block_value());
+    resource.set_attr(
+        "literal",
+        Value::Concrete(ConcreteValue::String("kept-first".into())),
+    );
+    resource.set_attr("first", block_value());
+    let mut resources = vec![resource];
+
+    let block_type = || {
+        AttributeType::list(AttributeType::struct_(
+            "Entry".to_string(),
+            Vec::<StructField>::new(),
+        ))
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.thing")
+            .attribute(AttributeSchema::new("firsts", block_type()).with_block_name("first"))
+            .attribute(AttributeSchema::new("seconds", block_type()).with_block_name("second")),
+    );
+
+    resolve_block_names(&mut resources, &schemas).unwrap();
+
+    assert_eq!(
+        resources[0]
+            .attributes
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["literal", "seconds", "firsts"],
+    );
+}
+
+#[test]
 fn resolve_block_names_noop_when_no_match() {
     let mut resources = vec![{
         let mut r = Resource::new("ec2.ipam", "my-ipam");
@@ -3097,6 +3139,47 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
         !lifecycle.contains_key("transitions"),
         "expected 'transitions' key NOT to be created from attribute assignment"
     );
+}
+
+#[test]
+fn resolve_file_block_names_canonicalizes_data_source_blocks() {
+    let mut data_source =
+        crate::resource::DataSource::with_provider("test", "thing", "lookup", None);
+    data_source.set_attr(
+        "rule",
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "action".to_string(),
+                Value::Concrete(ConcreteValue::String("allow".into())),
+            )])),
+        )])),
+    );
+    let mut parsed = crate::parser::ParsedFile {
+        data_sources: vec![data_source],
+        ..Default::default()
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("thing")
+            .attribute(
+                AttributeSchema::new(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "Rule",
+                        vec![StructField::new("action", AttributeType::string())],
+                    )),
+                )
+                .with_block_name("rule"),
+            )
+            .as_data_source(),
+    );
+
+    resolve_file_block_names_with_schemas(&mut parsed, &schemas)
+        .expect("data-source block alias must resolve");
+
+    assert!(parsed.data_sources[0].attributes.contains_key("rules"));
+    assert!(!parsed.data_sources[0].attributes.contains_key("rule"));
 }
 
 #[test]

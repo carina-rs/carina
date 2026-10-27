@@ -159,52 +159,6 @@ async fn normalized_resource_rejects_nested_block_aliases_returned_by_provider_n
 }
 
 #[tokio::test]
-async fn normalizer_alias_guard_respects_canonical_keys_in_another_union_arm() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
-    let canonical_arm = AttributeType::struct_(
-        "CanonicalRule",
-        vec![StructField::new("rule", AttributeType::string())],
-    );
-    let alias_arm = AttributeType::struct_(
-        "RepeatedRules",
-        vec![
-            StructField::new(
-                "rules",
-                AttributeType::list(AttributeType::struct_(
-                    "Rule",
-                    vec![StructField::new("action", AttributeType::string())],
-                )),
-            )
-            .with_block_name("rule"),
-        ],
-    );
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "test",
-        ResourceSchema::new("thing").attribute(AttributeSchema::new(
-            "choice",
-            AttributeType::union(vec![canonical_arm, alias_arm]),
-        )),
-    );
-    let resource = Resource::with_provider("test", "thing", "example", None).with_attribute(
-        "choice",
-        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-            "rule".to_string(),
-            string_value("canonical-in-this-arm"),
-        )]))),
-    );
-
-    let normalized = apply_desired_normalization(resource, &[], &NoopNormalizer, &schemas)
-        .await
-        .expect(
-            "a canonical key must not be rejected because another union arm uses it as an alias",
-        );
-
-    assert!(normalized.as_resource().get_attr("choice").is_some());
-}
-
-#[tokio::test]
 async fn normalization_error_stops_later_stages() {
     struct FailingNormalizer;
 

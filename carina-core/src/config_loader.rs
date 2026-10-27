@@ -203,7 +203,43 @@ impl fmt::Display for DuplicateDeclaration {
     }
 }
 
+/// The authored, pre-reference-resolution configuration snapshot.
+///
+/// Its parsed representation is crate-private so downstream callers cannot
+/// extract a raw resource vector. Schema block-name resolution consumes this
+/// value and returns the typestate required by override-aware planning.
+#[derive(Debug, Clone)]
+pub struct UnresolvedConfigSnapshot {
+    parsed: ParsedFile,
+}
+
+impl UnresolvedConfigSnapshot {
+    /// Wrap a parsed pre-resolution snapshot for schema-aware alias
+    /// resolution. The raw value remains opaque after construction; the only
+    /// way to recover its resources is to consume it through the resolver.
+    pub fn from_parsed(parsed: ParsedFile) -> Self {
+        Self { parsed }
+    }
+
+    pub(crate) fn parsed(&self) -> &ParsedFile {
+        &self.parsed
+    }
+
+    pub(crate) fn into_inner(self) -> ParsedFile {
+        self.parsed
+    }
+}
+
 /// Result of loading configuration, includes the file path containing backend block.
+///
+/// The authored snapshot is opaque: callers must pass it through schema-aware
+/// block-name resolution instead of extracting raw resources.
+///
+/// ```compile_fail
+/// # fn bypass(loaded: carina_core::config_loader::LoadedConfig) {
+/// let _ = loaded.unresolved_parsed.resources;
+/// # }
+/// ```
 ///
 /// The struct holds non-blocking diagnostics (e.g. deferred for-iterable
 /// binding errors) so the caller can decide to keep running the rest of
@@ -219,9 +255,9 @@ pub struct LoadedConfig {
     /// Resources before reference resolution, for unused binding detection.
     /// After `resolve_resource_refs`, intermediate `ResourceRef` values are resolved away,
     /// so this preserves the original references for accurate unused binding analysis.
-    /// Stays as `ParsedFile` because nothing downstream of this field
-    /// reads `export_params.type_expr`.
-    pub unresolved_parsed: ParsedFile,
+    /// Internally retains the `ParsedFile` export shape because this snapshot
+    /// predates inference; callers receive only the opaque wrapper.
+    pub unresolved_parsed: UnresolvedConfigSnapshot,
     pub backend_file: Option<PathBuf>,
     /// Identifier-scope errors surfaced by [`parser::check_identifier_scope`]
     /// on the merged directory parse: ResourceRef roots in resources /
@@ -512,7 +548,7 @@ pub fn load_configuration_with_config(
 
         Ok(LoadedConfig {
             parsed: inferred,
-            unresolved_parsed: unresolved_merged,
+            unresolved_parsed: UnresolvedConfigSnapshot::from_parsed(unresolved_merged),
             backend_file,
             identifier_scope_errors,
             inference_errors,
@@ -1872,7 +1908,7 @@ let _ = for unused_var in empty_list {
 
         let config = load_configuration(&dir).unwrap();
         // unresolved_parsed should also have the provider
-        assert_eq!(config.unresolved_parsed.providers.len(), 1);
+        assert_eq!(config.unresolved_parsed.parsed.providers.len(), 1);
         cleanup(&dir);
     }
 

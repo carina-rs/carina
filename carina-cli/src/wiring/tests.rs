@@ -42,6 +42,23 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
+fn canonical_unresolved(
+    resources: Vec<Resource>,
+    schemas: &SchemaRegistry,
+) -> CanonicalUnresolvedResources {
+    let unresolved = carina_core::parser::ParsedFile {
+        resources,
+        ..Default::default()
+    };
+    let mut evaluated = unresolved.clone();
+    carina_core::schema::resolve_config_block_names_with_schemas(
+        &mut evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        schemas,
+    )
+    .expect("test block-name resolution must succeed")
+}
+
 fn resolved_provider_configs<E>(
     parsed: &carina_core::parser::File<E>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
@@ -258,7 +275,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         &ctx,
         parsed,
         provider_configs,
-        &CanonicalUnresolvedResources::for_test(unresolved_resources),
+        &canonical_unresolved(unresolved_resources.to_vec(), ctx.schemas()),
         state_file,
         refresh,
         remote_bindings,
@@ -352,7 +369,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     };
     let ctx = WiringContext::new(Vec::new(), &[]);
     let mut resources = OverrideAwareResources::build(
-        Vec::new(),
+        canonical_unresolved(Vec::new(), ctx.schemas()),
         None::<&StateFile>,
         carina_core::binding_index::PreApplyInputs {
             managed: &[],
@@ -472,7 +489,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         );
     desired.binding = Some("resource".to_string());
     let mut resources = OverrideAwareResources::build(
-        vec![desired],
+        canonical_unresolved(vec![desired], &SchemaRegistry::new()),
         None::<&StateFile>,
         PreApplyInputs {
             managed: &[],
@@ -976,7 +993,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &ctx,
         &parsed,
         &provider_configs,
-        &CanonicalUnresolvedResources::for_test(&[]),
+        &canonical_unresolved(Vec::new(), ctx.schemas()),
         &None,
         false,
         &HashMap::new(),
@@ -1429,7 +1446,10 @@ let shared = read test.shared.Type {}
         &ctx,
         &parsed,
         &provider_configs,
-        &CanonicalUnresolvedResources::for_test(&parsed.resources),
+        &canonical_unresolved(
+            parsed.resources.clone(), // allow: direct — plan-time reconciliation
+            ctx.schemas(),
+        ),
         &state_file,
         true,
         &HashMap::new(),
@@ -3795,7 +3815,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &ctx,
         &parsed,
         &provider_configs,
-        &CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved(
+            unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
+            ctx.schemas(),
+        ),
         &Some(state_file),
         false,
         &HashMap::new(),
@@ -4633,9 +4656,6 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<ProviderConfig> = Vec::new();
 
-    let errors = resolve_names_with_ctx(&ctx, &mut resources);
-    assert!(errors.is_empty(), "resolve_names: got {errors:?}");
-
     let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
@@ -4691,9 +4711,12 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical_unresolved =
-        resolve_config_block_names_with_ctx(&ctx, &mut evaluated, unresolved)
-            .expect("paired block aliases must resolve");
+    let canonical_unresolved = resolve_config_block_names_with_ctx(
+        &ctx,
+        &mut evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+    )
+    .expect("paired block aliases must resolve");
 
     assert!(evaluated.resources[0].attributes.contains_key("rules"));
     assert!(!evaluated.resources[0].attributes.contains_key("rule"));
@@ -4706,7 +4729,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     );
     assert_eq!(evaluated_deferred.attributes[0].0, "rules");
 
-    let unresolved_resources = canonical_unresolved.to_vec();
+    let unresolved_resources = canonical_unresolved.as_slice();
     assert!(unresolved_resources[0].attributes.contains_key("rules"));
     assert!(!unresolved_resources[0].attributes.contains_key("rule"));
 }
@@ -4735,8 +4758,12 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     };
     let unresolved = evaluated.clone();
 
-    let errors = resolve_config_block_names_with_ctx(&ctx, &mut evaluated, unresolved)
-        .expect_err("mixed block and attribute syntax must fail");
+    let errors = resolve_config_block_names_with_ctx(
+        &ctx,
+        &mut evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+    )
+    .expect_err("mixed block and attribute syntax must fail");
 
     assert_eq!(errors.len(), 1);
     assert_eq!(
@@ -4857,11 +4884,14 @@ fn anonymous_route_resource() -> Resource {
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
     let ctx = WiringContext::new(vec![], &[]);
     let mut resources = OverrideAwareResources::build(
-        vec![
-            Resource::pending_with_provider("aws", "s3.Bucket", None),
-            Resource::pending_with_provider("aws", "s3.Bucket", None),
-            Resource::pending_with_provider("awscc", "ec2.Vpc", Some("secondary".to_string())),
-        ],
+        canonical_unresolved(
+            vec![
+                Resource::pending_with_provider("aws", "s3.Bucket", None),
+                Resource::pending_with_provider("aws", "s3.Bucket", None),
+                Resource::pending_with_provider("awscc", "ec2.Vpc", Some("secondary".to_string())),
+            ],
+            ctx.schemas(),
+        ),
         None::<&StateFile>,
         PreApplyInputs {
             managed: &[],
@@ -7312,6 +7342,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
 
 mod resolved_value_constraint_gate {
     use super::super::*;
+    use super::canonical_unresolved;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::PreApplyInputs;
@@ -7605,7 +7636,7 @@ mod resolved_value_constraint_gate {
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
         let resources = OverrideAwareResources::build(
-            source,
+            canonical_unresolved(source, &SchemaRegistry::new()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
                 managed: &[],
@@ -7706,7 +7737,7 @@ mod resolved_value_constraint_gate {
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
         let mut resources = OverrideAwareResources::build(
-            vec![producer],
+            canonical_unresolved(vec![producer], ctx.schemas()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
                 managed: &[],
@@ -7842,7 +7873,7 @@ mod resolved_value_constraint_gate {
         let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
         let normalizer = RewritingNormalizer::default();
         let mut resources = OverrideAwareResources::build(
-            Vec::new(),
+            canonical_unresolved(Vec::new(), ctx.schemas()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
                 managed: &[],
@@ -8009,7 +8040,7 @@ exports { team_prefix: String = "x" }"#,
             &ctx,
             &parsed,
             &provider_configs,
-            &CanonicalUnresolvedResources::for_test(&unresolved_resources),
+            &canonical_unresolved(unresolved_resources, ctx.schemas()),
             &None,
             true,
             &remote_bindings,
@@ -8084,7 +8115,7 @@ exports { team_prefix: String = "x" }"#,
             &ctx,
             &parsed,
             &provider_configs,
-            &CanonicalUnresolvedResources::for_test(&[]),
+            &canonical_unresolved(Vec::new(), ctx.schemas()),
             &None,
             true,
             &HashMap::new(),

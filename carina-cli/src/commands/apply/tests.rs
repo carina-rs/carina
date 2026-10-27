@@ -48,6 +48,38 @@ fn complete_update(
     }
 }
 
+fn canonical_unresolved_for_test(
+    ctx: &WiringContext,
+    parsed: &carina_core::parser::InferredFile,
+    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
+) -> carina_core::override_aware::CanonicalUnresolvedResources {
+    let mut evaluated = parsed.clone();
+    crate::wiring::resolve_config_block_names_with_ctx(ctx, &mut evaluated, unresolved.clone())
+        .unwrap_or_else(|errors| {
+            panic!(
+                "test block-name resolution failed: {}",
+                super::super::collapse_errors(errors)
+            )
+        })
+}
+
+fn canonical_resources_for_test(
+    resources: Vec<Resource>,
+    schemas: &SchemaRegistry,
+) -> carina_core::override_aware::CanonicalUnresolvedResources {
+    let unresolved = carina_core::parser::ParsedFile {
+        resources,
+        ..Default::default()
+    };
+    let mut evaluated = unresolved.clone();
+    carina_core::schema::resolve_config_block_names_with_schemas(
+        &mut evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        schemas,
+    )
+    .expect("test block-name resolution must succeed")
+}
+
 macro_rules! unexpected_resume_create {
     () => {
         fn resume_create(
@@ -1804,7 +1836,7 @@ fn load_and_resolve_module_data_source_fixture(
     shared: &ApplyTimeReadShared,
 ) -> (
     carina_core::parser::InferredFile,
-    carina_core::parser::ParsedFile,
+    carina_core::config_loader::UnresolvedConfigSnapshot,
 ) {
     let loaded = load_configuration_with_config(
         fixture.config_path(),
@@ -1841,10 +1873,6 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     let (parsed, unresolved_parsed) =
         load_and_resolve_module_data_source_fixture(&fixture, &shared);
 
-    assert!(
-        unresolved_parsed.data_sources.is_empty(),
-        "the pre-expansion snapshot must not contain module declarations"
-    );
     assert_eq!(
         parsed.data_sources[0].binding.as_deref(),
         Some("registry_publish.caller"),
@@ -1862,7 +1890,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &None,
         true,
         &HashMap::new(),
@@ -2556,7 +2584,9 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
         )],
         ..Default::default()
     };
-    let unresolved_parsed = carina_core::parser::ParsedFile::default();
+    let unresolved_parsed = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
+        carina_core::parser::ParsedFile::default(),
+    );
     let ctx = WiringContext::new(Vec::new(), &[]);
     let observer_factory = fixture.observer_factory();
 
@@ -2690,7 +2720,7 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
     let override_aware = OverrideAwareResources::build(
-        vec![resource],
+        canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
         Some(&state),
         PreApplyInputs {
             managed: &[],
@@ -3706,7 +3736,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &state_file,
         true,
         &HashMap::new(),
@@ -3824,7 +3854,7 @@ let nat = mock.ec2.NatGateway {{
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &step1_state,
         true,
         &HashMap::new(),
@@ -3885,7 +3915,7 @@ let nat = mock.ec2.NatGateway {{
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &step2_state,
         true,
         &HashMap::new(),
@@ -4016,7 +4046,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &saved,
         true,
         &HashMap::new(),
@@ -4154,7 +4184,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &before_failure,
         true,
         &HashMap::new(),
@@ -4232,7 +4262,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &saved,
         true,
         &HashMap::new(),
@@ -4304,7 +4334,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &ctx,
         &parsed,
         &provider_configs,
-        &crate::wiring::CanonicalUnresolvedResources::for_test(&unresolved_parsed.resources),
+        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &Some(applied),
         true,
         &HashMap::new(),
