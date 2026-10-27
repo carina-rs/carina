@@ -22,6 +22,8 @@ plan-image-module-cascade:
 	$(PLAN_FIXTURE) plan_image_module_cascade
 plan-image-reference-layout:
 	$(PLAN_FIXTURE) plan_image_reference_layout
+plan-image-anonymous:
+	$(PLAN_FIXTURE) plan_image_anonymous
 plan-replace-create-only:
 	$(PLAN_FIXTURE) replace_create_only
 plan-replace-with-non-forcing-diffs:
@@ -341,7 +343,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-image plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
+.PHONY: plan-image plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-replace-create-only plan-replace-with-non-forcing-diffs \
         plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \

@@ -33,6 +33,7 @@ const BARYCENTER_SWEEPS: usize = 4;
 const SWAP_REFINEMENT_SWEEPS: usize = 8;
 const RELAXATION_ITERATIONS: usize = 5;
 const MAX_RELAXATION_SHIFT: f32 = 24.0;
+const PORT_MARGIN_FRACTION: f32 = 0.2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NodeRect {
@@ -64,6 +65,29 @@ pub(crate) struct EdgeRoute {
     pub from: GraphNodeId,
     pub to: GraphNodeId,
     pub points: Vec<Point>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CardSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RouteEndpoint {
+    Start,
+    End,
+}
+
+#[derive(Debug)]
+struct PortEndpoint {
+    route_index: usize,
+    endpoint: RouteEndpoint,
+    other_primary: f32,
+    other_secondary: f32,
+    stable_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -372,16 +396,16 @@ fn ordered_bands(model: &GraphModel) -> Vec<BandId> {
 }
 
 fn graph_node_width(node: &GraphNode) -> f32 {
-    let mut widest = measured_width(
-        &truncate_for_measurement(&node.label, MAX_LABEL_CHARS),
-        15.0,
-    ) + 70.0;
+    let mut widest = measured_width(&truncate_middle(&node.label, MAX_LABEL_CHARS), 15.0) + 70.0;
     widest = widest.max(
         measured_width(
             &truncate_for_measurement(&node.resource_type, MAX_TYPE_CHARS),
             11.5,
         ) + 34.0,
     );
+    if let Some(discriminator) = &node.anonymous_discriminator {
+        widest = widest.max(measured_width(&format!("anonymous #{discriminator}"), 10.5) + 34.0);
+    }
     if let Some(note) = &node.note {
         widest = widest.max(measured_width(note, 11.0) + 34.0);
     }
@@ -405,6 +429,9 @@ pub(crate) fn graph_node_height(node: &GraphNode) -> f32 {
     } else {
         78.0
     };
+    if node.anonymous_discriminator.is_some() {
+        height += 17.0;
+    }
     if node.note.is_some() {
         height += 17.0;
     }
@@ -432,6 +459,26 @@ fn truncate_for_measurement(text: &str, max_chars: usize) -> String {
     text.chars()
         .take(max_chars.saturating_sub(1))
         .chain(std::iter::once('…'))
+        .collect()
+}
+
+pub(crate) fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let characters = text.chars().collect::<Vec<_>>();
+    if characters.len() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let kept = max_chars - 1;
+    let prefix_len = kept.div_ceil(2);
+    let suffix_len = kept - prefix_len;
+    characters[..prefix_len]
+        .iter()
+        .copied()
+        .chain(std::iter::once('…'))
+        .chain(characters[characters.len() - suffix_len..].iter().copied())
         .collect()
 }
 
@@ -1304,7 +1351,7 @@ fn build_edge_routes(
 ) -> Vec<EdgeRoute> {
     let node_rects: HashMap<_, _> = nodes.iter().map(|node| (node.id.clone(), node)).collect();
     let gate_offset = COLUMN_GAP * 0.18;
-    expanded
+    let mut routes: Vec<_> = expanded
         .routes
         .iter()
         .filter_map(|route| {
@@ -1385,7 +1432,177 @@ fn build_edge_routes(
                 points,
             })
         })
-        .collect()
+        .collect();
+    spread_card_ports(&mut routes, &node_rects);
+    routes
+}
+
+fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId, &NodeRect>) {
+    let mut groups: HashMap<(GraphNodeId, CardSide), Vec<PortEndpoint>> = HashMap::new();
+
+    for (route_index, route) in routes.iter().enumerate() {
+        let (Some(from_rect), Some(to_rect), Some(start), Some(end)) = (
+            node_rects.get(&route.from),
+            node_rects.get(&route.to),
+            route.points.first(),
+            route.points.last(),
+        ) else {
+            continue;
+        };
+        let endpoints = [
+            (
+                route.from.clone(),
+                card_side(from_rect, *start),
+                RouteEndpoint::Start,
+                *to_rect,
+                route.to.stable_key(),
+            ),
+            (
+                route.to.clone(),
+                card_side(to_rect, *end),
+                RouteEndpoint::End,
+                *from_rect,
+                route.from.stable_key(),
+            ),
+        ];
+        for (card, side, endpoint, other, other_key) in endpoints {
+            let Some(side) = side else {
+                continue;
+            };
+            let (other_primary, other_secondary) = match side {
+                CardSide::Left | CardSide::Right => {
+                    (other.y + other.height / 2.0, other.x + other.width / 2.0)
+                }
+                CardSide::Top | CardSide::Bottom => {
+                    (other.x + other.width / 2.0, other.y + other.height / 2.0)
+                }
+            };
+            groups.entry((card, side)).or_default().push(PortEndpoint {
+                route_index,
+                endpoint,
+                other_primary,
+                other_secondary,
+                stable_key: other_key,
+            });
+        }
+    }
+
+    for ((card, side), endpoints) in &mut groups {
+        let Some(rect) = node_rects.get(card) else {
+            continue;
+        };
+        endpoints.sort_by(|left, right| {
+            left.other_primary
+                .total_cmp(&right.other_primary)
+                .then_with(|| left.other_secondary.total_cmp(&right.other_secondary))
+                .then_with(|| left.stable_key.cmp(&right.stable_key))
+                .then_with(|| left.route_index.cmp(&right.route_index))
+        });
+
+        let (minimum, maximum) = match side {
+            CardSide::Left | CardSide::Right => (
+                rect.y + rect.height * PORT_MARGIN_FRACTION,
+                rect.y + rect.height * (1.0 - PORT_MARGIN_FRACTION),
+            ),
+            CardSide::Top | CardSide::Bottom => (
+                rect.x + rect.width * PORT_MARGIN_FRACTION,
+                rect.x + rect.width * (1.0 - PORT_MARGIN_FRACTION),
+            ),
+        };
+        let count = endpoints.len();
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            let coordinate = if count == 1 {
+                (minimum + maximum) / 2.0
+            } else {
+                minimum + (maximum - minimum) * index as f32 / (count - 1) as f32
+            };
+            set_route_port(
+                &mut routes[endpoint.route_index],
+                endpoint.endpoint,
+                *side,
+                coordinate,
+            );
+        }
+    }
+
+    for route in routes {
+        expand_shifted_direct_route(route, node_rects);
+        route.points.dedup();
+    }
+}
+
+fn card_side(rect: &NodeRect, point: Point) -> Option<CardSide> {
+    if point.x == rect.x {
+        Some(CardSide::Left)
+    } else if point.x == rect.x + rect.width {
+        Some(CardSide::Right)
+    } else if point.y == rect.y {
+        Some(CardSide::Top)
+    } else if point.y == rect.y + rect.height {
+        Some(CardSide::Bottom)
+    } else {
+        None
+    }
+}
+
+fn set_route_port(route: &mut EdgeRoute, endpoint: RouteEndpoint, side: CardSide, coordinate: f32) {
+    let endpoint_index = match endpoint {
+        RouteEndpoint::Start => 0,
+        RouteEndpoint::End => route.points.len() - 1,
+    };
+    match side {
+        CardSide::Left | CardSide::Right => route.points[endpoint_index].y = coordinate,
+        CardSide::Top | CardSide::Bottom => route.points[endpoint_index].x = coordinate,
+    }
+
+    if route.points.len() < 4 {
+        return;
+    }
+    let gate_index = match endpoint {
+        RouteEndpoint::Start => 1,
+        RouteEndpoint::End => route.points.len() - 2,
+    };
+    match side {
+        CardSide::Left | CardSide::Right => route.points[gate_index].y = coordinate,
+        CardSide::Top | CardSide::Bottom => route.points[gate_index].x = coordinate,
+    }
+}
+
+fn expand_shifted_direct_route(
+    route: &mut EdgeRoute,
+    node_rects: &HashMap<GraphNodeId, &NodeRect>,
+) {
+    if route.points.len() != 2 {
+        return;
+    }
+    let (Some(from_rect), Some(to_rect)) = (node_rects.get(&route.from), node_rects.get(&route.to))
+    else {
+        return;
+    };
+    let start = route.points[0];
+    let end = route.points[1];
+    let (Some(start_side), Some(end_side)) = (card_side(from_rect, start), card_side(to_rect, end))
+    else {
+        return;
+    };
+    if matches!(start_side, CardSide::Top | CardSide::Bottom)
+        && matches!(end_side, CardSide::Top | CardSide::Bottom)
+        && start.x != end.x
+    {
+        let corridor_y = (start.y + end.y) / 2.0;
+        route.points = vec![
+            start,
+            Point {
+                x: start.x,
+                y: corridor_y,
+            },
+            Point {
+                x: end.x,
+                y: corridor_y,
+            },
+            end,
+        ];
+    }
 }
 
 fn short_reference_route(from: &NodeRect, to: &NodeRect) -> Vec<Point> {
@@ -1811,6 +2028,159 @@ mod tests {
     }
 
     #[test]
+    fn shared_vertical_card_sides_spread_ports_in_other_endpoint_order() {
+        let source = resource("source", &[]);
+        let upper = resource("upper", &["source"]);
+        let middle = resource("middle", &["source"]);
+        let lower = resource("lower", &["source"]);
+        let sink = resource("sink", &["upper", "middle", "lower"]);
+        let desired = vec![
+            source.clone(),
+            upper.clone(),
+            middle.clone(),
+            lower.clone(),
+            sink.clone(),
+        ];
+        let mut plan = Plan::new();
+        for resource in [source, upper, middle, lower, sink] {
+            plan.add(Effect::Create(ResolvedResource::new(resource)));
+        }
+
+        let layout = layout_graph(&model_for(&plan, &desired, None));
+        let source_rect = layout.node(&GraphNodeId::Effect(0)).expect("source card");
+        let sink_rect = layout.node(&GraphNodeId::Effect(4)).expect("sink card");
+
+        let mut outgoing_ports = (1..=3)
+            .map(|target_index| {
+                let target = layout
+                    .node(&GraphNodeId::Effect(target_index))
+                    .expect("middle-layer card");
+                let route = layout
+                    .edge_route(&GraphNodeId::Effect(0), &GraphNodeId::Effect(target_index))
+                    .expect("source fan-out route");
+                let port = route.points.first().expect("route start");
+                assert_eq!(port.x, source_rect.x + source_rect.width);
+                (target.y + target.height / 2.0, port.y)
+            })
+            .collect::<Vec<_>>();
+        outgoing_ports.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert!(
+            outgoing_ports
+                .windows(2)
+                .all(|ports| ports[0].1 < ports[1].1),
+            "fan-out ports must be distinct and follow target y: {outgoing_ports:?}"
+        );
+
+        let mut incoming_ports = (1..=3)
+            .map(|source_index| {
+                let source = layout
+                    .node(&GraphNodeId::Effect(source_index))
+                    .expect("middle-layer card");
+                let route = layout
+                    .edge_route(&GraphNodeId::Effect(source_index), &GraphNodeId::Effect(4))
+                    .expect("sink fan-in route");
+                let port = route.points.last().expect("route end");
+                assert_eq!(port.x, sink_rect.x);
+                (source.y + source.height / 2.0, port.y)
+            })
+            .collect::<Vec<_>>();
+        incoming_ports.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert!(
+            incoming_ports
+                .windows(2)
+                .all(|ports| ports[0].1 < ports[1].1),
+            "fan-in ports must be distinct and follow source y: {incoming_ports:?}"
+        );
+    }
+
+    #[test]
+    fn shared_horizontal_card_side_spreads_incoming_and_outgoing_ports_together() {
+        let cards = [
+            NodeRect {
+                id: GraphNodeId::Effect(0),
+                x: 100.0,
+                y: 100.0,
+                width: 100.0,
+                height: 80.0,
+                column: 1,
+            },
+            NodeRect {
+                id: GraphNodeId::Effect(1),
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+                column: 0,
+            },
+            NodeRect {
+                id: GraphNodeId::Effect(2),
+                x: 140.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+                column: 1,
+            },
+            NodeRect {
+                id: GraphNodeId::Effect(3),
+                x: 200.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+                column: 2,
+            },
+            NodeRect {
+                id: GraphNodeId::Effect(4),
+                x: 140.0,
+                y: 260.0,
+                width: 20.0,
+                height: 20.0,
+                column: 1,
+            },
+        ];
+        let node_rects = cards
+            .iter()
+            .map(|card| (card.id.clone(), card))
+            .collect::<HashMap<_, _>>();
+        let mut routes = vec![
+            EdgeRoute {
+                from: GraphNodeId::Effect(1),
+                to: GraphNodeId::Effect(0),
+                points: vec![Point { x: 10.0, y: 20.0 }, Point { x: 150.0, y: 100.0 }],
+            },
+            EdgeRoute {
+                from: GraphNodeId::Effect(2),
+                to: GraphNodeId::Effect(0),
+                points: vec![Point { x: 150.0, y: 20.0 }, Point { x: 150.0, y: 100.0 }],
+            },
+            EdgeRoute {
+                from: GraphNodeId::Effect(0),
+                to: GraphNodeId::Effect(3),
+                points: vec![Point { x: 150.0, y: 100.0 }, Point { x: 210.0, y: 20.0 }],
+            },
+            EdgeRoute {
+                from: GraphNodeId::Effect(0),
+                to: GraphNodeId::Effect(4),
+                points: vec![Point { x: 150.0, y: 180.0 }, Point { x: 150.0, y: 260.0 }],
+            },
+        ];
+
+        spread_card_ports(&mut routes, &node_rects);
+
+        let mut top_ports = vec![
+            routes[0].points.last().unwrap().x,
+            routes[1].points.last().unwrap().x,
+            routes[2].points.first().unwrap().x,
+        ];
+        top_ports.sort_by(f32::total_cmp);
+        assert_eq!(top_ports, [120.0, 150.0, 180.0]);
+        assert_eq!(
+            routes[3].points.first().unwrap().x,
+            150.0,
+            "a side with one edge keeps its center port"
+        );
+    }
+
+    #[test]
     fn reference_layout_draws_changed_to_changed_reference_without_ordering_edge() {
         let model = fixture_model("plan_image_reference_layout");
         let subnet = model
@@ -2166,8 +2536,15 @@ mod tests {
     fn assert_vertical_card_edge_route(route: &EdgeRoute, from: &NodeRect, to: &NodeRect) {
         let first = route.points.first().expect("route start");
         let last = route.points.last().expect("route end");
-        assert_eq!(first.x, from.x + from.width / 2.0);
-        assert_eq!(last.x, to.x + to.width / 2.0);
+        for (port, card) in [(first, from), (last, to)] {
+            let minimum = card.x + card.width * PORT_MARGIN_FRACTION;
+            let maximum = card.x + card.width * (1.0 - PORT_MARGIN_FRACTION);
+            assert!(
+                port.x >= minimum && port.x <= maximum,
+                "horizontal port {} must stay within [{minimum}, {maximum}]",
+                port.x
+            );
+        }
         if from.y + from.height <= to.y {
             assert_eq!(first.y, from.y + from.height);
             assert_eq!(last.y, to.y);

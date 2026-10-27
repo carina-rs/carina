@@ -4,6 +4,7 @@ use carina_core::effect::Effect;
 use carina_core::executor::{
     PlanSchedulerPhase, UnresolvedResource, build_plan_scheduler_dependency_edges,
 };
+use carina_core::identifier::anonymous_identity_discriminator;
 use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::plan_tree::build_dependency_graph_from_effects;
 use carina_core::resource::{
@@ -84,6 +85,7 @@ pub(crate) struct GraphNode {
     pub id: GraphNodeId,
     pub label: String,
     pub resource_type: String,
+    pub anonymous_discriminator: Option<String>,
     pub kind: EffectKind,
     pub attribute_names: Vec<String>,
     pub note: Option<String>,
@@ -264,12 +266,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
                 .entry(info.id.clone())
                 .or_insert_with(|| info.clone());
         }
-        nodes.push(node_from_effect(
-            idx,
-            effect,
-            replacement,
-            module.map(|info| info.id),
-        ));
+        nodes.push(node_from_effect(idx, effect, replacement, module.as_ref()));
     }
 
     for (id, resource_idx) in synthetic_nodes.values() {
@@ -285,10 +282,18 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
                 .entry(info.id.clone())
                 .or_insert_with(|| info.clone());
         }
+        let label = resource_label(
+            resource.binding.as_deref(),
+            &resource.id,
+            module.as_ref().map(|info| info.label.as_str()),
+        );
+        let anonymous_discriminator =
+            resource_anonymous_discriminator(resource.binding.as_deref(), &resource.id);
         nodes.push(GraphNode {
             id: id.clone(),
-            label: resource_label(resource.binding.as_deref(), &resource.id),
+            label,
             resource_type: resource.id.display_type(),
+            anonymous_discriminator,
             kind: EffectKind::Unchanged,
             attribute_names: Vec::new(),
             note: None,
@@ -456,6 +461,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
                 .as_deref()
                 .map(|path| format!("module {path}"))
                 .unwrap_or_else(|| "module".to_string()),
+            anonymous_discriminator: None,
             kind: EffectKind::Unchanged,
             attribute_names: Vec::new(),
             note: None,
@@ -599,11 +605,13 @@ fn node_from_effect(
     idx: usize,
     effect: &Effect,
     replacement: Option<ReplaceDisplayInfo<'_>>,
-    module: Option<EphemeralId>,
+    module: Option<&ModuleInfo>,
 ) -> GraphNode {
+    let module_label = module.map(|info| info.label.as_str());
+    let anonymous_discriminator = effect_anonymous_discriminator(effect);
     let (label, resource_type, kind, mut attribute_names, note) = match effect {
         Effect::Read { resource } => (
-            resource_label(resource.binding.as_deref(), &resource.id),
+            resource_label(resource.binding.as_deref(), &resource.id, module_label),
             resource.id.display_type(),
             EffectKind::Read,
             Vec::new(),
@@ -612,7 +620,7 @@ fn node_from_effect(
         Effect::Create(resource) => {
             if let Some(replacement) = replacement {
                 (
-                    resource_label(resource.binding.as_deref(), &resource.id),
+                    resource_label(resource.binding.as_deref(), &resource.id, module_label),
                     resource.id.display_type(),
                     EffectKind::Replace,
                     replacement.changed_create_only.to_vec(),
@@ -622,7 +630,7 @@ fn node_from_effect(
                 )
             } else {
                 (
-                    resource_label(resource.binding.as_deref(), &resource.id),
+                    resource_label(resource.binding.as_deref(), &resource.id, module_label),
                     resource.id.display_type(),
                     EffectKind::Create,
                     Vec::new(),
@@ -634,7 +642,7 @@ fn node_from_effect(
             resource,
             started_at: _,
         } => (
-            resource_label(resource.binding.as_deref(), &resource.id),
+            resource_label(resource.binding.as_deref(), &resource.id, module_label),
             resource.id.display_type(),
             EffectKind::ResumeCreate,
             Vec::new(),
@@ -646,7 +654,7 @@ fn node_from_effect(
             to,
             changed_attributes,
         } => (
-            resource_label(to.binding.as_deref(), &to.id),
+            resource_label(to.binding.as_deref(), &to.id, module_label),
             to.id.display_type(),
             EffectKind::Update,
             changed_attributes.clone(),
@@ -662,7 +670,7 @@ fn node_from_effect(
             explicit_dependencies: _,
             blocked_by_updates: _,
         } => (
-            resource_label(binding.as_deref(), id.as_inner()),
+            resource_label(binding.as_deref(), id.as_inner(), module_label),
             id.display_type(),
             EffectKind::Delete,
             Vec::new(),
@@ -730,18 +738,49 @@ fn node_from_effect(
         id: GraphNodeId::Effect(idx),
         label,
         resource_type,
+        anonymous_discriminator,
         kind,
         attribute_names,
         note,
-        module,
+        module: module.map(|info| info.id.clone()),
         affected_by: Vec::new(),
     }
 }
 
-fn resource_label(binding: Option<&str>, id: &ResourceId) -> String {
-    binding
-        .map(str::to_string)
-        .unwrap_or_else(|| id.identity_display().to_string())
+fn effect_anonymous_discriminator(effect: &Effect) -> Option<String> {
+    let (binding, id) = match effect {
+        Effect::Read { resource } => (resource.binding.as_deref(), &resource.id),
+        Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
+            (resource.binding.as_deref(), &resource.id)
+        }
+        Effect::Update { to, .. } => (to.binding.as_deref(), &to.id),
+        Effect::Delete { binding, id, .. } => (binding.as_deref(), id.as_inner()),
+        _ => return None,
+    };
+    resource_anonymous_discriminator(binding, id)
+}
+
+fn resource_anonymous_discriminator(binding: Option<&str>, id: &ResourceId) -> Option<String> {
+    if binding.is_some() {
+        None
+    } else {
+        id.identity().and_then(anonymous_identity_discriminator)
+    }
+}
+
+fn resource_label(binding: Option<&str>, id: &ResourceId, module_label: Option<&str>) -> String {
+    if let Some(binding) = binding {
+        return binding.to_string();
+    }
+
+    let short_type = id
+        .resource_type
+        .rsplit('.')
+        .next()
+        .unwrap_or(&id.resource_type);
+    module_label
+        .map(|module| format!("{module}.{short_type}"))
+        .unwrap_or_else(|| short_type.to_string())
 }
 
 fn deferred_label(binding: &str, id: &ResolvedResourceId) -> String {
@@ -1143,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_resource_label_uses_only_its_system_identity() {
+    fn anonymous_resource_label_uses_short_type_instead_of_system_identity() {
         let resource = Resource::with_provider(
             "awscc",
             "ec2.SecurityGroup",
@@ -1163,8 +1202,35 @@ mod tests {
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
-        assert_eq!(node.label, "awscc_ec2_security_group_166e04b3");
+        assert_eq!(node.label, "SecurityGroup");
         assert_eq!(node.resource_type, "awscc.ec2.SecurityGroup");
+        assert_eq!(node.anonymous_discriminator.as_deref(), Some("166e04b3"));
+    }
+
+    #[test]
+    fn hash_suffixed_named_resource_stays_named() {
+        let mut resource = Resource::with_provider(
+            "awscc",
+            "ec2.SecurityGroup",
+            "named_but_hash_suffixed_166e04b3",
+            None,
+        );
+        resource.binding = Some("production_security_group".to_string());
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(ResolvedResource::new(resource.clone())));
+
+        let desired = resolved([resource]);
+        let unresolved = unresolved(&desired);
+        let model = build_model(input(
+            &plan,
+            &desired,
+            &unresolved,
+            &PlanChangeSummary::new(&plan, &[], &[]),
+        ));
+        let node = model.node(&GraphNodeId::Effect(0)).unwrap();
+
+        assert_eq!(node.label, "production_security_group");
+        assert_eq!(node.anonymous_discriminator, None);
     }
 
     #[test]

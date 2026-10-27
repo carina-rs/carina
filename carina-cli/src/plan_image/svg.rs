@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use super::layout::{
     Layout, MAX_ATTRIBUTE_NAMES, MAX_LABEL_CHARS, MAX_TYPE_CHARS, MONOSPACE_ADVANCE_EM,
-    NODE_HALO_OFFSET, NODE_HALO_STROKE_WIDTH, NodeRect, edge_segment_controls,
+    NODE_HALO_OFFSET, NODE_HALO_STROKE_WIDTH, NodeRect, edge_segment_controls, truncate_middle,
 };
 use super::model::{BlastKind, EffectKind, GraphModel, GraphNode, GraphNodeId};
 use super::{SvgTheme, Theme};
@@ -857,7 +857,7 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect, render_style
         "      <text{} x=\"{text_x:.1}\" y=\"{label_y:.1}\" font-size=\"14\" font-weight=\"700\" fill=\"{}\"{decoration}>{}</text>",
         render_style.class("fill-primary"),
         palette.primary_text,
-        escape(&truncate(&node.label, MAX_LABEL_CHARS))
+        escape(&truncate_middle(&node.label, MAX_LABEL_CHARS))
     )
     .unwrap();
     let type_y = if node.kind == EffectKind::Unchanged {
@@ -874,7 +874,18 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect, render_style
     )
     .unwrap();
 
-    let mut cursor = rect.y + 85.0;
+    let mut cursor = type_y + 18.0;
+    if let Some(discriminator) = &node.anonymous_discriminator {
+        writeln!(
+            out,
+            r#"      <text{} x="{text_x:.1}" y="{cursor:.1}" font-size="10.5" fill="{}">anonymous #{}</text>"#,
+            render_style.class("fill-muted"),
+            palette.muted_text,
+            escape(discriminator)
+        )
+        .unwrap();
+        cursor += 17.0;
+    }
     if let Some(note) = &node.note {
         writeln!(
             out,
@@ -1216,6 +1227,22 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_cards_show_type_and_discriminator_without_attribute_values() {
+        let svg = fixture_svg("plan_image_anonymous");
+
+        assert_eq!(svg.matches(">Widget</text>").count(), 2);
+        assert!(svg.contains("anonymous #3b61ad0d"));
+        assert!(svg.contains("anonymous #980e2d2a"));
+        assert!(!svg.contains("test_test_widget_"));
+        assert!(!svg.contains("anonymous-one"));
+        assert!(!svg.contains("anonymous-two"));
+
+        let module_svg = fixture_svg("module_anonymous_resource");
+        assert!(module_svg.contains(">bootstrap.RolePolicy</text>"));
+        assert!(module_svg.contains("anonymous #968c7070"));
+    }
+
+    #[test]
     fn svg_truncates_long_labels_and_caps_attribute_names() {
         let long_label = "this_label_is_intentionally_far_too_long_for_the_card";
         let mut resource = Resource::new("test.Widget", "long-label-resource");
@@ -1245,6 +1272,10 @@ mod tests {
 
         assert!(!svg.contains(long_label));
         assert!(svg.contains('…'));
+        assert!(
+            svg.contains("for_the_card"),
+            "middle truncation should preserve the distinguishing tail of a named title"
+        );
         assert!(svg.contains("• attribute_05"));
         assert!(!svg.contains("• attribute_06"));
         assert!(svg.contains("+2 more"));
@@ -1462,5 +1493,10 @@ mod tests {
     #[test]
     fn snapshot_reference_layout_svg() {
         insta::assert_snapshot!(fixture_svg("plan_image_reference_layout"));
+    }
+
+    #[test]
+    fn snapshot_anonymous_svg() {
+        insta::assert_snapshot!(fixture_svg("plan_image_anonymous"));
     }
 }

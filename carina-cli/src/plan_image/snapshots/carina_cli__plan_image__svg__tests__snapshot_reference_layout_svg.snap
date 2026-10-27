@@ -17,11 +17,11 @@ expression: "fixture_svg(\"plan_image_reference_layout\")"
     <text x="28" y="90" font-size="10.5" fill="#6e7781">state test-plan-image-reference-layout · serial 12</text>
     <rect x="336.0" y="714.0" width="252.0" height="335.0" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
     <path d="M248.0,208.0 C257.4,208.0 257.4,208.0 266.7,208.0 C300.0,208.0 300.0,167.0 333.3,167.0 C342.6,167.0 342.6,167.0 352.0,167.0" fill="none" stroke="#cf222e" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-delete)"/>
-    <path d="M248.0,414.5 C257.4,414.5 257.4,414.5 266.7,414.5 C300.0,414.5 300.0,273.0 333.3,273.0 C342.6,273.0 342.6,273.0 352.0,273.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
-    <path d="M248.0,414.5 C257.4,414.5 257.4,414.5 266.7,414.5 C300.0,414.5 300.0,414.5 333.3,414.5 C342.6,414.5 342.6,414.5 352.0,414.5" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
+    <path d="M248.0,375.5 C257.4,375.5 257.4,375.5 266.7,375.5 C300.0,375.5 300.0,273.0 333.3,273.0 C342.6,273.0 342.6,273.0 352.0,273.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
+    <path d="M248.0,453.5 C257.4,453.5 257.4,453.5 266.7,453.5 C300.0,453.5 300.0,414.5 333.3,414.5 C342.6,414.5 342.6,414.5 352.0,414.5" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
     <path d="M462.0,846.0 C462.0,846.0 462.0,900.0 462.0,900.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
-    <path d="M462.0,489.0 C462.0,489.0 462.0,760.0 462.0,760.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
-    <path d="M462.0,489.0 C462.0,489.0 462.0,543.0 462.0,543.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <path d="M528.0,489.0 C528.0,489.0 528.0,624.5 528.0,624.5 C495.0,624.5 495.0,624.5 462.0,624.5 C462.0,624.5 462.0,760.0 462.0,760.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <path d="M396.0,489.0 C396.0,489.0 396.0,516.0 396.0,516.0 C429.0,516.0 429.0,516.0 462.0,516.0 C462.0,516.0 462.0,543.0 462.0,543.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
     <rect x="344.0" y="719.0" width="190.2" height="21" rx="4" fill="#f6f8fa"/>
     <text x="350.0" y="734.0" font-size="11" font-weight="600" fill="#57606a">module &quot;app&quot; (./app-module)</text>
     <rect x="23.0" y="154.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#cf222e" stroke-width="8" stroke-opacity="0.24"/>

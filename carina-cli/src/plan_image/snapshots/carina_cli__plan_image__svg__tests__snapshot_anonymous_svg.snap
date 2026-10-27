@@ -1,0 +1,53 @@
+---
+source: carina-cli/src/plan_image/svg.rs
+expression: "fixture_svg(\"plan_image_anonymous\")"
+---
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="444" viewBox="0 0 900 444" role="img" aria-labelledby="title desc">
+  <rect id="background" fill="#ffffff" x="0" y="0" width="900" height="444"/>
+  <title id="title">carina plan</title>
+  <desc id="desc">Apply-order dependency graph with destructive-change blast radii.</desc>
+  <defs>
+    <marker id="arrow-default" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8c959f"/></marker>
+    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8250df"/></marker>
+    <marker id="arrow-delete" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#cf222e"/></marker>
+  </defs>
+  <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
+    <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
+    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#1a7f37" font-weight="600">3 to create</tspan></text>
+    <path d="M248.0,265.1 C257.4,265.1 257.4,265.1 266.7,265.1 C300.0,265.1 300.0,175.5 333.3,175.5 C342.6,175.5 342.6,175.5 352.0,175.5" fill="none" stroke="#8c959f" stroke-width="1.6" stroke-opacity="0.68" marker-end="url(#arrow-default)"/>
+    <path d="M248.0,311.9 C257.4,311.9 257.4,311.9 266.7,311.9 C300.0,311.9 300.0,288.5 333.3,288.5 C342.6,288.5 342.6,288.5 352.0,288.5" fill="none" stroke="#8c959f" stroke-width="1.6" stroke-opacity="0.68" marker-end="url(#arrow-default)"/>
+    <g>
+      <rect x="28.0" y="249.5" width="220.0" height="78.0" rx="9" fill="#dafbe1" fill-opacity="1" stroke="#1a7f37"/>
+      <rect x="28.0" y="249.5" width="6" height="78.0" rx="3" fill="#1a7f37"/>
+      <text x="45.0" y="276.5" font-size="13" font-weight="700" fill="#1a7f37">+</text>
+      <rect x="66.0" y="259.5" width="52.0" height="20" rx="10" fill="#1a7f37" fill-opacity="0.10"/>
+      <text x="74.0" y="274.0" font-size="10" font-weight="700" fill="#1a7f37">create</text>
+      <text x="46.0" y="298.5" font-size="14" font-weight="700" fill="#1f2328">anchor</text>
+      <text x="46.0" y="316.5" font-size="11" fill="#6e7781">test.test.Widget</text>
+    </g>
+    <g>
+      <rect x="352.0" y="128.0" width="220.0" height="95.0" rx="9" fill="#dafbe1" fill-opacity="1" stroke="#1a7f37"/>
+      <rect x="352.0" y="128.0" width="6" height="95.0" rx="3" fill="#1a7f37"/>
+      <text x="369.0" y="155.0" font-size="13" font-weight="700" fill="#1a7f37">+</text>
+      <rect x="390.0" y="138.0" width="52.0" height="20" rx="10" fill="#1a7f37" fill-opacity="0.10"/>
+      <text x="398.0" y="152.5" font-size="10" font-weight="700" fill="#1a7f37">create</text>
+      <text x="370.0" y="177.0" font-size="14" font-weight="700" fill="#1f2328">Widget</text>
+      <text x="370.0" y="195.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="370.0" y="213.0" font-size="10.5" fill="#57606a">anonymous #3b61ad0d</text>
+    </g>
+    <g>
+      <rect x="352.0" y="241.0" width="220.0" height="95.0" rx="9" fill="#dafbe1" fill-opacity="1" stroke="#1a7f37"/>
+      <rect x="352.0" y="241.0" width="6" height="95.0" rx="3" fill="#1a7f37"/>
+      <text x="369.0" y="268.0" font-size="13" font-weight="700" fill="#1a7f37">+</text>
+      <rect x="390.0" y="251.0" width="52.0" height="20" rx="10" fill="#1a7f37" fill-opacity="0.10"/>
+      <text x="398.0" y="265.5" font-size="10" font-weight="700" fill="#1a7f37">create</text>
+      <text x="370.0" y="290.0" font-size="14" font-weight="700" fill="#1f2328">Widget</text>
+      <text x="370.0" y="308.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="370.0" y="326.0" font-size="10.5" fill="#57606a">anonymous #980e2d2a</text>
+    </g>
+    <line x1="28" y1="362.0" x2="872" y2="362.0" stroke="#d8dee4"/>
+    <text x="28.0" y="383.0" font-size="11" font-weight="700" fill="#1a7f37">+</text>
+    <text x="40.6" y="383.0" font-size="10" fill="#57606a">create</text>
+    <line x1="28.0" y1="430.0" x2="72.0" y2="430.0" stroke="#8c959f" stroke-width="1.6" marker-end="url(#arrow-default)"/><text x="82.0" y="434.0" font-size="10" fill="#57606a">runs before</text>
+  </g>
+</svg>

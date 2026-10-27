@@ -735,6 +735,15 @@ pub(crate) enum AnonymousHashSuffix {
     SimHash(SimHash),
 }
 
+impl AnonymousHashSuffix {
+    fn discriminator(self) -> String {
+        match self {
+            Self::Standard(hash) => format!("{hash:08x}"),
+            Self::SimHash(hash) => format!("{hash:016x}"),
+        }
+    }
+}
+
 /// Find the unique candidate closest (by Hamming distance) to `target` SimHash
 /// among `candidates`, below `SIMHASH_HAMMING_THRESHOLD`. Returns `None` when
 /// no candidate qualifies, or when two or more candidates tie at the minimum
@@ -843,6 +852,16 @@ pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<Anonymous
             .map(AnonymousHashSuffix::Standard),
         _ => None,
     }
+}
+
+/// Return the canonical discriminator carried by a generated anonymous identity.
+///
+/// This is a value-free display projection of the same 8- or 16-hex suffix
+/// parsed by anonymous-resource reconciliation. Callers must still use typed
+/// resource metadata (such as `Resource::binding`) to decide whether a
+/// resource is anonymous; a matching suffix alone does not establish that.
+pub fn anonymous_identity_discriminator(identity: &ResourceIdentity) -> Option<String> {
+    extract_hash_from_identifier(identity.as_str()).map(AnonymousHashSuffix::discriminator)
 }
 
 /// Build a SimHash over the combined set of provider identity values plus
@@ -954,11 +973,11 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         let hash_values = stable_anonymous_hash_inputs(resource, schema);
         let use_simhash = hash_values.is_empty();
 
-        let hash_str = if use_simhash {
+        let hash_suffix = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce
             // similar hashes, enabling Hamming distance reconciliation.
             let simhash = simhash_from_identity_and_resource(&identity_values, resource);
-            format!("{:016x}", simhash)
+            AnonymousHashSuffix::SimHash(simhash)
         } else {
             // Use standard hash for create-only properties
             let mut hasher = std::hash::DefaultHasher::new();
@@ -970,8 +989,9 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
                 k.hash(&mut hasher);
                 v.hash(&mut hasher);
             }
-            format!("{:08x}", hasher.finish() & 0xFFFFFFFF)
+            AnonymousHashSuffix::Standard((hasher.finish() & 0xFFFFFFFF) as u32)
         };
+        let hash_str = hash_suffix.discriminator();
 
         // Build identifier: provider_resource_type_hash (e.g., awscc_ec2_vpc_a3f2b1c8).
         // The resource_type segments carry PascalCase for the final type name
