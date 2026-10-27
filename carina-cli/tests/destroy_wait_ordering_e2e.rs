@@ -351,14 +351,14 @@ fn destroy_timeout_fails_and_skips_dependency_as_dependent_failed() {
     let output = scenario.destroy_with_timed_out_dependency();
     assert_failure("carina destroy", &output);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("Operation timed out"),
-        "timed-out delete should be reported as a failure; stderr:\n{stderr}"
+        stdout.contains("Operation timed out"),
+        "timed-out delete should be reported as a failure; stdout:\n{stdout}"
     );
     assert!(
-        stderr.contains("skipped (dependent lst failed)"),
-        "the timed-out resource's dependency should be skipped; stderr:\n{stderr}"
+        stdout.contains("skipped (dependent lst failed)"),
+        "the timed-out resource's dependency should be skipped; stdout:\n{stdout}"
     );
     assert!(
         !scenario.delete_log_path.exists(),

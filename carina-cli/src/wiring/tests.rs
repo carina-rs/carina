@@ -14,6 +14,7 @@ use carina_core::provider::{
 use carina_core::resource::{
     Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
+use carina_core::schema::StructField;
 use carina_core::value::canonicalize_resources_with_schemas;
 
 macro_rules! unexpected_resume_create {
@@ -39,6 +40,56 @@ enum ReadBehavior {
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn canonical_unresolved(
+    resources: Vec<Resource>,
+    schemas: &SchemaRegistry,
+) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
+    let unresolved = carina_core::parser::ParsedFile {
+        resources,
+        ..Default::default()
+    };
+    carina_core::schema::resolve_config_block_names_with_schemas(
+        unresolved.clone(),
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        schemas,
+    )
+    .expect("test block-name resolution must succeed")
+}
+
+fn canonical_pair<E: Clone>(
+    evaluated: &carina_core::parser::File<E>,
+    unresolved_resources: Vec<Resource>,
+    schemas: &SchemaRegistry,
+) -> CanonicalResourcePair<E> {
+    let unresolved = carina_core::parser::ParsedFile {
+        resources: unresolved_resources,
+        ..Default::default()
+    };
+    carina_core::schema::resolve_config_block_names_with_schemas(
+        evaluated.clone(),
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        schemas,
+    )
+    .expect("test block-name resolution must succeed")
+}
+
+fn build_override_aware_pair_for_test<S>(
+    unresolved: CanonicalResourcePair<carina_core::parser::ParsedExportParam>,
+    state_file: Option<&S>,
+    inputs: PreApplyInputs<'_>,
+) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
+where
+    S: carina_core::override_aware::NameOverrideSource + ?Sized,
+{
+    OverrideAwareResources::build_pair_with_stability(
+        &unresolved,
+        state_file,
+        inputs,
+        &HashMap::new(),
+        OverrideAwareBuildMode::Apply,
+    )
 }
 
 fn resolved_provider_configs<E>(
@@ -253,11 +304,20 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     let (factories, _) =
         build_factories_from_providers(provider_configs.as_provider_configs(), base_dir)?;
     let ctx = WiringContext::new(factories, provider_configs.as_provider_configs());
+    let unresolved = carina_core::parser::ParsedFile {
+        resources: unresolved_resources.to_vec(),
+        ..Default::default()
+    };
+    let mut canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
+        parsed.clone(),
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        ctx.schemas(),
+    )
+    .expect("test block-name resolution must succeed");
     create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        parsed,
+        &mut canonical_resources,
         provider_configs,
-        unresolved_resources,
         state_file,
         refresh,
         remote_bindings,
@@ -350,8 +410,8 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
         state_called: Arc::clone(&state_called),
     };
     let ctx = WiringContext::new(Vec::new(), &[]);
-    let mut resources = OverrideAwareResources::build(
-        Vec::new(),
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(Vec::new(), ctx.schemas()),
         None::<&StateFile>,
         carina_core::binding_index::PreApplyInputs {
             managed: &[],
@@ -470,8 +530,8 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             Value::Concrete(ConcreteValue::String("saved".into())),
         );
     desired.binding = Some("resource".to_string());
-    let mut resources = OverrideAwareResources::build(
-        vec![desired],
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(vec![desired], &SchemaRegistry::new()),
         None::<&StateFile>,
         PreApplyInputs {
             managed: &[],
@@ -971,11 +1031,11 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().unwrap();
+    let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &[],
         &None,
         false,
         &HashMap::new(),
@@ -1423,12 +1483,16 @@ let shared = read test.shared.Type {}
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().expect("tempdir");
+    let mut canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
 
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &parsed.resources,
         &state_file,
         true,
         &HashMap::new(),
@@ -3790,11 +3854,15 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let provider_configs = resolved_provider_configs(&parsed);
+    let mut canonical_resources = canonical_pair(
+        &parsed,
+        unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &unresolved_parsed.resources,
         &Some(state_file),
         false,
         &HashMap::new(),
@@ -4632,9 +4700,6 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<ProviderConfig> = Vec::new();
 
-    let errors = resolve_names_with_ctx(&ctx, &mut resources);
-    assert!(errors.is_empty(), "resolve_names: got {errors:?}");
-
     let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
@@ -4646,6 +4711,151 @@ fn dependency_chain_wrappers_return_vec_app_error() {
         errors.is_empty(),
         "compute_anonymous_identifiers: got {errors:?}",
     );
+}
+
+#[test]
+fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
+    let schema = ResourceSchema::new("thing").attribute(
+        AttributeSchema::new(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![StructField::new("action", AttributeType::string())],
+            )),
+        )
+        .with_block_name("rule"),
+    );
+    let ctx =
+        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
+    let rule = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::String("allow".into())),
+        )])),
+    )]));
+    let resource = Resource::with_provider("test", "thing", "direct", None)
+        .with_attribute("rule", rule.clone());
+    let template_resource = Resource::with_provider("test", "thing", "deferred", None)
+        .with_attribute("rule", rule.clone());
+    let deferred = carina_core::parser::DeferredForExpression {
+        file: Some("main.crn".to_string()),
+        line: 4,
+        header: "for item in pending.items".to_string(),
+        resource_type: "test.thing".to_string(),
+        attributes: vec![("rule".to_string(), rule)],
+        binding_name: "items".to_string(),
+        iterable: Value::resource_ref("pending", "items", Vec::new()),
+        binding: carina_core::parser::ForBinding::Simple("item".to_string()),
+        template_resource,
+    };
+    let evaluated = carina_core::parser::ParsedFile {
+        resources: vec![resource],
+        deferred_for_expressions: vec![deferred],
+        ..Default::default()
+    };
+    let unresolved = evaluated.clone();
+
+    let canonical_unresolved = resolve_config_block_names_with_ctx(
+        &ctx,
+        evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+    )
+    .expect("paired block aliases must resolve");
+
+    assert!(
+        canonical_unresolved.parsed().resources[0]
+            .attributes
+            .contains_key("rules")
+    );
+    assert!(
+        !canonical_unresolved.parsed().resources[0]
+            .attributes
+            .contains_key("rule")
+    );
+    let evaluated_deferred = &canonical_unresolved.parsed().deferred_for_expressions[0];
+    assert!(
+        evaluated_deferred
+            .template_resource
+            .attributes
+            .contains_key("rules")
+    );
+    assert_eq!(evaluated_deferred.attributes[0].0, "rules");
+
+    let unresolved_resources = canonical_unresolved.unresolved();
+    assert!(unresolved_resources[0].attributes.contains_key("rules"));
+    assert!(!unresolved_resources[0].attributes.contains_key("rule"));
+}
+
+#[test]
+fn paired_block_name_resolution_reports_shared_conflict_once() {
+    let schema = ResourceSchema::new("thing").attribute(
+        AttributeSchema::new(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![StructField::new("action", AttributeType::string())],
+            )),
+        )
+        .with_block_name("rule"),
+    );
+    let ctx =
+        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
+    let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
+    let resource = Resource::with_provider("test", "thing", "direct", None)
+        .with_attribute("rule", rules.clone())
+        .with_attribute("rules", rules);
+    let evaluated = carina_core::parser::ParsedFile {
+        resources: vec![resource],
+        ..Default::default()
+    };
+    let unresolved = evaluated.clone();
+
+    let errors = resolve_config_block_names_with_ctx(
+        &ctx,
+        evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+    )
+    .expect_err("mixed block and attribute syntax must fail");
+
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        "test.thing.direct: cannot use both 'rule' and 'rules' (they refer to the same attribute)"
+    );
+}
+
+#[test]
+fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
+    let schema = ResourceSchema::new("thing")
+        .attribute(AttributeSchema::new("name", AttributeType::string()));
+    let ctx =
+        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
+    let evaluated = carina_core::parser::ParsedFile {
+        resources: vec![
+            Resource::with_provider("test", "thing", "direct", None).with_attribute(
+                "name_prefix",
+                Value::Concrete(ConcreteValue::String("owned-".into())),
+            ),
+        ],
+        ..Default::default()
+    };
+    let unresolved = evaluated.clone();
+
+    let canonical = resolve_config_names_with_ctx(
+        &ctx,
+        evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+    )
+    .expect("paired name resolution must succeed");
+
+    let resource = &canonical.parsed().resources[0];
+    assert_eq!(resource.prefixes.get("name"), Some(&"owned-".to_string()));
+    assert!(!resource.attributes.contains_key("name_prefix"));
+    assert!(matches!(
+        resource.attributes.get("name"),
+        Some(Value::Concrete(ConcreteValue::String(name)))
+            if name.expose_plaintext().starts_with("owned-")
+    ));
 }
 
 struct RegionIdentityFactory;
@@ -4759,12 +4969,15 @@ fn anonymous_route_resource() -> Resource {
 #[test]
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
     let ctx = WiringContext::new(vec![], &[]);
-    let mut resources = OverrideAwareResources::build(
-        vec![
-            Resource::pending_with_provider("aws", "s3.Bucket", None),
-            Resource::pending_with_provider("aws", "s3.Bucket", None),
-            Resource::pending_with_provider("awscc", "ec2.Vpc", Some("secondary".to_string())),
-        ],
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(
+            vec![
+                Resource::pending_with_provider("aws", "s3.Bucket", None),
+                Resource::pending_with_provider("aws", "s3.Bucket", None),
+                Resource::pending_with_provider("awscc", "ec2.Vpc", Some("secondary".to_string())),
+            ],
+            ctx.schemas(),
+        ),
         None::<&StateFile>,
         PreApplyInputs {
             managed: &[],
@@ -5690,7 +5903,7 @@ mod expand_same_config_deferred_for_tests {
     #[test]
     fn saved_plan_expansion_suppresses_duplicate_warning_output_but_keeps_candidate_state() {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
-        let parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
         let wiring = WiringContext::new(Vec::new(), &[]);
@@ -5700,7 +5913,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed.resources,
             &schemas,
         );
-        let prepared = DeferredForExpansionPrelude::new(&parsed, &state_file, &schemas)
+        let prepared = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
             .expect("build expansion prelude")
             .reconcile_addresses(
                 ReconcileDeferredForExpansionInputs {
@@ -5720,7 +5933,7 @@ mod expand_same_config_deferred_for_tests {
 
         let out = prepared
             .expand(
-                &parsed,
+                &mut parsed,
                 &schemas,
                 &HashMap::new(),
                 DeferredForWarningPolicy::Suppress,
@@ -7285,6 +7498,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
 
 mod resolved_value_constraint_gate {
     use super::super::*;
+    use super::{build_override_aware_pair_for_test, canonical_pair, canonical_unresolved};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::PreApplyInputs;
@@ -7577,8 +7791,8 @@ mod resolved_value_constraint_gate {
         let current_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
-        let resources = OverrideAwareResources::build(
-            source,
+        let (resources, _) = build_override_aware_pair_for_test(
+            canonical_unresolved(source, &SchemaRegistry::new()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
                 managed: &[],
@@ -7678,8 +7892,8 @@ mod resolved_value_constraint_gate {
         let current_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
-        let mut resources = OverrideAwareResources::build(
-            vec![producer],
+        let (mut resources, _) = build_override_aware_pair_for_test(
+            canonical_unresolved(vec![producer], ctx.schemas()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
                 managed: &[],
@@ -7814,8 +8028,8 @@ mod resolved_value_constraint_gate {
     async fn resolved_data_source_input_uses_the_same_gate() {
         let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
         let normalizer = RewritingNormalizer::default();
-        let mut resources = OverrideAwareResources::build(
-            Vec::new(),
+        let (mut resources, _) = build_override_aware_pair_for_test(
+            canonical_unresolved(Vec::new(), ctx.schemas()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
                 managed: &[],
@@ -7978,11 +8192,11 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
+        let mut canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &parsed,
+            &mut canonical_resources,
             &provider_configs,
-            &unresolved_resources,
             &None,
             true,
             &remote_bindings,
@@ -8053,11 +8267,11 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
+        let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &parsed,
+            &mut canonical_resources,
             &provider_configs,
-            &[],
             &None,
             true,
             &HashMap::new(),

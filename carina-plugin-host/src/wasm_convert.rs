@@ -8,9 +8,8 @@ use carina_core::provider::{
     AppliedState as CoreAppliedState, CreateRequest as CoreCreateRequest,
     DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
     PartialReadDiagnostic as CorePartialReadDiagnostic, PatchOp as CorePatchOp,
-    PatchOpKind as CorePatchOpKind, PendingCreate as CorePendingCreate,
-    ProviderError as CoreProviderError, ReadOutcome as CoreReadOutcome,
-    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    PendingCreate as CorePendingCreate, ProviderError as CoreProviderError,
+    ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
     UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
     UpdateRequest as CoreUpdateRequest,
 };
@@ -1803,32 +1802,40 @@ pub(crate) fn core_to_wit_update_patch(
 
 /// Convert a host-side [`CorePatchOp`] to a [`wit::PatchOp`].
 pub(crate) fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, SerializationError> {
-    let value = match &op.value {
-        Some(v) => Some(core_to_wit_value(v)?),
-        None => None,
-    };
-    Ok(wit::PatchOp {
-        kind: match op.kind {
-            CorePatchOpKind::Add => wit::PatchOpKind::Add,
-            CorePatchOpKind::Replace => wit::PatchOpKind::Replace,
-            CorePatchOpKind::Remove => wit::PatchOpKind::Remove,
-        },
-        key: op.key.clone(),
-        value,
+    Ok(match op {
+        CorePatchOp::Add { key, value } => wit::PatchOp::Add(wit::PatchValue {
+            key: key.clone(),
+            value: core_to_wit_value(value)?,
+        }),
+        CorePatchOp::Replace { key, value } => wit::PatchOp::Replace(wit::PatchValue {
+            key: key.clone(),
+            value: core_to_wit_value(value)?,
+        }),
+        CorePatchOp::Reassert { key, value } => wit::PatchOp::Reassert(wit::PatchValue {
+            key: key.clone(),
+            value: core_to_wit_value(value)?,
+        }),
+        CorePatchOp::Remove { key } => wit::PatchOp::Remove(key.clone()),
     })
 }
 
 /// Convert a [`wit::PatchOp`] to a host-side [`CorePatchOp`].
 #[cfg(test)]
 pub(crate) fn wit_to_core_patch_op(op: &wit::PatchOp) -> Result<CorePatchOp, WasmValueDecodeError> {
-    Ok(CorePatchOp {
-        kind: match op.kind {
-            wit::PatchOpKind::Add => CorePatchOpKind::Add,
-            wit::PatchOpKind::Replace => CorePatchOpKind::Replace,
-            wit::PatchOpKind::Remove => CorePatchOpKind::Remove,
+    Ok(match op {
+        wit::PatchOp::Add(value) => CorePatchOp::Add {
+            key: value.key.clone(),
+            value: wit_to_core_value(&value.value)?,
         },
-        key: op.key.clone(),
-        value: op.value.as_ref().map(wit_to_core_value).transpose()?,
+        wit::PatchOp::Replace(value) => CorePatchOp::Replace {
+            key: value.key.clone(),
+            value: wit_to_core_value(&value.value)?,
+        },
+        wit::PatchOp::Reassert(value) => CorePatchOp::Reassert {
+            key: value.key.clone(),
+            value: wit_to_core_value(&value.value)?,
+        },
+        wit::PatchOp::Remove(key) => CorePatchOp::Remove { key: key.clone() },
     })
 }
 
@@ -4080,7 +4087,11 @@ mod tests {
         let (persisted_secret, digest) = redacted_secret_and_digest("patch-secret");
         let resource = CoreResource::new("test", "patch-round-trip")
             .with_attribute("a", CV::Concrete(ConcreteValue::String("alpha".into())))
-            .with_attribute("b", CV::Concrete(ConcreteValue::Int(42)));
+            .with_attribute("b", CV::Concrete(ConcreteValue::Int(42)))
+            .with_attribute(
+                "token",
+                CV::Concrete(ConcreteValue::String("unchanged".into())),
+            );
         let from = CoreState::existing(
             resource.id.clone(),
             HashMap::from([
@@ -4090,11 +4101,25 @@ mod tests {
                     CV::Concrete(ConcreteValue::String("removed".into())),
                 ),
                 ("persisted_token".to_string(), persisted_secret),
+                (
+                    "token".to_string(),
+                    CV::Concrete(ConcreteValue::String("unchanged".into())),
+                ),
             ]),
         );
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let mut schemas = carina_core::schema::SchemaRegistry::new();
+        schemas.insert(
+            "",
+            carina_core::schema::ResourceSchema::new("test").attribute(
+                carina_core::schema::AttributeSchema::new(
+                    "token",
+                    carina_core::schema::AttributeType::string(),
+                )
+                .write_only(),
+            ),
+        );
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
             &module_gate,
@@ -4123,14 +4148,24 @@ mod tests {
             .map(wit_to_core_patch_op)
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(back.len(), 3);
-        assert_eq!(back[0].kind, CorePatchOpKind::Add);
-        assert_eq!(back[0].key, "a");
-        assert_eq!(back[1].kind, CorePatchOpKind::Replace);
-        assert_eq!(back[1].key, "b");
-        assert_eq!(back[2].kind, CorePatchOpKind::Remove);
-        assert_eq!(back[2].key, "c");
-        assert!(back[2].value.is_none(), "Remove must carry None");
+        assert_eq!(back.len(), 4);
+        assert!(matches!(&back[0], CorePatchOp::Add { key, .. } if key == "a"));
+        assert_eq!(
+            back[0].sent_value(),
+            Some(&CV::Concrete(ConcreteValue::String("alpha".into())))
+        );
+        assert!(matches!(&back[1], CorePatchOp::Replace { key, .. } if key == "b"));
+        assert_eq!(
+            back[1].sent_value(),
+            Some(&CV::Concrete(ConcreteValue::Int(42)))
+        );
+        assert!(matches!(&back[2], CorePatchOp::Remove { key } if key == "c"));
+        assert_eq!(back[2].sent_value(), None);
+        assert!(matches!(&back[3], CorePatchOp::Reassert { key, .. } if key == "token"));
+        assert_eq!(
+            back[3].sent_value(),
+            Some(&CV::Concrete(ConcreteValue::String("unchanged".into())))
+        );
     }
 
     #[test]
@@ -4164,9 +4199,9 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v10_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 10);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 10);
+    fn test_protocol_version_range_is_v11_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 11);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 11);
     }
 
     #[test]

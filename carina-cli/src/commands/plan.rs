@@ -9,6 +9,7 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
 use carina_core::effect::{Effect, EffectGeneration};
+use carina_core::override_aware::CanonicalResourcePair;
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
@@ -31,7 +32,7 @@ use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
-use crate::display::{print_plan, refresh_plan_separator};
+use crate::display::print_plan;
 use crate::error::AppError;
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
@@ -46,7 +47,7 @@ use crate::plan_image::{
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, create_plan_from_parsed_with_upstream_with_ctx,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -1726,17 +1727,18 @@ pub async fn run_plan(
     )?;
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let mut parsed = loaded.parsed;
-    let unresolved_parsed = loaded.unresolved_parsed;
+    let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    crate::commands::validate_and_resolve_with_config(
-        &mut parsed,
+    let mut canonical_resources = crate::commands::validate_and_resolve_config_pair(
+        parsed,
+        loaded.unresolved_parsed,
         base_dir,
         false,
         &inference_errors,
         &duplicate_declarations,
     )?;
+    let parsed = canonical_resources.parsed();
 
     let plan_backend = resolve_backend_for_read(
         base_dir,
@@ -1874,7 +1876,7 @@ pub async fn run_plan(
             },
         provider_inputs,
     } = prepare_plan_identity_and_provider_inputs(
-        &mut parsed,
+        &mut canonical_resources,
         &mut state_file,
         base_dir,
         provider_context,
@@ -1894,9 +1896,8 @@ pub async fn run_plan(
     // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &wiring,
-        &parsed,
+        &mut canonical_resources,
         provider_inputs.configs(),
-        &unresolved_parsed.resources,
         &state_file,
         refresh,
         provider_inputs.remote_bindings(),
@@ -1905,6 +1906,7 @@ pub async fn run_plan(
         base_dir,
     )
     .await?;
+    let parsed = canonical_resources.parsed();
     // TOCTOU drift detection (#3111). `plan` took no state lock, so a
     // concurrent apply/destroy may have written state while the diff
     // above was being computed. Re-read state now and compare against
@@ -2006,7 +2008,7 @@ pub async fn run_plan(
         // is unresolved) instead of a panic backtrace.
         let plan_file = build_plan_file(
             path,
-            &parsed,
+            parsed,
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
@@ -2031,10 +2033,6 @@ pub async fn run_plan(
             crate::commands::iam_preflight::emit_warnings(result);
         }
     } else {
-        // Separate the refresh-progress block (printed above when `refresh`)
-        // from the plan's terminal section so they don't read as a run-on
-        // (#3148).
-        print!("{}", refresh_plan_separator(refresh));
         print_plan(
             &ctx.plan,
             &summary,
@@ -2069,7 +2067,7 @@ pub async fn run_plan(
     let plan_output = if out.is_some() {
         let plan_file = build_plan_file(
             path,
-            &parsed,
+            parsed,
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
@@ -2179,7 +2177,7 @@ pub(crate) struct PreparedPlanIdentityInputs {
 }
 
 pub(crate) async fn prepare_plan_identity_and_provider_inputs(
-    parsed: &mut carina_core::parser::InferredFile,
+    canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     state_file: &mut Option<StateFile>,
     base_dir: &Path,
     provider_context: &ProviderContext,
@@ -2187,9 +2185,11 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
 ) -> Result<PreparedPlanIdentityInputs, AppError> {
     // Factory/schema wiring uses declaration metadata only. Provider values
     // are folded after identities are reconciled against state.
+    let parsed = canonical_resources.parsed();
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let wiring = WiringContext::new(factories, &parsed.providers);
-    reconcile_prefixed_names(&mut parsed.resources, state_file);
+    reconcile_canonical_prefixed_names(canonical_resources, state_file);
+    let parsed = canonical_resources.parsed();
     let state_blocks = crate::wiring::resolve_state_blocks(
         &parsed.state_blocks,
         state_file,
@@ -2197,9 +2197,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
         wiring.schemas(),
     );
     if let Some(state) = state_file.as_ref() {
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut parsed.resources,
-            &mut parsed.compositions,
+        canonical_resources.reconcile_anonymous_module_instances(
             &|provider, resource_type| {
                 state
                     .resources_by_type(provider, resource_type)
@@ -2211,17 +2209,16 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
         );
     }
     if let Some(state) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
+        reconcile_canonical_anonymous_identifiers_with_ctx(
             &wiring,
-            &mut parsed.resources,
-            &parsed.data_sources,
+            canonical_resources,
             state,
             &state_blocks.claims,
         )?;
     }
 
     let provider_inputs = load_and_resolve_provider_configs(
-        parsed,
+        canonical_resources.parsed(),
         base_dir,
         provider_context,
         upstream_policy,

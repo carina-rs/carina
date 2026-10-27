@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use carina_core::parser::{BackendConfig, SavedProviderConfigs};
+use carina_core::override_aware::CanonicalResourcePair;
+use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
 use carina_core::resource::{Composition, Current, DataSource, Resource, ResourceId, State, Value};
@@ -213,19 +214,29 @@ pub(super) struct ExpansionPriorStates {
 /// [`DeferredForExpansion`] witness, so a pending saved plan cannot be
 /// verified accidentally against the parser's pre-expansion resource view.
 pub(super) struct SavedPlanSecretCandidates {
-    parsed: carina_core::parser::InferredFile,
+    source: SavedPlanSecretCandidateSource,
     provider_inputs: ResolvedProviderInputs,
+}
+
+enum SavedPlanSecretCandidateSource {
+    Canonical(CanonicalResourcePair<InferredExportParam>),
+    #[cfg(test)]
+    Parsed(carina_core::parser::InferredFile),
 }
 
 impl SavedPlanSecretCandidates {
     pub(super) fn from_expansion(
-        parsed: carina_core::parser::InferredFile,
+        canonical_resources: &CanonicalResourcePair<InferredExportParam>,
         provider_inputs: ResolvedProviderInputs,
         expansion: DeferredForExpansion,
     ) -> Self {
-        let parsed = expansion.into_expanded_file(parsed);
+        debug_assert_eq!(
+            expansion.sorted_resources.len(),
+            canonical_resources.parsed().resources.len(),
+            "the expansion witness and canonical candidate view must describe the same resources"
+        );
         Self {
-            parsed,
+            source: SavedPlanSecretCandidateSource::Canonical(canonical_resources.clone()),
             provider_inputs,
         }
     }
@@ -236,23 +247,17 @@ impl SavedPlanSecretCandidates {
         provider_inputs: ResolvedProviderInputs,
     ) -> Self {
         Self {
-            parsed,
+            source: SavedPlanSecretCandidateSource::Parsed(parsed),
             provider_inputs,
         }
     }
 
-    pub(super) fn normalization_inputs(
-        &mut self,
-    ) -> (&mut [Resource], &mut [DataSource], &ResolvedProviderInputs) {
-        (
-            &mut self.parsed.resources,
-            &mut self.parsed.data_sources,
-            &self.provider_inputs,
-        )
-    }
-
     pub(super) fn parsed(&self) -> &carina_core::parser::InferredFile {
-        &self.parsed
+        match &self.source {
+            SavedPlanSecretCandidateSource::Canonical(resources) => resources.parsed(),
+            #[cfg(test)]
+            SavedPlanSecretCandidateSource::Parsed(parsed) => parsed,
+        }
     }
 
     pub(super) fn provider_inputs(&self) -> &ResolvedProviderInputs {

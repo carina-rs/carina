@@ -320,10 +320,11 @@ pub fn run_validate(
     }
 
     // Check for unused let bindings (warnings, not errors)
-    let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
-        &loaded.unresolved_parsed,
-        ctx.schemas(),
-    );
+    let unused_warnings =
+        carina_core::validation::check_unused_bindings_with_identity_requirements_in_snapshot(
+            &loaded.unresolved_parsed,
+            ctx.schemas(),
+        );
 
     // Check for duplicate attribute keys
     let source_files: Vec<(PathBuf, String)> = {

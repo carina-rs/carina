@@ -54,7 +54,13 @@ const sections = [
       },
     ],
   },
-  // TODO Step 7+: Providers
+  {
+    label: 'Providers',
+    items: [
+      { label: 'carina-rs/aws',   href: 'https://registry.carina-rs.dev/providers/carina-rs/aws',   external: true },
+      { label: 'carina-rs/awscc', href: 'https://registry.carina-rs.dev/providers/carina-rs/awscc', external: true },
+    ],
+  },
 ];
 
 const currentPath = Astro.url.pathname;
@@ -69,10 +75,10 @@ const currentPath = Astro.url.pathname;
             <li>
               <a
                 href={item.href}
-                class:list={['sidebar-link', { active: currentPath === item.href }]}
+                class:list={['sidebar-link', { active: currentPath === item.href, external: item.external }]}
                 aria-current={currentPath === item.href ? 'page' : undefined}
               >
-                {item.label}
+                {item.label}{item.external && ' →'}
               </a>
             </li>
           ))}

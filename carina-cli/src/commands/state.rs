@@ -47,6 +47,7 @@ use crate::commands::plan::{
 };
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
+use crate::commands::shared::progress::ProgressBackend;
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
@@ -1181,8 +1182,11 @@ async fn run_state_refresh_locked_with_ctx(
     )
     .await?;
 
-    let expansion_prelude =
-        crate::wiring::DeferredForExpansionPrelude::new(parsed, &state_file, ctx.schemas())?;
+    let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
+        parsed,
+        &state_file,
+        ctx.schemas(),
+    )?;
     let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
@@ -1310,7 +1314,7 @@ async fn run_state_refresh_locked_with_ctx(
             already_refreshed,
         })
         .seal();
-    let multi = indicatif::MultiProgress::new();
+    let progress = ProgressBackend::new();
     let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
         new_child_ids: _,
@@ -1319,14 +1323,14 @@ async fn run_state_refresh_locked_with_ctx(
         deferred_create_targets: _,
         printed_warnings: _,
     } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
-        parsed,
+        config: crate::wiring::ExpandRefreshConfig::Parsed(parsed),
         provider: &provider,
         expansion: &mut prepared_expansion,
         warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
         remote_bindings: &HashMap::new(),
         state_file: &state_file,
         saved_dep_bindings: &saved_dep_bindings,
-        multi: &multi,
+        progress: &progress,
         schemas: ctx.schemas(),
     })
     .await?;
@@ -3261,7 +3265,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_expansion_hydrates_lifted_saved_enum_attrs() {
-        let parsed = parse(
+        let mut parsed = parse(
             r#"
                 let source = aws.service.Source {
                     name = "source"
@@ -3370,9 +3374,12 @@ mod tests {
         .expect("production orphan refresh should succeed");
         let orphans = orphans.into_plan_orphans();
         let state_file = Some(state_file);
-        let expansion_prelude =
-            crate::wiring::DeferredForExpansionPrelude::new(&parsed, &state_file, &schemas)
-                .expect("expansion prelude");
+        let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
+            &parsed,
+            &state_file,
+            &schemas,
+        )
+        .expect("expansion prelude");
         let mut prepared_expansion = expansion_prelude
             .preserve_addresses(crate::wiring::PreserveDeferredForExpansionInputs {
                 managed_current: current_states,
@@ -3381,18 +3388,17 @@ mod tests {
                 already_refreshed,
             })
             .seal();
-        let multi =
-            indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let progress = ProgressBackend::plain(std::io::sink());
         let expanded = crate::wiring::expand_refresh_and_lift_states(
             crate::wiring::ExpandRefreshAndLiftInputs {
-                parsed: &parsed,
+                config: crate::wiring::ExpandRefreshConfig::Parsed(&mut parsed),
                 provider: &provider,
                 expansion: &mut prepared_expansion,
                 warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,
                 remote_bindings: &HashMap::new(),
                 state_file: &state_file,
                 saved_dep_bindings: &HashMap::new(),
-                multi: &multi,
+                progress: &progress,
                 schemas: &schemas,
             },
         )

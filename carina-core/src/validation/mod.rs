@@ -3212,6 +3212,11 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
         }
+        // Post-resolution files replace ResourceRef values with their resolved
+        // values. The resolver snapshots those authored references here, so
+        // the generic File<E> walk remains accurate for both parser-phase and
+        // inferred-phase inputs.
+        referenced.extend(rref.dependency_bindings().iter().cloned());
         // `Composition` has no directives — `directives()` is `None`
         // for that arm, so the depends_on walk is simply skipped.
         for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
@@ -3271,6 +3276,15 @@ pub fn check_unused_bindings_with_identity_requirements<E: crate::parser::Export
         .into_iter()
         .filter(|binding| !identity_required.contains(binding))
         .collect()
+}
+
+/// Identity-aware unused-binding check for the config loader's opaque
+/// pre-resolution snapshot.
+pub fn check_unused_bindings_with_identity_requirements_in_snapshot(
+    snapshot: &crate::config_loader::UnresolvedConfigSnapshot,
+    registry: &crate::schema::SchemaRegistry,
+) -> Vec<String> {
+    check_unused_bindings_with_identity_requirements(snapshot.parsed(), registry)
 }
 
 /// Walk `field_path` against `start`. Return `Ok(tail_type)` on a

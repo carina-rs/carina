@@ -17,10 +17,29 @@ const carinaDark = JSON.parse(
   ),
 );
 
+function wrapTables() {
+  return function visit(node) {
+    if (!node.children) return;
+
+    node.children = node.children.map((child) => {
+      visit(child);
+      if (child.tagName !== 'table') return child;
+
+      return {
+        type: 'element',
+        tagName: 'div',
+        properties: { className: ['table-scroll'] },
+        children: [child],
+      };
+    });
+  };
+}
+
 export default defineConfig({
   site: 'https://carina-rs.dev',
   integrations: [mdx()],
   markdown: {
+    rehypePlugins: [wrapTables],
     shikiConfig: {
       theme: carinaDark,
       langs: [crnGrammar],

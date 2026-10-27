@@ -1936,8 +1936,8 @@ impl<E> File<E> {
     /// Returns `true` iff at least one warning line was printed. Callers that
     /// interleave this with indicatif progress output use the return value to
     /// know the terminal's last line is now a newline-terminated `⚠` line
-    /// (not an open spinner bar) — see
-    /// `carina-cli`'s `finish_refresh_bar_region`.
+    /// (not an open spinner bar) — see `carina-cli`'s
+    /// `ProgressBackend::note_external_line`.
     pub fn print_warnings(&self) -> bool {
         self.print_warnings_from(0)
     }

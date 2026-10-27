@@ -38,13 +38,16 @@ const { title, description, headings = [] } = Astro.props;
     padding: var(--space-8) var(--space-6);
   }
 
-  .doc-main { min-width: 0; }
+  .doc-main {
+    min-width: 0;
+    overflow-wrap: break-word;
+  }
 
   .doc-header { margin-bottom: var(--space-8); }
 
   .doc-header h1 {
     font-family: var(--font-display);
-    font-size: 3rem;
+    font-size: clamp(2rem, 8vw, 3rem);
     font-weight: 700;
     letter-spacing: -0.01em;
     color: var(--page-title-color);
@@ -122,9 +125,13 @@ const { title, description, headings = [] } = Astro.props;
     color: var(--code-block-text);
   }
 
+  .doc-body :global(.table-scroll) {
+    margin: var(--space-4) 0;
+  }
+
   .doc-body :global(table) {
     border-collapse: collapse;
-    margin: var(--space-4) 0;
+    margin: 0;
     width: 100%;
     font-size: var(--text-sm);
   }

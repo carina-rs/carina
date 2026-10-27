@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::get_resource_dependencies;
@@ -50,9 +50,7 @@ use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
 };
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
-use crate::commands::shared::progress::{
-    RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
-};
+use crate::commands::shared::progress::{ProgressBackend, RefreshProgress, format_duration};
 use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
     DestroyStateWrite, DestroyedInstance, apply_destroy_to_state, apply_name_overrides,
@@ -356,7 +354,7 @@ async fn run_destroy_locked_with_ctx_owned(
 
     if refresh {
         RefreshProgress::start_header();
-        let multi = refresh_multi_progress();
+        let progress_backend = ProgressBackend::new();
 
         // Read states for managed resources concurrently using identifier
         // from state. carina#3181: `all_resources` is sourced from
@@ -387,7 +385,7 @@ async fn run_destroy_locked_with_ctx_owned(
                 let Some(resource) = resource_iter.next() else {
                     break;
                 };
-                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                let progress = RefreshProgress::begin(&progress_backend, &resource.id);
                 let loaded = persisted_state
                     .map(|sf| sf.build_state_for_resource(&resource.id))
                     .unwrap_or_else(|| Current::absent(resource.id.clone()));
@@ -487,7 +485,7 @@ async fn run_destroy_locked_with_ctx_owned(
                     let Some((id, orphan)) = orphan_iter.next() else {
                         break;
                     };
-                    let progress = RefreshProgress::begin_multi(&multi, &id);
+                    let progress = RefreshProgress::begin(&progress_backend, &id);
                     orphan_in_flight.push(async move {
                         let refreshed = refresh_loaded_orphan_with_retry(
                             provider_ref,
@@ -567,6 +565,7 @@ async fn run_destroy_locked_with_ctx_owned(
                 return Err(AppError::Interrupted);
             }
         }
+        progress_backend.finish_refresh_phase();
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls.
         // carina#3181: `all_resources` is managed-only.
@@ -819,14 +818,7 @@ async fn run_destroy_locked_with_ctx_owned(
     println!("{}", "Destroying resources...".red().bold());
     println!();
 
-    // Set up multi-progress for concurrent spinners
-    let multi = MultiProgress::new();
-    if !std::io::stdout().is_terminal() {
-        multi.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-    }
-
-    // Map from resource index to its spinner (populated lazily on dispatch)
-    let mut spinners: HashMap<usize, ProgressBar> = HashMap::new();
+    let progress = ProgressBackend::new();
 
     let mut success_count = 0;
     let mut failure_count = 0;
@@ -944,24 +936,14 @@ async fn run_destroy_locked_with_ctx_owned(
                         failed_dep,
                         counter
                     );
-                    if let Some(pb) = spinners.remove(&idx) {
-                        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                        pb.finish_with_message(msg);
-                    } else {
-                        eprintln!("  {}", msg);
-                    }
+                    progress.finish(idx, msg);
                     skip_count += 1;
                     failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
 
-                // Create a spinner for the in-flight deletion
-                let pb = multi.add(ProgressBar::new_spinner());
-                pb.set_style(spinner_style());
-                pb.set_message(format_effect(effect));
-                pb.enable_steady_tick(Duration::from_millis(80));
-                spinners.insert(idx, pb);
+                progress.start(idx, format_effect(effect));
 
                 // Spawn the deletion as a concurrent future
                 let Effect::Delete {
@@ -1007,6 +989,16 @@ async fn run_destroy_locked_with_ctx_owned(
                     .copied()
                     .collect();
                 for idx in remaining {
+                    let (_, effect) = &resource_info[idx];
+                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let counter = format!("{}/{}", c, destroy_total).dimmed();
+                    let msg = format!(
+                        "{} {} - skipped (destroy cancelled) {}",
+                        "⊘".yellow(),
+                        format_effect(effect),
+                        counter
+                    );
+                    progress.finish(idx, msg);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
                     skip_count += 1;
@@ -1036,12 +1028,7 @@ async fn run_destroy_locked_with_ctx_owned(
                         format_effect(effect),
                         counter
                     );
-                    if let Some(pb) = spinners.remove(&idx) {
-                        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                        pb.finish_with_message(msg);
-                    } else {
-                        eprintln!("  {}", msg);
-                    }
+                    progress.finish(idx, msg);
                     failed_indices.insert(idx);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
@@ -1049,8 +1036,18 @@ async fn run_destroy_locked_with_ctx_owned(
                 }
                 break;
             }
-            // Non-retry cycle: skip remaining
+            // Non-retry cycle: fail every remaining outcome.
             for &idx in &remaining {
+                let (_, effect) = &resource_info[idx];
+                let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let counter = format!("{}/{}", c, destroy_total).dimmed();
+                let msg = format!(
+                    "{} {} - dependency cycle (no progress possible) {}",
+                    "✗".red(),
+                    format_effect(effect),
+                    counter
+                );
+                progress.finish(idx, msg);
                 dispatched.insert(idx);
                 completed_indices.insert(idx);
                 failure_count += 1;
@@ -1095,23 +1092,6 @@ async fn run_destroy_locked_with_ctx_owned(
         let counter = format!("{}/{}", c, destroy_total).dimmed();
         let effect = &resource_info[finished_idx].1;
 
-        // Helper to finish the spinner for the completed effect.
-        // Always prints via eprintln when stdout is not a terminal,
-        // because indicatif suppresses spinner output in non-terminal contexts.
-        let is_terminal = std::io::stdout().is_terminal();
-        let finish_spinner =
-            |spinners: &mut HashMap<usize, ProgressBar>, idx: usize, msg: String| {
-                if let Some(pb) = spinners.remove(&idx) {
-                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg.clone());
-                    if !is_terminal {
-                        eprintln!("  {}", msg);
-                    }
-                } else {
-                    eprintln!("  {}", msg);
-                }
-            };
-
         match delete_result {
             Ok(()) => {
                 let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
@@ -1122,7 +1102,7 @@ async fn run_destroy_locked_with_ctx_owned(
                     timing,
                     counter
                 );
-                finish_spinner(&mut spinners, finished_idx, msg);
+                progress.finish(finished_idx, msg);
                 success_count += 1;
                 observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
                 let destroyed = DestroyedInstance {
@@ -1154,7 +1134,7 @@ async fn run_destroy_locked_with_ctx_owned(
                         retry_num,
                         max_retries
                     );
-                    finish_spinner(&mut spinners, finished_idx, msg);
+                    progress.finish(finished_idx, msg);
                 } else {
                     let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                     let msg = format!(
@@ -1166,12 +1146,38 @@ async fn run_destroy_locked_with_ctx_owned(
                         "→".red(),
                         e.to_string().red()
                     );
-                    finish_spinner(&mut spinners, finished_idx, msg);
+                    progress.finish(finished_idx, msg);
                     failure_count += 1;
                     failed_indices.insert(finished_idx);
                 }
             }
         }
+    }
+
+    // Cleanup-priority abandonment can exit before the normal cancellation
+    // drain gets another loop iteration. Finish both active spinners and
+    // never-dispatched resources before their backend is dropped.
+    if all_indices
+        .iter()
+        .any(|idx| !completed_indices.contains(idx))
+    {
+        cancelled = true;
+        skip_count += finish_interrupted_destroy_outcomes(
+            &progress,
+            &all_indices,
+            &completed_indices,
+            |idx| {
+                let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let counter = format!("{}/{}", c, destroy_total).dimmed();
+                let effect = &resource_info[idx].1;
+                format!(
+                    "{} {} - interrupted {}",
+                    "⊘".yellow(),
+                    format_effect(effect),
+                    counter
+                )
+            },
+        );
     }
     drop(in_flight);
     let state_base = saver.stop(&cancel).await;
@@ -1608,6 +1614,23 @@ fn should_skip_destroy_execution(delete_effect_count: usize) -> bool {
     delete_effect_count == 0
 }
 
+fn finish_interrupted_destroy_outcomes(
+    progress: &ProgressBackend<usize>,
+    all_indices: &[usize],
+    completed_indices: &HashSet<usize>,
+    mut line_for: impl FnMut(usize) -> String,
+) -> usize {
+    let mut emitted = 0;
+    for &idx in all_indices {
+        if completed_indices.contains(&idx) {
+            continue;
+        }
+        progress.finish(idx, line_for(idx));
+        emitted += 1;
+    }
+    emitted
+}
+
 fn state_row_key_from_id(id: &ResolvedResourceId) -> StateRowKey {
     state_row_key_from_parts(&id.provider, &id.resource_type, id.identity_str())
 }
@@ -1874,6 +1897,42 @@ mod tests {
     mod cancellation_fixture;
 
     use cancellation_fixture::DestroyCancellationFixture;
+
+    #[derive(Clone, Default)]
+    struct SharedProgressWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedProgressWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interrupted_destroy_finishes_in_flight_and_undispatched_outcomes() {
+        let output = SharedProgressWriter::default();
+        let progress = ProgressBackend::plain(output.clone());
+        progress.start(0, "Delete in-flight");
+        let completed = HashSet::from([2]);
+
+        let emitted =
+            finish_interrupted_destroy_outcomes(&progress, &[0, 1, 2], &completed, |idx| {
+                format!("⊘ Delete resource-{idx} - interrupted")
+            });
+
+        assert_eq!(emitted, 2);
+        assert_eq!(
+            String::from_utf8(output.0.lock().unwrap().clone()).unwrap(),
+            concat!(
+                "  ⊘ Delete resource-0 - interrupted\n",
+                "  ⊘ Delete resource-1 - interrupted\n",
+            )
+        );
+    }
 
     #[test]
     fn destroyed_instances_owner_publishes_snapshots_and_derives_final_view() {

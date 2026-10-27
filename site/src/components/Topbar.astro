@@ -1,5 +1,5 @@
 ---
-// Top navigation bar: logo + primary nav + GitHub link.
+// Top navigation bar: logo + primary nav + Providers + GitHub links.
 ---
 
 <header class="topbar">
@@ -11,6 +11,7 @@
 
     <nav class="topbar-nav" aria-label="Primary">
       <a href="/reference/dsl/syntax/">Reference</a>
+      <a href="https://registry.carina-rs.dev/providers/index.html" class="external">Providers →</a>
       <a href="https://github.com/carina-rs/carina" class="external">GitHub →</a>
     </nav>
   </div>
@@ -74,5 +75,6 @@
   @media (max-width: 50rem) {
     .topbar-inner { padding: 0 var(--space-4); gap: var(--space-3); }
     .topbar-nav { gap: var(--space-4); }
+    .topbar-nav a { font-size: var(--text-xs); }
   }
 </style>

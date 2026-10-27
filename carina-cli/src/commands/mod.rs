@@ -19,8 +19,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use carina_core::config_loader::DuplicateDeclaration;
+use carina_core::config_loader::{DuplicateDeclaration, UnresolvedConfigSnapshot};
 use carina_core::module_resolver;
+use carina_core::override_aware::CanonicalResourcePair;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
@@ -38,13 +39,15 @@ use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
-    resolve_names_with_ctx, validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
-    validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
-    validate_module_internal_ref_types, validate_no_backend_in_modules,
-    validate_no_empty_interpolations, validate_no_exports_in_modules,
-    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_config_names_with_ctx,
+    resolve_file_names_with_ctx, validate_deferred_populate_refs_with_ctx,
+    validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
+    validate_module_calls_with_imported, validate_module_internal_ref_types,
+    validate_no_backend_in_modules, validate_no_empty_interpolations,
+    validate_no_exports_in_modules, validate_no_provider_in_modules,
+    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
+    validate_provider_region_with_ctx, validate_resources_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -397,6 +400,127 @@ pub(crate) fn validate_and_resolve_errors_with_context(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
+    match validate_and_resolve_errors_with_context_inner(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+        ConfigNameResolution::EvaluatedOnly,
+    ) {
+        Ok(ResolvedConfig::Evaluated(_)) => Vec::new(),
+        Ok(ResolvedConfig::Paired(_)) => unreachable!("evaluated-only validation returned pair"),
+        Err(errors) => errors,
+    }
+}
+
+enum ConfigNameResolution {
+    EvaluatedOnly,
+    Paired(Box<UnresolvedConfigSnapshot>),
+}
+
+enum ResolvedConfig<'a> {
+    Evaluated(&'a mut carina_core::parser::InferredFile),
+    Paired(Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>),
+}
+
+impl ResolvedConfig<'_> {
+    fn parsed(&self) -> &carina_core::parser::InferredFile {
+        match self {
+            Self::Evaluated(parsed) => parsed,
+            Self::Paired(pair) => pair.parsed(),
+        }
+    }
+
+    fn compute_anonymous_identifiers(
+        &mut self,
+        ctx: &WiringContext,
+    ) -> Result<Vec<AppError>, AppError> {
+        let providers = self.parsed().providers.clone();
+        match self {
+            Self::Evaluated(parsed) => {
+                let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+                    &mut parsed.resources,
+                    ctx.schemas(),
+                )?;
+                Ok(compute_anonymous_identifiers_with_ctx(
+                    ctx,
+                    canonical_resources,
+                    &providers,
+                ))
+            }
+            Self::Paired(pair) => {
+                compute_canonical_pair_anonymous_identifiers_with_ctx(ctx, pair, &providers)
+            }
+        }
+    }
+}
+
+/// Validate and canonicalize the evaluated and authored resource snapshots at
+/// the same schema-aware name-resolution boundary.
+pub(crate) fn validate_and_resolve_config_pair(
+    parsed: carina_core::parser::InferredFile,
+    unresolved: UnresolvedConfigSnapshot,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
+    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let ctx = WiringContext::new(factories, &parsed.providers);
+    validate_and_resolve_config_pair_with_context(
+        parsed,
+        unresolved,
+        base_dir,
+        skip_resource_validation,
+        &ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_and_resolve_config_pair_with_context(
+    mut parsed: carina_core::parser::InferredFile,
+    unresolved: UnresolvedConfigSnapshot,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    ctx: &WiringContext,
+    load_errors: HashMap<String, String>,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
+    match validate_and_resolve_errors_with_context_inner(
+        &mut parsed,
+        base_dir,
+        skip_resource_validation,
+        ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+        ConfigNameResolution::Paired(Box::new(unresolved)),
+    )
+    .map_err(collapse_errors)?
+    {
+        ResolvedConfig::Paired(pair) => Ok(*pair),
+        ResolvedConfig::Evaluated(_) => unreachable!("paired validation returned evaluated-only"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_and_resolve_errors_with_context_inner<'a>(
+    parsed: &'a mut carina_core::parser::InferredFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    ctx: &WiringContext,
+    load_errors: HashMap<String, String>,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+    name_resolution: ConfigNameResolution,
+) -> Result<ResolvedConfig<'a>, Vec<AppError>> {
     let module_walk = if skip_resource_validation {
         ModuleWalk::default()
     } else {
@@ -558,7 +682,7 @@ pub(crate) fn validate_and_resolve_errors_with_context(
     // broken module calls into `resolve_modules_with_config` can
     // surface confusing secondary errors, so gate it here.
     if !errors.is_empty() {
-        return errors;
+        return Err(errors);
     }
 
     if let Err(e) = module_resolver::resolve_modules_with_config(
@@ -585,7 +709,7 @@ pub(crate) fn validate_and_resolve_errors_with_context(
             ),
         };
         errors.push(AppError::Config(message));
-        return errors;
+        return Err(errors);
     }
 
     // Module expansion produces composition resources for module-call
@@ -600,20 +724,36 @@ pub(crate) fn validate_and_resolve_errors_with_context(
             "Provider attribute resolution error: {}",
             e
         )));
-        return errors;
+        return Err(errors);
     }
     if let Err(e) = carina_core::parser::finalize_provider_configs(parsed) {
         errors.push(AppError::Config(format!("Finalize error: {}", e)));
-        return errors;
+        return Err(errors);
     }
 
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
-    errors.extend(resolve_names_with_ctx(ctx, &mut parsed.resources));
-    if !errors.is_empty() {
-        return errors;
-    }
+    let mut resolved_config = match name_resolution {
+        ConfigNameResolution::EvaluatedOnly => {
+            let name_errors = resolve_file_names_with_ctx(ctx, parsed);
+            if !name_errors.is_empty() {
+                errors.extend(name_errors);
+                return Err(errors);
+            }
+            ResolvedConfig::Evaluated(parsed)
+        }
+        ConfigNameResolution::Paired(unresolved) => {
+            match resolve_config_names_with_ctx(ctx, std::mem::take(parsed), *unresolved) {
+                Ok(pair) => ResolvedConfig::Paired(Box::new(pair)),
+                Err(name_errors) => {
+                    errors.extend(name_errors);
+                    return Err(errors);
+                }
+            }
+        }
+    };
+    let parsed = resolved_config.parsed();
 
     let (upstream_exports, upstream_resolve_errors) = if skip_resource_validation {
         (Default::default(), Vec::new())
@@ -709,32 +849,26 @@ pub(crate) fn validate_and_resolve_errors_with_context(
             errors.extend(split_validation_message(&msg));
         }
         if !errors.is_empty() {
-            return errors;
+            return Err(errors);
         }
     }
 
-    let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
-        &mut parsed.resources,
-        ctx.schemas(),
-    ) {
-        Ok(resources) => resources,
+    let anonymous_identifier_errors = match resolved_config.compute_anonymous_identifiers(ctx) {
+        Ok(errors) => errors,
         Err(error) => {
-            errors.push(error.into());
-            return errors;
+            errors.push(error);
+            return Err(errors);
         }
     };
 
     // Compute anonymous identifiers — downstream plan code assumes
     // every resource has a stable id, so a collision error must stop
     // the pipeline here.
-    errors.extend(compute_anonymous_identifiers_with_ctx(
-        ctx,
-        canonical_resources,
-        &parsed.providers,
-    ));
+    errors.extend(anonymous_identifier_errors);
     if !errors.is_empty() {
-        return errors;
+        return Err(errors);
     }
+    let parsed = resolved_config.parsed();
 
     // Reject references to `upstream_state` fields that the upstream's
     // `exports { }` block does not declare. Gated like the other
@@ -794,7 +928,11 @@ pub(crate) fn validate_and_resolve_errors_with_context(
         );
     }
 
-    errors
+    if errors.is_empty() {
+        Ok(resolved_config)
+    } else {
+        Err(errors)
+    }
 }
 
 /// Split the newline-joined error strings that `carina_core::validation::*`

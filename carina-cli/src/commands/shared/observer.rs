@@ -1,18 +1,5 @@
-//! CLI observer that prints colored progress output using `indicatif`.
-//!
-//! Two output modes:
-//!
-//! * **TTY mode** (default when stdout or stderr is a terminal): renders
-//!   per-effect spinners through `indicatif::MultiProgress`.
-//! * **Plain mode** (both stdout and stderr non-TTY, e.g. CI logs): emits
-//!   one line per event via `println!` / `eprintln!`. This is necessary
-//!   because `indicatif` suppresses all drawing on non-TTY targets, which
-//!   otherwise leaves CI logs blank between "Applying changes..." and
-//!   "Apply complete!" (#2883).
+//! CLI observer that formats execution events for the shared progress backend.
 
-use std::collections::HashMap;
-use std::io::IsTerminal;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
@@ -21,20 +8,9 @@ use carina_core::provider::PartialReadDiagnostic;
 use carina_core::value::format_value_user_facing;
 use carina_core::wait::WaitObservation;
 use colored::Colorize;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::commands::shared::progress::{format_progress, spinner_style};
+use crate::commands::shared::progress::{ProgressBackend, format_duration, format_progress};
 use crate::display::format_effect;
-
-use super::progress::format_duration;
-
-enum Backend {
-    Tty {
-        multi: MultiProgress,
-        bars: Mutex<HashMap<String, ProgressBar>>,
-    },
-    Plain,
-}
 
 /// Render the shared diagnostic details for a mutation whose follow-up read
 /// only partially succeeded.
@@ -53,45 +29,25 @@ pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [
 
 /// CLI observer that prints colored progress output.
 pub(crate) struct CliObserver {
-    backend: Backend,
+    progress: ProgressBackend<String>,
 }
 
 impl CliObserver {
-    /// Create a new observer. Picks `Tty` mode when stdout or stderr is a
-    /// terminal, otherwise `Plain` mode (one line per event, no spinners).
+    /// Create a new observer using stderr's terminal state.
     pub(crate) fn new(_plan: &Plan) -> Self {
-        let stdout_tty = std::io::stdout().is_terminal();
-        let stderr_tty = std::io::stderr().is_terminal();
-        let backend = if stdout_tty || stderr_tty {
-            let multi = MultiProgress::new();
-            if !stdout_tty {
-                multi.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-            }
-            Backend::Tty {
-                multi,
-                bars: Mutex::new(HashMap::new()),
-            }
-        } else {
-            Backend::Plain
-        };
-        Self { backend }
+        Self {
+            progress: ProgressBackend::new(),
+        }
     }
 }
 
 impl ExecutionObserver for CliObserver {
     fn on_event(&self, event: &ExecutionEvent) {
-        match &self.backend {
-            Backend::Tty { multi, bars } => handle_tty(multi, bars, event),
-            Backend::Plain => handle_plain(event),
-        }
+        handle_event(&self.progress, event);
     }
 }
 
-fn handle_tty(
-    multi: &MultiProgress,
-    bars: &Mutex<HashMap<String, ProgressBar>>,
-    event: &ExecutionEvent,
-) {
+fn handle_event(progress_backend: &ProgressBackend<String>, event: &ExecutionEvent) {
     match event {
         ExecutionEvent::Waiting { .. } => {
             // Dynamic display: don't show waiting resources.
@@ -99,11 +55,7 @@ fn handle_tty(
         }
         ExecutionEvent::EffectStarted { effect } => {
             let key = format_effect(effect);
-            let pb = multi.add(ProgressBar::new_spinner());
-            pb.set_style(spinner_style());
-            pb.set_message(key.clone());
-            pb.enable_steady_tick(Duration::from_millis(80));
-            bars.lock().unwrap().insert(key, pb);
+            progress_backend.start(key.clone(), key);
         }
         ExecutionEvent::EffectSucceeded {
             effect,
@@ -121,13 +73,7 @@ fn handle_tty(
                 timing,
                 counter
             );
-            let mut bars = bars.lock().unwrap();
-            if let Some(pb) = bars.remove(&key) {
-                pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                pb.finish_with_message(msg);
-            } else {
-                eprintln!("  {msg}");
-            }
+            progress_backend.finish(key, msg);
         }
         ExecutionEvent::EffectPartiallySucceeded {
             effect,
@@ -153,13 +99,7 @@ fn handle_tty(
                 "→".yellow(),
                 state_recorded,
             );
-            let mut bars = bars.lock().unwrap();
-            if let Some(pb) = bars.remove(&key) {
-                pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                pb.finish_with_message(msg);
-            } else {
-                eprintln!("  {msg}");
-            }
+            progress_backend.finish(key, msg);
         }
         ExecutionEvent::EffectFailed {
             effect,
@@ -179,14 +119,7 @@ fn handle_tty(
                 "→".red(),
                 error.red()
             );
-            let mut bars = bars.lock().unwrap();
-            if let Some(pb) = bars.remove(&key) {
-                pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                pb.finish_with_message(msg.clone());
-            }
-            // Always print errors to stderr so they're visible even when
-            // indicatif's MultiProgress swallows progress bar output.
-            eprintln!("  {msg}");
+            progress_backend.finish(key, msg);
         }
         ExecutionEvent::EffectSkipped {
             effect,
@@ -203,197 +136,62 @@ fn handle_tty(
                 counter
             );
             // Skipped effects may not have a spinner (they were never started).
-            let mut bars = bars.lock().unwrap();
-            if let Some(pb) = bars.remove(&key) {
-                pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                pb.finish_with_message(msg);
-            } else {
-                eprintln!("  {}", msg);
-            }
+            progress_backend.finish(key, msg);
         }
         ExecutionEvent::WaitPolling {
             observation,
             elapsed,
         } => {
-            multi
-                .println(format_wait_polling_line(observation, *elapsed))
-                .ok();
+            progress_backend.line(format_wait_polling_line(observation, *elapsed));
         }
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
-            multi
-                .println(format!("  {} Update {} (cascade)", "✓".green(), id))
-                .ok();
+            progress_backend.line(format!("{} Update {} (cascade)", "✓".green(), id));
         }
         ExecutionEvent::CascadeUpdateFailed { id, error } => {
-            multi
-                .println(format!("  {} Update {} (cascade)", "✗".red(), id))
-                .ok();
-            multi
-                .println(format!("      {} {}", "→".red(), error.red()))
-                .ok();
+            progress_backend.line(format!("{} Update {} (cascade)", "✗".red(), id));
+            progress_backend.line(format!("    {} {}", "→".red(), error.red()));
         }
         ExecutionEvent::RenameSucceeded { id, from, to } => {
-            multi
-                .println(format!(
-                    "  {} Rename {} \"{}\" → \"{}\"",
-                    "✓".green(),
-                    id,
-                    from,
-                    to
-                ))
-                .ok();
+            progress_backend.line(format!(
+                "{} Rename {} \"{}\" → \"{}\"",
+                "✓".green(),
+                id,
+                from,
+                to
+            ));
         }
         ExecutionEvent::RenameFailed { id, error } => {
-            multi.println(format!("  {} Rename {}", "✗".red(), id)).ok();
-            multi
-                .println(format!("      {} {}", "→".red(), error.red()))
-                .ok();
+            progress_backend.line(format!("{} Rename {}", "✗".red(), id));
+            progress_backend.line(format!("    {} {}", "→".red(), error.red()));
         }
         ExecutionEvent::RefreshStarted => {
-            multi.println("").ok();
-            multi
-                .println(format!(
-                    "{}",
-                    "Refreshing uncertain resource states...".cyan()
-                ))
-                .ok();
+            progress_backend.line("");
+            progress_backend.line(format!(
+                "{}",
+                "Refreshing uncertain resource states...".cyan()
+            ));
         }
         ExecutionEvent::RefreshSucceeded { id } => {
-            multi
-                .println(format!("  {} Refresh {}", "✓".green(), id))
-                .ok();
+            progress_backend.line(format!("{} Refresh {}", "✓".green(), id));
         }
         ExecutionEvent::RefreshFailed { id, error } => {
-            multi
-                .println(format!("  {} Refresh {} - {}", "!".yellow(), id, error))
-                .ok();
+            progress_backend.line(format!("{} Refresh {} - {}", "!".yellow(), id, error));
         }
         ExecutionEvent::ModuleConstraintFailed { error } => {
-            multi
-                .println(format!(
-                    "  {} Module constraint\n      {} {}",
-                    "✗".red(),
-                    "→".red(),
-                    error.red()
-                ))
-                .ok();
+            progress_backend.line(format!(
+                "{} Module constraint\n      {} {}",
+                "✗".red(),
+                "→".red(),
+                error.red()
+            ));
         }
-    }
-}
-
-fn handle_plain(event: &ExecutionEvent) {
-    for line in format_plain(event) {
-        println!("{}", line);
-    }
-}
-
-/// Render an `ExecutionEvent` as zero or more plain-mode lines.
-///
-/// Pulled out so the non-TTY rendering can be unit-tested without driving
-/// stdout. `EffectStarted` / `Waiting` produce no lines in plain mode —
-/// they would otherwise duplicate the matching Succeeded / Failed entry.
-fn format_plain(event: &ExecutionEvent) -> Vec<String> {
-    match event {
-        ExecutionEvent::Waiting { .. } | ExecutionEvent::EffectStarted { .. } => Vec::new(),
-        ExecutionEvent::EffectSucceeded {
-            effect,
-            duration,
-            progress,
-            ..
-        } => {
-            let timing = format!("took {}", format_duration(*duration));
-            let counter = format_progress(progress);
-            vec![format!(
-                "  ✓ {} {} {}",
-                format_effect(effect),
-                timing,
-                counter
-            )]
-        }
-        ExecutionEvent::EffectPartiallySucceeded {
-            effect,
-            diagnostic,
-            duration,
-            progress,
-            ..
-        } => {
-            let timing = format!("took {}", format_duration(*duration));
-            let counter = format_progress(progress);
-            let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
-            vec![
-                format!(
-                    "  ⚠ {} (partial) {} {}",
-                    format_effect(effect),
-                    timing,
-                    counter
-                ),
-                format!("      → {reason}"),
-                format!("      → {missing}"),
-                format!("      → {state_recorded}"),
-            ]
-        }
-        ExecutionEvent::EffectFailed {
-            effect,
-            error,
-            duration,
-            progress,
-        } => {
-            let timing = format!("took {}", format_duration(*duration));
-            let counter = format_progress(progress);
-            vec![
-                format!("  ✗ {} {} {}", format_effect(effect), timing, counter),
-                format!("      → {}", error),
-            ]
-        }
-        ExecutionEvent::EffectSkipped {
-            effect,
-            reason,
-            progress,
-        } => {
-            let counter = format_progress(progress);
-            vec![format!(
-                "  ⊘ {} - {} {}",
-                format_effect(effect),
-                reason,
-                counter
-            )]
-        }
-        ExecutionEvent::WaitPolling {
-            observation,
-            elapsed,
-        } => vec![format_wait_polling_line(observation, *elapsed)],
-        ExecutionEvent::CascadeUpdateSucceeded { id } => {
-            vec![format!("  ✓ Update {} (cascade)", id)]
-        }
-        ExecutionEvent::CascadeUpdateFailed { id, error } => vec![
-            format!("  ✗ Update {} (cascade)", id),
-            format!("      → {}", error),
-        ],
-        ExecutionEvent::RenameSucceeded { id, from, to } => {
-            vec![format!("  ✓ Rename {} \"{}\" → \"{}\"", id, from, to)]
-        }
-        ExecutionEvent::RenameFailed { id, error } => {
-            vec![format!("  ✗ Rename {}", id), format!("      → {}", error)]
-        }
-        ExecutionEvent::RefreshStarted => vec![
-            String::new(),
-            "Refreshing uncertain resource states...".to_string(),
-        ],
-        ExecutionEvent::RefreshSucceeded { id } => vec![format!("  ✓ Refresh {}", id)],
-        ExecutionEvent::RefreshFailed { id, error } => {
-            vec![format!("  ! Refresh {} - {}", id, error)]
-        }
-        ExecutionEvent::ModuleConstraintFailed { error } => vec![
-            "  ✗ Module constraint".to_string(),
-            format!("      → {error}"),
-        ],
     }
 }
 
 fn format_wait_polling_line(observation: &WaitObservation, elapsed: Duration) -> String {
     let observed = format_wait_observed_attr(observation);
     format!(
-        "  ~ {}: waited {}, {}",
+        "~ {}: waited {}, {}",
         observation.binding(),
         format_duration(elapsed),
         observed
@@ -416,6 +214,10 @@ fn format_wait_observed_attr(observation: &WaitObservation) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::executor::ProgressInfo;
@@ -424,6 +226,44 @@ mod tests {
     };
     use carina_core::wait::predicate::{AttrPath, WaitPredicate};
     use indexmap::IndexMap;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn plain_output(event: &ExecutionEvent) -> String {
+        let output = SharedWriter::default();
+        let backend = ProgressBackend::plain(output.clone());
+        handle_event(&backend, event);
+        strip_ansi(&String::from_utf8(output.0.lock().unwrap().clone()).unwrap())
+    }
+
+    fn strip_ansi(input: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.next_if_eq(&'[').is_some() {
+                for code in chars.by_ref() {
+                    if code.is_ascii_alphabetic() || code == '~' {
+                        break;
+                    }
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        output
+    }
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
@@ -566,9 +406,9 @@ mod tests {
     #[test]
     fn plain_skips_started_and_waiting() {
         let effect = dummy_create_effect();
-        assert!(format_plain(&ExecutionEvent::EffectStarted { effect: &effect }).is_empty());
+        assert!(plain_output(&ExecutionEvent::EffectStarted { effect: &effect }).is_empty());
         assert!(
-            format_plain(&ExecutionEvent::Waiting {
+            plain_output(&ExecutionEvent::Waiting {
                 effect: &effect,
                 pending_dependencies: vec!["x".into()],
             })
@@ -579,7 +419,7 @@ mod tests {
     #[test]
     fn plain_emits_one_line_per_succeeded() {
         let effect = dummy_create_effect();
-        let lines = format_plain(&ExecutionEvent::EffectSucceeded {
+        let output = plain_output(&ExecutionEvent::EffectSucceeded {
             effect: &effect,
             state: None,
             duration: Duration::from_millis(123),
@@ -588,8 +428,9 @@ mod tests {
                 total: 3,
             },
         });
+        let lines: Vec<_> = output.lines().collect();
         assert_eq!(lines.len(), 1);
-        let line = &lines[0];
+        let line = lines[0];
         assert!(line.contains("✓"), "missing check mark: {line}");
         assert!(line.contains("Create"), "missing verb: {line}");
         assert!(line.contains("demo"), "missing resource name: {line}");
@@ -610,7 +451,7 @@ mod tests {
         )
         .expect("fixture has missing attributes");
 
-        let lines = format_plain(&ExecutionEvent::EffectPartiallySucceeded {
+        let output = plain_output(&ExecutionEvent::EffectPartiallySucceeded {
             effect: &effect,
             state: &state,
             diagnostic: &diagnostic,
@@ -620,6 +461,7 @@ mod tests {
                 total: 3,
             },
         });
+        let lines: Vec<_> = output.lines().collect();
 
         assert_eq!(
             lines,
@@ -653,7 +495,7 @@ mod tests {
     #[test]
     fn plain_failed_includes_error_on_second_line() {
         let effect = dummy_create_effect();
-        let lines = format_plain(&ExecutionEvent::EffectFailed {
+        let output = plain_output(&ExecutionEvent::EffectFailed {
             effect: &effect,
             error: "boom",
             duration: Duration::from_millis(50),
@@ -662,6 +504,7 @@ mod tests {
                 total: 3,
             },
         });
+        let lines: Vec<_> = output.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("✗"));
         assert!(
@@ -675,7 +518,7 @@ mod tests {
     #[test]
     fn plain_skipped_includes_reason() {
         let effect = dummy_create_effect();
-        let lines = format_plain(&ExecutionEvent::EffectSkipped {
+        let output = plain_output(&ExecutionEvent::EffectSkipped {
             effect: &effect,
             reason: "dependency 'x' failed",
             progress: ProgressInfo {
@@ -683,6 +526,7 @@ mod tests {
                 total: 3,
             },
         });
+        let lines: Vec<_> = output.lines().collect();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("dependency 'x' failed"));
     }
