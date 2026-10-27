@@ -647,25 +647,21 @@ pub(crate) fn resolve_file_names_with_ctx<E>(
 /// in the source snapshot later paired by `OverrideAwareResources`.
 pub(crate) fn resolve_config_block_names_with_ctx<E>(
     ctx: &WiringContext,
-    parsed: &mut carina_core::parser::File<E>,
+    parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> Result<CanonicalResourcePair, Vec<AppError>> {
+) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
     resolve_config_block_names_with_schemas(parsed, unresolved, ctx.schemas())
         .map_err(block_name_errors)
 }
 
 pub(crate) fn resolve_config_names_with_ctx<E>(
     ctx: &WiringContext,
-    parsed: &mut carina_core::parser::File<E>,
+    parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> Result<CanonicalResourcePair, Vec<AppError>> {
-    let canonical_resources = resolve_config_block_names_with_ctx(ctx, parsed, unresolved)?;
-    let errors = resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources);
-    if errors.is_empty() {
-        Ok(canonical_resources)
-    } else {
-        Err(errors)
-    }
+) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
+    resolve_config_block_names_with_ctx(ctx, parsed, unresolved)?
+        .resolve_attr_prefixes(ctx.schemas())
+        .map_err(|error| split_validation_message(&error))
 }
 
 pub fn resolve_attr_prefixes_with_ctx(
@@ -699,6 +695,38 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
             }
         }
         Some(PrefixStateInfo {
+            prefixes: sr.prefixes.clone(),
+            attribute_values,
+        })
+    });
+}
+
+pub fn reconcile_canonical_prefixed_names<E>(
+    resources: &mut CanonicalResourcePair<E>,
+    state_file: &Option<StateFile>,
+) {
+    let Some(state_file) = state_file else {
+        return;
+    };
+
+    resources.reconcile_prefixed_names(&|provider, resource_type, name| {
+        let sr = state_file.find_resource(provider, resource_type, name)?;
+        let persisted = sr.persisted_attributes()?;
+        let mut attribute_values = persisted
+            .plain_string_values()
+            .into_iter()
+            .map(|(name, value)| (name, identifier::PrefixStateValue::Known(value)))
+            .collect::<HashMap<_, _>>();
+        if let Some(marker) = sr.partial_read() {
+            for attribute in &marker.missing_attributes {
+                attribute_values
+                    .entry(attribute.clone())
+                    .or_insert_with(|| identifier::PrefixStateValue::PostCreateReadIncomplete {
+                        detail: marker.detail.clone(),
+                    });
+            }
+        }
+        Some(identifier::PrefixStateInfo {
             prefixes: sr.prefixes.clone(),
             attribute_values,
         })
@@ -889,6 +917,81 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     state_file.rename_resource_identities(&renames)
 }
 
+pub fn reconcile_canonical_anonymous_identifiers_with_ctx<E>(
+    ctx: &WiringContext,
+    resources: &mut CanonicalResourcePair<E>,
+    state_file: &mut StateFile,
+    claims: &StateBlockClaims,
+) -> Result<(), BackendError> {
+    let state_by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>> = state_file
+        .resources()
+        .iter()
+        .filter_map(|sr| {
+            let binding = sr.binding.as_ref()?;
+            let persisted = sr.persisted_attributes()?;
+            Some((
+                binding.clone(),
+                AnonymousIdBindingStateInfo {
+                    name: sr.identity.to_string(),
+                    attribute_values: persisted
+                        .to_values()
+                        .into_iter()
+                        .filter_map(|(attr, value)| {
+                            identifier::canonical_create_only_value_string(&value)
+                                .map(|s| (attr.clone(), s))
+                        })
+                        .collect(),
+                },
+            ))
+        })
+        .fold(HashMap::new(), |mut acc, (binding, info)| {
+            acc.entry(binding).or_default().push(info);
+            acc
+        });
+
+    let renames = resources.reconcile_anonymous_identifiers(
+        ctx.schemas(),
+        &|provider, resource_type| {
+            let create_only_attrs = ctx
+                .schemas()
+                .get(
+                    provider,
+                    resource_type,
+                    carina_core::schema::SchemaKind::Resource,
+                )
+                .map(|s| s.create_only_attributes())
+                .unwrap_or_default();
+
+            let state_entries = state_file
+                .resources_by_type(provider, resource_type)
+                .into_iter()
+                .filter_map(|sr| {
+                    let persisted = sr.persisted_attributes()?;
+                    let create_only_values = create_only_attrs
+                        .iter()
+                        .filter_map(|attr| {
+                            persisted.get(attr).and_then(|value| {
+                                identifier::canonical_create_only_value_string(&value)
+                                    .map(|s| (attr.to_string(), s))
+                            })
+                        })
+                        .collect();
+                    Some(AnonymousIdStateInfo {
+                        name: sr.identity.to_string(),
+                        create_only_values,
+                    })
+                });
+            claims.screen_entries(provider, resource_type, state_entries, |entry| {
+                entry.name.as_str()
+            })
+        },
+        &|binding| state_by_binding.get(binding).cloned().unwrap_or_default(),
+        claims,
+    );
+
+    state_file.rename_resource_identities(&renames)
+}
+
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub resources: &'a mut OverrideAwareResources,
     pub data_sources: &'a [DataSource],
@@ -965,16 +1068,10 @@ pub fn compute_anonymous_identifiers_with_ctx(
     mut resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    let canonical_providers =
-        match carina_core::value::canonicalize_provider_configs_with_attribute_types(
-            providers,
-            &|provider_name, attr_name| {
-                provider_config_attribute_type_for(ctx, provider_name, attr_name)
-            },
-        ) {
-            Ok(providers) => providers,
-            Err(error) => return vec![error.into()],
-        };
+    let canonical_providers = match canonicalized_provider_configs_for_identifiers(ctx, providers) {
+        Ok(providers) => providers,
+        Err(error) => return vec![error],
+    };
 
     match identifier::compute_anonymous_identifiers_with_provider_configs(
         resources.as_mut_slice(),
@@ -985,6 +1082,45 @@ pub fn compute_anonymous_identifiers_with_ctx(
         Ok(()) => Vec::new(),
         Err(msg) => vec![AppError::Config(msg)],
     }
+}
+
+pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_ctx<E>(
+    ctx: &WiringContext,
+    resources: &mut CanonicalResourcePair<E>,
+    providers: &[ProviderConfig],
+) -> Result<Vec<AppError>, AppError> {
+    let canonical_providers = match canonicalized_provider_configs_for_identifiers(ctx, providers) {
+        Ok(providers) => providers,
+        Err(error) => return Ok(vec![error]),
+    };
+
+    match resources.canonicalize_and_compute_anonymous_identifiers(
+        ctx.schemas(),
+        &canonical_providers,
+        &|name| identity_attributes_for_provider(ctx, name),
+    ) {
+        Ok(()) => Ok(Vec::new()),
+        Err(carina_core::override_aware::CanonicalResourceIdentityError::EnumCanonicalization(
+            error,
+        )) => Err(error.into()),
+        Err(carina_core::override_aware::CanonicalResourceIdentityError::Identity(message)) => {
+            Ok(vec![AppError::Config(message)])
+        }
+    }
+}
+
+fn canonicalized_provider_configs_for_identifiers(
+    ctx: &WiringContext,
+    providers: &[ProviderConfig],
+) -> Result<carina_core::value::CanonicalizedProviderConfigs, AppError> {
+    Ok(
+        carina_core::value::canonicalize_provider_configs_with_attribute_types(
+            providers,
+            &|provider_name, attr_name| {
+                provider_config_attribute_type_for(ctx, provider_name, attr_name)
+            },
+        )?,
+    )
 }
 
 /// Encapsulates the plan-time normalization pipeline.
@@ -2194,9 +2330,57 @@ pub fn derive_managed_binding_stability<E>(
 /// (carina#3145). The decision is made here, once, alongside the
 /// moved-target exclusion, and carried in the typed `RefreshableChildIds`
 /// so the plan and apply paths cannot diverge.
+trait DeferredExpansionTarget<E> {
+    fn parsed(&self) -> &carina_core::parser::File<E>;
+
+    fn expand_selected(
+        &mut self,
+        deferred: Vec<carina_core::parser::DeferredForExpression>,
+        suppressed_warning_locations: &[(Option<String>, usize)],
+        bindings: &carina_core::binding_index::IterableBindings<'_>,
+    ) -> Result<(), carina_core::parser::DeferredForExpansionError>;
+}
+
+impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
+    fn parsed(&self) -> &carina_core::parser::File<E> {
+        self.parsed()
+    }
+
+    fn expand_selected(
+        &mut self,
+        deferred: Vec<carina_core::parser::DeferredForExpression>,
+        suppressed_warning_locations: &[(Option<String>, usize)],
+        bindings: &carina_core::binding_index::IterableBindings<'_>,
+    ) -> Result<(), carina_core::parser::DeferredForExpansionError> {
+        self.expand_deferred_for_expressions(deferred, suppressed_warning_locations, bindings)
+    }
+}
+
+impl<E> DeferredExpansionTarget<E> for carina_core::parser::File<E> {
+    fn parsed(&self) -> &carina_core::parser::File<E> {
+        self
+    }
+
+    fn expand_selected(
+        &mut self,
+        deferred: Vec<carina_core::parser::DeferredForExpression>,
+        suppressed_warning_locations: &[(Option<String>, usize)],
+        bindings: &carina_core::binding_index::IterableBindings<'_>,
+    ) -> Result<(), carina_core::parser::DeferredForExpansionError> {
+        self.warnings.retain(|warning| {
+            warning.kind != WarningKind::DeferredFor
+                || !suppressed_warning_locations
+                    .iter()
+                    .any(|location| location == &(warning.file.clone(), warning.line))
+        });
+        self.deferred_for_expressions = deferred;
+        self.expand_deferred_for_expressions(bindings)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn expand_same_config_deferred_for<E: Clone>(
-    parsed: &carina_core::parser::File<E>,
+fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E>>(
+    target: &mut T,
     sorted_resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
     data_source_states: &HashMap<ResourceId, State>,
@@ -2208,6 +2392,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     moved_targets: &HashSet<ResourceId>,
     already_refreshed: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
+    let parsed = target.parsed();
     // Common case: no deferred-for at all. Skip the binding projection
     // and the whole-`File` clone entirely (this runs on every plan /
     // validate). Parse warnings still print — with no deferred-for,
@@ -2282,24 +2467,20 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         })
         .collect();
 
-    // `expand_deferred_for_expressions` is a `&mut self` method that
-    // appends generated resources and drops resolved entries. `parsed`
-    // is borrowed immutably here, so expand on a local clone and read
-    // the augmented resource set / residual deferred list back out.
-    let mut expanded: carina_core::parser::File<E> = (*parsed).clone();
-    for target in &deferred_create_targets {
-        expanded.warnings.retain(|w| {
-            w.kind != WarningKind::DeferredFor
-                || w.line != target.template.line
-                || w.file != target.template.file
-        });
-    }
-    expanded.deferred_for_expressions = pre_expandable_deferred_for;
-    expanded
-        .expand_deferred_for_expressions(&iterable_bindings)
+    let suppressed_warning_locations = deferred_create_targets
+        .iter()
+        .map(|target| (target.template.file.clone(), target.template.line))
+        .collect::<Vec<_>>();
+    target
+        .expand_selected(
+            pre_expandable_deferred_for,
+            &suppressed_warning_locations,
+            &iterable_bindings,
+        )
         .map_err(|error| AppError::Validation(error.to_string()))?;
-    let printed_warnings = expanded.print_warnings();
-    let residual_deferred_for = expanded.deferred_for_expressions.clone();
+    let parsed = target.parsed();
+    let printed_warnings = parsed.print_warnings();
+    let residual_deferred_for = parsed.deferred_for_expressions.clone();
 
     let pre_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
 
@@ -2310,9 +2491,9 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     // independent resources (#1071), so already-planned resources keep
     // their relative order (carina#3132 re-sort stability requirement)
     // and the children are slotted in per their refs.
-    let materialized = expanded.resources.len() != sorted_resources.len();
+    let materialized = parsed.resources.len() != sorted_resources.len(); // allow: direct — topology (dependency sort)
     let resorted = if materialized {
-        sort_resources_by_dependencies(&expanded.resources).map_err(AppError::Validation)?
+        sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?
     } else {
         sorted_resources.to_vec()
     };
@@ -2352,6 +2533,65 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         refreshable_child_ids,
         printed_warnings,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn expand_same_config_deferred_for<E: Clone>(
+    parsed: &carina_core::parser::File<E>,
+    sorted_resources: &[Resource],
+    managed_current: &HashMap<ResourceId, Current>,
+    data_source_states: &HashMap<ResourceId, State>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[WaitAliasSpec],
+    moved_targets: &HashSet<ResourceId>,
+    already_refreshed: &HashSet<ResourceId>,
+) -> Result<DeferredForExpansion, AppError> {
+    let mut expanded = parsed.clone();
+    expand_same_config_deferred_for_target(
+        &mut expanded,
+        sorted_resources,
+        managed_current,
+        data_source_states,
+        schemas,
+        saved_attrs,
+        prev_explicit,
+        remote_bindings,
+        wait_aliases,
+        moved_targets,
+        already_refreshed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_canonical_same_config_deferred_for<E: Clone>(
+    canonical_resources: &mut CanonicalResourcePair<E>,
+    sorted_resources: &[Resource],
+    managed_current: &HashMap<ResourceId, Current>,
+    data_source_states: &HashMap<ResourceId, State>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[WaitAliasSpec],
+    moved_targets: &HashSet<ResourceId>,
+    already_refreshed: &HashSet<ResourceId>,
+) -> Result<DeferredForExpansion, AppError> {
+    expand_same_config_deferred_for_target(
+        canonical_resources,
+        sorted_resources,
+        managed_current,
+        data_source_states,
+        schemas,
+        saved_attrs,
+        prev_explicit,
+        remote_bindings,
+        wait_aliases,
+        moved_targets,
+        already_refreshed,
+    )
 }
 
 /// Result of the deferred-for expansion, materialised-child read,
@@ -2395,8 +2635,13 @@ pub struct ExpandedRefreshState {
 /// Grouped into a struct because the underlying phases need many of
 /// the same inputs (provider, schemas, wait_aliases, …) and a flat
 /// arg list would already trip the 7-argument lint here.
+pub enum ExpandRefreshConfig<'a, E> {
+    Parsed(&'a carina_core::parser::File<E>),
+    Canonical(&'a mut CanonicalResourcePair<E>),
+}
+
 pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormalizer> {
-    pub parsed: &'a carina_core::parser::File<E>,
+    pub config: ExpandRefreshConfig<'a, E>,
     pub provider: &'a P,
     pub sorted_resources: &'a [Resource],
     pub managed_current: &'a mut HashMap<ResourceId, Current>,
@@ -2428,9 +2673,37 @@ pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormal
 ///
 /// See [`ExpandedRefreshState`] for why this is a single function.
 pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
-    inputs: ExpandRefreshAndLiftInputs<'_, E, P>,
+    mut inputs: ExpandRefreshAndLiftInputs<'_, E, P>,
 ) -> Result<ExpandedRefreshState, AppError> {
     // Phase 1: expand for-loops.
+    let expansion = match &mut inputs.config {
+        ExpandRefreshConfig::Parsed(parsed) => expand_same_config_deferred_for(
+            parsed,
+            inputs.sorted_resources,
+            inputs.managed_current,
+            inputs.data_source_states,
+            inputs.schemas,
+            inputs.saved_attrs,
+            inputs.prev_explicit,
+            inputs.remote_bindings,
+            inputs.wait_aliases,
+            inputs.moved_targets,
+            inputs.already_refreshed,
+        ),
+        ExpandRefreshConfig::Canonical(resources) => expand_canonical_same_config_deferred_for(
+            resources,
+            inputs.sorted_resources,
+            inputs.managed_current,
+            inputs.data_source_states,
+            inputs.schemas,
+            inputs.saved_attrs,
+            inputs.prev_explicit,
+            inputs.remote_bindings,
+            inputs.wait_aliases,
+            inputs.moved_targets,
+            inputs.already_refreshed,
+        ),
+    }?;
     let DeferredForExpansion {
         sorted_resources,
         residual_deferred_for,
@@ -2438,19 +2711,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
-    } = expand_same_config_deferred_for(
-        inputs.parsed,
-        inputs.sorted_resources,
-        inputs.managed_current,
-        inputs.data_source_states,
-        inputs.schemas,
-        inputs.saved_attrs,
-        inputs.prev_explicit,
-        inputs.remote_bindings,
-        inputs.wait_aliases,
-        inputs.moved_targets,
-        inputs.already_refreshed,
-    )?;
+    } = expansion;
 
     // Phase 2: read materialised children that weren't already refreshed.
     // Moved targets are excluded by `refreshable_child_ids`; orphan-owned
@@ -2508,9 +2769,8 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E>,
+    canonical_resources: &mut CanonicalResourcePair<E>,
     provider_configs: &ResolvedProviderConfigs,
-    canonical_resources: &CanonicalResourcePair,
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -2518,6 +2778,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
+    let parsed = canonical_resources.parsed();
     let raw_provider_configs = provider_configs.as_provider_configs();
     // Mutable: a same-config deferred-for loop is expanded into concrete
     // resources *after* refresh (carina#3132) and the augmented set is
@@ -2861,8 +3122,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
-    } = expand_same_config_deferred_for(
-        parsed,
+    } = expand_canonical_same_config_deferred_for(
+        canonical_resources,
         &sorted_resources,
         &managed_current,
         &data_source_states,
@@ -2875,6 +3136,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &orphan_refreshed_ids,
     )?;
     sorted_resources = resorted;
+    let parsed = canonical_resources.parsed();
 
     // A printed `⚠` warning is newline-terminated and is written on top of
     // indicatif's open spinner bar line, so it closes the bar region the
@@ -2977,9 +3239,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     );
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
-            canonical_resources
-                .clone()
-                .with_transformed_evaluated(sorted_resources),
+            canonical_resources,
             state_file.as_ref(),
             PreApplyInputs {
                 managed: &[],

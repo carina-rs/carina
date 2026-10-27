@@ -3,52 +3,186 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
+use crate::deps::sort_resources_by_dependencies;
 use crate::effect::deps::UnresolvedResource;
 use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
+use crate::parser::File;
 use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
 
 /// Evaluated and pre-value-resolution resources whose provider-schema block
 /// aliases have been folded into canonical attribute names together.
 ///
-/// The inner vectors are deliberately private. Production construction is
-/// limited to the paired schema block-name resolver, and
-/// [`OverrideAwareResources`] consumes this type instead of either raw
-/// `Vec<Resource>` so neither parser snapshot can bypass that resolver.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CanonicalResourcePair {
-    evaluated: Vec<Resource>,
+/// The owned file and unresolved resource snapshot are deliberately private.
+/// Production construction is limited to the paired schema block-name
+/// resolver, and [`OverrideAwareResources`] consumes this type instead of a
+/// raw `Vec<Resource>` so neither parser snapshot can bypass that resolver.
+///
+/// An arbitrary evaluated resource vector cannot replace the resolver-owned
+/// evaluated configuration:
+///
+/// ```compile_fail
+/// # use carina_core::override_aware::CanonicalResourcePair;
+/// # use carina_core::resource::Resource;
+/// # fn bypass(pair: CanonicalResourcePair<()>, arbitrary: Vec<Resource>) {
+/// let _ = pair.with_transformed_evaluated(arbitrary);
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct CanonicalResourcePair<E> {
+    parsed: File<E>,
     unresolved: Vec<Resource>,
 }
 
-impl CanonicalResourcePair {
-    pub(crate) fn new(evaluated: Vec<Resource>, unresolved: Vec<Resource>) -> Self {
-        Self {
-            evaluated,
-            unresolved,
-        }
+/// Failure while canonicalizing resource values and assigning anonymous
+/// identities inside a [`CanonicalResourcePair`].
+#[derive(Debug, thiserror::Error)]
+pub enum CanonicalResourceIdentityError {
+    #[error(transparent)]
+    EnumCanonicalization(#[from] crate::value::EnumCanonicalizationError),
+    #[error("{0}")]
+    Identity(String),
+}
+
+impl<E> CanonicalResourcePair<E> {
+    pub(crate) fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
+        Self { parsed, unresolved }
     }
 
-    pub fn evaluated(&self) -> &[Resource] {
-        &self.evaluated
+    /// The canonical evaluated configuration. Callers borrow every non-resource
+    /// input from this file so it cannot drift from the resources consumed by
+    /// [`OverrideAwareResources`].
+    pub fn parsed(&self) -> &File<E> {
+        &self.parsed
     }
 
     pub fn unresolved(&self) -> &[Resource] {
         &self.unresolved
     }
 
-    /// Replace the evaluated ordering/view after a transformation that cannot
-    /// introduce authored attribute spellings (dependency sorting, identity
-    /// reconciliation, or deferred-template materialization).
-    ///
-    /// This operation requires the proof returned by the paired resolver, so
-    /// callers cannot construct build inputs from raw parsed resources alone.
-    pub fn with_transformed_evaluated(mut self, evaluated: Vec<Resource>) -> Self {
-        self.evaluated = evaluated;
-        self
+    /// Resolve `<attribute>_prefix` meta-attributes without releasing the
+    /// canonical configuration back into an untyped `File`.
+    pub fn resolve_attr_prefixes(
+        mut self,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<Self, String> {
+        crate::identifier::resolve_attr_prefixes(&mut self.parsed.resources, registry)?;
+        Ok(self)
     }
 
-    fn into_parts(self) -> (Vec<Resource>, Vec<Resource>) {
-        (self.evaluated, self.unresolved)
+    /// Canonicalize evaluated values and assign anonymous identities without
+    /// exposing the mutable resource slice held by the pair.
+    pub fn canonicalize_and_compute_anonymous_identifiers(
+        &mut self,
+        registry: &crate::schema::SchemaRegistry,
+        providers: &crate::value::CanonicalizedProviderConfigs,
+        identity_attributes: &dyn Fn(&str) -> Vec<String>,
+    ) -> Result<(), CanonicalResourceIdentityError> {
+        let mut resources = crate::value::canonicalize_resources_with_schemas(
+            &mut self.parsed.resources,
+            registry,
+        )?;
+        crate::identifier::compute_anonymous_identifiers_with_provider_configs(
+            resources.as_mut_slice(),
+            providers,
+            registry,
+            identity_attributes,
+        )
+        .map_err(CanonicalResourceIdentityError::Identity)
+    }
+
+    /// Reconcile generated prefix values against state while retaining the
+    /// resolver-owned evaluated file.
+    pub fn reconcile_prefixed_names(
+        &mut self,
+        find_state: &dyn Fn(&str, &str, &str) -> Option<crate::identifier::PrefixStateInfo>,
+    ) {
+        crate::identifier::reconcile_prefixed_names(&mut self.parsed.resources, find_state);
+    }
+
+    /// Reconcile anonymous module-instance addresses against state without
+    /// exposing a mutable resource vector.
+    pub fn reconcile_anonymous_module_instances(
+        &mut self,
+        find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
+        claims: &crate::identifier::StateBlockClaims,
+    ) {
+        crate::module_resolver::reconcile_anonymous_module_instances(
+            &mut self.parsed.resources,
+            &mut self.parsed.compositions,
+            find_state_names_by_type,
+            claims,
+        );
+    }
+
+    /// Reconcile anonymous resource identities against state without
+    /// releasing the canonical evaluated resource set.
+    pub fn reconcile_anonymous_identifiers(
+        &mut self,
+        registry: &crate::schema::SchemaRegistry,
+        find_state_by_type: &dyn Fn(
+            &str,
+            &str,
+        ) -> crate::identifier::ScreenedStateEntries<
+            crate::identifier::AnonymousIdStateInfo,
+        >,
+        find_state_by_binding: &dyn Fn(&str) -> Vec<crate::identifier::AnonymousIdBindingStateInfo>,
+        claims: &crate::identifier::StateBlockClaims,
+    ) -> Vec<(String, String)> {
+        crate::identifier::reconcile_anonymous_identifiers(
+            &mut self.parsed.resources,
+            &self.parsed.data_sources,
+            registry,
+            find_state_by_type,
+            find_state_by_binding,
+            claims,
+        )
+    }
+
+    /// Materialize the selected deferred-for templates in the owned evaluated
+    /// file. Generated children inherit canonical attribute names from their
+    /// already-resolved templates.
+    pub fn expand_deferred_for_expressions(
+        &mut self,
+        deferred: Vec<crate::parser::DeferredForExpression>,
+        suppressed_warning_locations: &[(Option<String>, usize)],
+        bindings: &crate::binding_index::IterableBindings<'_>,
+    ) -> Result<(), crate::parser::DeferredForExpansionError> {
+        self.parsed.warnings.retain(|warning| {
+            warning.kind != crate::parser::WarningKind::DeferredFor
+                || !suppressed_warning_locations
+                    .iter()
+                    .any(|location| location == &(warning.file.clone(), warning.line))
+        });
+        self.parsed.deferred_for_expressions = deferred;
+        self.parsed.expand_deferred_for_expressions(bindings)
+    }
+
+    /// Run the provider-bound desired normalization pipeline on the owned
+    /// evaluated resources and data sources.
+    pub async fn prepare_desired_side_for_plan(
+        &mut self,
+        provider_configs: &[crate::parser::ProviderConfig],
+        normalizer: &dyn crate::provider::ProviderNormalizer,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> crate::provider::ProviderResult<()> {
+        crate::value::canonicalize_data_sources_with_schemas(
+            &mut self.parsed.data_sources,
+            schemas,
+        )?;
+        crate::executor::normalized::apply_desired_normalization_slice(
+            &mut self.parsed.resources,
+            provider_configs,
+            normalizer,
+            schemas,
+        )
+        .await
+    }
+
+    fn resources_for_build(&self) -> Result<(Vec<Resource>, Vec<Resource>), String> {
+        Ok((
+            sort_resources_by_dependencies(&self.parsed.resources)?,
+            self.unresolved.clone(),
+        ))
     }
 }
 
@@ -98,9 +232,10 @@ pub enum OverrideAwareBuildMode<'a> {
 /// # use carina_core::resource::{Resource, ResourceId};
 /// # fn bypass(raw: Vec<Resource>, inputs: PreApplyInputs<'_>) {
 /// let _ = OverrideAwareResources::build_pair_with_stability::<
+///     (),
 ///     HashMap<ResourceId, HashMap<String, NameOverride>>,
 /// >(
-///     raw,
+///     &raw,
 ///     None,
 ///     inputs,
 ///     &HashMap::new(),
@@ -135,8 +270,8 @@ pub struct RebuildBindingsInputs<'a> {
 impl OverrideAwareResources {
     /// Build evaluated and authored views from the opaque pair returned by the
     /// schema block-name resolver.
-    pub fn build_pair_with_stability<S>(
-        resources: CanonicalResourcePair,
+    pub fn build_pair_with_stability<E, S>(
+        resources: &CanonicalResourcePair<E>,
         state_file: Option<&S>,
         inputs: PreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
@@ -145,7 +280,7 @@ impl OverrideAwareResources {
     where
         S: NameOverrideSource + ?Sized,
     {
-        let (evaluated, unresolved) = resources.into_parts();
+        let (evaluated, unresolved) = resources.resources_for_build()?;
         let evaluated = Self::build_inner(evaluated, state_file, &inputs, managed_stability, mode)?;
         let unresolved =
             Self::build_inner(unresolved, state_file, &inputs, managed_stability, mode)?;
@@ -557,8 +692,15 @@ mod tests {
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
+        let canonical = CanonicalResourcePair::new(
+            crate::parser::ParsedFile {
+                resources: resources.clone(),
+                ..Default::default()
+            },
+            resources,
+        );
         OverrideAwareResources::build_pair_with_stability(
-            CanonicalResourcePair::new(resources.clone(), resources),
+            &canonical,
             Some(overrides),
             PreApplyInputs {
                 managed: &[],

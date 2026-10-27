@@ -34,14 +34,15 @@ use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
-    resolve_config_names_with_ctx, resolve_file_names_with_ctx,
-    validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
-    validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
-    validate_module_internal_ref_types, validate_no_backend_in_modules,
-    validate_no_empty_interpolations, validate_no_exports_in_modules,
-    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_config_names_with_ctx,
+    resolve_file_names_with_ctx, validate_deferred_populate_refs_with_ctx,
+    validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
+    validate_module_calls_with_imported, validate_module_internal_ref_types,
+    validate_no_backend_in_modules, validate_no_empty_interpolations,
+    validate_no_exports_in_modules, validate_no_provider_in_modules,
+    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
+    validate_provider_region_with_ctx, validate_resources_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -374,66 +375,66 @@ pub(crate) fn validate_and_resolve_errors_with_context(
         load_errors,
         prior_inference_errors,
         duplicate_declarations,
-        EvaluatedConfigOnly,
+        ConfigNameResolution::EvaluatedOnly,
     ) {
-        Ok(()) => Vec::new(),
+        Ok(ResolvedConfig::Evaluated(_)) => Vec::new(),
+        Ok(ResolvedConfig::Paired(_)) => unreachable!("evaluated-only validation returned pair"),
         Err(errors) => errors,
     }
 }
 
-trait ConfigNameResolution {
-    type Output;
-
-    fn resolve<E>(
-        self,
-        ctx: &WiringContext,
-        parsed: &mut carina_core::parser::File<E>,
-    ) -> Result<Self::Output, Vec<AppError>>;
+enum ConfigNameResolution {
+    EvaluatedOnly,
+    Paired(Box<UnresolvedConfigSnapshot>),
 }
 
-struct EvaluatedConfigOnly;
+enum ResolvedConfig<'a> {
+    Evaluated(&'a mut carina_core::parser::InferredFile),
+    Paired(Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>),
+}
 
-impl ConfigNameResolution for EvaluatedConfigOnly {
-    type Output = ();
-
-    fn resolve<E>(
-        self,
-        ctx: &WiringContext,
-        parsed: &mut carina_core::parser::File<E>,
-    ) -> Result<Self::Output, Vec<AppError>> {
-        let errors = resolve_file_names_with_ctx(ctx, parsed);
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
+impl ResolvedConfig<'_> {
+    fn parsed(&self) -> &carina_core::parser::InferredFile {
+        match self {
+            Self::Evaluated(parsed) => parsed,
+            Self::Paired(pair) => pair.parsed(),
         }
     }
-}
 
-struct PairedConfig(UnresolvedConfigSnapshot);
-
-impl ConfigNameResolution for PairedConfig {
-    type Output = CanonicalResourcePair;
-
-    fn resolve<E>(
-        self,
+    fn compute_anonymous_identifiers(
+        &mut self,
         ctx: &WiringContext,
-        parsed: &mut carina_core::parser::File<E>,
-    ) -> Result<Self::Output, Vec<AppError>> {
-        resolve_config_names_with_ctx(ctx, parsed, self.0)
+    ) -> Result<Vec<AppError>, AppError> {
+        let providers = self.parsed().providers.clone();
+        match self {
+            Self::Evaluated(parsed) => {
+                let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+                    &mut parsed.resources,
+                    ctx.schemas(),
+                )?;
+                Ok(compute_anonymous_identifiers_with_ctx(
+                    ctx,
+                    canonical_resources,
+                    &providers,
+                ))
+            }
+            Self::Paired(pair) => {
+                compute_canonical_pair_anonymous_identifiers_with_ctx(ctx, pair, &providers)
+            }
+        }
     }
 }
 
 /// Validate and canonicalize the evaluated and authored resource snapshots at
 /// the same schema-aware name-resolution boundary.
 pub(crate) fn validate_and_resolve_config_pair(
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: carina_core::parser::InferredFile,
     unresolved: UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<CanonicalResourcePair, AppError> {
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories, &parsed.providers);
     validate_and_resolve_config_pair_with_context(
@@ -450,7 +451,7 @@ pub(crate) fn validate_and_resolve_config_pair(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_resolve_config_pair_with_context(
-    parsed: &mut carina_core::parser::InferredFile,
+    mut parsed: carina_core::parser::InferredFile,
     unresolved: UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
@@ -458,31 +459,35 @@ pub(crate) fn validate_and_resolve_config_pair_with_context(
     load_errors: HashMap<String, String>,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<CanonicalResourcePair, AppError> {
-    validate_and_resolve_errors_with_context_inner(
-        parsed,
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
+    match validate_and_resolve_errors_with_context_inner(
+        &mut parsed,
         base_dir,
         skip_resource_validation,
         ctx,
         load_errors,
         prior_inference_errors,
         duplicate_declarations,
-        PairedConfig(unresolved),
+        ConfigNameResolution::Paired(Box::new(unresolved)),
     )
-    .map_err(collapse_errors)
+    .map_err(collapse_errors)?
+    {
+        ResolvedConfig::Paired(pair) => Ok(*pair),
+        ResolvedConfig::Evaluated(_) => unreachable!("paired validation returned evaluated-only"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_and_resolve_errors_with_context_inner<R: ConfigNameResolution>(
-    parsed: &mut carina_core::parser::InferredFile,
+fn validate_and_resolve_errors_with_context_inner<'a>(
+    parsed: &'a mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     ctx: &WiringContext,
     load_errors: HashMap<String, String>,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
-    name_resolution: R,
-) -> Result<R::Output, Vec<AppError>> {
+    name_resolution: ConfigNameResolution,
+) -> Result<ResolvedConfig<'a>, Vec<AppError>> {
     let module_walk = if skip_resource_validation {
         ModuleWalk::default()
     } else {
@@ -696,13 +701,26 @@ fn validate_and_resolve_errors_with_context_inner<R: ConfigNameResolution>(
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
-    let resolved_names = match name_resolution.resolve(ctx, parsed) {
-        Ok(resolved) => resolved,
-        Err(name_errors) => {
-            errors.extend(name_errors);
-            return Err(errors);
+    let mut resolved_config = match name_resolution {
+        ConfigNameResolution::EvaluatedOnly => {
+            let name_errors = resolve_file_names_with_ctx(ctx, parsed);
+            if !name_errors.is_empty() {
+                errors.extend(name_errors);
+                return Err(errors);
+            }
+            ResolvedConfig::Evaluated(parsed)
+        }
+        ConfigNameResolution::Paired(unresolved) => {
+            match resolve_config_names_with_ctx(ctx, std::mem::take(parsed), *unresolved) {
+                Ok(pair) => ResolvedConfig::Paired(Box::new(pair)),
+                Err(name_errors) => {
+                    errors.extend(name_errors);
+                    return Err(errors);
+                }
+            }
         }
     };
+    let parsed = resolved_config.parsed();
 
     let (upstream_exports, upstream_resolve_errors) = if skip_resource_validation {
         (Default::default(), Vec::new())
@@ -802,13 +820,10 @@ fn validate_and_resolve_errors_with_context_inner<R: ConfigNameResolution>(
         }
     }
 
-    let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
-        &mut parsed.resources,
-        ctx.schemas(),
-    ) {
-        Ok(resources) => resources,
+    let anonymous_identifier_errors = match resolved_config.compute_anonymous_identifiers(ctx) {
+        Ok(errors) => errors,
         Err(error) => {
-            errors.push(error.into());
+            errors.push(error);
             return Err(errors);
         }
     };
@@ -816,14 +831,11 @@ fn validate_and_resolve_errors_with_context_inner<R: ConfigNameResolution>(
     // Compute anonymous identifiers — downstream plan code assumes
     // every resource has a stable id, so a collision error must stop
     // the pipeline here.
-    errors.extend(compute_anonymous_identifiers_with_ctx(
-        ctx,
-        canonical_resources,
-        &parsed.providers,
-    ));
+    errors.extend(anonymous_identifier_errors);
     if !errors.is_empty() {
         return Err(errors);
     }
+    let parsed = resolved_config.parsed();
 
     // Reject references to `upstream_state` fields that the upstream's
     // `exports { }` block does not declare. Gated like the other
@@ -884,7 +896,7 @@ fn validate_and_resolve_errors_with_context_inner<R: ConfigNameResolution>(
     }
 
     if errors.is_empty() {
-        Ok(resolved_names)
+        Ok(resolved_config)
     } else {
         Err(errors)
     }

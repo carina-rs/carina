@@ -45,14 +45,30 @@ fn resolved(resource: Resource) -> ResolvedResource {
 fn canonical_unresolved(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
-) -> CanonicalResourcePair {
+) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
     let unresolved = carina_core::parser::ParsedFile {
         resources,
         ..Default::default()
     };
-    let mut evaluated = unresolved.clone();
     carina_core::schema::resolve_config_block_names_with_schemas(
-        &mut evaluated,
+        unresolved.clone(),
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        schemas,
+    )
+    .expect("test block-name resolution must succeed")
+}
+
+fn canonical_pair<E: Clone>(
+    evaluated: &carina_core::parser::File<E>,
+    unresolved_resources: Vec<Resource>,
+    schemas: &SchemaRegistry,
+) -> CanonicalResourcePair<E> {
+    let unresolved = carina_core::parser::ParsedFile {
+        resources: unresolved_resources,
+        ..Default::default()
+    };
+    carina_core::schema::resolve_config_block_names_with_schemas(
+        evaluated.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         schemas,
     )
@@ -60,7 +76,7 @@ fn canonical_unresolved(
 }
 
 fn build_override_aware_pair_for_test<S>(
-    unresolved: CanonicalResourcePair,
+    unresolved: CanonicalResourcePair<carina_core::parser::ParsedExportParam>,
     state_file: Option<&S>,
     inputs: PreApplyInputs<'_>,
 ) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
@@ -68,7 +84,7 @@ where
     S: carina_core::override_aware::NameOverrideSource + ?Sized,
 {
     OverrideAwareResources::build_pair_with_stability(
-        unresolved,
+        &unresolved,
         state_file,
         inputs,
         &HashMap::new(),
@@ -288,11 +304,20 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     let (factories, _) =
         build_factories_from_providers(provider_configs.as_provider_configs(), base_dir)?;
     let ctx = WiringContext::new(factories, provider_configs.as_provider_configs());
+    let unresolved = carina_core::parser::ParsedFile {
+        resources: unresolved_resources.to_vec(),
+        ..Default::default()
+    };
+    let mut canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
+        parsed.clone(),
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        ctx.schemas(),
+    )
+    .expect("test block-name resolution must succeed");
     create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        parsed,
+        &mut canonical_resources,
         provider_configs,
-        &canonical_unresolved(unresolved_resources.to_vec(), ctx.schemas()),
         state_file,
         refresh,
         remote_bindings,
@@ -1006,11 +1031,11 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().unwrap();
+    let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved(Vec::new(), ctx.schemas()),
         &None,
         false,
         &HashMap::new(),
@@ -1458,15 +1483,16 @@ let shared = read test.shared.Type {}
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().expect("tempdir");
+    let mut canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
 
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved(
-            parsed.resources.clone(), // allow: direct — plan-time reconciliation
-            ctx.schemas(),
-        ),
         &state_file,
         true,
         &HashMap::new(),
@@ -3828,14 +3854,15 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let provider_configs = resolved_provider_configs(&parsed);
+    let mut canonical_resources = canonical_pair(
+        &parsed,
+        unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved(
-            unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
-            ctx.schemas(),
-        ),
         &Some(state_file),
         false,
         &HashMap::new(),
@@ -4721,7 +4748,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         binding: carina_core::parser::ForBinding::Simple("item".to_string()),
         template_resource,
     };
-    let mut evaluated = carina_core::parser::ParsedFile {
+    let evaluated = carina_core::parser::ParsedFile {
         resources: vec![resource],
         deferred_for_expressions: vec![deferred],
         ..Default::default()
@@ -4730,14 +4757,22 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
 
     let canonical_unresolved = resolve_config_block_names_with_ctx(
         &ctx,
-        &mut evaluated,
+        evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
     )
     .expect("paired block aliases must resolve");
 
-    assert!(evaluated.resources[0].attributes.contains_key("rules"));
-    assert!(!evaluated.resources[0].attributes.contains_key("rule"));
-    let evaluated_deferred = &evaluated.deferred_for_expressions[0];
+    assert!(
+        canonical_unresolved.parsed().resources[0]
+            .attributes
+            .contains_key("rules")
+    );
+    assert!(
+        !canonical_unresolved.parsed().resources[0]
+            .attributes
+            .contains_key("rule")
+    );
+    let evaluated_deferred = &canonical_unresolved.parsed().deferred_for_expressions[0];
     assert!(
         evaluated_deferred
             .template_resource
@@ -4769,7 +4804,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     let resource = Resource::with_provider("test", "thing", "direct", None)
         .with_attribute("rule", rules.clone())
         .with_attribute("rules", rules);
-    let mut evaluated = carina_core::parser::ParsedFile {
+    let evaluated = carina_core::parser::ParsedFile {
         resources: vec![resource],
         ..Default::default()
     };
@@ -4777,7 +4812,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
 
     let errors = resolve_config_block_names_with_ctx(
         &ctx,
-        &mut evaluated,
+        evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
     )
     .expect_err("mixed block and attribute syntax must fail");
@@ -4787,6 +4822,40 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
         errors[0].to_string(),
         "test.thing.direct: cannot use both 'rule' and 'rules' (they refer to the same attribute)"
     );
+}
+
+#[test]
+fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
+    let schema = ResourceSchema::new("thing")
+        .attribute(AttributeSchema::new("name", AttributeType::string()));
+    let ctx =
+        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
+    let evaluated = carina_core::parser::ParsedFile {
+        resources: vec![
+            Resource::with_provider("test", "thing", "direct", None).with_attribute(
+                "name_prefix",
+                Value::Concrete(ConcreteValue::String("owned-".into())),
+            ),
+        ],
+        ..Default::default()
+    };
+    let unresolved = evaluated.clone();
+
+    let canonical = resolve_config_names_with_ctx(
+        &ctx,
+        evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+    )
+    .expect("paired name resolution must succeed");
+
+    let resource = &canonical.parsed().resources[0];
+    assert_eq!(resource.prefixes.get("name"), Some(&"owned-".to_string()));
+    assert!(!resource.attributes.contains_key("name_prefix"));
+    assert!(matches!(
+        resource.attributes.get("name"),
+        Some(Value::Concrete(ConcreteValue::String(name)))
+            if name.expose_plaintext().starts_with("owned-")
+    ));
 }
 
 struct RegionIdentityFactory;
@@ -7359,7 +7428,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
 
 mod resolved_value_constraint_gate {
     use super::super::*;
-    use super::{build_override_aware_pair_for_test, canonical_unresolved};
+    use super::{build_override_aware_pair_for_test, canonical_pair, canonical_unresolved};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::PreApplyInputs;
@@ -8053,11 +8122,11 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
+        let mut canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &parsed,
+            &mut canonical_resources,
             &provider_configs,
-            &canonical_unresolved(unresolved_resources, ctx.schemas()),
             &None,
             true,
             &remote_bindings,
@@ -8128,11 +8197,11 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
+        let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &parsed,
+            &mut canonical_resources,
             &provider_configs,
-            &canonical_unresolved(Vec::new(), ctx.schemas()),
             &None,
             true,
             &HashMap::new(),

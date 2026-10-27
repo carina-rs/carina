@@ -3169,7 +3169,7 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
     let unresolved_ref = Value::resource_ref("source", "rules", Vec::new());
     let unresolved_resource = Resource::with_provider("test", "thing", "consumer", None)
         .with_attribute("rule", unresolved_ref.clone());
-    let mut evaluated = crate::parser::ParsedFile {
+    let evaluated = crate::parser::ParsedFile {
         resources: vec![evaluated_resource],
         ..Default::default()
     };
@@ -3179,21 +3179,19 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
     };
 
     let canonical_pair = resolve_config_block_names_with_schemas(
-        &mut evaluated,
+        evaluated,
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
     .expect("schema alias must resolve independently of the authored value shape");
 
-    assert!(evaluated.resources[0].attributes.contains_key("rules"));
-    assert!(!evaluated.resources[0].attributes.contains_key("rule"));
     assert!(
-        canonical_pair.evaluated()[0]
+        canonical_pair.parsed().resources[0]
             .attributes
             .contains_key("rules")
     );
     assert!(
-        !canonical_pair.evaluated()[0]
+        !canonical_pair.parsed().resources[0]
             .attributes
             .contains_key("rule")
     );
@@ -3247,7 +3245,7 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
                 unresolved_ref.clone(),
             )]))),
         );
-    let mut evaluated = crate::parser::ParsedFile {
+    let evaluated = crate::parser::ParsedFile {
         resources: vec![evaluated_resource],
         ..Default::default()
     };
@@ -3257,14 +3255,14 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
     };
 
     let canonical_pair = resolve_config_block_names_with_schemas(
-        &mut evaluated,
+        evaluated,
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
     .expect("paired resolution must use the authored ambiguous-key decision");
 
     for resource in [
-        &canonical_pair.evaluated()[0],
+        &canonical_pair.parsed().resources[0],
         &canonical_pair.unresolved()[0],
     ] {
         let lifecycle = match resource.get_attr("lifecycle_configuration") {

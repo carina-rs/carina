@@ -524,16 +524,16 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         resources: resources_for_plan.clone(),
         ..Default::default()
     };
-    let mut canonical_for_plan = unresolved_for_plan.clone();
+    let canonical_for_plan = unresolved_for_plan.clone();
     let canonical_unresolved = carina_core::schema::resolve_config_block_names_with_schemas(
-        &mut canonical_for_plan,
+        canonical_for_plan,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved_for_plan),
         ctx.schemas(),
     )
     .expect("block-name resolution");
     let (mut override_aware_resources, _) =
         carina_core::override_aware::OverrideAwareResources::build_pair_with_stability(
-            canonical_unresolved.with_transformed_evaluated(canonical_for_plan.resources),
+            &canonical_unresolved,
             None::<&carina_state::StateFile>,
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],

@@ -7102,11 +7102,11 @@ fn match_block_field<'a>(
         .find(|field| field.block_name == Some(key) && field.name != key);
 
     match (canonical, alias) {
-        // Parser-produced block syntax is represented as a concrete list. In
-        // the otherwise ambiguous case, it belongs to the aliased field when
-        // the real field cannot itself accept a list. Attribute assignment,
-        // references, calls, unknowns, and a real list field all keep the real
-        // field meaning.
+        // In the otherwise ambiguous case, a concrete list belongs to the
+        // aliased field when the real field cannot itself accept a list. This
+        // covers parser-produced block syntax as well as expressions already
+        // inlined to lists in the authored snapshot. Every other value shape,
+        // and a real list field, keeps the real-field meaning.
         (Some(canonical), Some(alias))
             if matches!(value, Value::Concrete(ConcreteValue::List(_)))
                 && !matches!(
@@ -7591,12 +7591,12 @@ pub fn resolve_file_block_names_with_schemas<E>(
 /// schema-aware operation, returning the only resource pair accepted by the
 /// override-aware input boundary.
 pub fn resolve_config_block_names_with_schemas<E>(
-    parsed: &mut crate::parser::File<E>,
+    mut parsed: crate::parser::File<E>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<CanonicalResourcePair, Vec<BlockNameConflict>> {
+) -> Result<CanonicalResourcePair<E>, Vec<BlockNameConflict>> {
     let mut unresolved = unresolved.into_inner();
-    let mut conflicts = resolve_file_block_names_with_authored(parsed, &unresolved, registry);
+    let mut conflicts = resolve_file_block_names_with_authored(&mut parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();
     for conflict in resolve_file_block_names(&mut unresolved, registry) {
         if seen.insert(conflict.clone()) {
@@ -7604,16 +7604,7 @@ pub fn resolve_config_block_names_with_schemas<E>(
         }
     }
     if conflicts.is_empty() {
-        let evaluated = parsed
-            .iter_top_level_resources()
-            .filter_map(|resource| match resource {
-                crate::parser::ResourceRef::Resource(resource) => Some(resource.clone()),
-                crate::parser::ResourceRef::Composition(_)
-                | crate::parser::ResourceRef::DataSource(_)
-                | crate::parser::ResourceRef::Deferred { .. } => None,
-            })
-            .collect();
-        Ok(CanonicalResourcePair::new(evaluated, unresolved.resources))
+        Ok(CanonicalResourcePair::new(parsed, unresolved.resources))
     } else {
         Err(conflicts)
     }

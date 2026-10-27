@@ -52,9 +52,8 @@ fn canonical_unresolved_for_test(
     ctx: &WiringContext,
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> carina_core::override_aware::CanonicalResourcePair {
-    let mut evaluated = parsed.clone();
-    crate::wiring::resolve_config_block_names_with_ctx(ctx, &mut evaluated, unresolved.clone())
+) -> carina_core::override_aware::CanonicalResourcePair<carina_core::parser::InferredExportParam> {
+    crate::wiring::resolve_config_block_names_with_ctx(ctx, parsed.clone(), unresolved.clone())
         .unwrap_or_else(|errors| {
             panic!(
                 "test block-name resolution failed: {}",
@@ -66,14 +65,13 @@ fn canonical_unresolved_for_test(
 fn canonical_resources_for_test(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
-) -> carina_core::override_aware::CanonicalResourcePair {
+) -> carina_core::override_aware::CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
     let unresolved = carina_core::parser::ParsedFile {
         resources,
         ..Default::default()
     };
-    let mut evaluated = unresolved.clone();
     carina_core::schema::resolve_config_block_names_with_schemas(
-        &mut evaluated,
+        unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         schemas,
     )
@@ -750,6 +748,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &downstream,
         &downstream,
         &ProviderContext::default(),
+        unresolved_parsed,
     )
     .expect("bootstrap reload must succeed");
     let received_role_arn = Arc::new(Mutex::new(None));
@@ -759,16 +758,15 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
                 received_role_arn: Arc::clone(&received_role_arn),
             },
         )],
-        &reloaded.providers,
+        &reloaded.parsed().providers,
     );
     let backend = Arc::new(carina_state::LocalBackend::with_path(
         downstream.join("apply.state.json"),
     ));
 
-    run_apply_locked(
+    run_apply_locked_canonical(
         &ctx,
         &mut reloaded,
-        &unresolved_parsed,
         true,
         backend,
         StateLock::disabled_for_test(),
@@ -814,11 +812,19 @@ inner { x = a }
     )
     .expect("outer module");
     std::fs::write(inner.join("main.crn"), "arguments { x: Int }\n").expect("inner module");
+    let unresolved = load_configuration_with_config(
+        fixture.path(),
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load unresolved bootstrap snapshot")
+    .unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
         fixture.path(),
         fixture.path(),
         &ProviderContext::default(),
+        unresolved,
     )
     .expect_err("apply bootstrap reload must retain the reference-type gate");
     let message = error.to_string();
@@ -883,10 +889,18 @@ let y = m { n = x.s }
 fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
     for nested in [false, true] {
         let fixture = write_module_output_mismatch_fixture(nested);
+        let unresolved = load_configuration_with_config(
+            fixture.path(),
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load unresolved bootstrap snapshot")
+        .unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
             fixture.path(),
             fixture.path(),
             &ProviderContext::default(),
+            unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
         let message = error.to_string();
@@ -1886,11 +1900,11 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &[],
     );
     let provider_configs = resolved_provider_configs(&parsed);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &None,
         true,
         &HashMap::new(),
@@ -2720,7 +2734,7 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
     let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
-        canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
+        &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
         Some(&state),
         PreApplyInputs {
             managed: &[],
@@ -3734,11 +3748,11 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     );
 
     let provider_configs = resolved_provider_configs(&parsed);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &state_file,
         true,
         &HashMap::new(),
@@ -3852,11 +3866,11 @@ let nat = mock.ec2.NatGateway {{
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let step1_state = Some(step1_state);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let clean_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &step1_state,
         true,
         &HashMap::new(),
@@ -3913,11 +3927,11 @@ let nat = mock.ec2.NatGateway {{
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let step2_state = Some(step2_state);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &step2_state,
         true,
         &HashMap::new(),
@@ -4044,11 +4058,11 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &saved,
         true,
         &HashMap::new(),
@@ -4182,11 +4196,11 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (mut parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let before_failure = Some(fixture.read_state().await);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let removal_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &before_failure,
         true,
         &HashMap::new(),
@@ -4260,11 +4274,11 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &saved,
         true,
         &HashMap::new(),
@@ -4332,11 +4346,11 @@ async fn assert_failed_nested_pending_removal_is_replanned(
 
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
+    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &parsed,
+        &mut canonical_resources,
         &provider_configs,
-        &canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed),
         &Some(applied),
         true,
         &HashMap::new(),
