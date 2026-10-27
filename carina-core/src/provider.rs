@@ -741,11 +741,14 @@ pub fn build_update_patch(
     let mut ops = changed_attributes
         .iter()
         .filter_map(|key| {
+            let value = to.attributes.get(key);
+            let in_from = from.attributes.contains_key(key);
+            if value.is_none() && !in_from {
+                return None;
+            }
             if !patched_keys.insert(key.clone()) {
                 return None;
             }
-            let value = to.attributes.get(key);
-            let in_from = from.attributes.contains_key(key);
             match (value, in_from) {
                 (Some(value), false) => Some(PatchOp::Add {
                     key: key.clone(),
@@ -756,10 +759,7 @@ pub fn build_update_patch(
                     value: value.clone(),
                 }),
                 (None, true) => Some(PatchOp::Remove { key: key.clone() }),
-                (None, false) => {
-                    patched_keys.remove(key);
-                    None
-                }
+                (None, false) => None,
             }
         })
         .collect::<Vec<_>>();
@@ -6781,6 +6781,44 @@ mod tests {
                                 assert!(is_changed || satisfies_reassert);
                                 if matches!(op, PatchOp::Reassert { .. }) {
                                     assert!(satisfies_reassert);
+                                }
+                            }
+
+                            for (index, key) in KEYS.iter().enumerate() {
+                                let bit = 1 << index;
+                                let is_desired = desired_mask & bit != 0;
+                                let is_from = from_mask & bit != 0;
+                                let is_changed = changed_mask & bit != 0;
+                                let operation = patch.ops.iter().find(|op| op.key() == *key);
+
+                                if is_changed && (is_desired || is_from) {
+                                    match (is_desired, is_from) {
+                                        (true, false) => assert!(
+                                            matches!(operation, Some(PatchOp::Add { .. })),
+                                            "changed desired-only key {key} must be Add"
+                                        ),
+                                        (true, true) => assert!(
+                                            matches!(operation, Some(PatchOp::Replace { .. })),
+                                            "changed key {key} present on both sides must be Replace"
+                                        ),
+                                        (false, true) => assert!(
+                                            matches!(operation, Some(PatchOp::Remove { .. })),
+                                            "changed current-only key {key} must be Remove"
+                                        ),
+                                        (false, false) => unreachable!(),
+                                    }
+                                }
+
+                                let must_reassert = !patch.ops.is_empty()
+                                    && is_desired
+                                    && write_only_mask & bit != 0
+                                    && create_only_mask & bit == 0
+                                    && !is_changed;
+                                if must_reassert {
+                                    assert!(
+                                        matches!(operation, Some(PatchOp::Reassert { .. })),
+                                        "eligible unchanged write-only key {key} must be Reassert"
+                                    );
                                 }
                             }
                         }

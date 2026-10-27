@@ -11,7 +11,7 @@ use crate::differ::{
 };
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
-    CheckInput, ProviderPreparationContext, ProviderPreparationError, ResolvedCheckInput,
+    CheckInput, ProviderPreparationContext, ResolvedCheckInput, managed_update_schema,
     prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
@@ -1001,13 +1001,10 @@ pub(super) async fn execute_basic_effect<'a>(
             // to update it.
             let mut effective_changed: Vec<String> = changed_attributes.to_vec();
             let resolved_resource = resolved_to.as_resource();
-            let schema = match preparation.schemas().get_for(resolved_resource) {
-                Some(schema) => schema,
-                None => {
-                    let error = ProviderPreparationError::MissingManagedSchema {
-                        resource: resolved_resource.id.clone(),
-                    }
-                    .to_string();
+            let schema = match managed_update_schema(preparation.schemas(), resolved_resource) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    let error = error.to_string();
                     observer.on_event(&ExecutionEvent::EffectFailed {
                         effect,
                         error: &error,

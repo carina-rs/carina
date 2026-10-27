@@ -744,6 +744,18 @@ pub async fn prepare_create_request(
     Ok(CreateRequest::checked(resource))
 }
 
+/// Look up the schema required to construct an update request.
+pub(super) fn managed_update_schema<'a>(
+    schemas: &'a SchemaRegistry,
+    resource: &Resource,
+) -> Result<&'a ResourceSchema, ProviderPreparationError> {
+    schemas
+        .get_for(resource)
+        .ok_or_else(|| ProviderPreparationError::MissingManagedSchema {
+            resource: resource.id.clone(),
+        })
+}
+
 /// Prepare a checked update request through the provider-boundary gate.
 pub async fn prepare_update_request(
     resource: Resource,
@@ -752,12 +764,7 @@ pub async fn prepare_update_request(
     context: &ProviderPreparationContext<'_>,
 ) -> Result<UpdateRequest, ProviderPreparationError> {
     let resource = prepare_provider_ready_resource(resource, context).await?;
-    let schema = context
-        .schemas
-        .get_for(resource.as_resource())
-        .ok_or_else(|| ProviderPreparationError::MissingManagedSchema {
-            resource: resource.id.clone(),
-        })?;
+    let schema = managed_update_schema(context.schemas, resource.as_resource())?;
     Ok(UpdateRequest::checked(
         from,
         changed_attributes,

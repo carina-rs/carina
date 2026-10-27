@@ -781,6 +781,28 @@ pub enum PatchOp {
     Remove { key: String },
 }
 
+impl PatchOp {
+    /// Top-level attribute name. Nested-field patches are a future extension.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Add { key, .. }
+            | Self::Replace { key, .. }
+            | Self::Reassert { key, .. }
+            | Self::Remove { key } => key,
+        }
+    }
+
+    /// Return the value sent by `Add`, `Replace`, or `Reassert`.
+    pub fn sent_value(&self) -> Option<&Value> {
+        match self {
+            Self::Add { value, .. }
+            | Self::Replace { value, .. }
+            | Self::Reassert { value, .. } => Some(value),
+            Self::Remove { .. } => None,
+        }
+    }
+}
+
 /// Structured description of the user's intended change to a resource plus
 /// desired write-only values reasserted alongside that change. Mirrors
 /// `update-patch` in `wit/types.wit`.

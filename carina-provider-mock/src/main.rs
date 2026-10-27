@@ -320,26 +320,15 @@ impl MockProcessProvider {
             .patch
             .ops
             .iter()
-            .find(|op| match op {
-                PatchOp::Add { key, .. }
-                | PatchOp::Replace { key, .. }
-                | PatchOp::Reassert { key, .. }
-                | PatchOp::Remove { key } => key == "update_pending_polls",
-            })
+            .find(|op| op.key() == "update_pending_polls")
             .or_else(|| {
-                request.patch.ops.iter().find(|op| match op {
-                    PatchOp::Add { key, .. }
-                    | PatchOp::Replace { key, .. }
-                    | PatchOp::Reassert { key, .. }
-                    | PatchOp::Remove { key } => key == "pending_polls",
-                })
+                request
+                    .patch
+                    .ops
+                    .iter()
+                    .find(|op| op.key() == "pending_polls")
             })
-            .and_then(|op| match op {
-                PatchOp::Add { value, .. }
-                | PatchOp::Replace { value, .. }
-                | PatchOp::Reassert { value, .. } => Some(value),
-                PatchOp::Remove { .. } => None,
-            })
+            .and_then(PatchOp::sent_value)
             .and_then(|value| match value {
                 Value::Int(value) => u32::try_from(*value).ok(),
                 Value::Bool(_)
@@ -386,13 +375,13 @@ impl MockProcessProvider {
         let mut state = request.state_after_patch();
         let mut applied_op_kinds: Vec<Value> = Vec::with_capacity(request.patch.ops.len());
         for op in &request.patch.ops {
-            let (kind, key) = match op {
-                PatchOp::Add { key, .. } => ("add", key),
-                PatchOp::Replace { key, .. } => ("replace", key),
-                PatchOp::Reassert { key, .. } => ("reassert", key),
-                PatchOp::Remove { key } => ("remove", key),
+            let kind = match op {
+                PatchOp::Add { .. } => "add",
+                PatchOp::Replace { .. } => "replace",
+                PatchOp::Reassert { .. } => "reassert",
+                PatchOp::Remove { .. } => "remove",
             };
-            applied_op_kinds.push(Value::String(format!("{kind}:{key}")));
+            applied_op_kinds.push(Value::String(format!("{kind}:{}", op.key())));
         }
         let patch_sentinel = Value::List(applied_op_kinds);
         state.attributes.insert(
