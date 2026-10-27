@@ -5,13 +5,13 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, FocusedPanel};
+use crate::row::{Indent, Row};
 
 use super::diff::{
     ListOfMapsDiffHeader, render_list_of_maps_diff, render_map_diff_entries,
     render_string_list_diff_entries,
 };
 use super::push_annotation_span;
-use super::row::{Indent, Row};
 use super::style::effect_style;
 use super::value_view::{
     ValueStyle, has_semantic_color, value_spans, value_spans_dimmed, value_spans_styled,
@@ -115,8 +115,8 @@ fn render_detail_row_to_rows(rows: &mut Vec<Row<'_>>, row: &DetailRow, is_select
             rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::PrettyAttribute { key, value } => {
-            // TUI uses a fixed 2-col prefix instead of the CLI's dynamic
-            // tree-indent string, so the layout is approximated.
+            // TUI uses a fixed 2-col indent (`Indent::new(2)`) instead of the
+            // CLI's dynamic tree-indent string, so the layout is approximated.
             let layout = carina_core::value::PrettyLayout::for_attribute(2, key);
             let pretty = value.render(layout);
             let mut spans = vec![Span::raw(format!("{}: ", key))];
@@ -353,7 +353,7 @@ mod tests {
     use ratatui::widgets::Paragraph;
 
     use crate::ui::test_render::{
-        first_content_cell, into_lines, render_with_unstyled_indentation,
+        first_content_cell, into_lines, line_text, render_with_unstyled_indentation,
     };
 
     fn render_detail_row_to_buffer(row: &DetailRow, is_selected: bool) -> Buffer {
@@ -591,12 +591,5 @@ mod tests {
         };
         let buffer = render_detail_row_to_buffer(&attribute, true);
         assert_row_background(&buffer, 0, "  name: 'plain'");
-    }
-
-    fn line_text(line: &Line) -> String {
-        line.spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>()
     }
 }

@@ -1,27 +1,17 @@
-//! Typed detail-pane rows with structurally unstyled indentation.
-
-use std::ops::Add;
+//! Typed TUI rows with structurally unstyled indentation.
 
 use ratatui::prelude::*;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct Indent(usize);
+#[derive(Clone, Copy)]
+pub(crate) struct Indent(usize);
 
 impl Indent {
-    pub(super) const fn new(cols: usize) -> Self {
+    pub(crate) const fn new(cols: usize) -> Self {
         Self(cols)
     }
 }
 
-impl Add for Indent {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0 + rhs.0)
-    }
-}
-
-pub(super) struct Row<'a> {
+pub(crate) struct Row<'a> {
     indent: Indent,
     content: Vec<Span<'a>>,
     highlighted: bool,
@@ -31,7 +21,7 @@ impl<'a> Row<'a> {
     /// Creates a row, moving leading content spaces, whatever their style, into
     /// the unstyled indent. [`Self::into_line`] is the only way to obtain a
     /// ratatui [`Line`] from a `Row`.
-    pub(super) fn new(indent: Indent, content: impl Into<Vec<Span<'a>>>) -> Self {
+    pub(crate) fn new(indent: Indent, content: impl Into<Vec<Span<'a>>>) -> Self {
         let content = content.into();
         let mut normalized = Vec::with_capacity(content.len());
         let mut leading_space_cols = 0;
@@ -58,27 +48,27 @@ impl<'a> Row<'a> {
         }
 
         Self {
-            indent: indent + Indent::new(leading_space_cols),
+            indent: Indent(indent.0 + leading_space_cols),
             content: normalized,
             highlighted: false,
         }
     }
 
-    pub(super) fn blank() -> Self {
+    pub(crate) fn blank() -> Self {
         Self::new(Indent::new(0), Vec::new())
     }
 
-    pub(super) fn indented(mut self, extra: Indent) -> Self {
-        self.indent = self.indent + extra;
+    pub(crate) fn indented(mut self, extra: Indent) -> Self {
+        self.indent.0 += extra.0;
         self
     }
 
-    pub(super) fn highlighted(mut self, on: bool) -> Self {
+    pub(crate) fn highlighted(mut self, on: bool) -> Self {
         self.highlighted = on;
         self
     }
 
-    pub(super) fn into_line(mut self) -> Line<'a> {
+    pub(crate) fn into_line(mut self) -> Line<'a> {
         let mut spans = Vec::new();
         if self.indent.0 > 0 {
             spans.push(Span::raw(" ".repeat(self.indent.0)));

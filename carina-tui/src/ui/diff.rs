@@ -7,8 +7,9 @@ use carina_core::detail_rows::{
 use carina_core::value::{PrettyLayout, RenderedValue};
 use ratatui::prelude::*;
 
+use crate::row::{Indent, Row};
+
 use super::push_annotation_span;
-use super::row::{Indent, Row};
 use super::value_view::{ValueStyle, value_lines_styled, value_spans_styled};
 
 pub(super) enum ListOfMapsDiffHeader {
@@ -275,10 +276,7 @@ fn push_added_removed_block(
         vec![Span::styled(format!("{} {{", marker), style)],
     ));
 
-    // Constant indent — nesting (e.g. `NestedListOfMapsDiff`) is handled by
-    // the outer wrapper that adds to each row's typed indent, shifting first-
-    // line key and continuation indent together. So we don't need to thread a
-    // dynamic prefix through here the way the CLI side does.
+    // Constant indent; nesting is added by the caller via `Row::indented`.
     let field_indent_cols = 6;
     let mut prev_needs_separator = false;
     for (key, value) in &item.fields {
@@ -295,16 +293,16 @@ fn push_added_removed_block(
             ListOfMapsDiffItemKind::Added => ValueStyle::Green,
             ListOfMapsDiffItemKind::Removed => ValueStyle::RedStrikethrough,
         };
-        for (index, mut line) in value_lines_styled(&pretty, value_style)
+        for (index, mut value_spans) in value_lines_styled(&pretty, value_style)
             .into_iter()
             .enumerate()
         {
             if index == 0 {
                 let mut spans = vec![Span::styled(format!("{}: ", key), style)];
-                spans.append(&mut line.spans);
+                spans.append(&mut value_spans);
                 lines.push(Row::new(Indent::new(field_indent_cols), spans));
             } else {
-                lines.push(Row::new(Indent::new(0), line.spans));
+                lines.push(Row::new(Indent::new(0), value_spans));
             }
         }
     }
@@ -330,18 +328,12 @@ mod tests {
     use indexmap::IndexMap;
 
     use crate::ui::test_render::{
-        first_content_cell, into_lines, leading_space_count, render_with_unstyled_indentation,
+        first_content_cell, into_lines, leading_space_count, line_text,
+        render_with_unstyled_indentation,
     };
 
     fn rendered_string(value: &str) -> RenderedValue {
         carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(value.into())))
-    }
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
     }
 
     fn string_value(value: &str) -> Value {
@@ -591,6 +583,84 @@ mod tests {
         assert_eq!(added_cell.symbol(), "+");
         assert_eq!(added_cell.fg, Color::Green);
         assert!(!added_cell.modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn map_string_list_diff_wrapper_keeps_indentation_unstyled() {
+        let entries = [MapDiffEntryIR::StringListChanged {
+            key: RenderedKey::from_raw("values"),
+            unchanged: Vec::new(),
+            added: vec![rendered_string("new")],
+            removed: vec![rendered_string("old")],
+        }];
+        let mut rows = Vec::new();
+
+        render_map_diff_entries(&mut rows, &entries);
+
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
+        let (column, marker) = (0..buffer.area.height)
+            .filter_map(|row| first_content_cell(&buffer, row))
+            .find(|(_, cell)| cell.symbol() == "-")
+            .expect("removed string-list element marker");
+        assert_eq!(column, 8);
+        assert_eq!(marker.fg, Color::Red);
+        assert!(marker.modifier.contains(Modifier::CROSSED_OUT));
+        assert!(
+            (0..buffer.area.height)
+                .filter_map(|row| first_content_cell(&buffer, row))
+                .any(|(_, cell)| cell.symbol() == "+"),
+            "added string-list element marker"
+        );
+    }
+
+    #[test]
+    fn modified_list_string_list_diff_wrapper_keeps_indentation_unstyled() {
+        let old_item = map_value(vec![
+            ("id", string_value("same")),
+            (
+                "values",
+                Value::Concrete(ConcreteValue::StringList(vec!["keep".into(), "old".into()])),
+            ),
+        ]);
+        let new_item = map_value(vec![
+            ("id", string_value("same")),
+            (
+                "values",
+                Value::Concrete(ConcreteValue::StringList(vec!["keep".into(), "new".into()])),
+            ),
+        ]);
+        let detail_rows = update_detail_rows(
+            Value::Concrete(ConcreteValue::List(vec![old_item])),
+            Value::Concrete(ConcreteValue::List(vec![new_item])),
+        );
+        let block = match detail_rows.as_slice() {
+            [DetailRow::ListOfMapsDiff { block, .. }] => block,
+            other => panic!("expected one list-of-maps diff row, got {other:?}"),
+        };
+        let modified = block.modified().first().expect("one modified item");
+        assert!(matches!(
+            modified.fields.as_slice(),
+            [ListOfMapsDiffField::StringListChanged { removed, .. }]
+                if !removed.is_empty()
+        ));
+        let mut rows = Vec::new();
+
+        render_list_of_maps_diff(
+            &mut rows,
+            "value",
+            block,
+            ListOfMapsDiffHeader::Standard,
+            false,
+        );
+
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
+        let (column, marker) = (0..buffer.area.height)
+            .filter_map(|row| first_content_cell(&buffer, row))
+            .find(|(_, cell)| cell.symbol() == "-")
+            .expect("removed string-list element marker");
+        assert_eq!(column, 10);
+        assert_eq!(marker.fg, Color::Red);
+        assert!(marker.modifier.contains(Modifier::CROSSED_OUT));
     }
 
     #[test]

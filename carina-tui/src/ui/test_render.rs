@@ -3,12 +3,19 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use super::row::Row;
+use crate::row::Row;
 
 const WIDTH: u16 = 120;
 
 pub(super) fn into_lines<'a>(rows: Vec<Row<'a>>) -> Vec<Line<'a>> {
     rows.into_iter().map(Row::into_line).collect()
+}
+
+pub(super) fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 pub(super) fn render_with_unstyled_indentation(lines: Vec<Line<'_>>) -> Buffer {

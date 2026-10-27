@@ -6,8 +6,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use crate::app::{App, FocusedPanel};
+use crate::row::{Indent, Row};
 
-use super::row::{Indent, Row};
 use super::style::{build_plan_title, effect_style};
 
 /// Draw the tree view (compact, no inline attributes)

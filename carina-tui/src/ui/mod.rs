@@ -6,7 +6,6 @@
 mod detail;
 mod diff;
 mod help;
-mod row;
 mod search;
 mod style;
 #[cfg(test)]
