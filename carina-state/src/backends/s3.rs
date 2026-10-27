@@ -17,6 +17,8 @@ use crate::backend_config::S3BackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
 
+use super::{S3_BACKEND_PROVIDER_NAME, S3_BACKEND_RESOURCE_TYPE};
+
 const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
 
 // GitHub Actions cancellation is SIGINT -> 7.5s -> SIGTERM -> 2.5s ->
@@ -46,12 +48,6 @@ fn cleanup_operation_config() -> aws_sdk_s3::config::Builder {
                 .build(),
         )
 }
-
-/// Provider name reported for the storage resource (the state bucket).
-const BACKEND_PROVIDER_NAME: &str = "aws";
-
-/// Resource type used to surface the state bucket in carina state.
-const BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
 
 /// S3-based state backend
 pub struct S3Backend {
@@ -900,11 +896,11 @@ impl StateBackend for S3Backend {
     }
 
     fn provider_name(&self) -> Option<&str> {
-        Some(BACKEND_PROVIDER_NAME)
+        Some(S3_BACKEND_PROVIDER_NAME)
     }
 
     fn resource_type(&self) -> Option<&str> {
-        Some(BACKEND_RESOURCE_TYPE)
+        Some(S3_BACKEND_RESOURCE_TYPE)
     }
 
     fn resource_definition(&self, name: &str) -> Option<String> {

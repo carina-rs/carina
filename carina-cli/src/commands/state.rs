@@ -33,7 +33,7 @@ use carina_state::LockInfo;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
     DeposedKey, LoadedOrphans, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
-    create_remote_backend, load_state_from_url,
+    load_state_from_url,
 };
 
 use super::{
@@ -359,12 +359,10 @@ pub async fn run_force_unlock(
 
     // Administrative lock recovery uses the shared old-backend-on-drift
     // selector without emitting the read-command warning.
-    let selection = BackendSelection::for_force_unlock(base_dir, parsed.backend.as_ref())?;
-
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
 
-    match selection.force_unlock(lock_id).await {
+    match BackendSelection::force_unlock(base_dir, parsed.backend.as_ref(), lock_id).await {
         Ok(()) => {
             println!("{}", "State has been successfully unlocked.".green().bold());
             Ok(())
@@ -938,23 +936,15 @@ async fn run_state_bucket_delete(
     }
 
     let base_dir = get_base_dir(path);
-    let backend = create_remote_backend(&selection)
-        .await
-        .map_err(AppError::Backend)?;
-    let backend_provider_name = backend
-        .provider_name()
-        .ok_or("Backend does not specify a provider name")?;
-    let backend_resource_type = backend
-        .resource_type()
-        .ok_or("Backend does not specify a resource type")?;
+    let provider_name = selection.provider_name();
+    let resource_type = selection.resource_type();
     let provider_inputs =
         load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
     let (factories, _) =
         build_factories_from_providers(provider_inputs.configs().as_provider_configs(), base_dir)?;
     let ctx = WiringContext::new(factories, provider_inputs.configs().as_provider_configs());
     let bucket_provider =
-        create_state_bucket_delete_provider(&ctx, provider_inputs.configs(), backend_provider_name)
-            .await?;
+        create_state_bucket_delete_provider(&ctx, provider_inputs.configs(), provider_name).await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
@@ -975,12 +965,8 @@ async fn run_state_bucket_delete(
             error,
         }
     })?;
-    let bucket_id = ResourceId::with_provider_identity(
-        backend_provider_name,
-        backend_resource_type,
-        bucket_identity,
-        None,
-    );
+    let bucket_id =
+        ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
     match bucket_provider
         .delete(
             &bucket_id,

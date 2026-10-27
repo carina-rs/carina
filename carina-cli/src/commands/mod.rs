@@ -25,9 +25,8 @@ use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendResult,
-    BackendSelection, LoadedState, MutationBackendSelection, PublishedExports,
-    ReadBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
+    BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendSelection,
+    MutationBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
 };
 #[cfg(test)]
 use carina_state::{BackendError, StateBackend};
@@ -85,59 +84,19 @@ pub(crate) enum ReadBackendWarningPolicy<'a> {
     UpstreamSource { source_dir: &'a Path },
 }
 
-/// A backend selected for a read-only state operation.
-///
-/// The state crate exposes only read capabilities through
-/// [`ResolvedReadBackend`]. This CLI wrapper also retains the selection
-/// metadata needed for plan and diagnostics.
-pub(crate) struct ReadBackend {
-    backend: ResolvedReadBackend,
-    selection: ReadBackendSelection,
-}
-
-impl ReadBackend {
-    pub(crate) async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
-        self.backend.read_state().await
-    }
-
-    pub(crate) async fn read_published_exports(&self) -> BackendResult<Option<PublishedExports>> {
-        self.backend.read_published_exports().await
-    }
-
-    pub(crate) async fn bucket_exists(&self) -> BackendResult<bool> {
-        self.backend.bucket_exists().await
-    }
-
-    pub(crate) fn provider_name(&self) -> Option<&str> {
-        self.backend.provider_name()
-    }
-
-    pub(crate) fn resource_type(&self) -> Option<&str> {
-        self.backend.resource_type()
-    }
-
-    pub(crate) fn state_config(&self) -> Option<&StateBackendConfig> {
-        self.selection.selected_config()
-    }
-
-    pub(crate) fn migration_pending(&self) -> bool {
-        self.selection.drift().is_some()
-    }
-}
-
 /// Resolve the backend for a read-only state operation.
 ///
 /// Every project-backed read goes through this function. If the configured
-/// backend differs from `carina-backend.lock`, the returned [`ReadBackend`]
-/// points at the locked old backend. A warning policy is mandatory and is
-/// applied before the readable backend is returned.
+/// backend differs from `carina-backend.lock`, the returned
+/// [`ResolvedReadBackend`] points at the locked old backend. A warning policy
+/// is mandatory and is applied before the readable backend is returned.
 pub(crate) async fn resolve_backend_for_read(
     base_dir: &Path,
     command_path: &Path,
     backend_config: Option<&BackendConfig>,
     lock_requirement: BackendLockRequirement,
     warning_policy: ReadBackendWarningPolicy<'_>,
-) -> Result<ReadBackend, AppError> {
+) -> Result<ResolvedReadBackend, AppError> {
     let selection = BackendSelection::for_read(base_dir, backend_config)?;
     if lock_requirement == BackendLockRequirement::RequirePresent && !selection.lock_present() {
         return Err(AppError::Config(format!(
@@ -150,7 +109,7 @@ pub(crate) async fn resolve_backend_for_read(
             emit_read_backend_drift_warning(drift, warning_policy);
         })
         .await?;
-    Ok(ReadBackend { backend, selection })
+    Ok(backend)
 }
 
 pub fn verify_for_mutation(

@@ -8,6 +8,8 @@ Carina takes a lock on the state backend during `apply` and `destroy` to prevent
 
 Only use this when you are certain no other Carina process is currently writing to the same state. Releasing a lock while another process holds it can corrupt state.
 
+During a pending backend migration, `force-unlock` targets the OLD backend recorded in `carina-backend.lock`.
+
 ## Usage
 
 ```bash

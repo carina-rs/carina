@@ -81,15 +81,14 @@ pub use backend_config::{
 pub use backend_lock::BackendLock;
 pub use backend_selection::{
     BackendDrift, BackendDriftStatus, BackendSelection, BucketDeleteBackendSelection,
-    ExplicitUrlBackendSelection, ForceUnlockBackendSelection, MigrationBackendSelection,
     MigrationBackends, MutationBackendSelection, ReadBackendSelection, ResolvedReadBackend,
     VerifiedMutationBackendSelection, inspect_backend_drift,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::local_backend_for_test;
 pub use backends::{
-    BucketDeleteBackend, LocalBackend, StateUrl, anchored_local_path, create_remote_backend,
-    load_published_exports_from_url, load_state_from_url,
+    LocalBackend, StateUrl, anchored_local_path, load_published_exports_from_url,
+    load_state_from_url,
 };
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;

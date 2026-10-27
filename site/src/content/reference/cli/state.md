@@ -143,6 +143,8 @@ carina state bucket-delete [OPTIONS] <BUCKET_NAME> [PATH]
 
 The bucket name must match the `bucket` attribute in the backend configuration. Without `--force`, Carina prompts for confirmation by requiring the user to type the bucket name.
 
+During a pending backend migration, `bucket-delete` targets the configured NEW backend, not the OLD backend recorded in `carina-backend.lock`.
+
 #### Flags
 
 | Flag | Description |

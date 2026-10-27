@@ -14,7 +14,13 @@ use std::path::Path;
 
 use crate::backend::{BackendResult, StateBackend};
 use crate::backend_config::{BackendConfig, LocalBackendSettings};
-use crate::backend_selection::{BackendSelection, BackendTarget, BucketDeleteBackendSelection};
+use crate::backend_selection::{BackendSelection, BackendTarget};
+
+/// Provider name reported for the storage resource (the state bucket).
+pub(crate) const S3_BACKEND_PROVIDER_NAME: &str = "aws";
+
+/// Resource type used to surface the state bucket in Carina state.
+pub(crate) const S3_BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
 
 /// Create the backend named by an opaque, operation-specific selection token.
 ///
@@ -60,31 +66,6 @@ async fn create_configured_backend(
             Ok(Box::new(backend))
         }
     }
-}
-
-/// An S3 backend narrowed to the metadata needed by state bucket deletion.
-pub struct BucketDeleteBackend {
-    backend: Box<dyn StateBackend>,
-}
-
-impl BucketDeleteBackend {
-    pub fn provider_name(&self) -> Option<&str> {
-        self.backend.provider_name()
-    }
-
-    pub fn resource_type(&self) -> Option<&str> {
-        self.backend.resource_type()
-    }
-}
-
-/// Construct the purpose-limited backend authorized by a bucket-delete
-/// selection.
-pub async fn create_remote_backend(
-    selection: &BucketDeleteBackendSelection,
-) -> BackendResult<BucketDeleteBackend> {
-    Ok(BucketDeleteBackend {
-        backend: Box::new(S3Backend::from_config(selection.s3_settings()).await?),
-    })
 }
 
 /// Resolve a local backend's state file path, anchoring a relative

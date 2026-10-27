@@ -184,11 +184,10 @@ pub async fn run_init_migrate_state(
     );
     println!("{}", drift.existing().describe_diff(drift.configured()));
 
-    // A migration token can only be built from the typed drift above. Its
-    // source is the locked OLD address and its target is the configured NEW
-    // address, both anchored at the project directory.
-    let backends = BackendSelection::for_migration(&drift)?
-        .resolve()
+    // The typed drift above resolves directly to purpose-limited migration
+    // backends: the locked OLD source and configured NEW target, both anchored
+    // at the project directory.
+    let backends = BackendSelection::for_migration(&drift)
         .await
         .map_err(AppError::Backend)?;
 
@@ -312,11 +311,7 @@ mod tests {
         else {
             panic!("test fixture must describe a pending backend migration")
         };
-        BackendSelection::for_migration(&drift)
-            .unwrap()
-            .resolve()
-            .await
-            .unwrap()
+        BackendSelection::for_migration(&drift).await.unwrap()
     }
 
     #[tokio::test]

@@ -26,11 +26,9 @@ use carina_core::value::{
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
-use carina_state::{ResourceState, StateFile};
+use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
 
-use super::{
-    BackendLockRequirement, ReadBackend, ReadBackendWarningPolicy, resolve_backend_for_read,
-};
+use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
@@ -1749,7 +1747,7 @@ pub async fn run_plan(
     )
     .await?;
     let plan_file_backend_config = plan_backend
-        .state_config()
+        .selected_config()
         .map(carina_state::BackendConfig::to_parser_config);
     let use_locked_backend = plan_backend.migration_pending();
     let drift_note = use_locked_backend.then(|| {
@@ -1766,7 +1764,7 @@ pub async fn run_plan(
     let mut state_bucket_name = String::new();
     let mut state_file: Option<StateFile> = None;
 
-    if let Some(config) = plan_backend.state_config() {
+    if let Some(config) = plan_backend.selected_config() {
         let bucket_exists = plan_backend
             .bucket_exists()
             .await
@@ -2744,7 +2742,7 @@ async fn build_upstream_backend(
     source_abs: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
-) -> Result<ReadBackend, AppError> {
+) -> Result<ResolvedReadBackend, AppError> {
     let loaded = load_configuration_with_config(
         source_abs,
         provider_context,

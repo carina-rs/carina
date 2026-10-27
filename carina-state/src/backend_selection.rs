@@ -1,8 +1,8 @@
 //! Typed selection of the state backend an operation is allowed to open.
 //!
-//! Backend construction accepts only the opaque [`BackendSelection`] token.
-//! Callers obtain that token through an operation-specific selector, making
-//! lock-aware reads, verified mutations, explicit URLs, migrations, and
+//! Raw backend construction is crate-private. Public callers obtain only an
+//! operation-specific capability through [`BackendSelection`], keeping
+//! lock-aware reads, verified mutations, migrations, force-unlock, and
 //! state-bucket deletion distinct at the call site.
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use carina_core::parser::BackendConfig as ParserBackendConfig;
 use crate::backend::{BackendError, BackendResult};
 use crate::backend_config::{BackendConfig, S3BackendSettings};
 use crate::backend_lock::BackendLock;
-use crate::backends::StateUrl;
+use crate::backends::{S3_BACKEND_PROVIDER_NAME, S3_BACKEND_RESOURCE_TYPE, StateUrl};
 
 /// The old and new backend addresses involved in a pending migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,16 +65,8 @@ pub struct ReadBackendSelection {
 }
 
 impl ReadBackendSelection {
-    pub fn selected_config(&self) -> Option<&BackendConfig> {
-        self.selection.configured_config()
-    }
-
     pub fn lock_present(&self) -> bool {
         self.lock_present
-    }
-
-    pub fn drift(&self) -> Option<&BackendDrift> {
-        self.drift.as_ref()
     }
 
     /// Construct the selected read capability, invoking `warn` on pending
@@ -83,20 +75,28 @@ impl ReadBackendSelection {
     /// The underlying [`BackendSelection`] is intentionally not exposed: a
     /// project-backed reader must cross this warning acknowledgement seam.
     pub async fn resolve_with_drift_warning(
-        &self,
+        self,
         warn: impl FnOnce(&BackendDrift),
     ) -> BackendResult<ResolvedReadBackend> {
+        let selected_config = self.selection.configured_config().cloned();
+        let migration_pending = self.drift.is_some();
         let backend = crate::backends::create_backend(&self.selection).await?;
-        if let Some(drift) = self.drift() {
+        if let Some(drift) = self.drift.as_ref() {
             warn(drift);
         }
-        Ok(ResolvedReadBackend { backend })
+        Ok(ResolvedReadBackend {
+            backend,
+            selected_config,
+            migration_pending,
+        })
     }
 }
 
 /// A backend narrowed to the operations used by read-only commands.
 pub struct ResolvedReadBackend {
     backend: Box<dyn crate::StateBackend>,
+    selected_config: Option<BackendConfig>,
+    migration_pending: bool,
 }
 
 impl ResolvedReadBackend {
@@ -118,6 +118,14 @@ impl ResolvedReadBackend {
 
     pub fn resource_type(&self) -> Option<&str> {
         self.backend.resource_type()
+    }
+
+    pub fn selected_config(&self) -> Option<&BackendConfig> {
+        self.selected_config.as_ref()
+    }
+
+    pub fn migration_pending(&self) -> bool {
+        self.migration_pending
     }
 }
 
@@ -146,28 +154,6 @@ pub enum MutationBackendSelection {
     Verified(VerifiedMutationBackendSelection),
     MissingLock { path: PathBuf },
     Drifted(BackendDrift),
-}
-
-/// The paired old and new backends for a proven pending migration.
-#[derive(Debug, Clone)]
-pub struct MigrationBackendSelection {
-    source: BackendSelection,
-    target: BackendSelection,
-}
-
-impl MigrationBackendSelection {
-    /// Resolve the two migration endpoints without exposing either as a
-    /// general-purpose backend.
-    pub async fn resolve(self) -> BackendResult<MigrationBackends> {
-        let source_config = self.source.configured_config().cloned();
-        let source = crate::backends::create_backend(&self.source).await?;
-        let target = crate::backends::create_backend(&self.target).await?;
-        Ok(MigrationBackends {
-            source,
-            target,
-            source_config,
-        })
-    }
 }
 
 /// Backends resolved for one state migration.
@@ -203,49 +189,38 @@ impl MigrationBackends {
 /// backend bucket.
 #[derive(Debug, Clone)]
 pub struct BucketDeleteBackendSelection {
-    settings: S3BackendSettings,
+    _private: (),
 }
 
 impl BucketDeleteBackendSelection {
-    pub(crate) fn s3_settings(&self) -> &S3BackendSettings {
-        &self.settings
+    pub fn provider_name(&self) -> &'static str {
+        S3_BACKEND_PROVIDER_NAME
+    }
+
+    pub fn resource_type(&self) -> &'static str {
+        S3_BACKEND_RESOURCE_TYPE
     }
 }
 
 /// Selection for a user-supplied `--state-url`.
 #[derive(Debug, Clone)]
-pub struct ExplicitUrlBackendSelection {
+pub(crate) struct ExplicitUrlBackendSelection {
     selection: BackendSelection,
 }
 
 impl ExplicitUrlBackendSelection {
-    pub async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+    pub(crate) async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
         crate::backends::create_backend(&self.selection)
             .await?
             .read_state()
             .await
     }
 
-    pub async fn read_published_exports(&self) -> BackendResult<Option<crate::PublishedExports>> {
+    pub(crate) async fn read_published_exports(
+        &self,
+    ) -> BackendResult<Option<crate::PublishedExports>> {
         let backend = crate::backends::create_backend(&self.selection).await?;
         crate::backend::read_published_exports(backend.as_ref()).await
-    }
-}
-
-/// Lock-aware backend selection for the administrative force-unlock path.
-/// It uses the same old-backend-on-drift rule as reads but deliberately leaves
-/// drift unreported because force-unlock intentionally targets that backend.
-#[derive(Debug, Clone)]
-pub struct ForceUnlockBackendSelection {
-    selection: BackendSelection,
-}
-
-impl ForceUnlockBackendSelection {
-    pub async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
-        crate::backends::create_backend(&self.selection)
-            .await?
-            .force_unlock(lock_id)
-            .await
     }
 }
 
@@ -309,15 +284,18 @@ impl BackendSelection {
         }
     }
 
-    /// Pair the old and new backend addresses carried by a proven drift.
-    pub fn for_migration(drift: &BackendDrift) -> BackendResult<MigrationBackendSelection> {
+    /// Resolve the old and new backend addresses carried by a proven drift.
+    pub async fn for_migration(drift: &BackendDrift) -> BackendResult<MigrationBackends> {
         let project_dir = canonical_project_dir(&drift.project_dir);
-        Ok(MigrationBackendSelection {
-            source: Self::configured_target(
-                Some(drift.existing.to_state_config()?),
-                project_dir.clone(),
-            ),
-            target: Self::configured_target(Some(drift.configured.to_state_config()?), project_dir),
+        let source =
+            Self::configured_target(Some(drift.existing.to_state_config()?), project_dir.clone());
+        let target =
+            Self::configured_target(Some(drift.configured.to_state_config()?), project_dir);
+        let source_config = source.configured_config().cloned();
+        Ok(MigrationBackends {
+            source: crate::backends::create_backend(&source).await?,
+            target: crate::backends::create_backend(&target).await?,
+            source_config,
         })
     }
 
@@ -338,14 +316,12 @@ impl BackendSelection {
             )));
         }
 
-        Ok(BucketDeleteBackendSelection {
-            settings: settings.clone(),
-        })
+        Ok(BucketDeleteBackendSelection { _private: () })
     }
 
     /// Select the exact URL supplied by the user, bypassing project backend
     /// configuration and its lock by explicit contract.
-    pub fn explicit_url(url: &StateUrl) -> ExplicitUrlBackendSelection {
+    pub(crate) fn explicit_url(url: &StateUrl) -> ExplicitUrlBackendSelection {
         ExplicitUrlBackendSelection {
             selection: Self {
                 target: BackendTarget::ExplicitUrl(url.clone()),
@@ -353,16 +329,18 @@ impl BackendSelection {
         }
     }
 
-    /// Select the backend whose lock may be administratively force-released.
-    /// On drift this is the old locked backend, matching read selection.
-    pub fn for_force_unlock(
+    /// Force-release a backend lock, selecting the old locked backend during
+    /// pending migration without exposing a general backend capability.
+    pub async fn force_unlock(
         project_dir: &Path,
         configured: Option<&ParserBackendConfig>,
-    ) -> BackendResult<ForceUnlockBackendSelection> {
+        lock_id: &str,
+    ) -> BackendResult<()> {
         let selected = Self::for_read(project_dir, configured)?;
-        Ok(ForceUnlockBackendSelection {
-            selection: selected.selection,
-        })
+        crate::backends::create_backend(&selected.selection)
+            .await?
+            .force_unlock(lock_id)
+            .await
     }
 
     pub(crate) fn target(&self) -> &BackendTarget {
@@ -467,8 +445,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_selection_uses_locked_config_on_drift() {
+    #[tokio::test]
+    async fn resolved_read_carries_locked_config_and_drift() {
         let project = tempfile::tempdir().unwrap();
         BackendLock::for_config(Some(&local_config("old.json")))
             .unwrap()
@@ -477,12 +455,13 @@ mod tests {
 
         let selected =
             BackendSelection::for_read(project.path(), Some(&local_config("new.json"))).unwrap();
+        let resolved = selected.resolve_with_drift_warning(|_| {}).await.unwrap();
 
-        let Some(BackendConfig::Local(settings)) = selected.selected_config() else {
+        let Some(BackendConfig::Local(settings)) = resolved.selected_config() else {
             panic!("read must select the old local backend")
         };
         assert_eq!(settings.path(), Some("old.json"));
-        assert!(selected.drift().is_some());
+        assert!(resolved.migration_pending());
     }
 
     #[tokio::test]
@@ -529,9 +508,21 @@ mod tests {
         assert!(matches!(selected, MutationBackendSelection::Drifted(_)));
     }
 
-    #[test]
-    fn migration_selection_pairs_the_proven_old_and_new_backends() {
+    #[tokio::test]
+    async fn migration_selection_resolves_the_proven_old_and_new_backends() {
+        use crate::StateBackend;
+        use crate::backends::LocalBackend;
+        use crate::state::StateFile;
+
         let project = tempfile::tempdir().unwrap();
+        let old_path = project.path().join("old.json");
+        let new_path = project.path().join("new.json");
+        let mut source_state = StateFile::new();
+        source_state.lineage = "locked-old".to_string();
+        LocalBackend::with_path(old_path)
+            .write_state(&source_state)
+            .await
+            .unwrap();
         BackendLock::for_config(Some(&local_config("old.json")))
             .unwrap()
             .save(project.path())
@@ -542,33 +533,25 @@ mod tests {
             panic!("fixture must have pending backend migration")
         };
 
-        let selected = BackendSelection::for_migration(&drift).unwrap();
+        let backends = BackendSelection::for_migration(&drift).await.unwrap();
 
-        let Some(BackendConfig::Local(source)) = selected.source.configured_config() else {
+        let Some(BackendConfig::Local(source)) = backends.source_config() else {
             panic!("migration source must be the locked local backend")
         };
-        let Some(BackendConfig::Local(target)) = selected.target.configured_config() else {
-            panic!("migration target must be the newly configured local backend")
-        };
         assert_eq!(source.path(), Some("old.json"));
-        assert_eq!(target.path(), Some("new.json"));
-        let BackendTarget::Configured {
-            base_dir: source_base,
-            ..
-        } = selected.source.target()
-        else {
-            panic!("migration source must be a configured target")
-        };
-        let BackendTarget::Configured {
-            base_dir: target_base,
-            ..
-        } = selected.target.target()
-        else {
-            panic!("migration target must be a configured target")
-        };
-        let canonical_project = project.path().canonicalize().unwrap();
-        assert_eq!(source_base, &canonical_project);
-        assert_eq!(target_base, &canonical_project);
+        let loaded_source = backends.read_source_state().await.unwrap().unwrap();
+        assert_eq!(loaded_source.into_state().lineage, "locked-old");
+        assert!(backends.read_target_state().await.unwrap().is_none());
+
+        let mut migrated = StateFile::new();
+        migrated.lineage = "configured-new".to_string();
+        backends.write_target_state(&migrated).await.unwrap();
+        let loaded_target = LocalBackend::with_path(new_path)
+            .read_state()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded_target.into_state().lineage, "configured-new");
     }
 
     #[test]
@@ -577,7 +560,8 @@ mod tests {
         let settings = config.as_s3().unwrap();
 
         let selected = BackendSelection::for_bucket_delete(settings, "configured-bucket").unwrap();
-        assert_eq!(selected.s3_settings().bucket(), "configured-bucket");
+        assert_eq!(selected.provider_name(), "aws");
+        assert_eq!(selected.resource_type(), "s3.Bucket");
 
         let error = BackendSelection::for_bucket_delete(settings, "different-bucket")
             .expect_err("a bucket-delete token must prove the CLI target matches config");
