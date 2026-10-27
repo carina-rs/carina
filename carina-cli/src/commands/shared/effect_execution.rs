@@ -7,6 +7,8 @@ use carina_core::provider::{AppliedIdentifier, Provider, ReadRequest};
 use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 use colored::Colorize;
 
+use crate::commands::shared::progress::{FailedOutcome, ProgressBackend, ProgressSink};
+
 /// Owns all result mutation for one import iteration and publishes at most one
 /// checkpoint when the iteration leaves scope, including through `continue`.
 struct ImportResultIteration<'a> {
@@ -52,6 +54,7 @@ pub(crate) async fn execute_import_effects(
     shutdown: &ShutdownToken,
     checkpoint_sink: &ExecutionCheckpointSink,
 ) {
+    let progress = ProgressBackend::<()>::new(ProgressSink::Human);
     let cleanup_loop = shutdown.cleanup_aware_loop();
     for effect in plan.effects() {
         if let Effect::Import { id, identifier } = effect {
@@ -76,7 +79,9 @@ pub(crate) async fn execute_import_effects(
             let identifier_str = match resolve_import_identifier(identifier) {
                 Ok(s) => s.to_string(),
                 Err(e) => {
-                    println!("  {} Import failed for {}: {}", "✗".red(), id, e);
+                    progress.failed_line(FailedOutcome::summary(format!(
+                        "Import failed for {id}: {e}"
+                    )));
                     iteration.mutate(|result| result.failure_count += 1);
                     continue;
                 }
@@ -84,12 +89,9 @@ pub(crate) async fn execute_import_effects(
             let applied_identifier = match AppliedIdentifier::new(identifier_str.clone()) {
                 Ok(identifier) => identifier,
                 Err(error) => {
-                    println!(
-                        "  {} Import failed for {}: invalid provider identifier: {}. Set import.id to the non-empty identifier used by the provider.",
-                        "✗".red(),
-                        id,
-                        error
-                    );
+                    progress.failed_line(FailedOutcome::summary(format!(
+                        "Import failed for {id}: invalid provider identifier: {error}. Set import.id to the non-empty identifier used by the provider."
+                    )));
                     iteration.mutate(|result| result.failure_count += 1);
                     continue;
                 }
@@ -123,17 +125,16 @@ pub(crate) async fn execute_import_effects(
                             result.success_count += 1;
                         });
                     } else {
-                        println!(
-                            "  {} Import failed: resource {} with id {} not found",
-                            "✗".red(),
-                            id,
-                            identifier_display
-                        );
+                        progress.failed_line(FailedOutcome::summary(format!(
+                            "Import failed: resource {id} with id {identifier_display} not found"
+                        )));
                         iteration.mutate(|result| result.failure_count += 1);
                     }
                 }
                 Err(e) => {
-                    println!("  {} Import failed for {}: {}", "✗".red(), id, e);
+                    progress.failed_line(FailedOutcome::summary(format!(
+                        "Import failed for {id}: {e}"
+                    )));
                     iteration.mutate(|result| result.failure_count += 1);
                 }
             }

@@ -50,7 +50,9 @@ use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
 };
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
-use crate::commands::shared::progress::{ProgressBackend, RefreshProgress, format_duration};
+use crate::commands::shared::progress::{
+    FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressSink, RefreshPhase, format_duration,
+};
 use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
     DestroyStateWrite, DestroyedInstance, apply_destroy_to_state, apply_name_overrides,
@@ -206,6 +208,7 @@ struct DestroyExecuted {
     success_count: usize,
     failure_count: usize,
     skip_count: usize,
+    unknown_count: usize,
     cancelled: bool,
     cancel: ShutdownToken,
 }
@@ -347,14 +350,20 @@ async fn run_destroy_locked_with_ctx_owned(
     }
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, provider_inputs.configs(), base_dir).await?;
+    let provider = get_provider_with_ctx(
+        ctx,
+        provider_inputs.configs(),
+        base_dir,
+        ProgressSink::Human,
+    )
+    .await?;
 
     // Build managed current state -- either from the provider or the state file.
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
 
     if refresh {
-        RefreshProgress::start_header();
-        let progress_backend = ProgressBackend::new();
+        let progress_backend = ProgressBackend::new(ProgressSink::Human);
+        let refresh_phase = RefreshPhase::start(&progress_backend);
 
         // Read states for managed resources concurrently using identifier
         // from state. carina#3181: `all_resources` is sourced from
@@ -385,7 +394,7 @@ async fn run_destroy_locked_with_ctx_owned(
                 let Some(resource) = resource_iter.next() else {
                     break;
                 };
-                let progress = RefreshProgress::begin(&progress_backend, &resource.id);
+                let progress = refresh_phase.begin(&resource.id);
                 let loaded = persisted_state
                     .map(|sf| sf.build_state_for_resource(&resource.id))
                     .unwrap_or_else(|| Current::absent(resource.id.clone()));
@@ -485,7 +494,7 @@ async fn run_destroy_locked_with_ctx_owned(
                     let Some((id, orphan)) = orphan_iter.next() else {
                         break;
                     };
-                    let progress = RefreshProgress::begin(&progress_backend, &id);
+                    let progress = refresh_phase.begin(&id);
                     orphan_in_flight.push(async move {
                         let refreshed = refresh_loaded_orphan_with_retry(
                             provider_ref,
@@ -565,7 +574,7 @@ async fn run_destroy_locked_with_ctx_owned(
                 return Err(AppError::Interrupted);
             }
         }
-        progress_backend.finish_refresh_phase();
+        drop(refresh_phase);
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls.
         // carina#3181: `all_resources` is managed-only.
@@ -738,8 +747,9 @@ async fn run_destroy_locked_with_ctx_owned(
                 .red()
                 .bold()
         );
+        let failure_progress = ProgressBackend::<()>::new(ProgressSink::Human);
         for resource in &prevent_destroy_resources {
-            println!("  {} {}", "✗".red().bold(), resource.id);
+            failure_progress.failed_line(FailedOutcome::summary(resource.id.to_string()));
         }
         println!();
         println!(
@@ -818,11 +828,12 @@ async fn run_destroy_locked_with_ctx_owned(
     println!("{}", "Destroying resources...".red().bold());
     println!();
 
-    let progress = ProgressBackend::new();
+    let progress = ProgressBackend::new(ProgressSink::Human);
 
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
+    let mut unknown_count = 0;
     let saver = IncrementalStateSaver::start(
         state_file.unwrap_or_default(),
         mid_run_writer,
@@ -926,24 +937,21 @@ async fn run_destroy_locked_with_ctx_owned(
                     delete_count,
                     &failed_indices,
                 ) {
-                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    let counter = format!("{}/{}", c, destroy_total).dimmed();
                     let failed_dep = &resource_info[failed_dep_idx].0;
-                    let msg = format!(
-                        "{} {} - skipped (dependent {} failed) {}",
-                        "⊘".yellow(),
-                        format_effect(effect),
-                        failed_dep,
-                        counter
-                    );
-                    progress.finish(idx, msg);
+                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(
+                        &completed_counter,
+                        destroy_total,
+                        effect,
+                        format!("- skipped (dependent {failed_dep} failed)"),
+                    ));
+                    progress.finish(idx, outcome);
                     skip_count += 1;
                     failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
 
-                progress.start(idx, format_effect(effect));
+                progress.start_indexed(idx, format_effect(effect));
 
                 // Spawn the deletion as a concurrent future
                 let Effect::Delete {
@@ -990,15 +998,13 @@ async fn run_destroy_locked_with_ctx_owned(
                     .collect();
                 for idx in remaining {
                     let (_, effect) = &resource_info[idx];
-                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    let counter = format!("{}/{}", c, destroy_total).dimmed();
-                    let msg = format!(
-                        "{} {} - skipped (destroy cancelled) {}",
-                        "⊘".yellow(),
-                        format_effect(effect),
-                        counter
-                    );
-                    progress.finish(idx, msg);
+                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(
+                        &completed_counter,
+                        destroy_total,
+                        effect,
+                        "- skipped (destroy cancelled)",
+                    ));
+                    progress.finish(idx, outcome);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
                     skip_count += 1;
@@ -1020,15 +1026,13 @@ async fn run_destroy_locked_with_ctx_owned(
             if all_retried {
                 for &idx in &remaining {
                     let (_, effect) = &resource_info[idx];
-                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    let counter = format!("{}/{}", c, destroy_total).dimmed();
-                    let msg = format!(
-                        "{} {} - retries exhausted (no progress possible) {}",
-                        "✗".red(),
-                        format_effect(effect),
-                        counter
-                    );
-                    progress.finish(idx, msg);
+                    let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
+                        &completed_counter,
+                        destroy_total,
+                        effect,
+                        "- retries exhausted (no progress possible)",
+                    ));
+                    progress.finish_failed(idx, outcome);
                     failed_indices.insert(idx);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
@@ -1039,15 +1043,13 @@ async fn run_destroy_locked_with_ctx_owned(
             // Non-retry cycle: fail every remaining outcome.
             for &idx in &remaining {
                 let (_, effect) = &resource_info[idx];
-                let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let counter = format!("{}/{}", c, destroy_total).dimmed();
-                let msg = format!(
-                    "{} {} - dependency cycle (no progress possible) {}",
-                    "✗".red(),
-                    format_effect(effect),
-                    counter
-                );
-                progress.finish(idx, msg);
+                let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
+                    &completed_counter,
+                    destroy_total,
+                    effect,
+                    "- dependency cycle (no progress possible)",
+                ));
+                progress.finish_failed(idx, outcome);
                 dispatched.insert(idx);
                 completed_indices.insert(idx);
                 failure_count += 1;
@@ -1088,21 +1090,18 @@ async fn run_destroy_locked_with_ctx_owned(
         // become eligible in the next iteration's ready-check.
         retry_pending.clear();
 
-        let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let counter = format!("{}/{}", c, destroy_total).dimmed();
         let effect = &resource_info[finished_idx].1;
 
         match delete_result {
             Ok(()) => {
                 let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
-                let msg = format!(
-                    "{} {} {} {}",
-                    "✓".green(),
-                    format_effect(effect),
+                let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(
+                    &completed_counter,
+                    destroy_total,
+                    effect,
                     timing,
-                    counter
-                );
-                progress.finish(finished_idx, msg);
+                ));
+                progress.finish(finished_idx, outcome);
                 success_count += 1;
                 observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
                 let destroyed = DestroyedInstance {
@@ -1125,28 +1124,26 @@ async fn run_destroy_locked_with_ctx_owned(
                     completed_indices.remove(&finished_idx);
                     dispatched.remove(&finished_idx);
                     retry_pending.insert(finished_idx);
-                    completed_counter.fetch_sub(1, Ordering::Relaxed);
                     let retry_num = retry_counts[&finished_idx];
-                    let msg = format!(
-                        "{} {} - dependency violation, will retry ({}/{})",
-                        "↻".yellow(),
+                    let outcome = NonFailureOutcome::retrying(format!(
+                        "{} - dependency violation, will retry ({}/{})",
                         format_effect(effect),
                         retry_num,
                         max_retries
-                    );
-                    progress.finish(finished_idx, msg);
+                    ));
+                    progress.finish(finished_idx, outcome);
                 } else {
                     let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
-                    let msg = format!(
-                        "{} {} {} {}\n      {} {}",
-                        "✗".red(),
-                        format_effect(effect),
-                        timing,
-                        counter,
-                        "→".red(),
-                        e.to_string().red()
+                    let outcome = FailedOutcome::new(
+                        format_destroy_outcome_summary(
+                            &completed_counter,
+                            destroy_total,
+                            effect,
+                            timing,
+                        ),
+                        [e.to_string()],
                     );
-                    progress.finish(finished_idx, msg);
+                    progress.finish_failed(finished_idx, outcome);
                     failure_count += 1;
                     failed_indices.insert(finished_idx);
                 }
@@ -1162,22 +1159,35 @@ async fn run_destroy_locked_with_ctx_owned(
         .any(|idx| !completed_indices.contains(idx))
     {
         cancelled = true;
-        skip_count += finish_interrupted_destroy_outcomes(
+        let interrupted = finish_interrupted_destroy_outcomes(
             &progress,
             &all_indices,
             &completed_indices,
-            |idx| {
-                let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let counter = format!("{}/{}", c, destroy_total).dimmed();
+            &dispatched,
+            |idx, outcome| {
                 let effect = &resource_info[idx].1;
-                format!(
-                    "{} {} - interrupted {}",
-                    "⊘".yellow(),
-                    format_effect(effect),
-                    counter
-                )
+                match outcome {
+                    InterruptedDestroyOutcome::Skipped => NonFailureOutcome::skipped(
+                        format_destroy_outcome_summary(
+                            &completed_counter,
+                            destroy_total,
+                            effect,
+                            "- skipped (destroy cancelled)",
+                        ),
+                    ),
+                    InterruptedDestroyOutcome::Unknown => NonFailureOutcome::unknown(
+                        format_destroy_outcome_summary(
+                            &completed_counter,
+                            destroy_total,
+                            effect,
+                            "- interrupted (outcome unknown)",
+                        ),
+                    ),
+                }
             },
         );
+        skip_count += interrupted.skipped;
+        unknown_count += interrupted.unknown;
     }
     drop(in_flight);
     let state_base = saver.stop(&cancel).await;
@@ -1189,6 +1199,7 @@ async fn run_destroy_locked_with_ctx_owned(
         success_count,
         failure_count,
         skip_count,
+        unknown_count,
         cancelled,
         cancel,
     })))
@@ -1217,17 +1228,30 @@ async fn run_destroy_locked_with_ctx_owned(
                     success_count,
                     failure_count,
                     skip_count,
+                    unknown_count,
                     cancelled,
                     cancel,
                 } = *context;
                 if cancelled && destroyed_instances.is_empty() {
+                    println!();
+                    println!(
+                        "{}",
+                        format_destroy_interrupted_summary(
+                            success_count,
+                            failure_count,
+                            skip_count,
+                            unknown_count,
+                        )
+                        .yellow()
+                        .bold()
+                    );
                     return Err(AppError::Interrupted);
                 }
 
                 println!();
                 println!("{}", "Saving state...".cyan());
 
-                finalize_after_execute(
+                let finalize_result = finalize_after_execute(
                     |persistence| {
                         finalize_destroy(
                             FinalizeDestroyInput {
@@ -1242,10 +1266,28 @@ async fn run_destroy_locked_with_ctx_owned(
                     cancelled,
                     &cancel,
                 )
-                .await?;
+                .await;
+
+                if let Err(error) = finalize_result {
+                    if cancelled {
+                        println!();
+                        println!(
+                            "{}",
+                            format_destroy_interrupted_summary(
+                                success_count,
+                                failure_count,
+                                skip_count,
+                                unknown_count,
+                            )
+                            .yellow()
+                            .bold()
+                        );
+                    }
+                    return Err(error);
+                }
 
                 println!();
-                if failure_count == 0 && skip_count == 0 {
+                if failure_count == 0 && skip_count == 0 && unknown_count == 0 {
                     println!(
                         "{}",
                         format!("Destroy complete! {} resources destroyed.", success_count)
@@ -1254,9 +1296,11 @@ async fn run_destroy_locked_with_ctx_owned(
                     );
                     Ok(())
                 } else {
-                    Err(AppError::Config(format!(
-                        "Destroy failed. {} succeeded, {} failed, {} skipped.",
-                        success_count, failure_count, skip_count
+                    Err(AppError::Config(format_destroy_failure_summary(
+                        success_count,
+                        failure_count,
+                        skip_count,
+                        unknown_count,
                     )))
                 }
             }
@@ -1614,21 +1658,83 @@ fn should_skip_destroy_execution(delete_effect_count: usize) -> bool {
     delete_effect_count == 0
 }
 
+fn format_destroy_interrupted_summary(
+    success_count: usize,
+    failure_count: usize,
+    skip_count: usize,
+    unknown_count: usize,
+) -> String {
+    format!(
+        "Destroy interrupted. {success_count} succeeded, {failure_count} failed, \
+         {skip_count} skipped, {unknown_count} outcome{} unknown.",
+        if unknown_count == 1 { "" } else { "s" }
+    )
+}
+
+fn format_destroy_failure_summary(
+    success_count: usize,
+    failure_count: usize,
+    skip_count: usize,
+    unknown_count: usize,
+) -> String {
+    if unknown_count == 0 {
+        return format!(
+            "Destroy failed. {success_count} succeeded, {failure_count} failed, \
+             {skip_count} skipped."
+        );
+    }
+    format!(
+        "Destroy failed. {success_count} succeeded, {failure_count} failed, \
+         {skip_count} skipped, {unknown_count} outcome{} unknown.",
+        if unknown_count == 1 { "" } else { "s" }
+    )
+}
+
+fn format_destroy_outcome_summary(
+    completed_counter: &AtomicUsize,
+    total: usize,
+    effect: &Effect,
+    detail: impl std::fmt::Display,
+) -> String {
+    let completed = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let counter = format!("{completed}/{total}").dimmed();
+    format!("{} {} {}", format_effect(effect), detail, counter)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterruptedDestroyOutcome {
+    Skipped,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InterruptedDestroyCounts {
+    skipped: usize,
+    unknown: usize,
+}
+
 fn finish_interrupted_destroy_outcomes(
     progress: &ProgressBackend<usize>,
     all_indices: &[usize],
     completed_indices: &HashSet<usize>,
-    mut line_for: impl FnMut(usize) -> String,
-) -> usize {
-    let mut emitted = 0;
+    dispatched: &HashSet<usize>,
+    mut outcome_for: impl FnMut(usize, InterruptedDestroyOutcome) -> NonFailureOutcome,
+) -> InterruptedDestroyCounts {
+    let mut counts = InterruptedDestroyCounts::default();
     for &idx in all_indices {
         if completed_indices.contains(&idx) {
             continue;
         }
-        progress.finish(idx, line_for(idx));
-        emitted += 1;
+        let outcome = if dispatched.contains(&idx) {
+            counts.unknown += 1;
+            InterruptedDestroyOutcome::Unknown
+        } else {
+            counts.skipped += 1;
+            InterruptedDestroyOutcome::Skipped
+        };
+        progress.finish(idx, outcome_for(idx, outcome));
     }
-    emitted
+    counts
 }
 
 fn state_row_key_from_id(id: &ResolvedResourceId) -> StateRowKey {
@@ -1916,21 +2022,54 @@ mod tests {
     fn interrupted_destroy_finishes_in_flight_and_undispatched_outcomes() {
         let output = SharedProgressWriter::default();
         let progress = ProgressBackend::plain(output.clone());
-        progress.start(0, "Delete in-flight");
+        progress.start_indexed(0, "Delete in-flight");
         let completed = HashSet::from([2]);
+        let dispatched = HashSet::from([0]);
 
-        let emitted =
-            finish_interrupted_destroy_outcomes(&progress, &[0, 1, 2], &completed, |idx| {
-                format!("⊘ Delete resource-{idx} - interrupted")
-            });
+        let counts = finish_interrupted_destroy_outcomes(
+            &progress,
+            &[0, 1, 2],
+            &completed,
+            &dispatched,
+            |idx, outcome| match outcome {
+                InterruptedDestroyOutcome::Unknown => NonFailureOutcome::unknown(format!(
+                    "Delete resource-{idx} - interrupted (outcome unknown)"
+                )),
+                InterruptedDestroyOutcome::Skipped => NonFailureOutcome::skipped(format!(
+                    "Delete resource-{idx} - skipped (destroy cancelled)"
+                )),
+            },
+        );
 
-        assert_eq!(emitted, 2);
+        assert_eq!(
+            counts,
+            InterruptedDestroyCounts {
+                skipped: 1,
+                unknown: 1,
+            }
+        );
         assert_eq!(
             String::from_utf8(output.0.lock().unwrap().clone()).unwrap(),
             concat!(
-                "  ⊘ Delete resource-0 - interrupted\n",
-                "  ⊘ Delete resource-1 - interrupted\n",
+                "  ? Delete resource-0 - interrupted (outcome unknown)\n",
+                "  ⊘ Delete resource-1 - skipped (destroy cancelled)\n",
             )
+        );
+    }
+
+    #[test]
+    fn destroy_summaries_keep_unknown_outcomes_separate_from_skips() {
+        assert_eq!(
+            format_destroy_interrupted_summary(1, 2, 3, 1),
+            "Destroy interrupted. 1 succeeded, 2 failed, 3 skipped, 1 outcome unknown."
+        );
+        assert_eq!(
+            format_destroy_interrupted_summary(1, 2, 3, 2),
+            "Destroy interrupted. 1 succeeded, 2 failed, 3 skipped, 2 outcomes unknown."
+        );
+        assert_eq!(
+            format_destroy_failure_summary(1, 2, 3, 0),
+            "Destroy failed. 1 succeeded, 2 failed, 3 skipped."
         );
     }
 

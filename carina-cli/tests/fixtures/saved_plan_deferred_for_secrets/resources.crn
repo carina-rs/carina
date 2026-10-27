@@ -1,0 +1,44 @@
+let simple_seed = mock.test.resource {
+  name = "simple-seed"
+
+  rule {
+    action = "simple-child"
+  }
+}
+
+let simple_children = for rule in simple_seed.rules {
+  mock.test.resource {
+    name    = rule.action
+    comment = secret(env("SAVED_PLAN_DEFERRED_FOR_SECRET_3990"))
+  }
+}
+
+let indexed_seed = mock.test.resource {
+  name = "indexed-seed"
+
+  rule {
+    action = "indexed-child"
+  }
+}
+
+let indexed_children = for (index, rule) in indexed_seed.rules {
+  mock.test.resource {
+    name    = "${rule.action}-${index}"
+    comment = secret(env("SAVED_PLAN_DEFERRED_FOR_SECRET_3990"))
+  }
+}
+
+let mapped_seed = mock.test.resource {
+  name = "mapped-seed"
+  tags = {
+    alpha = "mapped-child-a"
+    beta  = "mapped-child-b"
+  }
+}
+
+let mapped_children = for key, child_name in mapped_seed.tags {
+  mock.test.resource {
+    name    = "${child_name}-${key}"
+    comment = secret(env("SAVED_PLAN_DEFERRED_FOR_SECRET_3990"))
+  }
+}

@@ -12,8 +12,9 @@ use carina_core::parser::ProviderConfig;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome,
     CreateRequest, DeleteRequest, Observation, PartialReadDiagnostic, PatchOp, PendingToken,
-    Provider, ProviderError, ProviderResult, ReadOutcome, ReadRequest, Resume as CoreResume,
-    ResumeCreateRequest, ResumeFailure, ResumeOutcome, Sent, UpdateOutcome, UpdateRequest,
+    Provider, ProviderError, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
+    Resume as CoreResume, ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent,
+    StateTransformMap, UpdateOutcome, UpdateRequest,
 };
 #[cfg(test)]
 use carina_core::provider::{
@@ -175,6 +176,30 @@ pub fn builtin_schemas() -> Vec<ResourceSchema> {
             .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
             .attribute(AttributeSchema::new("parent", AttributeType::string()))
             .attribute(AttributeSchema::new("parent_name", AttributeType::string()))
+            .with_unique_name_attribute("name"),
+        ResourceSchema::new("test.deferred_source")
+            .attribute(
+                AttributeSchema::new("name", AttributeType::string())
+                    .required()
+                    .create_only(),
+            )
+            .attribute(
+                AttributeSchema::new(
+                    "replacement_options",
+                    AttributeType::map(AttributeType::string()),
+                )
+                .create_only(),
+            )
+            .attribute(
+                AttributeSchema::new(
+                    "generated_rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "GeneratedRule",
+                        vec![StructField::new("action", AttributeType::string())],
+                    )),
+                )
+                .read_only(),
+            )
             .with_unique_name_attribute("name"),
         ResourceSchema::new("compute.Instance")
             .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
@@ -493,6 +518,16 @@ impl MockProvider {
             let key = Self::resolved_resource_key(id)?;
             Self::append_op_log(path, op, &key).map_err(|e| {
                 ProviderError::internal_caused_by("Failed to append operation log", e)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn append_normalizer_log_if_configured(op: &str, id: &ResourceId) -> ProviderResult<()> {
+        if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+            let key = Self::resource_key(id).unwrap_or_else(|| id.to_string());
+            Self::append_op_log(path, op, &key).map_err(|error| {
+                ProviderError::internal_caused_by("Failed to append operation log", error)
             })?;
         }
         Ok(())
@@ -914,6 +949,7 @@ impl MockProvider {
         &self,
         id: &ResourceId,
     ) -> ProviderResult<Option<HashMap<String, Value>>> {
+        Self::append_op_log_if_configured("read", id)?;
         let mut read_outcome = None;
         if let Some(delay) = Self::read_delay_for(id) {
             read_outcome = Some(ReadOutcomeGuard::from_env());
@@ -944,6 +980,54 @@ impl MockProvider {
 impl Default for MockProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ProviderNormalizer for MockProvider {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for resource in resources
+                .iter()
+                .filter(|resource| resource.id.provider == BUILTIN_PROVIDER_NAME)
+            {
+                Self::append_normalizer_log_if_configured("normalize_desired", &resource.id)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        current_states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (id, _state) in current_states
+                .iter()
+                .filter(|(id, _state)| id.provider == BUILTIN_PROVIDER_NAME)
+            {
+                Self::append_normalizer_log_if_configured("normalize_state", id)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        current_states: &'a mut StateTransformMap,
+        _saved_attrs: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (id, _state) in current_states
+                .iter()
+                .filter(|(id, _state)| id.provider == BUILTIN_PROVIDER_NAME)
+            {
+                Self::append_normalizer_log_if_configured("hydrate_read_state", id)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2051,6 +2135,76 @@ mod tests {
             "create test.resource.web-acl-new\n\
              update test.resource.web-acl-new\n\
              delete test.resource.web-acl-new\n"
+        );
+    }
+
+    #[test]
+    fn op_log_records_provider_reads() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        let log_path = tmp.path().join("op.log");
+        let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
+        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
+        let provider = MockProvider {
+            state_file,
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "read-me", None);
+        let resource = Resource::with_provider("mock", "test.resource", "read-me", None)
+            .with_attribute("name", string_value("read-me"));
+        let identifier = AppliedIdentifier::new("mock-id").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            dispatch_mock_create(&provider, id.clone(), resource)
+                .await
+                .expect("create should succeed");
+            fs::write(&log_path, "").expect("clear create log");
+            provider
+                .read(&id, &identifier, ReadRequest)
+                .await
+                .expect("read should succeed");
+        });
+
+        assert_eq!(
+            fs::read_to_string(log_path).unwrap(),
+            "read test.resource.read-me\n"
+        );
+    }
+
+    #[test]
+    fn op_log_records_normalizer_calls() {
+        use carina_core::provider::ProviderNormalizer;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("op.log");
+        let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
+        let provider = MockProvider {
+            state_file: tmp.path().join("mock-state.json"),
+            partial_create: None,
+            partial_update: None,
+        };
+        let mut resources = vec![Resource::with_provider(
+            "mock",
+            "test.resource",
+            "normalize-me",
+            None,
+        )];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(provider.normalize_desired(&mut resources))
+            .expect("normalizer should succeed");
+
+        assert_eq!(
+            fs::read_to_string(log_path).unwrap(),
+            "normalize_desired test.resource.normalize-me\n"
         );
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,10 @@ use carina_core::parser::{
 use carina_core::plan::Plan;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
-use carina_core::resource::{ConcreteValue, Current, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    Composition, ConcreteValue, Current, DataSource, Resource, ResourceId, State, Value,
+};
+use carina_core::schema::SchemaKind;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_core::value::{
@@ -32,6 +35,7 @@ use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
+use crate::commands::shared::progress::ProgressSink;
 use crate::display::print_plan;
 use crate::error::AppError;
 #[cfg(test)]
@@ -51,6 +55,62 @@ use crate::wiring::{
 };
 use carina_core::hint::ProjectCommand;
 
+fn schema_kind_label(kind: SchemaKind) -> &'static str {
+    match kind {
+        SchemaKind::Resource => "managed",
+        SchemaKind::DataSource => "data source",
+    }
+}
+
+/// Presence and, when present, semantic identity of one referenced schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeSchemaFingerprint {
+    Present(String),
+    Absent,
+}
+
+/// One schema in a provider fingerprint, retained so apply can identify a
+/// changed or vanished type without persisting the full provider schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSchemaTypeFingerprint {
+    pub kind: SchemaKind,
+    pub resource_type: String,
+    pub fingerprint: TypeSchemaFingerprint,
+}
+
+/// Fingerprint of exactly the provider schemas referenced by one saved plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSchemaFingerprint {
+    pub schemas: Vec<PlanSchemaTypeFingerprint>,
+}
+
+/// Provider schema snapshot persisted in a saved plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSchemaFingerprints {
+    pub providers: BTreeMap<String, ProviderSchemaFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanSchemaReference {
+    provider: String,
+    kind: SchemaKind,
+    resource_type: String,
+}
+
+/// Immutable inventory of schema types referenced by a decoded saved plan.
+///
+/// Saved-plan apply captures this before the locked-state reload consumes
+/// `PlanFile::current_states`, then carries it to schema verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanSchemaReferences(BTreeSet<PlanSchemaReference>);
+
+/// Structured comparison failure consumed by the saved-plan apply typestate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanSchemaFingerprintMismatch {
+    pub(crate) providers: BTreeMap<String, Vec<String>>,
+}
+
 /// Saved plan file for `plan --out` / `apply <plan-file>`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanFile {
@@ -60,11 +120,11 @@ pub struct PlanFile {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 21 explicitly tags managed and data-source current-state
-    /// entries, and explicitly tags each managed [`Current`] variant. A
-    /// serialized `Present` row is classified again through
-    /// [`Current::from_state`] when decoded, so the tag cannot mint an invalid
-    /// provider identifier.
+    /// Plan format 23 adds the mandatory `schema_fingerprints` snapshot. Plan
+    /// format 21 explicitly tags managed and data-source current-state entries,
+    /// and explicitly tags each managed [`Current`] variant. A serialized
+    /// `Present` row is classified again through [`Current::from_state`] when
+    /// decoded, so the tag cannot mint an invalid provider identifier.
     pub version: u32,
     /// Carina version that created this plan
     pub carina_version: String,
@@ -171,10 +231,138 @@ pub struct PlanFile {
     /// Empty when the configuration declares no `wait` bindings.
     #[serde(default)]
     pub wait_bindings: Vec<PlanWaitBinding>,
+    /// Canonical fingerprints of exactly the managed and data-source schemas
+    /// this plan used. This field is mandatory in plan format 23.
+    pub schema_fingerprints: PlanSchemaFingerprints,
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 22;
+    pub const CURRENT_VERSION: u32 = 23;
+
+    /// Capture the exact schema type inventory reached by this plan.
+    pub fn record_schema_fingerprints(&mut self, schemas: &carina_core::schema::SchemaRegistry) {
+        let references = self.referenced_schema_types();
+        self.schema_fingerprints = PlanSchemaFingerprints::capture(&references, schemas);
+    }
+
+    pub(crate) fn referenced_schema_types(&self) -> PlanSchemaReferences {
+        fn insert(
+            references: &mut BTreeSet<PlanSchemaReference>,
+            id: &ResourceId,
+            kind: SchemaKind,
+        ) {
+            references.insert(PlanSchemaReference {
+                provider: id.provider.clone(),
+                kind,
+                resource_type: id.resource_type.clone(),
+            });
+        }
+
+        let mut references = BTreeSet::new();
+        for effect in self.plan.effects() {
+            match effect {
+                Effect::Read { resource } => {
+                    insert(&mut references, &resource.id, SchemaKind::DataSource);
+                }
+                Effect::Create(resource) => {
+                    insert(&mut references, &resource.id, SchemaKind::Resource);
+                }
+                Effect::ResumeCreate {
+                    resource,
+                    started_at: _started_at,
+                } => {
+                    insert(&mut references, &resource.id, SchemaKind::Resource);
+                }
+                Effect::Update {
+                    from,
+                    identifier: _identifier,
+                    to,
+                    changed_attributes: _changed_attributes,
+                } => {
+                    insert(&mut references, &from.id, SchemaKind::Resource);
+                    insert(&mut references, &to.id, SchemaKind::Resource);
+                }
+                Effect::Delete {
+                    id,
+                    identifier: _identifier,
+                    generation: _generation,
+                    directives: _directives,
+                    binding: _binding,
+                    dependencies: _dependencies,
+                    explicit_dependencies: _explicit_dependencies,
+                    blocked_by_updates: _blocked_by_updates,
+                } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
+                Effect::Import {
+                    id,
+                    identifier: _identifier,
+                } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
+                Effect::Remove { id } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
+                Effect::DeferredCreate { id: _id, template } => {
+                    insert(
+                        &mut references,
+                        &template.template_resource.id,
+                        SchemaKind::Resource,
+                    );
+                }
+                Effect::Move { from, to } => {
+                    insert(&mut references, from, SchemaKind::Resource);
+                    insert(&mut references, to, SchemaKind::Resource);
+                }
+                Effect::Wait {
+                    identity: _identity,
+                    target_id,
+                    target_schema_kind,
+                    until: _until,
+                    until_surface: _until_surface,
+                    timeout: _timeout,
+                    interval: _interval,
+                    explicit_dependencies: _explicit_dependencies,
+                } => {
+                    insert(&mut references, target_id, *target_schema_kind);
+                }
+                Effect::DeferredReplace(payload) => {
+                    insert(
+                        &mut references,
+                        &payload.template.template_resource.id,
+                        SchemaKind::Resource,
+                    );
+                    for delete in &payload.deletes {
+                        insert(&mut references, &delete.id, SchemaKind::Resource);
+                    }
+                }
+            }
+        }
+
+        for resource in &self.sorted_resources {
+            insert(&mut references, &resource.id, SchemaKind::Resource);
+        }
+        for resource in &self.unresolved_resources {
+            insert(&mut references, &resource.id, SchemaKind::Resource);
+        }
+        for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
+            insert(&mut references, &data_source.id, SchemaKind::DataSource);
+        }
+        for current in &self.current_states {
+            match current {
+                CurrentStateEntry::Managed {
+                    id,
+                    current: _current,
+                } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
+                CurrentStateEntry::DataSource { id, state: _state } => {
+                    insert(&mut references, id, SchemaKind::DataSource);
+                }
+            }
+        }
+        PlanSchemaReferences(references)
+    }
 
     /// Reload state-owned create continuations after the saved-plan apply has
     /// acquired its state lock. The plan contains only an address and marker;
@@ -387,6 +575,7 @@ impl PlanFile {
             upstream_snapshot,
             upstream_sources: _upstream_sources,
             wait_bindings: _wait_bindings,
+            schema_fingerprints: _schema_fingerprints,
         } = self;
 
         provider_configs.contains_redacted_secret()
@@ -573,6 +762,230 @@ impl PlanFile {
         }
 
         Ok(())
+    }
+}
+
+impl PlanSchemaFingerprints {
+    fn capture(
+        references: &PlanSchemaReferences,
+        registry: &carina_core::schema::SchemaRegistry,
+    ) -> Self {
+        let mut grouped = BTreeMap::<String, Vec<PlanSchemaTypeFingerprint>>::new();
+
+        for reference in &references.0 {
+            let fingerprint = registry
+                .get(
+                    &reference.provider,
+                    &reference.resource_type,
+                    reference.kind,
+                )
+                .map_or(TypeSchemaFingerprint::Absent, |schema| {
+                    TypeSchemaFingerprint::Present(schema.semantic_fingerprint())
+                });
+            grouped.entry(reference.provider.clone()).or_default().push(
+                PlanSchemaTypeFingerprint {
+                    kind: reference.kind,
+                    resource_type: reference.resource_type.clone(),
+                    fingerprint,
+                },
+            );
+        }
+
+        let providers = grouped
+            .into_iter()
+            .map(|(provider, mut schemas)| {
+                schemas.sort_by(|left, right| {
+                    (left.kind, left.resource_type.as_str())
+                        .cmp(&(right.kind, right.resource_type.as_str()))
+                });
+                (provider, ProviderSchemaFingerprint { schemas })
+            })
+            .collect();
+        Self { providers }
+    }
+
+    fn verify(
+        &self,
+        references: &PlanSchemaReferences,
+        registry: &carina_core::schema::SchemaRegistry,
+    ) -> Result<(), PlanSchemaFingerprintMismatch> {
+        let mut expected_by_provider = BTreeMap::<String, Vec<PlanSchemaReference>>::new();
+        for reference in &references.0 {
+            expected_by_provider
+                .entry(reference.provider.clone())
+                .or_default()
+                .push(reference.clone());
+        }
+
+        let providers = expected_by_provider
+            .keys()
+            .chain(self.providers.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut mismatches = BTreeMap::new();
+        for provider in providers {
+            let expected = expected_by_provider
+                .get(&provider)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let saved = self.providers.get(&provider);
+            let mut changed_types = Vec::new();
+            let mut saved_by_type = BTreeMap::new();
+            if let Some(saved) = saved {
+                for schema in &saved.schemas {
+                    let key = (schema.kind, schema.resource_type.as_str());
+                    if saved_by_type.insert(key, schema).is_some() {
+                        changed_types.push(format!(
+                            "{} `{}` (duplicate fingerprint entry)",
+                            schema_kind_label(schema.kind),
+                            schema.resource_type,
+                        ));
+                    }
+                }
+            }
+
+            let expected_keys = expected
+                .iter()
+                .map(|reference| (reference.kind, reference.resource_type.as_str()))
+                .collect::<BTreeSet<_>>();
+            for reference in expected {
+                let key = (reference.kind, reference.resource_type.as_str());
+                let Some(recorded) = saved_by_type.get(&key) else {
+                    changed_types.push(format!(
+                        "{} `{}` (not recorded)",
+                        schema_kind_label(reference.kind),
+                        reference.resource_type,
+                    ));
+                    continue;
+                };
+                let current = registry.get(
+                    &reference.provider,
+                    &reference.resource_type,
+                    reference.kind,
+                );
+                match (&recorded.fingerprint, current) {
+                    (TypeSchemaFingerprint::Absent, None) => {}
+                    (TypeSchemaFingerprint::Absent, Some(_)) => changed_types.push(format!(
+                        "{} `{}` (schema is now present)",
+                        schema_kind_label(reference.kind),
+                        reference.resource_type,
+                    )),
+                    (TypeSchemaFingerprint::Present(_), None) => changed_types.push(format!(
+                        "{} `{}` (missing)",
+                        schema_kind_label(reference.kind),
+                        reference.resource_type,
+                    )),
+                    (TypeSchemaFingerprint::Present(recorded), Some(current))
+                        if current.semantic_fingerprint() != *recorded =>
+                    {
+                        changed_types.push(format!(
+                            "{} `{}` (changed)",
+                            schema_kind_label(reference.kind),
+                            reference.resource_type,
+                        ));
+                    }
+                    (TypeSchemaFingerprint::Present(_), Some(_)) => {}
+                }
+            }
+
+            for schema in saved_by_type.values() {
+                if !expected_keys.contains(&(schema.kind, schema.resource_type.as_str())) {
+                    changed_types.push(format!(
+                        "{} `{}` (not referenced by plan)",
+                        schema_kind_label(schema.kind),
+                        schema.resource_type,
+                    ));
+                }
+            }
+
+            if !changed_types.is_empty() {
+                changed_types.sort();
+                changed_types.dedup();
+                mismatches.insert(provider, changed_types);
+            }
+        }
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(PlanSchemaFingerprintMismatch {
+                providers: mismatches,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_fingerprint_tests {
+    use super::*;
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+    fn reference(provider: &str, resource_type: &str) -> PlanSchemaReference {
+        PlanSchemaReference {
+            provider: provider.to_string(),
+            kind: SchemaKind::Resource,
+            resource_type: resource_type.to_string(),
+        }
+    }
+
+    fn schema(resource_type: &str, attribute: &str) -> ResourceSchema {
+        ResourceSchema::new(resource_type)
+            .attribute(AttributeSchema::new(attribute, AttributeType::string()))
+    }
+
+    #[test]
+    fn capture_accepts_a_referenced_type_without_a_loaded_schema() {
+        let references =
+            PlanSchemaReferences(BTreeSet::from([reference("retired", "example.Gone")]));
+        let saved = PlanSchemaFingerprints::capture(&references, &SchemaRegistry::new());
+        assert_eq!(
+            saved.providers["retired"].schemas[0].fingerprint,
+            TypeSchemaFingerprint::Absent,
+            "state-only effects must persist an absent schema"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_absent_to_present_schema_transition() {
+        let references =
+            PlanSchemaReferences(BTreeSet::from([reference("provider", "example.Gone")]));
+        let saved = PlanSchemaFingerprints::capture(&references, &SchemaRegistry::new());
+        let mut current = SchemaRegistry::new();
+        current.insert("provider", schema("example.Gone", "name"));
+
+        let mismatch = saved
+            .verify(&references, &current)
+            .expect_err("schema presence changes must invalidate the plan");
+        assert_eq!(
+            mismatch.providers["provider"],
+            vec!["managed `example.Gone` (schema is now present)"]
+        );
+    }
+
+    #[test]
+    fn verify_reports_mismatches_from_every_provider() {
+        let references = PlanSchemaReferences(BTreeSet::from([
+            reference("alpha", "example.One"),
+            reference("beta", "example.Two"),
+        ]));
+        let mut planned = SchemaRegistry::new();
+        planned.insert("alpha", schema("example.One", "old"));
+        planned.insert("beta", schema("example.Two", "old"));
+        let saved = PlanSchemaFingerprints::capture(&references, &planned);
+
+        let mut current = SchemaRegistry::new();
+        current.insert("alpha", schema("example.One", "new"));
+        current.insert("beta", schema("example.Two", "new"));
+        let mismatch = saved
+            .verify(&references, &current)
+            .expect_err("both providers changed");
+        assert_eq!(
+            mismatch
+                .providers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
     }
 }
 
@@ -860,6 +1273,10 @@ impl ReloadedCurrentStateEntry {
 }
 
 /// A decoded saved plan that has crossed the locked-state reload boundary.
+///
+/// The embedded `PlanFile::current_states` has been consumed and is never
+/// exposed through this type. Runtime current states live only in the sibling
+/// `current_states` field below.
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
     plan_file: PlanFile,
@@ -867,12 +1284,86 @@ pub(crate) struct ReloadedPlanFile {
 }
 
 impl ReloadedPlanFile {
-    pub(crate) fn plan_file(&self) -> &PlanFile {
-        &self.plan_file
+    pub(crate) fn verify_schema_fingerprints(
+        &self,
+        references: &PlanSchemaReferences,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<(), PlanSchemaFingerprintMismatch> {
+        self.plan_file
+            .schema_fingerprints
+            .verify(references, schemas)
     }
 
-    pub(crate) fn plan_file_mut(&mut self) -> &mut PlanFile {
-        &mut self.plan_file
+    pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
+        &self.plan_file.provider_configs
+    }
+
+    pub(crate) fn provider_configs_mut(&mut self) -> &mut SavedProviderConfigs {
+        &mut self.plan_file.provider_configs
+    }
+
+    pub(crate) fn plan(&self) -> &Plan {
+        &self.plan_file.plan
+    }
+
+    pub(crate) fn plan_mut(&mut self) -> &mut Plan {
+        &mut self.plan_file.plan
+    }
+
+    pub(crate) fn sorted_resources(&self) -> &[Resource] {
+        &self.plan_file.sorted_resources
+    }
+
+    pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<Resource> {
+        &mut self.plan_file.sorted_resources
+    }
+
+    pub(crate) fn unresolved_resources(&self) -> &[Resource] {
+        &self.plan_file.unresolved_resources
+    }
+
+    pub(crate) fn unresolved_resources_mut(&mut self) -> &mut Vec<Resource> {
+        &mut self.plan_file.unresolved_resources
+    }
+
+    pub(crate) fn compositions(&self) -> &[Composition] {
+        &self.plan_file.compositions
+    }
+
+    pub(crate) fn compositions_mut(&mut self) -> &mut Vec<Composition> {
+        &mut self.plan_file.compositions
+    }
+
+    pub(crate) fn data_sources(&self) -> &[DataSource] {
+        &self.plan_file.data_sources
+    }
+
+    pub(crate) fn data_sources_mut(&mut self) -> &mut Vec<DataSource> {
+        &mut self.plan_file.data_sources
+    }
+
+    pub(crate) fn data_source_origins(&self) -> &[DataSource] {
+        &self.plan_file.data_source_origins
+    }
+
+    pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<DataSource> {
+        &mut self.plan_file.data_source_origins
+    }
+
+    pub(crate) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
+        &self.plan_file.upstream_snapshot
+    }
+
+    pub(crate) fn upstream_snapshot_mut(&mut self) -> &mut HashMap<String, HashMap<String, Value>> {
+        &mut self.plan_file.upstream_snapshot
+    }
+
+    pub(crate) fn upstream_sources(&self) -> &[UpstreamSource] {
+        &self.plan_file.upstream_sources
+    }
+
+    pub(crate) fn wait_bindings(&self) -> &[PlanWaitBinding] {
+        &self.plan_file.wait_bindings
     }
 
     pub(crate) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
@@ -1076,6 +1567,7 @@ mod managed_current_serde_tests {
             upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
+            schema_fingerprints: Default::default(),
         }
     }
 
@@ -1294,6 +1786,7 @@ fn build_plan_file<E>(
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
     assert_eq!(
         ctx.data_sources.len(),
@@ -1421,7 +1914,11 @@ fn build_plan_file<E>(
         .map(|resource| (resource.id.clone(), resource.clone()))
         .collect();
 
-    Ok(PlanFile {
+    let mut plan_file = PlanFile {
+        // carina#3983: bumped 22→23 — saved plans bind every referenced
+        // managed/data-source type to the canonical provider schema used by
+        // planning. Apply must verify this snapshot before provider I/O.
+        //
         // carina#3909: bumped 20→21 — in-flight create snapshots store only
         // their resource address and a marker. Apply reloads the continuation
         // token from locked state and rejects either direction of status change.
@@ -1571,12 +2068,15 @@ fn build_plan_file<E>(
                 target: wb.target.as_str().to_string(),
             })
             .collect(),
-    })
+        schema_fingerprints: PlanSchemaFingerprints::default(),
+    };
+    plan_file.record_schema_fingerprints(schemas);
+    Ok(plan_file)
 }
 
-/// Format a `SerializationError` from `build_plan_file` into the
-/// CLI's "cannot save plan" diagnostic, suggesting the caller drop
-/// `flag` (e.g. `--json`, `--out`) to fall back to display-only.
+/// Format a `SerializationError` from `build_plan_file` into the CLI's
+/// "cannot save plan" diagnostic, suggesting the caller drop `flag` (for
+/// example `--json` or `--out`) to fall back to display-only output.
 fn format_plan_save_error(e: &carina_core::value::SerializationError, flag: &str) -> String {
     match e {
         carina_core::value::SerializationError::UnknownNotAllowed { reason, .. } => format!(
@@ -1728,6 +2228,11 @@ pub async fn run_plan(
     strict_iam: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
+    let progress_sink = if json || tui {
+        ProgressSink::MachineStdout
+    } else {
+        ProgressSink::Human
+    };
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -1858,8 +2363,8 @@ pub async fn run_plan(
         let backend_resource_type = plan_backend
             .resource_type()
             .ok_or("Backend does not specify a resource type")?;
-        println!("{}", "Bootstrap Plan:".cyan().bold());
-        println!(
+        progress_sink.line("Bootstrap Plan:".cyan().bold());
+        progress_sink.line(format!(
             "  {} {} (state bucket)",
             "+".green(),
             format!(
@@ -1867,12 +2372,12 @@ pub async fn run_plan(
                 backend_provider, backend_resource_type, state_bucket_name
             )
             .green()
-        );
-        println!(
+        ));
+        progress_sink.line(format!(
             "  {} Resource definition will be added to .crn file",
             "→".cyan()
-        );
-        println!();
+        ));
+        progress_sink.blank_line();
     }
 
     let PreparedPlanIdentityInputs {
@@ -1904,17 +2409,18 @@ pub async fn run_plan(
     // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &wiring,
-        &mut canonical_resources,
+        canonical_resources,
         provider_inputs.configs(),
         &state_file,
         refresh,
+        progress_sink,
         provider_inputs.remote_bindings(),
         &state_block_claims,
         &resolved_state_block_targets,
         base_dir,
     )
     .await?;
-    let parsed = canonical_resources.parsed();
+    let parsed = ctx.parsed();
     // TOCTOU drift detection (#3111). `plan` took no state lock, so a
     // concurrent apply/destroy may have written state while the diff
     // above was being computed. Re-read state now and compare against
@@ -2021,6 +2527,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
+            wiring.schemas(),
         )
         .map_err(|e| format_plan_save_error(&e, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
@@ -2080,6 +2587,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
+            wiring.schemas(),
         )
         .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
@@ -2111,20 +2619,18 @@ pub async fn run_plan(
     )?;
 
     if let Some(out_path) = out {
-        println!();
-        println!(
-            "{}",
+        progress_sink.blank_line();
+        progress_sink.line(
             format!("Plan saved to {}", out_path.display())
                 .green()
-                .bold()
+                .bold(),
         );
-        println!(
-            "{}",
+        progress_sink.line(
             format!(
                 "To apply this plan, run: `{}`",
                 ProjectCommand::new("apply", out_path)
             )
-            .cyan()
+            .cyan(),
         );
     }
 
@@ -2196,6 +2702,28 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     let parsed = canonical_resources.parsed();
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let wiring = WiringContext::new(factories, &parsed.providers);
+    prepare_plan_identity_and_provider_inputs_with_wiring(
+        canonical_resources,
+        state_file,
+        base_dir,
+        provider_context,
+        upstream_policy,
+        wiring,
+    )
+    .await
+}
+
+/// The saved-plan path supplies a schema context that it has already used to
+/// validate the plan fingerprint. Keeping that context avoids loading a
+/// second plugin or running any provider preparation before the check.
+pub(crate) async fn prepare_plan_identity_and_provider_inputs_with_wiring(
+    canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
+    state_file: &mut Option<StateFile>,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+    upstream_policy: UpstreamMissingStatePolicy,
+    wiring: WiringContext,
+) -> Result<PreparedPlanIdentityInputs, AppError> {
     reconcile_canonical_prefixed_names(canonical_resources, state_file);
     let parsed = canonical_resources.parsed();
     let state_blocks = crate::wiring::resolve_state_blocks(
@@ -3768,6 +4296,7 @@ mod run_plan_out_tests {
             None,
             &Some(state_file),
             &ctx,
+            WiringContext::new(Vec::new(), &[]).schemas(),
         )
         .expect("saved plan should serialize");
         let Effect::Create(created_effect) = &saved.plan.effects()[0] else {
@@ -4120,8 +4649,16 @@ mod run_plan_out_tests {
             &ProviderContext::default(),
         )
         .unwrap();
-        let plan_file = build_plan_file(&path, &parsed, &provider_configs, None, &None, &ctx)
-            .expect("saved plan should serialize");
+        let plan_file = build_plan_file(
+            &path,
+            &parsed,
+            &provider_configs,
+            None,
+            &None,
+            &ctx,
+            WiringContext::new(Vec::new(), &[]).schemas(),
+        )
+        .expect("saved plan should serialize");
 
         let saved = plan_file.data_sources[0]
             .get_attr("name_regex")
@@ -4200,8 +4737,16 @@ mod run_plan_out_tests {
             &ProviderContext::default(),
         )
         .unwrap();
-        let plan_file = build_plan_file(&path, &parsed, &provider_configs, None, &None, &ctx)
-            .expect("saved plan should serialize prepared compositions");
+        let plan_file = build_plan_file(
+            &path,
+            &parsed,
+            &provider_configs,
+            None,
+            &None,
+            &ctx,
+            WiringContext::new(Vec::new(), &[]).schemas(),
+        )
+        .expect("saved plan should serialize prepared compositions");
 
         assert_eq!(plan_file.compositions.len(), 1);
         assert_eq!(
@@ -4248,9 +4793,17 @@ mod run_plan_out_tests {
         )
         .unwrap();
 
-        let error = build_plan_file(&path, &parsed, &provider_configs, None, &None, &ctx)
-            .expect_err("a secret-bearing upstream snapshot must be rejected")
-            .to_string();
+        let error = build_plan_file(
+            &path,
+            &parsed,
+            &provider_configs,
+            None,
+            &None,
+            &ctx,
+            WiringContext::new(Vec::new(), &[]).schemas(),
+        )
+        .expect_err("a secret-bearing upstream snapshot must be rejected")
+        .to_string();
         assert!(
             error.contains("upstream_state network.password"),
             "saved-plan error lost the upstream field location: {error}",

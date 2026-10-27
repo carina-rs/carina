@@ -1,0 +1,18 @@
+attributes {
+  ready: String = "yes"
+}
+
+let module_seed = mock.test.resource {
+  name = "module-seed"
+
+  rule {
+    action = "module-child"
+  }
+}
+
+let module_children = for rule in module_seed.rules {
+  mock.test.resource {
+    name    = rule.action
+    comment = secret(env("SAVED_PLAN_DEFERRED_FOR_SECRET_3990"))
+  }
+}

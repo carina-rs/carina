@@ -700,6 +700,7 @@ fn node_from_effect(
         Effect::Wait {
             identity,
             target_id,
+            target_schema_kind: _,
             until: _,
             until_surface: _,
             timeout: _,

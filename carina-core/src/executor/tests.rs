@@ -244,6 +244,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             create_effect(wait_target.clone()),
             Effect::Wait {
                 identity: ResourceIdentity::new("wait_ready"),
+                target_schema_kind: crate::schema::SchemaKind::Resource,
                 target_id: crate::resource::ResolvedResourceId::new(wait_target.id.clone()),
                 until: WaitPredicate::equals(
                     AttrPath::single("status"),
@@ -4256,6 +4257,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("target_ready"),
+        target_schema_kind: crate::schema::SchemaKind::Resource,
         target_id: crate::resource::ResolvedResourceId::new(target_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -4495,6 +4497,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_ready"),
+        target_schema_kind: crate::schema::SchemaKind::Resource,
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -4563,6 +4566,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_ready"),
+        target_schema_kind: crate::schema::SchemaKind::Resource,
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8020,6 +8024,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
+        target_schema_kind: crate::schema::SchemaKind::Resource,
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8177,6 +8182,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
+        target_schema_kind: crate::schema::SchemaKind::Resource,
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8285,6 +8291,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
+        target_schema_kind: crate::schema::SchemaKind::Resource,
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8917,6 +8924,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
         identity: ResourceIdentity::new("cert_issued"),
+        target_schema_kind: crate::schema::SchemaKind::Resource,
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),

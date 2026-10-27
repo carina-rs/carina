@@ -1225,6 +1225,7 @@ mod tests {
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: crate::schema::SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -1327,6 +1328,7 @@ mod tests {
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: crate::schema::SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),

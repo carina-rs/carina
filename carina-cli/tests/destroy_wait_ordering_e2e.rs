@@ -352,9 +352,16 @@ fn destroy_timeout_fails_and_skips_dependency_as_dependent_failed() {
     assert_failure("carina destroy", &output);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("Operation timed out"),
-        "timed-out delete should be reported as a failure; stdout:\n{stdout}"
+        stderr.contains("✗ Delete mock.test.resource lst")
+            && stderr.contains("Operation timed out"),
+        "timed-out delete should be identified with its detail on stderr; stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("✗ Delete mock.test.resource lst")
+            && !stdout.contains("Operation timed out"),
+        "timed-out delete must not be duplicated on stdout; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("skipped (dependent lst failed)"),

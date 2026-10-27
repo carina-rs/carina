@@ -258,6 +258,280 @@ fn inspected_saved_plan(plan_file: PlanFile) -> InspectedPlanFile {
     InspectedPlanFile::inspect(plan_file)
 }
 
+fn mock_schema_registry(schemas: impl IntoIterator<Item = ResourceSchema>) -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
+    for schema in schemas {
+        registry.insert("mock", schema);
+    }
+    registry
+}
+
+fn record_builtin_mock_schema_fingerprints(plan_file: &mut PlanFile) {
+    plan_file.record_schema_fingerprints(&mock_schema_registry(
+        carina_provider_mock::builtin_schemas(),
+    ));
+}
+
+async fn run_saved_plan_schema_fingerprint_case(
+    planning_schemas: &SchemaRegistry,
+    resource_type: &str,
+    identity: &str,
+    secret_bearing: bool,
+) -> (Result<Option<Duration>, AppError>, String) {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    let op_log_path = tmp.path().join("provider-operations.log");
+    std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
+    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
+        "CARINA_MOCK_STATE_FILE",
+        &mock_state_path,
+    );
+    let _op_log = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
+        "CARINA_MOCK_OP_LOG",
+        &op_log_path,
+    );
+
+    let mut resource = Resource::with_provider(
+        "mock",
+        resource_type,
+        ResourceIdentity::try_from(identity.to_string()).expect("non-empty fixture identity"),
+        None,
+    )
+    .with_attribute("name", string_value(identity));
+    if secret_bearing {
+        resource.set_attr(
+            "name",
+            Value::Deferred(DeferredValue::Secret(Box::new(string_value(identity)))),
+        );
+        resource = carina_core::value::redact_secrets_in_resource(&resource)
+            .expect("redact saved-plan secret fixture");
+    }
+    let resource_id = resource.id.clone();
+    let mut plan = Plan::new();
+    plan.add(carina_core::effect::Effect::Create(resolved(
+        resource.clone(),
+    )));
+    let mut plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-27T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan,
+        sorted_resources: vec![resource.clone()],
+        unresolved_resources: vec![resource],
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
+            resource_id.clone(),
+            State::not_found(resource_id),
+        )],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
+    };
+    plan_file.record_schema_fingerprints(planning_schemas);
+
+    let observer_factory = fixture.observer_factory();
+    let result = run_apply_from_plan_locked(
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("."),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await;
+    let operations = std::fs::read_to_string(op_log_path).unwrap_or_default();
+    (result, operations)
+}
+
+#[tokio::test]
+async fn saved_plan_apply_rejects_removed_provider_type_before_provider_call() {
+    let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())]);
+
+    let (result, operations) =
+        run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "gone", false)
+            .await;
+    let error = result.expect_err("a removed planned type must invalidate the saved plan");
+    let AppError::SavedPlanSchemaMismatch(mismatch) = &error else {
+        panic!("expected typed schema mismatch, got {error:?}");
+    };
+    let changed_types = &mismatch.providers["mock"];
+    assert!(
+        changed_types
+            .iter()
+            .any(|change| { change.contains("removed.Widget") && change.contains("missing") })
+    );
+    assert_eq!(
+        mismatch.replan_command,
+        "carina plan --out reviewed-plan.json"
+    );
+    assert!(
+        error.to_string().contains("Re-run `carina plan --out"),
+        "error must include the saved-plan re-plan command: {error}"
+    );
+    assert_eq!(
+        operations, "",
+        "provider was called before schema rejection"
+    );
+}
+
+#[tokio::test]
+async fn secret_bearing_saved_plan_checks_schema_before_secret_rehydration() {
+    let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())]);
+
+    let (result, operations) =
+        run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "secret", true)
+            .await;
+    let error = result.expect_err("schema mismatch must win over unavailable secret inputs");
+    assert!(
+        matches!(error, AppError::SavedPlanSchemaMismatch(_)),
+        "expected SavedPlanSchemaMismatch before a secret error, got {error:?}"
+    );
+    assert_eq!(
+        operations, "",
+        "provider was called before schema rejection"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_apply_rejects_changed_attribute_flag_before_provider_call() {
+    let mut planned_schema = carina_provider_mock::builtin_schemas()
+        .into_iter()
+        .find(|schema| schema.resource_type == "test.resource")
+        .expect("built-in test.resource schema");
+    planned_schema
+        .attributes
+        .get_mut("comment")
+        .expect("comment attribute")
+        .write_only = true;
+    let planning_schemas = mock_schema_registry([planned_schema]);
+
+    let (result, operations) = run_saved_plan_schema_fingerprint_case(
+        &planning_schemas,
+        "test.resource",
+        "changed",
+        false,
+    )
+    .await;
+    let error = result.expect_err("a changed write_only flag must invalidate the saved plan");
+    assert!(matches!(
+        &error,
+        AppError::SavedPlanSchemaMismatch(mismatch)
+            if mismatch.providers["mock"].iter().any(|change| {
+                change.contains("test.resource") && change.contains("changed")
+            })
+    ));
+    assert_eq!(
+        operations, "",
+        "provider was called before schema rejection"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_apply_accepts_unchanged_provider_schema() {
+    let planning_schemas = mock_schema_registry(carina_provider_mock::builtin_schemas());
+
+    let (result, operations) = run_saved_plan_schema_fingerprint_case(
+        &planning_schemas,
+        "test.resource",
+        "unchanged",
+        false,
+    )
+    .await;
+    result.expect("an unchanged provider schema must remain executable");
+    assert!(
+        operations
+            .lines()
+            .any(|operation| operation == "create test.resource.unchanged"),
+        "the unchanged resource did not reach the provider: {operations}"
+    );
+}
+
+#[test]
+fn saved_plan_schema_check_preserves_current_state_only_references_after_reload() {
+    let fixture = ApplyCancellationFixture::new();
+    let schemas = mock_schema_registry(carina_provider_mock::builtin_schemas());
+    let id = ResourceId::with_provider_identity("mock", "example.thing", "gone", None);
+    let mut plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-28T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
+            id.clone(),
+            State::not_found(id),
+        )],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
+    };
+    plan_file.record_schema_fingerprints(&schemas);
+
+    let reloaded = inspected_saved_plan(plan_file)
+        .reload_in_flight_from_locked_state(None)
+        .expect("current-state snapshot should reload");
+    let checked = reloaded.verify_schema_fingerprints(
+        &schemas,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("."),
+        },
+    );
+
+    assert!(
+        matches!(checked, Ok(SchemaCheckedPlanFile::Verified(_))),
+        "the immutable pre-reload reference inventory must verify unchanged schemas"
+    );
+}
+
 fn checked_exports(
     params: &[carina_core::parser::InferredExportParam],
 ) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam> {
@@ -400,7 +674,8 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     )
     .await
     .expect("resolve empty provider config");
-    let mut plan_file = PlanFile {
+    let candidates = SavedPlanSecretCandidates::from_test_parts(parsed, provider_inputs);
+    let plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
@@ -419,12 +694,15 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
 
+    let mut plan_file = plan_file
+        .reload_in_flight_from_locked_state(None)
+        .expect("test plan should cross the locked-state reload boundary");
     let result = rehydrate_desired_plan_file(
         &mut plan_file,
-        &parsed,
-        &provider_inputs,
+        &candidates,
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -474,7 +752,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         HashMap::from([("name".to_string(), string_value("planned"))]),
     )
     .with_identifier("mock-id");
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
@@ -505,7 +783,9 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
+    record_builtin_mock_schema_fingerprints(&mut plan_file);
     let backend =
         Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
     unsafe {
@@ -745,7 +1025,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     );
 
     write_upstream("arn:aws:iam::222222222222:role/new");
-    let mut reloaded = reload_apply_configuration_after_bootstrap(
+    let reloaded = reload_apply_configuration_after_bootstrap(
         &downstream,
         &downstream,
         &ProviderContext::default(),
@@ -767,7 +1047,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
     run_apply_locked_canonical(
         &ctx,
-        &mut reloaded,
+        reloaded,
         true,
         backend,
         StateLock::disabled_for_test(),
@@ -1900,13 +2180,14 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &[],
     );
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &None,
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -2103,8 +2384,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     std::fs::write(
         &mock_state_path,
         serde_json::json!({
-            "test.resource.lookup": {
-                "name": "target"
+            "iam.Roles.lookup": {
+                "names": ["target"]
             }
         })
         .to_string(),
@@ -2124,12 +2405,12 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         Value::Concrete(ConcreteValue::String("target".into())),
     );
 
-    let lookup_id = ResourceId::with_provider_identity("mock", "test.resource", "lookup", None);
-    let mut lookup = DataSource::with_provider("mock", "test.resource", "lookup", None);
+    let lookup_id = ResourceId::with_provider_identity("mock", "iam.Roles", "lookup", None);
+    let mut lookup = DataSource::with_provider("mock", "iam.Roles", "lookup", None);
     lookup.id = lookup_id.clone();
     lookup.binding = Some("lookup".to_string());
     lookup.set_attr(
-        "filter",
+        "name_regex",
         Value::Deferred(DeferredValue::ResourceRef {
             path: carina_core::resource::AccessPath::new("target", "name"),
         }),
@@ -2146,7 +2427,12 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     consumer.set_attr(
         "comment",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: carina_core::resource::AccessPath::new("lookup", "name"),
+            path: carina_core::resource::AccessPath::with_fields_and_subscripts(
+                "lookup",
+                "names",
+                Vec::new(),
+                vec![carina_core::resource::Subscript::Int { index: 0 }],
+            ),
         }),
     );
 
@@ -2171,7 +2457,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }]);
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-07-02T00:00:00Z".to_string(),
@@ -2209,7 +2495,18 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
+    record_builtin_mock_schema_fingerprints(&mut plan_file);
+    let recorded = &plan_file.schema_fingerprints.providers["mock"].schemas;
+    assert!(recorded.iter().any(|schema| {
+        schema.kind == carina_core::schema::SchemaKind::Resource
+            && schema.resource_type == "test.resource"
+    }));
+    assert!(recorded.iter().any(|schema| {
+        schema.kind == carina_core::schema::SchemaKind::DataSource
+            && schema.resource_type == "iam.Roles"
+    }));
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
@@ -2290,7 +2587,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     plan.add(carina_core::effect::Effect::Create(resolved(
         consumer.clone(),
     )));
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
@@ -2327,7 +2624,9 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
+    record_builtin_mock_schema_fingerprints(&mut plan_file);
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
@@ -2355,10 +2654,19 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let error = result.expect_err("saved-plan module constraint must fail apply");
     assert!(error.to_string().contains("1 failed"), "error: {error}");
-    assert_eq!(
-        std::fs::read_to_string(&op_log_path).expect("producer operation log"),
-        "create test.resource.producer\n",
-        "the consuming resource must not reach the provider"
+    let operations = std::fs::read_to_string(&op_log_path).expect("producer operation log");
+    assert!(
+        operations
+            .lines()
+            .any(|operation| operation == "create test.resource.producer"),
+        "the producing resource must reach the provider: {operations}"
+    );
+    assert!(
+        !operations.lines().any(|operation| {
+            operation == "create test.resource.consumer"
+                || operation == "normalize_desired test.resource.consumer"
+        }),
+        "the consuming resource must not reach the provider: {operations}"
     );
 }
 
@@ -2385,6 +2693,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
 
     let observer_factory = fixture.observer_factory();
@@ -2456,6 +2765,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
     let plan_path = tmp.path().join("unresolved-provider-config.plan.json");
     std::fs::write(
@@ -2555,6 +2865,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
     let plan_path = tmp.path().join("deferred-default-tags.plan.json");
     std::fs::write(
@@ -2938,7 +3249,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     plan.add(carina_core::effect::Effect::Create(resolved(
         resource.clone(),
     )));
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-21T00:00:00Z".to_string(),
@@ -2969,7 +3280,9 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
+    record_builtin_mock_schema_fingerprints(&mut plan_file);
     let observer_factory = fixture.observer_factory();
     let backend = fixture.lock_loss_backend_handle();
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
@@ -3748,13 +4061,14 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     );
 
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &state_file,
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -3866,13 +4180,14 @@ let nat = mock.ec2.NatGateway {{
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let step1_state = Some(step1_state);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let clean_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &step1_state,
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -3927,13 +4242,14 @@ let nat = mock.ec2.NatGateway {{
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let step2_state = Some(step2_state);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &step2_state,
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -4058,13 +4374,14 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &saved,
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -4196,13 +4513,14 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (mut parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let before_failure = Some(fixture.read_state().await);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let removal_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &before_failure,
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -4274,13 +4592,14 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &saved,
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -4346,13 +4665,14 @@ async fn assert_failed_nested_pending_removal_is_replanned(
 
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &Some(applied),
         true,
+        crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
@@ -7373,11 +7693,9 @@ mod apply_deferred_for_parity {
 
 #[cfg(test)]
 mod saved_plan_version_tests {
-    //! carina#3248: saved plans now persist `compositions` and
-    //! `data_sources` (version `4`). Older plans (version `3` and
-    //! below) are rejected outright per the repo's
-    //! no-backward-compat policy — re-running `carina plan` is the
-    //! supported migration path.
+    //! Saved plan formats have no backward-compatibility path: re-running
+    //! `carina plan` is the supported migration. Version 23 adds the mandatory
+    //! provider-schema fingerprint snapshot (carina#3983).
 
     use std::path::Path;
 
@@ -7386,6 +7704,68 @@ mod saved_plan_version_tests {
     use super::{
         ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir, saved_provider_configs,
     };
+
+    #[tokio::test]
+    async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
+        assert_eq!(
+            crate::commands::plan::PlanFile::CURRENT_VERSION,
+            23,
+            "adding provider-schema fingerprints must bump the saved-plan format",
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("reviewed-plan.json");
+        let old_plan = serde_json::json!({
+            "version": 22,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-10-27T00:00:00Z",
+            "source_path": "infra",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": [] },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "data_source_origins": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("a plan predating schema fingerprints must be rejected");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found,
+            expected,
+            replan_command,
+            ..
+        } = &error
+        else {
+            panic!("expected typed version error, got {error:?}");
+        };
+        assert_eq!((*found, *expected), (22, 23));
+        let expected_replan = format!("carina plan --out {} infra", plan_path.display());
+        assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Re-run `{expected_replan}`"))
+        );
+    }
 
     #[tokio::test]
     async fn future_saved_plan_without_source_path_is_rejected_by_version() {
@@ -8076,6 +8456,7 @@ mod saved_plan_version_tests {
             upstream_snapshot: std::collections::HashMap::new(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
+            schema_fingerprints: Default::default(),
         };
         let json = serde_json::to_value(&plan_file).expect("plan file should serialize");
         (dir, plan_path, json)

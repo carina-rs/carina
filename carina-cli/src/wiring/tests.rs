@@ -308,7 +308,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         resources: unresolved_resources.to_vec(),
         ..Default::default()
     };
-    let mut canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
+    let canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
         parsed.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         ctx.schemas(),
@@ -316,16 +316,18 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     .expect("test block-name resolution must succeed");
     create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         provider_configs,
         state_file,
         refresh,
+        ProgressSink::Human,
         remote_bindings,
         state_block_claims,
         resolved_state_block_targets,
         base_dir,
     )
     .await
+    .map(ExpandedPlanContext::into_context)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -827,9 +829,16 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     let configs = validated_provider_configs(vec![config]);
     let config = configs.iter().next().unwrap();
     let mut router = ProviderRouter::new();
-    let error = instantiate_provider_into_router(&ctx, &mut router, config, Path::new("."), None)
-        .await
-        .expect_err("normalizer creation failure must abort provider router setup");
+    let error = instantiate_provider_into_router(
+        &ctx,
+        &mut router,
+        config,
+        Path::new("."),
+        None,
+        ProgressSink::Human,
+    )
+    .await
+    .expect_err("normalizer creation failure must abort provider router setup");
 
     let AppError::Provider(error) = error else {
         panic!("expected provider error, got {error}");
@@ -903,6 +912,7 @@ async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
         configs.iter().next().unwrap(),
         Path::new("."),
         None,
+        ProgressSink::Human,
     )
     .await
     .expect_err("provider initialization must fail");
@@ -1031,13 +1041,14 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().unwrap();
-    let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+    let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &None,
         false,
+        ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
@@ -1065,7 +1076,14 @@ async fn apply_provider_construction_revalidates_resolved_upstream_config() {
     );
     let temp = tempfile::tempdir().unwrap();
 
-    let error = match get_provider_with_ctx(&ctx, &provider_configs, temp.path()).await {
+    let error = match get_provider_with_ctx(
+        &ctx,
+        &provider_configs,
+        temp.path(),
+        ProgressSink::Human,
+    )
+    .await
+    {
         Ok(_) => panic!("resolved provider config must be rejected before apply construction"),
         Err(error) => error,
     };
@@ -1483,7 +1501,7 @@ let shared = read test.shared.Type {}
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut canonical_resources = canonical_pair(
+    let canonical_resources = canonical_pair(
         &parsed,
         parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
@@ -1491,10 +1509,11 @@ let shared = read test.shared.Type {}
 
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &state_file,
         true,
+        ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
@@ -3854,17 +3873,18 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_pair(
+    let canonical_resources = canonical_pair(
         &parsed,
         unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
     );
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &Some(state_file),
         false,
+        ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::empty(),
         &ResolvedStateBlockTargets::default(),
@@ -3872,6 +3892,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     )
     .await
     .expect("plan should build");
+    let plan_ctx = plan_ctx.into_context();
 
     let subnet_create = plan_ctx
         .plan
@@ -5900,6 +5921,65 @@ mod expand_same_config_deferred_for_tests {
         );
     }
 
+    #[test]
+    fn saved_plan_expansion_suppresses_duplicate_warning_output_but_keeps_candidate_state() {
+        let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
+        let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        let state_file = None;
+        let schemas = SchemaRegistry::new();
+        let wiring = WiringContext::new(Vec::new(), &[]);
+        let claims = resolve_state_block_claims(
+            &parsed.state_blocks,
+            &state_file,
+            &parsed.resources,
+            &schemas,
+        );
+        let prepared = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
+            .expect("build expansion prelude")
+            .reconcile_addresses(
+                ReconcileDeferredForExpansionInputs {
+                    ctx: &wiring,
+                    parsed: &parsed,
+                    provider_configs: &[],
+                    state_block_claims: &claims,
+                    managed_current: HashMap::new(),
+                    data_source_states: HashMap::new(),
+                    orphans: Orphans::new(),
+                    already_refreshed: HashSet::new(),
+                },
+                DeferredForWarningPolicy::Suppress,
+            )
+            .expect("prepare expansion")
+            .seal();
+
+        let out = prepared
+            .expand_parsed(
+                &mut parsed,
+                &schemas,
+                &HashMap::new(),
+                DeferredForWarningPolicy::Suppress,
+            )
+            .expect("deferred-for expansion should succeed");
+        assert!(
+            !out.printed_warnings,
+            "verification must not print warnings"
+        );
+
+        let expanded = out.into_expanded_file(parsed);
+        assert_eq!(
+            expanded.deferred_for_expressions.len(),
+            1,
+            "a DeferredCreate template remains available for secret rehydration"
+        );
+        assert!(
+            expanded
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == WarningKind::SingleQuotedInterpolation),
+            "suppression controls rendering, not the candidate parser state"
+        );
+    }
+
     /// Direct unit test of `RefreshableChildIds::select` — the sole
     /// constructor of the post-expansion refresh iterator. The
     /// `expand_*` tests cover it end-to-end, but `select` carries the
@@ -6046,6 +6126,11 @@ mod expand_same_config_deferred_for_tests {
             "resolved loop must leave no residual; got {:?}",
             out.residual_deferred_for
         );
+        let expanded = out.into_expanded_file(parsed);
+        assert!(
+            expanded.deferred_for_expressions.is_empty(),
+            "materialized loops must not remain in the candidate parser view"
+        );
     }
 
     #[test]
@@ -6088,6 +6173,12 @@ mod expand_same_config_deferred_for_tests {
         assert!(
             out.new_child_ids.is_empty(),
             "unresolved iterable must not report materialized children"
+        );
+        let expanded = out.into_expanded_file(parsed);
+        assert_eq!(
+            expanded.deferred_for_expressions.len(),
+            1,
+            "deferred effect templates must remain in the candidate parser view"
         );
     }
 
@@ -7203,7 +7294,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     assert!(load_error.contains("version 0.5.0"), "{load_error}");
 
     let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
-    let router = get_provider_with_ctx(&ctx, &configs, base)
+    let router = get_provider_with_ctx(&ctx, &configs, base, ProgressSink::Human)
         .await
         .expect("artifact load errors are rendered by the plan/apply wiring boundary");
     assert!(router.is_empty());
@@ -8122,13 +8213,14 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
-        let mut canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
+        let canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &mut canonical_resources,
+            canonical_resources,
             &provider_configs,
             &None,
             true,
+            ProgressSink::Human,
             &remote_bindings,
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
@@ -8197,13 +8289,14 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
-        let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+        let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &mut canonical_resources,
+            canonical_resources,
             &provider_configs,
             &None,
             true,
+            ProgressSink::Human,
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),

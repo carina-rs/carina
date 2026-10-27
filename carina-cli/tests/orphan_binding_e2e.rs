@@ -127,3 +127,48 @@ fn state_refresh_keeps_orphan_binding_and_prevent_destroy() {
         "the refusal must identify the let-bound orphan and its preserved directive\nstdout/stderr:\n{output}"
     );
 }
+
+#[test]
+fn state_refresh_does_not_apply_pending_moved_block_address_transitions() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"let a = mock.test.resource {
+  name = "a"
+}
+"#,
+    );
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.carina(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    scenario.write_main(
+        r#"moved {
+  from = mock.test.resource 'a'
+  to   = mock.test.resource 'b'
+}
+
+let b = mock.test.resource {
+  name = "a"
+}
+"#,
+    );
+    let refresh = scenario.carina(&["state", "refresh", "--lock=false", "."]);
+    assert_success("state refresh with pending move", &refresh);
+    let output = output_text(&refresh);
+    assert!(
+        output.contains("State refreshed: 0 resources updated, 1 resource unchanged."),
+        "state refresh must refresh the existing from-address without applying the move\n\
+         stdout/stderr:\n{output}",
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(scenario.project.join("carina.state.json"))
+            .expect("read refreshed state"),
+    )
+    .expect("parse refreshed state");
+    let resources = state["resources"].as_array().expect("state resources");
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0]["identity"], "a");
+}

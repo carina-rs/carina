@@ -2031,6 +2031,21 @@ fn resource_validator_called() {
 }
 
 #[test]
+fn with_validator_stores_in_process_validation() {
+    fn accept_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        Ok(())
+    }
+
+    let schema = ResourceSchema::new("test").with_validator(accept_all);
+
+    assert!(matches!(
+        schema.validation,
+        ResourceValidation::InProcess(_)
+    ));
+    assert!(schema.validator().is_some());
+}
+
+#[test]
 fn validate_known_values_defers_constraints_until_values_are_concrete() {
     use crate::resource::UnknownReason;
 
@@ -10736,5 +10751,235 @@ fn raw_shape_passes_through_non_ref_variants() {
     match AttributeType::unordered_list(AttributeType::string()).raw_shape() {
         RawShape::List { ordered, .. } => assert!(!ordered),
         other => panic!("expected RawShape::List(unordered), got {other:?}"),
+    }
+}
+
+fn schema_fingerprint_fixture(reverse_attributes: bool) -> ResourceSchema {
+    let mut default_map = indexmap::IndexMap::new();
+    if reverse_attributes {
+        default_map.insert("second".to_string(), Value::Concrete(ConcreteValue::Int(2)));
+        default_map.insert("first".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+    } else {
+        default_map.insert("first".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+        default_map.insert("second".to_string(), Value::Concrete(ConcreteValue::Int(2)));
+    }
+
+    let first = AttributeSchema::new(
+        "first",
+        AttributeType::list(AttributeType::struct_(
+            "Nested",
+            vec![StructField::new("value", AttributeType::string()).required()],
+        )),
+    )
+    .required()
+    .with_default(Value::Concrete(ConcreteValue::Map(default_map)))
+    .with_provider_name("First")
+    .with_block_name("first_block")
+    .create_only()
+    .write_only()
+    .identity()
+    .deferred_populate();
+    let second = AttributeSchema::new("second", AttributeType::int()).non_removable();
+
+    let mut schema = ResourceSchema::new("test.Widget")
+        .with_unique_name_attribute("first")
+        .with_operation_config(OperationConfig {
+            delete_timeout_secs: Some(11),
+            delete_max_retries: Some(2),
+            create_timeout_secs: Some(13),
+            create_max_retries: Some(3),
+            update_timeout_secs: Some(17),
+        })
+        .with_default_wait_timeout(std::time::Duration::from_secs(19))
+        .with_default_wait_interval(std::time::Duration::from_secs(23))
+        .with_def("Alias", AttributeType::string());
+    schema.exclusive_required = vec![vec!["first".to_string(), "second".to_string()]];
+    if reverse_attributes {
+        schema.attributes.insert(second.name.clone(), second);
+        schema.attributes.insert(first.name.clone(), first);
+    } else {
+        schema.attributes.insert(first.name.clone(), first);
+        schema.attributes.insert(second.name.clone(), second);
+    }
+    schema
+}
+
+#[test]
+fn resource_schema_semantic_fingerprint_is_order_independent() {
+    let forward = schema_fingerprint_fixture(false);
+    let reverse = schema_fingerprint_fixture(true);
+
+    assert_eq!(
+        forward.semantic_fingerprint(),
+        reverse.semantic_fingerprint(),
+        "hash-map and nested map insertion order must not affect a schema fingerprint",
+    );
+}
+
+#[test]
+fn schema_kind_serde_uses_the_snake_case_core_shape() {
+    assert_eq!(
+        serde_json::to_value(SchemaKind::Resource).expect("serialize resource kind"),
+        serde_json::json!("resource")
+    );
+    assert_eq!(
+        serde_json::from_value::<SchemaKind>(serde_json::json!("data_source"))
+            .expect("deserialize data-source kind"),
+        SchemaKind::DataSource
+    );
+}
+
+#[test]
+fn in_process_validator_fingerprint_uses_a_fixed_marker() {
+    fn accept_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        Ok(())
+    }
+
+    fn reject_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        Err(Vec::new())
+    }
+
+    let accepting = schema_fingerprint_fixture(false).with_validator(accept_all);
+    let rejecting = schema_fingerprint_fixture(false).with_validator(reject_all);
+
+    assert_eq!(
+        accepting.semantic_fingerprint(),
+        rejecting.semantic_fingerprint(),
+        "in-process callback identity must not affect a portable fingerprint",
+    );
+}
+
+#[test]
+fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
+    type SchemaMutation = (&'static str, Box<dyn Fn(&mut ResourceSchema)>);
+
+    fn reject_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        Err(Vec::new())
+    }
+
+    let baseline = schema_fingerprint_fixture(false).semantic_fingerprint();
+    let mut changes: Vec<SchemaMutation> = vec![
+        (
+            "resource_type",
+            Box::new(|schema| schema.resource_type.push_str("V2")),
+        ),
+        (
+            "attribute type",
+            Box::new(|schema| {
+                schema.attributes.get_mut("second").unwrap().attr_type = AttributeType::bool();
+            }),
+        ),
+        (
+            "input mode",
+            Box::new(|schema| {
+                schema.attributes.get_mut("second").unwrap().input_mode = InputMode::Required;
+            }),
+        ),
+        (
+            "default",
+            Box::new(|schema| {
+                schema.attributes.get_mut("first").unwrap().default =
+                    Some(Value::Concrete(ConcreteValue::Bool(true)));
+            }),
+        ),
+        (
+            "provider name",
+            Box::new(|schema| {
+                schema.attributes.get_mut("first").unwrap().provider_name = Some("Other".into());
+            }),
+        ),
+        (
+            "create_only",
+            Box::new(|schema| schema.attributes.get_mut("first").unwrap().create_only = false),
+        ),
+        (
+            "removable",
+            Box::new(|schema| schema.attributes.get_mut("second").unwrap().removable = Some(true)),
+        ),
+        (
+            "block_name",
+            Box::new(|schema| {
+                schema.attributes.get_mut("first").unwrap().block_name = Some("other".into());
+            }),
+        ),
+        (
+            "write_only",
+            Box::new(|schema| schema.attributes.get_mut("first").unwrap().write_only = false),
+        ),
+        (
+            "identity",
+            Box::new(|schema| schema.attributes.get_mut("first").unwrap().identity = false),
+        ),
+        (
+            "deferred_populate",
+            Box::new(|schema| {
+                schema
+                    .attributes
+                    .get_mut("first")
+                    .unwrap()
+                    .deferred_populate = false;
+            }),
+        ),
+        (
+            "schema kind",
+            Box::new(|schema| schema.kind = SchemaKind::DataSource),
+        ),
+        (
+            "unique name",
+            Box::new(|schema| schema.unique_name = UniqueNameSpec::Coexisting),
+        ),
+        (
+            "operation config",
+            Box::new(|schema| {
+                schema
+                    .operation_config
+                    .as_mut()
+                    .unwrap()
+                    .update_timeout_secs = None
+            }),
+        ),
+        (
+            "exclusive required",
+            Box::new(|schema| schema.exclusive_required.push(vec!["first".into()])),
+        ),
+        (
+            "wait timeout",
+            Box::new(|schema| {
+                schema.default_wait_timeout = Some(std::time::Duration::from_secs(29));
+            }),
+        ),
+        (
+            "wait interval",
+            Box::new(|schema| {
+                schema.default_wait_interval = Some(std::time::Duration::from_secs(31));
+            }),
+        ),
+        (
+            "definition",
+            Box::new(|schema| {
+                schema.defs.insert("Alias".into(), AttributeType::bool());
+            }),
+        ),
+        (
+            "declarative validator",
+            Box::new(|schema| {
+                schema.validation =
+                    ResourceValidation::Declared(vec![ValidatorType::TagsKeyValueCheck]);
+            }),
+        ),
+        (
+            "resource validator",
+            Box::new(|schema| schema.validation = ResourceValidation::InProcess(reject_all)),
+        ),
+    ];
+
+    for (field, change) in changes.drain(..) {
+        let mut changed = schema_fingerprint_fixture(false);
+        change(&mut changed);
+        assert_ne!(
+            changed.semantic_fingerprint(),
+            baseline,
+            "changing semantic field {field} must change the fingerprint",
+        );
     }
 }

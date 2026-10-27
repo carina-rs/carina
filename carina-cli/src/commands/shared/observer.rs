@@ -9,7 +9,10 @@ use carina_core::value::format_value_user_facing;
 use carina_core::wait::WaitObservation;
 use colored::Colorize;
 
-use crate::commands::shared::progress::{ProgressBackend, format_duration, format_progress};
+use crate::commands::shared::progress::{
+    EffectProgressKey, FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressSink,
+    format_duration, format_progress,
+};
 use crate::display::format_effect;
 
 /// Render the shared diagnostic details for a mutation whose follow-up read
@@ -29,14 +32,14 @@ pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [
 
 /// CLI observer that prints colored progress output.
 pub(crate) struct CliObserver {
-    progress: ProgressBackend<String>,
+    progress: ProgressBackend<EffectProgressKey>,
 }
 
 impl CliObserver {
     /// Create a new observer using stderr's terminal state.
     pub(crate) fn new(_plan: &Plan) -> Self {
         Self {
-            progress: ProgressBackend::new(),
+            progress: ProgressBackend::new(ProgressSink::Human),
         }
     }
 }
@@ -47,15 +50,14 @@ impl ExecutionObserver for CliObserver {
     }
 }
 
-fn handle_event(progress_backend: &ProgressBackend<String>, event: &ExecutionEvent) {
+fn handle_event(progress_backend: &ProgressBackend<EffectProgressKey>, event: &ExecutionEvent) {
     match event {
         ExecutionEvent::Waiting { .. } => {
             // Dynamic display: don't show waiting resources.
             // They will appear when they start executing.
         }
         ExecutionEvent::EffectStarted { effect } => {
-            let key = format_effect(effect);
-            progress_backend.start(key.clone(), key);
+            progress_backend.start_effect(EffectProgressKey::new(effect), format_effect(effect));
         }
         ExecutionEvent::EffectSucceeded {
             effect,
@@ -63,17 +65,16 @@ fn handle_event(progress_backend: &ProgressBackend<String>, event: &ExecutionEve
             progress,
             ..
         } => {
-            let key = format_effect(effect);
+            let key = EffectProgressKey::new(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
-            let msg = format!(
-                "{} {} {} {}",
-                "✓".green(),
+            let outcome = NonFailureOutcome::success(format!(
+                "{} {} {}",
                 format_effect(effect),
                 timing,
                 counter
-            );
-            progress_backend.finish(key, msg);
+            ));
+            progress_backend.finish(key, outcome);
         }
         ExecutionEvent::EffectPartiallySucceeded {
             effect,
@@ -82,24 +83,15 @@ fn handle_event(progress_backend: &ProgressBackend<String>, event: &ExecutionEve
             progress,
             ..
         } => {
-            let key = format_effect(effect);
+            let key = EffectProgressKey::new(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
             let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
-            let msg = format!(
-                "{} {} (partial) {} {}\n      {} {}\n      {} {}\n      {} {}",
-                "⚠".yellow(),
-                format_effect(effect),
-                timing,
-                counter,
-                "→".yellow(),
-                reason,
-                "→".yellow(),
-                missing,
-                "→".yellow(),
-                state_recorded,
+            let outcome = NonFailureOutcome::partial(
+                format!("{} (partial) {} {}", format_effect(effect), timing, counter),
+                [reason, missing, state_recorded],
             );
-            progress_backend.finish(key, msg);
+            progress_backend.finish(key, outcome);
         }
         ExecutionEvent::EffectFailed {
             effect,
@@ -107,83 +99,73 @@ fn handle_event(progress_backend: &ProgressBackend<String>, event: &ExecutionEve
             duration,
             progress,
         } => {
-            let key = format_effect(effect);
+            let key = EffectProgressKey::new(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
-            let msg = format!(
-                "{} {} {} {}\n      {} {}",
-                "✗".red(),
-                format_effect(effect),
-                timing,
-                counter,
-                "→".red(),
-                error.red()
+            let outcome = FailedOutcome::new(
+                format!("{} {} {}", format_effect(effect), timing, counter),
+                [error.to_string()],
             );
-            progress_backend.finish(key, msg);
+            progress_backend.finish_failed(key, outcome);
         }
         ExecutionEvent::EffectSkipped {
             effect,
             reason,
             progress,
         } => {
-            let key = format_effect(effect);
+            let key = EffectProgressKey::new(effect);
             let counter = format_progress(progress).dimmed();
-            let msg = format!(
-                "{} {} - {} {}",
-                "⊘".yellow(),
+            let outcome = NonFailureOutcome::skipped(format!(
+                "{} - {} {}",
                 format_effect(effect),
                 reason,
                 counter
-            );
+            ));
             // Skipped effects may not have a spinner (they were never started).
-            progress_backend.finish(key, msg);
+            progress_backend.finish(key, outcome);
         }
         ExecutionEvent::WaitPolling {
             observation,
             elapsed,
         } => {
-            progress_backend.line(format_wait_polling_line(observation, *elapsed));
+            progress_backend.info_line(format_wait_polling_line(observation, *elapsed));
         }
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
-            progress_backend.line(format!("{} Update {} (cascade)", "✓".green(), id));
+            progress_backend
+                .outcome_line(NonFailureOutcome::success(format!("Update {id} (cascade)")));
         }
         ExecutionEvent::CascadeUpdateFailed { id, error } => {
-            progress_backend.line(format!("{} Update {} (cascade)", "✗".red(), id));
-            progress_backend.line(format!("    {} {}", "→".red(), error.red()));
-        }
-        ExecutionEvent::RenameSucceeded { id, from, to } => {
-            progress_backend.line(format!(
-                "{} Rename {} \"{}\" → \"{}\"",
-                "✓".green(),
-                id,
-                from,
-                to
+            progress_backend.failed_line(FailedOutcome::new(
+                format!("Update {id} (cascade)"),
+                [error.to_string()],
             ));
         }
+        ExecutionEvent::RenameSucceeded { id, from, to } => {
+            progress_backend.outcome_line(NonFailureOutcome::success(format!(
+                "Rename {id} \"{from}\" → \"{to}\""
+            )));
+        }
         ExecutionEvent::RenameFailed { id, error } => {
-            progress_backend.line(format!("{} Rename {}", "✗".red(), id));
-            progress_backend.line(format!("    {} {}", "→".red(), error.red()));
+            progress_backend.failed_line(FailedOutcome::new(
+                format!("Rename {id}"),
+                [error.to_string()],
+            ));
         }
         ExecutionEvent::RefreshStarted => {
-            progress_backend.line("");
-            progress_backend.line(format!(
+            progress_backend.section_header(format!(
                 "{}",
                 "Refreshing uncertain resource states...".cyan()
             ));
         }
         ExecutionEvent::RefreshSucceeded { id } => {
-            progress_backend.line(format!("{} Refresh {}", "✓".green(), id));
+            progress_backend.outcome_line(NonFailureOutcome::success(format!("Refresh {id}")));
         }
         ExecutionEvent::RefreshFailed { id, error } => {
-            progress_backend.line(format!("{} Refresh {} - {}", "!".yellow(), id, error));
+            progress_backend.info_line(format!("{} Refresh {} - {}", "!".yellow(), id, error));
         }
         ExecutionEvent::ModuleConstraintFailed { error } => {
-            progress_backend.line(format!(
-                "{} Module constraint\n      {} {}",
-                "✗".red(),
-                "→".red(),
-                error.red()
-            ));
+            progress_backend
+                .failed_line(FailedOutcome::new("Module constraint", [error.to_string()]));
         }
     }
 }
@@ -214,18 +196,21 @@ fn format_wait_observed_attr(observation: &WaitObservation) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use carina_core::effect::Effect;
+    use carina_core::effect::EffectGeneration;
     use carina_core::executor::ProgressInfo;
+    use carina_core::resource::ResolvedResourceId;
     use carina_core::resource::{
         ConcreteValue, DeferredValue, ResolvedResource, Resource, ResourceId, UnknownReason, Value,
     };
     use carina_core::wait::predicate::{AttrPath, WaitPredicate};
     use indexmap::IndexMap;
+    use indicatif::ProgressDrawTarget;
 
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -271,6 +256,19 @@ mod tests {
 
     fn dummy_create_effect() -> Effect {
         Effect::Create(resolved(Resource::new("aws.s3.Bucket", "demo")))
+    }
+
+    fn dummy_delete_effect(generation: EffectGeneration) -> Effect {
+        Effect::Delete {
+            id: ResolvedResourceId::with_provider_identity("mock", "test.resource", "same", None),
+            identifier: crate::fixture_applied_identifier("mock-id"),
+            generation,
+            directives: Default::default(),
+            binding: Some("same".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        }
     }
 
     fn wait_observation<'a>(
@@ -513,6 +511,71 @@ mod tests {
             lines[0]
         );
         assert!(lines[1].contains("boom"));
+    }
+
+    #[test]
+    fn refresh_started_uses_an_empty_line_and_column_zero_header() {
+        assert_eq!(
+            plain_output(&ExecutionEvent::RefreshStarted),
+            "\nRefreshing uncertain resource states...\n",
+        );
+    }
+
+    #[test]
+    fn identical_effect_labels_keep_distinct_live_spinners() {
+        let first = dummy_delete_effect(EffectGeneration::Deposed(
+            carina_state::DeposedKey::new_unique(),
+        ));
+        let second = dummy_delete_effect(EffectGeneration::Deposed(
+            carina_state::DeposedKey::new_unique(),
+        ));
+        assert_eq!(format_effect(&first), format_effect(&second));
+
+        let backend = ProgressBackend::tty(
+            ProgressDrawTarget::hidden(),
+            std::io::sink(),
+            std::io::sink(),
+        );
+        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &first });
+        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &second });
+
+        assert_eq!(
+            backend.active_count(),
+            2,
+            "equal display labels must not replace each other's spinner",
+        );
+
+        handle_event(
+            &backend,
+            &ExecutionEvent::EffectSucceeded {
+                effect: &first,
+                state: None,
+                duration: Duration::from_millis(1),
+                progress: ProgressInfo {
+                    completed: 1,
+                    total: 2,
+                },
+            },
+        );
+        assert_eq!(
+            backend.active_count(),
+            1,
+            "finishing one equal-looking effect must leave the other spinner active",
+        );
+
+        handle_event(
+            &backend,
+            &ExecutionEvent::EffectSucceeded {
+                effect: &second,
+                state: None,
+                duration: Duration::from_millis(1),
+                progress: ProgressInfo {
+                    completed: 2,
+                    total: 2,
+                },
+            },
+        );
+        assert_eq!(backend.active_count(), 0);
     }
 
     #[test]

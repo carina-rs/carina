@@ -32,6 +32,7 @@
 //!    (not flicker — it is exactly where the user is being asked to type).
 
 use std::io::IsTerminal;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// DECTCEM cursor-hide control sequence (`ESC [ ? 25 l`).
@@ -45,6 +46,31 @@ const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 /// transition first (via [`AtomicBool::swap`]) — so the sequence is emitted
 /// exactly once no matter which exit path fires.
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Terminal mode shared by cursor handling and the progress backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressMode {
+    Tty,
+    Plain,
+}
+
+impl ProgressMode {
+    pub(crate) fn is_tty(self) -> bool {
+        matches!(self, Self::Tty)
+    }
+}
+
+/// Resolve the progress terminal once from stderr, indicatif's render stream.
+pub fn progress_mode() -> ProgressMode {
+    static MODE: OnceLock<ProgressMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::io::stderr().is_terminal() {
+            ProgressMode::Tty
+        } else {
+            ProgressMode::Plain
+        }
+    })
+}
 
 /// Restore the cursor before a `std::process::exit`.
 ///
@@ -68,7 +94,7 @@ fn restore_cursor_once() -> bool {
         return false;
     }
     use std::io::Write;
-    let mut out = std::io::stdout();
+    let mut out = std::io::stderr();
     let _ = out.write_all(CURSOR_SHOW);
     let _ = out.flush();
     true
@@ -83,9 +109,9 @@ fn restore_cursor_once() -> bool {
 /// covered by explicit `restore_cursor()` calls and
 /// [`install_panic_restore_hook`] reading the same flag.
 ///
-/// Hiding is gated on `stdout().is_terminal()`: when stdout is not a TTY (CI
-/// capture, redirection to a file) nothing is emitted, so captured logs stay
-/// clean. With `should_hide` false the guard is fully inert.
+/// Hiding is gated on the shared stderr progress mode: when stderr is not a
+/// TTY (CI capture, redirection to a file) nothing is emitted. With
+/// `should_hide` false the guard is fully inert.
 pub struct CursorGuard<W: std::io::Write> {
     writer: W,
     should_hide: bool,
@@ -93,7 +119,7 @@ pub struct CursorGuard<W: std::io::Write> {
 
 impl<W: std::io::Write> CursorGuard<W> {
     /// Construct a guard over an explicit writer, hiding the cursor now iff
-    /// `should_hide`. Used by tests; production code uses [`Self::stdout`].
+    /// `should_hide`. Used by tests; production code uses [`Self::progress`].
     pub(crate) fn new(mut writer: W, should_hide: bool) -> Self {
         if should_hide {
             let _ = writer.write_all(CURSOR_HIDE);
@@ -107,13 +133,13 @@ impl<W: std::io::Write> CursorGuard<W> {
     }
 }
 
-impl CursorGuard<std::io::Stdout> {
-    /// Hide the cursor on stdout for the whole command, restoring it on drop.
+impl CursorGuard<std::io::Stderr> {
+    /// Hide the cursor on the stderr progress terminal for the whole command,
+    /// restoring it on drop.
     ///
-    /// Inert (writes nothing, ever) when stdout is not a terminal.
-    pub fn stdout() -> Self {
-        let should_hide = std::io::stdout().is_terminal();
-        Self::new(std::io::stdout(), should_hide)
+    /// Inert (writes nothing, ever) when stderr is not a terminal.
+    pub fn progress() -> Self {
+        Self::new(std::io::stderr(), progress_mode().is_tty())
     }
 }
 
@@ -165,7 +191,7 @@ impl CursorReveal {
     pub(crate) fn new() -> Self {
         // Claiming the hidden state and emitting show is exactly
         // `restore_cursor_once`: it `swap(false)`s the flag and, iff it won
-        // that transition, writes `CURSOR_SHOW` via buffered stdout. Reusing
+        // that transition, writes `CURSOR_SHOW` via buffered stderr. Reusing
         // it keeps the claim-once protocol in one place; the inverse half
         // (re-hide + re-arm) has no equivalent and lives in `Drop`.
         let revealed = restore_cursor_once();
@@ -186,7 +212,7 @@ impl Drop for CursorReveal {
         // before this drop runs — so nothing else can have touched the flag
         // between `new` and here. Safe only under that sole-mutator invariant.
         use std::io::Write;
-        let mut out = std::io::stdout();
+        let mut out = std::io::stderr();
         let _ = out.write_all(CURSOR_HIDE);
         let _ = out.flush();
         CURSOR_HIDDEN.store(true, Ordering::SeqCst);
@@ -195,10 +221,10 @@ impl Drop for CursorReveal {
 
 /// Install the panic hook that restores the cursor on the panic exit path
 /// `Drop` cannot reach. Idempotent-safe to call once at startup; a no-op
-/// when stdout is not a terminal (nothing ever hides the cursor in that case,
+/// when stderr is not a terminal (nothing ever hides the cursor in that case,
 /// so nothing needs restoring).
 pub fn install_panic_restore_hook() {
-    if !std::io::stdout().is_terminal() {
+    if !progress_mode().is_tty() {
         return;
     }
 

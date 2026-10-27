@@ -1179,6 +1179,7 @@ mod tests {
 
         let e = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: crate::schema::SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -1212,6 +1213,7 @@ mod tests {
         ))));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: crate::schema::SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
