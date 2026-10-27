@@ -193,6 +193,7 @@ pre {
   font-size: var(--text-sm);
   line-height: 1.55;
 }
+.table-scroll { overflow-x: auto; }
 
 /* Link */
 a {
