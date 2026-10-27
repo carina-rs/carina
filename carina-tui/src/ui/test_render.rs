@@ -3,7 +3,13 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
+use super::row::Row;
+
 const WIDTH: u16 = 120;
+
+pub(super) fn into_lines<'a>(rows: Vec<Row<'a>>) -> Vec<Line<'a>> {
+    rows.into_iter().map(Row::into_line).collect()
+}
 
 pub(super) fn render_with_unstyled_indentation(lines: Vec<Line<'_>>) -> Buffer {
     let height = u16::try_from(lines.len()).expect("rendered lines fit in terminal height");

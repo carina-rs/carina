@@ -28,6 +28,9 @@ pub(super) struct Row<'a> {
 }
 
 impl<'a> Row<'a> {
+    /// Creates a row, moving leading content spaces, whatever their style, into
+    /// the unstyled indent. [`Self::into_line`] is the only way to obtain a
+    /// ratatui [`Line`] from a `Row`.
     pub(super) fn new(indent: Indent, content: impl Into<Vec<Span<'a>>>) -> Self {
         let content = content.into();
         let mut normalized = Vec::with_capacity(content.len());
@@ -76,7 +79,7 @@ impl<'a> Row<'a> {
     }
 
     pub(super) fn into_line(mut self) -> Line<'a> {
-        let mut spans = Vec::with_capacity(self.content.len() + usize::from(self.indent.0 > 0));
+        let mut spans = Vec::new();
         if self.indent.0 > 0 {
             spans.push(Span::raw(" ".repeat(self.indent.0)));
         }

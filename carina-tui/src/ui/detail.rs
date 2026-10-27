@@ -225,26 +225,18 @@ fn render_detail_row_to_rows(rows: &mut Vec<Row<'_>>, row: &DetailRow, is_select
             render_list_of_maps_diff(
                 rows,
                 key,
-                block.unchanged(),
-                block.modified(),
-                block.added(),
-                block.removed(),
-                ListOfMapsDiffHeader::Standard {
-                    highlighted: is_selected,
-                },
+                block,
+                ListOfMapsDiffHeader::Standard,
+                is_selected,
             );
         }
         DetailRow::ListOfMapsDiffForcesReplacement { key, block } => {
             render_list_of_maps_diff(
                 rows,
                 key,
-                block.unchanged(),
-                block.modified(),
-                block.added(),
-                block.removed(),
-                ListOfMapsDiffHeader::ForcesReplacement {
-                    highlighted: is_selected,
-                },
+                block,
+                ListOfMapsDiffHeader::ForcesReplacement,
+                is_selected,
             );
         }
         DetailRow::ForceReplaceMapHeader { key }
@@ -356,8 +348,41 @@ mod tests {
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::value::{PrettyValue, RenderedKey};
     use indexmap::IndexMap;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Paragraph;
 
-    use crate::ui::test_render::{first_content_cell, render_with_unstyled_indentation};
+    use crate::ui::test_render::{
+        first_content_cell, into_lines, render_with_unstyled_indentation,
+    };
+
+    fn render_detail_row_to_buffer(row: &DetailRow, is_selected: bool) -> Buffer {
+        let mut rows = Vec::new();
+        render_detail_row_to_rows(&mut rows, row, is_selected);
+        let lines = into_lines(rows);
+        let height = u16::try_from(lines.len()).expect("rendered lines fit in terminal height");
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn assert_row_background(buffer: &Buffer, row: u16, expected_text: &str) {
+        let width = expected_text.chars().count();
+        let actual_text = (0..width)
+            .map(|column| buffer[(column as u16, row)].symbol())
+            .collect::<String>();
+        assert_eq!(actual_text, expected_text);
+
+        for column in 0..width {
+            assert_eq!(
+                buffer[(column as u16, row)].bg,
+                Color::DarkGray,
+                "cell at row {row}, column {column} is not highlighted"
+            );
+        }
+    }
 
     #[test]
     fn removed_row_keeps_indentation_unstyled() {
@@ -371,8 +396,7 @@ mod tests {
 
         render_detail_row_to_rows(&mut rows, &row, false);
 
-        let buffer =
-            render_with_unstyled_indentation(rows.into_iter().map(Row::into_line).collect());
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
         let (column, key_cell) =
             first_content_cell(&buffer, 0).expect("removed row has key content");
         assert_eq!(column, 2, "removed row uses a two-column indent");
@@ -417,7 +441,7 @@ mod tests {
 
         let mut rows = Vec::new();
         render_detail_row_to_rows(&mut rows, &row, false);
-        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
+        let lines = into_lines(rows);
 
         let version_idx = lines
             .iter()
@@ -469,7 +493,7 @@ mod tests {
 
         let mut rows = Vec::new();
         render_detail_row_to_rows(&mut rows, &row, false);
-        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
+        let lines = into_lines(rows);
 
         let last = lines.last().expect("at least one line");
         assert!(
@@ -492,7 +516,7 @@ mod tests {
 
         let mut rows = Vec::new();
         render_detail_row_to_rows(&mut rows, &row, false);
-        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
+        let lines = into_lines(rows);
 
         let line = lines.first().expect("changed row should render one line");
         let new_span = line
@@ -527,7 +551,7 @@ mod tests {
 
         let mut rows = Vec::new();
         render_detail_row_to_rows(&mut rows, &row, false);
-        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
+        let lines = into_lines(rows);
 
         let header = lines.first().expect("list-of-maps header should render");
         assert_eq!(
@@ -535,6 +559,38 @@ mod tests {
             "  rules: (forces replacement) [",
             "forcing suffix must appear before the list opening bracket"
         );
+    }
+
+    #[test]
+    fn selected_rows_highlight_indent_and_content() {
+        let forcing_list = DetailRow::ListOfMapsDiffForcesReplacement {
+            key: "key".to_string(),
+            block: NonEmptyListOfMapsBlock::from_parts(
+                vec![],
+                vec![],
+                vec![],
+                vec![ListOfMapsDiffItem {
+                    fields: vec![(
+                        RenderedKey::from_raw("name"),
+                        PrettyValue::new(Value::Concrete(ConcreteValue::String("legacy".into()))),
+                    )],
+                }],
+            )
+            .unwrap(),
+        };
+        let buffer = render_detail_row_to_buffer(&forcing_list, true);
+        assert_row_background(&buffer, 0, "  key: (forces replacement) [");
+
+        let attribute = DetailRow::Attribute {
+            key: "name".to_string(),
+            value: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+                "plain".into(),
+            ))),
+            ref_binding: None,
+            annotation: None,
+        };
+        let buffer = render_detail_row_to_buffer(&attribute, true);
+        assert_row_background(&buffer, 0, "  name: 'plain'");
     }
 
     fn line_text(line: &Line) -> String {

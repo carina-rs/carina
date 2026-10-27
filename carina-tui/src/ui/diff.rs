@@ -1,8 +1,8 @@
 //! Map and list-of-maps diff rendering.
 
 use carina_core::detail_rows::{
-    ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind, ListOfMapsDiffModified,
-    MapDiffEntryIR, hidden_unchanged_summary,
+    ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind, MapDiffEntryIR,
+    NonEmptyListOfMapsBlock, hidden_unchanged_summary,
 };
 use carina_core::value::{PrettyLayout, RenderedValue};
 use ratatui::prelude::*;
@@ -12,8 +12,8 @@ use super::row::{Indent, Row};
 use super::value_view::{ValueStyle, value_lines_styled, value_spans_styled};
 
 pub(super) enum ListOfMapsDiffHeader {
-    Standard { highlighted: bool },
-    ForcesReplacement { highlighted: bool },
+    Standard,
+    ForcesReplacement,
 }
 
 /// Render string-list diff entries (#2943) into TUI lines. Mirrors
@@ -118,11 +118,9 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Row<'_>>, entries: &[MapDi
                 render_list_of_maps_diff(
                     &mut nested_lines,
                     key.plain(),
-                    block.unchanged(),
-                    block.modified(),
-                    block.added(),
-                    block.removed(),
-                    ListOfMapsDiffHeader::Standard { highlighted: false },
+                    block,
+                    ListOfMapsDiffHeader::Standard,
+                    false,
                 );
                 for line in nested_lines {
                     lines.push(line.indented(Indent::new(4)));
@@ -153,32 +151,28 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Row<'_>>, entries: &[MapDi
 pub(super) fn render_list_of_maps_diff(
     lines: &mut Vec<Row<'_>>,
     key: &str,
-    unchanged: &[RenderedValue],
-    modified: &[ListOfMapsDiffModified],
-    added: &[ListOfMapsDiffItem],
-    removed: &[ListOfMapsDiffItem],
+    block: &NonEmptyListOfMapsBlock,
     header: ListOfMapsDiffHeader,
+    highlighted: bool,
 ) {
-    let (header_spans, highlighted) = match header {
-        ListOfMapsDiffHeader::Standard { highlighted } => {
-            (vec![Span::raw(format!("{}: [", key))], highlighted)
-        }
-        ListOfMapsDiffHeader::ForcesReplacement { highlighted } => (
+    let header_spans = match header {
+        ListOfMapsDiffHeader::Standard => vec![Span::raw(format!("{}: [", key))],
+        ListOfMapsDiffHeader::ForcesReplacement => {
             vec![
                 Span::raw(format!("{}: ", key)),
                 Span::styled("(forces replacement)", Style::default().fg(Color::Magenta)),
                 Span::raw(" ["),
-            ],
-            highlighted,
-        ),
+            ]
+        }
     };
     lines.push(Row::new(Indent::new(2), header_spans).highlighted(highlighted));
-    for item in unchanged {
-        let mut spans = Vec::new();
-        spans.extend(value_spans_styled(item, ValueStyle::DarkGray));
-        lines.push(Row::new(Indent::new(4), spans));
+    for item in block.unchanged() {
+        lines.push(Row::new(
+            Indent::new(4),
+            value_spans_styled(item, ValueStyle::DarkGray),
+        ));
     }
-    for m in modified {
+    for m in block.modified() {
         let mut spans = vec![Span::raw("{")];
         let mut spans_indent = Indent::new(4);
         let mut emitted = 0usize;
@@ -251,10 +245,10 @@ pub(super) fn render_list_of_maps_diff(
             lines.push(Row::new(Indent::new(4), vec![Span::raw("}")]));
         }
     }
-    for item in added {
+    for item in block.added() {
         push_added_removed_block(lines, item, ListOfMapsDiffItemKind::Added);
     }
-    for item in removed {
+    for item in block.removed() {
         push_added_removed_block(lines, item, ListOfMapsDiffItemKind::Removed);
     }
     lines.push(Row::new(Indent::new(2), vec![Span::raw("]")]));
@@ -334,11 +328,9 @@ mod tests {
     use carina_core::resource::{ResolvedResource, Resource, ResourceId, State};
     use carina_core::value::{PrettyValue, RenderedKey};
     use indexmap::IndexMap;
-    use ratatui::backend::TestBackend;
-    use ratatui::widgets::Paragraph;
 
     use crate::ui::test_render::{
-        first_content_cell, leading_space_count, render_with_unstyled_indentation,
+        first_content_cell, into_lines, leading_space_count, render_with_unstyled_indentation,
     };
 
     fn rendered_string(value: &str) -> RenderedValue {
@@ -350,10 +342,6 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
-    }
-
-    fn into_lines<'a>(rows: Vec<Row<'a>>) -> Vec<Line<'a>> {
-        rows.into_iter().map(Row::into_line).collect()
     }
 
     fn string_value(value: &str) -> Value {
@@ -560,11 +548,9 @@ mod tests {
         render_list_of_maps_diff(
             &mut rows,
             "value",
-            block.unchanged(),
-            block.modified(),
-            block.added(),
-            block.removed(),
-            ListOfMapsDiffHeader::Standard { highlighted: false },
+            block,
+            ListOfMapsDiffHeader::Standard,
+            false,
         );
 
         let buffer = render_with_unstyled_indentation(into_lines(rows));
@@ -670,46 +656,29 @@ mod tests {
                 ),
             ],
         };
+        let block = NonEmptyListOfMapsBlock::from_parts(vec![], vec![], vec![], vec![item])
+            .expect("removed item makes the block non-empty");
         let mut rows = Vec::new();
 
         render_list_of_maps_diff(
             &mut rows,
             "rules",
-            &[],
-            &[],
-            &[],
-            &[item],
-            ListOfMapsDiffHeader::Standard { highlighted: false },
+            &block,
+            ListOfMapsDiffHeader::Standard,
+            false,
         );
-        let lines = into_lines(rows);
-
-        let width = 120;
-        let height = u16::try_from(lines.len()).expect("rendered lines fit in terminal height");
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
+        let width = buffer.area.width;
+        let height = buffer.area.height;
         let mut has_nested_continuation = false;
 
         for row in 0..height {
-            let indent = (0..width)
-                .take_while(|&column| buffer[(column, row)].symbol() == " ")
-                .count();
+            let indent = leading_space_count(&buffer, row);
             if indent == usize::from(width) {
                 continue;
             }
 
             has_nested_continuation |= indent >= 10;
-
-            for column in 0..indent {
-                assert!(
-                    !buffer[(column as u16, row)]
-                        .modifier
-                        .contains(Modifier::CROSSED_OUT),
-                    "leading indentation is crossed out at row {row}, column {column}"
-                );
-            }
 
             let last_content_column = (indent..usize::from(width))
                 .rfind(|&column| buffer[(column as u16, row)].symbol() != " ")
@@ -717,7 +686,7 @@ mod tests {
             let row_text = (indent..=last_content_column)
                 .map(|column| buffer[(column as u16, row)].symbol())
                 .collect::<String>();
-            let is_layout_row = indent == 2 && matches!(row_text.as_str(), "rules: [" | "]");
+            let is_layout_row = matches!(row_text.as_str(), "rules: [" | "]");
 
             if !is_layout_row {
                 for column in indent..=last_content_column {
