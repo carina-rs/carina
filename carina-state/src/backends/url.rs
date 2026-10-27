@@ -21,7 +21,8 @@
 
 use std::path::PathBuf;
 
-use crate::backend::{BackendError, BackendResult, StateBackend, read_published_exports};
+use crate::backend::{BackendError, BackendResult};
+use crate::backend_selection::BackendSelection;
 use crate::state::{PublishedExports, StateFile};
 
 /// A parsed `--state-url` argument.
@@ -143,22 +144,11 @@ impl StateUrl {
 ///
 /// Returns an error if the URL resolves to a missing object/file.
 pub async fn load_state_from_url(url: &StateUrl) -> BackendResult<StateFile> {
-    let loaded = backend_for_url(url).await?.read_state().await?;
+    let loaded = BackendSelection::explicit_url(url).read_state().await?;
 
     loaded
         .map(|l| l.into_state())
         .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", url.display_target())))
-}
-
-async fn backend_for_url(url: &StateUrl) -> BackendResult<Box<dyn StateBackend>> {
-    match url {
-        StateUrl::S3 { bucket, key } => Ok(Box::new(
-            crate::backends::S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
-        )),
-        StateUrl::File { path } => Ok(Box::new(crate::backends::LocalBackend::with_path(
-            path.clone(),
-        ))),
-    }
 }
 
 /// Load published exports from a parsed `--state-url` without decoding
@@ -166,8 +156,9 @@ async fn backend_for_url(url: &StateUrl) -> BackendResult<Box<dyn StateBackend>>
 ///
 /// Returns an error if the URL resolves to a missing object or file.
 pub async fn load_published_exports_from_url(url: &StateUrl) -> BackendResult<PublishedExports> {
-    let backend = backend_for_url(url).await?;
-    let loaded = read_published_exports(backend.as_ref()).await?;
+    let loaded = BackendSelection::explicit_url(url)
+        .read_published_exports()
+        .await?;
 
     loaded
         .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", url.display_target())))

@@ -7,7 +7,6 @@ use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::shutdown::ShutdownToken;
 use carina_core::shutdown::testing::TestShutdownTrigger;
-use carina_state::LocalBackend;
 
 use crate::commands::shared::cancellation_test_support::{
     CancellationFixtureBase, LockLossBackend, ScopedEnv,
@@ -165,10 +164,6 @@ impl ApplyCancellationFixture {
 
     pub(super) fn config_path(&self) -> &std::path::Path {
         self.base.config_path()
-    }
-
-    pub(super) fn backend(&self) -> &LocalBackend {
-        self.base.backend()
     }
 
     pub(super) fn backend_handle(&self) -> Arc<dyn carina_state::StateBackend> {

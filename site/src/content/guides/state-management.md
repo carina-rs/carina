@@ -132,12 +132,14 @@ carina init --migrate-state
 
 `init` compares the configured backend against the one recorded in
 `carina-backend.lock`. If they differ, a bare `carina init` warns and
-leaves migration pending, while `plan` warns and reads state from the old
-backend recorded in the lock. `apply`, `destroy`, and `state refresh`
-refuse to run until you opt in with `--migrate-state` (or revert the
-backend configuration), so you never silently abandon the old state.
-With `--migrate-state`, `init` copies the state to the new backend,
-verifies the copy, and rewrites the lock.
+leaves migration pending. Project-backed readers — `plan`, `state list`,
+`state show`, `state lookup`, `export`, and `upstream_state` consumers — warn
+and read state from the old backend recorded in the lock. Explicit
+`--state-url` reads bypass this selection. `apply`, `destroy`, and `state
+refresh` refuse to run until you opt in with `--migrate-state` (or revert the
+backend configuration), so you never silently abandon the old state. With
+`--migrate-state`, `init` copies the state to the new backend, verifies the
+copy, and rewrites the lock.
 
 A local source is deleted after the verified copy; a remote source is
 kept as a recoverable backup. Add `--force` only when a *different*
@@ -231,7 +233,7 @@ awscc.ec2.SecurityGroup {
 }
 ```
 
-The `upstream_state` expression points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the `let`-bound name. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
+The `upstream_state` expression points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the `let`-bound name. If that project has a pending backend migration, Carina warns and reads its locked old backend. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
 
 `source` is required and resolved relative to the enclosing `.crn` file's directory. The upstream directory must contain a valid Carina configuration (one or more `.crn` files — no filename is privileged) with an `exports` block that publishes the values consumers need.
 

@@ -143,12 +143,12 @@ async fn run_init_with_provider_resolver(
                 );
             }
         }
-        BackendDriftStatus::Drifted {
-            existing,
-            configured,
-        } => {
+        BackendDriftStatus::Drifted(drift) => {
             if !migrate_state {
-                eprintln!("{}", drift_warning(&existing, &configured, path).yellow());
+                eprintln!(
+                    "{}",
+                    drift_warning(drift.existing(), drift.configured(), path).yellow()
+                );
                 migration_pending = true;
             } else {
                 match run_init_migrate_state(path, backend_config, force)

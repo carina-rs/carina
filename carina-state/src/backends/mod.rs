@@ -2,6 +2,8 @@
 
 mod local;
 mod s3;
+#[cfg(test)]
+mod s3_winterbaume_tests;
 mod url;
 
 pub use local::LocalBackend;
@@ -10,30 +12,49 @@ pub use url::{StateUrl, load_published_exports_from_url, load_state_from_url};
 
 use std::path::Path;
 
-use crate::backend::{BackendError, BackendResult, StateBackend};
+use crate::backend::{BackendResult, StateBackend};
 use crate::backend_config::{BackendConfig, LocalBackendSettings};
+use crate::backend_selection::{BackendSelection, BackendTarget};
 
-/// Create a backend from configuration, anchoring local state paths at `base_dir`.
+/// Provider name reported for the storage resource (the state bucket).
+pub(crate) const S3_BACKEND_PROVIDER_NAME: &str = "aws";
+
+/// Resource type used to surface the state bucket in Carina state.
+pub(crate) const S3_BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
+
+/// Create the backend named by an opaque, operation-specific selection token.
 ///
-/// This function dispatches to the appropriate backend implementation
-/// based on the backend_type in the configuration. Relative local backend
-/// paths, including the default when no backend is configured, are resolved
-/// relative to `base_dir`.
-pub async fn create_backend(
-    config: Option<&BackendConfig>,
-    base_dir: &Path,
+/// Raw backend configuration is deliberately not accepted. Callers must first
+/// choose one of the named selection paths on [`BackendSelection`].
+pub(crate) async fn create_backend(
+    selection: &BackendSelection,
 ) -> BackendResult<Box<dyn StateBackend>> {
-    match config {
-        Some(config) => create_configured_backend(config, base_dir).await,
-        None => Ok(Box::new(LocalBackend::with_path(
-            base_dir.join(LocalBackend::DEFAULT_STATE_FILE),
-        ))),
+    match selection.target() {
+        BackendTarget::Configured { config, base_dir } => match config {
+            Some(config) => create_configured_backend(config, base_dir).await,
+            None => Ok(Box::new(LocalBackend::with_path(
+                base_dir.join(LocalBackend::DEFAULT_STATE_FILE),
+            ))),
+        },
+        BackendTarget::ExplicitUrl(StateUrl::S3 { bucket, key }) => Ok(Box::new(
+            S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
+        )),
+        BackendTarget::ExplicitUrl(StateUrl::File { path }) => {
+            Ok(Box::new(LocalBackend::with_path(path.clone())))
+        }
     }
+}
+
+/// Construct a local backend for tests that need to exercise the full backend
+/// contract without weakening production selection capabilities.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn local_backend_for_test(state_path: impl Into<std::path::PathBuf>) -> Box<dyn StateBackend> {
+    Box::new(LocalBackend::with_path(state_path.into()))
 }
 
 async fn create_configured_backend(
     config: &BackendConfig,
-    base_dir: &Path,
+    base_dir: &std::path::Path,
 ) -> BackendResult<Box<dyn StateBackend>> {
     match config {
         BackendConfig::S3(settings) => {
@@ -44,36 +65,6 @@ async fn create_configured_backend(
             let backend = LocalBackend::from_config(settings, base_dir)?;
             Ok(Box::new(backend))
         }
-    }
-}
-
-/// Create a non-local backend from configuration.
-///
-/// Use this for metadata-only paths, such as backend bucket management, where
-/// the operation is meaningful only for remote backends and should reject a
-/// local backend instead of constructing one.
-pub async fn create_remote_backend(config: &BackendConfig) -> BackendResult<Box<dyn StateBackend>> {
-    match config {
-        BackendConfig::Local(_) => Err(BackendError::Configuration(
-            "Local backend does not manage a remote state bucket".to_string(),
-        )),
-        BackendConfig::S3(_) => create_configured_backend(config, Path::new(".")).await,
-    }
-}
-
-/// Resolve a backend from an optional parser BackendConfig for read-only use.
-///
-/// If a config is provided, converts it to a StateBackendConfig and creates the
-/// appropriate backend. If no config is provided, falls back to a local backend.
-pub async fn resolve_backend_for_read(
-    backend_config: Option<&carina_core::parser::BackendConfig>,
-    base_dir: &Path,
-) -> BackendResult<Box<dyn StateBackend>> {
-    if let Some(config) = backend_config {
-        let state_config = BackendConfig::try_from(config)?;
-        create_backend(Some(&state_config), base_dir).await
-    } else {
-        create_backend(None, base_dir).await
     }
 }
 
@@ -94,6 +85,7 @@ pub fn anchored_local_path(config: &LocalBackendSettings, base_dir: &Path) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackendError;
     use crate::backend_config::BackendConfigError;
     use std::collections::HashMap;
 
@@ -113,37 +105,5 @@ mod tests {
             BackendError::InvalidConfig(BackendConfigError::UnsupportedBackend(name))
                 if name == "unsupported"
         ));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_backend_for_read_none_returns_local() {
-        let base_dir = tempfile::tempdir().unwrap();
-        let backend = resolve_backend_for_read(None, base_dir.path()).await;
-        assert!(backend.is_ok(), "None config should return a local backend");
-        // Local backend read_state returns Ok(None) when no state file exists
-        let state = backend.unwrap().read_state().await;
-        assert!(state.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_backend_for_read_invalid_config_returns_error() {
-        use carina_core::parser::BackendConfig as ParserBackendConfig;
-
-        let config = ParserBackendConfig {
-            backend_type: "unsupported".to_string(),
-            attributes: HashMap::new(),
-            attribute_spans: Default::default(),
-        };
-
-        let result = resolve_backend_for_read(Some(&config), Path::new(".")).await;
-        assert!(result.is_err());
-
-        if let Err(BackendError::InvalidConfig(BackendConfigError::UnsupportedBackend(name))) =
-            result
-        {
-            assert_eq!(name, "unsupported");
-        } else {
-            panic!("Expected typed unsupported-backend config error");
-        }
     }
 }

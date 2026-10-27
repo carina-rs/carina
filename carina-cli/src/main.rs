@@ -227,8 +227,10 @@ enum Commands {
         /// carina-backend.lock to the currently configured backend when
         /// they differ. Without this flag, init only warns about a backend
         /// change and leaves migration pending; apply, destroy, and state
-        /// refresh refuse to run until the state is migrated. Plan warns and
-        /// reads state from the old backend recorded in carina-backend.lock.
+        /// refresh refuse to run until the state is migrated. Read-only
+        /// commands (plan, state list/show/lookup, export, and upstream_state
+        /// reads) warn and read state from the old backend recorded in
+        /// carina-backend.lock.
         #[arg(long)]
         migrate_state: bool,
         /// When migrating, overwrite a target backend that already
@@ -1256,7 +1258,8 @@ mod error_format_tests {
         assert!(help.contains("apply, destroy, and state refresh"), "{help}");
         assert!(
             help.contains(
-                "Plan warns and reads state from the old backend recorded in carina-backend.lock"
+                "Read-only commands (plan, state list/show/lookup, export, and upstream_state \
+                 reads) warn and read state from the old backend recorded in carina-backend.lock"
             ),
             "{help}"
         );
