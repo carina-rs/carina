@@ -35,6 +35,7 @@ use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
+use crate::commands::shared::progress::ProgressSink;
 use crate::display::print_plan;
 use crate::error::AppError;
 #[cfg(test)]
@@ -2219,6 +2220,11 @@ pub async fn run_plan(
     strict_iam: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
+    let progress_sink = if json || tui {
+        ProgressSink::MachineStdout
+    } else {
+        ProgressSink::Human
+    };
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -2349,8 +2355,8 @@ pub async fn run_plan(
         let backend_resource_type = plan_backend
             .resource_type()
             .ok_or("Backend does not specify a resource type")?;
-        println!("{}", "Bootstrap Plan:".cyan().bold());
-        println!(
+        progress_sink.line("Bootstrap Plan:".cyan().bold());
+        progress_sink.line(format!(
             "  {} {} (state bucket)",
             "+".green(),
             format!(
@@ -2358,12 +2364,12 @@ pub async fn run_plan(
                 backend_provider, backend_resource_type, state_bucket_name
             )
             .green()
-        );
-        println!(
+        ));
+        progress_sink.line(format!(
             "  {} Resource definition will be added to .crn file",
             "→".cyan()
-        );
-        println!();
+        ));
+        progress_sink.blank_line();
     }
 
     let PreparedPlanIdentityInputs {
@@ -2399,6 +2405,7 @@ pub async fn run_plan(
         provider_inputs.configs(),
         &state_file,
         refresh,
+        progress_sink,
         provider_inputs.remote_bindings(),
         &state_block_claims,
         &resolved_state_block_targets,
@@ -2604,20 +2611,18 @@ pub async fn run_plan(
     )?;
 
     if let Some(out_path) = out {
-        println!();
-        println!(
-            "{}",
+        progress_sink.blank_line();
+        progress_sink.line(
             format!("Plan saved to {}", out_path.display())
                 .green()
-                .bold()
+                .bold(),
         );
-        println!(
-            "{}",
+        progress_sink.line(
             format!(
                 "To apply this plan, run: `{}`",
                 ProjectCommand::new("apply", out_path)
             )
-            .cyan()
+            .cyan(),
         );
     }
 

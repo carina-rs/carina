@@ -63,7 +63,7 @@ use crate::commands::shared::lock_heartbeat::{
 use crate::commands::shared::observer::{CliObserver, partial_read_detail_lines};
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
-    ProgressBackend, RefreshProgress, emit_newline_on_interrupt, format_duration,
+    ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt, format_duration,
 };
 use crate::commands::shared::state_writeback::{
     ApplyStateSaveInputs, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
@@ -1794,7 +1794,9 @@ async fn run_apply_locked_owned(
             let raw_provider_configs = provider_configs.as_provider_configs();
             let remote_bindings = provider_inputs.remote_bindings();
             // Select appropriate Provider based on configuration
-            let provider = get_provider_with_ctx(ctx, provider_configs, project_dir).await?;
+            let provider =
+                get_provider_with_ctx(ctx, provider_configs, project_dir, ProgressSink::Human)
+                    .await?;
 
             // carina#3132: `sorted_resources` is `mut` because deferred-for
             // expansion now runs post-refresh (after phase-2, below) via the
@@ -1821,8 +1823,8 @@ async fn run_apply_locked_owned(
             // An address with no state row is absent. A persisted row without
             // an identifier stays present and invalid until planning reports it.
             // Skip composition resources (module attribute containers) — they have no infrastructure.
-            RefreshProgress::start_header();
-            let progress_backend = ProgressBackend::new();
+            let progress_backend = ProgressBackend::new(ProgressSink::Human);
+            let refresh_phase = RefreshPhase::start(&progress_backend);
             let provider_ref = &provider;
             let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
             let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
@@ -1855,7 +1857,7 @@ async fn run_apply_locked_owned(
             let phase1_results: Vec<Result<(ResourceId, Current), AppError>> =
                 stream::iter(sorted_resources.iter())
                     .map(|resource| {
-                        let progress = RefreshProgress::begin(&progress_backend, &resource.id);
+                        let progress = refresh_phase.begin(&resource.id);
                         let loaded = persisted_state
                             .map(|sf| sf.build_state_for_resource(&resource.id))
                             .unwrap_or_else(|| Current::absent(resource.id.clone()));
@@ -2001,7 +2003,7 @@ async fn run_apply_locked_owned(
             let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
                 stream::iter(resolved_data_sources.iter())
                     .map(|resource| {
-                        let progress = RefreshProgress::begin(&progress_backend, &resource.id);
+                        let progress = refresh_phase.begin(&resource.id);
                         let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                         let data_source_bindings = &data_source_bindings;
                         let module_gate = &module_gate;
@@ -2064,7 +2066,7 @@ async fn run_apply_locked_owned(
                     remote_bindings,
                     state_file: &state_file,
                     saved_dep_bindings: &HashMap::new(),
-                    progress: &progress_backend,
+                    refresh_phase: &refresh_phase,
                     schemas: ctx.schemas(),
                 },
             )
@@ -2080,7 +2082,7 @@ async fn run_apply_locked_owned(
                 moved_pairs,
             } = prepared_expansion.into_parts();
             let parsed = expanded_canonical_resources.parsed();
-            progress_backend.finish_refresh_phase();
+            drop(refresh_phase);
             // Keep passing the explicit residual list to `print_plan`, matching
             // the plan path's `ctx.residual_deferred_for` (`commands/plan.rs`).
 

@@ -28,6 +28,7 @@ struct Fixture {
 struct PtyOptions {
     stdout_tty: bool,
     stderr_tty: bool,
+    merge_streams: bool,
     color: bool,
     rows: u16,
     scrollback_len: usize,
@@ -62,6 +63,21 @@ let gamma = mock.test.resource {
         Self::with_resources(&resources)
     }
 
+    fn with_deferred_for_resources() -> Self {
+        Self::with_resources(
+            r#"let source = mock.test.resource {
+  name = "source"
+}
+
+for _, resource_name in (source.tags ?? {}) {
+  mock.test.resource {
+    name = resource_name
+  }
+}
+"#,
+        )
+    }
+
     fn with_resources(resources: &str) -> Self {
         let temp = tempfile::tempdir().expect("create temporary project");
         let project = temp.path().to_path_buf();
@@ -90,6 +106,20 @@ let gamma = mock.test.resource {
             "carina apply fixture setup",
             &self.run_piped(&["apply", "--auto-approve", "."], &[]),
         );
+    }
+
+    fn add_second_source_tag(&self) {
+        let mut document = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&self.mock_state).expect("read mock provider state"),
+        )
+        .expect("parse mock provider state");
+        document["states"]["test.resource.source"]["tags"] =
+            serde_json::json!({ "one": "one", "two": "two" });
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(&document).expect("serialize mock provider state"),
+        )
+        .expect("write mock provider state");
     }
 
     fn run_piped(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
@@ -131,7 +161,23 @@ let gamma = mock.test.resource {
             PtyOptions {
                 stdout_tty,
                 stderr_tty,
+                merge_streams: false,
                 color,
+                rows: PTY_ROWS,
+                scrollback_len: 0,
+            },
+        )
+    }
+
+    fn run_with_merged_output(&self, args: &[&str], extra_env: &[(&str, &str)]) -> PtyRun {
+        self.run_with_streams_and_options(
+            args,
+            extra_env,
+            PtyOptions {
+                stdout_tty: false,
+                stderr_tty: false,
+                merge_streams: true,
+                color: false,
                 rows: PTY_ROWS,
                 scrollback_len: 0,
             },
@@ -150,10 +196,13 @@ let gamma = mock.test.resource {
         let _ = fs::remove_file(&stderr_file);
 
         let mut shell_command = String::from("exec \"$CARINA_BIN\" \"$@\"");
-        if !options.stdout_tty {
+        if options.merge_streams {
+            assert!(!options.stdout_tty && !options.stderr_tty);
+            shell_command.push_str(" >\"$CARINA_STDOUT_FILE\" 2>&1");
+        } else if !options.stdout_tty {
             shell_command.push_str(" >\"$CARINA_STDOUT_FILE\"");
         }
-        if !options.stderr_tty {
+        if !options.merge_streams && !options.stderr_tty {
             shell_command.push_str(" 2>\"$CARINA_STDERR_FILE\"");
         }
 
@@ -424,7 +473,7 @@ fn assert_one_blank_line_between_refresh_and_header(output: &str, header: &str) 
 }
 
 #[test]
-fn destroy_writes_all_outcomes_when_only_stdout_is_a_tty() {
+fn destroy_routes_failure_to_redirected_stderr_when_stdout_is_a_tty() {
     let fixture = Fixture::new();
     fixture.apply();
 
@@ -436,10 +485,40 @@ fn destroy_writes_all_outcomes_when_only_stdout_is_a_tty() {
     );
 
     assert!(!output.success, "forced delete failure must fail destroy");
-    assert_destroy_outcomes_once(&output.screen);
+    for (symbol, binding) in [("⊘", "alpha"), ("✓", "gamma")] {
+        let outcome = format!("{symbol} Delete mock.test.resource {binding}");
+        assert_eq!(
+            output.screen.matches(&outcome).count(),
+            1,
+            "non-failure outcome must remain on stdout\nscreen:\n{}\nstderr:\n{}",
+            output.screen,
+            output.stderr,
+        );
+    }
     assert!(
-        !output.stderr.contains("mock.test.resource"),
-        "progress outcomes must not be written to stderr: {:?}",
+        !output.screen.contains("✗ Delete mock.test.resource beta"),
+        "failure outcome must not be duplicated on stdout\nscreen:\n{}\nstderr:\n{}",
+        output.screen,
+        output.stderr,
+    );
+    assert_eq!(
+        output
+            .stderr
+            .matches("✗ Delete mock.test.resource beta")
+            .count(),
+        1,
+        "redirected stderr must contain one identified failure\nstdout screen:\n{}\nstderr:\n{}",
+        output.screen,
+        output.stderr,
+    );
+    assert_eq!(
+        output
+            .stderr
+            .matches("CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for test.resource.beta")
+            .count(),
+        1,
+        "redirected stderr must contain one provider detail\nstdout screen:\n{}\nstderr:\n{}",
+        output.screen,
         output.stderr,
     );
 }
@@ -491,6 +570,107 @@ fn apply_writes_all_create_and_refresh_outcomes_when_both_streams_are_piped() {
 }
 
 #[test]
+fn apply_routes_full_failure_to_redirected_stderr() {
+    let fixture = Fixture::new();
+
+    let output = fixture.run_with_streams(
+        &["apply", "--auto-approve", "."],
+        true,
+        false,
+        &[("CARINA_MOCK_CREATE_FAIL_FOR", "test.resource.beta")],
+    );
+
+    assert!(!output.success, "forced create failure must fail apply");
+    assert!(
+        !output.screen.contains("✗ Create mock.test.resource beta"),
+        "failure outcome must not be duplicated on stdout\nscreen:\n{}\nstderr:\n{}",
+        output.screen,
+        output.stderr,
+    );
+    assert_eq!(
+        output
+            .stderr
+            .matches("✗ Create mock.test.resource beta")
+            .count(),
+        1,
+        "redirected stderr must contain one identified failure\nstdout screen:\n{}\nstderr:\n{}",
+        output.screen,
+        output.stderr,
+    );
+    assert_eq!(
+        output
+            .stderr
+            .matches("CARINA_MOCK_CREATE_FAIL_FOR requested create failure for test.resource.beta")
+            .count(),
+        1,
+        "redirected stderr must retain the provider error detail\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr,
+    );
+}
+
+#[test]
+fn apply_merged_output_contains_each_failure_line_and_detail_once() {
+    let fixture = Fixture::new();
+
+    let output = fixture.run_with_merged_output(
+        &["apply", "--auto-approve", "."],
+        &[("CARINA_MOCK_CREATE_FAIL_FOR", "test.resource.alpha")],
+    );
+
+    assert!(!output.success, "forced create failure must fail apply");
+    assert_eq!(
+        output
+            .stdout
+            .matches("✗ Create mock.test.resource alpha")
+            .count(),
+        1,
+        "merged output must contain one failure line\noutput:\n{}",
+        output.stdout,
+    );
+    assert_eq!(
+        output
+            .stdout
+            .matches("CARINA_MOCK_CREATE_FAIL_FOR requested create failure for test.resource.alpha")
+            .count(),
+        1,
+        "merged output must contain one provider detail\noutput:\n{}",
+        output.stdout,
+    );
+}
+
+#[test]
+fn destroy_merged_output_contains_each_failure_line_and_detail_once() {
+    let fixture = Fixture::new();
+    fixture.apply();
+
+    let output = fixture.run_with_merged_output(
+        &["destroy", "--auto-approve", "."],
+        &[("CARINA_MOCK_DELETE_FAIL_FOR", "test.resource.beta")],
+    );
+
+    assert!(!output.success, "forced delete failure must fail destroy");
+    assert_eq!(
+        output
+            .stdout
+            .matches("✗ Delete mock.test.resource beta")
+            .count(),
+        1,
+        "merged output must contain one failure line\noutput:\n{}",
+        output.stdout,
+    );
+    assert_eq!(
+        output
+            .stdout
+            .matches("CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for test.resource.beta")
+            .count(),
+        1,
+        "merged output must contain one provider detail\noutput:\n{}",
+        output.stdout,
+    );
+}
+
+#[test]
 fn destroy_writes_outcomes_and_summary_to_stdout_when_both_streams_are_piped() {
     let fixture = Fixture::new();
     fixture.apply();
@@ -530,6 +710,7 @@ fn apply_renders_every_outcome_once_when_resources_exceed_pty_rows() {
         PtyOptions {
             stdout_tty: true,
             stderr_tty: true,
+            merge_streams: false,
             color: false,
             rows: 24,
             scrollback_len: SCROLLBACK_ROWS,
@@ -551,6 +732,7 @@ fn destroy_renders_every_outcome_once_when_resources_exceed_pty_rows() {
         PtyOptions {
             stdout_tty: true,
             stderr_tty: true,
+            merge_streams: false,
             color: false,
             rows: 24,
             scrollback_len: SCROLLBACK_ROWS,
@@ -575,6 +757,15 @@ fn destroy_keeps_failure_and_dependent_skip_on_the_rendered_tty_screen() {
 
     assert!(!output.success, "forced delete failure must fail destroy");
     assert_destroy_outcomes_once(&output.screen);
+    assert_eq!(
+        output
+            .screen
+            .matches("CARINA_MOCK_DELETE_FAIL_FOR requested delete failure")
+            .count(),
+        1,
+        "TTY screen must contain one provider detail\nscreen:\n{}",
+        output.screen,
+    );
     assert_marker_on_own_line(&output.screen, "Destroy Plan:");
 }
 
@@ -591,6 +782,15 @@ fn apply_keeps_failure_and_dependent_skip_on_the_rendered_tty_screen() {
 
     assert!(!output.success, "forced create failure must fail apply");
     assert_failed_apply_outcomes_once(&output.screen);
+    assert_eq!(
+        output
+            .screen
+            .matches("CARINA_MOCK_CREATE_FAIL_FOR requested create failure")
+            .count(),
+        1,
+        "TTY screen must contain one provider detail\nscreen:\n{}",
+        output.screen,
+    );
     assert_marker_on_own_line(&output.screen, "Execution Plan:");
 }
 
@@ -628,6 +828,85 @@ fn plan_refresh_separator_is_unchanged_on_the_rendered_screen() {
 }
 
 #[test]
+fn state_refresh_closes_post_expansion_progress_before_its_summary() {
+    let fixture = Fixture::with_deferred_for_resources();
+    fixture.apply();
+    fixture.add_second_source_tag();
+
+    let output = fixture.run_with_streams(&["state", "refresh", "."], true, true, &[]);
+
+    assert_pty_success("carina state refresh", &output);
+    assert!(
+        output.screen.contains("mock.test.resource _for0.two took"),
+        "fixture must exercise the post-expansion progress backend\nscreen:\n{}",
+        output.screen,
+    );
+    assert_one_blank_line_above(&output.screen, "mock.test.resource \"source\":");
+    assert_marker_on_own_line(
+        &output.screen,
+        "State refreshed: 1 resource updated, 0 resources unchanged.",
+    );
+}
+
+#[test]
+fn plan_json_is_the_only_stdout_document_when_both_streams_are_piped() {
+    let fixture = Fixture::new();
+    fixture.apply();
+
+    let output = fixture.run_with_streams(&["plan", "--json", "."], false, false, &[]);
+
+    assert_pty_success("carina plan --json", &output);
+    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "plan --json stdout must be exactly one JSON document: {error}\nstdout:\n{}\nstderr:\n{}",
+            output.stdout, output.stderr,
+        )
+    });
+}
+
+#[test]
+fn plan_json_is_the_only_stdout_document_when_stderr_is_a_tty() {
+    let fixture = Fixture::new();
+    fixture.apply();
+
+    let output = fixture.run_with_streams(&["plan", "--json", "."], false, true, &[]);
+
+    assert_pty_success("carina plan --json", &output);
+    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "plan --json stdout must be exactly one JSON document: {error}\nstdout:\n{}\nPTY screen:\n{}",
+            output.stdout, output.screen,
+        )
+    });
+}
+
+#[test]
+fn plan_json_with_out_keeps_stdout_and_saved_plan_machine_readable() {
+    let fixture = Fixture::new();
+    fixture.apply();
+
+    let output = fixture.run_with_streams(
+        &["plan", "--json", "--out", "saved-plan.json", "."],
+        false,
+        false,
+        &[],
+    );
+
+    assert_pty_success("carina plan --json --out", &output);
+    serde_json::from_str::<serde_json::Value>(&output.stdout)
+        .expect("plan --json --out stdout must be exactly one JSON document");
+    serde_json::from_slice::<serde_json::Value>(
+        &fs::read(fixture.project.join("saved-plan.json")).expect("read saved plan"),
+    )
+    .expect("--out must contain exactly one JSON document");
+    assert!(
+        !output.stdout.contains("Plan saved to"),
+        "saved-plan status belongs on stderr when stdout is JSON: {}",
+        output.stdout,
+    );
+}
+
+#[test]
 fn plan_apply_and_destroy_separate_redirected_stdout_when_stderr_is_a_tty() {
     let fixture = Fixture::new();
 
@@ -659,6 +938,38 @@ fn plain_stdout_follows_stdout_color_decision() {
     assert_pty_success("carina apply", &output);
     assert_apply_create_and_refresh_outcomes_once(&output.screen);
     assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+}
+
+#[test]
+fn cursor_visibility_follows_the_stderr_progress_terminal() {
+    let fixture = Fixture::new();
+
+    let stdout_tty = fixture.run_with_streams(&["plan", "."], true, false, &[]);
+    assert_pty_success("carina plan with stdout TTY", &stdout_tty);
+    assert!(
+        !stdout_tty
+            .pty_raw
+            .windows(b"\x1b[?25l".len())
+            .any(|bytes| bytes == b"\x1b[?25l"),
+        "cursor must stay visible when the progress stream (stderr) is not a TTY: {:?}",
+        String::from_utf8_lossy(&stdout_tty.pty_raw),
+    );
+
+    let stderr_tty = fixture.run_with_streams(&["plan", "."], false, true, &[]);
+    assert_pty_success("carina plan with stderr TTY", &stderr_tty);
+    assert!(
+        stderr_tty
+            .pty_raw
+            .windows(b"\x1b[?25l".len())
+            .any(|bytes| bytes == b"\x1b[?25l"),
+        "cursor must be hidden on the same stderr TTY as the spinners: {:?}",
+        String::from_utf8_lossy(&stderr_tty.pty_raw),
+    );
+    assert!(
+        !stderr_tty.stdout.as_bytes().contains(&b'\x1b'),
+        "redirected stdout must not receive cursor control sequences: {:?}",
+        stderr_tty.stdout,
+    );
 }
 
 #[test]

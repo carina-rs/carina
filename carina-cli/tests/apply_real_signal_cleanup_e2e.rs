@@ -119,6 +119,121 @@ fn sigint_then_sigterm_flushes_completed_state_releases_lock_and_exits_130() {
     assert!(stderr.contains("Cancellation cleanup: state lock released."));
 }
 
+#[test]
+fn abandoned_destroy_reports_unknown_outcome_separately_from_skipped() {
+    let fixture = TempDir::new().unwrap();
+    let project = fixture.path();
+    let state_path = project.join("carina.state.json");
+    let provider_state_path = project.join("mock-provider-state.json");
+    let provider_ready_path = project.join("blocked-delete-ready");
+
+    fs::write(
+        project.join("main.crn"),
+        format!(
+            "backend local {{ path = \"{}\" }}\n\
+             provider mock {{}}\n\
+             let a_completed = mock.test.resource {{ name = \"a_completed\" }}\n\
+             let z_blocked = mock.test.resource {{ name = \"z_blocked\" }}\n",
+            state_path.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.join("carina-backend.lock"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "backend_type": "local",
+                "attributes": { "path": state_path.display().to_string() },
+            }))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+
+    let setup = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(project)
+        .args(["apply", ".", "--auto-approve", "--parallelism", "1"])
+        .env("NO_COLOR", "1")
+        .env("CARINA_MOCK_STATE_FILE", &provider_state_path)
+        .env_remove("CLICOLOR_FORCE")
+        .output()
+        .expect("apply destroy fixture");
+    assert!(
+        setup.status.success(),
+        "fixture apply failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&setup.stdout),
+        String::from_utf8_lossy(&setup.stderr),
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(project)
+        .args([
+            "destroy",
+            ".",
+            "--auto-approve",
+            "--refresh=false",
+            "--parallelism",
+            "1",
+        ])
+        .env("NO_COLOR", "1")
+        .env("CARINA_MOCK_STATE_FILE", &provider_state_path)
+        .env("CARINA_MOCK_DELETE_DELAY_MS_FOR", "test.resource.z_blocked")
+        .env("CARINA_MOCK_DELETE_DELAY_MS", "60000")
+        .env("CARINA_MOCK_DELETE_READY_PATH", &provider_ready_path)
+        .env_remove("CLICOLOR_FORCE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn carina destroy");
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_reader = thread::spawn(move || read_to_string(stdout));
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stderr_reader = thread::spawn(move || {
+        let mut captured = String::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line.expect("read child stderr");
+            captured.push_str(&line);
+            captured.push('\n');
+            let _ = stderr_tx.send(line);
+        }
+        captured
+    });
+    let mut child = KillOnDrop::new(child);
+
+    wait_for_file(&provider_ready_path, Duration::from_secs(10));
+    send_signal(child.id(), libc::SIGINT);
+    wait_for_stderr(
+        &stderr_rx,
+        "Received shutdown signal: Interrupt.",
+        Duration::from_secs(5),
+    );
+    send_signal(child.id(), libc::SIGTERM);
+
+    let status = child
+        .wait_with_timeout(Duration::from_secs(5))
+        .expect("carina destroy must exit after cancellation cleanup");
+    let stdout = stdout_reader.join().unwrap();
+    let stderr = stderr_reader.join().unwrap();
+
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Delete mock.test.resource z_blocked - interrupted (outcome unknown)"),
+        "abandoned delete must say its outcome is unknown\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stdout
+            .contains("Destroy interrupted. 1 succeeded, 0 failed, 0 skipped, 1 outcome unknown."),
+        "unknown outcomes must be counted separately from skipped resources\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+}
+
 fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {

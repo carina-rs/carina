@@ -65,7 +65,7 @@ use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
 use carina_state::{BackendError, LoadedOrphans, StateFile};
 
-use crate::commands::shared::progress::{ProgressBackend, RefreshProgress};
+use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPhase};
 use crate::commands::split_validation_message;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
@@ -1762,10 +1762,11 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
     errors
 }
 
-pub async fn get_provider_with_ctx(
+pub(crate) async fn get_provider_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
     base_dir: &Path,
+    progress_sink: ProgressSink,
 ) -> Result<ProviderRouter, AppError> {
     let mut router = ProviderRouter::new();
 
@@ -1776,7 +1777,15 @@ pub async fn get_provider_with_ctx(
     // instance (`let <name> = provider <kind> { ... }`), reusing the
     // factory the default instance already brought in.
     for provider_config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None).await?;
+        instantiate_provider_into_router(
+            ctx,
+            &mut router,
+            provider_config,
+            base_dir,
+            None,
+            progress_sink,
+        )
+        .await?;
     }
 
     for provider_config in configs.iter().filter(|config| !config.is_default()) {
@@ -1787,6 +1796,7 @@ pub async fn get_provider_with_ctx(
             provider_config,
             base_dir,
             inherited_source,
+            progress_sink,
         )
         .await?;
     }
@@ -1795,7 +1805,7 @@ pub async fn get_provider_with_ctx(
         // Use mock provider for other cases.
         // Register the kind's default instance with empty kind to match
         // resources without a provider prefix.
-        println!("{}", "Using mock provider".cyan());
+        progress_sink.line("Using mock provider".cyan());
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
@@ -1879,6 +1889,7 @@ async fn instantiate_provider_into_router(
     provider_config: &ResolvedProviderConfig,
     base_dir: &Path,
     inherited_source: Option<&ProviderSource>,
+    progress_sink: ProgressSink,
 ) -> Result<(), AppError> {
     let binding = provider_config.binding();
     // Named instances inherit `source`/`version`/`revision` from the
@@ -1888,7 +1899,7 @@ async fn instantiate_provider_into_router(
     if provider_config.is_default()
         && let Some(source) = provider_config.source()
     {
-        try_add_source_provider(router, source, provider_config, base_dir).await?;
+        try_add_source_provider(router, source, provider_config, base_dir, progress_sink).await?;
         return Ok(());
     }
 
@@ -1900,9 +1911,8 @@ async fn instantiate_provider_into_router(
         // and the parser rejects `source` on named instances. So the only
         // candidate for the log line is the kind default's source, threaded
         // in by the caller as `inherited_source`.
-        println!(
-            "{}",
-            format_provider_using_line(factory.name(), &region, binding, inherited_source).cyan()
+        progress_sink.line(
+            format_provider_using_line(factory.name(), &region, binding, inherited_source).cyan(),
         );
         let provider = factory
             .create_provider(binding, &config)
@@ -1917,7 +1927,7 @@ async fn instantiate_provider_into_router(
         );
         router.add_provider_config(provider_config.as_provider_config(), provider);
     } else if ctx.uses_builtin_mock() && provider_config.name() == BUILTIN_PROVIDER_NAME {
-        println!("{}", "Using mock provider".cyan());
+        progress_sink.line("Using mock provider".cyan());
         router.add_provider_config(
             provider_config.as_provider_config(),
             Box::new(MockProvider::new()),
@@ -1948,14 +1958,13 @@ async fn try_add_source_provider(
     source: &ProviderSource,
     config: &ResolvedProviderConfig,
     base_dir: &Path,
+    progress_sink: ProgressSink,
 ) -> Result<(), AppError> {
     match load_source_provider(source, config, base_dir).await {
         Ok((factory, provider, name, ready_config)) => {
             let region = factory.extract_region(ready_config.attributes());
-            println!(
-                "{}",
-                format_provider_using_line(&name, &region, None, Some(source)).cyan()
-            );
+            progress_sink
+                .line(format_provider_using_line(&name, &region, None, Some(source)).cyan());
             router.add_provider_config(config.as_provider_config(), provider);
             router.add_normalizer(
                 config.name().to_string(),
@@ -2093,19 +2102,34 @@ pub async fn create_providers_from_configs_with_ctx(
     // first (they may load the WASM plugin), then named instances reuse
     // the factory that was just loaded.
     for config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(ctx, &mut router, config, base_dir, None).await?;
+        instantiate_provider_into_router(
+            ctx,
+            &mut router,
+            config,
+            base_dir,
+            None,
+            ProgressSink::Human,
+        )
+        .await?;
     }
     for config in configs.iter().filter(|config| !config.is_default()) {
         let inherited_source = kind_default_source(configs, config.name());
-        instantiate_provider_into_router(ctx, &mut router, config, base_dir, inherited_source)
-            .await?;
+        instantiate_provider_into_router(
+            ctx,
+            &mut router,
+            config,
+            base_dir,
+            inherited_source,
+            ProgressSink::Human,
+        )
+        .await?;
     }
 
     if ctx.uses_builtin_mock() {
         router.add_normalizer(BUILTIN_PROVIDER_NAME, Box::new(MockProvider::new()));
     }
     if router.is_empty() && ctx.uses_builtin_mock() {
-        println!("{}", "Using mock provider".cyan());
+        ProgressSink::Human.line("Using mock provider".cyan());
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
@@ -3112,7 +3136,7 @@ pub struct ExpandedRefreshState<R> {
 /// Grouped into a struct because the underlying phases need many of
 /// the same inputs (provider, schemas, wait_aliases, …) and a flat
 /// arg list would already trip the 7-argument lint here.
-pub(crate) struct ExpandRefreshAndLiftInputs<'a, P: Provider + ProviderNormalizer> {
+pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + ProviderNormalizer> {
     pub provider: &'a P,
     /// Address/metadata parity witness produced by the shared I/O-free
     /// prelude. Expansion cannot be invoked with independently assembled
@@ -3122,7 +3146,7 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, P: Provider + ProviderNormalize
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub state_file: &'a Option<StateFile>,
     pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
-    pub progress: &'a ProgressBackend<ResourceId>,
+    pub refresh_phase: &'a RefreshPhase<'backend>,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
 }
 
@@ -3133,7 +3157,7 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, P: Provider + ProviderNormalize
 /// canonical plan/apply result at the type level.
 pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
     parsed: &mut carina_core::parser::File<E>,
-    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+    inputs: ExpandRefreshAndLiftInputs<'_, '_, P>,
 ) -> Result<ExpandedRefreshState<()>, AppError> {
     let expansion = inputs.expansion.expand_parsed(
         parsed,
@@ -3154,7 +3178,7 @@ pub(crate) async fn expand_canonical_refresh_and_lift_states<
     P: Provider + ProviderNormalizer,
 >(
     canonical_resources: CanonicalResourcePair<E>,
-    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+    inputs: ExpandRefreshAndLiftInputs<'_, '_, P>,
 ) -> Result<ExpandedRefreshState<ExpandedCanonicalResources<E>>, AppError> {
     let (canonical_resources, expansion) = inputs.expansion.expand(
         canonical_resources,
@@ -3168,7 +3192,7 @@ pub(crate) async fn expand_canonical_refresh_and_lift_states<
 async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
     canonical_resources: R,
     expansion: DeferredForExpansion,
-    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+    inputs: ExpandRefreshAndLiftInputs<'_, '_, P>,
 ) -> Result<ExpandedRefreshState<R>, AppError> {
     let DeferredForExpansion {
         sorted_resources,
@@ -3182,7 +3206,7 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
         _expanded: _,
     } = expansion;
     if printed_warnings {
-        inputs.progress.note_external_line();
+        inputs.refresh_phase.note_external_line();
     }
     // Phase 2: read materialised children that weren't already refreshed.
     // Moved targets are excluded by `refreshable_child_ids`; orphan-owned
@@ -3204,7 +3228,7 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
         let children = refreshable_child_ids.select(&sorted_resources, orphans);
         refresh_resource_set(
             inputs.provider,
-            inputs.progress,
+            inputs.refresh_phase,
             children,
             inputs.state_file,
             inputs.schemas,
@@ -3247,6 +3271,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     provider_configs: &ResolvedProviderConfigs,
     state_file: &Option<StateFile>,
     refresh: bool,
+    progress_sink: ProgressSink,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
@@ -3273,7 +3298,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let data_sources: Vec<DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, provider_configs, base_dir).await?;
+    let provider = get_provider_with_ctx(ctx, provider_configs, base_dir, progress_sink).await?;
 
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
     let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
@@ -3296,10 +3321,9 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let mut deferred_data_source_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
     let mut refresh_module_constraint_errors = Vec::new();
-    let progress_backend = ProgressBackend::new();
-    let prepared_expansion = if refresh {
-        RefreshProgress::start_header();
-
+    let progress_backend = ProgressBackend::new(progress_sink);
+    let refresh_phase = refresh.then(|| RefreshPhase::start(&progress_backend));
+    let prepared_expansion = if let Some(refresh_phase) = refresh_phase.as_ref() {
         // Read states for all resources concurrently using the identifier from
         // state. An address with no row is absent; a persisted row without an
         // identifier remains present and invalid so planning can fail closed.
@@ -3331,7 +3355,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // been resolved against phase 1's `managed_current`.
         refresh_resource_set(
             provider_ref,
-            &progress_backend,
+            refresh_phase,
             sorted_resources.iter(),
             state_file,
             ctx.schemas(),
@@ -3352,7 +3376,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             let refreshed = refresh_loaded_orphans(
                 provider_ref,
                 loaded_orphans,
-                &progress_backend,
+                refresh_phase,
                 state_file.as_ref(),
                 ctx.schemas(),
             )
@@ -3444,7 +3468,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             if refresh_module_constraint_errors.is_empty() {
                 stream::iter(resolved_data_sources.iter())
                     .map(|resource| {
-                        let progress = RefreshProgress::begin(&progress_backend, &resource.id);
+                        let progress = refresh_phase.begin(&resource.id);
                         let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                         let data_source_bindings = &data_source_bindings;
                         let module_gate = &module_gate;
@@ -3564,12 +3588,11 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // A printed `⚠` warning is newline-terminated and is written on top of
     // indicatif's open spinner bar line, so it closes the bar region the
     // refresh phases above left open — the cursor is no longer parked on an
-    // unterminated `✓` line. Clear the flag so `finish_refresh_bar_region`
-    // does not add a second, spurious blank line on the
-    // deferred-for-with-warnings TTY path (#3150 Round-4 finding). The
-    // child-refresh phase below may re-open the region if it draws bars.
-    if printed_warnings {
-        progress_backend.note_external_line();
+    // unterminated `✓` line. Tell the phase guard so its eventual close does
+    // not add a second, spurious blank line on the deferred-for-with-warnings
+    // TTY path (#3150 Round-4 finding). A child refresh below may re-open it.
+    if printed_warnings && let Some(refresh_phase) = refresh_phase.as_ref() {
+        refresh_phase.note_external_line();
     }
 
     if !new_child_ids.is_empty() {
@@ -3581,10 +3604,10 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // set — the apply path uses the same one, so the moved-exclusion
         // cannot diverge between the two paths (compile-time parity).
         let children = || refreshable_child_ids.select(&sorted_resources, &orphans);
-        if refresh {
+        if let Some(refresh_phase) = refresh_phase.as_ref() {
             refresh_resource_set(
                 &provider,
-                &progress_backend,
+                refresh_phase,
                 children(),
                 state_file,
                 ctx.schemas(),
@@ -3626,9 +3649,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         }
     }
 
-    if refresh {
-        progress_backend.finish_refresh_phase();
-    }
+    drop(refresh_phase);
 
     // awscc#251 (follow-up to #3055): data-source lifting stays here
     // because data sources do not flow through `into_plan_input_current_map`.
@@ -4720,7 +4741,7 @@ pub async fn refresh_loaded_orphan_with_retry(
 async fn refresh_loaded_orphans(
     provider: &dyn Provider,
     loaded: LoadedOrphans,
-    progress_backend: &ProgressBackend<ResourceId>,
+    refresh_phase: &RefreshPhase<'_>,
     state_file: Option<&StateFile>,
     schemas: &SchemaRegistry,
 ) -> Result<LoadedOrphans, AppError> {
@@ -4732,7 +4753,7 @@ async fn refresh_loaded_orphans(
                 Current::CreateInFlight(pending) => pending.id(),
                 Current::MissingIdentifier(state) => &state.state().id,
             };
-            let progress = RefreshProgress::begin(progress_backend, id);
+            let progress = refresh_phase.begin(id);
             async move {
                 let refreshed =
                     refresh_loaded_orphan_with_retry(provider, loaded, state_file, schemas)
@@ -4765,7 +4786,7 @@ async fn refresh_loaded_orphans(
 /// bindings).
 pub(crate) async fn refresh_resource_set<'a>(
     provider: &dyn Provider,
-    progress_backend: &ProgressBackend<ResourceId>,
+    refresh_phase: &RefreshPhase<'_>,
     resources: impl Iterator<Item = &'a Resource>,
     state_file: &Option<StateFile>,
     schemas: &SchemaRegistry,
@@ -4778,7 +4799,7 @@ pub(crate) async fn refresh_resource_set<'a>(
         // compositions carry no provider state.
         stream::iter(resources)
             .map(|resource| {
-                let progress = RefreshProgress::begin(progress_backend, &resource.id);
+                let progress = refresh_phase.begin(&resource.id);
                 let loaded = state_file
                     .as_ref()
                     .map(|sf| sf.build_state_for_resource(&resource.id))

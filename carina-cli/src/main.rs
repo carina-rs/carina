@@ -400,7 +400,7 @@ async fn main() {
     // after `Cli::parse()` because that exits the process itself on
     // --help/--version/parse error, so those paths must not hide; and
     // before dispatch so all user-visible output runs cursor-hidden.
-    let _cursor_guard = carina_cli::cursor::CursorGuard::stdout();
+    let _cursor_guard = carina_cli::cursor::CursorGuard::progress();
 
     let completion = carina_cli::signal::run_with_shutdown(|shutdown| async move {
         // Handle Plan separately since it returns Result<bool, String>
