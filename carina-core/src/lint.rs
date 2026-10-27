@@ -7,6 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use pest::Span;
+use pest::iterators::Pair;
+
+use crate::parser::{PreprocessedFile, Rule, extract_key_string, preprocess_file};
 use crate::schema::ResourceSchema;
 
 /// Find list literal syntax (`attr = [...]`) for the given attribute names.
@@ -529,96 +533,143 @@ fn is_inside_string(line: &str, pos: usize) -> bool {
     in_string
 }
 
-/// A duplicate attribute warning with attribute name, 1-indexed line number, and first occurrence line.
+/// A duplicate attribute warning with its source position and first occurrence line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DuplicateAttr {
     /// The attribute name that is duplicated
     pub name: String,
     /// 1-indexed line number of the duplicate occurrence
     pub line: usize,
+    /// 1-indexed character column of the duplicate occurrence
+    pub column: usize,
+    /// 1-indexed exclusive end column of the duplicate key span
+    pub end_column: usize,
     /// 1-indexed line number of the first occurrence
     pub first_line: usize,
 }
 
-/// Find duplicate attribute keys within the same block in source text.
+/// Find duplicate keyed members within the same parsed container.
 ///
-/// Scans the source for blocks (delimited by `{` and `}`) and detects
-/// attribute assignments (`key = value`) where the same key appears more
-/// than once in the same block. Returns a list of duplicates found.
+/// This walks the pest parse tree, so syntactically distinct nested containers
+/// are checked independently. If `source` does not parse, this returns no
+/// results because the parse error is reported elsewhere.
 ///
-/// This works on resource, provider, backend, and nested blocks. Direct members
-/// of declaration blocks (`exports`, `attributes`, and `arguments`) are
-/// excluded because directory loading reports their name collisions as hard
-/// duplicate-declaration errors; emitting a second warning that says the last
-/// value wins would be contradictory.
+/// Direct members of `exports`, `attributes`, and `arguments` blocks are not
+/// compared: they use their own grammar rules, and directory loading reports
+/// their name collisions as hard duplicate-declaration errors. Emitting a
+/// second warning that says the last value wins would contradict that error.
 pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
+    let Ok(preprocessed_file) = preprocess_file(source) else {
+        return Vec::new();
+    };
+    let Ok(pairs) = preprocessed_file.parse() else {
+        return Vec::new();
+    };
+
     let mut results = Vec::new();
-    let mut block_stack: Vec<(HashMap<String, usize>, bool)> = Vec::new();
-
-    for (line_idx, line) in source.lines().enumerate() {
-        let trimmed = line.trim();
-        let line_number = line_idx + 1; // 1-indexed
-
-        // Count braces to handle patterns like `= [{`, `}]`, or single-line blocks
-        let opens = trimmed.chars().filter(|&c| c == '{').count();
-        let closes = trimmed.chars().filter(|&c| c == '}').count();
-
-        // Push new blocks for each opening brace
-        let opens_declaration_block = opens_duplicate_owned_declaration_block(trimmed);
-        for open_index in 0..opens {
-            block_stack.push((HashMap::new(), opens_declaration_block && open_index == 0));
-        }
-
-        // Check for attribute assignment: `key = value` or `key =`
-        // Only check if the line doesn't start with `}` (closing brace line)
-        if !trimmed.starts_with('}')
-            && let Some(eq_pos) = trimmed.find('=')
-        {
-            // The key is everything before '=' trimmed
-            let key_part = trimmed[..eq_pos].trim();
-
-            // Must be a simple identifier (no dots, no spaces, not empty)
-            if !key_part.is_empty()
-                && key_part.chars().all(|c| c.is_alphanumeric() || c == '_')
-                && key_part.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-                && let Some((current_block, suppress_duplicate)) = block_stack.last_mut()
-            {
-                if let Some(&first_line) = current_block.get(key_part) {
-                    if !*suppress_duplicate {
-                        results.push(DuplicateAttr {
-                            name: key_part.to_string(),
-                            line: line_number,
-                            first_line,
-                        });
-                    }
-                } else {
-                    current_block.insert(key_part.to_string(), line_number);
-                }
-            }
-        }
-
-        // Pop blocks for each closing brace
-        for _ in 0..closes {
-            block_stack.pop();
-        }
+    for pair in pairs {
+        find_duplicate_attrs_in_pair(pair, &preprocessed_file, &mut results);
     }
-
+    results.sort_by_key(|duplicate| (duplicate.line, duplicate.column));
     results
 }
 
-fn opens_duplicate_owned_declaration_block(trimmed: &str) -> bool {
-    ["exports", "attributes", "arguments"]
-        .into_iter()
-        .any(|keyword| {
-            let Some(after_keyword) = trimmed.strip_prefix(keyword) else {
-                return false;
-            };
-            let has_identifier_boundary = after_keyword
-                .chars()
-                .next()
-                .is_some_and(|character| character == '{' || character.is_whitespace());
-            has_identifier_boundary && after_keyword.contains('{')
+fn find_duplicate_attrs_in_pair<'source>(
+    pair: Pair<'source, Rule>,
+    preprocessed_file: &PreprocessedFile,
+    results: &mut Vec<DuplicateAttr>,
+) {
+    let children: Vec<_> = pair.into_inner().collect();
+    let mut first_spans: HashMap<String, Span<'source>> = HashMap::new();
+
+    for child in &children {
+        let Some((name, key_span)) = keyed_member_name(child.clone()) else {
+            continue;
+        };
+
+        if let Some(first_span) = first_spans.get(&name) {
+            // Position lookup scans the source in pest, so defer it until a
+            // duplicate actually needs a diagnostic. Heredoc preprocessing
+            // only changes text from `<<` to the end of its line; a valid
+            // marker cannot have a later key on that line, so key columns are
+            // unchanged even though only line numbers need remapping here.
+            let (preprocessed_line, column) = key_span.start_pos().line_col();
+            let (_, end_column) = key_span.end_pos().line_col();
+            let first_preprocessed_line = first_span.start_pos().line_col().0;
+            results.push(DuplicateAttr {
+                name,
+                line: preprocessed_file.original_line(preprocessed_line),
+                column,
+                end_column,
+                first_line: preprocessed_file.original_line(first_preprocessed_line),
+            });
+        } else {
+            first_spans.insert(name, key_span);
+        }
+    }
+
+    for child in children {
+        find_duplicate_attrs_in_pair(child, preprocessed_file, results);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberKeyKind {
+    Wrapper,
+    KeyedFirstChild,
+    Fixed,
+}
+
+fn member_key_kind(rule: Rule) -> Option<MemberKeyKind> {
+    match rule {
+        Rule::block_content
+        | Rule::arguments_param_attr
+        | Rule::validation_block_attr
+        | Rule::import_state_attr
+        | Rule::moved_attr => Some(MemberKeyKind::Wrapper),
+        Rule::attribute | Rule::map_entry | Rule::module_call_arg => {
+            Some(MemberKeyKind::KeyedFirstChild)
+        }
+        Rule::arg_description_attr
+        | Rule::arg_default_attr
+        | Rule::validation_condition_attr
+        | Rule::validation_error_message_attr
+        | Rule::import_to_attr
+        | Rule::import_id_attr
+        | Rule::removed_attr
+        | Rule::moved_from_attr
+        | Rule::moved_to_attr => Some(MemberKeyKind::Fixed),
+        _ => None,
+    }
+}
+
+fn keyed_member_name<'i>(pair: Pair<'i, Rule>) -> Option<(String, Span<'i>)> {
+    match member_key_kind(pair.as_rule())? {
+        MemberKeyKind::Wrapper => keyed_member_name(pair.into_inner().next()?),
+        MemberKeyKind::KeyedFirstChild => {
+            let key_pair = pair.into_inner().next()?;
+            let key_span = key_pair.as_span();
+            let name = extract_key_string(key_pair).ok()?;
+            Some((name, key_span))
+        }
+        MemberKeyKind::Fixed => fixed_keyword(pair),
+    }
+}
+
+fn fixed_keyword<'i>(pair: Pair<'i, Rule>) -> Option<(String, Span<'i>)> {
+    let text = pair.as_str();
+    let key_end = text
+        .char_indices()
+        .find_map(|(index, character)| {
+            (character.is_whitespace() || character == '=').then_some(index)
         })
+        .unwrap_or(text.len());
+    let keyword = text.get(..key_end)?;
+    if keyword.is_empty() {
+        return None;
+    }
+    let key_span = pair.as_span().get(..key_end)?;
+    Some((keyword.to_string(), key_span))
 }
 
 #[cfg(test)]
@@ -626,6 +677,188 @@ mod tests {
     use super::*;
     use crate::parser::{ModuleCall, ParsedFile, UseStatement};
     use crate::schema::{AttributeType, StructField};
+
+    const NOT_COMPARED: &[(Rule, &str)] = &[
+        (
+            Rule::arguments_param,
+            "directory loading reports duplicate declarations as hard errors",
+        ),
+        (
+            Rule::attributes_param,
+            "directory loading reports duplicate declarations as hard errors",
+        ),
+        (
+            Rule::exports_param,
+            "directory loading reports duplicate declarations as hard errors",
+        ),
+        (
+            Rule::wait_until_attr,
+            "the semantic parser rejects duplicate wait members",
+        ),
+        (
+            Rule::wait_timeout_attr,
+            "the semantic parser rejects duplicate wait members",
+        ),
+        (
+            Rule::wait_depends_on_attr,
+            "the semantic parser rejects duplicate wait members",
+        ),
+        (Rule::let_binding, "bindings are not keyed members"),
+        (Rule::local_binding, "bindings are not keyed members"),
+        (Rule::fn_local_let, "bindings are not keyed members"),
+        (Rule::for_local_binding, "bindings are not keyed members"),
+        (Rule::if_local_binding, "bindings are not keyed members"),
+        (
+            Rule::fn_param,
+            "function parameters are not keyed members; duplicate parameters are a separate concern",
+        ),
+    ];
+
+    const WRAPPER_RULES: &[Rule] = &[
+        Rule::block_content,
+        Rule::arguments_param_attr,
+        Rule::validation_block_attr,
+        Rule::import_state_attr,
+        Rule::moved_attr,
+    ];
+
+    fn grammar_rule_name(line: &str) -> Option<(&str, &str)> {
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let (name, body) = line.split_once('=')?;
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return None;
+        }
+        let body = body.trim_start();
+        ["{", "@{", "${", "_{", "!{"]
+            .iter()
+            .any(|prefix| body.starts_with(prefix))
+            .then_some((name, body))
+    }
+
+    fn grammar_rule_bodies(grammar: &str) -> Vec<(String, String)> {
+        let mut rules = Vec::new();
+        let mut current: Option<(String, String)> = None;
+
+        for line in grammar.lines() {
+            if let Some((name, body)) = grammar_rule_name(line) {
+                if let Some(rule) = current.take() {
+                    rules.push(rule);
+                }
+                current = Some((name.to_string(), body.to_string()));
+            } else if let Some((_, body)) = &mut current {
+                body.push('\n');
+                body.push_str(line);
+            }
+        }
+        if let Some(rule) = current {
+            rules.push(rule);
+        }
+
+        rules
+    }
+
+    fn contains_equals_token(body: &str) -> bool {
+        let bytes = body.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            if bytes[index] != b'"' {
+                index += 1;
+                continue;
+            }
+
+            let content_start = index + 1;
+            index = content_start;
+            let mut escaped = false;
+            while index < bytes.len() {
+                match (bytes[index], escaped) {
+                    (_, true) => escaped = false,
+                    (b'\\', false) => escaped = true,
+                    (b'"', false) => break,
+                    _ => {}
+                }
+                index += 1;
+            }
+            if bytes.get(content_start..index) == Some(b"=".as_slice()) {
+                return true;
+            }
+            index += usize::from(index < bytes.len());
+        }
+        false
+    }
+
+    #[test]
+    fn every_assignment_rule_has_an_explicit_duplicate_member_policy() {
+        let grammar = include_str!("parser/carina.pest");
+        let assignment_rule_names: HashSet<_> = grammar_rule_bodies(grammar)
+            .into_iter()
+            .filter_map(|(name, body)| contains_equals_token(&body).then_some(name))
+            .collect();
+
+        assert!(!assignment_rule_names.is_empty());
+        assert!(assignment_rule_names.contains("attribute"));
+
+        let rules_by_name: HashMap<_, _> = Rule::all_rules()
+            .iter()
+            .copied()
+            .map(|rule| (format!("{rule:?}"), rule))
+            .collect();
+
+        for &(rule, reason) in NOT_COMPARED {
+            assert!(!reason.is_empty(), "{rule:?} needs an exclusion reason");
+            assert_eq!(
+                member_key_kind(rule),
+                None,
+                "excluded rule {rule:?} must not be classified",
+            );
+            assert!(
+                assignment_rule_names.contains(&format!("{rule:?}")),
+                "excluded rule {rule:?} no longer contains an assignment token",
+            );
+        }
+
+        for &rule in WRAPPER_RULES {
+            assert_eq!(
+                member_key_kind(rule),
+                Some(MemberKeyKind::Wrapper),
+                "wrapper rule {rule:?} must remain explicitly classified",
+            );
+        }
+
+        for name in assignment_rule_names {
+            let rule = *rules_by_name
+                .get(&name)
+                .unwrap_or_else(|| panic!("grammar rule {name} is missing from Rule::all_rules()"));
+            let excluded = NOT_COMPARED
+                .iter()
+                .any(|&(not_compared, _)| not_compared == rule);
+            assert!(
+                member_key_kind(rule).is_some() || excluded,
+                "assignment rule {name} is neither classified nor explicitly excluded",
+            );
+        }
+    }
+
+    fn assert_duplicate_lint_source_parses(source: &str) {
+        let preprocessed_file = crate::parser::preprocess_file(source)
+            .expect("duplicate-lint suppression fixture must preprocess");
+        preprocessed_file
+            .parse()
+            .expect("duplicate-lint suppression fixture must parse");
+    }
 
     #[test]
     fn test_find_list_literal_attrs_detects_list_literal() {
@@ -706,6 +939,154 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
     }
 
     #[test]
+    fn test_find_duplicate_attrs_maps_lines_after_heredoc() {
+        let source = r#"let thing = mock.test.Thing {
+    policy = <<EOT
+hello
+EOT
+    a = 1
+    a = 2
+}
+"#;
+
+        let results = find_duplicate_attrs(source);
+        assert_eq!(results.len(), 1, "expected one duplicate: {results:?}");
+        assert_eq!(results[0].name, "a");
+        assert_eq!(results[0].line, 6);
+        assert_eq!(results[0].first_line, 5);
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_detects_duplicate_before_heredoc() {
+        let source = r#"let thing = mock.test.Thing {
+    a = 1
+    a = 2
+    policy = <<EOT
+hello
+EOT
+}
+"#;
+
+        let results = find_duplicate_attrs(source);
+        assert_eq!(results.len(), 1, "expected one duplicate: {results:?}");
+        assert_eq!(results[0].name, "a");
+        assert_eq!(results[0].line, 3);
+        assert_eq!(results[0].first_line, 2);
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_ignores_same_name_in_nested_map() {
+        let source = r#"let policy = awscc.cloudfront.ResponseHeadersPolicy {
+    response_headers_policy_config = {
+        security_headers_config = {
+            content_security_policy = {
+                content_security_policy = "default-src 'self'"
+                override = true
+            }
+        }
+    }
+}
+"#;
+
+        assert_duplicate_lint_source_parses(source);
+        assert_eq!(find_duplicate_attrs(source), Vec::<DuplicateAttr>::new());
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_reports_duplicate_in_same_resource() {
+        let source = r#"let thing = test.example.Thing {
+    a = 1
+    a = 2
+}
+"#;
+
+        assert_eq!(
+            find_duplicate_attrs(source),
+            vec![DuplicateAttr {
+                name: "a".to_string(),
+                line: 3,
+                column: 5,
+                end_column: 6,
+                first_line: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_reports_duplicate_in_nested_map_literal() {
+        let source = r#"let thing = test.example.Thing {
+    config = {
+        a = 1
+        a = 2
+    }
+}
+"#;
+
+        assert_eq!(
+            find_duplicate_attrs(source),
+            vec![DuplicateAttr {
+                name: "a".to_string(),
+                line: 4,
+                column: 9,
+                end_column: 10,
+                first_line: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_ignores_open_brace_in_string() {
+        let source = r#"let thing = test.example.Thing {
+    a = 1
+    description = "{"
+    a = 2
+}
+"#;
+
+        assert_eq!(
+            find_duplicate_attrs(source),
+            vec![DuplicateAttr {
+                name: "a".to_string(),
+                line: 4,
+                column: 5,
+                end_column: 6,
+                first_line: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_ignores_close_brace_in_string() {
+        let source = r#"let thing = test.example.Thing {
+    a = 1
+    nested {
+        description = "}"
+        a = 2
+    }
+}
+"#;
+
+        assert_duplicate_lint_source_parses(source);
+        assert_eq!(find_duplicate_attrs(source), Vec::<DuplicateAttr>::new());
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_allows_repeated_nested_blocks() {
+        let source = r#"let thing = test.example.Thing {
+    rule {
+        value = 1
+    }
+    rule {
+        value = 2
+    }
+}
+"#;
+
+        assert_duplicate_lint_source_parses(source);
+        assert_eq!(find_duplicate_attrs(source), Vec::<DuplicateAttr>::new());
+    }
+
+    #[test]
     fn test_find_duplicate_attrs_no_false_positive() {
         let source = r#"
 awscc.ec2.Vpc {
@@ -713,6 +1094,7 @@ awscc.ec2.Vpc {
     enable_dns_support = true
 }
 "#;
+        assert_duplicate_lint_source_parses(source);
         let results = find_duplicate_attrs(source);
         assert!(results.is_empty(), "No duplicates should be found");
     }
@@ -729,6 +1111,7 @@ awscc.ec2.Subnet {
     cidr_block = "10.0.1.0/24"
 }
 "#;
+        assert_duplicate_lint_source_parses(source);
         let results = find_duplicate_attrs(source);
         assert!(
             results.is_empty(),
@@ -822,6 +1205,7 @@ exports {
 }
 "#;
 
+        assert_duplicate_lint_source_parses(source);
         assert!(find_duplicate_attrs(source).is_empty());
     }
 
@@ -834,20 +1218,20 @@ attributes {
 }
 "#;
 
+        assert_duplicate_lint_source_parses(source);
         assert!(find_duplicate_attrs(source).is_empty());
     }
 
     #[test]
     fn test_find_duplicate_attrs_ignores_direct_argument_members() {
-        // Use assignment-shaped members to prove suppression comes from the
-        // declaration-block frame rather than today's typed-member filter.
         let source = r#"
 arguments {
-    x = "one"
-    x = "two"
+    x: String
+    x: String
 }
 "#;
 
+        assert_duplicate_lint_source_parses(source);
         assert!(find_duplicate_attrs(source).is_empty());
     }
 
@@ -869,6 +1253,171 @@ let value = mock.test.Thing {
             "expected duplicate-key warning: {results:?}"
         );
         assert_eq!(results[0].name, "key");
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_reports_duplicate_module_call_arguments() {
+        let source = r#"let network_module = use { source = "./network" }
+let network = network_module {
+    cidr = "10.0.0.0/16"
+    cidr = "10.1.0.0/16"
+}
+"#;
+
+        crate::parser::parse(source, &crate::parser::ProviderContext::default())
+            .expect("the parser silently keeps the last module-call argument");
+
+        let results = find_duplicate_attrs(source);
+        assert_eq!(results.len(), 1, "expected one duplicate: {results:?}");
+        assert_eq!(results[0].name, "cidr");
+        assert_eq!(results[0].line, 4);
+        assert_eq!(results[0].first_line, 3);
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_reports_silently_overwritten_argument_members() {
+        let source = r#"arguments {
+    port: Int {
+        description = "first"
+        description = "second"
+        default = 80
+        default = 443
+        validation {
+            condition = port > 0
+            condition = port > 1
+            error_message = "first"
+            error_message = "second"
+        }
+    }
+}
+"#;
+
+        crate::parser::parse(source, &crate::parser::ProviderContext::default())
+            .expect("the parser silently keeps the last dedicated argument member");
+
+        let actual: Vec<_> = find_duplicate_attrs(source)
+            .into_iter()
+            .map(|duplicate| (duplicate.name, duplicate.line, duplicate.first_line))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("description".to_string(), 4, 3),
+                ("default".to_string(), 6, 5),
+                ("condition".to_string(), 9, 8),
+                ("error_message".to_string(), 11, 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_reports_silently_overwritten_state_members() {
+        let source = r#"import {
+    to = awscc.ec2.Vpc "first"
+    to = awscc.ec2.Vpc "second"
+    id = "first"
+    id = "second"
+}
+removed {
+    from = awscc.ec2.Vpc "first"
+    from = awscc.ec2.Vpc "second"
+}
+moved {
+    from = awscc.ec2.Vpc "first"
+    from = awscc.ec2.Vpc "second"
+    to = awscc.ec2.Vpc "first"
+    to = awscc.ec2.Vpc "second"
+}
+"#;
+
+        crate::parser::parse(source, &crate::parser::ProviderContext::default())
+            .expect("the parser silently keeps the last dedicated state member");
+
+        let actual: Vec<_> = find_duplicate_attrs(source)
+            .into_iter()
+            .map(|duplicate| (duplicate.name, duplicate.line, duplicate.first_line))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("to".to_string(), 3, 2),
+                ("id".to_string(), 5, 4),
+                ("from".to_string(), 9, 8),
+                ("from".to_string(), 13, 12),
+                ("to".to_string(), 15, 14),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_ignores_wait_members_rejected_by_parser() {
+        let cases = [
+            (
+                "until",
+                r#"let source = mock.test.Thing {}
+let ready = wait source {
+    until = source.ready == true
+    until = source.ready == false
+}
+"#,
+            ),
+            (
+                "timeout",
+                r#"let source = mock.test.Thing {}
+let ready = wait source {
+    until = source.ready == true
+    timeout = 30s
+    timeout = 60s
+}
+"#,
+            ),
+            (
+                "depends_on",
+                r#"let source = mock.test.Thing {}
+let ready = wait source {
+    until = source.ready == true
+    depends_on = [source]
+    depends_on = []
+}
+"#,
+            ),
+        ];
+
+        for (name, source) in cases {
+            assert_duplicate_lint_source_parses(source);
+            let error = crate::parser::parse(source, &crate::parser::ProviderContext::default())
+                .expect_err("the parser must reject duplicate wait members");
+            assert!(
+                error.to_string().contains(&format!("duplicate `{name}`")),
+                "unexpected parser error for {name}: {error}"
+            );
+            assert!(
+                find_duplicate_attrs(source).is_empty(),
+                "a hard parser error must not also produce a last-value warning for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_returns_duplicates_in_source_order() {
+        let source = r#"let thing = mock.test.Thing {
+    config = {
+        nested = "first"
+        nested = "second"
+    }
+    top_level = "first"
+    top_level = "second"
+}
+"#;
+
+        let actual: Vec<_> = find_duplicate_attrs(source)
+            .into_iter()
+            .map(|duplicate| (duplicate.name, duplicate.line))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![("nested".to_string(), 4), ("top_level".to_string(), 7),]
+        );
     }
 
     #[test]

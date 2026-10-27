@@ -617,6 +617,100 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
 }
 
 #[test]
+fn duplicate_attribute_warning_anchors_inline_map_key() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let thing = mock.test.Thing {
+    tags = { Name = "first", Name = "second" }
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Duplicate attribute 'Name'"))
+        .unwrap_or_else(|| panic!("missing inline duplicate diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.range.start.line, 1);
+    assert_eq!(diagnostic.range.start.character, 29);
+    assert_eq!(diagnostic.range.end.line, 1);
+    assert_eq!(diagnostic.range.end.character, 33);
+}
+
+#[test]
+fn duplicate_attribute_warning_uses_quoted_key_span() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let thing = mock.test.Thing {
+    tags = { "a.b" = 1, "a.b" = 2 }
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Duplicate attribute 'a.b'"))
+        .unwrap_or_else(|| panic!("missing quoted-key diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.range.start.line, 1);
+    assert_eq!(diagnostic.range.start.character, 24);
+    assert_eq!(diagnostic.range.end.line, 1);
+    assert_eq!(diagnostic.range.end.character, 29);
+}
+
+#[test]
+fn duplicate_attribute_warning_uses_original_line_after_heredoc() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let thing = mock.test.Thing {
+    policy = <<EOT
+hello
+EOT
+    a = 1
+    a = 2
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Duplicate attribute 'a'"))
+        .unwrap_or_else(|| panic!("missing heredoc duplicate diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.range.start.line, 5);
+    assert_eq!(diagnostic.range.start.character, 4);
+    assert_eq!(diagnostic.range.end.line, 5);
+    assert_eq!(diagnostic.range.end.character, 5);
+}
+
+#[test]
+fn no_duplicate_warning_for_same_name_in_nested_map() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let policy = awscc.cloudfront.ResponseHeadersPolicy {
+    response_headers_policy_config = {
+        security_headers_config = {
+            content_security_policy = {
+                content_security_policy = "default-src 'self'"
+                override = true
+            }
+        }
+    }
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let duplicate_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Duplicate attribute"))
+        .collect();
+    assert!(
+        duplicate_diagnostics.is_empty(),
+        "Nested map key must not conflict with its containing attribute. Got: {duplicate_diagnostics:?}"
+    );
+}
+
+#[test]
 fn no_duplicate_warning_for_unique_attrs() {
     let engine = test_engine();
     let doc = create_document(

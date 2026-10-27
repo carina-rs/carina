@@ -10,6 +10,7 @@ mod entry;
 mod error;
 mod expressions;
 mod functions;
+mod grammar;
 mod let_binding;
 mod resolve;
 mod static_eval;
@@ -67,6 +68,9 @@ pub(crate) use types::{is_known_bare_custom_type, unknown_custom_type_message};
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 
+pub use grammar::Rule;
+pub(crate) use grammar::{PreprocessedFile, preprocess_file};
+
 pub(crate) use blocks::module_call::parse_module_call;
 pub(crate) use blocks::resource::{
     parse_block_contents, parse_read_resource_expr, parse_resource_expr,
@@ -76,12 +80,6 @@ pub use expressions::for_expr::ForBinding;
 pub use expressions::validate_expr::CompareOp;
 pub(crate) use let_binding::{LetBindingKind, LetBindingRhs, if_structural_handle};
 pub(crate) use static_eval::{evaluate_static_value, is_static_eval, is_static_value};
-
-use pest_derive::Parser;
-
-#[derive(Parser)]
-#[grammar = "parser/carina.pest"]
-pub(super) struct CarinaParser;
 
 #[cfg(test)]
 mod tests;

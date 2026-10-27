@@ -1370,7 +1370,8 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_resource_ref_attributes(doc, parsed, &binding_index));
         }
 
-        // Check for duplicate attribute keys (text-based, works without parsed file)
+        // Check for duplicate attribute keys by parsing this document's source.
+        // Invalid source yields no duplicate warnings; its parse error is reported above.
         diagnostics.extend(self.check_duplicate_attrs(doc));
 
         // Check for direct calls to pipe-preferred functions
@@ -1389,23 +1390,23 @@ impl DiagnosticEngine {
 
         duplicates
             .into_iter()
-            .filter_map(|dup| {
+            .map(|dup| {
                 // Convert 1-indexed line to 0-indexed
                 let line = (dup.line - 1) as u32;
-                // Find the column of the attribute name
-                let line_text = text.lines().nth(dup.line - 1)?;
-                let col = position::leading_whitespace_chars(line_text);
+                // Convert the detector's 1-indexed character column to LSP's
+                // 0-indexed character offset.
+                let col = dup.column.saturating_sub(1) as u32;
 
-                Some(carina_diagnostic(
+                carina_diagnostic(
                     line,
                     col,
-                    col + dup.name.len() as u32,
+                    dup.end_column.saturating_sub(1) as u32,
                     DiagnosticSeverity::WARNING,
                     format!(
                         "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
                         dup.name, dup.first_line
                     ),
-                ))
+                )
             })
             .collect()
     }

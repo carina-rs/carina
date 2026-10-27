@@ -373,11 +373,11 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::CarinaParser;
-    use pest::Parser;
+    use crate::parser::grammar::parse_rule_for_test;
+    use crate::parser::preprocess_file;
 
     fn parse_one(src: &str) -> WaitBinding {
-        let pair = CarinaParser::parse(Rule::wait_expr, src)
+        let pair = parse_rule_for_test(Rule::wait_expr, src)
             .expect("pest should parse wait_expr")
             .next()
             .expect("at least one pair");
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_until() {
-        let pair = CarinaParser::parse(Rule::wait_expr, "wait cert {\n    timeout = 30s\n}")
+        let pair = parse_rule_for_test(Rule::wait_expr, "wait cert {\n    timeout = 30s\n}")
             .unwrap()
             .next()
             .unwrap();
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_until() {
-        let pair = CarinaParser::parse(
+        let pair = parse_rule_for_test(
             Rule::wait_expr,
             "wait cert {\n    until = cert.status == A\n    until = cert.status == B\n}",
         )
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn rejects_lhs_unrelated_to_target() {
-        let pair = CarinaParser::parse(
+        let pair = parse_rule_for_test(
             Rule::wait_expr,
             "wait cert {\n    until = other.status == ISSUED\n}",
         )
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn rejects_bare_binding_lhs() {
-        let pair = CarinaParser::parse(
+        let pair = parse_rule_for_test(
             Rule::wait_expr,
             "wait cert {\n    until = cert == ISSUED\n}",
         )
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn rejects_non_eq_operator() {
-        let pair = CarinaParser::parse(
+        let pair = parse_rule_for_test(
             Rule::wait_expr,
             "wait cert {\n    until = cert.status != FAILED\n}",
         )
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn rejects_boolean_combinator() {
-        let pair = CarinaParser::parse(
+        let pair = parse_rule_for_test(
             Rule::wait_expr,
             "wait cert {\n    until = cert.status == A && cert.status == B\n}",
         )
@@ -560,7 +560,9 @@ mod tests {
 
     #[test]
     fn pest_grammar_rejects_wait_without_target() {
-        let result = CarinaParser::parse(Rule::file, "let foo = wait { until = x.y == z }");
+        let preprocessed_file =
+            preprocess_file("let foo = wait { until = x.y == z }").expect("preprocessing succeeds");
+        let result = preprocessed_file.parse();
         assert!(
             result.is_err(),
             "pest should reject `wait` without an identifier"
@@ -569,10 +571,11 @@ mod tests {
 
     #[test]
     fn pest_grammar_accepts_wait_inside_let_binding() {
-        let result = CarinaParser::parse(
-            Rule::file,
+        let preprocessed_file = preprocess_file(
             "let cert_issued = wait cert {\n    until = cert.status == ISSUED\n    timeout = 75min\n    depends_on = [validation_record]\n}",
-        );
+        )
+        .expect("preprocessing succeeds");
+        let result = preprocessed_file.parse();
         assert!(result.is_ok(), "expected parse success, got {:?}", result);
     }
 }
