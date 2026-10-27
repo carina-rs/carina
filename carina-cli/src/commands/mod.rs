@@ -16,7 +16,7 @@ pub mod state;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use carina_core::config_loader::DuplicateDeclaration;
@@ -24,11 +24,16 @@ use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
+#[cfg(test)]
+use carina_state::BackendError;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, BackendLock, BackendResult, LoadedState,
-    PublishedExports, S3BackendSettings, StateBackend, create_backend,
+    BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendResult,
+    BackendSelection, LoadedState, MutationBackendSelection, PublishedExports,
+    ReadBackendSelection, StateBackend, VerifiedMutationBackendSelection, create_backend,
 };
 use colored::Colorize;
+
+pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
 
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
@@ -43,17 +48,6 @@ use crate::wiring::{
     validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
-
-#[must_use = "Drifted must be handled explicitly — mutators refuse, while read paths select the locked backend and warn"]
-#[derive(Debug, PartialEq)]
-pub enum BackendDriftStatus {
-    Fresh,
-    Unchanged,
-    Drifted {
-        existing: BackendLock,
-        configured: BackendLock,
-    },
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftCommand {
@@ -72,30 +66,6 @@ impl DriftCommand {
     }
 }
 
-pub fn inspect_backend_drift(
-    base_dir: &Path,
-    backend_config: Option<&BackendConfig>,
-) -> Result<BackendDriftStatus, AppError> {
-    let configured = BackendLock::for_config(backend_config)?;
-    let existing = BackendLock::load(base_dir).map_err(AppError::Backend)?;
-
-    Ok(match existing {
-        None => BackendDriftStatus::Fresh,
-        Some(existing) if existing == configured => BackendDriftStatus::Unchanged,
-        Some(existing) => BackendDriftStatus::Drifted {
-            existing,
-            configured,
-        },
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadBackendLockStatus {
-    Missing,
-    Current,
-    MigrationPending,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendLockRequirement {
     AllowMissing,
@@ -111,9 +81,7 @@ pub(crate) enum BackendLockRequirement {
 /// backend while a migration from the locked old backend is still pending.
 pub(crate) struct ReadBackend {
     backend: Box<dyn StateBackend>,
-    state_config: Option<StateBackendConfig>,
-    parser_config: Option<BackendConfig>,
-    lock_status: ReadBackendLockStatus,
+    selection: ReadBackendSelection,
 }
 
 impl ReadBackend {
@@ -138,15 +106,15 @@ impl ReadBackend {
     }
 
     pub(crate) fn state_config(&self) -> Option<&StateBackendConfig> {
-        self.state_config.as_ref()
-    }
-
-    pub(crate) fn parser_config(&self) -> Option<&BackendConfig> {
-        self.parser_config.as_ref()
+        self.selection.selected_config()
     }
 
     pub(crate) fn migration_pending(&self) -> bool {
-        self.lock_status == ReadBackendLockStatus::MigrationPending
+        self.selection.drift().is_some()
+    }
+
+    pub(crate) fn drift(&self) -> Option<&BackendDrift> {
+        self.selection.drift()
     }
 }
 
@@ -154,117 +122,52 @@ impl ReadBackend {
 ///
 /// Every project-backed read goes through this function. If the configured
 /// backend differs from `carina-backend.lock`, the returned [`ReadBackend`]
-/// points at the locked old backend and this function emits the shared drift
-/// warning. [`BackendLockRequirement`] makes each caller state explicitly
-/// whether a missing lock is accepted, without changing drift selection.
+/// points at the locked old backend. Warning policy remains at the command
+/// layer, using the drift metadata carried by the returned value.
 pub(crate) async fn resolve_backend_for_read(
     base_dir: &Path,
     command_path: &Path,
     backend_config: Option<&BackendConfig>,
     lock_requirement: BackendLockRequirement,
 ) -> Result<ReadBackend, AppError> {
-    let (state_config, parser_config, lock_status) =
-        match inspect_backend_drift(base_dir, backend_config)? {
-            BackendDriftStatus::Fresh => {
-                if lock_requirement == BackendLockRequirement::RequirePresent {
-                    return Err(AppError::Config(format!(
-                        "Backend lock file not found. Run `{}` to initialize the project.",
-                        ProjectCommand::new("init", command_path)
-                    )));
-                }
-                (
-                    backend_config
-                        .map(StateBackendConfig::try_from)
-                        .transpose()
-                        .map_err(BackendError::from)?,
-                    backend_config.cloned(),
-                    ReadBackendLockStatus::Missing,
-                )
-            }
-            BackendDriftStatus::Unchanged => (
-                backend_config
-                    .map(StateBackendConfig::try_from)
-                    .transpose()
-                    .map_err(BackendError::from)?,
-                backend_config.cloned(),
-                ReadBackendLockStatus::Current,
-            ),
-            BackendDriftStatus::Drifted {
-                existing,
-                configured,
-            } => {
-                eprintln!(
-                    "{}",
-                    drift_warning(&existing, &configured, command_path).yellow()
-                );
-                let state_config = existing.to_state_config()?;
-                let parser_config = state_config.to_parser_config();
-                (
-                    Some(state_config),
-                    Some(parser_config),
-                    ReadBackendLockStatus::MigrationPending,
-                )
-            }
-        };
-
-    let backend = create_backend(state_config.as_ref(), base_dir).await?;
-    Ok(ReadBackend {
-        backend,
-        state_config,
-        parser_config,
-        lock_status,
-    })
-}
-
-#[must_use = "VerifiedBackend proves Fresh and Drifted were rejected before mutating state"]
-#[derive(Debug, Clone)]
-pub struct VerifiedBackend {
-    state_config: Option<StateBackendConfig>,
-    base_dir: PathBuf,
-}
-
-impl VerifiedBackend {
-    pub async fn resolve(&self) -> Result<Box<dyn StateBackend>, BackendError> {
-        create_backend(self.state_config.as_ref(), &self.base_dir).await
+    let selection = BackendSelection::for_read(base_dir, backend_config)?;
+    if lock_requirement == BackendLockRequirement::RequirePresent && !selection.lock_present() {
+        return Err(AppError::Config(format!(
+            "Backend lock file not found. Run `{}` to initialize the project.",
+            ProjectCommand::new("init", command_path)
+        )));
     }
-
-    pub fn s3_settings(&self) -> Option<&S3BackendSettings> {
-        self.state_config
-            .as_ref()
-            .and_then(StateBackendConfig::as_s3)
-    }
+    let backend = create_backend(selection.backend_selection()).await?;
+    Ok(ReadBackend { backend, selection })
 }
 
 pub fn verify_for_mutation(
     project_dir: &Path,
     backend_config: Option<&BackendConfig>,
     command: DriftCommand,
-) -> Result<VerifiedBackend, AppError> {
-    let verified_base_dir = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
-
-    match inspect_backend_drift(&verified_base_dir, backend_config)? {
-        BackendDriftStatus::Fresh => Err(AppError::Config(format!(
-            "Backend lock file not found. Run `{}` to initialize the project.",
+) -> Result<VerifiedMutationBackendSelection, AppError> {
+    match BackendSelection::verified_for_mutation(project_dir, backend_config)? {
+        MutationBackendSelection::MissingLock { path } => Err(AppError::Config(format!(
+            "Backend lock file not found at {}. Run `{}` to initialize the project.",
+            path.display(),
             ProjectCommand::new("init", project_dir)
         ))),
-        BackendDriftStatus::Unchanged => Ok(VerifiedBackend {
-            state_config: backend_config
-                .map(StateBackendConfig::try_from)
-                .transpose()
-                .map_err(BackendError::from)?,
-            base_dir: verified_base_dir,
-        }),
-        BackendDriftStatus::Drifted {
-            existing,
-            configured,
-        } => Err(AppError::Config(drift_error_message(
+        MutationBackendSelection::Verified(selection) => Ok(selection),
+        MutationBackendSelection::Drifted(drift) => Err(AppError::Config(drift_error_message(
             command,
-            &existing,
-            &configured,
+            drift.existing(),
+            drift.configured(),
             project_dir,
         ))),
+    }
+}
+
+pub(crate) fn warn_for_read_backend_drift(backend: &ReadBackend, project_dir: &Path) {
+    if let Some(drift) = backend.drift() {
+        eprintln!(
+            "{}",
+            drift_warning(drift.existing(), drift.configured(), project_dir).yellow()
+        );
     }
 }
 
@@ -981,13 +884,11 @@ mod tests {
             let existing = BackendLock::for_config(Some(&old)).unwrap();
             let configured = BackendLock::for_config(Some(&new)).unwrap();
 
-            assert_eq!(
-                status,
-                BackendDriftStatus::Drifted {
-                    existing,
-                    configured,
-                }
-            );
+            let BackendDriftStatus::Drifted(drift) = status else {
+                panic!("expected backend drift")
+            };
+            assert_eq!(drift.existing(), &existing);
+            assert_eq!(drift.configured(), &configured);
         }
 
         #[test]
@@ -1009,13 +910,11 @@ mod tests {
             let existing = BackendLock::for_config(Some(&remote)).unwrap();
             let configured = BackendLock::for_config(None).unwrap();
 
-            assert_eq!(
-                status,
-                BackendDriftStatus::Drifted {
-                    existing,
-                    configured,
-                }
-            );
+            let BackendDriftStatus::Drifted(drift) = status else {
+                panic!("expected backend drift")
+            };
+            assert_eq!(drift.existing(), &existing);
+            assert_eq!(drift.configured(), &configured);
         }
 
         #[test]

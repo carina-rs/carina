@@ -22,6 +22,8 @@
 use std::path::PathBuf;
 
 use crate::backend::{BackendError, BackendResult, StateBackend, read_published_exports};
+use crate::backend_selection::BackendSelection;
+use crate::backends::create_backend;
 use crate::state::{PublishedExports, StateFile};
 
 /// A parsed `--state-url` argument.
@@ -151,14 +153,8 @@ pub async fn load_state_from_url(url: &StateUrl) -> BackendResult<StateFile> {
 }
 
 async fn backend_for_url(url: &StateUrl) -> BackendResult<Box<dyn StateBackend>> {
-    match url {
-        StateUrl::S3 { bucket, key } => Ok(Box::new(
-            crate::backends::S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
-        )),
-        StateUrl::File { path } => Ok(Box::new(crate::backends::LocalBackend::with_path(
-            path.clone(),
-        ))),
-    }
+    let selection = BackendSelection::explicit_url(url);
+    create_backend(selection.backend_selection()).await
 }
 
 /// Load published exports from a parsed `--state-url` without decoding

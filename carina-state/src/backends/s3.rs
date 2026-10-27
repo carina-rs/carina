@@ -113,7 +113,7 @@ impl S3Backend {
     /// default endpoint. The S3 SDK transparently follows cross-region
     /// redirects, so any region from the chain reaches buckets in other
     /// regions.
-    pub async fn from_config(config: &S3BackendSettings) -> BackendResult<Self> {
+    pub(crate) async fn from_config(config: &S3BackendSettings) -> BackendResult<Self> {
         let bucket = config.bucket().to_string();
         let key = config.key().to_string();
         let encrypt = config.encrypt();
@@ -144,7 +144,7 @@ impl S3Backend {
     /// lookup must never create infrastructure as a side effect.
     /// `encrypt` is left at the production default (`true`) so any future
     /// fallback write would match `from_config`'s behavior.
-    pub async fn from_url_parts(bucket: String, key: String) -> BackendResult<Self> {
+    pub(crate) async fn from_url_parts(bucket: String, key: String) -> BackendResult<Self> {
         let sdk_region = sdk_chain_region().await;
         let region = resolve_region(None, sdk_region.as_deref())?;
         let client = build_s3_client(&region).await;

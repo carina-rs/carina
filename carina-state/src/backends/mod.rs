@@ -12,28 +12,34 @@ use std::path::Path;
 
 use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_config::{BackendConfig, LocalBackendSettings};
+use crate::backend_selection::{
+    BackendSelection, BackendTarget, UnlockedConfiguredBackendSelection,
+};
 
-/// Create a backend from configuration, anchoring local state paths at `base_dir`.
+/// Create the backend named by an opaque, operation-specific selection token.
 ///
-/// This function dispatches to the appropriate backend implementation
-/// based on the backend_type in the configuration. Relative local backend
-/// paths, including the default when no backend is configured, are resolved
-/// relative to `base_dir`.
-pub async fn create_backend(
-    config: Option<&BackendConfig>,
-    base_dir: &Path,
-) -> BackendResult<Box<dyn StateBackend>> {
-    match config {
-        Some(config) => create_configured_backend(config, base_dir).await,
-        None => Ok(Box::new(LocalBackend::with_path(
-            base_dir.join(LocalBackend::DEFAULT_STATE_FILE),
-        ))),
+/// Raw backend configuration is deliberately not accepted. Callers must first
+/// choose one of the named selection paths on [`BackendSelection`].
+pub async fn create_backend(selection: &BackendSelection) -> BackendResult<Box<dyn StateBackend>> {
+    match selection.target() {
+        BackendTarget::Configured { config, base_dir } => match config {
+            Some(config) => create_configured_backend(config, base_dir).await,
+            None => Ok(Box::new(LocalBackend::with_path(
+                base_dir.join(LocalBackend::DEFAULT_STATE_FILE),
+            ))),
+        },
+        BackendTarget::ExplicitUrl(StateUrl::S3 { bucket, key }) => Ok(Box::new(
+            S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
+        )),
+        BackendTarget::ExplicitUrl(StateUrl::File { path }) => {
+            Ok(Box::new(LocalBackend::with_path(path.clone())))
+        }
     }
 }
 
 async fn create_configured_backend(
     config: &BackendConfig,
-    base_dir: &Path,
+    base_dir: &std::path::Path,
 ) -> BackendResult<Box<dyn StateBackend>> {
     match config {
         BackendConfig::S3(settings) => {
@@ -52,12 +58,18 @@ async fn create_configured_backend(
 /// Use this for metadata-only paths, such as backend bucket management, where
 /// the operation is meaningful only for remote backends and should reject a
 /// local backend instead of constructing one.
-pub async fn create_remote_backend(config: &BackendConfig) -> BackendResult<Box<dyn StateBackend>> {
+pub async fn create_remote_backend(
+    selection: &UnlockedConfiguredBackendSelection,
+) -> BackendResult<Box<dyn StateBackend>> {
+    let BackendTarget::Configured { config, base_dir } = selection.backend_selection().target()
+    else {
+        unreachable!("unlocked configured selections always target configuration")
+    };
     match config {
-        BackendConfig::Local(_) => Err(BackendError::Configuration(
+        None | Some(BackendConfig::Local(_)) => Err(BackendError::Configuration(
             "Local backend does not manage a remote state bucket".to_string(),
         )),
-        BackendConfig::S3(_) => create_configured_backend(config, Path::new(".")).await,
+        Some(config @ BackendConfig::S3(_)) => create_configured_backend(config, base_dir).await,
     }
 }
 

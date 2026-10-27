@@ -12,7 +12,7 @@ use crate::display::colored_value;
 use crate::error::AppError;
 use carina_core::hint::ProjectCommand;
 
-use super::{BackendLockRequirement, resolve_backend_for_read};
+use super::{BackendLockRequirement, resolve_backend_for_read, warn_for_read_backend_drift};
 
 /// Output format for the export command.
 pub enum OutputFormat {
@@ -52,6 +52,7 @@ pub async fn run_export(
             BackendLockRequirement::AllowMissing,
         )
         .await?;
+        warn_for_read_backend_drift(&backend, path);
         backend
             .read_published_exports()
             .await

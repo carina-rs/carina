@@ -78,6 +78,41 @@ impl std::fmt::Display for ProjectBackendError {
 // command, so exposing the backend error again would repeat the diagnostic.
 impl std::error::Error for ProjectBackendError {}
 
+/// A backend-selection failure annotated with the upstream project whose
+/// state was being resolved.
+#[derive(Debug)]
+pub struct UpstreamStateSourceError {
+    source_dir: PathBuf,
+    source: Box<AppError>,
+}
+
+impl UpstreamStateSourceError {
+    fn new(source: AppError, source_dir: &Path) -> Self {
+        Self {
+            source_dir: source_dir
+                .canonicalize()
+                .unwrap_or_else(|_| source_dir.to_path_buf()),
+            source: Box::new(source),
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamStateSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "upstream_state source {}: {}",
+            self.source_dir.display(),
+            self.source
+        )
+    }
+}
+
+// This is a terminal contextual rendering: Display already includes the
+// wrapped diagnostic, so exposing it again as Error::source would duplicate
+// the message in source-chain renderers.
+impl std::error::Error for UpstreamStateSourceError {}
+
 /// Provider preparation failure annotated with the same resource header that
 /// `ProviderError::for_resource` historically rendered.
 #[derive(Debug)]
@@ -461,6 +496,10 @@ pub enum AppError {
     #[error(transparent)]
     ProjectBackend(Box<ProjectBackendError>),
 
+    /// A state-backend error while resolving a concrete upstream project.
+    #[error(transparent)]
+    UpstreamStateSource(Box<UpstreamStateSourceError>),
+
     /// Provider errors (AWS API failures, timeouts, etc.)
     #[error(transparent)]
     Provider(#[from] ProviderError),
@@ -675,6 +714,10 @@ impl AppError {
             }
             other => other,
         }
+    }
+
+    pub(crate) fn with_upstream_state_source(self, source_dir: &Path) -> Self {
+        Self::UpstreamStateSource(Box::new(UpstreamStateSourceError::new(self, source_dir)))
     }
 
     pub fn from_resource_preparation(

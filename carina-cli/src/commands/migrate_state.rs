@@ -24,8 +24,8 @@ use colored::Colorize;
 #[cfg(test)]
 use carina_state::LocalBackend;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendLock, StateBackend, StateFile, anchored_local_path,
-    create_backend,
+    BackendConfig as StateBackendConfig, BackendLock, BackendSelection, StateBackend, StateFile,
+    anchored_local_path, create_backend,
 };
 
 use crate::error::AppError;
@@ -194,10 +194,13 @@ pub async fn run_init_migrate_state(
     // snapshots, so a relative local `path` must be anchored at the
     // project dir (not the binary's CWD) for `carina init <dir>` invoked
     // from elsewhere.
-    let source = create_backend(Some(&locked_config), project_dir)
+    let source_selection = BackendSelection::unlocked_configured(project_dir, Some(&locked_config));
+    let target_selection =
+        BackendSelection::unlocked_configured(project_dir, Some(&configured_state_config));
+    let source = create_backend(source_selection.backend_selection())
         .await
         .map_err(AppError::Backend)?;
-    let target = create_backend(Some(&configured_state_config), project_dir)
+    let target = create_backend(target_selection.backend_selection())
         .await
         .map_err(AppError::Backend)?;
 

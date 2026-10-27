@@ -31,15 +31,12 @@ use carina_core::value::format_value;
 #[cfg(test)]
 use carina_state::LockInfo;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LoadedOrphans,
-    ResourceState, RowBasis, StateBackend, StateFile, StateUrl, create_backend,
-    create_remote_backend, load_state_from_url,
+    BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
+    DeposedKey, LoadedOrphans, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
+    create_backend, create_remote_backend, load_state_from_url,
 };
 
-use super::{
-    BackendDriftStatus, BackendLockRequirement, DriftCommand, inspect_backend_drift,
-    resolve_backend_for_read, verify_for_mutation,
-};
+use super::{BackendLockRequirement, DriftCommand, resolve_backend_for_read, verify_for_mutation};
 use crate::commands::plan::{
     ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
     load_and_resolve_provider_configs,
@@ -357,18 +354,10 @@ pub async fn run_force_unlock(
     .parsed;
     let base_dir = get_base_dir(path);
 
-    let backend_config = match inspect_backend_drift(base_dir, parsed.backend.as_ref())? {
-        BackendDriftStatus::Drifted { existing, .. } => Some(existing.to_state_config()?),
-        BackendDriftStatus::Fresh | BackendDriftStatus::Unchanged => parsed
-            .backend
-            .as_ref()
-            .map(StateBackendConfig::try_from)
-            .transpose()
-            .map_err(carina_state::BackendError::from)?,
-    };
-
-    // Bypasses verify_for_mutation by design. On drift, targets the OLD locked backend so users can unlock a stale migration.
-    let backend: Box<dyn StateBackend> = create_backend(backend_config.as_ref(), base_dir)
+    // Administrative lock recovery uses the shared old-backend-on-drift
+    // selector without emitting the read-command warning.
+    let selection = BackendSelection::for_force_unlock(base_dir, parsed.backend.as_ref())?;
+    let backend: Box<dyn StateBackend> = create_backend(selection.backend_selection())
         .await
         .map_err(AppError::Backend)?;
 
@@ -427,6 +416,7 @@ async fn load_state_file(
         BackendLockRequirement::AllowMissing,
     )
     .await?;
+    super::warn_for_read_backend_drift(&backend, path);
 
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
     state_file
@@ -950,9 +940,12 @@ async fn run_state_bucket_delete(
         }
     }
 
-    // Bypasses verify_for_mutation by design. The configured-bucket-name guard pins this to the NEW backend; for an orphaned OLD bucket, delete manually via the cloud console.
-    // Create backend to get provider metadata
-    let backend = create_remote_backend(&state_config)
+    // Explicitly bypasses lock selection by design. The configured-bucket-name
+    // guard pins this to the NEW backend; delete an orphaned OLD bucket via the
+    // cloud console.
+    let base_dir = get_base_dir(path);
+    let selection = BackendSelection::unlocked_configured(base_dir, Some(&state_config));
+    let backend = create_remote_backend(&selection)
         .await
         .map_err(AppError::Backend)?;
 
@@ -963,7 +956,6 @@ async fn run_state_bucket_delete(
     let backend_resource_type = backend
         .resource_type()
         .ok_or("Backend does not specify a resource type")?;
-    let base_dir = get_base_dir(path);
     let provider_inputs =
         load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
     let (factories, _) =

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
@@ -26,9 +27,11 @@ use carina_core::value::{
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
-use carina_state::{ResourceState, StateFile};
+use carina_state::{BackendDrift, ResourceState, StateFile};
 
-use super::{BackendLockRequirement, ReadBackend, resolve_backend_for_read};
+use super::{
+    BackendLockRequirement, ReadBackend, resolve_backend_for_read, warn_for_read_backend_drift,
+};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
@@ -1745,7 +1748,10 @@ pub async fn run_plan(
         BackendLockRequirement::RequirePresent,
     )
     .await?;
-    let plan_file_backend_config = plan_backend.parser_config().cloned();
+    warn_for_read_backend_drift(&plan_backend, path);
+    let plan_file_backend_config = plan_backend
+        .state_config()
+        .map(carina_state::BackendConfig::to_parser_config);
     let use_locked_backend = plan_backend.migration_pending();
     let drift_note = use_locked_backend.then(|| {
         format!(
@@ -2695,6 +2701,7 @@ pub(crate) async fn load_upstream_states(
             build_upstream_backend(us, &source_abs, provider_context, cycle_guard).await;
         cycle_guard.remove(&source_abs);
         let backend = backend_result?;
+        warn_for_upstream_backend_drift_once(&backend, &source_abs);
 
         let published_exports = backend
             .read_published_exports()
@@ -2772,6 +2779,35 @@ async fn build_upstream_backend(
         BackendLockRequirement::AllowMissing,
     )
     .await
+    .map_err(|error| error.with_upstream_state_source(source_abs))
+}
+
+static WARNED_UPSTREAM_BACKEND_DRIFT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn warn_for_upstream_backend_drift_once(backend: &ReadBackend, source: &Path) {
+    let Some(drift) = backend.drift() else {
+        return;
+    };
+    let warned = WARNED_UPSTREAM_BACKEND_DRIFT.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut warned = warned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !warned.insert(source.to_path_buf()) {
+        return;
+    }
+    drop(warned);
+
+    eprintln!("{}", upstream_backend_drift_warning(drift, source).yellow());
+}
+
+fn upstream_backend_drift_warning(drift: &BackendDrift, source: &Path) -> String {
+    format!(
+        "upstream_state source {} has a pending backend migration; reading its OLD backend \
+         recorded in carina-backend.lock.\n{}\nRun `{}` to migrate that upstream state.",
+        source.display(),
+        drift.existing().describe_diff(drift.configured()),
+        ProjectCommand::new("init --migrate-state", source),
+    )
 }
 
 /// Walk an upstream's transitive `upstream_state` chain *without*

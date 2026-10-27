@@ -89,7 +89,10 @@ impl LocalBackend {
     }
 
     /// Create a LocalBackend from configuration, anchoring relative paths at `base_dir`.
-    pub fn from_config(config: &LocalBackendSettings, base_dir: &Path) -> BackendResult<Self> {
+    pub(crate) fn from_config(
+        config: &LocalBackendSettings,
+        base_dir: &Path,
+    ) -> BackendResult<Self> {
         let path = config
             .path()
             .map(PathBuf::from)
